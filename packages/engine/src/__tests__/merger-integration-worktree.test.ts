@@ -10,6 +10,13 @@ import {
 } from "./merger-test-helpers.js";
 import { activeSessionRegistry, executingTaskLock } from "../agents/active-session-registry.js";
 import * as branchAutocorrect from "../execution/branch-autocorrect.js";
+
+const renewMergeQueueLease = vi.hoisted(() => vi.fn());
+const LEASED_AT = "2026-10-07T21:40:00.000Z";
+vi.mock("@fusion/core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@fusion/core")>()),
+  renewMergeQueueLease,
+}));
 import {
   acquireReuseHandoff,
   ensureUsableMergeIntegrationRoot,
@@ -352,11 +359,63 @@ describe("acquireReuseHandoff", () => {
     store.listTasks.mockResolvedValue([
       { id: "FN-5279", column: "in-review", worktree: "/tmp/task-worktree" },
     ]);
-    store.acquireMergeQueueLease = vi.fn().mockReturnValue({ taskId: "FN-5279" });
+    store.acquireMergeQueueLease = vi.fn().mockReturnValue({ taskId: "FN-5279", leasedAt: LEASED_AT });
     store.releaseMergeQueueLease = vi.fn();
     store.peekMergeQueueHead = vi.fn().mockReturnValue({ taskId: "FN-5000", leasedBy: "merger-reuse-handoff", column: "todo" });
     return store;
   }
+
+  const acquire = async (store: any) => acquireReuseHandoff({
+    task: await store.getTask("FN-5279"),
+    store,
+    projectRoot: "/tmp/project-root",
+    settings: {} as any,
+    worktreePath: "/tmp/task-worktree",
+  });
+
+  /*
+  FNXC:TaskStoreMergeCoordination 2026-10-07-21:40:
+  A merge that outlives its 15-minute queue lease (AI merge plus verification on Windows) must not be recovered as
+  expired and handed to a second merger. The holder renews the exact lease generation on a heartbeat, stops renewing
+  once released or once ownership is lost, and fences its release with the same token.
+  */
+  it("renews the held lease generation on a heartbeat until it is released", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = createStore();
+      store.asyncLayer = {};
+      renewMergeQueueLease.mockReset().mockResolvedValue({});
+      const handoff = await acquire(store);
+
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+      expect(renewMergeQueueLease).toHaveBeenCalledWith(store, "FN-5279", "merger-reuse-handoff", { leaseToken: LEASED_AT, leaseDurationMs: 900000 });
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+      expect(renewMergeQueueLease).toHaveBeenCalledTimes(3);
+
+      await releaseReuseHandoff({ handoff, outcome: "boom" });
+      expect(store.releaseMergeQueueLease).toHaveBeenCalledWith("FN-5279", "merger-reuse-handoff", { kind: "failure", error: "boom", leaseToken: LEASED_AT });
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+      expect(renewMergeQueueLease).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops renewing once the lease generation is lost", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = createStore();
+      store.asyncLayer = {};
+      renewMergeQueueLease.mockReset().mockRejectedValue(new Error("lease owned by another worker"));
+      const handoff = await acquire(store);
+
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+      expect(renewMergeQueueLease).toHaveBeenCalledTimes(1);
+      await releaseReuseHandoff({ handoff, outcome: "success" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   async function expectRefusal(
     promise: Promise<unknown>,
@@ -398,7 +457,7 @@ describe("acquireReuseHandoff", () => {
     );
 
     await releaseReuseHandoff({ handoff, outcome: "success", auditEmit });
-    expect(store.releaseMergeQueueLease).toHaveBeenCalledWith("FN-5279", "merger-reuse-handoff", { kind: "success" });
+    expect(store.releaseMergeQueueLease).toHaveBeenCalledWith("FN-5279", "merger-reuse-handoff", { kind: "success", leaseToken: LEASED_AT });
     expect(auditEmit).toHaveBeenCalledWith({
       type: "merge:reuse-handoff-released",
       target: "/tmp/task-worktree",
