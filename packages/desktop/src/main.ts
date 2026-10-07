@@ -474,7 +474,7 @@ export async function initializeApp(): Promise<void> {
   tray = new Tray(nativeImage.createEmpty());
   setupTray(createdWindow, tray);
 
-  registerIpcHandlers(createdWindow, tray, {
+  registerIpcHandlers(createdWindow, {
     onDesktopModeChange: async (mode) => {
       if (!localRuntimeManager) {
         return;

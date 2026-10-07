@@ -1,11 +1,10 @@
-import { app, type BrowserWindow, ipcMain, shell, type Tray } from "electron";
+import { app, type BrowserWindow, ipcMain, shell } from "electron";
 import {
   showExportSettingsDialog,
   showImportSettingsDialog,
   triggerUpdateCheck,
   type NormalizedDesktopRemoteLaunch,
 } from "./native.js";
-import { type EngineStatus, updateTrayStatus } from "./tray.js";
 import {
   applyDeleteProfile,
   applySetActiveProfile,
@@ -77,7 +76,7 @@ async function emitShellState(
   return state;
 }
 
-export function registerIpcHandlers(mainWindow: BrowserWindow, tray: Tray, options: RegisterIpcOptions = {}): void {
+export function registerIpcHandlers(mainWindow: BrowserWindow, options: RegisterIpcOptions = {}): void {
   ipcMain.handle("window:minimize", () => mainWindow.minimize());
   ipcMain.handle("window:maximize", () => {
     const isCurrentlyMaximized = mainWindow.isMaximized();
@@ -108,7 +107,6 @@ export function registerIpcHandlers(mainWindow: BrowserWindow, tray: Tray, optio
     }
   });
 
-  ipcMain.handle("tray:updateStatus", (_event, status: EngineStatus) => updateTrayStatus(tray, status));
   /*
   FNXC:DesktopOAuth 2026-07-18-04:00:
   OAuth flows call window.open AFTER awaiting POST /auth/login; when the round

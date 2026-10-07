@@ -470,7 +470,7 @@ describe("main process", () => {
 
     await initializeApp();
 
-    const options = mainDeps.registerIpcHandlers.mock.calls[0]?.[2] as
+    const options = mainDeps.registerIpcHandlers.mock.calls[0]?.[1] as
       | { onDesktopModeChange?: (mode: "local" | "remote") => Promise<void> }
       | undefined;
     await options?.onDesktopModeChange?.("remote");

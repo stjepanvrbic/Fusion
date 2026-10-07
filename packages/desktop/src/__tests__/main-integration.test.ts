@@ -358,13 +358,12 @@ describe("main integration", () => {
     expect(mocks.setupTray).toHaveBeenCalledWith(instance, trayInstance);
   });
 
-  it("registerIpcHandlers is called with mainWindow and tray", async () => {
+  it("registerIpcHandlers is called with mainWindow and runtime options", async () => {
     const { initializeApp } = await importMainModule();
     await initializeApp();
 
     const [{ instance }] = mocks.windowInstances;
-    const [trayInstance] = mocks.trayInstances;
-    expect(mocks.registerIpcHandlers).toHaveBeenCalledWith(instance, trayInstance, expect.any(Object));
+    expect(mocks.registerIpcHandlers).toHaveBeenCalledWith(instance, expect.any(Object));
   });
 
   it("window close hides to tray when app is not quitting", async () => {

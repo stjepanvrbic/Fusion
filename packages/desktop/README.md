@@ -103,7 +103,6 @@ Desktop boots through a shell-owned mode chooser before mounting the dashboard a
 | `desktopRuntime:stopLocal` | renderer → main | none | `Promise<DesktopRuntimeStatus>` |
 | `desktopLaunchMode:getMode` | renderer → main | none | `Promise<"choose" \| "local" \| "remote">` |
 | `desktopLaunchMode:setMode` | renderer → main | `mode: "choose" \| "local" \| "remote"` | `Promise<"choose" \| "local" \| "remote">` |
-| `tray:updateStatus` | renderer → main | `status: "running" \| "paused" \| "stopped"` | `Promise<void>` |
 | `native:showExportDialog` | renderer → main | none | `Promise<string \| null>` |
 | `native:showImportDialog` | renderer → main | none | `Promise<string \| null>` |
 
@@ -144,7 +143,7 @@ Desktop local mode uses an in-process runtime manager (`src/local-runtime.ts`) t
 
 ## Main Process Lifecycle
 
-`src/main.ts` orchestrates module startup in this order:
+`run()` in `src/main.ts` first takes `app.requestSingleInstanceLock()`. A process that loses the lock quits before any boot work, so only the lock holder ever starts a runtime. The holder then registers the relaunch handlers with `setupDeepLinkHandler(() => mainWindow)` and the quit coordinator, and once Electron is ready `initializeApp()` runs in this order:
 
 1. `loadWindowState()`
 2. `loadDesktopLaunchMode()`
@@ -152,12 +151,13 @@ Desktop local mode uses an in-process runtime manager (`src/local-runtime.ts`) t
 4. `createMainWindow(state)`
 5. `buildAppMenu({ mainWindow, appName: "Fusion" })`
 6. `setupTray(mainWindow, tray)`
-7. `registerIpcHandlers(mainWindow, tray)`
+7. `registerIpcHandlers(mainWindow, options)`
 8. `registerDeepLinkProtocol()`
-9. `setupDeepLinkHandler(mainWindow)`
-10. `setupAutoUpdater(mainWindow)`
-11. `startUpdateCheckInterval(mainWindow)` (4-hour periodic background checks)
-12. `mainWindow.maximize()` when restored state was maximized
+9. `setupAutoUpdater(mainWindow)`
+10. `startUpdateCheckInterval(mainWindow)` (4-hour periodic background checks)
+11. `mainWindow.maximize()` when restored state was maximized
+
+After `initializeApp()` resolves, any deep link received during boot is delivered to the new window.
 
 ### Window state and platform close behavior
 
@@ -174,10 +174,13 @@ Desktop local mode uses an in-process runtime manager (`src/local-runtime.ts`) t
 
 ### Quit cleanup
 
-- `before-quit` sets `app.isQuitting = true`
-- Periodic updater interval is disposed
-- Tray instance is destroyed (`tray.destroy()`)
-- Embedded local runtime cleanup runs via `localRuntimeManager.stopLocal()`; external CLI runtime mode remains a no-op through the runtime manager
+Every quit path (Windows window close, tray Quit, menu Quit, System-panel restart) reaches Electron's `before-quit`, which `src/quit-coordinator.ts` owns:
+
+- Every `before-quit` sets `app.isQuitting = true`, disposes the periodic updater interval and destroys the tray
+- The first `before-quit` is vetoed while `localRuntimeManager.stopLocal()` runs, honoring the Windows close prompt's PostgreSQL answer; external CLI runtime mode remains a no-op through the runtime manager
+- Once teardown settles, the coordinator quits again and that quit proceeds
+- If teardown exceeds `DESKTOP_SHUTDOWN_TIMEOUT_MS`, the coordinator force-exits
+- Stopping the embedded runtime drains held SSE and WebSocket connections, so the HTTP server close cannot block engine stop or backend shutdown
 - `mainWindow` is nulled on `closed` for clean re-creation on macOS `activate`
 
 ## Preload APIs (`window.electronAPI` and `window.fusionShell`)
@@ -190,7 +193,6 @@ Desktop local mode uses an in-process runtime manager (`src/local-runtime.ts`) t
   - Desktop runtime: `getDesktopRuntimeStatus()`, `startDesktopLocalRuntime()`, `stopDesktopLocalRuntime()`
   - Desktop launch mode: `getDesktopLaunchMode()`, `setDesktopLaunchMode(mode)`
   - Native shell management: `openConnectionManager()` (invokes `shell:openConnectionManager`)
-  - Tray: `updateTrayStatus(status)`
   - Native dialogs: `showExportDialog()`, `showImportDialog()`
   - Event subscriptions (return unsubscribe functions):
     - `onDeepLink(callback)`
@@ -226,7 +228,7 @@ renderer (window.fusionAPI)
         ▼
      ipc.ts handlers ───────────► native.ts (dialogs, updater, window state)
         │
-        ├────────────────────────► tray.ts (status + tray menu wiring)
+        ├────────────────────────► tray.ts (tray icon + window/quit menu)
         │
         └────────────────────────► main.ts lifecycle orchestration
                                       ├─ menu.ts (application menu)
@@ -238,13 +240,9 @@ renderer (window.fusionAPI)
 - Left-clicking the tray icon toggles the main window visibility.
 - Right-click context menu includes:
   - **Show/Hide Window** (contextual based on visibility)
-  - **Pause/Resume Engine** (status toggle placeholder; IPC wiring lands in FN-1076)
   - **Quit Fusion**
-- Tray tooltip reflects engine status:
-  - `Fusion — Running`
-  - `Fusion — Paused`
-  - `Fusion — Stopped`
-- Tray icon is generated from the Fusion four-dot logo.
+- The tray offers no engine control and its tooltip is `Fusion`. Engine pause is per project and lives in the dashboard's engine controls, so the tray never claims an engine state it cannot verify.
+- Tray icon is generated from the Fusion four-dot logo. Packaged builds load it from `<resources>/icons`, where electron-builder ships `src/icons/tray-*.png`; development loads it from `src/icons`.
 
 ## Application Menu
 
@@ -294,10 +292,12 @@ Invalid or unsupported URLs (wrong scheme, missing host, unknown host) are ignor
 
 ### Single-instance behavior and platform differences
 
-- `setupDeepLinkHandler(mainWindow)` owns `app.requestSingleInstanceLock()`.
-- If no lock is granted, the app quits to avoid duplicate instances.
+- `run()` in `src/main.ts` owns `app.requestSingleInstanceLock()` and takes it before any boot work.
+- If no lock is granted, the app quits before migrating data, opening the store, starting engines, loading plugins or creating a window.
 - **macOS:** listens to `open-url` events.
 - **Windows/Linux:** listens to `second-instance` args and extracts `fusion://` URLs.
+- Every `second-instance` launch shows, restores and focuses the main window, with or without a deep link, so a window hidden to the tray is recoverable by relaunching Fusion.
+- A deep link that arrives before the window exists is held and delivered by `flushPending()` once the window is created.
 - Valid parsed deep links are forwarded to the renderer as `mainWindow.webContents.send("deep-link", result)`.
 
 ## Cross-Task API Contract (FN-1075 → FN-1076)
@@ -328,7 +328,7 @@ FN-1076 depends on these exact exports and names.
 | `registerDeepLinkProtocol` | `() => void` |
 | `parseDeepLink` | `(url: string) => DeepLinkResult \| null` |
 | `handleDeepLink` | `(mainWindow, url: string) => void` |
-| `setupDeepLinkHandler` | `(mainWindow) => void` |
+| `setupDeepLinkHandler` | `(getMainWindow: () => BrowserWindow \| null) => DeepLinkRouter` |
 | `DeepLinkResult` | `interface` |
 
 ## Tray Icons

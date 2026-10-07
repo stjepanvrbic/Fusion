@@ -13,7 +13,6 @@ const mocks = vi.hoisted(() => {
     getVersion: vi.fn(() => "1.2.3"),
   };
 
-  const updateTrayStatus = vi.fn();
   const showExportSettingsDialog = vi.fn();
   const showImportSettingsDialog = vi.fn();
   const setupAutoUpdater = vi.fn();
@@ -30,7 +29,6 @@ const mocks = vi.hoisted(() => {
     ipcMain,
     ipcHandlers,
     app,
-    updateTrayStatus,
     showExportSettingsDialog,
     showImportSettingsDialog,
     setupAutoUpdater,
@@ -43,10 +41,6 @@ const mocks = vi.hoisted(() => {
 vi.mock("electron", () => ({
   ipcMain: mocks.ipcMain,
   app: mocks.app,
-}));
-
-vi.mock("../tray.js", () => ({
-  updateTrayStatus: mocks.updateTrayStatus,
 }));
 
 vi.mock("../native.js", () => ({
@@ -97,19 +91,11 @@ function createWindowMock() {
   };
 }
 
-function createTrayMock() {
-  return {
-    setToolTip: vi.fn(),
-    setContextMenu: vi.fn(),
-  };
-}
-
 async function registerHandlers(options: Record<string, unknown> = {}) {
   const { registerIpcHandlers } = await import("../ipc.ts");
   const window = createWindowMock();
-  const tray = createTrayMock();
-  registerIpcHandlers(window as never, tray as never, options as never);
-  return { window, tray };
+  registerIpcHandlers(window as never, options as never);
+  return { window };
 }
 
 describe("ipc handlers", () => {
@@ -153,6 +139,14 @@ describe("ipc handlers", () => {
     expect(channels.has("desktopLaunchMode:setMode")).toBe(true);
     expect(channels.has("platform:get")).toBe(true);
     expect(channels.has("shell:openConnectionManager")).toBe(true);
+  });
+
+  // C-115: the renderer cannot set a tray engine status the main process never verified.
+  it("registers no tray status channel", async () => {
+    await registerHandlers();
+
+    const channels = mocks.ipcMain.handle.mock.calls.map(([channel]) => String(channel));
+    expect(channels.filter((channel) => channel.startsWith("tray:"))).toEqual([]);
   });
 
   it("shell:getState returns desktop shell state", async () => {

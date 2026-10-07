@@ -41,6 +41,15 @@ describe("preload", () => {
     expect(getExposed("fusionShell")).toBeTruthy();
   });
 
+  // C-115: no renderer bridge may set a tray engine status the main process never verified.
+  it("exposes no tray status setter", async () => {
+    await importPreloadModule();
+
+    for (const name of ["electronAPI", "fusionAPI", "fusionShell"]) {
+      expect(Object.keys(getExposed<Record<string, unknown>>(name) ?? {})).not.toContain("updateTrayStatus");
+    }
+  });
+
   it("electronAPI delegates getServerPort to IPC", async () => {
     await importPreloadModule();
     const api = getExposed<{ getServerPort: () => Promise<number | undefined> }>("electronAPI");

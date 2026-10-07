@@ -160,69 +160,51 @@ describe("tray module", () => {
     warn.mockRestore();
   });
 
-  it("getTrayTooltip returns running label", async () => {
-    const { getTrayTooltip } = await import("../tray.ts");
-    expect(getTrayTooltip("running")).toBe("Fusion — Running");
-  });
-
-  it("getTrayTooltip returns paused label", async () => {
-    const { getTrayTooltip } = await import("../tray.ts");
-    expect(getTrayTooltip("paused")).toBe("Fusion — Paused");
-  });
-
-  it("getTrayTooltip returns stopped label", async () => {
-    const { getTrayTooltip } = await import("../tray.ts");
-    expect(getTrayTooltip("stopped")).toBe("Fusion — Stopped");
-  });
-
   it("buildTrayContextMenu toggles show/hide label based on visibility", async () => {
     const { buildTrayContextMenu } = await import("../tray.ts");
 
-    const hiddenMenu = buildTrayContextMenu({
-      isWindowVisible: false,
-      engineStatus: "running",
-    });
-    const visibleMenu = buildTrayContextMenu({
-      isWindowVisible: true,
-      engineStatus: "running",
-    });
+    const hiddenMenu = buildTrayContextMenu({ isWindowVisible: false });
+    const visibleMenu = buildTrayContextMenu({ isWindowVisible: true });
 
     expect(hiddenMenu[0]).toMatchObject({ label: "Show Window" });
     expect(visibleMenu[0]).toMatchObject({ label: "Hide Window" });
+    expect(visibleMenu.at(-1)).toMatchObject({ label: "Quit Fusion" });
   });
 
-  it("buildTrayContextMenu shows Pause/Resume labels and enables toggles for running/paused", async () => {
-    const { buildTrayContextMenu } = await import("../tray.ts");
+  /*
+   * C-115: the tray's Pause/Resume Engine item only flipped its own label; no engine, API or renderer
+   * call was ever made, and the "Fusion — Running" tooltip was hardcoded even in remote mode or with the
+   * runtime stopped. Operator controls must never report a state the system is not in, so the tray
+   * offers no engine control and claims no engine state, on every platform and window state.
+   */
+  it.each(["win32", "darwin", "linux"] as const)("the %s tray offers only window and quit controls and never claims an engine state", async (platform) => {
+    mockPlatform(platform);
+    const { setupTray } = await import("../tray.ts");
+    const mainWindow = createMainWindowMock(true);
+    const tray = createTrayMock();
 
-    const runningMenu = buildTrayContextMenu({
-      isWindowVisible: true,
-      engineStatus: "running",
-    });
-    const pausedMenu = buildTrayContextMenu({
-      isWindowVisible: true,
-      engineStatus: "paused",
-    });
+    setupTray(mainWindow as never, tray as never);
+    mainWindow.hide();
+    mainWindow.getListener("hide")?.();
+    mainWindow.show();
+    mainWindow.getListener("show")?.();
 
-    expect(runningMenu[2]).toMatchObject({ label: "Pause Engine", enabled: true });
-    expect(pausedMenu[2]).toMatchObject({ label: "Resume Engine", enabled: true });
+    const templates = mocks.menu.buildFromTemplate.mock.calls.map(
+      ([template]) => template as Array<{ type?: string; label?: string }>,
+    );
+    expect(templates.length).toBeGreaterThanOrEqual(3);
+    for (const template of templates) {
+      const labels = template.filter((item) => item.type !== "separator").map((item) => item.label);
+      expect(labels).toHaveLength(2);
+      expect(["Show Window", "Hide Window"]).toContain(labels[0]);
+      expect(labels[1]).toBe("Quit Fusion");
+    }
+    const tooltips = tray.setToolTip.mock.calls.map(([tooltip]) => tooltip);
+    expect(tooltips.length).toBeGreaterThan(0);
+    expect(new Set(tooltips)).toEqual(new Set(["Fusion"]));
   });
 
-  it("buildTrayContextMenu disables engine toggle when stopped and includes separators and quit", async () => {
-    const { buildTrayContextMenu } = await import("../tray.ts");
-
-    const stoppedMenu = buildTrayContextMenu({
-      isWindowVisible: true,
-      engineStatus: "stopped",
-    });
-
-    const separatorCount = stoppedMenu.filter((item) => item.type === "separator").length;
-
-    expect(stoppedMenu[2]).toMatchObject({ enabled: false });
-    expect(separatorCount).toBe(2);
-    expect(stoppedMenu[4]).toMatchObject({ label: "Quit Fusion" });
-  });
-
-  it("setupTray sets tooltip and context menu", async () => {
+  it("setupTray sets icon, tooltip and context menu", async () => {
     const { setupTray } = await import("../tray.ts");
     const mainWindow = createMainWindowMock(true);
     const tray = createTrayMock();
@@ -230,7 +212,7 @@ describe("tray module", () => {
     setupTray(mainWindow as never, tray as never);
 
     expect(tray.setImage).toHaveBeenCalledTimes(1);
-    expect(tray.setToolTip).toHaveBeenCalledWith("Fusion — Running");
+    expect(tray.setToolTip).toHaveBeenCalledWith("Fusion");
     expect(mocks.menu.buildFromTemplate).toHaveBeenCalledTimes(1);
     expect(tray.setContextMenu).toHaveBeenCalledTimes(1);
   });
@@ -303,27 +285,5 @@ describe("tray module", () => {
 
     expect(event.preventDefault).toHaveBeenCalledTimes(1);
     expect(mainWindow.hide).toHaveBeenCalledTimes(1);
-  });
-
-  it("updateTrayStatus updates tooltip and menu", async () => {
-    const { setupTray, updateTrayStatus } = await import("../tray.ts");
-    const mainWindow = createMainWindowMock(true);
-    const tray = createTrayMock();
-
-    setupTray(mainWindow as never, tray as never);
-    updateTrayStatus(tray as never, "paused");
-
-    expect(tray.setToolTip).toHaveBeenLastCalledWith("Fusion — Paused");
-    expect(mocks.menu.buildFromTemplate).toHaveBeenCalledTimes(2);
-  });
-
-  it("updateTrayStatus still updates tooltip when tray was not initialized", async () => {
-    const { updateTrayStatus } = await import("../tray.ts");
-    const tray = createTrayMock();
-
-    updateTrayStatus(tray as never, "stopped");
-
-    expect(tray.setToolTip).toHaveBeenCalledWith("Fusion — Stopped");
-    expect(tray.setContextMenu).toHaveBeenCalledTimes(1);
   });
 });

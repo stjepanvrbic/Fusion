@@ -9,20 +9,22 @@ import {
   type NativeImage,
 } from "electron";
 
-export type EngineStatus = "running" | "paused" | "stopped";
+/*
+FNXC:DesktopTray 2026-10-07-18:02:
+Operator controls must never report a state the system is not in.
+The tray's Pause/Resume Engine item only flipped its own label and a hardcoded "Fusion — Running" tooltip, with no engine, API or renderer call behind it, so an operator could leave the machine believing dispatch had stopped.
+The tray has no project context for a real pause, which is per-project and lives in the dashboard's engine controls, so the tray offers only window and quit controls and claims no engine state.
+*/
+const TRAY_TOOLTIP = "Fusion";
 
 export interface TrayMenuOptions {
   isWindowVisible: boolean;
-  engineStatus: EngineStatus;
 }
 
 interface TrayState {
   mainWindow: BrowserWindow;
-  engineStatus: EngineStatus;
   isQuitting: boolean;
 }
-
-const trayState = new WeakMap<Tray, TrayState>();
 
 function toggleMainWindow(mainWindow: BrowserWindow): void {
   if (mainWindow.isVisible()) {
@@ -34,14 +36,9 @@ function toggleMainWindow(mainWindow: BrowserWindow): void {
   mainWindow.focus();
 }
 
-function resolveEngineMenuLabel(engineStatus: EngineStatus): string {
-  return engineStatus === "running" ? "Pause Engine" : "Resume Engine";
-}
-
 function applyTrayMenu(tray: Tray, state: TrayState): void {
   const baseTemplate = buildTrayContextMenu({
     isWindowVisible: state.mainWindow.isVisible(),
-    engineStatus: state.engineStatus,
   });
 
   const contextTemplate = baseTemplate.map((item) => {
@@ -56,20 +53,6 @@ function applyTrayMenu(tray: Tray, state: TrayState): void {
       };
     }
 
-    if (item.label === "Pause Engine" || item.label === "Resume Engine") {
-      return {
-        ...item,
-        click: () => {
-          if (state.engineStatus === "stopped") {
-            return;
-          }
-
-          state.engineStatus = state.engineStatus === "running" ? "paused" : "running";
-          applyTrayMenu(tray, state);
-        },
-      };
-    }
-
     return {
       ...item,
       click: () => {
@@ -79,7 +62,7 @@ function applyTrayMenu(tray: Tray, state: TrayState): void {
     };
   });
 
-  tray.setToolTip(getTrayTooltip(state.engineStatus));
+  tray.setToolTip(TRAY_TOOLTIP);
   tray.setContextMenu(Menu.buildFromTemplate(contextTemplate));
 }
 
@@ -131,38 +114,16 @@ export function buildTrayContextMenu(options: TrayMenuOptions): MenuItemConstruc
       type: "separator",
     },
     {
-      label: resolveEngineMenuLabel(options.engineStatus),
-      enabled: options.engineStatus !== "stopped",
-    },
-    {
-      type: "separator",
-    },
-    {
       label: "Quit Fusion",
     },
   ];
 }
 
-export function getTrayTooltip(status: EngineStatus): string {
-  switch (status) {
-    case "paused":
-      return "Fusion — Paused";
-    case "stopped":
-      return "Fusion — Stopped";
-    case "running":
-    default:
-      return "Fusion — Running";
-  }
-}
-
 export function setupTray(mainWindow: BrowserWindow, tray: Tray): Tray {
   const state: TrayState = {
     mainWindow,
-    engineStatus: "running",
     isQuitting: false,
   };
-
-  trayState.set(tray, state);
 
   tray.setImage(createTrayIcon());
   applyTrayMenu(tray, state);
@@ -197,23 +158,4 @@ export function setupTray(mainWindow: BrowserWindow, tray: Tray): Tray {
   });
 
   return tray;
-}
-
-export function updateTrayStatus(tray: Tray, status: EngineStatus): void {
-  const state = trayState.get(tray);
-
-  if (!state) {
-    tray.setToolTip(getTrayTooltip(status));
-    const menu = Menu.buildFromTemplate(
-      buildTrayContextMenu({
-        isWindowVisible: false,
-        engineStatus: status,
-      }),
-    );
-    tray.setContextMenu(menu);
-    return;
-  }
-
-  state.engineStatus = status;
-  applyTrayMenu(tray, state);
 }
