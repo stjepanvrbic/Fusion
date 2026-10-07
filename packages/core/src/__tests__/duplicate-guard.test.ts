@@ -360,7 +360,7 @@ describe("reconcileDeterministicDuplicate", () => {
         deterministicDuplicateOf: "FN-1",
       },
     });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-2", "archived");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-2", "archived", { moveSource: "engine", bypassGuards: false });
     expect(store.recordActivity).toHaveBeenCalledWith(expect.objectContaining({
       type: "task:auto-archived-deterministic-duplicate",
       metadata: { canonicalTaskId: "FN-1", contentFingerprint: "fp" },
@@ -408,7 +408,7 @@ describe("reconcileDeterministicDuplicate", () => {
     const result = await reconcileDeterministicDuplicate(store, { createdTask: created, fingerprint: "fp" });
 
     expect(result).toEqual({ outcome: "archived", canonical });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-2", "boxed");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-2", "boxed", { moveSource: "engine", bypassGuards: false });
     expect(store.moveTask).not.toHaveBeenCalledWith("FN-2", "archived");
   });
 

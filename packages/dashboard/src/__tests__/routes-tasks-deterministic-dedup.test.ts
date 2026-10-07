@@ -285,7 +285,7 @@ describe("task deterministic dedup", () => {
     const res = await performRequest(app, "POST", "/api/tasks", JSON.stringify({ title: TITLE, description: DESCRIPTION, acknowledgedDuplicates: ["FN-1"] }), { "content-type": "application/json" });
     expect(res.status).toBe(200);
     expect((res.body as Task).id).toBe("FN-1");
-    expect(store.moveTask).toHaveBeenCalledWith("FN-101", "archived");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-101", "archived", { moveSource: "engine", bypassGuards: false });
     expect(store.recordActivity).toHaveBeenCalledWith(expect.objectContaining({
       type: "task:auto-archived-deterministic-duplicate",
       metadata: { canonicalTaskId: "FN-1", contentFingerprint: FINGERPRINT },

@@ -2684,6 +2684,9 @@ export default function kbExtension(pi: ExtensionAPI) {
       A manual retry re-queues a card the scheduler can dispatch; hard-cancel and userPaused park semantics apply only to an operator drag back to the queue.
       These moves used `moveSource: "user"`, so the hold-lane hook parked every retried card userPaused and the tool reported success for a card that never ran.
       Retry moves now match `fn task retry` and the dashboard route: no moveSource (the operator-compatible route that keeps guards and lifecycle containment) plus explicit `manual-retry` provenance for the move log and the move-source census.
+
+      FNXC:LifecycleContainment 2026-10-07-21:40:
+      That operator route is now spelled `moveSource: "operator"`, so the move-source census can require every call to name its source.
       */
       if (isMissingWorktreeSessionRetry) {
         await applyRetryReset({
@@ -2698,7 +2701,7 @@ export default function kbExtension(pi: ExtensionAPI) {
         await store.logEntry(params.id, `Retry requested via Fusion extension (unusable worktree session-start recovery → todo, preserving progress${retryLogSuffix})`);
         /* FNXC:WorkflowResolvedColumns 2026-07-30-22:20: census-invisible moveTask DESTINATION — a call argument, not a comparison. This is an OPERATOR-triggered Retry: on a board that does not declare `todo` the move is REJECTED and the retry fails in the operator's face. The reply text below uses the SAME resolved value so it cannot name a lane the card did not go to. */
         const retryTarget = await fusionCore.resolveReboundTargetForTask(store, params.id);
-        await store.moveTask(params.id, retryTarget, { preserveProgress: true, workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE });
+        await store.moveTask(params.id, retryTarget, { preserveProgress: true, moveSource: "operator", workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE });
         return {
           content: [{ type: "text", text: `Retried ${params.id} → ${retryTarget} (unusable worktree session metadata cleared)` }],
           details: { taskId: params.id, newColumn: 'todo' },
@@ -2722,7 +2725,7 @@ export default function kbExtension(pi: ExtensionAPI) {
           );
           /* FNXC:WorkflowResolvedColumns 2026-07-30-22:20: census-invisible moveTask DESTINATION — same operator Retry path as above. */
           const executionRetryTarget = await fusionCore.resolveReboundTargetForTask(store, params.id);
-          await store.moveTask(params.id, executionRetryTarget, { preserveProgress: true, workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE });
+          await store.moveTask(params.id, executionRetryTarget, { preserveProgress: true, moveSource: "operator", workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE });
           return {
             content: [{ type: "text", text: `Retried ${params.id} → ${executionRetryTarget} (execution failure, preserving step progress)` }],
             details: { taskId: params.id, newColumn: 'todo' },
@@ -2760,7 +2763,7 @@ export default function kbExtension(pi: ExtensionAPI) {
       Resolve once, then use that value everywhere the operator or a downstream tool reads it.
       */
       const retryTarget = await fusionCore.resolveReboundTargetForTask(store, params.id);
-      await store.moveTask(params.id, retryTarget, { workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE });
+      await store.moveTask(params.id, retryTarget, { moveSource: "operator", workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE });
 
       // Log the retry action
       await store.logEntry(params.id, "Retry requested via Fusion extension", `Task reset to ${retryTarget} for retry`);
@@ -6842,7 +6845,7 @@ export default function kbExtension(pi: ExtensionAPI) {
           landingError = "this workflow declares no hold (ready-to-pick-up) lane";
         } else if (holdColumn && holdColumn !== task.column) {
           try {
-            await store.moveTask(task.id, holdColumn);
+            await store.moveTask(task.id, holdColumn, { moveSource: "operator" });
             landedColumn = holdColumn;
           } catch (moveError) {
             landingError = moveError instanceof Error ? moveError.message : String(moveError);

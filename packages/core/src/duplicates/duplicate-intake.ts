@@ -325,7 +325,8 @@ export async function archiveAsSameAgentDuplicate(
     details: "Auto-archived as same-agent duplicate during intake",
     metadata: { siblingTaskIds: siblingIds, scores },
   });
-  await store.moveTask(taskId, await resolveArchiveTargetForTask(store, taskId));
+  // FNXC:LifecycleContainment 2026-10-07-21:40: an automatic intake-to-archive move names its source; guards still apply, as they did when the source was absent.
+  await store.moveTask(taskId, await resolveArchiveTargetForTask(store, taskId), { moveSource: "engine", bypassGuards: false });
 }
 
 /**

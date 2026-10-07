@@ -305,7 +305,8 @@ export async function recoverCompletedTask(
         });
       }
       // Non-undefined: the guard above returned early when this workflow declares no WIP lane.
-      completionTask = await deps.store.moveTask(task.id, plannerLanes.wip as string);
+      // FNXC:LifecycleContainment 2026-10-07-21:40: a forward planner-to-WIP engine move names its source; guards still apply, as they did when the source was absent.
+      completionTask = await deps.store.moveTask(task.id, plannerLanes.wip as string, { moveSource: "engine", bypassGuards: false });
     }
     await deps.handoffTaskToReview(completionTask, "completed-task-recovered");
     if (promotedFromPlannerColumn) {

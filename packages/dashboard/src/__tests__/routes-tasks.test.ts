@@ -2266,7 +2266,7 @@ describe("POST /tasks/:id/review/address", () => {
       }),
     });
     expect(store.addSteeringComment).toHaveBeenCalledWith("FN-001", expect.stringContaining("Fix tests before merge."), "user");
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", { preserveProgress: true });
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", { preserveProgress: true, moveSource: "operator" });
     expect(store.updateStep).toHaveBeenCalledWith("FN-001", 0, "pending");
   });
 
@@ -2329,7 +2329,7 @@ describe("POST /tasks/:id/review/address", () => {
     expect(steering).toContain("Canonical advisory: preserve this text.");
     expect(steering).not.toContain("FORGED");
     expect(steering).not.toContain("invalid.example");
-    expect(store.moveTask).toHaveBeenCalledWith("FN-009", "in-progress", { preserveProgress: true });
+    expect(store.moveTask).toHaveBeenCalledWith("FN-009", "in-progress", { preserveProgress: true, moveSource: "operator" });
   });
 
   it("accepts reviewer-agent fallback log review ids when no reviewer text block exists", async () => {
@@ -2511,7 +2511,7 @@ describe("POST /tasks/:id/pr/address-feedback", () => {
     expect(store.addSteeringComment).toHaveBeenCalledWith("FN-001", expect.stringContaining("PR #42 https://github.com/acme/repo/pull/42"), "user");
     expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: null, error: null, sessionFile: null });
     expect(store.updateStep).toHaveBeenCalledWith("FN-001", 0, "pending");
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", { preserveProgress: true });
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", { preserveProgress: true, moveSource: "operator" });
     expect(store.logEntry).toHaveBeenCalledWith("FN-001", "Address PR feedback requested", expect.stringContaining("PR #42"));
     expect(res.body.task.column).toBe("in-progress");
   });

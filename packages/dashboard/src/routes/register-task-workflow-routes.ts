@@ -1169,7 +1169,13 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
     }
 
     const reengageColumn = await resolveWipColumnForTask(scopedStore, task.id);
-    const reengagedTask = await scopedStore.moveTask(task.id, reengageColumn, { preserveProgress: true });
+    /*
+    FNXC:LifecycleContainment 2026-10-07-21:40:
+    Operator-initiated route moves in this file (re-engage, retry, rebound, respecify, unassign, plan approval, PR feedback,
+    archived-duplicate recovery) name their source "operator": guards apply, the drag-only "user" hard cancel does not, and
+    lifecycle containment does not judge them as automatic moves. A board drag still sends "user".
+    */
+    const reengagedTask = await scopedStore.moveTask(task.id, reengageColumn, { preserveProgress: true, moveSource: "operator" });
     await triggerCommentWakeForAssignedAgent(scopedStore, reengagedTask, wake);
     return { task: reengagedTask, reengaged: true };
   }
@@ -2229,7 +2235,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         const intakeColumn = await resolveIntakeColumnForTask(scopedStore, archivedTask.id);
         const recoveredTask = archivedTask.column === intakeColumn
           ? archivedTask
-          : await scopedStore.moveTask(archivedTask.id, intakeColumn, { recoveryRehome: true });
+          : await scopedStore.moveTask(archivedTask.id, intakeColumn, { recoveryRehome: true, moveSource: "operator" });
         const trustedCreateResult = await trusted.onCreated?.(recoveredTask);
         res.status(200).json(trusted.responseForCreated?.(recoveredTask, trustedCreateResult) ?? recoveredTask);
         return;
@@ -3739,7 +3745,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
           ...buildManualRetryResetPatch({ resetMergeRetries: true }),
         });
         await scopedStore.logEntry(req.params.id, `Retry requested from dashboard (unusable worktree session-start recovery → ${reboundColumn}, preserving progress${retryLogSuffix})`);
-        const updated = await scopedStore.moveTask(req.params.id, reboundColumn, { preserveProgress: true });
+        const updated = await scopedStore.moveTask(req.params.id, reboundColumn, { preserveProgress: true, moveSource: "operator" });
         res.json(updated);
         return;
       }
@@ -3771,7 +3777,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
               ? `Retry requested from dashboard (stranded in-review execution retry → ${reboundColumn}, preserving progress${retryLogSuffix})`
               : `Retry requested from dashboard (execution failure in-review → ${reboundColumn}, preserving progress${retryLogSuffix})`,
           );
-          const updated = await scopedStore.moveTask(req.params.id, reboundColumn, { preserveProgress: true });
+          const updated = await scopedStore.moveTask(req.params.id, reboundColumn, { preserveProgress: true, moveSource: "operator" });
           res.json(updated);
           return;
         }
@@ -3872,7 +3878,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
 
       await scopedStore.logEntry(req.params.id, "Retry requested from dashboard (stuck kill budget reset)");
       const reboundColumn = await resolveReboundColumnForTask(scopedStore, req.params.id);
-      const updated = await scopedStore.moveTask(req.params.id, reboundColumn);
+      const updated = await scopedStore.moveTask(req.params.id, reboundColumn, { moveSource: "operator" });
       res.json(updated);
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -5429,11 +5435,12 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
           });
           await scopedStore.moveTask(task.id, reboundColumn, {
             preserveStatus: true,
+            moveSource: "operator",
             workflowMoveSource: "plan-approval",
           });
         } else {
           // Preserve the historical same-column move behavior and its guards.
-          await scopedStore.moveTask(task.id, reboundColumn);
+          await scopedStore.moveTask(task.id, reboundColumn, { moveSource: "operator" });
         }
         /*
          * FNXC:PlanApproval 2026-08-03-18:53:
@@ -5541,6 +5548,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
            */
           await scopedStore.moveTask(task.id, intakeColumn, {
             preserveStatus: true,
+            moveSource: "operator",
             workflowMoveSource: "plan-approval",
           });
         }
@@ -6428,7 +6436,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       await scopedStore.logEntry(task.id, "AI spec revision requested", feedback);
 
       // Move to triage for replanning
-      const moved = await scopedStore.moveTask(task.id, respecifyTarget);
+      const moved = await scopedStore.moveTask(task.id, respecifyTarget, { moveSource: "operator" });
 
       if (preservePlan === true) {
         const supersededAt = new Date().toISOString();
@@ -7665,7 +7673,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
           await scopedStore.updateStep(task.id, lastDoneStep.index, "pending");
         }
         const prFeedbackColumn = await resolveWipColumnForTask(scopedStore, task.id);
-        updatedTask = await scopedStore.moveTask(task.id, prFeedbackColumn, { preserveProgress: true });
+        updatedTask = await scopedStore.moveTask(task.id, prFeedbackColumn, { preserveProgress: true, moveSource: "operator" });
       }
 
       const hasActiveSession = Boolean(updatedTask.sessionFile);
@@ -7699,7 +7707,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         status: null,
       });
       const unassignColumn = await resolveReboundColumnForTask(scopedStore, req.params.id);
-      const task = await scopedStore.moveTask(req.params.id, unassignColumn);
+      const task = await scopedStore.moveTask(req.params.id, unassignColumn, { moveSource: "operator" });
       res.json(task);
     } catch (err: unknown) {
       if (err instanceof ApiError) {

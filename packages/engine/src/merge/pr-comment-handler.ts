@@ -253,7 +253,12 @@ export class PrCommentHandler {
         },
         "queued",
       );
-      await this.store.moveTask(taskId, wipTarget);
+      /*
+      FNXC:LifecycleContainment 2026-10-07-21:40:
+      Requested PR changes are a code-review revision, the one reason a card may return from review to WIP. The move names
+      its engine source and that reason so lifecycle containment judges it; guards still apply, as they did before.
+      */
+      await this.store.moveTask(taskId, wipTarget, { moveSource: "engine", lifecycleReason: "code-review-revise-remediation", bypassGuards: false });
       await this.store.logEntry(
         taskId,
         `PR #${prInfo.number}: changes requested by @${reviewerLogin} — moved back to in-progress`,

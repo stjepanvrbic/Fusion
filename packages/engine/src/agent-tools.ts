@@ -3622,7 +3622,7 @@ export function createTaskRetryTool(store: TaskStore, options: TaskRetryToolOpti
         act on, so a wrong value there is not merely cosmetic.
         */
         const retryTarget = await fusionCore.resolveReboundTargetForTask(store, params.id);
-        await store.moveTask(params.id, retryTarget);
+        await store.moveTask(params.id, retryTarget, { moveSource: "operator" });
         await store.logEntry(params.id, "Retry requested via chat tool", `Task reset to ${retryTarget} for retry`);
         return { content: [{ type: "text" as const, text: `Retried ${params.id} → ${retryTarget}` }], details: { taskId: params.id, newColumn: retryTarget } };
       } catch (err: unknown) {
