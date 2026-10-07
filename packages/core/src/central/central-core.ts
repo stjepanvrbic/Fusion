@@ -34,7 +34,8 @@ import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
-import { isAbsolute, basename, resolve } from "node:path";
+import { isAbsolute, basename } from "node:path";
+import { canonicalizePath, isPathInside, isSamePath, pathIdentityKey } from "../fs/path-identity.js";
 import type {
   RegisteredProject,
   ProjectHealth,
@@ -507,8 +508,9 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
   }): Promise<RegisteredProject> {
     this.ensureInitialized();
     this.validateProjectPath(input.path);
+    const projectPath = canonicalizePath(input.path);
 
-    const existingByPath = await this.getProjectByPath(input.path);
+    const existingByPath = await this.getProjectByPath(projectPath);
     if (existingByPath) {
       throw new Error(`Project already registered at path: ${input.path}`);
     }
@@ -521,7 +523,7 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
     const project: RegisteredProject = {
       id: input.id ?? `proj_${randomUUID().replace(/-/g, "").slice(0, 16)}`,
       name: input.name,
-      path: input.path,
+      path: projectPath,
       status: "initializing",
       isolationMode: input.isolationMode ?? "in-process",
       nodeId: input.nodeId,
@@ -553,7 +555,7 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
 
     const existingById = await this.getProject(input.id);
     if (existingById) {
-      if (existingById.path === input.path) {
+      if (isSamePath(existingById.path, input.path)) {
         return existingById;
       }
       throw new Error(
@@ -572,7 +574,7 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
     const project: RegisteredProject = {
       id: input.id,
       name: input.name,
-      path: input.path,
+      path: canonicalizePath(input.path),
       status: "initializing",
       isolationMode: input.isolationMode ?? "in-process",
       nodeId: input.nodeId,
@@ -616,7 +618,7 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
 
     if (input.identity?.id) {
       const byId = await this.getProject(input.identity.id);
-      if (byId && byId.path !== input.path) {
+      if (byId && !isSamePath(byId.path, input.path)) {
         throw new ProjectIdentityConflictError(input.identity.id, byId.path, input.path);
       }
       if (byId) {
@@ -715,7 +717,20 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
   async getProjectByPath(path: string): Promise<RegisteredProject | undefined> {
     this.ensureInitialized();
 
-        return asyncCentralCore.getProjectByPath(this.backendHandle, path);
+    /*
+    FNXC:PathIdentity 2026-10-07-18:30:
+    Project identity is the physical directory, not the spelling. A CLI cwd keeps whatever case the shell typed, git prints on-disk case, and rows registered before canonicalization keep their original spelling.
+    Registration stores `canonicalizePath` (on-disk case, junctions resolved); lookup tries the exact and canonical spellings, then falls back to an identity-key scan so legacy rows still match.
+    */
+    const exact = await asyncCentralCore.getProjectByPath(this.backendHandle, path);
+    if (exact) return exact;
+    const canonical = canonicalizePath(path);
+    if (canonical !== path) {
+      const byCanonical = await asyncCentralCore.getProjectByPath(this.backendHandle, canonical);
+      if (byCanonical) return byCanonical;
+    }
+    const identity = pathIdentityKey(path);
+    return (await this.listProjects()).find((project) => pathIdentityKey(project.path) === identity);
 }
 
   /**
@@ -2545,19 +2560,14 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
   async autoRegisterProject(projectPath: string): Promise<RegisteredProject> {
     this.ensureInitialized();
 
-    const normalizedProjectPath = resolve(projectPath);
+    // FNXC:PathIdentity 2026-10-07-18:30: Overlap is containment by path identity in either direction; a slash-only prefix test missed every Windows path.
     const existingProjects = await this.listProjects();
-    const overlappingProject = existingProjects.find((project) => {
-      const existingPath = resolve(project.path);
-      return (
-        existingPath === normalizedProjectPath ||
-        existingPath.startsWith(`${normalizedProjectPath}/`) ||
-        normalizedProjectPath.startsWith(`${existingPath}/`)
-      );
-    });
+    const overlappingProject = existingProjects.find((project) =>
+      isPathInside(project.path, projectPath, { allowEqual: true }) || isPathInside(projectPath, project.path),
+    );
 
     if (overlappingProject) {
-      if (resolve(overlappingProject.path) === normalizedProjectPath) {
+      if (isSamePath(overlappingProject.path, projectPath)) {
         return overlappingProject;
       }
       throw new Error(`Project path overlaps an existing registered project: ${overlappingProject.path}`);

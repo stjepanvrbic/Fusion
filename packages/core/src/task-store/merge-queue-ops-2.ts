@@ -12,7 +12,9 @@ import {TaskStore, storeLog} from "../store.js";
 import type {Task, Column, MergeResult, MergeQueueReleaseOutcome, MergeRequestState} from "../types.js";
 import "../builtin-traits.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
-import {releaseMergeQueueLease as releaseMergeQueueLeaseAsync} from "../task-store/async/async-merge-coordination.js";
+import {releaseMergeQueueLease as releaseMergeQueueLeaseAsync, renewMergeQueueLease as renewMergeQueueLeaseAsync} from "../task-store/async/async-merge-coordination.js";
+import type {MergeQueueEntry} from "../types.js";
+import type {MergeQueueRenewOptions} from "../types/merge/merge-queue.js";
 import {resolveTaskLifecycleColumns} from "../workflows/workflow-lifecycle-traits.js";
 
 export function isValidMergeRequestTransitionImpl(store: TaskStore, from: MergeRequestState, to: MergeRequestState): boolean {
@@ -41,6 +43,14 @@ count drops here, so do not read this file's 0 as a converted seam.
 export async function releaseMergeQueueLeaseImpl(store: TaskStore, taskId: string, workerId: string, outcome: MergeQueueReleaseOutcome): Promise<void> {
         const layer = store.asyncLayer!;
     return releaseMergeQueueLeaseAsync(layer, taskId, workerId, outcome);
+}
+
+/**
+ * FNXC:TaskStoreMergeCoordination 2026-10-07-19:05:
+ * Store-level renewal for the merger's lease heartbeat, fenced by the acquired entry's `leasedAt`. Throws `MergeQueueLeaseOwnershipError` once the lease was recovered or re-leased.
+ */
+export async function renewMergeQueueLease(store: TaskStore, taskId: string, workerId: string, opts: MergeQueueRenewOptions): Promise<MergeQueueEntry> {
+  return renewMergeQueueLeaseAsync(store.asyncLayer!, taskId, workerId, opts);
 }
 
 export async function collectMergeDetailsImpl(store: TaskStore, _id: string, _branch: string, task: Task, commitMessage: string, mergeTarget?: { branch: string; source: "task-base-branch" | "task-branch-context" | "branch-group-integration" | "project-default" | "legacy-main"; },): Promise<import("../types.js").MergeDetails> {

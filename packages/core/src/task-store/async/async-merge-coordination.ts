@@ -48,6 +48,7 @@ import type {
   MergeQueueReleaseOutcome,
   TaskPriority,
 } from "../../types.js";
+import type { MergeQueueRenewOptions } from "../../types/merge/merge-queue.js";
 import type { MergeQueueRow } from "../row-types.js";
 
 /**
@@ -683,24 +684,24 @@ export async function releaseMergeQueueLease(
 ): Promise<void> {
   await layer.transactionImmediate(async (tx) => {
     const currentRows = await tx
-      .select({ leasedBy: schema.project.mergeQueue.leasedBy })
+      .select({ leasedBy: schema.project.mergeQueue.leasedBy, leasedAt: schema.project.mergeQueue.leasedAt })
       .from(schema.project.mergeQueue)
       .where(eq(schema.project.mergeQueue.taskId, taskId))
       .limit(1);
     const current = currentRows[0];
-    if (!current || current.leasedBy !== workerId) {
+    if (!current || current.leasedBy !== workerId || (outcome.leaseToken !== undefined && current.leasedAt !== outcome.leaseToken)) {
       throw new MergeQueueLeaseOwnershipError(taskId, workerId, current?.leasedBy ?? null);
     }
+    const heldLease = and(
+      eq(schema.project.mergeQueue.taskId, taskId),
+      eq(schema.project.mergeQueue.leasedBy, workerId),
+      ...(outcome.leaseToken !== undefined ? [eq(schema.project.mergeQueue.leasedAt, outcome.leaseToken)] : []),
+    );
 
     if (outcome.kind === "success") {
       await tx
         .delete(schema.project.mergeQueue)
-        .where(
-          and(
-            eq(schema.project.mergeQueue.taskId, taskId),
-            eq(schema.project.mergeQueue.leasedBy, workerId),
-          ),
-        );
+        .where(heldLease);
       await recordRunAuditEventWithinTransaction(tx, {
         taskId,
         agentId: audit?.agentId ?? "system",
@@ -723,12 +724,7 @@ export async function releaseMergeQueueLease(
         attemptCount: sql`${schema.project.mergeQueue.attemptCount} + 1`,
         lastError: outcome.error,
       })
-      .where(
-        and(
-          eq(schema.project.mergeQueue.taskId, taskId),
-          eq(schema.project.mergeQueue.leasedBy, workerId),
-        ),
-      )
+      .where(heldLease)
       .returning();
     const releasedRow = released[0] as MergeQueueRow | undefined;
     if (!releasedRow) {
@@ -743,14 +739,65 @@ export async function releaseMergeQueueLease(
       domain: "database",
       mutationType: "mergeQueue:lease-released",
       target: taskId,
+      // FNXC:RunAudit 2026-10-07-19:05: ids/counts/outcomes only. The failure prose stays on the queue row's `last_error`.
       metadata: {
         taskId,
         workerId,
         outcome: "failure",
         attemptCount: entry.attemptCount,
-        error: outcome.error,
       },
     });
+  });
+}
+
+/**
+ * FNXC:TaskStoreMergeCoordination 2026-10-07-19:05:
+ * Renew a held merge-queue lease so a merge that outlives its initial lease (AI merge plus verification on Windows) is not recovered as expired and handed to a second merger.
+ * Only the exact lease generation may renew: the row must still be leased by `workerId` with `leasedAt === leaseToken`. A lease that expired but was not yet recovered or re-leased is still that generation and may renew.
+ * `leasedAt` is a sound generation token because a takeover requires `leaseExpiresAt <= now`, and `leaseExpiresAt = leasedAt + duration` with a positive duration, so a successor's `leasedAt` is strictly later.
+ */
+export async function renewMergeQueueLease(
+  layer: AsyncDataLayer,
+  taskId: string,
+  workerId: string,
+  opts: MergeQueueRenewOptions,
+  audit?: { agentId?: string; runId?: string },
+): Promise<MergeQueueEntry> {
+  if (opts.leaseDurationMs <= 0) {
+    throw new InvalidMergeQueueLeaseDurationError(opts.leaseDurationMs);
+  }
+  return layer.transactionImmediate(async (tx) => {
+    const now = opts.now ?? new Date().toISOString();
+    const leaseExpiresAt = new Date(Date.parse(now) + opts.leaseDurationMs).toISOString();
+    const renewed = await tx
+      .update(schema.project.mergeQueue)
+      .set({ leaseExpiresAt })
+      .where(and(
+        eq(schema.project.mergeQueue.taskId, taskId),
+        eq(schema.project.mergeQueue.leasedBy, workerId),
+        eq(schema.project.mergeQueue.leasedAt, opts.leaseToken),
+      ))
+      .returning();
+    const renewedRow = renewed[0] as MergeQueueRow | undefined;
+    if (!renewedRow) {
+      const current = (await tx
+        .select({ leasedBy: schema.project.mergeQueue.leasedBy })
+        .from(schema.project.mergeQueue)
+        .where(eq(schema.project.mergeQueue.taskId, taskId))
+        .limit(1))[0];
+      throw new MergeQueueLeaseOwnershipError(taskId, workerId, current?.leasedBy ?? null);
+    }
+    const entry = rowToMergeQueueEntry(renewedRow);
+    await recordRunAuditEventWithinTransaction(tx, {
+      taskId,
+      agentId: audit?.agentId ?? "system",
+      runId: audit?.runId ?? "unknown",
+      domain: "database",
+      mutationType: "mergeQueue:lease-renewed",
+      target: taskId,
+      metadata: { taskId, workerId, leaseExpiresAt: entry.leaseExpiresAt },
+    });
+    return entry;
   });
 }
 

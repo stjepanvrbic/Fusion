@@ -12,7 +12,8 @@ import { resolveWorkflowIrForTask } from "../workflows/workflow-ir-resolver.js";
 import { toTaskMoveLanes } from "../workflows/workflow-lifecycle-traits.js";
 import {getFeatureByTaskId as getMissionFeatureByTaskId, unlinkFeatureFromTaskId as unlinkMissionFeatureFromTaskId, recordGeneratedFixOperatorStop} from "../async-stores/async-mission-store-queries.js";
 import {TaskHasDependentsError, TaskHasLineageChildrenError, TaskNotFoundError, TaskSelfDeleteError} from "./errors.js";
-import {mkdir} from "node:fs/promises";
+import {access, mkdir, rm} from "node:fs/promises";
+import {getErrorMessage} from "../process/error-message.js";
 import {join} from "node:path";
 import {and, eq, inArray, sql} from "drizzle-orm";
 import * as schema from "../postgres/schema/index.js";
@@ -33,7 +34,7 @@ import {appendTaskLifecycleEventInTransaction} from "../task-store/lifecycle-out
 import {findLiveDependencyDependents, findLiveLineageChildren as findLiveLineageChildrenAsync, projectPartition, removeLineageReferences, type LineageRemovalOutcome} from "../task-store/async/async-lifecycle.js";
 import { classifyLineageInvalidationOutcomeError, lineageEvidenceTargetVersionForTest, recordLineageInvalidationOutcome, reconcileClearedLineageChildren, resolveAndAssertLineageCandidatesUnchanged, runLineageInvalidation } from "../task-store/lineage-approval-invalidation.js";
 import { resolveProjectColumnsForRoles } from "../project-lane-vocabulary.js";
-import {archiveParentTaskWithLineageGate, findArchivedTaskEntry, deleteArchivedTaskEntry, restoreTaskFromArchive} from "../task-store/async/async-archive-lineage.js";
+import {archiveParentTaskWithLineageGate, findArchivedTaskEntry, restoreTaskFromArchive} from "../task-store/async/async-archive-lineage.js";
 import { capturePatchnodeCompletionInTransaction } from "../task-store/async/async-patchnode.js";
 import {getArchivedRowCount, listArchivedTaskEntriesPage} from "../async-stores/async-archive-db.js";
 import {disposeArchivedWorkspaceWorktrees, disposeArchivedWorktree, prepareArchivedWorkspaceWorktrees, releasePreparedWorkspaceArchiveDisposal} from "./archive-lifecycle.js";
@@ -603,10 +604,7 @@ export async function archiveTaskBackendImpl(store: TaskStore, id: string, optio
       if (workspace.refusedLive || singular.refusedLive) {
         storeLog.warn("archive-cleanup-suppressed-live-task", {taskId: id, refusedBy: workspace.refusedLive ? "workspace" : "singular"});
       } else {
-        await store.cleanupBranchForTask(task);
-        const { rm } = await import("node:fs/promises");
-        await rm(dir, { recursive: true, force: true });
-        if (store.isWatching) store.taskCache.delete(id);
+        await runPostCommitArchiveCleanup(store, task, dir);
       }
     }
 
@@ -697,22 +695,33 @@ export async function unarchiveTaskImpl(store: TaskStore, id: string): Promise<T
     */
     const liveRow = await readTaskRowAsync(layer, id, { includeDeleted: true });
     const entry = await findArchivedTaskEntry(layer.db, id, layer.projectId);
-    let task: Task;
     if (entry) {
       /*
       FNXC:ArchiveRestore 2026-07-14-21:48:
       A cold snapshot may outlive a missing project.tasks row after cleanup or partial legacy archival. Rebuild that row through the canonical snapshot restoration path before restoreTaskFromArchive consumes the snapshot; an existing live or tombstoned row keeps the established in-place restore path.
+
+      FNXC:ArchiveRestore 2026-10-07-18:40:
+      Default archive cleanup deletes the task directory but keeps the tombstoned row, so the in-place path must also publish PROMPT.md from the snapshot before consuming it. A publication failure throws here, leaving the snapshot and tombstone for a retry.
+      The lane is resolved from the snapshot before any write, and the restore, lane move and snapshot delete then commit as one transaction.
       */
       if (!liveRow) {
         await store.restoreFromArchive(entry);
+      } else {
+        await publishArchivedTaskFiles(store, entry, "if-missing");
       }
-      await restoreTaskFromArchive(layer, entry);
-      task = await store.getTask(id);
-    } else if (liveRow && liveRow.deletedAt == null) {
-      task = await store.getTask(id);
-    } else {
+      const toColumn = await store.resolveUnarchiveTargetColumn(entry.preArchiveColumn ?? "todo", id);
+      await restoreTaskFromArchive(layer, entry, {
+        toColumn,
+        beforeCommitForTest: (store as unknown as { __beforeUnarchiveCommitForTest?: () => Promise<void> }).__beforeUnarchiveCommitForTest,
+      });
+      const restoredTask = await store.getTask(id);
+      await store.logEntry(id, "Task unarchived");
+      return restoredTask;
+    }
+    if (!liveRow || liveRow.deletedAt != null) {
       throw new Error(`Cannot unarchive ${id}: task is missing from active storage and not found in archive`);
     }
+    const task = await store.getTask(id);
 
     /*
     FNXC:WorkflowResolvedColumns 2026-07-30-18:50 DELIBERATE-LITERAL: the value is literally "archived" by construction.
@@ -749,7 +758,7 @@ export async function unarchiveTaskImpl(store: TaskStore, id: string): Promise<T
     survives. Preferred over the row, which falls back to it, which falls back to the literal for a
     row so old it was archived before the column was captured at all.
     */
-    const preArchiveColumn = entry?.preArchiveColumn ?? task.preArchiveColumn ?? "todo";
+    const preArchiveColumn = task.preArchiveColumn ?? "todo";
     const toColumn = await store.resolveUnarchiveTargetColumn(preArchiveColumn, id);
 
     /*
@@ -779,9 +788,6 @@ export async function unarchiveTaskImpl(store: TaskStore, id: string): Promise<T
 
     // Log the unarchive action.
     await store.logEntry(id, "Task unarchived");
-
-    // Remove from archive table.
-    await deleteArchivedTaskEntry(layer.db, id, layer.projectId);
 
     return updatedTask;
 }
@@ -847,20 +853,48 @@ export async function restoreFromArchiveImpl(store: TaskStore, entry: import("..
 
     // Write task.json
     await store.atomicWriteTaskJson(dir, restoredTask);
+    await publishArchivedTaskFiles(store, entry, "always");
 
-    // Generate PROMPT.md with preserved steps
+    return restoredTask;
+  }
+
+/**
+ * FNXC:ArchiveCleanup 2026-10-07-18:55:
+ * Branch and task-directory cleanup run after the archive committed, so a failure here must never surface the committed archive as failed.
+ * The directory removal retries Windows-transient EBUSY/EPERM/ENOTEMPTY (a held agent log, editor or AV scan); residue is then logged and left, because the orphan task-dir reconcile preserves archived IDs.
+ */
+async function runPostCommitArchiveCleanup(store: TaskStore, task: Task, dir: string): Promise<void> {
+  try {
+    await store.cleanupBranchForTask(task);
+  } catch (error) {
+    storeLog.warn("archive-branch-cleanup-failed", {taskId: task.id, error: getErrorMessage(error)});
+  }
+  try {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (error) {
+    storeLog.warn("archive-task-dir-cleanup-failed", {taskId: task.id, taskDir: dir, error: getErrorMessage(error)});
+  }
+  if (store.isWatching) store.taskCache.delete(task.id);
+}
+
+/**
+ * Publish the task-directory files an archive snapshot carries: PROMPT.md (byte-for-byte, File Scope sanitized) and the attachments directory.
+ * `if-missing` keeps a PROMPT.md that survived a cleanup-free archive, because the live file is the authority.
+ */
+async function publishArchivedTaskFiles(store: TaskStore, entry: ArchivedTaskEntry, mode: "always" | "if-missing"): Promise<void> {
+  const dir = store.taskDir(entry.id);
+  const promptPath = join(dir, "PROMPT.md");
+  const promptExists = mode === "if-missing" && await access(promptPath).then(() => true, () => false);
+  if (!promptExists) {
     const prompt = entry.prompt ?? store.generatePromptFromArchiveEntry(entry);
     const sanitizedPrompt = sanitizeFileScopeInPromptContent(prompt);
     if (sanitizedPrompt.dropped.length > 0) {
       storeLog.log(`[file-scope-sanitize] restore ${entry.id}: dropped=[${sanitizedPrompt.dropped.join(",")}]`);
     }
     await mkdir(dir, { recursive: true });
-    await writePromptFileAtomic(join(dir, "PROMPT.md"), sanitizedPrompt.sanitized);
-
-    // Create empty attachments directory if attachments existed
-    if (entry.attachments && entry.attachments.length > 0) {
-      await mkdir(join(dir, "attachments"), { recursive: true });
-    }
-
-    return restoredTask;
+    await writePromptFileAtomic(promptPath, sanitizedPrompt.sanitized);
   }
+  if (entry.attachments && entry.attachments.length > 0) {
+    await mkdir(join(dir, "attachments"), { recursive: true });
+  }
+}

@@ -1104,11 +1104,10 @@ async function sourceRowsArePrimaryKeyConflictCovered(
   const selectableCols = [...new Set(
     primaryKeyColumns.flatMap((column) => {
       if (!column || column.pgName === "project_id" && plan.partitionProjectId !== undefined) return [];
-      return [quoteIdent(columnByPgName.get(column.pgName)!.sqliteName)];
+      return [columnByPgName.get(column.pgName)!.sqliteName];
     }),
-  )].join(", ") || "1";
-  const rows = sqlite.prepare(`SELECT ${selectableCols} FROM ${quoteIdent(plan.table)}`)
-    .all() as Array<Record<string, unknown>>;
+  )];
+  const rows = selectSqliteRowsLossless(sqlite, plan.table, { columns: selectableCols });
   for (const row of rows) {
     const predicates = primaryKeyColumns.map((column) => {
       const resolved = column!;
@@ -1238,7 +1237,7 @@ async function migrateLegacyProjectPluginRowsOnSession(
   const sqlite = openSqlite(sqlitePath);
   let rows: LegacyProjectPluginMigrationRow[];
   try {
-    rows = sqlite.prepare(`SELECT * FROM plugins ORDER BY id`).all() as LegacyProjectPluginMigrationRow[];
+    rows = selectSqliteRowsLossless(sqlite, "plugins", { suffix: "ORDER BY id" }) as unknown as LegacyProjectPluginMigrationRow[];
   } finally {
     sqlite.close();
   }
@@ -1770,9 +1769,10 @@ async function migrateLegacyPreservationTable(
     ).all() as Array<{ name: string }>).map(({ name }) => quoteIdent(name)).join(", ");
     const reportCopyProgress = createQuarterProgressReporter(sourceRows, progress.onCopyProgress);
     for (let offset = 0; offset < sourceRows; offset += INSERT_BATCH_SIZE) {
-      const rawBatch = sqlite.prepare(
-        `SELECT * FROM ${quoteIdent(plan.table)} ORDER BY ${sourceColumnOrder} LIMIT ? OFFSET ?`,
-      ).all(INSERT_BATCH_SIZE, offset) as Array<Record<string, unknown>>;
+      const rawBatch = selectSqliteRowsLossless(sqlite, plan.table, {
+        suffix: `ORDER BY ${sourceColumnOrder} LIMIT ? OFFSET ?`,
+        params: [INSERT_BATCH_SIZE, offset],
+      });
       const batch = canonicalizeLegacyRows(rawBatch, occurrences);
       const values = batch.map((row) => sql`(
         ${projectId},
@@ -1925,9 +1925,7 @@ async function migrateTable(
   let insertedRows = 0;
   try {
     // Only select columns that have a PostgreSQL counterpart and are insertable.
-    const selectableCols = insertableCols
-      .map((c) => quoteIdent(c.sqliteName))
-      .join(", ");
+    const selectableCols = insertableCols.map((c) => c.sqliteName);
 
     // Count source rows.
     const countRow = sqlite.prepare(`SELECT COUNT(*) AS n FROM ${quoteIdent(plan.table)}`).get() as { n: number };
@@ -1953,7 +1951,7 @@ async function migrateTable(
     }
 
     // Stream rows in batches.
-    const stmt = sqlite.prepare(`SELECT ${selectableCols} FROM ${quoteIdent(plan.table)}`);
+    const sourceRowsLossless = selectSqliteRowsLossless(sqlite, plan.table, { columns: selectableCols });
     const batch: Record<string, unknown>[] = [];
     let processedRows = 0;
     const reportCopyProgress = createQuarterProgressReporter(sourceRows, progress.onCopyProgress);
@@ -1967,7 +1965,7 @@ async function migrateTable(
       reportCopyProgress(processedRows);
     };
 
-    for (const row of stmt.all() as Array<Record<string, unknown>>) {
+    for (const row of sourceRowsLossless) {
       const converted: Record<string, unknown> = {};
       for (const col of insertableCols) {
         converted[col.pgName] = convertValue(
@@ -2030,7 +2028,7 @@ async function migrateTable(
       contentOk = isSharedSingletonTable(plan.pgSchema, plan.pgTable)
         ? await verifySharedSingletonTable(
             db, plan.pgSchema, plan.pgTable,
-            sqlite.prepare(`SELECT * FROM ${quoteIdent(plan.table)}`).all() as Record<string, unknown>[],
+            selectSqliteRowsLossless(sqlite, plan.table),
             plan.partitionProjectId,
           )
         : verifiesSharedProjectTable
@@ -2316,6 +2314,47 @@ function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
 
+/*
+FNXC:PostgresMigration 2026-10-07-19:15:
+node:sqlite returns a TEXT value cut at its first U+0000, so the NUL sanitizer never saw the tail and a legacy row silently lost everything after the NUL; verification passed because source and target checksums read through the same truncating reader.
+Every source-row read goes through this reader: TEXT is selected as `CAST(col AS BLOB)` and decoded in JS in the database's text encoding, BLOB stays bytes, and other types pass through unchanged.
+*/
+const sqliteTextDecoders = new WeakMap<DatabaseSync, TextDecoder>();
+function sqliteTextDecoder(sqlite: DatabaseSync): TextDecoder {
+  const cached = sqliteTextDecoders.get(sqlite);
+  if (cached) return cached;
+  const encoding = String((sqlite.prepare("PRAGMA encoding").get() as { encoding?: unknown } | undefined)?.encoding ?? "UTF-8").toLowerCase();
+  const decoder = new TextDecoder(encoding === "utf-16le" ? "utf-16le" : encoding === "utf-16be" ? "utf-16be" : "utf-8");
+  sqliteTextDecoders.set(sqlite, decoder);
+  return decoder;
+}
+
+function selectSqliteRowsLossless(
+  sqlite: DatabaseSync,
+  table: string,
+  options: { columns?: readonly string[]; suffix?: string; params?: unknown[] } = {},
+): Array<Record<string, unknown>> {
+  const columns = options.columns
+    ?? (sqlite.prepare(`PRAGMA table_info(${quoteIdent(table)})`).all() as Array<{ name: string }>).map(({ name }) => name);
+  const selectList = columns.length === 0
+    ? "1 AS fusion_no_columns"
+    : columns.map((column, index) => {
+      const source = quoteIdent(column);
+      return `CASE WHEN typeof(${source}) = 'text' THEN CAST(${source} AS BLOB) ELSE ${source} END AS fusion_c${index}, typeof(${source}) AS fusion_t${index}`;
+    }).join(", ");
+  const query = `SELECT ${selectList} FROM ${quoteIdent(table)}${options.suffix ? ` ${options.suffix}` : ""}`;
+  const raw = sqlite.prepare(query).all(...(options.params ?? [])) as Array<Record<string, unknown>>;
+  const decoder = sqliteTextDecoder(sqlite);
+  return raw.map((row) => {
+    const decoded: Record<string, unknown> = {};
+    columns.forEach((column, index) => {
+      const value = row[`fusion_c${index}`];
+      decoded[column] = row[`fusion_t${index}`] === "text" && value instanceof Uint8Array ? decoder.decode(value) : value;
+    });
+    return decoded;
+  });
+}
+
 // ── Content verification (P1 #15) ───────────────────────────────────
 
 /**
@@ -2417,10 +2456,7 @@ function computeSourceCanonicalRows(
   partitionProjectId?: string,
 ): string[] {
   if (cols.length === 0) return [];
-  const selectCols = cols.map((c) => quoteIdent(c.sqliteName)).join(", ");
-  const rows = sqlite
-    .prepare(`SELECT ${selectCols} FROM ${quoteIdent(table)}`)
-    .all() as Array<Record<string, unknown>>;
+  const rows = selectSqliteRowsLossless(sqlite, table, { columns: cols.map((c) => c.sqliteName) });
 
   return rows.map((row) => {
     let canonical = "";

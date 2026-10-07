@@ -16,6 +16,7 @@ export type RunAuditMutationType =
   | "mergeQueue:enqueue"
   | "mergeQueue:lease-acquired"
   | "mergeQueue:lease-released"
+  | "mergeQueue:lease-renewed"
   | "mergeQueue:lease-expired"
   | "task:handoff"
   | "task:handoff-invariant-violation"

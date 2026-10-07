@@ -26,6 +26,8 @@ import {
 import type { AsyncDataLayer } from "../../postgres/data-layer.js";
 import { insertTaskRow } from "../../task-store/async/async-persistence.js";
 import { writeProjectConfig } from "../../task-store/async/async-settings.js";
+import { renewMergeQueueLease } from "../../task-store/merge-queue-ops-2.js";
+import { MergeQueueLeaseOwnershipError } from "../../task-store/async/async-merge-coordination.js";
 
 const pgDescribe = PG_AVAILABLE ? describe : describe.skip;
 
@@ -186,6 +188,68 @@ pgDescribe("runtime-lifecycle-async: merge-queue delegation (PostgreSQL)", () =>
     expect(recovered[0].leasedBy).toBeNull();
     // VAL-DATA-014: attemptCount NOT incremented on expiry recovery.
     expect(recovered[0].attemptCount).toBe(0);
+  });
+});
+
+/*
+FNXC:TaskStoreMergeCoordination 2026-10-07-19:05:
+At most one live merger per task. The merger leases with one constant worker id, so `leasedBy` cannot tell a recovered pass from its successor; the lease generation (`leasedAt` of the acquired entry) is the fencing token for renew and release.
+*/
+pgDescribe("runtime-lifecycle-async: merge-queue lease fencing (PostgreSQL)", () => {
+  let h: PgTestHarness | null = null;
+  afterEach(async () => {
+    if (h) {
+      await h.teardown();
+      h = null;
+    }
+  });
+
+  async function queuedTask(): Promise<PgTestHarness> {
+    const harness = await createTaskStoreForTest({ prefix: "rt_lease_fence" });
+    await writeProjectConfig(harness.layer, { taskPrefix: "TEST", nextId: 1, nextWorkflowStepId: 1, settings: {} });
+    await seedTask(harness.layer, "FN-1", "in-review", "normal");
+    await harness.store.enqueueMergeQueue("FN-1", { now: "2026-06-24T01:00:00Z" });
+    return harness;
+  }
+
+  it("rejects renew and release from a recovered lease generation even under the same worker id", async () => {
+    h = await queuedTask();
+    const first = await h.store.acquireMergeQueueLease("merger", { leaseDurationMs: 1, now: "2026-06-24T02:00:00.000Z" });
+    expect(first?.leasedAt).toBe("2026-06-24T02:00:00.000Z");
+    await h.store.recoverExpiredMergeQueueLeases("2026-06-24T02:00:01.000Z");
+    const second = await h.store.acquireMergeQueueLease("merger", { leaseDurationMs: 60_000, now: "2026-06-24T02:00:02.000Z" });
+    expect(second?.leasedAt).toBe("2026-06-24T02:00:02.000Z");
+
+    await expect(renewMergeQueueLease(h.store, "FN-1", "merger", { leaseToken: first!.leasedAt!, leaseDurationMs: 60_000, now: "2026-06-24T02:00:03.000Z" }))
+      .rejects.toBeInstanceOf(MergeQueueLeaseOwnershipError);
+    await expect(h.store.releaseMergeQueueLease("FN-1", "merger", { kind: "success", leaseToken: first!.leasedAt! }))
+      .rejects.toBeInstanceOf(MergeQueueLeaseOwnershipError);
+    await expect(h.store.releaseMergeQueueLease("FN-1", "merger", { kind: "failure", error: "stale", leaseToken: first!.leasedAt! }))
+      .rejects.toBeInstanceOf(MergeQueueLeaseOwnershipError);
+    expect((await h.store.peekMergeQueue())[0]).toMatchObject({ leasedBy: "merger", leasedAt: second!.leasedAt, attemptCount: 0 });
+
+    await h.store.releaseMergeQueueLease("FN-1", "merger", { kind: "success", leaseToken: second!.leasedAt! });
+    expect(await h.store.peekMergeQueue()).toHaveLength(0);
+  });
+
+  it("renewal keeps the holder's lease alive past its original expiry", async () => {
+    h = await queuedTask();
+    const lease = await h.store.acquireMergeQueueLease("merger", { leaseDurationMs: 1_000, now: "2026-06-24T02:00:00.000Z" });
+    const renewed = await renewMergeQueueLease(h.store, "FN-1", "merger", { leaseToken: lease!.leasedAt!, leaseDurationMs: 60_000, now: "2026-06-24T02:00:00.500Z" });
+    expect(renewed).toMatchObject({ leasedBy: "merger", leasedAt: lease!.leasedAt, leaseExpiresAt: "2026-06-24T02:01:00.500Z" });
+
+    expect(await h.store.recoverExpiredMergeQueueLeases("2026-06-24T02:00:05.000Z")).toHaveLength(0);
+    expect(await h.store.acquireMergeQueueLease("other", { leaseDurationMs: 60_000, now: "2026-06-24T02:00:05.000Z" })).toBeNull();
+    await h.store.releaseMergeQueueLease("FN-1", "merger", { kind: "failure", error: "boom", leaseToken: lease!.leasedAt! });
+    expect((await h.store.peekMergeQueue())[0]).toMatchObject({ leasedBy: null, attemptCount: 1 });
+  });
+
+  it("records lease-released audits with ids and outcomes only", async () => {
+    h = await queuedTask();
+    const lease = await h.store.acquireMergeQueueLease("merger", { leaseDurationMs: 60_000, now: "2026-06-24T02:00:00.000Z" });
+    await h.store.releaseMergeQueueLease("FN-1", "merger", { kind: "failure", error: "conflict in C:\secret\path", leaseToken: lease!.leasedAt! });
+    const released = (await h.store.getRunAuditEventsAsync({ taskId: "FN-1", mutationType: "mergeQueue:lease-released" as never }))[0];
+    expect(released?.metadata).toEqual({ taskId: "FN-1", workerId: "merger", outcome: "failure", attemptCount: 1 });
   });
 });
 
