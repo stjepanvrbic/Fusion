@@ -1594,6 +1594,8 @@ export {
   releaseEmbeddedRuntimeLease,
   invalidateEmbeddedRuntimeUrl,
   getActiveEmbeddedRuntimeUrl,
+  claimEmbeddedPostgresSignalShutdown,
+  isEmbeddedPostgresSignalShutdownClaimed,
   clearActiveEmbeddedRuntimeUrl,
 } from "./postgres/active-backend-registry.js";
 export type { EmbeddedRuntimeLease } from "./postgres/active-backend-registry.js";

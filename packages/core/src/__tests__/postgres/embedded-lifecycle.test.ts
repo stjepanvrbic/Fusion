@@ -72,7 +72,9 @@ import {
   type EmbeddedLifecycleOptions,
 } from "../../postgres/embedded-lifecycle.js";
 import {
+  claimEmbeddedPostgresSignalShutdown,
   clearActiveEmbeddedRuntimeUrl,
+  isEmbeddedPostgresSignalShutdownClaimed,
   getActiveEmbeddedRuntimeUrl,
   registerEmbeddedRuntimeUrl,
   releaseEmbeddedRuntimeLease,
@@ -2163,6 +2165,61 @@ describe("embedded-lifecycle: platform-aware max_connections default (issue #241
   it("treats non-integer configured values as unset", () => {
     expect(resolveEmbeddedMaxConnections(Number.NaN, "win32")).toBe(DEFAULT_EMBEDDED_MAX_CONNECTIONS_WIN32);
     expect(resolveEmbeddedMaxConnections(250.5, "linux")).toBe(DEFAULT_EMBEDDED_MAX_CONNECTIONS);
+  });
+});
+
+describe("embedded-lifecycle: claimed signal shutdown defers to the owning CLI", () => {
+  function ownedRunningLifecycle() {
+    const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions("/tmp/unused-claimed"), port: 55433 });
+    const pgStop = vi.fn(async () => {});
+    const internal = lifecycle as unknown as {
+      running: boolean;
+      ownsProcess: boolean;
+      pg: { stop: () => Promise<void> };
+      boundShutdown: (signal: NodeJS.Signals | "beforeExit") => Promise<void>;
+    };
+    internal.running = true;
+    internal.ownsProcess = true;
+    internal.pg = { stop: pgStop };
+    return { lifecycle, internal, pgStop };
+  }
+
+  it.each(["SIGINT", "SIGTERM"] as const)("%s neither stops PostgreSQL nor re-raises while a claim is held", async (signal) => {
+    const { internal, pgStop, lifecycle } = ownedRunningLifecycle();
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const release = claimEmbeddedPostgresSignalShutdown();
+    try {
+      await internal.boundShutdown(signal);
+      expect(pgStop).not.toHaveBeenCalled();
+      expect(lifecycle.isRunning()).toBe(true);
+      expect(kill).not.toHaveBeenCalled();
+      expect(exit).not.toHaveBeenCalled();
+    } finally {
+      release();
+      kill.mockRestore();
+      exit.mockRestore();
+    }
+  });
+
+  it("releasing the claim restores the self-owned signal stop, and beforeExit always stops", async () => {
+    const claimed = ownedRunningLifecycle();
+    const release = claimEmbeddedPostgresSignalShutdown();
+    await claimed.internal.boundShutdown("beforeExit");
+    expect(claimed.pgStop).toHaveBeenCalledOnce();
+    release();
+    release();
+    expect(isEmbeddedPostgresSignalShutdownClaimed()).toBe(false);
+
+    const unclaimed = ownedRunningLifecycle();
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      await unclaimed.internal.boundShutdown("SIGTERM");
+      expect(unclaimed.pgStop).toHaveBeenCalledOnce();
+      expect(kill).toHaveBeenCalledWith(process.pid, "SIGTERM");
+    } finally {
+      kill.mockRestore();
+    }
   });
 });
 

@@ -204,3 +204,28 @@ export function clearActiveEmbeddedRuntimeUrl(): void {
   registrationSequence = 0;
   registryEpoch += 1;
 }
+
+let signalShutdownClaims = 0;
+
+/**
+ * Claim SIGINT/SIGTERM shutdown of embedded PostgreSQL for a caller that owns process teardown.
+ *
+ * FNXC:PostgresShutdownOrder 2026-10-07-19:49:
+ * The embedded lifecycle's own signal hook stopped PostgreSQL while engines were still tearing down, then re-raised the signal, which the CLI treated as a second signal and exited mid-teardown (on Windows the re-raise terminates outright).
+ * A CLI command whose shutdown handler stops engines before releasing its backend claims signal shutdown; while any claim is held the lifecycle signal hook neither stops PostgreSQL nor re-raises, so the database stops only after every engine has stopped.
+ * The beforeExit backstop is unaffected. Returns an idempotent release.
+ */
+export function claimEmbeddedPostgresSignalShutdown(): () => void {
+  signalShutdownClaims += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    signalShutdownClaims -= 1;
+  };
+}
+
+/** True while a caller owns SIGINT/SIGTERM shutdown of embedded PostgreSQL. */
+export function isEmbeddedPostgresSignalShutdownClaimed(): boolean {
+  return signalShutdownClaims > 0;
+}

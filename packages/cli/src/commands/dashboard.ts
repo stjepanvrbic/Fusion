@@ -38,6 +38,7 @@ import {
   resolveWorktreeCapacityLimit,
   hydrateGrokApiKeyFromUserSettings,
   projectPiXaiModelsToGrokCli,
+  claimEmbeddedPostgresSignalShutdown,
   type WorkflowIr,
 } from "@fusion/core";
 
@@ -1331,6 +1332,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     handler: (...args: any[]) => void;
   }> = [];
   const disposeCallbacks: Array<() => Promise<void> | void> = [];
+  let releaseEmbeddedSignalShutdown: (() => void) | null = null;
   let disposed = false;
   let shutdownInProgress = false;
 
@@ -1495,6 +1497,18 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   ): void {
     target.on(event, handler);
     handlers.push({ target, event, handler });
+  }
+
+  /**
+   * FNXC:PostgresShutdownOrder 2026-10-07-19:51:
+   * The dashboard's SIGINT/SIGTERM shutdown owns process teardown: it stops engines before releasing the shared PostgreSQL backend and exits only after every step.
+   * Claim signal shutdown from the embedded-PostgreSQL lifecycle so its own hook cannot stop the database beneath running engines or re-raise the signal into a premature second-signal exit.
+   * The claim is released once dispose has released the backend.
+   */
+  function registerShutdownSignalHandlers(onSignal: (signal: NodeJS.Signals) => void): void {
+    registerHandler(process, "SIGINT", () => onSignal("SIGINT"));
+    registerHandler(process, "SIGTERM", () => onSignal("SIGTERM"));
+    releaseEmbeddedSignalShutdown ??= claimEmbeddedPostgresSignalShutdown();
   }
 
   // automationStore already initialized in parallel phase above
@@ -2192,6 +2206,8 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
         logSink.warn(`Dashboard dispose callback failed: ${error instanceof Error ? error.message : String(error)}`, "dashboard");
       }
     }
+    releaseEmbeddedSignalShutdown?.();
+    releaseEmbeddedSignalShutdown = null;
   }
 
   const dispose = (): void => {
@@ -2682,8 +2698,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       return true;
     };
     bindDevSourceRestart(centralCoreForEngine, () => engineManager.beginDrain());
-    registerHandler(process, "SIGINT", () => void shutdown("SIGINT"));
-    registerHandler(process, "SIGTERM", () => void shutdown("SIGTERM"));
+    registerShutdownSignalHandlers((signal) => void shutdown(signal));
 
     // Ignore SIGHUP so the dashboard survives SSH session disconnects.
     // Without this, SIGHUP (sent when the controlling terminal closes) kills
@@ -3033,8 +3048,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
         heartbeatMonitorImpl?.stop();
       });
     }
-    registerHandler(process, "SIGINT", () => void devShutdown("SIGINT"));
-    registerHandler(process, "SIGTERM", () => void devShutdown("SIGTERM"));
+    registerShutdownSignalHandlers((signal) => void devShutdown(signal));
 
     // Ignore SIGHUP so the dashboard survives SSH session disconnects
     registerHandler(process, "SIGHUP", () => {

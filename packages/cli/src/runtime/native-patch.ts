@@ -299,16 +299,12 @@ export function initNativePatch(): { success: boolean; nativeDir: string | null 
   const result = setupNativeResolution();
   initialized = true;
 
-  // Register cleanup on exit
+  /*
+  FNXC:PostgresShutdownOrder 2026-10-07-19:52:
+  The dashboard owns SIGINT/SIGTERM: its graceful shutdown stops engines, child processes and embedded PostgreSQL, then exits with its own code.
+  Signal handlers here exited synchronously with 0 ahead of that async teardown, orphaning children and the database. Clean up on process exit only, which every graceful path reaches.
+  */
   process.on("exit", cleanupNativeResolution);
-  process.on("SIGINT", () => {
-    cleanupNativeResolution();
-    process.exit(0);
-  });
-  process.on("SIGTERM", () => {
-    cleanupNativeResolution();
-    process.exit(0);
-  });
 
   return result;
 }

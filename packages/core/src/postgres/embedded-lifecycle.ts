@@ -68,6 +68,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { createLogger } from "../process/logger.js";
 import { redactConnectionString } from "./credential-redact.js";
 import type { ResolvedBackend } from "./backend-resolver.js";
+import { isEmbeddedPostgresSignalShutdownClaimed } from "./active-backend-registry.js";
 import {
   isWindowsElevatedAdmin,
   startServerElevatedRestricted,
@@ -2483,6 +2484,8 @@ export class EmbeddedPostgresLifecycle {
   ): Promise<void> => {
     if (!this.running && signal !== "beforeExit") return;
     if (!this.ownsProcess) return; // Don't stop an instance we didn't start
+    // FNXC:PostgresShutdownOrder 2026-10-07-19:49: a claimed signal belongs to the owning CLI shutdown, which stops engines before releasing this backend; stopping or re-raising here races that teardown.
+    if (signal !== "beforeExit" && isEmbeddedPostgresSignalShutdownClaimed()) return;
     this.options.onLog(
       `embedded postgres: received ${signal}, stopping embedded cluster`,
     );

@@ -24,6 +24,7 @@ import {
   hydrateGrokApiKeyFromUserSettings,
   projectPiXaiModelsToGrokCli,
   reconcileClaudeCliPaths,
+  claimEmbeddedPostgresSignalShutdown,
 } from "@fusion/core";
 import type { AutomationRunResult, ScheduledTask } from "@fusion/core";
 import { createServer, GitHubClient, createDashboardMissionForgeReader, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook, resolveGitLabClient } from "@fusion/dashboard";
@@ -1122,6 +1123,8 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   process.on("SIGTERM", () => {
     void shutdown("SIGTERM");
   });
+  // FNXC:PostgresShutdownOrder 2026-10-07-19:51: this daemon shutdown stops engines before releasing PostgreSQL and then exits, so the embedded lifecycle's signal hook must not stop the database or re-raise first. Held for the process lifetime.
+  claimEmbeddedPostgresSignalShutdown();
 
   // Ignore SIGHUP so the daemon survives SSH session disconnects
   process.on("SIGHUP", () => {

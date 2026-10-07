@@ -930,6 +930,14 @@ describe("runServe", () => {
   // exit-code contract as `fn daemon` — a memory-pressure SIGTERM exits non-zero
   // (143) so `Restart=on-failure` restarts it; SIGINT exits 130. Guards against
   // the two headless-server paths regressing independently.
+  // FNXC:PostgresShutdownOrder 2026-10-07-19:58: the command's own shutdown stops engines before PostgreSQL, so it must hold the embedded signal-shutdown claim.
+  it("claims embedded PostgreSQL signal shutdown when it installs its handlers", async () => {
+    const { isEmbeddedPostgresSignalShutdownClaimed } = await import("@fusion/core");
+    await runServe(0, {});
+    expect(isEmbeddedPostgresSignalShutdownClaimed()).toBe(true);
+    await triggerSignal("SIGINT");
+  });
+
   it("exits 143 on SIGTERM-initiated shutdown", async () => {
     await runServe(0, {});
     await triggerSignal("SIGTERM");
