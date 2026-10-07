@@ -110,6 +110,34 @@ pgDescribe("TaskStore.listTaskRecommendations", () => {
     ]);
   });
 
+  it("includes landed review rows only when review lanes are supplied and merge is confirmed", async () => {
+    await insertRecommendationTask(h, "FN-LANDED", {
+      column: "in-review",
+      mergeDetails: { mergeConfirmed: true, commitSha: "8ff7e7ae7" },
+      updatedAt: "2026-08-13T02:00:00.000Z",
+    });
+    await insertRecommendationTask(h, "FN-UNLANDED", {
+      column: "in-review",
+      mergeDetails: { mergeConfirmed: false },
+      updatedAt: "2026-08-13T03:00:00.000Z",
+    });
+    await insertRecommendationTask(h, "FN-REOPENED", {
+      column: "todo",
+      mergeDetails: { mergeConfirmed: true },
+      updatedAt: "2026-08-13T04:00:00.000Z",
+    });
+    await insertRecommendationTask(h, "FN-DONE", { updatedAt: "2026-08-13T01:00:00.000Z" });
+
+    const withReview = await h.store().listTaskRecommendations({
+      completeColumns: new Set(["complete"]),
+      landedReviewColumns: new Set(["in-review"]),
+    });
+    expect(withReview.items.map((item) => item.taskId)).toEqual(["FN-LANDED", "FN-DONE"]);
+
+    const completeOnly = await h.store().listTaskRecommendations({ completeColumns: new Set(["complete"]) });
+    expect(completeOnly.items.map((item) => item.taskId)).toEqual(["FN-DONE"]);
+  });
+
   it("uses the default row limit and clamps oversized row pages", async () => {
     await insertRecommendationTask(h, "FN-LIMIT");
 

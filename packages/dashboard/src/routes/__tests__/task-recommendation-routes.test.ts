@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import express from "express";
-import type { Column, Task, TaskStore } from "@fusion/core";
+import { isRecommendationSourceActionable, type Column, type Task, type TaskStore } from "@fusion/core";
 import * as taskWorkflowRoutes from "../register-task-workflow-routes.js";
 import { request as performRequest } from "../../test-request.js";
 import { ApiError, sendErrorResponse } from "../../api-error.js";
@@ -47,8 +47,8 @@ function buildApp(seed: Task[], projectId = "project-a") {
     findTaskByProposalClaimId: vi.fn(async (claimId: string, options?: { includeDeleted?: boolean }) =>
       tasks.find((item) => item.proposalClaimId === claimId && (options?.includeDeleted || !item.deletedAt)) ?? null,
     ),
-    listTaskRecommendations: vi.fn(async (options?: { completeColumns?: ReadonlySet<string>; limit?: number; offset?: number }) => {
-      const rows = tasks.filter((item) => !item.deletedAt && !!item.recommendations?.length && (options?.completeColumns ?? new Set(["done"])).has(item.column))
+    listTaskRecommendations: vi.fn(async (options?: { completeColumns?: ReadonlySet<string>; landedReviewColumns?: ReadonlySet<string>; limit?: number; offset?: number }) => {
+      const rows = tasks.filter((item) => !item.deletedAt && !!item.recommendations?.length && isRecommendationSourceActionable(item, options?.completeColumns ?? new Set(["done"]), options?.landedReviewColumns))
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id));
       const offset = options?.offset ?? 0;
       const limit = options?.limit ?? 50;
@@ -94,12 +94,12 @@ function buildApp(seed: Task[], projectId = "project-a") {
       tasks[index] = { ...tasks[index], column: "todo" };
       return tasks[index];
     }),
-    linkTaskRecommendation: vi.fn(async (id: string, recommendationId: string, createdTaskId: string, completeColumns?: ReadonlySet<string>) => {
+    linkTaskRecommendation: vi.fn(async (id: string, recommendationId: string, createdTaskId: string, completeColumns?: ReadonlySet<string>, landedReviewColumns?: ReadonlySet<string>) => {
       const index = tasks.findIndex((item) => item.id === id);
       if (index < 0) throw new Error("Task not found");
       if (
         completeColumns
-        && !completeColumns.has(tasks[index]!.column)
+        && !isRecommendationSourceActionable(tasks[index]!, completeColumns, landedReviewColumns)
         && typeof tasks[index]!.archivedAt !== "string"
       ) {
         throw new Error("Recommendations are available only on completed or archived tasks");
@@ -624,6 +624,29 @@ describe("recommendation task creation route", () => {
     expect(liveArchived.tasks[0]?.recommendations?.[0]?.createdTaskId).toBeUndefined();
   });
 
+  it("creates and lists follow-ups from a landed parent still held in review", async () => {
+    const landed = buildApp([parent({ column: "in-review", mergeDetails: { mergeConfirmed: true, commitSha: "8ff7e7ae7" } })]);
+
+    const created = await performRequest(landed.app, "POST", "/api/tasks/FN-1/recommendations/rec-1/create", undefined);
+    expect(created.status).toBe(201);
+    expect(landed.store.createTask).toHaveBeenCalledTimes(1);
+    expect(landed.tasks[0]?.recommendations?.[0]?.createdTaskId).toBe(created.body.task.id);
+
+    const listed = await performRequest(landed.app, "GET", "/api/tasks/recommendations");
+    expect(listed.status).toBe(200);
+    expect(listed.body.items.map((item: { taskId: string }) => item.taskId)).toEqual(["FN-1"]);
+  });
+
+  it("explains that an unlanded review parent becomes actionable once it lands", async () => {
+    const unlanded = buildApp([parent({ column: "in-review", mergeDetails: { mergeConfirmed: false } })]);
+
+    const response = await performRequest(unlanded.app, "POST", "/api/tasks/FN-1/recommendations/rec-1/create", undefined);
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toMatch(/after FN-1 lands or completes/);
+    expect(unlanded.store.createTask).not.toHaveBeenCalled();
+  });
+
   it("rejects non-complete parents and stale linked children without creating another task", async () => {
     const incomplete = buildApp([parent({ column: "todo" })]);
     const incompleteResponse = await performRequest(incomplete.app, "POST", "/api/tasks/FN-1/recommendations/rec-1/create", undefined);
@@ -750,6 +773,7 @@ describe("recommendation task creation route", () => {
       "rec-1",
       "FN-9",
       expect.any(Set),
+      expect.any(Set),
     );
     expect(custom.tasks[0]?.recommendations?.[0]?.createdTaskId).toBe("FN-9");
   });
@@ -787,6 +811,7 @@ describe("recommendation task creation route", () => {
       "FN-1",
       "rec-1",
       "FN-10",
+      expect.any(Set),
       expect.any(Set),
     );
     expect(custom.tasks[0]?.recommendations?.[0]?.createdTaskId).toBe("FN-10");
@@ -826,6 +851,7 @@ describe("recommendation task creation route", () => {
       "rec-1",
       "FN-10",
       expect.any(Set),
+      expect.any(Set),
     );
     expect(custom.tasks[0]?.recommendations?.[0]?.createdTaskId).toBe("FN-10");
   });
@@ -863,6 +889,7 @@ describe("recommendation task creation route", () => {
       "FN-1",
       "rec-1",
       "FN-10",
+      expect.any(Set),
       expect.any(Set),
     );
     expect(legacy.tasks[0]?.recommendations?.[0]?.createdTaskId).toBe("FN-10");

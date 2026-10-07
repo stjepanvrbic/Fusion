@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { Task, TaskRecommendation } from "@fusion/core";
 import { createTaskFromRecommendation } from "../api";
+import { ApiRequestError } from "../api/client/client";
 import "./TaskRecommendationsTab.css";
 
 export function TaskRecommendationsTab({
@@ -19,7 +20,8 @@ export function TaskRecommendationsTab({
   const creatingIdsRef = useRef(new Set<string>());
   const taskIdRef = useRef(task.id);
   const [creatingActions, setCreatingActions] = useState<Record<string, true>>({});
-  const [errorActions, setErrorActions] = useState<Record<string, true>>({});
+  // FNXC:TaskRecommendations 2026-10-07-12:56: A 4xx refusal is shown verbatim because it tells the operator what to do; other failures keep the generic retry prompt.
+  const [errorActions, setErrorActions] = useState<Record<string, string | true>>({});
   const recommendations = task.recommendations ?? [];
 
   useEffect(() => {
@@ -63,8 +65,11 @@ export function TaskRecommendationsTab({
       if (taskIdRef.current === task.id) {
         setCreatedIds((current) => ({ ...current, [actionKey]: response.task.id }));
       }
-    } catch {
-      if (taskIdRef.current === task.id) setErrorActions((current) => ({ ...current, [actionKey]: true }));
+    } catch (cause) {
+      const reason = cause instanceof ApiRequestError && cause.status >= 400 && cause.status < 500 && cause.message.trim()
+        ? cause.message.trim()
+        : true;
+      if (taskIdRef.current === task.id) setErrorActions((current) => ({ ...current, [actionKey]: reason }));
     } finally {
       creatingIdsRef.current.delete(actionKey);
       if (taskIdRef.current === task.id) {
@@ -91,7 +96,8 @@ export function TaskRecommendationsTab({
         const actionKey = `${task.id}:${recommendation.id}`;
         const createdTaskId = recommendation.createdTaskId ?? createdIds[actionKey];
         const creating = creatingActions[actionKey] === true;
-        const failed = errorActions[actionKey] === true;
+        const failure = errorActions[actionKey];
+        const failed = failure !== undefined;
         return (
           <article className="task-recommendations__item card" key={recommendation.id}>
             <div className="task-recommendations__content">
@@ -119,7 +125,7 @@ export function TaskRecommendationsTab({
                       ? t("taskDetail.recommendations.retry", "Retry creating task")
                       : t("taskDetail.recommendations.create", "Create task")}
                 </button>
-                {failed && <span className="task-recommendations__error" role="status">{t("taskDetail.recommendations.error", "Could not create task. Try again.")}</span>}
+                {failed && <span className="task-recommendations__error" role="status">{typeof failure === "string" ? failure : t("taskDetail.recommendations.error", "Could not create task. Try again.")}</span>}
               </div>
             )}
           </article>

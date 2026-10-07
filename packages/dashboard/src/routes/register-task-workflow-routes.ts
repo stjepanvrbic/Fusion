@@ -153,7 +153,7 @@ import { buildBoardWorkflowsPayload } from "./board-workflows.js";
 import { resolveNativeStructurePreview } from "../native-structure-preview.js";
 import { isBackwardMoveBlockedByOpenPr, PR_OPEN_BLOCKS_MOVE_BACK_MESSAGE } from "./register-pull-requests-routes.js";
 import { allowsAutoMergeProcessing, computePlanApprovalFingerprint, isTaskAwaitingPlanning, isWorkspaceTask, resolveEffectiveAutoMerge, type RunAuditEventInput } from "@fusion/core";
-import { FUSION_CLIENT_HEADER, resolveHttpDeleteCallerKind, isValidTaskBranchName } from "@fusion/core";
+import { FUSION_CLIENT_HEADER, resolveHttpDeleteCallerKind, isValidTaskBranchName, isRecommendationSourceActionable, recommendationSourceNotActionableMessage } from "@fusion/core";
 import { ApiError, badRequest, conflict, notFound } from "../api-error.js";
 // FNXC:TaskLookup404 2026-07-26-11:40: shared task-miss -> 404 mapping seam.
 import { isTaskLookupMiss, rethrowTaskApiError } from "./task-lookup-error.js";
@@ -1615,12 +1615,15 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       if (requestedLimit === 0) throw badRequest("limit must be a positive integer");
       const limit = requestedLimit === undefined ? undefined : Math.min(200, requestedLimit);
       let completeColumns: ReadonlySet<string>;
+      let landedReviewColumns: ReadonlySet<string>;
       try {
         completeColumns = await resolveProjectColumnsForRoles(scopedStore, ["complete"]);
+        landedReviewColumns = await resolveProjectColumnsForRoles(scopedStore, ["mergeBlocker", "humanReview"]);
       } catch {
         completeColumns = new Set(["done"]);
+        landedReviewColumns = new Set(["in-review"]);
       }
-      res.json(await scopedStore.listTaskRecommendations({ completeColumns, limit, offset }));
+      res.json(await scopedStore.listTaskRecommendations({ completeColumns, landedReviewColumns, limit, offset }));
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
       rethrowAsApiError(err);
@@ -2385,13 +2388,21 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       // Re-read only after acquiring the recommendation identity lock; this is the queue winner's authority.
       const parent = await scopedStore.getTask(req.params.id).catch(() => null);
       if (!parent || parent.deletedAt) throw notFound("Task not found");
-      const completeColumns = await (async () => {
+      /*
+      FNXC:TaskRecommendations 2026-10-07-12:56:
+      A landed card in a review lane (merge-blocker or human-review, matching the dashboard's isReviewColumnRole) is an actionable source because its implementation never re-runs, so resolve those lanes alongside the complete lanes from the parent's own workflow.
+      */
+      const { completeColumns, landedReviewColumns } = await (async () => {
         try {
           const ir = await resolveWorkflowIrForTask(scopedStore, parent.id);
-          const columns = columnsWithFlag(ir, "complete");
-          return new Set(columns.length > 0 ? columns : ["done"]);
+          const complete = columnsWithFlag(ir, "complete");
+          const review = [...columnsWithFlag(ir, "mergeBlocker"), ...columnsWithFlag(ir, "humanReview")];
+          return {
+            completeColumns: new Set(complete.length > 0 ? complete : ["done"]),
+            landedReviewColumns: new Set(review.length > 0 ? review : ["in-review"]),
+          };
         } catch {
-          return new Set(["done"]);
+          return { completeColumns: new Set(["done"]), landedReviewColumns: new Set(["in-review"]) };
         }
       })();
       const archivedColumns = await archivedColumnsForTask(scopedStore, parent.id);
@@ -2410,8 +2421,8 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         && archivedSourceRecord?.deletedAt
         && (archivedColumns.has(parent.column) || parent.preArchiveColumn),
       );
-      if (!completeColumns.has(parent.column) && !isPhysicalArchivedSource) {
-        throw conflict("recommendations are available only on completed or archived tasks");
+      if (!isRecommendationSourceActionable(parent, completeColumns, landedReviewColumns) && !isPhysicalArchivedSource) {
+        throw conflict(recommendationSourceNotActionableMessage(parent.id));
       }
       const recommendation = parent.recommendations?.find((item) => item.id === req.params.recommendationId);
       if (!recommendation) throw notFound("Recommendation not found");
@@ -2425,14 +2436,18 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
           transaction, so concurrent dashboard instances cannot overwrite another recommendation
           link after the durable child claim has been created.
           */
-          return await scopedStore.linkTaskRecommendation(parent.id, recommendation.id, child.id, completeColumns);
+          return await scopedStore.linkTaskRecommendation(parent.id, recommendation.id, child.id, completeColumns, landedReviewColumns);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (
+            message === "Recommendations are available only on completed tasks"
+            || message === "Recommendations are available only on completed or archived tasks"
+          ) {
+            throw conflict(recommendationSourceNotActionableMessage(parent.id));
+          }
+          if (
             message === "Recommendation no longer exists"
             || message === "Recommendation is already linked to another task"
-            || message === "Recommendations are available only on completed tasks"
-            || message === "Recommendations are available only on completed or archived tasks"
           ) {
             throw conflict(message);
           }

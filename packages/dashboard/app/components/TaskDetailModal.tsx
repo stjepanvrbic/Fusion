@@ -1373,8 +1373,12 @@ export function TaskDetailContent({
   Recommendation follow-ups remain actionable from a cold archived snapshot, not from every live
   workflow lane carrying the archived trait. The archive marker proves the task left the live row;
   without it, a custom archived-role lane would render a Create task action that the API must refuse.
+
+  FNXC:TaskRecommendations 2026-10-07-12:56:
+  A landed (merge-confirmed) card waiting in review is an actionable source too, matching the create route's isRecommendationSourceActionable rule.
   */
-  const hasRecommendations = (isDoneColumn || (isArchivedColumn && typeof task.archivedAt === "string"))
+  const isLandedReviewSource = isReviewColumn && (workingTask.mergeDetails ?? task.mergeDetails)?.mergeConfirmed === true;
+  const hasRecommendations = (isDoneColumn || isLandedReviewSource || (isArchivedColumn && typeof task.archivedAt === "string"))
     && (taskOwnedRecommendations?.length ?? 0) > 0;
   // Reset planner-chat focus when the operator opens a different task.
   useEffect(() => {

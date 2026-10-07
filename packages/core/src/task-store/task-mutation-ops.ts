@@ -40,7 +40,9 @@ import { buildPatchnodeEntryInput } from "../board/patchnode.js";
 import { resolveProjectColumnsForRoles } from "../project-lane-vocabulary.js";
 import {purgeTaskWorkflowSelectionRowsAsyncImpl} from "./workflow-definitions.js";
 import * as schema from "../postgres/schema/index.js";
-import {and, asc, eq, inArray, isNotNull, isNull, sql} from "drizzle-orm";
+import { isRecommendationSourceActionable } from "../tasks/recommendation-source-eligibility.js";
+import { recommendationSourceLaneFilter } from "./recommendation-source-sql.js";
+import {and, asc, eq, isNotNull, isNull, sql} from "drizzle-orm";
 import {recoverExpiredMergeQueueLeases as recoverExpiredMergeQueueLeasesAsync} from "../task-store/async/async-merge-coordination.js";
 import {getPrEntity as getPrEntityAsync, updateBranchGroup as updateBranchGroupAsync, updatePrEntity as updatePrEntityAsync} from "../task-store/async/async-branch-groups.js";
 import { acquireTaskAdvisoryXactLock } from "./task-advisory-lock.js";
@@ -656,6 +658,7 @@ export async function linkTaskRecommendationImpl(
   recommendationId: string,
   createdTaskId: string,
   completeColumns?: ReadonlySet<string>,
+  landedReviewColumns?: ReadonlySet<string>,
 ): Promise<Task> {
   return store.withTaskLock(id, async () => {
     const layer = store.asyncLayer!;
@@ -678,7 +681,7 @@ export async function linkTaskRecommendationImpl(
       const current = archivedEntry
         ? store.archiveEntryToTask(archivedEntry, false)
         : store.rowToTask(store.pgRowToTaskRow(row));
-      if (!archivedEntry && completeColumns && !completeColumns.has(current.column)) {
+      if (!archivedEntry && completeColumns && !isRecommendationSourceActionable(current, completeColumns, landedReviewColumns)) {
         throw new Error("Recommendations are available only on completed or archived tasks");
       }
       const index = current.recommendations?.findIndex((item) => item.id === recommendationId) ?? -1;
@@ -709,7 +712,7 @@ export async function linkTaskRecommendationImpl(
           eq(schema.project.tasks.id, id),
           taskProjectScope(layer),
           isNull(schema.project.tasks.deletedAt),
-          ...(completeColumns ? [inArray(schema.project.tasks.column, [...completeColumns])] : []),
+          ...(completeColumns ? [recommendationSourceLaneFilter(completeColumns, landedReviewColumns) ?? sql`false`] : []),
         ))
         .returning();
       if (!updatedRow) {

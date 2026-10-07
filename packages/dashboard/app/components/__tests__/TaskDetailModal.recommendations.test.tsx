@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { TaskRecommendationsTab } from "../TaskRecommendationsTab";
 import { TaskDetailContent } from "../TaskDetailModal";
 import type { Task } from "@fusion/core";
+import { ApiRequestError } from "../../api/client/client";
 
 const { createTaskFromRecommendation, fetchBoardWorkflows } = vi.hoisted(() => ({
   createTaskFromRecommendation: vi.fn(),
@@ -70,6 +71,40 @@ describe("TaskRecommendationsTab", () => {
     expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Custom workflow");
     expect(screen.queryByRole("heading", { name: "Recommendations" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Create task" })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["shows", true],
+    ["hides", false],
+  ] as const)("%s recommendations for a review-lane card when merge confirmed is %s", async (_verb, mergeConfirmed) => {
+    fetchBoardWorkflows.mockResolvedValue({
+      flagEnabled: true,
+      defaultWorkflowId: "review-workflow",
+      taskWorkflowIds: { "FN-8829": "review-workflow" },
+      workflows: [{
+        id: "review-workflow",
+        name: "Review workflow",
+        columns: [{ id: "in-review", name: "In Review", flags: { mergeBlocker: true } }],
+      }],
+    } as never);
+
+    render(
+      <TaskDetailContent
+        {...sharedDetailProps}
+        embedded
+        task={{ ...task, column: "in-review", prompt: "", mergeDetails: { mergeConfirmed } }}
+      />,
+    );
+
+    expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Review workflow");
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    if (mergeConfirmed) {
+      expect(await screen.findByRole("heading", { name: "Recommendations" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Create task" })).toBeEnabled();
+    } else {
+      expect(screen.queryByRole("heading", { name: "Recommendations" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Create task" })).not.toBeInTheDocument();
+    }
   });
 
   it("renders one accessible empty message with no action for undefined or empty recommendations", () => {
@@ -175,5 +210,16 @@ describe("TaskRecommendationsTab", () => {
       parent: { ...multiRecommendationTask, recommendations: [task.recommendations![0], { ...secondRecommendation, createdTaskId: "FN-8831" }] },
     });
     expect(await screen.findByText("Created FN-8831")).toBeInTheDocument();
+  });
+
+  it("shows the server's refusal reason after a rejected creation", async () => {
+    createTaskFromRecommendation.mockReset();
+    createTaskFromRecommendation.mockRejectedValueOnce(new ApiRequestError("Recommendations from FN-8829 can be filed as tasks after FN-8829 lands or completes", 409));
+    render(<TaskRecommendationsTab task={task} projectId="project-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Create task" }));
+
+    expect(await screen.findByText("Recommendations from FN-8829 can be filed as tasks after FN-8829 lands or completes")).toBeInTheDocument();
+    expect(screen.queryByText("Could not create task. Try again.")).not.toBeInTheDocument();
   });
 });

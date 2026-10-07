@@ -12,7 +12,8 @@ import {join} from "node:path";
 import {existsSync, statSync} from "node:fs";
 import type {Task, TaskDetail, ColumnId, ArchivedTaskEntry, TaskVerificationRequest, TaskVerificationResultSummary, TaskVerificationStatus, TaskRecommendation, TaskRecommendationListItem, TaskRecommendationListPage, TaskColumnSortMode} from "../types.js";
 import * as schema from "../postgres/schema/index.js";
-import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { recommendationSourceLaneFilter } from "./recommendation-source-sql.js";
+import { and, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import "../builtin-traits.js";
 import {allowsAutoMergeProcessing} from "../merge/task-merge.js";
 import {getInReviewStallReason, DEFAULT_STALE_MERGING_MIN_AGE_MS, type InReviewStallContext} from "../tasks/in-review-stall.js";
@@ -992,7 +993,7 @@ export async function getTaskVerificationRequestAsyncImpl(store: TaskStore, task
  */
 export async function listTaskRecommendationsImpl(
   store: TaskStore,
-  options?: { completeColumns?: ReadonlySet<string>; limit?: number; offset?: number },
+  options?: { completeColumns?: ReadonlySet<string>; landedReviewColumns?: ReadonlySet<string>; limit?: number; offset?: number },
 ): Promise<TaskRecommendationListPage> {
   const layer = store.asyncLayer!;
   const completeColumns = options?.completeColumns ?? await resolveProjectColumnsForRoles(store, ["complete"]);
@@ -1000,11 +1001,11 @@ export async function listTaskRecommendationsImpl(
   const rawOffset = options?.offset;
   const limit = typeof rawLimit === "number" && Number.isFinite(rawLimit) ? Math.min(200, Math.max(1, Math.trunc(rawLimit))) : 50;
   const offset = typeof rawOffset === "number" && Number.isFinite(rawOffset) ? Math.max(0, Math.trunc(rawOffset)) : 0;
-  const columns = [...completeColumns];
-  const liveFilter = columns.length === 0 ? undefined : and(
+  const laneFilter = recommendationSourceLaneFilter(completeColumns, options?.landedReviewColumns);
+  const liveFilter = !laneFilter ? undefined : and(
     taskProjectScope(layer),
     isNull(schema.project.tasks.deletedAt),
-    inArray(schema.project.tasks.column, columns),
+    laneFilter,
     isNotNull(schema.project.tasks.recommendations),
     sql`jsonb_array_length(${schema.project.tasks.recommendations}) > 0`,
   );

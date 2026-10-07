@@ -3,6 +3,7 @@ import type { MessageMetadata } from "@fusion/core";
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { createTaskFromRecommendation, fetchTaskDetail } from "../../api";
 import { MailboxTaskRecommendations } from "../MailboxTaskRecommendations";
+import { ApiRequestError } from "../../api/client/client";
 
 vi.mock("../../api", () => ({ createTaskFromRecommendation: vi.fn(), fetchTaskDetail: vi.fn() }));
 
@@ -115,6 +116,24 @@ describe("MailboxTaskRecommendations", () => {
     expect(await screen.findByRole("button", { name: "View task FN-9101" })).toBeInTheDocument();
     expect(createTaskFromRecommendation).toHaveBeenCalledTimes(2);
     expectMailboxCardWithoutBoardClass();
+  });
+
+  it("shows the server's refusal reason instead of a generic retry prompt", async () => {
+    vi.mocked(fetchTaskDetail).mockResolvedValue(detail as never);
+    vi.mocked(createTaskFromRecommendation).mockRejectedValueOnce(new ApiRequestError("Recommendations from FN-9100 can be filed as tasks after FN-9100 lands or completes", 409));
+    render(<MailboxTaskRecommendations metadata={metadata} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Create task" }));
+    expect(await screen.findByText("Recommendations from FN-9100 can be filed as tasks after FN-9100 lands or completes")).toBeInTheDocument();
+    expect(screen.queryByText("Could not create task. Try again.")).not.toBeInTheDocument();
+  });
+
+  it("keeps the generic retry prompt for transport and server failures", async () => {
+    vi.mocked(fetchTaskDetail).mockResolvedValue(detail as never);
+    vi.mocked(createTaskFromRecommendation).mockRejectedValueOnce(new ApiRequestError("Internal error", 500));
+    render(<MailboxTaskRecommendations metadata={metadata} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Create task" }));
+    expect(await screen.findByText("Could not create task. Try again.")).toBeInTheDocument();
+    expect(screen.queryByText("Internal error")).not.toBeInTheDocument();
   });
 
   it("ignores a stale parent lookup after the notice changes", async () => {

@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import type { MessageMetadata, TaskRecommendation } from "@fusion/core";
 import { parseRecommendationSnapshot } from "../../../core/src/tasks/recommendation-validation";
 import { createTaskFromRecommendation, fetchTaskDetail } from "../api";
+import { ApiRequestError } from "../api/client/client";
 import "./MailboxTaskRecommendations.css";
 
 type TaskRecommendationNoticeMetadata = MessageMetadata & {
@@ -50,7 +51,11 @@ export function MailboxTaskRecommendations({
   const [unavailableReason, setUnavailableReason] = useState<"task-unavailable" | "recommendations-missing" | null>(null);
   const [createdIds, setCreatedIds] = useState<Record<string, string>>({});
   const [creatingActions, setCreatingActions] = useState<Record<string, true>>({});
-  const [errorActions, setErrorActions] = useState<Record<string, true>>({});
+  /*
+  FNXC:TaskRecommendations 2026-10-07-12:56:
+  A 4xx refusal is a domain answer the operator can act on (for example the source has not landed yet), so show the server's reason; transport and 5xx failures keep the generic retry prompt.
+  */
+  const [errorActions, setErrorActions] = useState<Record<string, string | true>>({});
   const creatingIdsRef = useRef(new Set<string>());
 
   const taskId = target?.taskId;
@@ -124,8 +129,11 @@ export function MailboxTaskRecommendations({
     try {
       const response = await createTaskFromRecommendation(target.taskId, recommendation.id, projectId);
       setCreatedIds((current) => ({ ...current, [actionKey]: response.task.id }));
-    } catch {
-      setErrorActions((current) => ({ ...current, [actionKey]: true }));
+    } catch (cause) {
+      const reason = cause instanceof ApiRequestError && cause.status >= 400 && cause.status < 500 && cause.message.trim()
+        ? cause.message.trim()
+        : true;
+      setErrorActions((current) => ({ ...current, [actionKey]: reason }));
     } finally {
       creatingIdsRef.current.delete(actionKey);
       setCreatingActions((current) => {
@@ -150,7 +158,8 @@ export function MailboxTaskRecommendations({
       const actionKey = `${target.taskId}:${recommendation.id}`;
       const createdTaskId = recommendation.createdTaskId ?? createdIds[actionKey];
       const creating = creatingActions[actionKey] === true;
-      const failed = errorActions[actionKey] === true;
+      const failure = errorActions[actionKey];
+      const failed = failure !== undefined;
       /*
       FNXC:MailboxTaskCards 2026-09-01-05:06:
       The board `.card` primitive imposes raw-pixel padding, hover repaint, container sizing, and
@@ -168,7 +177,7 @@ export function MailboxTaskRecommendations({
             <button type="button" className="btn btn-primary" disabled={creating} onClick={() => void createRecommendation(recommendation)}>
               {creating ? t("mailbox.creatingTask", "Creating…") : failed ? t("mailbox.retryCreatingTask", "Retry creating task") : t("mailbox.createTask", "Create task")}
             </button>
-            {failed && <span className="mailbox-task-recommendations__error" role="status">{t("mailbox.createTaskError", "Could not create task. Try again.")}</span>}
+            {failed && <span className="mailbox-task-recommendations__error" role="status">{typeof failure === "string" ? failure : t("mailbox.createTaskError", "Could not create task. Try again.")}</span>}
           </div>
         )}
       </article>;

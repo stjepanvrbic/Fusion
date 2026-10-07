@@ -1855,7 +1855,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   Real callers already supply it — the dashboard route resolves `completeColumns` and passes it — so
   the fallback serves the pass-through wrapper, not production paths.
   */
-  async listTaskRecommendations(options?: { completeColumns?: ReadonlySet<string>; limit?: number; offset?: number }): Promise<import("./types.js").TaskRecommendationListPage> {
+  async listTaskRecommendations(options?: { completeColumns?: ReadonlySet<string>; landedReviewColumns?: ReadonlySet<string>; limit?: number; offset?: number }): Promise<import("./types.js").TaskRecommendationListPage> {
     return listTaskRecommendationsImpl(this, options);
   }
   async listTasksForGithubTrackingReconcile(options?: { offset?: number; limit?: number }): Promise<{ tasks: Task[]; hasMore: boolean }> {
@@ -2317,8 +2317,9 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     recommendationId: string,
     createdTaskId: string,
     completeColumns?: ReadonlySet<string>,
+    landedReviewColumns?: ReadonlySet<string>,
   ): Promise<Task> {
-    return linkTaskRecommendationImpl(this, id, recommendationId, createdTaskId, completeColumns);
+    return linkTaskRecommendationImpl(this, id, recommendationId, createdTaskId, completeColumns, landedReviewColumns);
   }
   /**
    * FNXC:WorkspaceRootRouting 2026-08-19-12:15:

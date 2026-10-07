@@ -175,6 +175,32 @@ pgDescribe("TaskStore recommendation persistence (PostgreSQL)", () => {
     expect((await store.getTask(parent.id))?.recommendations?.[0]?.createdTaskId).toBeUndefined();
   });
 
+  it("links a landed parent held in review only when review lanes are supplied", async () => {
+    const store = h.store();
+    const seed = (id: string, recId: string, mergeConfirmed: boolean) => insertTaskRow(h.layer(), {
+      id,
+      description: "Land work that waits in review for post-merge evidence.",
+      column: "in-review",
+      currentStep: 0,
+      createdAt: "2026-10-07T00:00:00.000Z",
+      updatedAt: "2026-10-07T00:00:00.000Z",
+      mergeDetails: { mergeConfirmed, commitSha: "8ff7e7ae7" },
+      recommendations: [{ id: recId, title: "Add export", description: "Build export as a separate follow-up.", category: "feature" }],
+    }, { lineageId: `lineage-${id}` });
+    await seed("FN-LANDED", "rec-landed", true);
+    await seed("FN-UNLANDED", "rec-unlanded", false);
+
+    await expect(store.linkTaskRecommendation("FN-LANDED", "rec-landed", "FN-CHILD-L", new Set(["done"])))
+      .rejects.toThrow("completed or archived tasks");
+    const linked = await store.linkTaskRecommendation("FN-LANDED", "rec-landed", "FN-CHILD-L", new Set(["done"]), new Set(["in-review"]));
+    expect(linked.recommendations?.[0]?.createdTaskId).toBe("FN-CHILD-L");
+    expect((await store.getTask("FN-LANDED")).recommendations?.[0]?.createdTaskId).toBe("FN-CHILD-L");
+
+    await expect(store.linkTaskRecommendation("FN-UNLANDED", "rec-unlanded", "FN-CHILD-U", new Set(["done"]), new Set(["in-review"])))
+      .rejects.toThrow("completed or archived tasks");
+    expect((await store.getTask("FN-UNLANDED")).recommendations?.[0]?.createdTaskId).toBeUndefined();
+  });
+
   it("preserves and links an archived recommendation source without creating a second child", async () => {
     const store = h.store();
     const parent = await store.createTask({ description: "Complete a parent before archiving its recommendation." });

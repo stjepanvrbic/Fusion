@@ -360,6 +360,7 @@ export { resolveStepReopenPolicy } from "./workflows/workflow-step-reopen-policy
 /* FNXC:ReviewLaneRecommendations 2026-08-26-07:34: shared with the engine so a review-lane projection is screened by the same rule as the store boundary. */
 export { normalizeTaskRecommendations, parseRecommendationSnapshot, RECOMMENDATION_ID_MAX_LENGTH, RECOMMENDATION_TITLE_MAX_LENGTH, RECOMMENDATION_DESCRIPTION_MAX_LENGTH, RECOMMENDATION_SNAPSHOT_MAX_ENTRIES, RECOMMENDATION_SNAPSHOT_MAX_BYTES } from "./tasks/recommendation-validation.js";
 export type { RecommendationSnapshotEntry } from "./tasks/recommendation-validation.js";
+export { isRecommendationSourceActionable, recommendationSourceNotActionableMessage } from "./tasks/recommendation-source-eligibility.js";
 export type { StepReopenPolicy } from "./workflows/workflow-step-reopen-policy.js";
 export {
   classifyMergeSweepAdmission,
