@@ -7,26 +7,67 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { writeFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { killProcessTree, resolveShellFreeLaunch } from "./windows-launch.js";
 
 function debugLog(message: string): void {
   if (process.env.PI_CLAUDE_CLI_DEBUG !== "1") return;
   console.error(`[pi-claude-cli] ${message}`);
 }
 
+/** A system prompt written for exactly one Claude CLI invocation. */
+export interface SystemPromptFile {
+  path: string;
+  /** Remove this invocation's file. Idempotent and never throws. */
+  cleanup(): void;
+}
+
+export interface SystemPromptFileOptions {
+  rm?: typeof rmSync;
+}
+
 /**
- * Spawn a Claude CLI subprocess with all required flags for stream-json communication.
+ * Write a system prompt to a file owned by one invocation.
+ *
+ * FNXC:ClaudeCliProvider 2026-10-07-19:34:
+ * The prompt goes through a file because a long prompt argv hits ENAMETOOLONG on Windows, and the CLI reads it via `--append-system-prompt-file`.
+ * `--append-system-prompt` takes literal text, so passing the path there sent the model a file name instead of Fusion's instructions.
+ * Every turn in one process used one PID-named file, so concurrent sessions overwrote each other's prompt and any turn's cleanup deleted another's.
+ * Each invocation now owns a private temp directory that only its own cleanup removes, after its process closes.
+ */
+export function createSystemPromptFile(systemPrompt: string, options: SystemPromptFileOptions = {}): SystemPromptFile {
+  const directory = mkdtempSync(join(tmpdir(), "pi-claude-cli-sysprompt-"));
+  const path = join(directory, "system-prompt.txt");
+  writeFileSync(path, systemPrompt, "utf-8");
+  const rm = options.rm ?? rmSync;
+  let removed = false;
+  return {
+    path,
+    cleanup() {
+      if (removed) return;
+      removed = true;
+      try {
+        // Windows can briefly hold a just-read file open; retry, then leave the private directory for the OS temp sweeper.
+        rm(dirname(path), { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch (error) {
+        debugLog(`system prompt cleanup failed for ${path}: ${(error as Error).message}`);
+      }
+    },
+  };
+}
+
+/**
+ * Build the Claude CLI argv for stream-json communication. Pure: writes no files.
  *
  * @param modelId - The model ID to pass via --model flag
- * @param systemPrompt - Optional system prompt appended via --append-system-prompt
- * @param options - Optional cwd, AbortSignal, and effort level
- * @returns The spawned ChildProcess with piped stdin/stdout/stderr
+ * @param systemPromptFile - Optional path from `createSystemPromptFile`, read via --append-system-prompt-file
+ * @param options - Optional effort, MCP config, and session ids
  */
 export function buildClaudeSpawnArgs(
   modelId: string,
-  systemPrompt?: string,
+  systemPromptFile?: string,
   options?: {
     effort?: string;
     mcpConfigPath?: string;
@@ -54,15 +95,8 @@ export function buildClaudeSpawnArgs(
     args.push("--session-id", options.newSessionId);
   }
 
-  if (systemPrompt) {
-    // Write system prompt to a temp file to avoid ENAMETOOLONG on Windows.
-    // Claude CLI's --append-system-prompt accepts a file path or literal text.
-    const tmpFile = join(
-      tmpdir(),
-      `pi-claude-cli-sysprompt-${process.pid}.txt`,
-    );
-    writeFileSync(tmpFile, systemPrompt, "utf-8");
-    args.push("--append-system-prompt", tmpFile);
+  if (systemPromptFile) {
+    args.push("--append-system-prompt-file", systemPromptFile);
   }
 
   if (options?.effort) {
@@ -76,45 +110,53 @@ export function buildClaudeSpawnArgs(
   return args;
 }
 
+/**
+ * Spawn a Claude CLI subprocess with piped stdio.
+ *
+ * @param systemPromptFile - Optional path from `createSystemPromptFile`; the caller owns its cleanup
+ */
 export function spawnClaude(
   modelId: string,
-  systemPrompt?: string,
+  systemPromptFile?: string,
   options?: {
     cwd?: string;
-    signal?: AbortSignal;
     effort?: string;
     mcpConfigPath?: string;
     resumeSessionId?: string;
     newSessionId?: string;
   },
 ): ChildProcess {
-  const args = buildClaudeSpawnArgs(modelId, systemPrompt, {
+  const args = buildClaudeSpawnArgs(modelId, systemPromptFile, {
     effort: options?.effort,
     mcpConfigPath: options?.mcpConfigPath,
     resumeSessionId: options?.resumeSessionId,
     newSessionId: options?.newSessionId,
   });
 
-  const proc = spawn("claude", args, {
+  /*
+  FNXC:WindowsProcessLaunch 2026-10-07-19:34:
+  An npm-installed Claude Code is `claude.cmd`, which a bare shell-free spawn cannot find (ENOENT); resolve through the shared launch seam, as the probes do.
+  */
+  const launch = resolveShellFreeLaunch("claude", args);
+  const proc = spawn(launch.command, launch.args, {
     stdio: ["pipe", "pipe", "pipe"],
     cwd: options?.cwd ?? process.cwd(),
+    shell: false,
+    windowsHide: true,
   });
 
-  debugLog(`spawnClaude: pid=${proc.pid} model=${modelId}`);
+  /*
+  FNXC:ClaudeCliProvider 2026-10-07-19:34:
+  A CLI that exits before reading its input makes the stdin write fail with EPIPE; without a listener that error is uncaught and crashes the host.
+  The caller's close handler reports the exit itself, so the stdin error is only logged.
+  */
+  proc.stdin?.on("error", (error: Error) => {
+    debugLog(`stdin error for pid=${proc.pid}: ${error.message}`);
+  });
+
+  debugLog(`spawnClaude: pid=${proc.pid} model=${modelId} args=${JSON.stringify(args)}`);
 
   return proc as ChildProcess;
-}
-
-/**
- * Clean up the temp system prompt file created by spawnClaude.
- * Safe to call multiple times or when no file exists.
- */
-export function cleanupSystemPromptFile(): void {
-  try {
-    unlinkSync(join(tmpdir(), `pi-claude-cli-sysprompt-${process.pid}.txt`));
-  } catch {
-    // File doesn't exist or already deleted — ignore
-  }
 }
 
 /**
@@ -145,15 +187,13 @@ export function writeUserMessage(
 }
 
 /**
- * Force-kill a subprocess immediately via SIGKILL.
- * No-ops if the process is already dead (killed or exited).
- * Cross-platform safe: Node.js treats SIGKILL as forceful termination on Windows.
+ * Force-kill a subprocess and every process it started. No-ops once it was signalled or has exited.
+ * On Windows `proc.kill` ends only the direct child, leaving the CLI's MCP servers running, so the shared tree kill is used.
  *
  * @param proc - The subprocess to force-kill
  */
 export function forceKillProcess(proc: ChildProcess): void {
-  if (proc.killed || proc.exitCode !== null) return;
-  proc.kill("SIGKILL");
+  killProcessTree(proc);
 }
 
 /** Registry of active subprocesses for cleanup on teardown. */
@@ -227,7 +267,9 @@ function runClaudeProbe(args: string[], timeoutMs = 5000): Promise<number> {
   return new Promise((resolve) => {
     let proc: ChildProcess;
     try {
-      proc = spawn("claude", args, { stdio: "ignore" });
+      // Probe the same shell-free launch the session uses, so "present" implies spawnable; an unlaunchable shim throws here.
+      const launch = resolveShellFreeLaunch("claude", args);
+      proc = spawn(launch.command, launch.args, { stdio: "ignore", shell: false, windowsHide: true });
     } catch {
       resolve(127);
       return;

@@ -9,10 +9,18 @@ export interface ClaudeStreamEventMessage {
   parent_tool_use_id?: string | null;
 }
 
+/**
+ * FNXC:ClaudeCliProvider 2026-10-07-19:34:
+ * The CLI ends every turn with one result. Failures use `error_*` subtypes (`error_max_turns`, `error_during_execution`, ...) or `success` with `is_error: true` (auth, billing, API errors); there is no plain `error` subtype.
+ * Only `subtype: "success"` without `is_error` is a completed turn.
+ */
 export interface ClaudeResultMessage {
   type: "result";
-  subtype: "success" | "error";
+  subtype: "success" | "error_max_turns" | "error_during_execution" | (string & {});
+  is_error?: boolean;
   result?: string;
+  /** Diagnostics on `error_*` results. */
+  errors?: string[];
   error?: string;
   session_id?: string;
 }

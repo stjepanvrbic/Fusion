@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build as esbuildBuild } from "esbuild";
 import { ALL_STAGED_BUNDLED_IDS, RUNTIME_PLUGIN_IDS } from "./src/plugins/staged-bundled-plugin-ids";
+import { stagePiClaudeCliSources } from "./src/plugins/pi-claude-cli-staging";
 
 export { ALL_STAGED_BUNDLED_IDS };
 
@@ -559,9 +560,7 @@ const cliBuildConfig = {
       rmSync(piClaudeCliDest, { recursive: true, force: true });
     }
     if (existsSync(piClaudeCliSrc)) {
-      mkdirSync(piClaudeCliDest, { recursive: true });
-      cpSync(join(piClaudeCliSrc, "index.ts"), join(piClaudeCliDest, "index.ts"));
-      cpSync(join(piClaudeCliSrc, "src"), join(piClaudeCliDest, "src"), { recursive: true });
+      stagePiClaudeCliSources(join(__dirname, ".."), piClaudeCliDest);
       writeSanitizedCopiedManifest(join(piClaudeCliSrc, "package.json"), join(piClaudeCliDest, "package.json"));
       console.log("Copied pi-claude-cli extension to dist/pi-claude-cli/");
     } else {

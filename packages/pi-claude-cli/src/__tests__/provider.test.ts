@@ -3,10 +3,11 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
 // Mock child_process.spawn with PassThrough streams for readline compatibility
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: vi.fn(() => {
     const proc = new EventEmitter();
-    const stdin = { write: vi.fn(), end: vi.fn() };
+    const stdin = { write: vi.fn(), end: vi.fn(), on: vi.fn() };
     const stdout = new PassThrough();
     const stderr = new EventEmitter();
     (proc as any).stdin = stdin;
@@ -20,6 +21,23 @@ vi.mock("node:child_process", () => ({
     (proc as any).pid = 99999;
     return proc;
   }),
+}));
+
+// Per-invocation system prompt files: record writes and removals instead of touching the real temp dir.
+const fsMocks = vi.hoisted(() => {
+  let dirSeq = 0;
+  return {
+    mkdtempSync: vi.fn((prefix: string) => `${prefix}${++dirSeq}`),
+    writeFileSync: vi.fn(),
+    rmSync: vi.fn(),
+  };
+});
+
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
+  mkdtempSync: fsMocks.mkdtempSync,
+  writeFileSync: fsMocks.writeFileSync,
+  rmSync: fsMocks.rmSync,
 }));
 
 // Mock @earendil-works/pi-ai
@@ -72,6 +90,25 @@ vi.mock("@earendil-works/pi-ai/providers/all", () => ({
 import { spawn } from "node:child_process";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { streamViaCli } from "../provider";
+
+/** The terminal events (`done` or `error`) a turn pushed. */
+function terminalEvents(mockStream: any): any[] {
+  return mockStream._events.filter((e: any) => e.type === "done" || e.type === "error");
+}
+
+/** A turn settled exactly once, as a failure with the given reason, and ended its stream. */
+function expectSingleFailure(mockStream: any, reason: "error" | "aborted"): any {
+  const terminal = terminalEvents(mockStream);
+  expect(terminal.map((e: any) => e.type)).toEqual(["error"]);
+  const [failure] = terminal;
+  expect(failure.reason).toBe(reason);
+  expect(failure.error.role).toBe("assistant");
+  expect(failure.error.stopReason).toBe(reason);
+  expect(typeof failure.error.errorMessage).toBe("string");
+  expect(failure.error.errorMessage.length).toBeGreaterThan(0);
+  expect(mockStream.end).toHaveBeenCalledTimes(1);
+  return failure;
+}
 
 describe("provider registration (default export)", () => {
   it("registers provider with ID pi-claude-cli", async () => {
@@ -173,6 +210,8 @@ describe("provider registration (default export)", () => {
 describe("streamViaCli", { timeout: 90_000 }, () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Launch resolution and tree kill are platform-specific; these cases assert the POSIX shape on fake processes.
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -428,20 +467,16 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
     // Write error result to stdout
     const errorLine = JSON.stringify({
       type: "result",
-      subtype: "error",
-      error: "Rate limit exceeded",
+      subtype: "error_during_execution",
+      errors: ["Rate limit exceeded"],
     });
     proc.stdout.write(errorLine + "\n");
     proc.stdout.end();
     await vi.advanceTimersByTimeAsync(100);
 
     const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-    const doneEvent = mockStream._events.find(
-      (e: any) => e.type === "done" && e.message,
-    );
-    expect(doneEvent).toBeDefined();
-    expect(doneEvent.message.content).toBeDefined();
-    expect(mockStream.end).toHaveBeenCalled();
+    const failure = expectSingleFailure(mockStream, "error");
+    expect(failure.error.errorMessage).toContain("Rate limit exceeded");
   });
 
   it("calls cleanupProcess after receiving result", async () => {
@@ -1115,7 +1150,7 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
   });
 
   describe("subprocess error handling", () => {
-    it("pushes done event when subprocess emits error (e.g. spawn failure)", async () => {
+    it("ends the turn as failed when subprocess emits error (e.g. spawn failure)", async () => {
       const model = mockModels[0] as any;
       const context = {
         messages: [{ role: "user", content: "Hello" }],
@@ -1132,12 +1167,8 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       await vi.advanceTimersByTimeAsync(100);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-      const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
-      );
-      expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
-      expect(mockStream.end).toHaveBeenCalled();
+      const failure = expectSingleFailure(mockStream, "error");
+      expect(failure.error.errorMessage).toContain("spawn ENOENT");
     });
 
     it("pushes error event when subprocess crashes with non-zero exit code", async () => {
@@ -1157,12 +1188,8 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       await vi.advanceTimersByTimeAsync(100);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-      const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
-      );
-      expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
-      expect(mockStream.end).toHaveBeenCalled();
+      const failure = expectSingleFailure(mockStream, "error");
+      expect(failure.error.errorMessage).toContain("code 1");
     });
 
     it("includes stderr in error event on crash", async () => {
@@ -1183,11 +1210,8 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       await vi.advanceTimersByTimeAsync(100);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-      const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
-      );
-      expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
+      const failure = expectSingleFailure(mockStream, "error");
+      expect(failure.error.errorMessage).toContain("segfault in libfoo.so");
     });
 
     it.each([
@@ -1239,13 +1263,17 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       await vi.advanceTimersByTimeAsync(0);
 
       const proc = (spawn as any).mock.results[0].value;
-      proc.emit("close", 0, null);
+      proc.stdout.write(
+        JSON.stringify({ type: "result", subtype: "success", result: "" }) + "\n",
+      );
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
 
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining("closed without content events"),
       );
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      expect(mockStream._events.map((e: any) => e.type)).toEqual(["done"]);
     });
 
     it("does not push error on normal close (code 0)", async () => {
@@ -1357,7 +1385,7 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
   });
 
   describe("inactivity timeout", () => {
-    it("kills subprocess and pushes error after 1800s of no output", async () => {
+    it("kills subprocess and fails the turn after 1800s of no output", async () => {
       const model = mockModels[0] as any;
       const context = {
         messages: [{ role: "user", content: "Hello" }],
@@ -1372,11 +1400,8 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       await vi.advanceTimersByTimeAsync(1_800_000);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-      const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
-      );
-      expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
+      const failure = expectSingleFailure(mockStream, "error");
+      expect(failure.error.errorMessage).toContain("timed out");
       expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
 
       // Clean up - end stdout so readline closes
@@ -1414,19 +1439,12 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       await vi.advanceTimersByTimeAsync(1_790_000);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-      const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
-      );
-      expect(doneEvent).toBeUndefined();
+      expect(terminalEvents(mockStream)).toHaveLength(0);
 
       // Advance 10 more seconds (1800s since last line) -- NOW should timeout
       await vi.advanceTimersByTimeAsync(10_000);
 
-      const doneEvent2 = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
-      );
-      expect(doneEvent2).toBeDefined();
-      expect(doneEvent2.message.content).toBeDefined();
+      expectSingleFailure(mockStream, "error");
 
       // Clean up
       proc.stdout.end();
@@ -1508,10 +1526,11 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
   });
 
   describe("abort signal already aborted", () => {
-    it("kills subprocess immediately when signal is already aborted", async () => {
+    it("settles the turn as aborted without spawning when the signal is already aborted", async () => {
       const model = mockModels[0] as any;
       const context = {
         messages: [{ role: "user", content: "Hello" }],
+        systemPrompt: "Be helpful",
       };
       const controller = new AbortController();
       controller.abort(); // Abort BEFORE calling streamViaCli
@@ -1519,12 +1538,10 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       streamViaCli(model, context, { signal: controller.signal });
       await vi.advanceTimersByTimeAsync(0);
 
-      const proc = (spawn as any).mock.results[0].value;
-      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
-
-      // Clean up
-      proc.stdout.end();
-      await vi.advanceTimersByTimeAsync(100);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(fsMocks.mkdtempSync).not.toHaveBeenCalled();
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      expectSingleFailure(mockStream, "aborted");
     });
   });
 
@@ -1982,11 +1999,241 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       const args = (spawn as any).mock.calls[0][1] as string[];
       expect(args).toContain("--resume");
       expect(args).not.toContain("--append-system-prompt");
+      expect(args).not.toContain("--append-system-prompt-file");
 
       // Clean up
       const proc = (spawn as any).mock.results[0].value;
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
+    });
+  });
+
+  /*
+  FNXC:ClaudeCliProvider 2026-10-07-19:34:
+  A failed or cancelled CLI turn must never read as a completed one, and every turn settles exactly once.
+  These cases cover each failure source on fresh and resumed sessions, keep partial output, and pin per-invocation system prompt files.
+  */
+  describe("turn settlement", () => {
+    const freshContext = () => ({ messages: [{ role: "user", content: "Hello" }] });
+    const resumeContext = () => ({
+      messages: [
+        { role: "user", content: "Turn 1" },
+        { role: "assistant", content: "Reply 1" },
+        { role: "user", content: "Follow-up" },
+      ],
+    });
+    const sessions = [
+      { name: "fresh session", context: freshContext, options: { sessionId: "sess-fresh" } },
+      { name: "resumed session", context: resumeContext, options: { sessionId: "sess-resume" } },
+    ];
+    const failureResults = [
+      { subtype: "error_max_turns" },
+      { subtype: "error_during_execution", errors: ["tool crashed"] },
+      { subtype: "success", is_error: true, result: "Credit balance is too low" },
+    ];
+
+    for (const session of sessions) {
+      for (const result of failureResults) {
+        it(`fails the turn on a ${result.subtype}${result.is_error ? "+is_error" : ""} result (${session.name})`, async () => {
+          streamViaCli(mockModels[0] as any, session.context(), session.options as any);
+          await vi.advanceTimersByTimeAsync(0);
+          const proc = (spawn as any).mock.results[0].value;
+          proc.stdout.write(JSON.stringify({ type: "result", ...result }) + "\n");
+          proc.stdout.end();
+          await vi.advanceTimersByTimeAsync(100);
+
+          const failure = expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
+          expect(failure.error.errorMessage).toContain(result.subtype);
+          if (result.errors) expect(failure.error.errorMessage).toContain("tool crashed");
+          if (result.result) expect(failure.error.errorMessage).toContain("Credit balance is too low");
+        });
+      }
+
+      it(`completes the turn on a success result (${session.name})`, async () => {
+        streamViaCli(mockModels[0] as any, session.context(), session.options as any);
+        await vi.advanceTimersByTimeAsync(0);
+        const proc = (spawn as any).mock.results[0].value;
+        proc.stdout.write(JSON.stringify({ type: "result", subtype: "success", result: "ok" }) + "\n");
+        proc.stdout.end();
+        await vi.advanceTimersByTimeAsync(100);
+
+        const terminal = terminalEvents(MockAssistantMessageEventStream.mock.instances[0]);
+        expect(terminal.map((e: any) => [e.type, e.reason])).toEqual([["done", "stop"]]);
+      });
+
+      it(`fails the turn on a non-zero exit (${session.name})`, async () => {
+        streamViaCli(mockModels[0] as any, session.context(), session.options as any);
+        await vi.advanceTimersByTimeAsync(0);
+        const proc = (spawn as any).mock.results[0].value;
+        proc.stderr.emit("data", Buffer.from("not authenticated"));
+        proc.emit("close", 1, null);
+        proc.stdout.end();
+        await vi.advanceTimersByTimeAsync(100);
+
+        const failure = expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
+        expect(failure.error.errorMessage).toContain("not authenticated");
+      });
+    }
+
+    it("fails the turn when output ends without a result after a clean exit", async () => {
+      streamViaCli(mockModels[0] as any, freshContext());
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(0);
+      proc.emit("close", 0, null);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const failure = expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
+      expect(failure.error.errorMessage).toContain("exited with code 0 without a result");
+    });
+
+    it("fails the turn when the CLI is terminated by a signal before a result", async () => {
+      streamViaCli(mockModels[0] as any, freshContext());
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(0);
+      proc.emit("close", null, "SIGTERM");
+      await vi.advanceTimersByTimeAsync(0);
+
+      const failure = expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
+      expect(failure.error.errorMessage).toContain("terminated by SIGTERM");
+    });
+
+    it("still fails the turn when output ends without a result and no exit is ever reported", async () => {
+      streamViaCli(mockModels[0] as any, freshContext());
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
+    });
+
+    it("keeps partial content on a failed turn", async () => {
+      streamViaCli(mockModels[0] as any, freshContext());
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[0].value;
+      const lines = [
+        { type: "stream_event", event: { type: "message_start", message: { usage: { input_tokens: 1, output_tokens: 0 } } } },
+        { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+        { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial answer" } } },
+        { type: "result", subtype: "error_during_execution", errors: ["boom"] },
+      ];
+      for (const line of lines) proc.stdout.write(JSON.stringify(line) + "\n");
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const failure = expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
+      expect(failure.error.content).toEqual([expect.objectContaining({ type: "text", text: "partial answer" })]);
+    });
+
+    it("settles an abort during streaming immediately, without waiting for output to end", async () => {
+      const controller = new AbortController();
+      streamViaCli(mockModels[0] as any, freshContext(), { signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.write(
+        JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { usage: {} } } }) + "\n",
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+      expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "aborted");
+
+      // Late output and exit after the abort do not add a second terminal event.
+      proc.emit("close", null, "SIGKILL");
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "aborted");
+    });
+
+    it("settles as aborted when the abort lands during setup, before any output", async () => {
+      const controller = new AbortController();
+      (spawn as any).mockImplementationOnce((...args: unknown[]) => {
+        const real = (spawn as any).getMockImplementation()(...args);
+        controller.abort();
+        return real;
+      });
+      streamViaCli(mockModels[0] as any, freshContext(), { signal: controller.signal });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const proc = (spawn as any).mock.results[0].value;
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+      expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "aborted");
+    });
+
+    it("fails the turn when setup throws after spawn", async () => {
+      (spawn as any).mockImplementationOnce((...args: unknown[]) => {
+        const proc = (spawn as any).getMockImplementation()(...args);
+        proc.stdin.write = vi.fn(() => {
+          throw new Error("write after end");
+        });
+        return proc;
+      });
+      streamViaCli(mockModels[0] as any, freshContext());
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+      const failure = expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
+      expect(failure.error.errorMessage).toContain("write after end");
+    });
+
+    it("passes each invocation its own system prompt file and removes it only when that process closes", async () => {
+      const contextA = { messages: [{ role: "user", content: "A" }], systemPrompt: "Prompt for A" };
+      const contextB = { messages: [{ role: "user", content: "B" }], systemPrompt: "Prompt for B" };
+      streamViaCli(mockModels[0] as any, contextA);
+      streamViaCli(mockModels[0] as any, contextB);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const [argsA, argsB] = (spawn as any).mock.calls.map((call: unknown[]) => call[1] as string[]);
+      for (const args of [argsA, argsB]) {
+        expect(args).not.toContain("--append-system-prompt");
+        expect(args).toContain("--append-system-prompt-file");
+      }
+      const fileA = argsA[argsA.indexOf("--append-system-prompt-file") + 1];
+      const fileB = argsB[argsB.indexOf("--append-system-prompt-file") + 1];
+      expect(fileA).not.toBe(fileB);
+
+      const written = new Map(fsMocks.writeFileSync.mock.calls.map((call: unknown[]) => [call[0], call[1]]));
+      expect(written.get(fileA)).toContain("Prompt for A");
+      expect(written.get(fileB)).toContain("Prompt for B");
+
+      const removedDirs = () => fsMocks.rmSync.mock.calls.map((call: unknown[]) => call[0] as string);
+      const [procA, procB] = (spawn as any).mock.results.map((r: { value: any }) => r.value);
+      procA.stdout.write(JSON.stringify({ type: "result", subtype: "success", result: "ok" }) + "\n");
+      procA.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(removedDirs()).toEqual([]);
+
+      procA.emit("close", 0, null);
+      expect(removedDirs()).toHaveLength(1);
+      expect(fileA.startsWith(removedDirs()[0])).toBe(true);
+      expect(fileB.startsWith(removedDirs()[0])).toBe(false);
+
+      procB.emit("close", 1, null);
+      procB.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(removedDirs()).toHaveLength(2);
+      expect(fileB.startsWith(removedDirs()[1])).toBe(true);
+    });
+
+    it("removes the prompt file when the launch itself throws", async () => {
+      (spawn as any).mockImplementationOnce(() => {
+        throw new Error("Cannot launch claude without a command shell");
+      });
+      streamViaCli(mockModels[0] as any, { messages: [{ role: "user", content: "A" }], systemPrompt: "P" });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(fsMocks.mkdtempSync).toHaveBeenCalledTimes(1);
+      expect(fsMocks.rmSync).toHaveBeenCalledTimes(1);
+      expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
     });
   });
 });

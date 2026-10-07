@@ -2,11 +2,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { ChildProcess } from "node:child_process";
 
 // Mock child_process.spawn before importing process-manager
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: vi.fn(() => {
     const EventEmitter = require("node:events");
     const proc = new EventEmitter();
-    proc.stdin = { write: vi.fn(), end: vi.fn() };
+    proc.stdin = new EventEmitter();
+    proc.stdin.write = vi.fn();
+    proc.stdin.end = vi.fn();
     proc.stdout = new EventEmitter();
     proc.stderr = new EventEmitter();
     proc.killed = false;
@@ -18,26 +21,51 @@ vi.mock("node:child_process", () => ({
   }),
 }));
 
-const mocks = vi.hoisted(() => ({
-  writeFileSync: vi.fn(),
-  unlinkSync: vi.fn(),
-  existsSync: vi.fn(),
-  readFileSync: vi.fn(),
-  tmpdir: vi.fn(() => "/mock-tmp"),
-}));
+const mocks = vi.hoisted(() => {
+  let dirSeq = 0;
+  return {
+    writeFileSync: vi.fn(),
+    unlinkSync: vi.fn(),
+    existsSync: vi.fn(),
+    readFileSync: vi.fn(),
+    mkdtempSync: vi.fn((prefix: string) => `${prefix}${++dirSeq}`),
+    rmSync: vi.fn(),
+    tmpdir: vi.fn(() => "/mock-tmp"),
+  };
+});
 
-vi.mock("node:fs", () => ({
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
   writeFileSync: mocks.writeFileSync,
   unlinkSync: mocks.unlinkSync,
   existsSync: mocks.existsSync,
   readFileSync: mocks.readFileSync,
+  mkdtempSync: mocks.mkdtempSync,
+  rmSync: mocks.rmSync,
 }));
 
-vi.mock("node:os", () => ({
+vi.mock("node:os", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:os")>()),
   tmpdir: mocks.tmpdir,
 }));
 
+// Observe the shared launch seam while keeping its real resolution.
+vi.mock("../windows-launch.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../windows-launch.js")>();
+  return { ...actual, resolveShellFreeLaunch: vi.fn(actual.resolveShellFreeLaunch) };
+});
+
+/*
+FNXC:ClaudeCliProvider 2026-10-07-19:34:
+These cases assert POSIX launch and SIGKILL semantics on fake processes. Pin a POSIX host so a Windows runner, where launches resolve through PATHEXT and kills go through taskkill, exercises the same contract.
+The Windows launch and tree-kill cases below override the pin explicitly.
+*/
+beforeEach(() => {
+  vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+});
+
 import { spawn } from "node:child_process";
+import { resolveShellFreeLaunch } from "../windows-launch.js";
 import {
   spawnClaude,
   buildClaudeSpawnArgs,
@@ -49,7 +77,7 @@ import {
   forceKillProcess,
   registerProcess,
   killAllProcesses,
-  cleanupSystemPromptFile,
+  createSystemPromptFile,
 } from "../process-manager";
 
 describe("buildClaudeSpawnArgs", () => {
@@ -133,36 +161,56 @@ describe("spawnClaude", () => {
     expect(options.cwd).toBe("/custom/path");
   });
 
-  it("writes system prompt to temp file and passes path via --append-system-prompt", () => {
-    spawnClaude("claude-sonnet-4-5-20250929", "You are a helpful assistant.");
+  it("passes the prompt file path via --append-system-prompt-file, never as literal --append-system-prompt text", () => {
+    const promptFile = createSystemPromptFile("You are a helpful assistant.");
+    spawnClaude("claude-sonnet-4-5-20250929", promptFile.path);
     const args = (spawn as any).mock.calls[0][1] as string[];
-    const expectedTmpFile = `/mock-tmp/pi-claude-cli-sysprompt-${process.pid}.txt`;
 
-    expect(mocks.writeFileSync).toHaveBeenCalledWith(
-      expectedTmpFile,
-      "You are a helpful assistant.",
-      "utf-8",
-    );
-    expect(args).toContain("--append-system-prompt");
-    const idx = args.indexOf("--append-system-prompt");
-    expect(args[idx + 1]).toContain("pi-claude-cli-sysprompt-");
-    expect(args[idx + 1]).toBe(expectedTmpFile);
+    expect(args).not.toContain("--append-system-prompt");
+    const idx = args.indexOf("--append-system-prompt-file");
+    expect(idx).toBeGreaterThan(-1);
+    expect(args[idx + 1]).toBe(promptFile.path);
+    expect(mocks.writeFileSync).toHaveBeenCalledWith(promptFile.path, "You are a helpful assistant.", "utf-8");
   });
 
-  it("temp file contains the system prompt text", () => {
-    spawnClaude("claude-sonnet-4-5-20250929", "You are a helpful assistant.");
-
-    expect(mocks.writeFileSync).toHaveBeenCalledWith(
-      `/mock-tmp/pi-claude-cli-sysprompt-${process.pid}.txt`,
-      "You are a helpful assistant.",
-      "utf-8",
-    );
+  it("writes no files itself", () => {
+    spawnClaude("claude-sonnet-4-5-20250929", "/given/prompt.txt");
+    expect(mocks.writeFileSync).not.toHaveBeenCalled();
+    expect(mocks.mkdtempSync).not.toHaveBeenCalled();
   });
 
-  it("does not include --append-system-prompt when no system prompt", () => {
+  it("does not include a system prompt flag when no system prompt file", () => {
     spawnClaude("claude-sonnet-4-5-20250929");
     const args = (spawn as any).mock.calls[0][1] as string[];
     expect(args).not.toContain("--append-system-prompt");
+    expect(args).not.toContain("--append-system-prompt-file");
+  });
+
+  it("spawns without a shell", () => {
+    spawnClaude("claude-sonnet-4-5-20250929");
+    const options = (spawn as any).mock.calls[0][2];
+    expect(options.shell).toBe(false);
+    expect(options.windowsHide).toBe(true);
+  });
+
+  it("launches whatever the shared shell-free seam resolves, so an npm claude.cmd shim runs as node plus its entry", () => {
+    vi.mocked(resolveShellFreeLaunch).mockImplementationOnce((_command, args) => ({
+      command: "C:\\Program Files\\nodejs\\node.exe",
+      args: ["C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js", ...args],
+    }));
+    spawnClaude("claude-sonnet-4-5-20250929");
+
+    expect(resolveShellFreeLaunch).toHaveBeenCalledWith("claude", expect.arrayContaining(["--model"]));
+    const [cmd, args] = (spawn as any).mock.calls[0];
+    expect(cmd).toBe("C:\\Program Files\\nodejs\\node.exe");
+    expect(args[0]).toBe("C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js");
+    expect(args).toContain("--model");
+  });
+
+  it("listens for stdin errors so an early CLI exit cannot crash the host with EPIPE", () => {
+    const proc = spawnClaude("claude-sonnet-4-5-20250929") as any;
+    expect(proc.stdin.listenerCount("error")).toBe(1);
+    expect(() => proc.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }))).not.toThrow();
   });
 
   it("returns the spawned ChildProcess", () => {
@@ -219,12 +267,12 @@ describe("effort flag", () => {
   });
 
   it("is backward compatible - existing calls without effort still work", () => {
-    spawnClaude("claude-sonnet-4-5-20250929", "system prompt", {
+    spawnClaude("claude-sonnet-4-5-20250929", "/prompt/system-prompt.txt", {
       cwd: "/path",
     });
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).toContain("--append-system-prompt");
+    expect(args).toContain("--append-system-prompt-file");
     expect(args).not.toContain("--effort");
   });
 });
@@ -415,6 +463,35 @@ describe("validateCliPresenceAsync", () => {
     expect(result.ok).toBe(false);
   });
 
+  it("probes the same shell-free launch the session uses", async () => {
+    const EventEmitter = require("node:events");
+    vi.mocked(resolveShellFreeLaunch).mockImplementationOnce((_command, args) => ({
+      command: "/resolved/node",
+      args: ["/resolved/cli.js", ...args],
+    }));
+    (spawn as any).mockImplementationOnce(() => {
+      const proc = new EventEmitter();
+      proc.kill = vi.fn();
+      setImmediate(() => proc.emit("exit", 0));
+      return proc;
+    });
+
+    await expect(validateCliPresenceAsync()).resolves.toEqual({ ok: true });
+    const [cmd, args, options] = (spawn as any).mock.calls[0];
+    expect(cmd).toBe("/resolved/node");
+    expect(args).toEqual(["/resolved/cli.js", "--version"]);
+    expect(options.shell).toBe(false);
+  });
+
+  it("resolves ok=false when the claude shim cannot be launched without a shell", async () => {
+    vi.mocked(resolveShellFreeLaunch).mockImplementationOnce(() => {
+      throw new Error("Cannot launch claude (C:\\bin\\claude.bat) without a command shell");
+    });
+
+    await expect(validateCliPresenceAsync()).resolves.toMatchObject({ ok: false });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("resolves ok=false instead of rejecting when claude spawn throws synchronously", async () => {
     (spawn as any).mockImplementationOnce(() => {
       throw new Error("Real AI CLI launch blocked during tests: claude --version");
@@ -532,13 +609,13 @@ describe("mcp-config flag", () => {
   });
 
   it("backward compatibility - existing calls with only effort/cwd still work", () => {
-    spawnClaude("claude-sonnet-4-5-20250929", "system prompt", {
+    spawnClaude("claude-sonnet-4-5-20250929", "/prompt/system-prompt.txt", {
       cwd: "/path",
       effort: "high",
     });
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).toContain("--append-system-prompt");
+    expect(args).toContain("--append-system-prompt-file");
     expect(args).toContain("--effort");
     expect(args).not.toContain("--mcp-config");
     expect(args).not.toContain("--permission-prompt-tool");
@@ -580,6 +657,28 @@ describe("forceKillProcess", () => {
     forceKillProcess(proc);
 
     expect(proc.kill).not.toHaveBeenCalled();
+  });
+});
+
+describe("forceKillProcess on Windows", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+  });
+
+  it("kills the whole process tree with taskkill, not just the direct child", () => {
+    const EventEmitter = require("node:events");
+    const killer = new EventEmitter();
+    killer.unref = vi.fn();
+    (spawn as any).mockImplementationOnce(() => killer);
+    const proc = { pid: 4242, killed: false, exitCode: null, signalCode: null, kill: vi.fn() } as unknown as ChildProcess;
+
+    forceKillProcess(proc);
+
+    const [cmd, args, options] = (spawn as any).mock.calls[0];
+    expect(cmd).toBe("taskkill");
+    expect(args).toEqual(["/PID", "4242", "/T", "/F"]);
+    expect(options.shell).toBe(false);
   });
 });
 
@@ -728,27 +827,42 @@ describe("resume session flag", () => {
   });
 });
 
-describe("cleanupSystemPromptFile", () => {
+describe("createSystemPromptFile", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.unlinkSync.mockReset();
+    mocks.rmSync.mockReset();
     mocks.tmpdir.mockReset();
     mocks.tmpdir.mockReturnValue("/mock-tmp");
   });
 
-  it("deletes the temp file when it exists", () => {
-    cleanupSystemPromptFile();
+  it("gives every invocation its own file holding its own prompt", () => {
+    const a = createSystemPromptFile("prompt A");
+    const b = createSystemPromptFile("prompt B");
 
-    expect(mocks.unlinkSync).toHaveBeenCalledWith(
-      `/mock-tmp/pi-claude-cli-sysprompt-${process.pid}.txt`,
-    );
+    expect(a.path).not.toBe(b.path);
+    expect(mocks.writeFileSync).toHaveBeenCalledWith(a.path, "prompt A", "utf-8");
+    expect(mocks.writeFileSync).toHaveBeenCalledWith(b.path, "prompt B", "utf-8");
+    expect(a.path).not.toContain(String(process.pid));
   });
 
-  it("does not throw when file does not exist", () => {
-    mocks.unlinkSync.mockImplementation(() => {
-      throw new Error("ENOENT");
+  it("removes only its own directory, once", () => {
+    const a = createSystemPromptFile("prompt A");
+    const b = createSystemPromptFile("prompt B");
+
+    a.cleanup();
+    a.cleanup();
+
+    expect(mocks.rmSync).toHaveBeenCalledTimes(1);
+    const removed = mocks.rmSync.mock.calls[0][0] as string;
+    expect(a.path.startsWith(removed)).toBe(true);
+    expect(b.path.startsWith(removed)).toBe(false);
+  });
+
+  it("does not throw when removal fails", () => {
+    mocks.rmSync.mockImplementation(() => {
+      throw new Error("EBUSY");
     });
 
-    expect(() => cleanupSystemPromptFile()).not.toThrow();
+    expect(() => createSystemPromptFile("prompt").cleanup()).not.toThrow();
   });
 });
