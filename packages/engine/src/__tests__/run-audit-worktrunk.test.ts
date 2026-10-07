@@ -58,7 +58,8 @@ describe("run-audit worktrunk lifecycle events", () => {
     }));
   });
 
-  it("records long stderr previews without mutating payload content", async () => {
+  // FNXC:RunAudit 2026-10-07-20:30: stderr previews are diagnostic prose and are never persisted in run-audit metadata.
+  it("never persists stderr previews, and records that they were redacted", async () => {
     const recordRunAuditEvent = vi.fn(async (_event: RunAuditEventInput) => undefined);
     const auditor = createRunAuditor({ recordRunAuditEvent } as unknown as TaskStore, {
       runId: "run-1",
@@ -73,7 +74,9 @@ describe("run-audit worktrunk lifecycle events", () => {
       metadata: { op: "failure", stderrPreview: longPreview },
     });
 
-    expect(recordRunAuditEvent.mock.calls[0]?.[0]?.metadata?.stderrPreview).toHaveLength(5000);
+    const metadata = recordRunAuditEvent.mock.calls[0]?.[0]?.metadata;
+    expect(metadata?.stderrPreview).toBeUndefined();
+    expect(metadata).toMatchObject({ op: "failure", redactedFields: ["stderrPreview"] });
   });
 
   /*

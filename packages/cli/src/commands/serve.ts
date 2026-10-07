@@ -21,6 +21,7 @@ import {
   getEnabledPiExtensionPaths,
   hydrateGrokApiKeyFromUserSettings,
   projectPiXaiModelsToGrokCli,
+  claimEmbeddedPostgresSignalShutdown,
 } from "@fusion/core";
 import type { AutomationRunResult, ScheduledTask } from "@fusion/core";
 import { createServer, GitHubClient, createDashboardMissionForgeReader, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook, resolveGitLabClient } from "@fusion/dashboard";
@@ -1366,6 +1367,8 @@ export async function runServe(
   process.on("SIGTERM", () => {
     requestShutdown("SIGTERM");
   });
+  // FNXC:PostgresShutdownOrder 2026-10-07-19:51: this serve shutdown stops engines before releasing PostgreSQL and then exits, so the embedded lifecycle's signal hook must not stop the database or re-raise first. Held for the process lifetime.
+  claimEmbeddedPostgresSignalShutdown();
 
   // Ignore SIGHUP so the server survives SSH session disconnects.
   // Without this, SIGHUP (sent when the controlling terminal closes) kills

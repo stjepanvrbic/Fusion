@@ -59,6 +59,7 @@ import {
   chmodSync,
   writeFileSync,
 } from "node:fs";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { createServer, type Server } from "node:net";
@@ -67,6 +68,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { createLogger } from "../process/logger.js";
 import { redactConnectionString } from "./credential-redact.js";
 import type { ResolvedBackend } from "./backend-resolver.js";
+import { isEmbeddedPostgresSignalShutdownClaimed } from "./active-backend-registry.js";
 import {
   isWindowsElevatedAdmin,
   startServerElevatedRestricted,
@@ -820,6 +822,20 @@ export function __setWindowsLauncherForTests(
   windowsLauncherForTests = launcher;
 }
 
+/** Request for a clean `pg_ctl stop -m fast` of an owned Windows postmaster. */
+export interface WindowsPgCtlStopRequest {
+  readonly pgCtl: string;
+  readonly dataDir: string;
+  readonly timeoutSeconds: number;
+}
+type WindowsPgCtlStop = (request: WindowsPgCtlStopRequest) => Promise<{ status: number | null }>;
+let windowsPgCtlStopForTests: WindowsPgCtlStop | null = null;
+
+/** Test seam: replaces the pg_ctl stop and forces the Windows clean-stop branch on any host. */
+export function __setWindowsPgCtlStopForTests(stop: WindowsPgCtlStop | null): void {
+  windowsPgCtlStopForTests = stop;
+}
+
 function getEmbeddedPostgresCtor(): EmbeddedPostgresCtor {
   if (embeddedPostgresCtorCache) return embeddedPostgresCtorCache;
   // FNXC:DesktopEmbeddedPostgres 2026-07-14-18:30:
@@ -976,6 +992,68 @@ export interface EmbeddedLifecycleOptions {
  * Reuse starts (no initdb) finish in seconds, well within the bound.
  */
 export const DEFAULT_START_TIMEOUT_MS = 120_000;
+
+/** pg_ctl's own `-t` wait for a fast shutdown of an owned Windows postmaster. */
+const WINDOWS_PG_CTL_STOP_TIMEOUT_SECONDS = 30;
+/** Wall-clock beyond pg_ctl's `-t` before a pg_ctl process itself is treated as hung. */
+const WINDOWS_PG_CTL_PROCESS_GRACE_MS = 10_000;
+/** After pg_ctl reports a completed shutdown, how long the postmaster child may take to exit. */
+const WINDOWS_POSTMASTER_EXIT_WAIT_MS = 5_000;
+
+/** The embedded-postgres library's postmaster child, read for a clean Windows stop. */
+type PostmasterChildLike = {
+  readonly exitCode: number | null;
+  readonly signalCode: NodeJS.Signals | string | null;
+  readonly spawnfile: string;
+  once(event: "exit", listener: () => void): unknown;
+  removeListener(event: "exit", listener: () => void): unknown;
+};
+
+function hasChildExited(child: PostmasterChildLike): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForChildExit(child: PostmasterChildLike, timeoutMs: number): Promise<boolean> {
+  if (hasChildExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const onExit = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      child.removeListener("exit", onExit);
+      resolve(hasChildExited(child));
+    }, timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
+function runWindowsPgCtlFastStop(request: WindowsPgCtlStopRequest): Promise<{ status: number | null }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (status: number | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status });
+    };
+    const child = spawn(
+      request.pgCtl,
+      ["-D", request.dataDir, "-m", "fast", "-t", String(request.timeoutSeconds), "-w", "stop"],
+      {
+        windowsHide: true,
+        stdio: "ignore",
+        env: withWindowsNativeBinPath(process.env, dirname(dirname(request.pgCtl))),
+      },
+    );
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(null);
+    }, request.timeoutSeconds * 1000 + WINDOWS_PG_CTL_PROCESS_GRACE_MS);
+    child.once("error", () => finish(null));
+    child.once("exit", (code) => finish(code));
+  });
+}
 
 /**
  * The marker file `initdb` writes into a data directory once initialization
@@ -1234,6 +1312,25 @@ export function readPidFromPostmasterPid(dataDir: string): number | null {
   }
 }
 
+/**
+ * Identify the postmaster recorded in postmaster.pid as `pid:start-timestamp`, or null.
+ *
+ * FNXC:PostgresBackup 2026-10-07-19:31:
+ * The process-local runtime registry keys lease generations by the actual postmaster, not the URL alone.
+ * PostgreSQL writes both fields itself on every start path (ordinary and elevated Windows), so owners and joiners read the same identity, and a restart on a reused port yields a different one.
+ */
+export function readPostmasterIdentity(dataDir: string): string | null {
+  try {
+    const lines = readFileSync(join(dataDir, "postmaster.pid"), "utf-8").split("\n");
+    const pid = parseInt((lines[0] ?? "").trim(), 10);
+    const startedAt = (lines[2] ?? "").trim();
+    if (!Number.isFinite(pid) || pid <= 0 || !/^\d+$/.test(startedAt)) return null;
+    return `${pid}:${startedAt}`;
+  } catch {
+    return null;
+  }
+}
+
 /*
 FNXC:PostgresEmbedded 2026-07-23-11:50:
 Issue #2411 (stale-pid gap): a hard host crash (SIGKILL, power loss) leaves
@@ -1255,6 +1352,65 @@ function isPostmasterProcessAlive(pid: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException | undefined)?.code === "EPERM";
   }
+}
+
+/** What the process at a recorded postmaster pid is: a postgres server, something else, or unknowable. */
+export type PostmasterImageVerdict = "postgres" | "other" | "unknown";
+type PostmasterImageProbe = (pid: number) => Promise<PostmasterImageVerdict>;
+let postmasterImageProbeForTests: PostmasterImageProbe | null = null;
+const POSTMASTER_IMAGE_PROBE_TIMEOUT_MS = 5_000;
+
+/** Test seam replacing {@link probePostmasterImage}; null restores the platform probe. */
+export function __setPostmasterImageProbeForTests(probe: PostmasterImageProbe | null): void {
+  postmasterImageProbeForTests = probe;
+}
+
+function execFileStdout(file: string, args: readonly string[]): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(file, [...args], { timeout: POSTMASTER_IMAGE_PROBE_TIMEOUT_MS, windowsHide: true }, (error, stdout) => {
+      resolve(error ? null : String(stdout));
+    });
+  });
+}
+
+function classifyImageName(image: string): PostmasterImageVerdict {
+  return /^postgres(?:\.exe)?$/i.test(basename(image.trim())) ? "postgres" : "other";
+}
+
+/**
+ * Identify the executable behind a live recorded postmaster pid.
+ *
+ * FNXC:PostgresEmbedded 2026-10-07-19:43:
+ * Windows recycles pids aggressively, so a crash-left postmaster.pid can name a live unrelated process; signal-0 liveness then made every boot join a dead port until the operator deleted the file.
+ * A join requires the recorded pid to be a postgres process: Windows reads the image name via tasklist, Linux via /proc, other hosts via ps.
+ * A probe that cannot answer reports unknown, which keeps the historical fail-closed join.
+ */
+export async function probePostmasterImage(pid: number): Promise<PostmasterImageVerdict> {
+  if (process.platform === "win32") {
+    const stdout = await execFileStdout("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"]);
+    if (stdout === null) return "unknown";
+    const row = stdout.split(/\r?\n/).find((line) => line.startsWith("\""));
+    if (!row) return "other";
+    const [image, rowPid] = row.split("\",\"").map((field) => field.replace(/^"|"$/g, ""));
+    if (Number.parseInt(rowPid ?? "", 10) !== pid) return "other";
+    return classifyImageName(image ?? "");
+  }
+  if (process.platform === "linux") {
+    try {
+      return classifyImageName(readFileSync(`/proc/${pid}/comm`, "utf-8"));
+    } catch (error) {
+      return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" ? "other" : "unknown";
+    }
+  }
+  const stdout = await execFileStdout("ps", ["-o", "comm=", "-p", String(pid)]);
+  if (stdout === null) return "unknown";
+  const image = stdout.trim();
+  return image ? classifyImageName(image) : "other";
+}
+
+async function isRecordedPostmasterLive(pid: number): Promise<boolean> {
+  if (!isPostmasterProcessAlive(pid)) return false;
+  return (await (postmasterImageProbeForTests ?? probePostmasterImage)(pid)) !== "other";
 }
 
 /**
@@ -1386,9 +1542,9 @@ async function isAlreadyRunning(
   if (!existsSync(pidPath)) return null;
 
   const pid = readPidFromPostmasterPid(dataDir);
-  if (pid !== null && !isPostmasterProcessAlive(pid)) {
+  if (pid !== null && !(await isRecordedPostmasterLive(pid))) {
     onLog?.(
-      `embedded postgres: postmaster.pid in ${dataDir} records pid ${pid}, which is not running (stale lock from a crash); starting an owned postmaster — PostgreSQL reclaims the stale lock file itself`,
+      `embedded postgres: postmaster.pid in ${dataDir} records pid ${pid}, which is not a running postgres process (stale lock from a crash); starting an owned postmaster — PostgreSQL reclaims the stale lock file itself`,
     );
     return null;
   }
@@ -1528,6 +1684,11 @@ export class EmbeddedPostgresLifecycle {
   /** True when this lifecycle started the postmaster rather than joining it. */
   getOwnsProcess(): boolean {
     return this.ownsProcess;
+  }
+
+  /** Identity of the postmaster this lifecycle started or joined; see {@link readPostmasterIdentity}. */
+  getPostmasterIdentity(): string | null {
+    return readPostmasterIdentity(this.options.dataDir);
   }
 
   /** True when the embedded postgres process is currently running. */
@@ -1913,7 +2074,7 @@ export class EmbeddedPostgresLifecycle {
       this.options.onLog("embedded postgres: detected Windows DLL initialization shutdown; attempting one owned-cluster recovery");
       try {
         if (this.nonAdminHandle) await this.nonAdminHandle.stop();
-        else await this.pg?.stop();
+        else if (this.pg) await this.stopLibraryPostgres(this.pg);
         this.pg = null;
         this.nonAdminHandle = null;
         this.running = false;
@@ -1954,7 +2115,7 @@ export class EmbeddedPostgresLifecycle {
       }
     }
     try {
-      await pg.stop();
+      await this.stopLibraryPostgres(pg);
     } catch (error) {
       this.options.onError(`embedded postgres: cancelled startup cleanup failed: ${String(error)}`);
     } finally {
@@ -2189,6 +2350,35 @@ export class EmbeddedPostgresLifecycle {
     runningInstances.delete(this.options.dataDir);
   }
 
+  /**
+   * Stop the library-launched (non-elevated) postmaster.
+   *
+   * FNXC:PostgresEmbedded 2026-10-07-19:39:
+   * embedded-postgres stops Windows postmasters with `taskkill /f /t`, a forced TerminateProcess with no shutdown checkpoint, so every ordinary Fusion stop or restart was a PostgreSQL crash followed by WAL recovery on the next boot.
+   * An owned Windows postmaster must stop cleanly on every stop path (stop, signal hook, cancelled start, fatal recovery): run `pg_ctl stop -m fast -w` from the postmaster's own bin directory and force-kill only when pg_ctl cannot stop it.
+   * A postmaster child that already exited is never signalled: the library would wait forever for an exit that already happened and taskkill a pid Windows may have recycled.
+   */
+  private async stopLibraryPostgres(pg: EmbeddedPostgresInstance): Promise<void> {
+    const gracefulStop = windowsPgCtlStopForTests ?? (process.platform === "win32" ? runWindowsPgCtlFastStop : null);
+    const child = (pg as { process?: PostmasterChildLike }).process;
+    if (!gracefulStop || !child) {
+      await pg.stop();
+      return;
+    }
+    if (hasChildExited(child)) return;
+    const { status } = await gracefulStop({
+      pgCtl: join(dirname(child.spawnfile), "pg_ctl.exe"),
+      dataDir: this.options.dataDir,
+      timeoutSeconds: WINDOWS_PG_CTL_STOP_TIMEOUT_SECONDS,
+    });
+    if (status === 0 && (await waitForChildExit(child, WINDOWS_POSTMASTER_EXIT_WAIT_MS))) return;
+    if (hasChildExited(child)) return;
+    this.options.onLog(
+      `embedded postgres: pg_ctl fast stop did not stop the postmaster (status=${String(status)}); falling back to a forced stop`,
+    );
+    await pg.stop();
+  }
+
   async stop(): Promise<void> {
     this.stopRequested = true;
     this.uninstallShutdownHook();
@@ -2226,7 +2416,7 @@ export class EmbeddedPostgresLifecycle {
       return;
     }
     try {
-      await this.pg.stop();
+      await this.stopLibraryPostgres(this.pg);
     } catch (err) {
       this.options.onError(`embedded postgres: error during stop: ${String(err)}`);
     } finally {
@@ -2294,6 +2484,8 @@ export class EmbeddedPostgresLifecycle {
   ): Promise<void> => {
     if (!this.running && signal !== "beforeExit") return;
     if (!this.ownsProcess) return; // Don't stop an instance we didn't start
+    // FNXC:PostgresShutdownOrder 2026-10-07-19:49: a claimed signal belongs to the owning CLI shutdown, which stops engines before releasing this backend; stopping or re-raising here races that teardown.
+    if (signal !== "beforeExit" && isEmbeddedPostgresSignalShutdownClaimed()) return;
     this.options.onLog(
       `embedded postgres: received ${signal}, stopping embedded cluster`,
     );

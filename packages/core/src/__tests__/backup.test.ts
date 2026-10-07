@@ -1173,6 +1173,49 @@ describe("embedded backup runtime URL registry", () => {
     expect(getActiveEmbeddedRuntimeUrl()).toBeUndefined();
   });
 
+  it("adopts a joiner that registered before the owner of the same postmaster", async () => {
+    const stopOwner = vi.fn(async () => undefined);
+    const joiner = registerEmbeddedRuntimeUrl(embeddedUrl, { ownsProcess: false, postmasterIdentity: "4242:1784424901" });
+    const owner = registerEmbeddedRuntimeUrl(embeddedUrl, { ownsProcess: true, postmasterIdentity: "4242:1784424901" });
+
+    await releaseEmbeddedRuntimeLease(owner, { stopOwner });
+    expect(stopOwner).not.toHaveBeenCalled();
+    expect(getActiveEmbeddedRuntimeUrl()).toBe(embeddedUrl);
+
+    await releaseEmbeddedRuntimeLease(joiner);
+    expect(stopOwner).toHaveBeenCalledOnce();
+    expect(getActiveEmbeddedRuntimeUrl()).toBeUndefined();
+  });
+
+  it("adopts an earlier joiner when the postmaster identity is unknown to either side", async () => {
+    const stopOwner = vi.fn(async () => undefined);
+    const joiner = registerEmbeddedRuntimeUrl(embeddedUrl, { ownsProcess: false });
+    const owner = registerEmbeddedRuntimeUrl(embeddedUrl, { ownsProcess: true, postmasterIdentity: "4242:1784424901" });
+
+    await releaseEmbeddedRuntimeLease(owner, { stopOwner });
+    expect(stopOwner).not.toHaveBeenCalled();
+    await releaseEmbeddedRuntimeLease(joiner);
+    expect(stopOwner).toHaveBeenCalledOnce();
+  });
+
+  it("starts a new generation only when the postmaster identity proves replacement", async () => {
+    const staleStop = vi.fn(async () => undefined);
+    const replacementStop = vi.fn(async () => undefined);
+    const staleJoiner = registerEmbeddedRuntimeUrl(embeddedUrl, { ownsProcess: false, postmasterIdentity: "4242:1784424901" });
+    const replacementOwner = registerEmbeddedRuntimeUrl(embeddedUrl, { ownsProcess: true, postmasterIdentity: "5151:1784429999" });
+    const replacementJoiner = registerEmbeddedRuntimeUrl(embeddedUrl, { ownsProcess: false, postmasterIdentity: "5151:1784429999" });
+
+    await releaseEmbeddedRuntimeLease(staleJoiner, { stopOwner: staleStop });
+    expect(getActiveEmbeddedRuntimeUrl()).toBe(embeddedUrl);
+
+    await releaseEmbeddedRuntimeLease(replacementOwner, { stopOwner: replacementStop });
+    expect(replacementStop).not.toHaveBeenCalled();
+    await releaseEmbeddedRuntimeLease(replacementJoiner);
+    expect(replacementStop).toHaveBeenCalledOnce();
+    expect(staleStop).not.toHaveBeenCalled();
+    expect(getActiveEmbeddedRuntimeUrl()).toBeUndefined();
+  });
+
   it("uses the last live registration and ignores unknown invalidation/releases", () => {
     const firstUrl = pgUrl("a", "postgres", "127.0.0.1", 55431);
     const first = registerEmbeddedRuntimeUrl(firstUrl, { ownsProcess: true });

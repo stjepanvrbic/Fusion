@@ -14,7 +14,7 @@
  *   - VAL-CONN-007: graceful shutdown stops the Postgres process; no orphan.
  */
 
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import {
   mkdtempSync,
   existsSync,
@@ -26,6 +26,7 @@ import {
   symlinkSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -44,12 +45,16 @@ import {
   isDataDirInitialized,
   isWindowsElevatedAdmin,
   readPidFromPostmasterPid,
+  readPostmasterIdentity,
   normalizeMacosEmbeddedPostgresDylibSymlinks,
   readPortFromPostmasterPid,
   __setEmbeddedPostgresCtorForTests,
   __setWindowsElevatedAdminForTests,
   __setWindowsEmbeddedPostgresNativeRootForTests,
   __setWindowsLauncherForTests,
+  __setWindowsPgCtlStopForTests,
+  __setPostmasterImageProbeForTests,
+  probePostmasterImage,
   resolveElectronAsarUnpackedPath,
   fingerprintEmbeddedPostgresNativeRoot,
   buildEmbeddedPostgresMaterializationMarker,
@@ -66,6 +71,14 @@ import {
   embeddedPostgresRuntimeBinRoot,
   type EmbeddedLifecycleOptions,
 } from "../../postgres/embedded-lifecycle.js";
+import {
+  claimEmbeddedPostgresSignalShutdown,
+  clearActiveEmbeddedRuntimeUrl,
+  isEmbeddedPostgresSignalShutdownClaimed,
+  getActiveEmbeddedRuntimeUrl,
+  registerEmbeddedRuntimeUrl,
+  releaseEmbeddedRuntimeLease,
+} from "../../postgres/active-backend-registry.js";
 
 const testRequire = createRequire(import.meta.url);
 
@@ -78,11 +91,21 @@ const tracked: Array<{
   dataDir: string;
 }> = [];
 
+/*
+Join-path fixtures record this test process's pid as the live postmaster in postmaster.pid.
+A join requires that pid to be a postgres process, so the image probe declares it one; the stale-pid suite restores the real probe.
+*/
+beforeEach(() => {
+  __setPostmasterImageProbeForTests(async (pid) => (pid === process.pid ? "postgres" : "other"));
+});
+
 afterEach(async () => {
+  __setPostmasterImageProbeForTests(null);
   __setEmbeddedPostgresCtorForTests(null);
   __setWindowsElevatedAdminForTests(null);
   __setWindowsEmbeddedPostgresNativeRootForTests(null);
   __setWindowsLauncherForTests(null);
+  __setWindowsPgCtlStopForTests(null);
   clearEmbeddedPayloadIntegrityFailure();
   vi.useRealTimers();
   while (tracked.length > 0) {
@@ -1575,6 +1598,86 @@ describe("embedded-lifecycle: stale postmaster.pid recovery (issue #2411)", () =
     }
   });
 
+  it("identifies a live non-postgres process with the real platform probe", async () => {
+    await expect(probePostmasterImage(process.pid)).resolves.toBe("other");
+  });
+
+  it.each(["preflight join", "lock-collision join"] as const)(
+    "%s: never joins a postmaster.pid that names a live recycled non-postgres pid",
+    async (surface) => {
+      __setPostmasterImageProbeForTests(null);
+      const dataDir = makeDataDir();
+      writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+      const recordRecycledPid = () =>
+        writeFileSync(
+          join(dataDir, "postmaster.pid"),
+          [String(process.pid), dataDir, "1784424901", "55452", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+        );
+      if (surface === "preflight join") recordRecycledPid();
+      const lockCollision = new Error('lock file "postmaster.pid" already exists');
+      const ownedStartReached = new Error("owned start reached");
+      const ctor = vi.fn();
+      class RecycledPidEmbeddedPostgres {
+        constructor() {
+          ctor();
+        }
+        initialise = vi.fn(async () => {});
+        start = vi.fn(async () => {
+          if (surface === "lock-collision join") {
+            recordRecycledPid();
+            throw lockCollision;
+          }
+          throw ownedStartReached;
+        });
+        stop = vi.fn(async () => {});
+      }
+      __setEmbeddedPostgresCtorForTests(RecycledPidEmbeddedPostgres as never);
+      __setWindowsElevatedAdminForTests(false);
+      const ensureJoinedDatabase = vi.spyOn(EmbeddedPostgresLifecycle.prototype as never, "ensureJoinedDatabase");
+      try {
+        const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), startTimeoutMs: 0 });
+        // Preflight: the owned start runs instead of joining. Lock collision: the
+        // collision is surfaced instead of being rescued into a join of a dead port.
+        await expect(lifecycle.start()).rejects.toBe(surface === "preflight join" ? ownedStartReached : lockCollision);
+        expect(ctor).toHaveBeenCalledOnce();
+        expect(ensureJoinedDatabase).not.toHaveBeenCalled();
+      } finally {
+        ensureJoinedDatabase.mockRestore();
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("keeps the fail-closed join when the image probe cannot answer", async () => {
+    __setPostmasterImageProbeForTests(async () => "unknown");
+    const dataDir = makeDataDir();
+    const ctor = vi.fn();
+    class UnexpectedEmbeddedPostgres {
+      constructor() {
+        ctor();
+      }
+      initialise = vi.fn(async () => {});
+      start = vi.fn(async () => {});
+      stop = vi.fn(async () => {});
+    }
+    __setEmbeddedPostgresCtorForTests(UnexpectedEmbeddedPostgres as never);
+    const ensureJoinedDatabase = vi
+      .spyOn(EmbeddedPostgresLifecycle.prototype as never, "ensureJoinedDatabase")
+      .mockResolvedValue(undefined as never);
+    try {
+      writeFileSync(
+        join(dataDir, "postmaster.pid"),
+        [String(process.pid), dataDir, "1784424901", "55453", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+      );
+      const lifecycle = new EmbeddedPostgresLifecycle(baseOptions(dataDir));
+      await expect(lifecycle.start()).resolves.toMatchObject({ runtimeUrl: expect.stringContaining(":55453/") });
+      expect(ctor).not.toHaveBeenCalled();
+    } finally {
+      ensureJoinedDatabase.mockRestore();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("readPidFromPostmasterPid reads line 1 and rejects garbage", () => {
     const dataDir = makeDataDir();
     try {
@@ -1593,6 +1696,196 @@ describe("embedded-lifecycle: stale postmaster.pid recovery (issue #2411)", () =
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
+});
+
+describe("embedded-lifecycle: owned Windows postmaster stops cleanly (pg_ctl fast)", () => {
+  type FakeChild = EventEmitter & { exitCode: number | null; signalCode: string | null; spawnfile: string; pid: number };
+  function fakePostgresChild(): FakeChild {
+    return Object.assign(new EventEmitter(), {
+      exitCode: null,
+      signalCode: null,
+      spawnfile: join("C:", "pg", "native", "bin", "postgres.exe"),
+      pid: 4242,
+    });
+  }
+
+  function setup(options: { pgCtlStatus?: number; exitOnPgCtl?: boolean } = {}) {
+    const dataDir = makeDataDir();
+    writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+    const child = fakePostgresChild();
+    const libraryStop = vi.fn(async () => {});
+    class ChildOwningEmbeddedPostgres {
+      process: FakeChild | undefined;
+      initialise = vi.fn(async () => {});
+      start = vi.fn(async () => { this.process = child; });
+      stop = libraryStop;
+    }
+    __setEmbeddedPostgresCtorForTests(ChildOwningEmbeddedPostgres as never);
+    __setWindowsElevatedAdminForTests(false);
+    const pgCtlCalls: Array<{ pgCtl: string; dataDir: string }> = [];
+    __setWindowsPgCtlStopForTests(async (request) => {
+      pgCtlCalls.push({ pgCtl: request.pgCtl, dataDir: request.dataDir });
+      if (options.exitOnPgCtl !== false) {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+      }
+      return { status: options.pgCtlStatus ?? 0 };
+    });
+    vi.spyOn(EmbeddedPostgresLifecycle.prototype, "ensureDatabase").mockResolvedValue(undefined);
+    const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), port: 55460, startTimeoutMs: 0 });
+    tracked.push({ lifecycle, dataDir });
+    return { dataDir, child, libraryStop, pgCtlCalls, lifecycle };
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("stop() runs pg_ctl fast shutdown from the postmaster's own bin and never force-kills", async () => {
+    const { dataDir, libraryStop, pgCtlCalls, lifecycle } = setup();
+    await lifecycle.start();
+    await lifecycle.stop();
+    expect(pgCtlCalls).toEqual([{ pgCtl: join("C:", "pg", "native", "bin", "pg_ctl.exe"), dataDir }]);
+    expect(libraryStop).not.toHaveBeenCalled();
+    expect(lifecycle.isRunning()).toBe(false);
+  });
+
+  it("the signal hook stops through pg_ctl", async () => {
+    const { pgCtlCalls, libraryStop, lifecycle } = setup();
+    await lifecycle.start();
+    const realKill = process.kill;
+    (process as unknown as { kill: () => void }).kill = () => {};
+    try {
+      await (lifecycle as unknown as { boundShutdown: (s: NodeJS.Signals) => Promise<void> }).boundShutdown("SIGINT");
+    } finally {
+      (process as unknown as { kill: typeof realKill }).kill = realKill;
+    }
+    expect(pgCtlCalls).toHaveLength(1);
+    expect(libraryStop).not.toHaveBeenCalled();
+  });
+
+  it("Windows fatal recovery stops the crashed owner through pg_ctl before restarting", async () => {
+    const { pgCtlCalls, libraryStop, lifecycle } = setup();
+    await lifecycle.start();
+    await (lifecycle as unknown as { recoverWindowsFatalOnce: () => Promise<void> }).recoverWindowsFatalOnce();
+    expect(pgCtlCalls.length).toBeGreaterThanOrEqual(1);
+    expect(libraryStop).not.toHaveBeenCalled();
+  });
+
+  it("a cancelled start settles its postmaster through pg_ctl", async () => {
+    const { pgCtlCalls, libraryStop, lifecycle, child } = setup();
+    const internal = lifecycle as unknown as {
+      settleCancelledStart: (pg: { process?: unknown; stop: () => Promise<void> }) => Promise<void>;
+    };
+    await internal.settleCancelledStart({ process: child, stop: libraryStop });
+    expect(pgCtlCalls).toHaveLength(1);
+    expect(libraryStop).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the library stop when pg_ctl cannot stop the postmaster", async () => {
+    const { pgCtlCalls, libraryStop, lifecycle } = setup({ pgCtlStatus: 1, exitOnPgCtl: false });
+    await lifecycle.start();
+    await lifecycle.stop();
+    expect(pgCtlCalls).toHaveLength(1);
+    expect(libraryStop).toHaveBeenCalledOnce();
+  });
+
+  it("does not signal an already-exited postmaster pid, which Windows may have recycled", async () => {
+    const { pgCtlCalls, libraryStop, lifecycle, child } = setup();
+    await lifecycle.start();
+    child.exitCode = 1;
+    await lifecycle.stop();
+    expect(pgCtlCalls).toHaveLength(0);
+    expect(libraryStop).not.toHaveBeenCalled();
+  });
+});
+
+describe("embedded-lifecycle: postmaster identity for runtime lease generations", () => {
+  const startedAt = "1784424901";
+  function writePidFile(dataDir: string, port: number): void {
+    writeFileSync(
+      join(dataDir, "postmaster.pid"),
+      [String(process.pid), dataDir, startedAt, String(port), "/tmp", "localhost", "79484 2", "ready"].join("\n") + "\n",
+    );
+  }
+
+  afterEach(() => {
+    clearActiveEmbeddedRuntimeUrl();
+  });
+
+  it("reads pid and start timestamp, and rejects partial files", () => {
+    const dataDir = makeDataDir();
+    try {
+      writePidFile(dataDir, 55450);
+      expect(readPostmasterIdentity(dataDir)).toBe(`${process.pid}:${startedAt}`);
+      writeFileSync(join(dataDir, "postmaster.pid"), `${process.pid}\n${dataDir}\n`);
+      expect(readPostmasterIdentity(dataDir)).toBeNull();
+      rmSync(join(dataDir, "postmaster.pid"));
+      expect(readPostmasterIdentity(dataDir)).toBeNull();
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["ordinary", "elevated-windows"] as const)(
+    "a joiner registered before the %s owner shares the owner's generation and defers its stop",
+    async (startPath) => {
+      const dataDir = makeDataDir();
+      writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+      const port = 55451;
+      class PidWritingEmbeddedPostgres {
+        initialise = vi.fn(async () => {});
+        start = vi.fn(async () => { writePidFile(dataDir, port); });
+        stop = vi.fn(async () => {});
+      }
+      __setEmbeddedPostgresCtorForTests(PidWritingEmbeddedPostgres as never);
+      if (startPath === "elevated-windows") {
+        __setWindowsElevatedAdminForTests(true);
+        __setWindowsEmbeddedPostgresNativeRootForTests("/test/embedded-postgres/native");
+        __setWindowsLauncherForTests(async () => {
+          writePidFile(dataDir, port);
+          return {
+            postgresPid: process.pid,
+            stop: vi.fn(async () => {}),
+            stopMonitoring: vi.fn(),
+            stopWrapperOnly: vi.fn(async () => {}),
+          };
+        });
+      } else {
+        __setWindowsElevatedAdminForTests(false);
+      }
+      vi.spyOn(EmbeddedPostgresLifecycle.prototype, "ensureDatabase").mockResolvedValue(undefined);
+      vi.spyOn(EmbeddedPostgresLifecycle.prototype as never, "ensureJoinedDatabase").mockResolvedValue(undefined as never);
+      const owner = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), port, startTimeoutMs: 0 });
+      const joiner = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), startTimeoutMs: 0 });
+      tracked.push({ lifecycle: joiner, dataDir }, { lifecycle: owner, dataDir });
+      try {
+        const ownerBackend = await owner.start();
+        const joinerBackend = await joiner.start();
+        expect(owner.getOwnsProcess()).toBe(true);
+        expect(joiner.getOwnsProcess()).toBe(false);
+        expect(joiner.getPostmasterIdentity()).toBe(owner.getPostmasterIdentity());
+        expect(owner.getPostmasterIdentity()).toBe(`${process.pid}:${startedAt}`);
+
+        const stopOwner = vi.fn(async () => undefined);
+        const joinerLease = registerEmbeddedRuntimeUrl(joinerBackend.runtimeUrl!, {
+          ownsProcess: false,
+          postmasterIdentity: joiner.getPostmasterIdentity(),
+        });
+        const ownerLease = registerEmbeddedRuntimeUrl(ownerBackend.runtimeUrl!, {
+          ownsProcess: true,
+          postmasterIdentity: owner.getPostmasterIdentity(),
+        });
+        await releaseEmbeddedRuntimeLease(ownerLease, { stopOwner });
+        expect(stopOwner).not.toHaveBeenCalled();
+        expect(getActiveEmbeddedRuntimeUrl()).toBe(ownerBackend.runtimeUrl);
+        await releaseEmbeddedRuntimeLease(joinerLease);
+        expect(stopOwner).toHaveBeenCalledOnce();
+      } finally {
+        vi.restoreAllMocks();
+      }
+    },
+  );
 });
 
 describe("embedded-lifecycle: postmaster.pid join safety", () => {
@@ -1872,6 +2165,61 @@ describe("embedded-lifecycle: platform-aware max_connections default (issue #241
   it("treats non-integer configured values as unset", () => {
     expect(resolveEmbeddedMaxConnections(Number.NaN, "win32")).toBe(DEFAULT_EMBEDDED_MAX_CONNECTIONS_WIN32);
     expect(resolveEmbeddedMaxConnections(250.5, "linux")).toBe(DEFAULT_EMBEDDED_MAX_CONNECTIONS);
+  });
+});
+
+describe("embedded-lifecycle: claimed signal shutdown defers to the owning CLI", () => {
+  function ownedRunningLifecycle() {
+    const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions("/tmp/unused-claimed"), port: 55433 });
+    const pgStop = vi.fn(async () => {});
+    const internal = lifecycle as unknown as {
+      running: boolean;
+      ownsProcess: boolean;
+      pg: { stop: () => Promise<void> };
+      boundShutdown: (signal: NodeJS.Signals | "beforeExit") => Promise<void>;
+    };
+    internal.running = true;
+    internal.ownsProcess = true;
+    internal.pg = { stop: pgStop };
+    return { lifecycle, internal, pgStop };
+  }
+
+  it.each(["SIGINT", "SIGTERM"] as const)("%s neither stops PostgreSQL nor re-raises while a claim is held", async (signal) => {
+    const { internal, pgStop, lifecycle } = ownedRunningLifecycle();
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const release = claimEmbeddedPostgresSignalShutdown();
+    try {
+      await internal.boundShutdown(signal);
+      expect(pgStop).not.toHaveBeenCalled();
+      expect(lifecycle.isRunning()).toBe(true);
+      expect(kill).not.toHaveBeenCalled();
+      expect(exit).not.toHaveBeenCalled();
+    } finally {
+      release();
+      kill.mockRestore();
+      exit.mockRestore();
+    }
+  });
+
+  it("releasing the claim restores the self-owned signal stop, and beforeExit always stops", async () => {
+    const claimed = ownedRunningLifecycle();
+    const release = claimEmbeddedPostgresSignalShutdown();
+    await claimed.internal.boundShutdown("beforeExit");
+    expect(claimed.pgStop).toHaveBeenCalledOnce();
+    release();
+    release();
+    expect(isEmbeddedPostgresSignalShutdownClaimed()).toBe(false);
+
+    const unclaimed = ownedRunningLifecycle();
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      await unclaimed.internal.boundShutdown("SIGTERM");
+      expect(unclaimed.pgStop).toHaveBeenCalledOnce();
+      expect(kill).toHaveBeenCalledWith(process.pid, "SIGTERM");
+    } finally {
+      kill.mockRestore();
+    }
   });
 });
 

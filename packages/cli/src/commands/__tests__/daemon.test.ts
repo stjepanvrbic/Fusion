@@ -955,6 +955,14 @@ describe("runDaemon", () => {
   // non-zero (128+signal) so a `Restart=on-failure` supervisor restarts the
   // daemon instead of treating the kill as a clean stop. Regression for the
   // "daemon exits clean under memory pressure and isn't restarted" report.
+  // FNXC:PostgresShutdownOrder 2026-10-07-19:58: the command's own shutdown stops engines before PostgreSQL, so it must hold the embedded signal-shutdown claim.
+  it("claims embedded PostgreSQL signal shutdown when it installs its handlers", async () => {
+    const { isEmbeddedPostgresSignalShutdownClaimed } = await import("@fusion/core");
+    await runDaemon({});
+    expect(isEmbeddedPostgresSignalShutdownClaimed()).toBe(true);
+    await triggerSignal("SIGINT");
+  });
+
   it("exits 143 on SIGTERM-initiated shutdown", async () => {
     await runDaemon({});
     await triggerSignal("SIGTERM");

@@ -288,8 +288,6 @@ export const RECOVERY_DISPOSITION_VERSION = "0088";
 /** FNXC:MemoryFocus 2026-08-13-15:57: explicit registration prevents the per-conversation memory-focus migration from being skipped. Renumbered to 0060 (FN-9037 took 0059), then 0061, then 0065 (2026-08-20) when the upstream FN-066..FN-094 batch claimed 0061-0064. */
 export const CHAT_SESSION_MEMORY_FOCUS_VERSION = "0066";
 
-/** SECURITY DEFINER helper that only inserts LEGACY_ADOPTION_DRAINED_MARKER. */
-export const LEGACY_ADOPTION_DRAINED_MARKER_FUNCTION = "fusion_mark_legacy_adoption_drained";
 
 /**
  * Thrown when the database was migrated by a NEWER Fusion binary than the one now
@@ -371,6 +369,9 @@ row produced a mutating adoption plan; its presence lets subsequent opens skip t
 whole-active-census scan (which would otherwise run on every open forever).
 Deliberately NON-NUMERIC so assertBinaryNotOlderThanDatabase ignores it by design
 (see that guard's FNXC note — the two sites are coupled).
+
+FNXC:LegacyAdoption 2026-10-07-20:49:
+Current binaries no longer read or write this database-wide row: one clean project's row certified projects it never scanned. The marker is per project in project.__meta (LEGACY_ADOPTION_DRAINED_META_KEY in task-store/lifecycle-ops.ts). Rows written by older binaries may still exist, so the non-numeric guard coupling stays.
 */
 export const LEGACY_ADOPTION_DRAINED_MARKER = "legacy-adoption-drained";
 
