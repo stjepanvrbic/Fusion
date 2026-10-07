@@ -21,11 +21,14 @@
  *   session record (under `autonomyPosture.resumeDirtyWorktree`), then resume
  *   PROCEEDS — the flag surfaces to the UI.
  * - Relaunch: via the manager's resume path (adapter `buildResume` with the
- *   recorded `nativeSessionId`, in the recorded worktree). Telemetry is
- *   re-attached (a fresh hook token + scripts via `wireTelemetry`/the hub).
- *   NO prompt is re-injected — scrollback replays to viewers, the agent
- *   continues from its own native transcript.
- * - Attempt cap: 2 attempts with backoff (tracked on `resumeAttempts`).
+ *   recorded `nativeSessionId`, in the recorded worktree) with the launch
+ *   settings recorded at the original launch. Telemetry is re-attached BEFORE
+ *   the relaunch (a fresh hook token + scripts via the hub) so the CLI starts
+ *   with its hooks. The coordinator injects no prompt itself: the task's
+ *   re-dispatched cli-agent node adopts the resumed session
+ *   (`claimResumedSession`) and re-drives it with a continuation prompt.
+ * - Attempt cap: 2 attempts with backoff (tracked on `resumeAttempts`), counting
+ *   every attempt, successful or not, across engine restarts.
  *   Exhaustion, an adapter without resume support, a missing vendor session
  *   store, or an immediate spawn error route to `needsAttention` (a permanent
  *   failure path, NOT an infinite retry loop).
@@ -39,7 +42,12 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { CliSession, CliSessionStore, CliTerminationReason } from "@fusion/core";
 import type { CliSessionManager } from "./session-manager.js";
-import { CliConcurrencyLimitError, CliResumeUnsupportedError } from "./session-manager.js";
+import {
+  CliConcurrencyLimitError,
+  CliResumeUnsupportedError,
+  CliSessionAlreadyLiveError,
+  recordedLaunchSettings,
+} from "./session-manager.js";
 import type { CliAdapterRegistry } from "./adapter.js";
 import { isResumeEligible } from "./state-machine.js";
 
@@ -66,7 +74,8 @@ export type ResumeDisposition =
   | "needsAttention-exhausted"
   | "needsAttention-resumeUnsupported"
   | "needsAttention-spawnError"
-  | "skipped-noCapacity";
+  | "skipped-noCapacity"
+  | "skipped-superseded";
 
 export interface ResumeResult {
   sessionId: string;
@@ -83,11 +92,14 @@ export interface CliResumeCoordinatorOptions {
   manager: CliSessionManager;
   registry: CliAdapterRegistry;
   /**
-   * Re-attach telemetry for a resumed session — typically wires a fresh hook
-   * token + scripts via the TelemetryHub. Called AFTER a successful relaunch and
-   * BEFORE returning. Best-effort; a throw is logged, never fatal to the sweep.
+   * Re-attach telemetry for a session about to be resumed — typically mints a
+   * fresh hook token and writes the hook scripts via the TelemetryHub. Called
+   * BEFORE the relaunch so the returned hook launch settings reach the CLI.
+   * Best-effort; a throw is logged and the resume proceeds without hooks.
    */
-  reattachTelemetry?: (session: CliSession) => void | Promise<void>;
+  reattachTelemetry?: (session: CliSession) => ResumeTelemetry | void | Promise<ResumeTelemetry | void>;
+  /** Undo `reattachTelemetry` when the relaunch then fails (invalidate the minted token). */
+  detachTelemetry?: (session: CliSession) => void;
   /** Max resume attempts before needsAttention. Default 2 (KTD). */
   maxResumeAttempts?: number;
   /** Base backoff (ms); doubled per prior attempt. Default 1000. */
@@ -101,6 +113,20 @@ export interface CliResumeCoordinatorOptions {
   isWorktreeDirty?: (worktreePath: string) => Promise<boolean>;
   /** Best-effort logger. */
   log?: (msg: string) => void;
+}
+
+/** What `reattachTelemetry` hands back for the relaunch. */
+export interface ResumeTelemetry {
+  /** Scratch dir holding the session's hook scripts; the adopting task session cleans it up. */
+  hookDir?: string;
+  /** Hook launch settings (script paths) merged over the recorded launch settings. */
+  settings?: Record<string, unknown>;
+}
+
+/** A session this coordinator resumed in this engine run, waiting for its task to adopt it. */
+export interface ResumedCliSession {
+  sessionId: string;
+  hookDir: string | null;
 }
 
 /** Default dirty-tree probe: `git status --porcelain` is non-empty. */
@@ -120,7 +146,10 @@ export class CliResumeCoordinator {
   private readonly store: CliSessionStore;
   private readonly manager: CliSessionManager;
   private readonly registry: CliAdapterRegistry;
-  private readonly reattachTelemetry?: (session: CliSession) => void | Promise<void>;
+  private readonly reattachTelemetry?: (session: CliSession) => ResumeTelemetry | void | Promise<ResumeTelemetry | void>;
+  private readonly detachTelemetry?: (session: CliSession) => void;
+  /** Resumed-but-unowned sessions, keyed by session id, for `claimResumedSession`. */
+  private readonly resumedUnowned = new Map<string, { taskId: string | null; hookDir: string | null }>();
   private readonly maxResumeAttempts: number;
   private readonly resumeBackoffBaseMs: number;
   private readonly worktreeExists: (worktreePath: string) => boolean;
@@ -132,6 +161,7 @@ export class CliResumeCoordinator {
     this.manager = opts.manager;
     this.registry = opts.registry;
     this.reattachTelemetry = opts.reattachTelemetry;
+    this.detachTelemetry = opts.detachTelemetry;
     this.maxResumeAttempts = opts.maxResumeAttempts ?? DEFAULT_MAX_RESUME_ATTEMPTS;
     this.resumeBackoffBaseMs = opts.resumeBackoffBaseMs ?? DEFAULT_RESUME_BACKOFF_BASE_MS;
     this.worktreeExists = opts.worktreeExists ?? ((p) => existsSync(p));
@@ -272,6 +302,32 @@ export class CliResumeCoordinator {
       this.flagDirty(session);
     }
 
+    /*
+    FNXC:ProcessLifecycle 2026-10-07-18:00:
+    Resume is bounded and yields a session observed the same way as the original.
+    Every attempt, successful or not, is counted before the relaunch, so a session that keeps dying is resumed at most maxResumeAttempts times across restarts.
+    Telemetry is re-attached BEFORE the relaunch and the recorded launch settings are replayed with the fresh hook paths, so the CLI is launched with its model, flags and hooks; the resumed session is then held for its task to adopt.
+    */
+    if (session.taskId && this.store.listByTask(session.taskId).some((s) => s.id !== session.id && this.manager.isLive(s.id))) {
+      // The task already re-ran with a fresh session; resuming this one would put two CLIs in one worktree.
+      this.log(`[cli-resume] session ${session.id}: superseded by a live session for task ${session.taskId}`);
+      this.store.updateSession(session.id, { agentState: "dead", terminationReason: "killed" });
+      return { ...base, disposition: "skipped-superseded" };
+    }
+
+    const attempts = session.resumeAttempts + 1;
+    this.store.updateSession(session.id, { resumeAttempts: attempts });
+
+    let telemetry: ResumeTelemetry | void = undefined;
+    if (this.reattachTelemetry) {
+      try {
+        telemetry = await this.reattachTelemetry(this.store.getSession(session.id) ?? session);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log(`[cli-resume] session ${session.id}: telemetry re-attach failed (${msg}); resuming without hooks`);
+      }
+    }
+
     // Relaunch via the manager's resume path (adapter buildResume + native id),
     // reusing the existing record so no duplicate session row is created.
     try {
@@ -283,53 +339,48 @@ export class CliResumeCoordinator {
         chatSessionId: session.chatSessionId,
         worktreePath,
         posture: session.autonomyPosture,
+        settings: { ...recordedLaunchSettings(session), ...(telemetry?.settings ?? {}) },
         resume: { sessionId: session.id, nativeSessionId: session.nativeSessionId },
       });
     } catch (err) {
-      // Immediate spawn failure / unsupported resume / missing vendor store →
-      // permanent-failure path. Record the attempt and route to needsAttention
-      // once the cap is reached; otherwise leave it for the next sweep (backoff).
-      const attempts = session.resumeAttempts + 1;
-      this.store.updateSession(session.id, { resumeAttempts: attempts });
+      try {
+        this.detachTelemetry?.(session);
+      } catch {
+        // best-effort
+      }
       const msg = err instanceof Error ? err.message : String(err);
-      const isUnsupported = err instanceof CliResumeUnsupportedError;
-      const isCeiling = err instanceof CliConcurrencyLimitError;
-      if (isCeiling) {
-        // Capacity raced away — leave persisted-live for the next sweep, no attempt charge.
+      if (err instanceof CliConcurrencyLimitError || err instanceof CliSessionAlreadyLiveError) {
+        // Capacity raced away, or another resume owns it: not an attempt; leave it for the next sweep.
         this.store.updateSession(session.id, { resumeAttempts: session.resumeAttempts });
         return { ...base, disposition: "skipped-noCapacity" };
       }
+      // Immediate spawn failure / unsupported resume / missing vendor store is
+      // permanent per the KTD: do NOT loop. Route to needsAttention now.
       this.log(`[cli-resume] session ${session.id}: resume spawn failed (${msg})`);
-      if (isUnsupported || attempts >= this.maxResumeAttempts) {
-        this.toNeedsAttention(session, reason, `resume spawn failed: ${msg}`);
-        return {
-          ...base,
-          disposition: isUnsupported
-            ? "needsAttention-resumeUnsupported"
-            : "needsAttention-spawnError",
-          reason: msg,
-        };
-      }
-      // Under the cap: needsAttention is the permanent floor only at exhaustion;
-      // a single immediate failure (missing vendor store / spawn error) is also
-      // permanent per the KTD — do NOT loop. Route to needsAttention now.
       this.toNeedsAttention(session, reason, `resume spawn failed: ${msg}`);
-      return { ...base, disposition: "needsAttention-spawnError", reason: msg };
+      return {
+        ...base,
+        disposition: err instanceof CliResumeUnsupportedError ? "needsAttention-resumeUnsupported" : "needsAttention-spawnError",
+        reason: msg,
+      };
     }
 
-    // Re-attach telemetry (fresh hook token + scripts). Best-effort.
-    if (this.reattachTelemetry) {
-      try {
-        const fresh = this.store.getSession(session.id) ?? session;
-        await this.reattachTelemetry(fresh);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.log(`[cli-resume] session ${session.id}: telemetry re-attach failed (${msg}) — non-fatal`);
-      }
-    }
-
-    this.log(`[cli-resume] session ${session.id}: resumed (native ${session.nativeSessionId}) in ${worktreePath}`);
+    this.resumedUnowned.set(session.id, { taskId: session.taskId, hookDir: telemetry?.hookDir ?? null });
+    this.log(`[cli-resume] session ${session.id}: resumed (native ${session.nativeSessionId}) in ${worktreePath} (attempt ${attempts})`);
     return { ...base, disposition: "resumed", dirtyWorktree: dirty };
+  }
+
+  /**
+   * Hand a session this coordinator resumed to its task's owner (the cli-agent graph node), once.
+   * Returns null when nothing live is waiting for the task.
+   */
+  claimResumedSession(taskId: string): ResumedCliSession | null {
+    for (const [sessionId, entry] of this.resumedUnowned) {
+      if (entry.taskId !== taskId) continue;
+      this.resumedUnowned.delete(sessionId);
+      if (this.manager.isLive(sessionId)) return { sessionId, hookDir: entry.hookDir };
+    }
+    return null;
   }
 
   /** Backoff (ms) before the next resume attempt for a given attempt count. */

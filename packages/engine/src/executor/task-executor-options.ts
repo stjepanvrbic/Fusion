@@ -121,6 +121,11 @@ export interface CliAgentRuntime {
   hookEndpointUrl: string;
   /** Optional override for the hook scratch-dir root (tests). */
   hookDirRoot?: string;
+  /**
+   * Claim, once, a session the resume coordinator relaunched for this task after an engine restart,
+   * so the cli-agent node adopts it instead of killing it and launching fresh.
+   */
+  claimResumedTaskSession?: (taskId: string) => { sessionId: string; hookDir: string | null } | null;
 }
 
 export interface ActiveExecutorSessionState {

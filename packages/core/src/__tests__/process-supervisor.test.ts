@@ -418,6 +418,23 @@ describe("process-supervisor win32 tree kill", () => {
     killProcessTree(777, "SIGTERM");
     expect(spawnCalls).toEqual([expect.objectContaining({ args: ["/PID", "777", "/T", "/F"] })]);
   });
+
+  it("reports settlement once, after taskkill finishes, whatever its outcome", () => {
+    installWin32();
+    const settled = vi.fn();
+    const failed = vi.fn();
+
+    killProcessTree(777, "SIGKILL", { onSettled: settled, onTreeKillFailed: failed });
+    expect(settled).not.toHaveBeenCalled();
+    killers[0].emit("exit", 128);
+    killers[0].emit("error", new Error("late"));
+
+    expect(settled).toHaveBeenCalledTimes(1);
+    expect(failed).toHaveBeenCalledTimes(1);
+
+    killProcessTree(778, "SIGKILL", { sync: true, onSettled: settled });
+    expect(settled).toHaveBeenCalledTimes(2);
+  });
 });
 
 function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {

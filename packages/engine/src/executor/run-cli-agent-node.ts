@@ -27,6 +27,7 @@ export type CliAgentRuntimeBundle = {
   projectId: string;
   hookEndpointUrl: string;
   hookDirRoot?: string;
+  claimResumedTaskSession?: (taskId: string) => { sessionId: string; hookDir: string | null } | null;
 };
 
 export type RunCliAgentNodeDeps = {
@@ -76,11 +77,31 @@ export async function runCliAgentNode(
 
   const prompt = typeof cfg.prompt === "string" ? cfg.prompt : (live.prompt ?? "");
 
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  A session the resume coordinator relaunched after an engine restart belongs to this task's re-dispatched node: adopt it so its outcome is observed, instead of killing it and launching a fresh CLI that loses the resumed transcript.
+  */
+  const resumed = runtime.claimResumedTaskSession?.(live.id) ?? null;
+  let session: CliTaskSession;
+  if (resumed) {
+    session = CliTaskSession.adopt({
+      taskId: live.id,
+      sessionId: resumed.sessionId,
+      config,
+      manager: runtime.manager,
+      hub: runtime.hub,
+      registry: runtime.registry,
+      hookEndpointUrl: runtime.hookEndpointUrl,
+      hookDir: resumed.hookDir,
+      log: (msg) => executorLog.log(`[cli-agent] ${msg}`),
+    });
+    return awaitCliTaskOutcome(deps, node, live, session);
+  }
+
   // Re-entry: kill any prior LIVE session for this task (RETHINK/replan context
   // reset) before launching fresh.
   killLiveTaskSessions(live.id, runtime.manager, runtime.store);
 
-  let session: CliTaskSession;
   try {
     session = await launchCliTaskSession({
       taskId: live.id,
@@ -110,6 +131,16 @@ export async function runCliAgentNode(
     throw err;
   }
 
+  return awaitCliTaskOutcome(deps, node, live, session);
+}
+
+/** Await a task session's single terminal outcome and map it onto the graph node result. */
+async function awaitCliTaskOutcome(
+  deps: RunCliAgentNodeDeps,
+  _node: WorkflowIrNode,
+  live: TaskDetail,
+  session: CliTaskSession,
+): Promise<WorkflowNodeResult> {
   deps.activeCliTaskSessions.set(live.id, session);
   let outcome: CliTaskOutcome;
   try {

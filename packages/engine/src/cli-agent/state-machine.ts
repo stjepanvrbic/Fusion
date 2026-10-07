@@ -210,6 +210,11 @@ export class CliSessionStateMachine {
   private state: CliMachineState;
   private terminationReason: CliTerminationReason | null = null;
   private resumeAttempts = 0;
+  /**
+   * Whether this machine changed `resumeAttempts` since it was seeded. The resume coordinator counts
+   * restart resumes on the row directly, so an unchanged seed must never be written back over it.
+   */
+  private resumeAttemptsChanged = false;
 
   /** Per-turn latch: has a positive done fired in the current busy turn. */
   private doneLatched = false;
@@ -259,7 +264,8 @@ export class CliSessionStateMachine {
   }
 
   getResumeAttempts(): number {
-    return this.resumeAttempts;
+    if (this.resumeAttemptsChanged) return this.resumeAttempts;
+    return this.store.getSession(this.sessionId)?.resumeAttempts ?? this.resumeAttempts;
   }
 
   /** Subscribe to throttled state changes. Returns an unsubscribe handle. */
@@ -424,13 +430,14 @@ export class CliSessionStateMachine {
     if (this.state !== "resuming") {
       throw new InvalidCliTransitionError(this.state, "recordResumeResult");
     }
+    // FNXC:ProcessLifecycle 2026-10-07-18:00: every resume attempt counts against the cap, successful or not, so a session that keeps crashing cannot resume forever.
+    this.resumeAttempts = this.getResumeAttempts() + 1;
+    this.resumeAttemptsChanged = true;
     if (success) {
-      this.resumeAttempts = 0;
       this.beginTurn();
       this.transition("busy");
       return;
     }
-    this.resumeAttempts += 1;
     if (this.resumeAttempts >= this.maxResumeAttempts) {
       this.transition("needsAttention");
       return;
@@ -527,16 +534,19 @@ export class CliSessionStateMachine {
   ): void {
     // Persist the U1 store enum (resuming → dead); the machine state and the
     // resume-eligible reason carry the recovery intent for surfaces.
-    this.store.updateSession(this.sessionId, {
+    const updated = this.store.updateSession(this.sessionId, {
       agentState: toPersistedState(next),
       terminationReason: reason,
-      resumeAttempts: this.resumeAttempts,
+      ...(this.resumeAttemptsChanged ? { resumeAttempts: this.resumeAttempts } : {}),
     });
+    const resumeAttempts = this.resumeAttemptsChanged
+      ? this.resumeAttempts
+      : (updated?.resumeAttempts ?? this.resumeAttempts);
     const change: CliStateChange = {
       sessionId: this.sessionId,
       state: next,
       terminationReason: reason,
-      resumeAttempts: this.resumeAttempts,
+      resumeAttempts,
       ...(resumeBackoffMs !== undefined ? { resumeBackoffMs } : {}),
       at: new Date(this.now()).toISOString(),
     };

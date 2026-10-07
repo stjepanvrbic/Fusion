@@ -58,6 +58,8 @@ export interface KillProcessTreeOptions {
   sync?: boolean;
   /** Called when the platform tree kill could not be launched or reported failure. */
   onTreeKillFailed?: () => void;
+  /** Called exactly once after the tree kill finished, whatever its outcome (synchronously on POSIX and with `sync`). */
+  onSettled?: () => void;
 }
 
 /**
@@ -74,22 +76,30 @@ export function killProcessTree(
   if (currentPlatform() !== "win32") {
     try {
       process.kill(-pid, signal);
-      return;
     } catch {
       // Not a group leader, or the group is already gone.
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // Already gone.
+      }
     }
-    try {
-      process.kill(pid, signal);
-    } catch {
-      // Already gone.
-    }
+    options.onSettled?.();
     return;
   }
   killWindowsProcessTrees([pid], options);
 }
 
 function killWindowsProcessTrees(pids: readonly number[], options: KillProcessTreeOptions = {}): void {
+  let settled = false;
+  const settle = (failed: boolean) => {
+    if (settled) return;
+    settled = true;
+    if (failed) options.onTreeKillFailed?.();
+    options.onSettled?.();
+  };
   if (pids.length === 0) {
+    settle(false);
     return;
   }
   const args = windowsTreeKillArgs(pids);
@@ -100,25 +110,19 @@ function killWindowsProcessTrees(pids: readonly number[], options: KillProcessTr
         windowsHide: true,
         timeout: TREE_KILL_SYNC_TIMEOUT_MS,
       });
-      if (result.error || result.status !== 0) {
-        options.onTreeKillFailed?.();
-      }
+      settle(Boolean(result.error) || result.status !== 0);
     } catch {
-      options.onTreeKillFailed?.();
+      settle(true);
     }
     return;
   }
   try {
     const killer = currentTreeKillLauncher().spawn(taskkillExecutable(), args, { stdio: "ignore", windowsHide: true });
-    killer.once("error", () => options.onTreeKillFailed?.());
-    killer.once("exit", (code) => {
-      if (code !== 0) {
-        options.onTreeKillFailed?.();
-      }
-    });
+    killer.once("error", () => settle(true));
+    killer.once("exit", (code) => settle(code !== 0));
     killer.unref?.();
   } catch {
-    options.onTreeKillFailed?.();
+    settle(true);
   }
 }
 

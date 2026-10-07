@@ -32,6 +32,7 @@ import { CliSessionManager, type CliSessionManagerOptions } from "./session-mana
 import { TelemetryHub, type TelemetryHubOptions } from "./telemetry-hub.js";
 import { CliResumeCoordinator } from "./resume-coordinator.js";
 import { writeSessionHookScripts } from "./hook-scripts.js";
+import { buildHookLaunchSettings } from "./task-session.js";
 import type { CliAgentRuntime } from "../executor.js";
 
 /** Options for {@link createCliAgentRuntime}. */
@@ -127,15 +128,19 @@ export async function createCliAgentRuntime(
     store,
     manager,
     registry,
+    // FNXC:ProcessLifecycle 2026-10-07-18:00: re-attach runs before the relaunch and returns the hook paths, so the resumed CLI is launched pointing at its fresh scripts.
     reattachTelemetry: async (session) => {
       const token = hub.issueToken(session.id);
+      const dir = hookScriptDir(options, session.id);
       await writeSessionHookScripts({
         sessionId: session.id,
         token,
         endpointUrl: hookEndpointUrl,
-        dir: hookScriptDir(options, session.id),
+        dir,
       });
+      return { hookDir: dir, settings: buildHookLaunchSettings(dir) };
     },
+    detachTelemetry: (session) => hub.invalidate(session.id),
   });
 
   const bundle: CliAgentRuntime = {
@@ -146,6 +151,7 @@ export async function createCliAgentRuntime(
     projectId,
     hookEndpointUrl,
     hookDirRoot: options.hookDirRoot,
+    claimResumedTaskSession: (taskId: string) => resumeCoordinator.claimResumedSession(taskId),
   };
 
   return {
