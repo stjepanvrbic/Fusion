@@ -4,6 +4,11 @@
  *
  * FNXC:StuckRequeue 2026-06-27-23:55:
  * Stuck-requeue cleanup is about to delete the checkout. If git cannot prove the branch has durable commits, treat completed steps as lost uncommitted work and reset them.
+ *
+ * FNXC:StuckRequeue 2026-10-07-19:23:
+ * Completed steps are reset only on positive proof of lost work: the branch is absent, or its tip equals its merge-base with HEAD.
+ * A git failure, timeout, or shell error is not proof, so it logs and leaves step progress intact.
+ * Before this, any probe failure (including the Windows `2>/dev/null` cmd.exe failure) reset every done step and the executor redid finished work.
  */
 import { isWorkspaceTask, loadWorkspaceConfig, type Task } from "@fusion/core";
 import { exec } from "node:child_process";
@@ -40,27 +45,62 @@ export async function resetStepsIfWorkLost(
 
   const branchName = resolveTaskWorkingBranch(task);
 
-  try {
-    // Check if the branch has any unique commits vs main
-    const { stdout: mergeBaseStdout } = await execAsync(
-      `git merge-base "${branchName}" HEAD 2>/dev/null`,
-      { cwd: deps.rootDir, encoding: "utf-8" },
-    );
-    const { stdout: branchHeadStdout } = await execAsync(
-      `git rev-parse "${branchName}" 2>/dev/null`,
-      { cwd: deps.rootDir, encoding: "utf-8" },
-    );
-    const mergeBase = mergeBaseStdout.trim();
-    const branchHead = branchHeadStdout.trim();
-
-    if (mergeBase === branchHead) {
-      await deps.resetLostWorkStepProgress(task, completedSteps.length, "branch had no commits");
-    }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
+  const proof = await proveBranchDurability(deps.rootDir, branchName);
+  if (proof.kind === "absent") {
+    await deps.resetLostWorkStepProgress(task, completedSteps.length, "branch does not exist");
+  } else if (proof.kind === "no-commits") {
+    await deps.resetLostWorkStepProgress(task, completedSteps.length, "branch had no commits");
+  } else if (proof.kind === "unknown") {
     executorLog.warn(
-      `${task.id}: unable to prove surviving branch commits before worktree removal — resetting ${completedSteps.length} steps (${msg})`,
+      `${task.id}: unable to prove whether branch ${branchName} holds durable commits; keeping ${completedSteps.length} completed step(s) (${proof.error})`,
     );
-    await deps.resetLostWorkStepProgress(task, completedSteps.length, `git proof failed: ${msg}`);
+  }
+}
+
+type BranchDurability =
+  | { kind: "has-commits" }
+  | { kind: "no-commits" }
+  | { kind: "absent" }
+  | { kind: "unknown"; error: string };
+
+function execErrorDetail(err: unknown): { code: unknown; stderr: string; message: string } {
+  const e = (err ?? {}) as { code?: unknown; stderr?: unknown; message?: unknown };
+  return {
+    code: e.code,
+    stderr: typeof e.stderr === "string" ? e.stderr.trim() : "",
+    message: typeof e.message === "string" ? e.message : String(err),
+  };
+}
+
+/**
+ * `rev-parse --verify --quiet` exits 1 with no stderr only when the ref is missing.
+ * Any other failure shape (spawn error, timeout, exit 128, shell stderr) leaves durability unknown.
+ */
+async function proveBranchDurability(rootDir: string, branchName: string): Promise<BranchDurability> {
+  let branchHead: string;
+  try {
+    const { stdout } = await execAsync(
+      `git rev-parse --verify --quiet "refs/heads/${branchName}^{commit}"`,
+      { cwd: rootDir, encoding: "utf-8" },
+    );
+    branchHead = stdout.trim();
+  } catch (err: unknown) {
+    const detail = execErrorDetail(err);
+    if (detail.code === 1 && detail.stderr === "") return { kind: "absent" };
+    return { kind: "unknown", error: detail.stderr || detail.message };
+  }
+  if (!branchHead) return { kind: "unknown", error: "rev-parse returned no commit" };
+
+  try {
+    const { stdout } = await execAsync(
+      `git merge-base "${branchName}" HEAD`,
+      { cwd: rootDir, encoding: "utf-8" },
+    );
+    return stdout.trim() === branchHead ? { kind: "no-commits" } : { kind: "has-commits" };
+  } catch (err: unknown) {
+    const detail = execErrorDetail(err);
+    // Exit 1 with no output: no common ancestor, so every branch commit is unique to it.
+    if (detail.code === 1 && detail.stderr === "") return { kind: "has-commits" };
+    return { kind: "unknown", error: detail.stderr || detail.message };
   }
 }
