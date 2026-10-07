@@ -1164,9 +1164,10 @@ export function __setCleanupRmSyncForTests(nextRmSync) {
   cleanupRmSync = typeof nextRmSync === "function" ? nextRmSync : rmSync;
 }
 
+// FNXC:WindowsVerification 2026-10-07-18:03: block in-process instead of spawning POSIX `sleep`, which Windows lacks outside Git Bash, so the cleanup retry actually waits there.
 function sleepMsSync(ms) {
   if (ms <= 0) return;
-  spawnSync("sleep", [String(ms / 1000)], { stdio: "ignore" });
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /**
