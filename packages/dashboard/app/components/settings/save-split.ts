@@ -27,6 +27,7 @@
  */
 import { isGlobalSettingsKey, isProjectSettingsKey } from "@fusion/core";
 import type { GlobalSettings, McpServersSettings, Settings } from "@fusion/core";
+import { SETTINGS_SECTION_METADATA } from "../../../src/shared/settings-sections";
 
 /**
  * Project-scoped model-override keys whose overrides track inheritance
@@ -319,9 +320,20 @@ export const GLOBAL_SECTION_KEYS: Record<string, ReadonlySet<string>> = {
   remote: new Set(["remoteAccess"]),
 };
 
+const PROJECT_SCOPED_SECTION_IDS = new Set(
+  SETTINGS_SECTION_METADATA.filter((section) => section.scope === "project").map((section) => section.id),
+);
+
+/*
+FNXC:SettingsScope 2026-10-07-17:59:
+A project-scoped section never writes a global key unless GLOBAL_SECTION_KEYS allowlists it for that section (e.g. "project-models" lane baselines).
+Dual-scope keys such as `testMode` otherwise entered both patches: the project Merge "Enable test mode" toggle silently set global testMode, which flips every inheriting project to mock and makes the next startup open the empty test database.
+Global and unscoped sections without an allowlist keep the changed-only permissive gate.
+*/
 function isGlobalKeyAllowedForSection(key: string, activeSection: string): boolean {
   const sectionKeys = GLOBAL_SECTION_KEYS[activeSection];
-  return !sectionKeys || sectionKeys.has(key);
+  if (sectionKeys) return sectionKeys.has(key);
+  return !PROJECT_SCOPED_SECTION_IDS.has(activeSection);
 }
 
 export interface SaveSplitInput {

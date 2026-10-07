@@ -1245,6 +1245,25 @@ describe("SettingsModal", () => {
   });
 
   describe("Merge section", () => {
+    /*
+    FNXC:SettingsScope 2026-10-07-17:59:
+    Mobile-layout surface for the project-only test-mode toggle: the save must reach the project patch and never the global settings write.
+    */
+    it("saves the test mode toggle as a project override only on the mobile layout", async () => {
+      mockFetchSettingsByScope.mockResolvedValue({ global: { ...defaultSettings, testMode: false }, project: {} });
+      renderModal({ initialSection: "merge" });
+      await waitForSettingsModalReady();
+
+      const toggle = await screen.findByLabelText("Enable test mode");
+      vi.useFakeTimers();
+      fireEvent.click(toggle);
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
+
+      expect(mockUpdateSettings).toHaveBeenCalledWith(expect.objectContaining({ testMode: true }), undefined);
+      expect(mockUpdateGlobalSettings).not.toHaveBeenCalled();
+    });
+
     describe("with default Merge render", () => {
       beforeEach(async () => {
         renderModal({ initialSection: "merge" });
@@ -1387,8 +1406,7 @@ describe("SettingsModal", () => {
 
         const payload = mockUpdateSettings.mock.calls[0][0] as Record<string, unknown>;
         expect(payload.planApprovalMode).toBe("require-all");
-        expect(mockUpdateGlobalSettings).toHaveBeenCalledTimes(1);
-        expect(mockUpdateGlobalSettings.mock.calls[0][0]).not.toHaveProperty("planApprovalMode");
+        expect(mockUpdateGlobalSettings).not.toHaveBeenCalled();
       });
     });
 
