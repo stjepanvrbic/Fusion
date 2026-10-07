@@ -47,6 +47,9 @@ vi.mock("@fusion/core", () => ({
   AgentStore: vi.fn(),
   ChatStore: vi.fn(),
   registerTraitHookImpl: vi.fn(),
+  // FNXC:PosixShell 2026-10-07-18:05: github.ts (reached via task-planner-pr-status) wraps its exec with bindPosixShell at import time; identity keeps the POSIX-shell seam inert here.
+  bindPosixShell: <F>(fn: F) => fn,
+  withPosixShell: <T>(options: T) => options,
 }));
 /*
 FNXC:DashboardChatTests 2026-07-12-08:15:
