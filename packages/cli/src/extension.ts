@@ -102,6 +102,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { MANUAL_RETRY_MOVE_PROVENANCE } from "./manual-retry.js";
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -2678,6 +2679,12 @@ export default function kbExtension(pi: ExtensionAPI) {
       // FNXC:TaskWedgeNotifications 2026-08-10-20:15: an operator retry ends the prior terminal-failure episode and mints a fresh budget.
       await store.resetTerminalFailureAutoRecoveryBudget(params.id);
 
+      /*
+      FNXC:TaskRetry 2026-10-07-17:57:
+      A manual retry re-queues a card the scheduler can dispatch; hard-cancel and userPaused park semantics apply only to an operator drag back to the queue.
+      These moves used `moveSource: "user"`, so the hold-lane hook parked every retried card userPaused and the tool reported success for a card that never ran.
+      Retry moves now match `fn task retry` and the dashboard route: no moveSource (the operator-compatible route that keeps guards and lifecycle containment) plus explicit `manual-retry` provenance for the move log and the move-source census.
+      */
       if (isMissingWorktreeSessionRetry) {
         await applyRetryReset({
           status: null,
@@ -2691,8 +2698,7 @@ export default function kbExtension(pi: ExtensionAPI) {
         await store.logEntry(params.id, `Retry requested via Fusion extension (unusable worktree session-start recovery → todo, preserving progress${retryLogSuffix})`);
         /* FNXC:WorkflowResolvedColumns 2026-07-30-22:20: census-invisible moveTask DESTINATION — a call argument, not a comparison. This is an OPERATOR-triggered Retry: on a board that does not declare `todo` the move is REJECTED and the retry fails in the operator's face. The reply text below uses the SAME resolved value so it cannot name a lane the card did not go to. */
         const retryTarget = await fusionCore.resolveReboundTargetForTask(store, params.id);
-        /* FNXC:ToolPermissionGates 2026-07-30-13:55: fn_task_retry is a user-facing lever — carry the user move source (target resolves by role). */
-        await store.moveTask(params.id, retryTarget, { preserveProgress: true, moveSource: "user" });
+        await store.moveTask(params.id, retryTarget, { preserveProgress: true, workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE });
         return {
           content: [{ type: "text", text: `Retried ${params.id} → ${retryTarget} (unusable worktree session metadata cleared)` }],
           details: { taskId: params.id, newColumn: 'todo' },
@@ -2716,8 +2722,7 @@ export default function kbExtension(pi: ExtensionAPI) {
           );
           /* FNXC:WorkflowResolvedColumns 2026-07-30-22:20: census-invisible moveTask DESTINATION — same operator Retry path as above. */
           const executionRetryTarget = await fusionCore.resolveReboundTargetForTask(store, params.id);
-          /* FNXC:ToolPermissionGates 2026-07-30-13:55: fn_task_retry is a user-facing lever — carry the user move source (target resolves by role). */
-          await store.moveTask(params.id, executionRetryTarget, { preserveProgress: true, moveSource: "user" });
+          await store.moveTask(params.id, executionRetryTarget, { preserveProgress: true, workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE });
           return {
             content: [{ type: "text", text: `Retried ${params.id} → ${executionRetryTarget} (execution failure, preserving step progress)` }],
             details: { taskId: params.id, newColumn: 'todo' },
@@ -2754,9 +2759,8 @@ export default function kbExtension(pi: ExtensionAPI) {
 
       Resolve once, then use that value everywhere the operator or a downstream tool reads it.
       */
-      // FNXC:ToolPermissionGates 2026-07-26-13:55: user-facing retry move carries the user/hard-cancel source (Move-Task contract).
       const retryTarget = await fusionCore.resolveReboundTargetForTask(store, params.id);
-      await store.moveTask(params.id, retryTarget, { moveSource: "user" });
+      await store.moveTask(params.id, retryTarget, { workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE });
 
       // Log the retry action
       await store.logEntry(params.id, "Retry requested via Fusion extension", `Task reset to ${retryTarget} for retry`);

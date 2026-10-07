@@ -705,16 +705,21 @@ pgDescribe("extension tool permission gates", () => {
 
   // ── fn_task_retry move source ────────────────────────────────────
 
-  it("fn_task_retry moves with the user/hard-cancel move source", async () => {
+  /*
+  FNXC:TaskRetry 2026-10-07-17:57:
+  A retry is not an operator drag back to the queue: the user source parked the card userPaused and took the hard-cancel branches.
+  The retry move carries the operator-compatible absent source plus `manual-retry` provenance, matching `fn task retry` and the dashboard route.
+  */
+  it("fn_task_retry re-queues with manual-retry provenance, never the user/hard-cancel source", async () => {
     const cwd = h.rootDir();
     const api = freshApi();
     const tool = requireTool(api, "fn_task_retry");
     const task = await h.store().createTask({ description: "retry source target", column: "triage" });
     await h.store().updateTask(task.id, { status: "failed", error: "boom" });
 
-    const moves: Array<{ to: string; source: string }> = [];
-    const onMoved = (data: { to: string; source: string }) => {
-      moves.push({ to: data.to, source: data.source });
+    const moves: Array<{ to: string; requestedSource?: string; workflowMoveSource?: string }> = [];
+    const onMoved = (data: { to: string; requestedSource?: string; workflowMoveSource?: string }) => {
+      moves.push({ to: data.to, requestedSource: data.requestedSource, workflowMoveSource: data.workflowMoveSource });
     };
     h.store().on("task:moved", onMoved as never);
     try {
@@ -726,7 +731,10 @@ pgDescribe("extension tool permission gates", () => {
 
     const todoMove = moves.find((m) => m.to === "todo");
     expect(todoMove).toBeTruthy();
-    expect(todoMove?.source).toBe("user");
-    expect((await h.store().getTask(task.id)).column).toBe("todo");
+    expect(todoMove?.requestedSource).toBeUndefined();
+    expect(todoMove?.workflowMoveSource).toBe("manual-retry");
+    const retried = await h.store().getTask(task.id);
+    expect(retried.column).toBe("todo");
+    expect(retried.userPaused).not.toBe(true);
   });
 });

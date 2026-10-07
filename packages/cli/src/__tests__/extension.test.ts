@@ -3938,6 +3938,54 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       expect(updated?.mergeRetries).toBe(0);
     });
 
+    /*
+    FNXC:TaskRetry 2026-10-07-17:57:
+    A manual retry re-queues a card the scheduler can dispatch. The user move source made the hold-lane hook park every retried card userPaused, so the tool reported success while the card sat in todo forever.
+    Every re-queue branch must leave the card unpaused: generic failure, in-review execution failure, and unusable-worktree session failure.
+    */
+    it.each(["generic-failure", "in-review-execution-failure", "unusable-worktree"] as const)(
+      "re-queues a %s retry unpaused so the scheduler can dispatch it",
+      async (branch) => {
+        const store = createStore();
+        const task = await store.createTask({ title: `retry ${branch}`, description: "test", column: "todo" });
+        await store.updateTask(task.id, { steps: [{ name: "Step 0", status: "done" }, { name: "Step 1", status: "pending" }] });
+        await store.moveTask(task.id, "in-progress");
+        if (branch === "generic-failure") {
+          await store.updateTask(task.id, { status: "failed", error: "boom" });
+        } else {
+          await store.moveTask(task.id, "in-review");
+          await store.updateTask(task.id, branch === "unusable-worktree"
+            ? {
+              status: "merging",
+              error: "Refusing to start coding agent in missing worktree: /tmp/fusion-missing-worktree",
+              worktree: "/tmp/fusion-missing-worktree",
+              branch: `fusion/${task.id}`,
+              branchWriteOrigin: "engine",
+              sessionFile: "/tmp/fusion-session.json",
+            }
+            : { status: "failed", error: "executor crashed" });
+        }
+
+        const moveSources: Array<string | undefined> = [];
+        const onMoved = (data: { requestedSource?: string }) => { moveSources.push(data.requestedSource); };
+        store.on("task:moved", onMoved as never);
+        let result;
+        try {
+          result = await api.tools.get("fn_task_retry")!.execute(`retry-${branch}`, { id: task.id }, undefined, undefined, makeCtx(tmpDir));
+        } finally {
+          store.off("task:moved", onMoved as never);
+        }
+
+        expect(result.isError).toBeFalsy();
+        const updated = await store.getTask(task.id);
+        expect(updated?.column).toBe("todo");
+        expect(updated?.userPaused).not.toBe(true);
+        expect(updated?.paused).toBeFalsy();
+        expect(updated?.status).toBeFalsy();
+        expect(moveSources).not.toContain("user");
+      },
+    );
+
     it("rejects unrelated merge-active tasks", async () => {
       const store = createStore();
       await store.init();
