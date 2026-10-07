@@ -24,6 +24,7 @@ import {
   buildVerifyPlan,
   batchVerifySteps,
   runStep,
+  resolveStepInvocation,
   runVerifyPlan,
   PRETEST_STATIC_CHECK_SCRIPTS,
   VERIFY_EXCLUDED_PACKAGES,
@@ -486,4 +487,29 @@ test("runVerifyPlan reports the first failure in plan order and skips later batc
   assert.deepEqual(settled.sort(), ["static-check:check-a", "static-check:check-b", "static-check:check-c"]);
   // ...and the next batch never starts.
   assert.ok(!started.includes("boot-smoke"));
+});
+
+/*
+FNXC:VerifyFastWindows 2026-10-07-17:45:
+On Windows `pnpm` is a .cmd shim that spawn cannot run without a shell (ENOENT), so typecheck/build steps never started there.
+*/
+test("resolveStepInvocation runs pnpm through node via npm_execpath on Windows", () => {
+  const env = { npm_execpath: "C:\pnpm\bin\pnpm.cjs" };
+  assert.deepEqual(
+    resolveStepInvocation("pnpm", ["--filter", "@runfusion/fusion", "build"], { platform: "win32", env, execPath: "C:\node\node.exe" }),
+    { command: "C:\node\node.exe", args: ["C:\pnpm\bin\pnpm.cjs", "--filter", "@runfusion/fusion", "build"] },
+  );
+});
+
+test("resolveStepInvocation leaves pnpm untouched off Windows and for non-pnpm commands", () => {
+  const args = ["--filter", "x", "build"];
+  assert.deepEqual(resolveStepInvocation("pnpm", args, { platform: "linux", env: { npm_execpath: "/x/pnpm.cjs" }, execPath: "/node" }), { command: "pnpm", args });
+  assert.deepEqual(resolveStepInvocation("node", args, { platform: "win32", env: { npm_execpath: "C:\pnpm.cjs" }, execPath: "C:\node.exe" }), { command: "node", args });
+});
+
+test("resolveStepInvocation falls back to the .cmd shim through cmd.exe on Windows when npm_execpath is not a pnpm script", () => {
+  assert.deepEqual(
+    resolveStepInvocation("pnpm", ["build"], { platform: "win32", env: {}, execPath: "C:\node.exe" }),
+    { command: "cmd.exe", args: ["/d", "/s", "/c", "pnpm", "build"] },
+  );
 });

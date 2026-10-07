@@ -345,14 +345,28 @@ export function resolveAffectedForVerify() {
  * child's output (stdio inherit) and throws with an `.exitCode` on the first
  * failure/timeout/signal so the caller exits nonzero immediately.
  */
+/*
+FNXC:VerifyFastWindows 2026-10-07-17:45:
+On Windows `pnpm` is a .cmd shim, which spawn cannot execute without a shell (ENOENT), so typecheck/build steps never started there.
+Run the pnpm CLI through node via npm_execpath (set by pnpm for its own scripts); without it, go through cmd.exe so the shim resolves.
+Other platforms and non-pnpm steps are spawned exactly as planned.
+*/
+export function resolveStepInvocation(command, args, { platform = process.platform, env = process.env, execPath = process.execPath } = {}) {
+  if (platform !== "win32" || command !== "pnpm") return { command, args };
+  const pnpmCli = env.npm_execpath;
+  if (pnpmCli && /pnpm(\.c?js)?$/i.test(pnpmCli)) return { command: execPath, args: [pnpmCli, ...args] };
+  return { command: "cmd.exe", args: ["/d", "/s", "/c", "pnpm", ...args] };
+}
+
 export async function runStep(step, { spawnFn = spawn, log = console.log, errLog = console.error, cwd = repoRoot } = {}) {
   const budgetMs = deriveBudgetMs({ klass: step.klass ?? "changed" });
   log(`\n[verify:fast] -> ${step.label}`);
   log(`[verify:fast]    ${step.command} ${step.args.join(" ")}  (budget ${Math.round(budgetMs / 1000)}s)`);
   const startedAt = Date.now();
+  const invocation = resolveStepInvocation(step.command, step.args);
   const { code, signal, timedOut } = await runWithWatchdog({
-    command: step.command,
-    args: step.args,
+    command: invocation.command,
+    args: invocation.args,
     env: process.env,
     cwd,
     budgetMs,
