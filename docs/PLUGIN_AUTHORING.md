@@ -535,6 +535,11 @@ const plugin: FusionPlugin = {
 
 - Use a unique name prefixed with your plugin ID (e.g., `my-plugin_action`)
 - Avoid conflicts with built-in tools
+- Agents see the tool as `plugin_<name>`. Exposed names are unique per session: when two loaded plugins declare the same name, the plugin with the lowest ID keeps it and the other plugin's tool is skipped with a warning in the engine log.
+
+### Tool Parameters
+
+`parameters` is passed to the agent unchanged as the tool's input schema, and arguments are validated against it before `execute` runs. The root must be a JSON Schema object with `type: "object"`; a tool whose schema has any other root is skipped with a warning.
 
 ### Tool Result Format
 

@@ -173,6 +173,31 @@ interface CachedSetupInfo {
 
 const DEFAULT_HOOK_TIMEOUT_MS = 5000;
 
+/** Prefix applied to every plugin tool name exposed to agent sessions. */
+const PLUGIN_TOOL_PREFIX = "plugin_";
+
+interface OwnedPluginTool {
+  pluginId: string;
+  tool: PluginToolDefinition;
+  exposedName: string;
+  /** Detached copy of the declared JSON Schema, validated as an object schema. */
+  parameters: Record<string, unknown>;
+}
+
+/**
+ * Return a detached copy of a plugin tool's declared parameter schema, or undefined when it cannot serve as a tool input schema.
+ * Tool input must be a JSON object, so the root must be a JSON Schema with `type: "object"`; a copy keeps a plugin from mutating the schema after conversion.
+ */
+function toPluginToolParameters(declared: unknown): Record<string, unknown> | undefined {
+  if (!declared || typeof declared !== "object" || Array.isArray(declared)) return undefined;
+  if ((declared as { type?: unknown }).type !== "object") return undefined;
+  try {
+    return structuredClone(declared) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
 export class PluginRunner {
   private readonly log = createLogger("plugin-runner");
   private cachedTools: CachedTools | null = null;
@@ -330,9 +355,8 @@ export class PluginRunner {
    */
   getPluginTools(): ToolDefinition[] {
     if (!this.cachedTools || this.cachedTools.version !== this.toolsCacheVersion) {
-      const pluginTools = this.options.pluginLoader.getPluginTools();
       this.cachedTools = {
-        tools: this.convertPluginTools(pluginTools),
+        tools: this.convertPluginTools(this.collectOwnedPluginTools()),
         version: this.toolsCacheVersion,
       };
     }
@@ -1162,30 +1186,55 @@ export class PluginRunner {
   // ── Tool Conversion ───────────────────────────────────────────────
 
   /**
-   * Convert PluginToolDefinition[] to ToolDefinition[] for the pi-coding-agent.
+   * Collect plugin tools with their owning plugin id, one entry per exposed name.
    *
-   * Plugin tools have this signature:
-   *   execute(params: Record<string, unknown>, ctx: PluginContext): Promise<PluginToolResult>
-   *
-   * Engine ToolDefinition has this signature:
-   *   execute(toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult>
-   *
-   * The conversion:
-   * 1. Prefixes the tool name with "plugin_"
-   * 2. Maps name/description directly (use name as label)
-   * 3. Wraps execute to extract params and call plugin's execute
-   * 4. Returns { content: result.content } format
+   * FNXC:PluginTools 2026-10-07-19:36:
+   * Ownership is carried from collection, never inferred by name: inferring it bound a second plugin's same-named tool to the first plugin's context (settings, identity, destructive-operation permission).
+   * Exposed names are unique per session because providers reject duplicate tool names. On a collision the plugin with the lowest id keeps the name, independent of load order, and the others are skipped with a warning naming both plugins.
    */
-  private convertPluginTools(pluginTools: PluginToolDefinition[]): ToolDefinition[] {
-    return pluginTools.map((pluginTool) => {
-      // Get the plugin context for this tool
-      const pluginId = this.getPluginIdForTool(pluginTool);
-      const plugin = pluginId ? this.options.pluginLoader.getPlugin(pluginId) : undefined;
+  private collectOwnedPluginTools(): OwnedPluginTool[] {
+    const plugins = [...this.options.pluginLoader.getLoadedPlugins()]
+      .sort((a, b) => (a.manifest.id < b.manifest.id ? -1 : a.manifest.id > b.manifest.id ? 1 : 0));
+    const owners = new Map<string, string>();
+    const owned: OwnedPluginTool[] = [];
+    for (const plugin of plugins) {
+      const pluginId = plugin.manifest.id;
+      for (const tool of plugin.tools ?? []) {
+        const exposedName = `${PLUGIN_TOOL_PREFIX}${tool.name}`;
+        const existingOwner = owners.get(exposedName);
+        if (existingOwner !== undefined) {
+          if (existingOwner !== pluginId) {
+            this.log.warn(
+              `Plugin tool '${exposedName}' from plugin '${pluginId}' is skipped: plugin '${existingOwner}' already exposes that name`,
+            );
+          } else {
+            this.log.warn(`Plugin '${pluginId}' declares tool '${exposedName}' more than once; only the first is exposed`);
+          }
+          continue;
+        }
+        const parameters = toPluginToolParameters(tool.parameters);
+        if (!parameters) {
+          this.log.warn(
+            `Plugin tool '${exposedName}' from plugin '${pluginId}' is skipped: parameters must be a JSON Schema object with type "object"`,
+          );
+          continue;
+        }
+        owners.set(exposedName, pluginId);
+        owned.push({ pluginId, tool, exposedName, parameters });
+      }
+    }
+    return owned;
+  }
 
-      // Store the timeout for use in the closure
-      const timeout = this.hookTimeoutMs;
-
-      // Create wrapper that extracts params and uses stored context
+  /**
+   * Convert owned plugin tools to the pi-coding-agent ToolDefinition shape.
+   *
+   * FNXC:PluginTools 2026-10-07-19:36:
+   * The agent-visible schema is the plugin's declared JSON Schema (pi-ai validates arguments against it and providers advertise its properties and required fields); it previously advertised Type.Any(), so required arguments never reached the model.
+   * Each call resolves the owner's currently loaded instance and its same-named tool, so a session that captured definitions before a reload runs the new module, and one that captured them before an unload gets "not available" instead of a torn-down module.
+   */
+  private convertPluginTools(ownedTools: OwnedPluginTool[]): ToolDefinition[] {
+    return ownedTools.map(({ pluginId, tool: declaredTool, exposedName, parameters }) => {
       const wrappedExecute = async (
         _toolCallId: string,
         params: Record<string, unknown>,
@@ -1193,24 +1242,25 @@ export class PluginRunner {
         _onUpdate: unknown | undefined,
         _ctx: unknown,
       ) => {
-        if (!plugin) {
+        const plugin = this.options.pluginLoader.getPlugin(pluginId);
+        const currentTool = plugin?.tools?.find((t) => t.name === declaredTool.name);
+        if (!plugin || !currentTool) {
           return {
-            content: [{ type: "text" as const, text: "Plugin not available" }],
+            content: [{ type: "text" as const, text: `Plugin tool ${exposedName} is not available: plugin '${pluginId}' is not loaded` }],
+            isError: true,
             details: {},
           };
         }
 
-        // Create context for this specific tool call
         const context = await this.createToolContext(plugin);
 
         try {
           const result = await this.withTimeout(
-            pluginTool.execute(params as Record<string, unknown>, context),
-            timeout,
-            `Tool ${pluginTool.name} execution timed out`,
+            currentTool.execute(params as Record<string, unknown>, context),
+            this.hookTimeoutMs,
+            `Tool ${declaredTool.name} execution timed out`,
           );
 
-          // Convert PluginToolResult to AgentToolResult
           return {
             content: result.content,
             isError: result.isError ?? false,
@@ -1225,32 +1275,14 @@ export class PluginRunner {
         }
       };
 
-      // Use Type.Any for plugin tool parameters since plugins use JSON Schema
-      // which is compatible with TypeBox's Any type
-      const anySchema = Type.Any();
-
       return {
-        name: `plugin_${pluginTool.name}`,
-        label: pluginTool.name,
-        description: pluginTool.description,
-        parameters: anySchema,
+        name: exposedName,
+        label: declaredTool.name,
+        description: declaredTool.description,
+        parameters: Type.Unsafe<Record<string, unknown>>(parameters),
         execute: wrappedExecute,
       };
     });
-  }
-
-  /**
-   * Get the plugin ID that owns a tool.
-   * We infer it from the loader's perspective - tools are stored per plugin.
-   */
-  private getPluginIdForTool(tool: PluginToolDefinition): string | undefined {
-    const loadedPlugins = this.options.pluginLoader.getLoadedPlugins();
-    for (const plugin of loadedPlugins) {
-      if (plugin.tools?.some((t) => t.name === tool.name)) {
-        return plugin.manifest.id;
-      }
-    }
-    return undefined;
   }
 
   /**

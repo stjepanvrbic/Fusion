@@ -16,7 +16,7 @@ import {
   type PluginStore,
   type PluginInstallation,
 } from "@fusion/core";
-import type { FusionPlugin, PluginToolDefinition } from "@fusion/core";
+import type { FusionPlugin, PluginContext, PluginToolDefinition } from "@fusion/core";
 
 /*
 FNXC:PluginRunnerTests 2026-08-17-12:11:
@@ -320,7 +320,7 @@ describe("PluginRunner", () => {
           execute: vi.fn(),
         },
       ];
-      mockPluginLoader.getPluginTools.mockReturnValue(mockTools);
+      mockPluginLoader.getLoadedPlugins.mockReturnValue([createMockPlugin({ tools: mockTools })]);
       
       await pluginRunner.init();
       const tools1 = pluginRunner.getPluginTools();
@@ -339,7 +339,219 @@ describe("PluginRunner", () => {
       
       // Next call should rebuild cache
       const tools3 = pluginRunner.getPluginTools();
-      expect(mockPluginLoader.getPluginTools).toHaveBeenCalledTimes(2);
+      expect(tools3).not.toBe(tools1);
+      expect(tools3.map((t) => t.name)).toEqual(["plugin_test-tool"]);
+    });
+  });
+
+  /*
+  FNXC:PluginTools 2026-10-07-19:36:
+  Each exposed plugin tool carries its owning plugin from collection onward. The agent sees the declared JSON Schema unchanged, a call executes the owner's currently loaded instance with the owner's context, and a duplicate exposed name is never bound to another plugin's context.
+  */
+  describe("plugin tool conversion", () => {
+    const linearBrowseSchema = {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Optional text search." },
+        state: { type: "string", enum: ["active", "backlog", "all"] },
+        limit: { type: "number", minimum: 1, maximum: 100 },
+      },
+      required: [],
+    };
+    const linearImportSchema = {
+      type: "object",
+      properties: { issueId: { type: "string", description: "Linear issue id." } },
+      required: ["issueId"],
+    };
+    const pressUpdateSchema = {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        draft: { type: "object", additionalProperties: true },
+        tags: { type: "array", items: { type: "string" } },
+      },
+      required: ["id", "draft"],
+    };
+
+    type ToolExecute = (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
+
+    const toolPlugin = (
+      id: string,
+      tools: PluginToolDefinition[],
+      overrides: Partial<FusionPlugin> = {},
+    ): FusionPlugin => createMockPlugin({
+      manifest: { id, name: id, version: "1.0.0" },
+      tools,
+      ...overrides,
+    });
+
+    const tool = (
+      name: string,
+      parameters: Record<string, unknown>,
+      execute: PluginToolDefinition["execute"] = vi.fn(async () => ({ content: [{ type: "text" as const, text: name }] })),
+    ): PluginToolDefinition => ({ name, description: `${name} tool`, parameters, execute });
+
+    const loadPlugins = (plugins: FusionPlugin[]) => {
+      mockPluginLoader.getLoadedPlugins.mockImplementation(() => plugins);
+      mockPluginLoader.getPlugin.mockImplementation((id: string) => plugins.find((p) => p.manifest.id === id));
+      mockPluginLoader.getPluginTools.mockImplementation(() => plugins.flatMap((p) => p.tools ?? []));
+    };
+
+    const runTool = async (exposedName: string, params: Record<string, unknown> = {}) => {
+      const converted = pluginRunner.getPluginTools().find((t) => t.name === exposedName);
+      expect(converted, `tool ${exposedName} is exposed`).toBeDefined();
+      return (converted!.execute as unknown as ToolExecute)("call-1", params, undefined, undefined, undefined);
+    };
+
+    it("advertises the declared JSON Schema for every tool", async () => {
+      loadPlugins([
+        toolPlugin("linear", [tool("linear_browse", linearBrowseSchema), tool("linear_import", linearImportSchema)]),
+        toolPlugin("press", [tool("press_update", pressUpdateSchema)]),
+      ]);
+      await pluginRunner.init();
+
+      const byName = new Map(pluginRunner.getPluginTools().map((t) => [t.name, t]));
+      expect(byName.get("plugin_linear_browse")?.parameters).toEqual(linearBrowseSchema);
+      expect(byName.get("plugin_linear_import")?.parameters).toEqual(linearImportSchema);
+      expect(byName.get("plugin_press_update")?.parameters).toEqual(pressUpdateSchema);
+    });
+
+    it("validates arguments against the declared schema through pi-ai", async () => {
+      const { validateToolArguments } = await import("@earendil-works/pi-ai");
+      loadPlugins([
+        toolPlugin("linear", [tool("linear_browse", linearBrowseSchema), tool("linear_import", linearImportSchema)]),
+        toolPlugin("press", [tool("press_update", pressUpdateSchema)]),
+      ]);
+      await pluginRunner.init();
+      type ValidateArgs = Parameters<typeof validateToolArguments>;
+      const tools = pluginRunner.getPluginTools() as unknown as ValidateArgs[0][];
+      const check = (name: string, args: Record<string, unknown>) => validateToolArguments(
+        tools.find((t) => t.name === name)!,
+        { type: "toolCall", id: "c1", name, arguments: args } as unknown as ValidateArgs[1],
+      );
+
+      expect(() => check("plugin_linear_import", {})).toThrow(/issueId/);
+      expect(check("plugin_linear_import", { issueId: "ENG-1" })).toEqual({ issueId: "ENG-1" });
+      expect(() => check("plugin_linear_browse", { state: "bogus" })).toThrow();
+      expect(() => check("plugin_linear_browse", { limit: 500 })).toThrow();
+      expect(check("plugin_linear_browse", {})).toEqual({});
+      expect(() => check("plugin_press_update", { id: "x" })).toThrow(/draft/);
+      expect(() => check("plugin_press_update", { id: "x", draft: {}, tags: [{}] })).toThrow();
+      expect(check("plugin_press_update", { id: "x", draft: { a: 1 }, tags: ["t"] })).toEqual({ id: "x", draft: { a: 1 }, tags: ["t"] });
+    });
+
+    it("does not let a plugin mutate the advertised schema after conversion", async () => {
+      const schema = structuredClone(linearImportSchema);
+      loadPlugins([toolPlugin("linear", [tool("linear_import", schema)])]);
+      await pluginRunner.init();
+      const advertised = pluginRunner.getPluginTools()[0].parameters;
+      (schema.properties as Record<string, unknown>).injected = { type: "string" };
+      expect(advertised).toEqual(linearImportSchema);
+    });
+
+    it("excludes a tool whose schema is not an object schema and keeps the plugin's valid tools", async () => {
+      loadPlugins([
+        toolPlugin("linear", [
+          tool("bad_scalar", { type: "string" }),
+          tool("bad_missing", undefined as unknown as Record<string, unknown>),
+          tool("linear_import", linearImportSchema),
+        ]),
+      ]);
+      await pluginRunner.init();
+      expect(pluginRunner.getPluginTools().map((t) => t.name)).toEqual(["plugin_linear_import"]);
+      expect(pluginRunnerLogger.warn).toHaveBeenCalledWith(expect.stringContaining("bad_scalar"));
+      expect(pluginRunnerLogger.warn).toHaveBeenCalledWith(expect.stringContaining("bad_missing"));
+    });
+
+    it.each([
+      ["alpha loaded first", ["alpha", "beta"]],
+      ["beta loaded first", ["beta", "alpha"]],
+    ])("binds each tool to its owner's context with duplicate names (%s)", async (_label, order) => {
+      const contexts = new Map<string, { pluginId: string; settings: Record<string, unknown> }>();
+      const make = (id: string) => toolPlugin(
+        id,
+        [
+          tool("lookup", { type: "object", properties: {} }, vi.fn(async (_p, ctx) => {
+            contexts.set(`lookup:${id}`, { pluginId: ctx.pluginId, settings: ctx.settings });
+            return { content: [{ type: "text" as const, text: id }] };
+          })),
+          tool(`${id}_only`, { type: "object", properties: {} }, vi.fn(async (_p, ctx) => {
+            contexts.set(`${id}_only`, { pluginId: ctx.pluginId, settings: ctx.settings });
+            return { content: [{ type: "text" as const, text: id }] };
+          })),
+        ],
+      );
+      loadPlugins(order.map(make));
+      mockPluginStore.getPlugin.mockImplementation(async (id: string) => ({ id, settings: { owner: id } }));
+      await pluginRunner.init();
+
+      const names = pluginRunner.getPluginTools().map((t) => t.name);
+      expect(new Set(names).size).toBe(names.length);
+      expect(names.filter((n) => n === "plugin_lookup")).toHaveLength(1);
+
+      // The shared name resolves deterministically to the lowest plugin id regardless of load order.
+      const shared = await runTool("plugin_lookup");
+      expect(shared.content[0].text).toBe("alpha");
+      expect(contexts.get("lookup:alpha")).toEqual({ pluginId: "alpha", settings: { owner: "alpha" } });
+      expect(contexts.has("lookup:beta")).toBe(false);
+
+      await runTool("plugin_alpha_only");
+      await runTool("plugin_beta_only");
+      expect(contexts.get("alpha_only")).toEqual({ pluginId: "alpha", settings: { owner: "alpha" } });
+      expect(contexts.get("beta_only")).toEqual({ pluginId: "beta", settings: { owner: "beta" } });
+      expect(pluginRunnerLogger.warn).toHaveBeenCalledWith(expect.stringMatching(/plugin_lookup.*beta/));
+    });
+
+    it("gates each duplicate-name owner's TaskStore by its own manifest permissions", async () => {
+      const seen = new Map<string, PluginContext>();
+      const make = (id: string, destructive: boolean) => toolPlugin(
+        id,
+        [tool(`${id}_tool`, { type: "object", properties: {} }, vi.fn(async (_p, ctx) => {
+          seen.set(id, ctx);
+          return { content: [{ type: "text" as const, text: id }] };
+        }))],
+        { manifest: { id, name: id, version: "1.0.0", permissions: { destructiveTaskOps: destructive } } as FusionPlugin["manifest"] },
+      );
+      loadPlugins([make("safe", false), make("admin", true)]);
+      (mockTaskStore as unknown as { deleteTask: ReturnType<typeof vi.fn> }).deleteTask = vi.fn(async () => undefined);
+      await pluginRunner.init();
+
+      await runTool("plugin_safe_tool");
+      await runTool("plugin_admin_tool");
+      expect(seen.get("safe")?.pluginId).toBe("safe");
+      expect(seen.get("admin")?.pluginId).toBe("admin");
+      expect(() => (seen.get("safe")!.taskStore as unknown as { deleteTask: (id: string) => Promise<void> }).deleteTask("FN-1")).toThrow();
+      await expect((seen.get("admin")!.taskStore as unknown as { deleteTask: (id: string) => Promise<void> }).deleteTask("FN-1")).resolves.toBeUndefined();
+    });
+
+    it("executes the reloaded instance from a tool definition captured before reload", async () => {
+      const v1 = vi.fn(async () => ({ content: [{ type: "text" as const, text: "v1" }] }));
+      const v2 = vi.fn(async () => ({ content: [{ type: "text" as const, text: "v2" }] }));
+      let current = toolPlugin("reports", [tool("reports_get", linearImportSchema, v1)]);
+      mockPluginLoader.getLoadedPlugins.mockImplementation(() => [current]);
+      mockPluginLoader.getPlugin.mockImplementation((id: string) => (id === "reports" ? current : undefined));
+      await pluginRunner.init();
+      const captured = pluginRunner.getPluginTools()[0];
+
+      current = toolPlugin("reports", [tool("reports_get", linearImportSchema, v2)]);
+      const result = await (captured.execute as unknown as ToolExecute)("c", { issueId: "1" }, undefined, undefined, undefined);
+      expect(result.content[0].text).toBe("v2");
+      expect(v1).not.toHaveBeenCalled();
+    });
+
+    it("reports the tool unavailable after its plugin unloads instead of running the unloaded module", async () => {
+      const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }] }));
+      let loaded: FusionPlugin[] = [toolPlugin("reports", [tool("reports_get", linearImportSchema, execute)])];
+      mockPluginLoader.getLoadedPlugins.mockImplementation(() => loaded);
+      mockPluginLoader.getPlugin.mockImplementation((id: string) => loaded.find((p) => p.manifest.id === id));
+      await pluginRunner.init();
+      const captured = pluginRunner.getPluginTools()[0];
+
+      loaded = [];
+      const result = await (captured.execute as unknown as ToolExecute)("c", {}, undefined, undefined, undefined);
+      expect(execute).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/not available/i);
     });
   });
 
