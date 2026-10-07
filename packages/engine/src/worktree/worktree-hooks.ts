@@ -126,6 +126,10 @@ async function resolveGitPath(worktreePath: string, gitPath: string): Promise<st
  * prepare-commit-msg gets the commit-source argument so we can correctly
  * allow legitimate empty commits during amend / merge / squash / template
  * paths and only refuse new --allow-empty commits.
+ *
+ * FNXC:WorktreeHooks 2026-10-07-20:25:
+ * `git commit --amend -m` must be allowed on every OS. Under Git for Windows the hook's parent is the native git.exe, invisible to `ps` and `/proc`, so every reword was refused as empty.
+ * The parent command line now also resolves through the shell's Windows pid, and the amend check runs only once the staged diff is empty, so ordinary commits never pay for that lookup.
  */
 export function buildPrepareCommitMsgEmptyGuardHook(taskId: string): string {
   return `#!/bin/sh
@@ -148,14 +152,33 @@ case "$COMMIT_SOURCE" in
   commit|merge|squash) exit 0 ;;
 esac
 
+GIT_DIR=$(git rev-parse --git-dir)
+if [ -f "$GIT_DIR/MERGE_HEAD" ] \\
+  || [ -f "$GIT_DIR/CHERRY_PICK_HEAD" ] \\
+  || [ -f "$GIT_DIR/REVERT_HEAD" ] \\
+  || [ -d "$GIT_DIR/rebase-merge" ] \\
+  || [ -d "$GIT_DIR/rebase-apply" ]; then
+  exit 0
+fi
+
+# A non-empty staged diff is never refused; only an empty one needs the amend check below.
+if ! git diff --cached --quiet --no-ext-diff 2>/dev/null; then
+  exit 0
+fi
+
 # 'git commit --amend -m "..."' reports source=message (not commit), so the
 # source arg alone cannot distinguish amend-with-new-message from
-# --allow-empty -m. Inspect the parent process command line as a tiebreaker.
+# --allow-empty -m. Inspect the parent git process command line as a tiebreaker.
 #
 # Sourcing:
 #   - 'ps -o args= -p $PPID' is POSIX (macOS, BSD, glibc Linux).
 #   - Alpine/busybox 'ps' may not support '-o args='; fall back to
 #     /proc/$PPID/cmdline (Linux including busybox).
+#   - Git for Windows runs hooks in an msys shell whose parent is the native
+#     git.exe, so $PPID is 1 and neither source can see it. The shell's
+#     Windows pid (/proc/$$/winpid) leads to the parent's command line
+#     through CIM. That costs a PowerShell start, which is why this runs only
+#     after the staged diff proved empty.
 #
 # Matching: tokenize PARENT_CMD by whitespace and require an EXACT '--amend'
 # token APPEARING BEFORE the first message-supplying flag ('-m', '-F',
@@ -164,11 +187,21 @@ esac
 # (e.g. -m 'fix --amend handling') re-tokenizes into a standalone '--amend'
 # token — we must not be fooled by message content. Since '--amend' is a
 # positional flag that always appears before the message args, stopping at
-# the first message flag is reliable on both macOS ps and Linux
-# /proc/$PPID/cmdline (which preserves argv boundaries with NUL separators).
+# the first message flag is reliable on macOS ps, Linux /proc/$PPID/cmdline
+# and the Windows command line alike.
 PARENT_CMD=$(ps -o args= -p "$PPID" 2>/dev/null || echo "")
 if [ -z "$PARENT_CMD" ] && [ -r "/proc/$PPID/cmdline" ]; then
   PARENT_CMD=$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null || echo "")
+fi
+if [ -z "$PARENT_CMD" ] && [ -r "/proc/$$/winpid" ]; then
+  WINPID=$(cat "/proc/$$/winpid" 2>/dev/null || echo "")
+  case "$WINPID" in
+    ''|*[!0-9]*) ;;
+    *)
+      PS_SCRIPT='$p=(Get-CimInstance Win32_Process -Filter "ProcessId='"$WINPID"'").ParentProcessId; (Get-CimInstance Win32_Process -Filter "ProcessId=$p").CommandLine'
+      PARENT_CMD=$(powershell.exe -NoProfile -NonInteractive -Command "$PS_SCRIPT" 2>/dev/null | tr -d '\\r' || echo "")
+      ;;
+  esac
 fi
 for tok in $PARENT_CMD; do
   case "$tok" in
@@ -189,21 +222,10 @@ for tok in $PARENT_CMD; do
   esac
 done
 
-GIT_DIR=$(git rev-parse --git-dir)
-if [ -f "$GIT_DIR/MERGE_HEAD" ] \\
-  || [ -f "$GIT_DIR/CHERRY_PICK_HEAD" ] \\
-  || [ -f "$GIT_DIR/REVERT_HEAD" ] \\
-  || [ -d "$GIT_DIR/rebase-merge" ] \\
-  || [ -d "$GIT_DIR/rebase-apply" ]; then
-  exit 0
-fi
-
-if git diff --cached --quiet --no-ext-diff 2>/dev/null; then
-  printf '%s\\n' "fusion: refusing empty commit \u2014 staged diff is empty." >&2
-  printf '%s\\n' "  Use fn_task_document_write for narrative output, not git commits." >&2
-  printf '%s\\n' "  (FN-5345/FN-5377 empty-commit guard)" >&2
-  exit 1
-fi
+printf '%s\\n' "fusion: refusing empty commit \u2014 staged diff is empty." >&2
+printf '%s\\n' "  Use fn_task_document_write for narrative output, not git commits." >&2
+printf '%s\\n' "  (FN-5345/FN-5377 empty-commit guard)" >&2
+exit 1
 `;
 }
 
