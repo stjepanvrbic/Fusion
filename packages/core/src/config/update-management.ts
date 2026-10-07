@@ -12,10 +12,33 @@ export const EXTERNALLY_MANAGED_UPDATE_MESSAGE =
   "The in-app updater is intentionally disabled so a self-update cannot bypass this deployment's release process. " +
   "Update this install the way it was deployed.";
 
+export const DESKTOP_APP_UPDATE_MESSAGE =
+  "This is the Fusion desktop app, which updates through its built-in updater (Fusion menu → Check for Updates…). " +
+  "The in-app npm updater is disabled here because a global npm install cannot change the desktop app.";
+
 const TRUTHY_VALUES = new Set(["1", "true", "yes", "on"]);
 
-/** Resolves the deployment-owned update declaration, failing closed to existing behavior. */
-export function resolveUpdatesExternallyManaged(env: NodeJS.ProcessEnv = process.env): boolean {
+/*
+FNXC:UpdateManagement 2026-10-07-18:02:
+The desktop app embeds the dashboard in Electron, and electron-updater owns its updates.
+`npm install -g` there updated a separate global CLI and restarted the desktop into the same bundled version, so with autoUpdateAndRestart on it reinstalled and restarted on every boot, killing engines each time.
+An Electron host is therefore always externally managed. Detection reads the running process, not an environment variable, so shells and CLIs spawned from the desktop keep their own update behavior.
+*/
+function isElectronHost(versions: NodeJS.ProcessVersions): boolean {
+  return typeof (versions as NodeJS.ProcessVersions & { electron?: string }).electron === "string";
+}
+
+/** Resolves whether in-app npm updates are owned elsewhere: a deployment declaration or the Electron desktop host. */
+export function resolveUpdatesExternallyManaged(
+  env: NodeJS.ProcessEnv = process.env,
+  versions: NodeJS.ProcessVersions = process.versions,
+): boolean {
+  if (isElectronHost(versions)) return true;
   const value = env[EXTERNALLY_MANAGED_UPDATES_ENV];
   return typeof value === "string" && TRUTHY_VALUES.has(value.trim().toLowerCase());
+}
+
+/** Operator guidance for a host whose updates are externally managed. */
+export function resolveExternallyManagedUpdateMessage(versions: NodeJS.ProcessVersions = process.versions): string {
+  return isElectronHost(versions) ? DESKTOP_APP_UPDATE_MESSAGE : EXTERNALLY_MANAGED_UPDATE_MESSAGE;
 }

@@ -137,4 +137,32 @@ describe("registerUpdateCheckRoutes", () => {
     expect(mockPerformUpdateCheck).not.toHaveBeenCalled();
     expect(mockPerformUpdateInstall).not.toHaveBeenCalled();
   });
+
+  /*
+   * C-045: the manual banner install inside the Electron desktop app reported success and restarted the
+   * desktop without updating it. Every update route treats that host as externally managed and names
+   * the desktop updater.
+   */
+  it("suppresses all routes inside the Electron desktop host and points at the desktop updater", async () => {
+    const versionsDescriptor = Object.getOwnPropertyDescriptor(process, "versions")!;
+    Object.defineProperty(process, "versions", { ...versionsDescriptor, value: { ...process.versions, electron: "35.0.0" } });
+    try {
+      const app = createApp();
+
+      const get = await performRequest(app, "GET", "/api/update-check");
+      const refresh = await performRequest(app, "POST", "/api/update-check/refresh", "{}", { "content-type": "application/json" });
+      const install = await postInstall(app);
+
+      for (const response of [get, refresh]) {
+        expect(response.body).toMatchObject({ disabled: true, externallyManaged: true, updateAvailable: false, latestVersion: null });
+        expect(response.body.message).toMatch(/desktop app/i);
+      }
+      expect(install.body).toMatchObject({ updated: false, outcome: "unsupported-install-method" });
+      expect(install.body.error).toMatch(/desktop app/i);
+      expect(mockPerformUpdateCheck).not.toHaveBeenCalled();
+      expect(mockPerformUpdateInstall).not.toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(process, "versions", versionsDescriptor);
+    }
+  });
 });

@@ -1,5 +1,5 @@
 import {
-  EXTERNALLY_MANAGED_UPDATE_MESSAGE,
+  resolveExternallyManagedUpdateMessage,
   resolveGlobalDir,
   resolveUpdateAutomationSettings,
   resolveUpdatesExternallyManaged,
@@ -39,6 +39,9 @@ export const registerUpdateCheckRoutes: ApiRouteRegistrar = (ctx) => {
       FNXC:UpdateManagement 2026-08-21-16:37:
       This declaration suppresses the offer, not merely the registry check: a managed
       deployment's release pipeline owns the artifact and must not be bypassed by npm.
+
+      FNXC:UpdateManagement 2026-10-07-18:02:
+      The Electron desktop host is always externally managed, so the banner install can no longer report success and restart the desktop into the same version; the message names the desktop updater instead.
       */
       if (resolveUpdatesExternallyManaged()) {
         res.json({
@@ -48,7 +51,7 @@ export const registerUpdateCheckRoutes: ApiRouteRegistrar = (ctx) => {
           currentVersion: cliPackageVersion,
           latestVersion: null,
           lastChecked: Date.now(),
-          message: EXTERNALLY_MANAGED_UPDATE_MESSAGE,
+          message: resolveExternallyManagedUpdateMessage(),
         });
         return;
       }
@@ -89,7 +92,7 @@ export const registerUpdateCheckRoutes: ApiRouteRegistrar = (ctx) => {
           currentVersion: cliPackageVersion,
           latestVersion: null,
           lastChecked: Date.now(),
-          message: EXTERNALLY_MANAGED_UPDATE_MESSAGE,
+          message: resolveExternallyManagedUpdateMessage(),
         });
         return;
       }
@@ -121,8 +124,8 @@ export const registerUpdateCheckRoutes: ApiRouteRegistrar = (ctx) => {
           latestVersion: null,
           updated: false,
           outcome: "unsupported-install-method",
-          message: EXTERNALLY_MANAGED_UPDATE_MESSAGE,
-          error: EXTERNALLY_MANAGED_UPDATE_MESSAGE,
+          message: resolveExternallyManagedUpdateMessage(),
+          error: resolveExternallyManagedUpdateMessage(),
         });
         return;
       }
