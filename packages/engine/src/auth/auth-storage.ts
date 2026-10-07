@@ -1,4 +1,5 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import lockfile from "proper-lockfile";
@@ -130,6 +131,81 @@ async function withOAuthInstanceLoginLock<T>(
 type AuthFileData = Record<string, unknown>;
 type DefaultInstanceMap = Record<string, string>;
 
+/*
+FNXC:ProviderAuth 2026-10-07-17:57:
+A credential write never removes keys it did not intend to change.
+Writes used to truncate auth.json in place and every read failure parsed as `{}`, so a crash mid-write, an antivirus interruption or a hand-edit typo made the next locked write persist only the one changed key and delete every other credential.
+auth.json is now replaced atomically (same-directory temp file, fsync, rename with a short EPERM/EBUSY/EACCES retry for Windows scanners), and an unparseable file refuses every write with a `.corrupt-*` backup instead of being overwritten.
+Only a missing or blank file reads as empty.
+*/
+export class AuthFileCorruptError extends Error {
+  constructor(readonly authPath: string, readonly backupPath: string | undefined) {
+    super(
+      `${authPath} is not a valid auth.json; refusing to write credentials so existing ones are not lost. `
+        + (backupPath ? `A copy was saved to ${backupPath}. ` : "")
+        + "Fix or remove the file, then retry.",
+    );
+    this.name = "AuthFileCorruptError";
+  }
+}
+
+const AUTH_FILE_CORRUPT = Symbol("auth-file-corrupt");
+
+/** Strictly parse auth.json: missing or blank is empty, anything else that is not a JSON object is corrupt. */
+function parseAuthFile(authPath: string): AuthFileData | typeof AUTH_FILE_CORRUPT {
+  let text: string;
+  try {
+    text = readFileSync(authPath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+  if (text.trim() === "") return {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as AuthFileData : AUTH_FILE_CORRUPT;
+  } catch {
+    return AUTH_FILE_CORRUPT;
+  }
+}
+
+const AUTH_RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+const AUTH_RENAME_MAX_ATTEMPTS = 8;
+const AUTH_RENAME_RETRY_BASE_MS = 25;
+
+async function renameAuthFileWithRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      renameSync(from, to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (process.platform !== "win32" || !code || !AUTH_RENAME_RETRY_CODES.has(code) || attempt >= AUTH_RENAME_MAX_ATTEMPTS) throw error;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, AUTH_RENAME_RETRY_BASE_MS * attempt));
+    }
+  }
+}
+
+/** Replace auth.json so a reader or a crash observes either the old or the new content, never a partial file. */
+async function writeAuthFileAtomic(authPath: string, content: string): Promise<void> {
+  const tmpPath = `${authPath}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(tmpPath, "wx", 0o600);
+    writeFileSync(fd, content, "utf-8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    chmodSync(tmpPath, 0o600);
+    await renameAuthFileWithRetry(tmpPath, authPath);
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* already failing; the original error is rethrown */ }
+    }
+    rmSync(tmpPath, { force: true });
+  }
+}
+
 function readDefaultInstanceMap(data: AuthFileData): DefaultInstanceMap {
   const candidate = data.__fusionDefaultInstances;
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return {};
@@ -157,13 +233,41 @@ class FusionFileAuthStorage implements FusionAuthStorage {
   private ensureFile(): void {
     const parent = dirname(this.authPath);
     if (!existsSync(parent)) mkdirSync(parent, { recursive: true, mode: 0o700 });
-    if (!existsSync(this.authPath)) { writeFileSync(this.authPath, "{}", { encoding: "utf-8", mode: 0o600 }); chmodSync(this.authPath, 0o600); }
+    if (!existsSync(this.authPath)) {
+      try {
+        writeFileSync(this.authPath, "{}", { encoding: "utf-8", mode: 0o600, flag: "wx" });
+        chmodSync(this.authPath, 0o600);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
   }
-  private readCurrent(): AuthFileData {
+  /*
+  FNXC:ProviderAuth 2026-10-07-17:57:
+  Unlocked readers (reload, revalidate) keep their last good snapshot when auth.json is unreadable or torn, instead of dropping every in-memory credential until the next change.
+  */
+  private readCurrentOrKeep(): AuthFileData | undefined {
     try {
-      const parsed: unknown = JSON.parse(readFileSync(this.authPath, "utf-8"));
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as AuthFileData : {};
-    } catch { return {}; }
+      const parsed = parseAuthFile(this.authPath);
+      return parsed === AUTH_FILE_CORRUPT ? undefined : parsed;
+    } catch { return undefined; }
+  }
+  private corruptBackup: { stampKey: string; path: string } | undefined;
+  /** Locked read for a write: refuse on corruption, keeping one backup per distinct corrupt file. */
+  private readCurrentForWrite(): AuthFileData {
+    const parsed = parseAuthFile(this.authPath);
+    if (parsed !== AUTH_FILE_CORRUPT) return parsed;
+    const stamp = this.readFileStamp();
+    const stampKey = stamp ? `${stamp.mtimeMs}:${stamp.size}` : "unknown";
+    if (this.corruptBackup?.stampKey !== stampKey) {
+      const path = `${this.authPath}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+      try {
+        copyFileSync(this.authPath, path);
+        chmodSync(path, 0o600);
+        this.corruptBackup = { stampKey, path };
+      } catch { this.corruptBackup = undefined; }
+    }
+    throw new AuthFileCorruptError(this.authPath, this.corruptBackup?.path);
   }
   private readFileStamp(): { mtimeMs: number; size: number } | undefined {
     try {
@@ -174,20 +278,30 @@ class FusionFileAuthStorage implements FusionAuthStorage {
   private revalidate(): void {
     const stamp = this.readFileStamp();
     if (!stamp || (this.fileStamp && stamp.mtimeMs === this.fileStamp.mtimeMs && stamp.size === this.fileStamp.size)) return;
-    this.data = this.readCurrent();
+    const next = this.readCurrentOrKeep();
+    // An unreadable file keeps the last good snapshot; the stamp is left stale so the next read retries.
+    if (next === undefined) return;
+    this.data = next;
     this.fileStamp = stamp;
   }
   private async withLock<T>(fn: (current: AuthFileData) => Promise<{ result: T; changed: boolean }>): Promise<T> {
     return enqueueAuthWrite(this.authPath, async () => {
       this.ensureFile(); const release = await lockfile.lock(this.authPath, AUTH_LOCK_OPTIONS);
       try {
-        const current = this.readCurrent(); const { result, changed } = await fn(current);
-        if (changed) { writeFileSync(this.authPath, JSON.stringify(current, null, 2), { encoding: "utf-8", mode: 0o600 }); chmodSync(this.authPath, 0o600); this.data = current; this.fileStamp = this.readFileStamp(); }
+        const current = this.readCurrentForWrite(); const { result, changed } = await fn(current);
+        if (changed) { await writeAuthFileAtomic(this.authPath, JSON.stringify(current, null, 2)); this.data = current; this.fileStamp = this.readFileStamp(); }
         return result;
       } finally { await release(); }
     });
   }
-  reload(): void { this.ensureFile(); this.data = this.readCurrent(); this.fileStamp = this.readFileStamp(); }
+  reload(): void {
+    this.ensureFile();
+    const stamp = this.readFileStamp();
+    const next = this.readCurrentOrKeep();
+    if (next === undefined) return;
+    this.data = next;
+    this.fileStamp = stamp;
+  }
   private parseReadKey(key: string): ProviderInstanceRef | undefined { return parseProviderInstanceKey(key); }
   private assertRef(ref: ProviderInstanceRef): ProviderInstanceRef {
     // format validates both ids and rejects reserved provider names before any mutator locks.
@@ -590,6 +704,8 @@ const ANTHROPIC_PROVIDER_ID = "anthropic";
 const META_PROVIDER_ID = "meta";
 const META_SUBSCRIPTION_PROVIDER_ID = "meta-subscription";
 const OAUTH_REFRESH_FAILURE_COOLDOWN_MS = 30_000;
+/** Upper bound for one OAuth token-endpoint round trip made under the refresh lock. */
+const OAUTH_REFRESH_REQUEST_TIMEOUT_MS = 15_000;
 
 export function getHomeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || homedir();
@@ -707,18 +823,31 @@ async function refreshAnthropicOAuthCredential(credential: StoredCredential): Pr
     FNXC:ClaudeOAuth 2026-07-14-14:25:
     Refresh through pi-ai's registered Anthropic provider—the same implementation that performs login and owns the endpoint, client id, expiry buffer, and response contract. Fusion's duplicated HTTP implementation drifted, so expired subscription OAuth degraded into a misleading missing-API-key failure after restart or PostgreSQL migration. Preserve Fusion's recorded scopes because the provider refresh result intentionally contains only runtime token fields.
     */
-    const response = await fetch("https://platform.claude.com/v1/oauth/token", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      // Do not include scope: RFC 6749 refreshes preserve the granted scope only when omitted.
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-        refresh_token: credential.refresh,
-      }),
-    });
-    if (!response.ok) return undefined;
-    const payload = JSON.parse(await response.text()) as { access_token?: string; refresh_token?: string; expires_in?: number };
+    /*
+    FNXC:ProviderAuth 2026-10-07-17:57:
+    The refresh runs while the cross-process refresh lock is held, so a stalled token endpoint would block every session behind it; the request and body read are bounded by OAUTH_REFRESH_REQUEST_TIMEOUT_MS.
+    */
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), OAUTH_REFRESH_REQUEST_TIMEOUT_MS);
+    let responseText: string;
+    try {
+      const response = await fetch("https://platform.claude.com/v1/oauth/token", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        // Do not include scope: RFC 6749 refreshes preserve the granted scope only when omitted.
+        body: JSON.stringify({
+          grant_type: "refresh_token",
+          client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+          refresh_token: credential.refresh,
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) return undefined;
+      responseText = await response.text();
+    } finally {
+      clearTimeout(timeout);
+    }
+    const payload = JSON.parse(responseText) as { access_token?: string; refresh_token?: string; expires_in?: number };
     if (!payload.access_token || !payload.refresh_token || typeof payload.expires_in !== "number") return undefined;
     return {
       ...credential,
@@ -965,23 +1094,86 @@ export function createFusionAuthStorage(): FusionAuthStorage {
     }
   };
 
+  /*
+  FNXC:ProviderAuth 2026-10-07-17:57:
+  One refresh per credential at a time across processes. Provider-keyed and instance-keyed refreshes share this in-process single-flight, failure cooldown and cross-process refresh lock; the instance path used to refresh with none of them, so two sessions on one selected subscription instance spent the same rotating refresh token and one failed with invalid_grant.
+  */
+  const runSingleFlightOAuthRefresh = (
+    flightKey: string,
+    refreshLockProvider: string,
+    transaction: () => Promise<StoredCredential | undefined>,
+  ): Promise<StoredCredential | undefined> => {
+    const cooldownUntil = oauthRefreshCooldownUntil.get(flightKey);
+    if (cooldownUntil && cooldownUntil > Date.now()) {
+      return Promise.resolve(undefined);
+    }
+
+    const existing = oauthRefreshInFlight.get(flightKey);
+    if (existing) {
+      return existing;
+    }
+
+    const refreshPromise = withOAuthRefreshLock(authPath, refreshLockProvider, transaction)
+      .then((refreshed) => {
+        if (refreshed && !shouldRefreshOAuthCredential(refreshed)) {
+          oauthRefreshCooldownUntil.delete(flightKey);
+        } else {
+          oauthRefreshCooldownUntil.set(flightKey, Date.now() + OAUTH_REFRESH_FAILURE_COOLDOWN_MS);
+        }
+        return refreshed;
+      })
+      .catch(() => {
+        oauthRefreshCooldownUntil.set(flightKey, Date.now() + OAUTH_REFRESH_FAILURE_COOLDOWN_MS);
+        return undefined;
+      })
+      .finally(() => {
+        oauthRefreshInFlight.delete(flightKey);
+      });
+
+    oauthRefreshInFlight.set(flightKey, refreshPromise);
+    return refreshPromise;
+  };
+
+  /** Refresh one concrete credential instance under the shared lock, writing back only if its submitted material is still current. */
+  const refreshInstanceOAuthCredential = async (
+    instance: ProviderInstanceRef,
+    credential: StoredCredential,
+  ): Promise<StoredCredential | undefined> => {
+    if (!shouldRefreshOAuthCredential(credential)) {
+      return credential;
+    }
+    return runSingleFlightOAuthRefresh(
+      formatProviderInstanceKey(instance),
+      getOAuthResolutionProviderId(instance.providerId),
+      async () => {
+        primary.reload();
+        const persisted = primary.getInstance(instance);
+        if (!persisted) return undefined;
+        // A waiter that acquires the lock after another session rotated the token returns the fresh row without a second request.
+        if (!shouldRefreshOAuthCredential(persisted)) return persisted;
+        const refreshed = await refreshOAuthCredential(
+          instance.providerId,
+          persisted,
+          primary.getModelRuntime(),
+          () => {
+            primary.reload();
+            return primary.getInstance(instance);
+          },
+        );
+        if (!refreshed) return undefined;
+        if (await primary.setInstanceIfMaterialMatches(instance, persisted, refreshed)) return refreshed;
+        primary.reload();
+        return primary.getInstance(instance) ?? refreshed;
+      },
+    );
+  };
+
   const refreshProviderOAuthCredential = async (
     storageProvider: string,
     credential: StoredCredential,
   ): Promise<StoredCredential | undefined> => {
     if (!shouldRefreshOAuthCredential(credential)) {
       return credential;
-    }
-
-    const now = Date.now();
-    const cooldownUntil = oauthRefreshCooldownUntil.get(storageProvider);
-    if (cooldownUntil && cooldownUntil > now) {
-      return undefined;
-    }
-
-    const existing = oauthRefreshInFlight.get(storageProvider);
-    if (existing) {
-      return existing;
     }
 
     /*
@@ -1004,7 +1196,7 @@ export function createFusionAuthStorage(): FusionAuthStorage {
     // row can refer to the same rotating refresh token, so both aliases must use
     // one canonical refresh-lock domain.
     const refreshLockProvider = getOAuthResolutionProviderId(storageProvider);
-    const refreshPromise = withOAuthRefreshLock(authPath, refreshLockProvider, async () => {
+    return runSingleFlightOAuthRefresh(storageProvider, refreshLockProvider, async () => {
       primary.reload();
       const writeRef = primary.resolveInstanceRef(storageProvider);
       const selectPersistedRefreshCredential = (): StoredCredential | undefined => {
@@ -1068,25 +1260,7 @@ export function createFusionAuthStorage(): FusionAuthStorage {
         await primary.set(storageProvider, refreshed);
       }
       return refreshed;
-    })
-      .then((refreshed) => {
-        if (refreshed && !shouldRefreshOAuthCredential(refreshed)) {
-          oauthRefreshCooldownUntil.delete(storageProvider);
-        } else {
-          oauthRefreshCooldownUntil.set(storageProvider, Date.now() + OAUTH_REFRESH_FAILURE_COOLDOWN_MS);
-        }
-        return refreshed;
-      })
-      .catch(() => {
-        oauthRefreshCooldownUntil.set(storageProvider, Date.now() + OAUTH_REFRESH_FAILURE_COOLDOWN_MS);
-        return undefined;
-      })
-      .finally(() => {
-        oauthRefreshInFlight.delete(storageProvider);
-      });
-
-    oauthRefreshInFlight.set(storageProvider, refreshPromise);
-    return refreshPromise;
+    });
   };
 
   const selectStoredCredential = (provider: string) => choosePreferredStoredCredential(
@@ -1485,16 +1659,7 @@ export function createFusionAuthStorage(): FusionAuthStorage {
           if (instance) {
             const credential = target.getInstance(instance);
             if (!credential) return undefined;
-            const refreshed = await refreshOAuthCredential(
-              instance.providerId,
-              credential,
-              target.getModelRuntime?.(),
-              () => {
-                target.reload();
-                return target.getInstance(instance);
-              },
-            );
-            if (refreshed && refreshed !== credential) await target.setInstance(instance, refreshed);
+            const refreshed = await refreshInstanceOAuthCredential(instance, credential);
             return resolveStoredCredentialApiKey(provider, refreshed ?? credential);
           }
           if (provider === ANTHROPIC_PROVIDER_ID) {
