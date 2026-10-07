@@ -109,7 +109,8 @@ const mocks = vi.hoisted(() => {
   };
 });
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: mocks.spawn,
 }));
 
@@ -337,6 +338,10 @@ describe("runSkillsSearch", () => {
 
 // ─── runSkillsInstall tests ────────────────────────────────────────────────────
 
+// win32 runs the npx shim through cmd.exe with validated tokens; POSIX spawns npx directly.
+const INSTALLER_COMMAND = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "npx";
+const INSTALLER_PREFIX = process.platform === "win32" ? ["/d", "/s", "/c", "npx"] : [];
+
 describe("runSkillsInstall", () => {
   beforeEach(() => {
     consoleLogSpy.mockClear();
@@ -363,6 +368,7 @@ describe("runSkillsInstall", () => {
   afterEach(() => {
     consoleLogSpy.mockClear();
     consoleErrorSpy.mockClear();
+    process.exitCode = undefined;
   });
 
   it("prints usage when no source provided", async () => {
@@ -401,9 +407,9 @@ describe("runSkillsInstall", () => {
     await runSkillsInstall(["firebase/agent-skills"]);
 
     expect(mocks.spawn).toHaveBeenCalledWith(
-      "npx",
-      ["skills", "add", "firebase/agent-skills", "-y", "-a", "pi"],
-      expect.any(Object),
+      INSTALLER_COMMAND,
+      [...INSTALLER_PREFIX, "skills", "add", "firebase/agent-skills", "-y", "-a", "pi"],
+      expect.not.objectContaining({ shell: true }),
     );
   });
 
@@ -411,10 +417,28 @@ describe("runSkillsInstall", () => {
     await runSkillsInstall(["firebase/agent-skills"], { skill: "firebase-basics" });
 
     expect(mocks.spawn).toHaveBeenCalledWith(
-      "npx",
-      ["skills", "add", "firebase/agent-skills", "--skill", "firebase-basics", "-y", "-a", "pi"],
-      expect.any(Object),
+      INSTALLER_COMMAND,
+      [...INSTALLER_PREFIX, "skills", "add", "firebase/agent-skills", "--skill", "firebase-basics", "-y", "-a", "pi"],
+      expect.not.objectContaining({ shell: true }),
     );
+  });
+
+  /*
+  FNXC:SkillInstall 2026-10-07-17:57:
+  Installation parameters are data, never shell syntax: metacharacters in either field are refused before any process starts, and refusals and failed installs exit non-zero.
+  */
+  it.each([
+    [["owner/repo&echo INJECTED"], undefined],
+    [["a/b;id"], undefined],
+    [["owner/repo|calc"], undefined],
+    [["owner/repo"], { skill: "x & powershell -c calc" }],
+    [["owner/repo"], { skill: "demo & echo FUSION_MARKER & rem" }],
+    [["owner/repo"], { skill: "%PATH%" }],
+    [["owner/repo"], { skill: "$(id)" }],
+  ])("refuses %j %j without spawning and exits non-zero", async (args, options) => {
+    await runSkillsInstall(args as string[], options as { skill?: string } | undefined);
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
   });
 
   it("prints success message on successful install", async () => {
@@ -442,5 +466,6 @@ describe("runSkillsInstall", () => {
     expect(consoleErrorSpy).toHaveBeenCalledWith(
       expect.stringContaining("Failed to install skill"),
     );
+    expect(process.exitCode).toBe(1);
   });
 });

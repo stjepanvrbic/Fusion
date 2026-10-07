@@ -8,6 +8,7 @@
 import { access, readFile, writeFile, mkdir, readdir, stat } from "node:fs/promises";
 import { join, relative, dirname, resolve, sep } from "node:path";
 import {
+  buildSkillInstallInvocation,
   computeSkillId,
   getSkillSettingState,
   normalizeStoredSkillPath,
@@ -153,7 +154,7 @@ export interface InstallSkillResultSuccess {
 
 export interface InstallSkillResultError {
   error: string;
-  code: "invalid_source" | "spawn_error" | "install_failed" | "install_timeout";
+  code: "invalid_source" | "invalid_skill" | "spawn_error" | "install_failed" | "install_timeout";
 }
 
 export type InstallSkillResult = InstallSkillResultSuccess | InstallSkillResultError;
@@ -221,10 +222,6 @@ export function bareSkillName(name: string): string {
   const lastPathSegment = withoutSkillMd.split("/").pop() ?? withoutSkillMd;
   const afterNamespace = lastPathSegment.split(":").pop() ?? lastPathSegment;
   return afterNamespace.toLowerCase();
-}
-
-function isValidInstallSource(source: string): boolean {
-  return /^[^/]+\/[^/]+$/.test(source);
 }
 
 function captureStream(stream: NodeJS.ReadableStream | null | undefined): Promise<string> {
@@ -580,25 +577,15 @@ export function createSkillsAdapter(options: {
     },
 
     async installSkill(input: { source: string; skill?: string; cwd: string }): Promise<InstallSkillResult> {
-      const source = input.source.trim();
-      if (!isValidInstallSource(source)) {
-        return {
-          error: "Invalid source format. Use owner/repo.",
-          code: "invalid_source",
-        };
+      // FNXC:SkillInstall 2026-10-07-17:57: source and skill are grammar-validated data spawned without a shell; see buildSkillInstallInvocation.
+      const invocation = buildSkillInstallInvocation({ source: input.source, skill: input.skill });
+      if (!invocation.ok) {
+        return { error: invocation.error, code: invocation.code };
       }
-
-      const npxArgs = ["skills", "add", source];
-      const skill = input.skill?.trim();
-      if (skill) {
-        npxArgs.push("--skill", skill);
-      }
-      npxArgs.push("-y", "-a", "pi");
 
       const runSpawn = options.superviseSpawn ?? superviseSpawn;
-      const supervised = runSpawn("npx", npxArgs, {
+      const supervised = runSpawn(invocation.command, invocation.args, {
         cwd: input.cwd,
-        shell: true,
         stdio: ["ignore", "pipe", "pipe"],
         maxLifetimeMs: 60_000,
       });

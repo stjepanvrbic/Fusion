@@ -7,6 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { buildSkillInstallInvocation } from "@fusion/core";
 
 export { BUILTIN_SKILL_GUIDES, runSkillsGet, type BuiltinSkillGuide } from "./skills-get.js";
 
@@ -144,13 +145,6 @@ export async function runSkillsSearch(
 }
 
 /**
- * Validate that a source string is in owner/repo format.
- */
-function isValidSourceFormat(source: string): boolean {
-  return /^[^/]+\/[^/]+$/.test(source);
-}
-
-/**
  * Run the skills install command.
  *
  * @param args - Command arguments (source owner/repo)
@@ -170,26 +164,25 @@ export async function runSkillsInstall(
     return;
   }
 
-  if (!isValidSourceFormat(source)) {
-    console.error("Invalid source format. Use owner/repo (e.g., firebase/agent-skills)");
+  /*
+  FNXC:SkillInstall 2026-10-07-17:57:
+  Source and skill are grammar-validated data spawned without a shell (see buildSkillInstallInvocation).
+  A refused or failed install exits non-zero so scripts can detect it.
+  */
+  const invocation = buildSkillInstallInvocation({ source, skill: options?.skill });
+  if (!invocation.ok) {
+    console.error(
+      invocation.code === "invalid_source"
+        ? "Invalid source format. Use owner/repo (e.g., firebase/agent-skills)"
+        : `${invocation.error} (e.g., firebase-basics)`,
+    );
+    process.exitCode = 1;
     return;
   }
 
-  // Build npx skills add arguments
-  const npxArgs = ["skills", "add", source];
-
-  if (options?.skill) {
-    npxArgs.push("--skill", options.skill);
-  }
-
-  // Non-interactive mode (-y) targeting pi agent (-a pi)
-  npxArgs.push("-y", "-a", "pi");
-
-  // Execute via spawn (async, non-blocking)
-  const child = spawn("npx", npxArgs, {
+  const child = spawn(invocation.command, invocation.args, {
     cwd: process.cwd(),
     stdio: "inherit",
-    shell: true,
   });
 
   const exitCode = await new Promise<number>((resolve, reject) => {
@@ -203,6 +196,7 @@ export async function runSkillsInstall(
 
   if (exitCode !== 0) {
     console.error("Failed to install skill. Make sure 'npx' is available.");
+    process.exitCode = 1;
     return;
   }
 

@@ -5,6 +5,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import * as fusionCore from "@fusion/core";
 import {
   type TaskStore,
+  buildSkillInstallInvocation,
   createTaskStoreForBackend,
   drizzleSql,
   AgentStore,
@@ -7266,29 +7267,21 @@ export default function kbExtension(pi: ExtensionAPI) {
       // FNXC:ToolPermissionGates 2026-07-26-13:55: hard-withheld from agent/ambiguous principals (installs third-party code into the project); operators unaffected.
       const withheldDenied = denyWithheldToolForAgentPrincipal("fn_skills_install", ctx as ExtensionCallerContext);
       if (withheldDenied) return withheldDenied;
-      // Validate source format
-      if (!/^[^/]+\/[^/]+$/.test(params.source)) {
+      /*
+      FNXC:SkillInstall 2026-10-07-17:57:
+      The model chooses source and skill, so both are validated against the shared install grammar and spawned without a shell; no model text reaches a shell parser.
+      */
+      const invocation = buildSkillInstallInvocation({ source: params.source, skill: params.skill });
+      if (!invocation.ok) {
+        const text = invocation.code === "invalid_source"
+          ? `Invalid source format: '${params.source}'. Use owner/repo format (e.g., 'firebase/agent-skills').`
+          : `Invalid skill name: '${params.skill}'. ${invocation.error}`;
         return {
-          content: [
-            {
-              type: "text",
-              text: `Invalid source format: '${params.source}'. Use owner/repo format (e.g., 'firebase/agent-skills').`,
-            },
-          ],
+          content: [{ type: "text", text }],
           isError: true,
-          details: { error: "Invalid source format" },
+          details: { error: invocation.code === "invalid_source" ? "Invalid source format" : "Invalid skill name" },
         };
       }
-
-      // Build npx skills add arguments
-      const npxArgs = ["skills", "add", params.source];
-
-      if (params.skill) {
-        npxArgs.push("--skill", params.skill);
-      }
-
-      // Non-interactive mode (-y) targeting pi agent (-a pi)
-      npxArgs.push("-y", "-a", "pi");
 
       if (signal?.aborted) {
         return {
@@ -7298,10 +7291,9 @@ export default function kbExtension(pi: ExtensionAPI) {
         };
       }
 
-      const child = spawn("npx", npxArgs, {
+      const child = spawn(invocation.command, invocation.args, {
         cwd: resolveProjectRoot(ctx.cwd),
         stdio: "pipe",
-        shell: true,
       });
 
       let stderr = "";
