@@ -696,6 +696,8 @@ export {
   stripWin32NamespacePrefix,
   type PathIdentityOptions,
 } from "./fs/path-identity.js";
+export { renewMergeQueueLease } from "./task-store/merge-queue-ops-2.js";
+export type { MergeQueueRenewOptions } from "./types/merge/merge-queue.js";
 export {
   setRunningAgentCountSource,
   getRunningAgentCountSource,

@@ -203,9 +203,22 @@ export interface MergeQueueAcquireOptions {
   resolveReviewColumnsFor?: (taskId: string) => Promise<ReadonlySet<string>>;
 }
 
+/**
+ * FNXC:TaskStoreMergeCoordination 2026-10-07-19:05:
+ * `leaseToken` fences a release to one lease generation: the `leasedAt` of the entry acquire returned.
+ * The merger leases under one constant worker id, so without the token a pass whose lease expired and was re-leased could release its successor's lease.
+ * It is optional only so existing callers keep working; every merger caller should pass it.
+ */
 export type MergeQueueReleaseOutcome =
-  | { kind: "success" }
-  | { kind: "failure"; error: string };
+  | { kind: "success"; leaseToken?: string }
+  | { kind: "failure"; error: string; leaseToken?: string };
+
+/** Extends a held merge-queue lease. `leaseToken` is the `leasedAt` of the acquired entry; renewal never changes it. */
+export interface MergeQueueRenewOptions {
+  leaseToken: string;
+  leaseDurationMs: number;
+  now?: string;
+}
 
 export interface HandoffEvidence {
   /** Reason text recorded on the run-audit event (for example "fn_task_done"). */
