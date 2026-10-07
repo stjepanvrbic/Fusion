@@ -6,6 +6,7 @@
  * the run-local worker/home directories as leaks.
  */
 
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -100,16 +101,27 @@ export function removeWorkerRootWithRetry(workerRoot: string, retries = 8, delay
   console.warn(`[vitest-teardown] failed to remove worker root ${workerRoot} after ${retries} attempts: ${message}`);
 }
 
+/*
+FNXC:TestTeardownOwnership 2026-10-07-18:04:
+A direct `pnpm --filter <pkg> exec vitest run` starts without the root runner's FUSION_TEST_RUN_TOKEN. Global setup used to record an empty token while every worker minted its own, so teardown never matched and leaked one fusion-test-workers-* root per run.
+Mint and publish the token here, before the marker is written and before workers spawn, so every worker inherits it. A caller-supplied token is kept, and a successor's different token still blocks removal.
+*/
+function ensureInvocationRunToken(): string {
+  const existing = process.env[FUSION_TEST_RUN_TOKEN_ENV];
+  if (existing && existing.trim().length > 0) return existing;
+  const minted = randomUUID();
+  process.env[FUSION_TEST_RUN_TOKEN_ENV] = minted;
+  return minted;
+}
+
 export default function setup(): () => Promise<void> {
   removeLegacyTopLevelHomeRoots();
   // Use a fresh root for each Vitest invocation. A static shared root makes the
   // setup-time redirect sweep proportional to stale directories left by every
   // prior interrupted run.
+  const ownerRunToken = ensureInvocationRunToken();
   const workerRoot = resolve(mkdtempSync(join(tmpdir(), "fusion-test-workers-")));
-  const runToken = process.env[FUSION_TEST_RUN_TOKEN_ENV];
-  const ownerRunToken = runToken && runToken.trim().length > 0 ? runToken : "";
-  const tokenLine = ownerRunToken ? `runToken=${ownerRunToken}\n` : "";
-  const ownerMarker = `${process.pid}\n${tokenLine}`;
+  const ownerMarker = `${process.pid}\nrunToken=${ownerRunToken}\n`;
   let ownsWorkerRoot = false;
   try {
     writeFileSync(join(workerRoot, WORKER_ROOT_OWNER_FILE), ownerMarker);

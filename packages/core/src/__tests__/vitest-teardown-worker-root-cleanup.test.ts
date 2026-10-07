@@ -1,6 +1,9 @@
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { __fusionWorkerRootCleanupTestHooks } from "../__test-utils__/vitest-setup";
 import setup, {
@@ -89,6 +92,82 @@ describe("vitest global teardown worker-root cleanup", () => {
     await teardown();
 
     expect(existsSync(workerRoot)).toBe(false);
+  });
+
+  /*
+  FNXC:TestTeardownOwnership 2026-10-07-18:04:
+  A direct `vitest run` has no root-runner FUSION_TEST_RUN_TOKEN. Global setup must mint and publish one before
+  workers spawn, so every worker inherits the same token and teardown can prove ownership.
+  Global setup runs in the Vitest main process, where vitest-setup's fs patches are absent; in this worker those
+  patches mint a token during setup's mkdtemp and would hide the defect. So the real setup runs in an unpatched
+  child, and each simulated worker starts from the env a fork inherits at spawn, never from a sibling's mutation.
+  */
+  async function startUnpatchedGlobalSetup(): Promise<{
+    workerRoot: string;
+    publishedRunToken: string | undefined;
+    teardown(): Promise<void>;
+  }> {
+    const teardownUrl = pathToFileURL(fileURLToPath(new URL("../__test-utils__/vitest-teardown.ts", import.meta.url))).href;
+    const script = [
+      `import setup from ${JSON.stringify(teardownUrl)};`,
+      `import { once } from "node:events";`,
+      `const teardown = setup();`,
+      `process.stdout.write(JSON.stringify({ workerRoot: process.env.FUSION_TEST_WORKER_ROOT, runToken: process.env.FUSION_TEST_RUN_TOKEN ?? null }) + "\\n");`,
+      `await once(process.stdin, "data");`,
+      `await teardown();`,
+    ].join("\n");
+    const env = { ...process.env };
+    delete env.FUSION_TEST_RUN_TOKEN;
+    delete env.FUSION_TEST_WORKER_ROOT;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script], { env, stdio: ["pipe", "pipe", "inherit"] });
+    const exited = once(child, "exit");
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    while (!stdout.includes("\n")) {
+      const [chunk] = (await Promise.race([once(child.stdout, "data"), exited.then(() => [""])])) as [string];
+      if (chunk === "") throw new Error(`global setup child exited before publishing its worker root: ${stdout}`);
+      stdout += chunk;
+    }
+    const published = JSON.parse(stdout.slice(0, stdout.indexOf("\n"))) as { workerRoot: string; runToken: string | null };
+    remember(published.workerRoot);
+    return {
+      workerRoot: published.workerRoot,
+      publishedRunToken: published.runToken ?? undefined,
+      async teardown() {
+        child.stdin.end("go\n");
+        const [code] = await exited;
+        expect(code).toBe(0);
+      },
+    };
+  }
+
+  function rewriteMarkerAsForkedWorker(inheritedRunToken: string | undefined, workerRoot: string): void {
+    if (inheritedRunToken === undefined) delete process.env.FUSION_TEST_RUN_TOKEN;
+    else process.env.FUSION_TEST_RUN_TOKEN = inheritedRunToken;
+    __fusionWorkerRootCleanupTestHooks.writeWorkerRootOwnerMarker(workerRoot);
+  }
+
+  it("removes its root on a direct invocation where no caller supplied a run token", async () => {
+    const run = await startUnpatchedGlobalSetup();
+    for (const label of ["a", "b", "c"]) {
+      rewriteMarkerAsForkedWorker(run.publishedRunToken, run.workerRoot);
+      makeWorkerChild(run.workerRoot, `direct-${label}`);
+    }
+    await run.teardown();
+
+    expect(run.publishedRunToken).toEqual(expect.any(String));
+    expect(existsSync(run.workerRoot)).toBe(false);
+  });
+
+  it("preserves a successor root when global setup minted the run token itself", async () => {
+    const run = await startUnpatchedGlobalSetup();
+    makeWorkerChild(run.workerRoot, "minted-successor");
+
+    rewriteMarkerAsForkedWorker("genuine-successor-token", run.workerRoot);
+    await run.teardown();
+
+    expect(existsSync(join(run.workerRoot, "w-" + process.pid + "-minted-successor", "file.txt"))).toBe(true);
+    expect(readFileSync(join(run.workerRoot, ".fusion-test-worker-root-owner"), "utf8")).toContain("genuine-successor-token");
   });
 
   it("does not let a stale teardown remove a successor-owned worker root", async () => {
