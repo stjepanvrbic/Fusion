@@ -888,6 +888,65 @@ function blockedCliError(commandLine: string): Error {
   );
 }
 
+/*
+FNXC:TestInfraWindows 2026-10-07-15:30:
+Test fixtures pass POSIX shell command strings to execSync (single-quoted commit messages, `VAR=value cmd` env prefixes, `&&` chains).
+cmd.exe cannot parse them, so on Windows ~100 engine tests failed before their bodies ran and agents verifying engine changes locally saw environment noise instead of signal.
+On win32, an execSync call that does not choose a shell runs under Git for Windows' bash; an explicit `shell` is always honored, and other platforms are unchanged.
+Only the synchronous fixture seam is redirected: production code under test uses async exec/execFile with its own native semantics.
+WSL's System32 bash is deliberately never used because it runs a different filesystem and git.
+*/
+const WINDOWS_POSIX_SHELL: string | undefined = (() => {
+  if (process.platform !== "win32") return undefined;
+  // MSYS shells upper-case Windows variable names and worker env objects are case-sensitive, so match names case-insensitively.
+  const env = (name: string): string | undefined => {
+    const key = Object.keys(process.env).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+    return key ? process.env[key] : undefined;
+  };
+  // Git for Windows ships bash two levels above its exec path (<root>/mingw64/libexec/git-core -> <root>/bin/bash.exe).
+  const fromGit = (() => {
+    try {
+      const execPath = originalChildProcess.execFileSync("git", ["--exec-path"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 }).trim();
+      return execPath ? join(execPath, "..", "..", "..", "bin", "bash.exe") : undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+  const candidates = [
+    env("FUSION_TEST_POSIX_SHELL"),
+    fromGit,
+    env("ProgramFiles") && join(env("ProgramFiles")!, "Git", "bin", "bash.exe"),
+    env("ProgramFiles(x86)") && join(env("ProgramFiles(x86)")!, "Git", "bin", "bash.exe"),
+    env("LOCALAPPDATA") && join(env("LOCALAPPDATA")!, "Programs", "Git", "bin", "bash.exe"),
+  ].filter((candidate): candidate is string => typeof candidate === "string" && candidate.length > 0);
+  return candidates.find((candidate) => existsSync(candidate));
+})();
+
+/*
+FNXC:TestInfraWindows 2026-10-07-15:55:
+Only commands that need POSIX syntax go to bash: single quotes, leading `NAME=value` env assignments, or `$(...)`.
+Fixtures that embed native Windows paths (`git remote add origin C:\Users\...`) must stay on cmd.exe, because bash treats each backslash as an escape.
+*/
+const POSIX_ONLY_SYNTAX = /'|^\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s|\$\(/;
+
+function withFixtureShell<T extends { shell?: string | boolean | undefined }>(command: string, options: T | undefined): T | undefined {
+  if (!WINDOWS_POSIX_SHELL || options?.shell !== undefined || !POSIX_ONLY_SYNTAX.test(command)) return options;
+  return { ...(options ?? {}), shell: WINDOWS_POSIX_SHELL } as T;
+}
+
+/*
+FNXC:TestInfraWindows 2026-10-07-15:55:
+Git for Windows sets core.autocrlf=true system-wide, so fixture repos created by tests check files out with CRLF and byte-level assertions written against CI (Linux) fail.
+Pin autocrlf off for every git process the test worker spawns through git's environment config channel, appending to any entries already present.
+*/
+if (process.platform === "win32") {
+  const existing = Number.parseInt(process.env.GIT_CONFIG_COUNT ?? "0", 10);
+  const index = Number.isFinite(existing) && existing > 0 ? existing : 0;
+  process.env[`GIT_CONFIG_KEY_${index}`] = "core.autocrlf";
+  process.env[`GIT_CONFIG_VALUE_${index}`] = "false";
+  process.env.GIT_CONFIG_COUNT = String(index + 1);
+}
+
 function withDefaultTimeout<T extends { timeout?: number | undefined }>(options: T | undefined): T {
   if (typeof options?.timeout === "number" && Number.isFinite(options.timeout)) {
     return options;
@@ -991,7 +1050,7 @@ function installChildProcessGuards(): void {
       throw blockedCliError(command);
     }
     ensureRuntimeIsolationForSubprocess();
-    return originalChildProcess.execSync(command, withDefaultTimeout(options));
+    return originalChildProcess.execSync(command, withDefaultTimeout(withFixtureShell(command, options)));
   }) as ChildProcessModule["execSync"];
 
   mutableChildProcess.execFileSync = ((file: string, argsOrOptions?: readonly string[] | ExecFileSyncOptions, maybeOptions?: ExecFileSyncOptions) => {

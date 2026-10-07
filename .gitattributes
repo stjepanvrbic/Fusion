@@ -1,3 +1,12 @@
+# Line endings: the repository stores LF, and every checkout uses LF regardless of the
+# machine's core.autocrlf (Git for Windows defaults it to true system-wide). CRLF checkouts
+# broke Windows development: Vite cannot parse a CRLF shebang in the engine merge-gate
+# globalSetup, and source-reading tests and checks saw different bytes than CI.
+# Windows batch scripts stay CRLF because cmd.exe requires it.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
 # FNXC:RepoAssets 2026-06-25-09:00:
 # Demo reel GIFs dominate repo size (the same captures get re-shot and re-committed,
 # and git keeps every old blob forever). Route them through Git LFS so the binaries
