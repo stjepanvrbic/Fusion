@@ -45,7 +45,14 @@ function hasFreshCheckoutLease(
   return !!task.checkoutRunId && Number.isFinite(leaseAge) && leaseAge >= 0 && leaseAge < graceMs;
 }
 
-export type PostMergePublicationWaitReason = NonNullable<MergeDetails["publicationWait"]>["reason"];
+type PersistedPublicationWaitReason = NonNullable<MergeDetails["publicationWait"]>["reason"];
+/**
+ * FNXC:PostMergePublication 2026-10-07-17:58:
+ * `push-pending` means a confirmed-merge push for this target is in flight, cooling down, or owned by another task.
+ * It is transient and process-observed, so it is reported to the caller but never persisted as `publicationWait`
+ * and never audited: a durable "push failed" record for a push that is succeeding misleads the operator.
+ */
+export type PostMergePublicationWaitReason = PersistedPublicationWaitReason | "push-pending";
 
 export type PostMergeGateResumeResult =
   | { outcome: "resumed"; gateId: string }
@@ -62,6 +69,12 @@ push-after-merge on retries the confirmed-merge push and proceeds only if it del
 off, a failed push, or an undeterminable remote does not reseed. Unknown is never conflated with unpublished
 and fails closed only for that tick. Each distinct waiting state is logged and audited once per commit.
 User-defined post-merge gates own their own evidence contract and are not gated on publication.
+*/
+/*
+FNXC:PostMergePublication 2026-10-07-17:58:
+Workspace and shared-branch landings stay exempt. A workspace landing has one SHA per repository and publishes through the per-repository land-intent path, so the single `mergeDetails.commitSha` probe cannot represent it.
+A shared-branch member lands on the group branch, whose publication is the group promotion, not this commit's push.
+Their gates keep the rejected-evidence recheck ladder (capped at one reviewer run per hour) until a publication owner exists for them.
 */
 function requiresPublishedLanding(task: Task, gateId: string): boolean {
   // Workspace and shared-branch landings publish through other owners; a missing SHA cannot be probed.
@@ -93,8 +106,10 @@ async function establishLandedCommitPublication(
   if (publication.state === "published") return { outcome: "published" };
   if (publication.state === "unknown") return { outcome: "waiting", reason: "publication-unknown", publication };
   if (!isPushAfterMergeEnabled(settings)) return { outcome: "waiting", reason: "push-disabled", publication };
-  const pushed = await recoverConfirmedMergePush(store, task, settings, git, fence);
-  return pushed === "delivered" ? { outcome: "delivered" } : { outcome: "waiting", reason: "push-failed", publication };
+  const pushed = await recoverConfirmedMergePush(store, task, settings, git, fence, { remoteProvenAbsent: true });
+  if (pushed === "delivered") return { outcome: "delivered" };
+  // Every eligibility input of push recovery is pre-checked by the caller, so `skipped` here is a race, like `deferred`.
+  return { outcome: "waiting", reason: pushed === "failed" ? "push-failed" : "push-pending", publication };
 }
 
 function publicationWaitMessage(reason: PostMergePublicationWaitReason, shortSha: string, target: string, targetBranch: string, remote: string): string {
@@ -102,6 +117,7 @@ function publicationWaitMessage(reason: PostMergePublicationWaitReason, shortSha
   const rerun = "the gate re-runs once the commit is on the remote.";
   if (reason === "push-disabled") return `${prefix} ${shortSha} is not on ${target} and Push after merge is off. Enable Push after merge or push ${targetBranch} to ${remote}; ${rerun}`;
   if (reason === "push-failed") return `${prefix} ${shortSha} is not on ${target} and push-after-merge recovery did not publish it. Resolve the push failure or push ${targetBranch} to ${remote}; ${rerun}`;
+  if (reason === "push-pending") return `${prefix} ${shortSha} is not on ${target} yet and a push to ${target} is in progress or scheduled; ${rerun}`;
   return `${prefix} could not determine whether ${shortSha} is on ${target} (remote unreachable or git error). The gate re-runs once the remote can confirm the commit.`;
 }
 
@@ -119,6 +135,7 @@ async function reportAwaitingPublication(
   const targetBranch = publication.target?.targetBranch ?? task.mergeDetails?.mergeTargetBranch ?? "the target branch";
   const target = publication.target?.target ?? `${remote}/${targetBranch}`;
   const message = publicationWaitMessage(reason, shortSha, target, targetBranch, remote);
+  if (reason === "push-pending") return { outcome: "awaiting-publication", gateId, reason, message };
   const isReported = (details: MergeDetails | undefined) => details?.publicationWait?.commitSha === sha
     && details.publicationWait.target === target && details.publicationWait.reason === reason;
   if (!isReported(task.mergeDetails)) {

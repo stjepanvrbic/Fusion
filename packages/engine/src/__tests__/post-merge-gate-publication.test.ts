@@ -14,7 +14,7 @@ let sequence = 0;
 
 type Git = (args: string[], cwd: string, timeout: number, signal?: AbortSignal) => Promise<string>;
 
-function fixture(options: { pushAfterMerge: boolean; workflowStepId?: string; customWorkflow?: boolean }) {
+function fixture(options: { pushAfterMerge: boolean; workflowStepId?: string; customWorkflow?: boolean; rootDir?: string }) {
   const workflowStepId = options.workflowStepId ?? "post-merge-verification";
   const rejection = {
     workflowStepId, phase: "post-merge", status: "failed", verdict: "REVISE",
@@ -32,7 +32,7 @@ function fixture(options: { pushAfterMerge: boolean; workflowStepId?: string; cu
   const customIr = JSON.stringify(BUILTIN_CODING_WORKFLOW_IR).replaceAll("\"post-merge-verification\"", `"${workflowStepId}"`);
   let updatedAtCounter = 0;
   const store = {
-    rootDir: `/repo-publication-${sequence}`,
+    rootDir: options.rootDir ?? `/repo-publication-${sequence}`,
     getTask: vi.fn(async () => structuredClone(task)),
     getSettings: vi.fn(async () => settings),
     updateTaskAtomic: vi.fn(async (_id: string, update: (live: Task) => Partial<Task> | null | Promise<Partial<Task> | null>) => {
@@ -213,5 +213,57 @@ describe("post-merge verification publication precondition", () => {
     await expect(resumeMissingPostMergeGate(store, task.id, { git })).resolves.toEqual({ outcome: "resumed", gateId: "custom-post-merge-gate" });
     expect(items).toHaveLength(1);
     expect(git).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:PostMergePublication 2026-10-07-17:58:
+  A push attempt owned elsewhere (in flight, cooling down, or held by another task on the same target) is not a failure.
+  The operator must see that the push is pending, and no durable push-failed marker or audit row may be written.
+  */
+  const expectNoPushFailedRecord = (task: Task, store: TaskStore) => {
+    expect(task.mergeDetails?.publicationWait).toBeUndefined();
+    expect(publicationAudits(store)).toEqual([]);
+    expect(publicationLogs(store).some((message) => message.includes("Resolve the push failure"))).toBe(false);
+  };
+
+  it("reports a push attempt already in flight for this task as pending, not failed", async () => {
+    const { task, store, items, git } = fixture({ pushAfterMerge: true });
+    task.mergeDetails = { ...task.mergeDetails!, pushRecovery: { target: "origin/main", commitSha: sha, nextAttemptAt: new Date(Date.now() + 60_000).toISOString() } };
+    await expect(resumeMissingPostMergeGate(store, task.id, { git })).resolves.toMatchObject({
+      outcome: "awaiting-publication", reason: "push-pending", message: expect.stringContaining("push to origin/main is in progress"),
+    });
+    expect(items).toEqual([]);
+    expect(git.mock.calls.some(([args]) => args[0] === "push")).toBe(false);
+    expectNoPushFailedRecord(task, store);
+  });
+
+  it("reports a push cooldown held by another task on the same target as pending, not failed", async () => {
+    const first = fixture({ pushAfterMerge: true, rootDir: "/repo-publication-shared-target" });
+    const second = fixture({ pushAfterMerge: true, rootDir: "/repo-publication-shared-target" });
+    let releasePush!: () => void;
+    const base = first.git.getMockImplementation()!;
+    first.git.mockImplementation(async (args, ...rest) => {
+      if (args[0] === "push") await new Promise<void>((resolve) => { releasePush = resolve; });
+      return base(args, ...rest);
+    });
+    const inFlight = resumeMissingPostMergeGate(first.store, first.task.id, { git: first.git });
+    await vi.waitFor(() => expect(first.git.mock.calls.some(([args]) => args[0] === "push")).toBe(true));
+    await expect(resumeMissingPostMergeGate(second.store, second.task.id, { git: second.git })).resolves.toMatchObject({
+      outcome: "awaiting-publication", reason: "push-pending",
+    });
+    expectNoPushFailedRecord(second.task, second.store);
+    releasePush();
+    await expect(inFlight).resolves.toMatchObject({ outcome: "resumed" });
+  });
+
+  it("re-pushes when an earlier recorded delivery is proven absent from the remote", async () => {
+    const { task, store, items, git, remote } = fixture({ pushAfterMerge: true });
+    const past = new Date(Date.now() - 60 * 60_000).toISOString();
+    task.mergeDetails = { ...task.mergeDetails!, pushRecovery: { target: "origin/main", commitSha: sha, nextAttemptAt: past, pushedAt: past } };
+    await expect(resumeMissingPostMergeGate(store, task.id, { git })).resolves.toEqual({ outcome: "resumed", gateId: "post-merge-verification" });
+    expect(git).toHaveBeenCalledWith(["push", "origin", `${sha}:refs/heads/main`], store.rootDir, expect.any(Number));
+    expect(remote.tip).toBe(sha);
+    expect(items).toHaveLength(1);
+    expect(task.mergeDetails?.pushRecovery?.pushedAt).not.toBe(past);
   });
 });
