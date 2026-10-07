@@ -45,8 +45,14 @@ export default mergeConfig(
       while plain invocations can still opt in through the same environment
       variable without relying on this config.
       */
+      /*
+      FNXC:PgGateRequired 2026-10-07-18:03:
+      This config backs the blocking `test:pg-gate` lane, so PostgreSQL is mandatory here: the harness throws instead of skipping when the server is unreachable or FUSION_PG_TEST_SKIP=1 is inherited.
+      The participant flag also lives only here now; the package script's POSIX `VAR=1 vitest` prefix was redundant and cmd.exe rejects it.
+      */
       env: {
         FUSION_PG_TEST_SETUP_PARTICIPANT: "1",
+        FUSION_PG_TEST_REQUIRED: "1",
       },
       maxWorkers: computeMaxWorkers({ maxCap: PG_MAX_WORKERS }),
       minWorkers: 1,
