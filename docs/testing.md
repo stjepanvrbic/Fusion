@@ -1018,6 +1018,10 @@ dependency changes, and other host-level shifts that can change test outcomes
 without changing any hashed file. Seven days bounds that blind spot while keeping
 the cache useful across a normal work week.
 
+## No live provider credentials in test workers
+
+The shared Vitest setup removes provider credentials from every worker before any test runs: every `*_API_KEY`/`API_KEY_*` variable plus the provider token and cloud-credential names pi-ai resolves. A test that reaches a model session must mock the session seam, for example `reviewStep`, instead of relying on whatever keys the operator's shell exports. A deliberate live-provider run sets `FUSION_TEST_ALLOW_LIVE_PROVIDER_CREDENTIALS=1`. The same setup also drops `DATABASE_URL`.
+
 ## Engine test helper convention
 
 `packages/engine/src/__tests__/executor-test-helpers.ts` defaults both `isUsableTaskWorktree` to `true` and `classifyTaskWorktree` to `{ ok: true }` via a helper-level `worktree-pool` mock. To test failure paths, override with `vi.spyOn(worktreePool, "classifyTaskWorktree").mockResolvedValueOnce({ ok: false, classification: "unregistered", reason: "..." })` (or `isUsableTaskWorktree` for legacy call sites). Production liveness assertions in `executor.ts` are unchanged.

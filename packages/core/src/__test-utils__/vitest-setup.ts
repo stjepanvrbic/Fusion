@@ -24,6 +24,7 @@ import {
   resolveReservedPortsFromEnv,
   shouldRunPortProbe,
 } from "./port-probe-policy.js";
+import { scrubLiveProviderCredentials } from "./live-provider-credentials.js";
 
 type FsModule = typeof import("node:fs");
 type FsPromisesModule = typeof import("node:fs/promises");
@@ -80,6 +81,9 @@ installWarningFilter();
 // inside the test after this setup file has run.
 delete process.env.DATABASE_URL;
 delete process.env.DATABASE_MIGRATION_URL;
+
+// FNXC:TestIsolation 2026-10-07-18:04: Remove the operator's provider credentials before any test can open a live model session; see live-provider-credentials.ts for the opt-in.
+scrubLiveProviderCredentials(process.env);
 
 const TEST_HOME_PREFIX = "fn-test-home-";
 const WORKER_ROOT_OWNER_FILE = ".fusion-test-worker-root-owner";
