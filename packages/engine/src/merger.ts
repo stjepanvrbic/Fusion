@@ -6296,11 +6296,14 @@ async function pullWithRebaseAndResolveConflicts(
 
         try {
           throwIfAborted(options?.signal, taskId);
-          await execAsync("GIT_EDITOR=true git rebase --continue", {
+          // FNXC:MergePush 2026-10-07-22:40: `GIT_EDITOR=true cmd` is POSIX shell syntax and failed under cmd.exe whenever Git Bash
+          // was not resolved; the editor override now travels in the process env and git runs from argv.
+          await execFileAsync("git", ["rebase", "--continue"], {
             cwd: rootDir,
             timeout: PULL_REBASE_TIMEOUT_MS,
             maxBuffer: VERIFICATION_COMMAND_MAX_BUFFER,
             encoding: "utf-8",
+            env: { ...process.env, GIT_EDITOR: "true" },
           });
           mergerLog.log(`${taskId}: git rebase --continue succeeded (attempt ${attempt})`);
         } catch (continueError: unknown) {

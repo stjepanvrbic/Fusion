@@ -814,7 +814,7 @@ describe("push-after-merge", () => {
         err.status = 128;
         throw err;
       }
-      if (cmdStr.startsWith("GIT_EDITOR=true git rebase --continue")) {
+      if (cmdStr === "git rebase --continue") {
         rebaseInProgress = false;
         return Buffer.from("");
       }
@@ -837,7 +837,9 @@ describe("push-after-merge", () => {
       mockedExecSync.mock.calls.some((call) => String(call[0]).includes("checkout --ours") && String(call[0]).includes("pnpm-lock.yaml")),
     ).toBe(true);
     expect(
-      mockedExecSync.mock.calls.some((call) => String(call[0]).startsWith("GIT_EDITOR=true git rebase --continue")),
+      // FNXC:MergePush 2026-10-07-22:40: the editor override travels in the process env, never as shell syntax.
+      mockedExecSync.mock.calls.some((call) => String(call[0]) === "git rebase --continue"
+        && (call[1] as { env?: NodeJS.ProcessEnv } | undefined)?.env?.GIT_EDITOR === "true"),
     ).toBe(true);
   });
 
@@ -879,7 +881,7 @@ describe("push-after-merge", () => {
         err.status = 128;
         throw err;
       }
-      if (cmdStr.startsWith("GIT_EDITOR=true git rebase --continue")) {
+      if (cmdStr === "git rebase --continue") {
         rebaseInProgress = false;
         return Buffer.from("");
       }
