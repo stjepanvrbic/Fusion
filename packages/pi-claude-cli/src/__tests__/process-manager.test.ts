@@ -676,7 +676,8 @@ describe("forceKillProcess on Windows", () => {
     forceKillProcess(proc);
 
     const [cmd, args, options] = (spawn as any).mock.calls[0];
-    expect(cmd).toBe("taskkill");
+    // Core resolves taskkill under %SystemRoot%\System32 when it is set.
+    expect(cmd).toMatch(/(^|[\\/])taskkill(\.exe)?$/i);
     expect(args).toEqual(["/PID", "4242", "/T", "/F"]);
     expect(options.shell).toBe(false);
   });

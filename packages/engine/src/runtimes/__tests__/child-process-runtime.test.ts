@@ -686,7 +686,8 @@ describe("ChildProcessRuntime", () => {
       await runtime.stop();
 
       expect(mockSpawn).toHaveBeenCalledWith(
-        "taskkill",
+        // Core resolves taskkill under %SystemRoot%\System32 when it is set.
+        expect.stringMatching(/(^|[\\/])taskkill(\.exe)?$/i),
         ["/PID", String(child.pid), "/T", "/F"],
         expect.objectContaining({ shell: false }),
       );
