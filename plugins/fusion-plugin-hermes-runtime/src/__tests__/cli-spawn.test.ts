@@ -267,9 +267,15 @@ describe("parseHermesOutput", () => {
 // ── invokeHermesCli ────────────────────────────────────────────────────────
 
 describe("invokeHermesCli", () => {
+  // Pin a POSIX host by default: on a real Windows host the launcher first spawns where.exe, which would consume the spawn mock. Windows cases opt in with setPlatform("win32").
+  let restoreHostPlatform: () => void = () => undefined;
   beforeEach(() => {
     vi.clearAllMocks();
     __resetHermesLaunchCacheForTests();
+    restoreHostPlatform = setPlatform("linux");
+  });
+  afterEach(() => {
+    restoreHostPlatform();
   });
 
   it("launches a Windows .cmd prompt turn through cmd.exe with escaped prompt data", async () => {
@@ -350,6 +356,20 @@ describe("invokeHermesCli", () => {
       expect(mockSuperviseSpawn.mock.calls[0]![2].maxLifetimeMs).toBeGreaterThan(10);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("launches in the requested working directory, including Windows paths", async () => {
+    for (const cwd of ["/worktrees/task-a", "C:\\worktrees\\task b"]) {
+      mockSuperviseSpawn.mockClear();
+      const { child, emitStdout, emitClose } = makeFakeChild();
+      mockSpawn.mockReturnValue(child);
+      const promise = invokeHermesCli("hi", defaultSettings(), undefined, { cwd });
+      await flushAsync();
+      emitStdout(fakeHermesOutput("ok"));
+      emitClose(0);
+      await promise;
+      expect(mockSuperviseSpawn.mock.calls[0]![2].cwd).toBe(cwd);
     }
   });
 
@@ -473,7 +493,7 @@ describe("invokeHermesCli", () => {
     mockSpawn.mockReturnValue(child);
 
     const ac = new AbortController();
-    const promise = invokeHermesCli("hi", defaultSettings(), undefined, ac.signal);
+    const promise = invokeHermesCli("hi", defaultSettings(), undefined, { signal: ac.signal });
     await flushAsync();
 
     // Abort before any output arrives.
@@ -482,15 +502,24 @@ describe("invokeHermesCli", () => {
 
     await expect(promise).rejects.toThrow(/aborted/);
     expect(kill).toHaveBeenCalledWith("SIGTERM");
+    // A late successful close cannot resurrect the aborted turn.
+    (child as unknown as EventEmitter).emit("close", 0);
+    await expect(promise).rejects.toThrow(/aborted/);
   });
 });
 
 // ── listHermesProfiles ─────────────────────────────────────────────────────
 
 describe("listHermesProfiles", () => {
+  // Pin a POSIX host by default: on a real Windows host the launcher first spawns where.exe, which would consume the spawn mock. Windows cases opt in with setPlatform("win32").
+  let restoreHostPlatform: () => void = () => undefined;
   beforeEach(() => {
     vi.clearAllMocks();
     __resetHermesLaunchCacheForTests();
+    restoreHostPlatform = setPlatform("linux");
+  });
+  afterEach(() => {
+    restoreHostPlatform();
   });
 
   it("launches a Windows .cmd profile shim through cmd.exe", async () => {

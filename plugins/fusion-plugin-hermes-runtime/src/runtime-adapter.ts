@@ -38,6 +38,18 @@ function buildRuntimeContextSection(options: AgentRuntimeOptions): string {
   return lines.join("\n");
 }
 
+/*
+FNXC:HermesCli 2026-10-07-18:02:
+Every turn, first or resumed, runs the CLI in the session's `AgentRuntimeOptions.cwd` (the task worktree), never Fusion's own cwd.
+Disposing a session (adapter `dispose` or `session.dispose`) aborts its active turn: the engine disposes on step timeout, and a no-op disposer left the CLI running and its output arriving after the step ended.
+*/
+interface HermesSessionControl {
+  cwd: string;
+  activeTurn?: AbortController;
+}
+
+const sessionControl = new WeakMap<HermesStreamSession, HermesSessionControl>();
+
 export class HermesRuntimeAdapter implements AgentRuntime {
   readonly id = "hermes";
   readonly name = "Hermes Runtime";
@@ -52,6 +64,7 @@ export class HermesRuntimeAdapter implements AgentRuntime {
 
   async createSession(options: AgentRuntimeOptions): Promise<AgentSessionResult> {
     const messages: unknown[] = [];
+    const control: HermesSessionControl = { cwd: options.cwd };
     const session: HermesStreamSession = {
       model: undefined,
       systemPrompt: options.systemPrompt,
@@ -69,8 +82,11 @@ export class HermesRuntimeAdapter implements AgentRuntime {
       },
       runtimeContext: options.runtimeContext,
       fusedSystemPrompt: [options.systemPrompt.trim(), buildRuntimeContextSection(options).trim()].filter((part) => part.length > 0).join("\n\n"),
-      dispose: () => undefined,
+      dispose: () => {
+        control.activeTurn?.abort();
+      },
     };
+    sessionControl.set(session, control);
 
     return { session, sessionFile: undefined };
   }
@@ -86,14 +102,19 @@ export class HermesRuntimeAdapter implements AgentRuntime {
       : `${session.fusedSystemPrompt}\n\nUser request:\n${prompt}`;
     const userMessage = { role: "user", content: prompt };
     session.messages.push(userMessage);
+    const control = sessionControl.get(session);
+    const turn = new AbortController();
+    if (control) control.activeTurn = turn;
     let result: Awaited<ReturnType<typeof invokeHermesCli>>;
     try {
-      result = await invokeHermesCli(promptWithContext, this.settings, resumeId);
+      result = await invokeHermesCli(promptWithContext, this.settings, resumeId, { signal: turn.signal, cwd: control?.cwd });
       session.state.errorMessage = undefined;
     } catch (err) {
       session.messages.pop();
       session.state.errorMessage = err instanceof Error ? err.message : String(err);
       throw err;
+    } finally {
+      if (control?.activeTurn === turn) control.activeTurn = undefined;
     }
 
     session.sessionId = result.sessionId;
@@ -109,8 +130,8 @@ export class HermesRuntimeAdapter implements AgentRuntime {
     return session.lastModelDescription || this.describeFromSettings();
   }
 
-  async dispose(_session: AgentSession): Promise<void> {
-    // No persistent resources to release — the hermes CLI process exits per turn.
+  async dispose(session: AgentSession): Promise<void> {
+    session.dispose();
   }
 
   private describeFromSettings(): string {
