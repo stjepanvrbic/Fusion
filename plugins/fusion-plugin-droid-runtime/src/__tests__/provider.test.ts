@@ -1,6 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const { promptFiles, promptFileSeq } = vi.hoisted(() => ({
+  promptFiles: [] as Array<{ path: string; prompt: string; cleanup: ReturnType<typeof vi.fn> }>,
+  promptFileSeq: { value: 0 },
+}));
 
 const mocks = vi.hoisted(() => ({
   spawnDroid: vi.fn(),
@@ -9,7 +16,11 @@ const mocks = vi.hoisted(() => ({
   registerProcess: vi.fn(),
   cleanupProcess: vi.fn(),
   forceKillProcess: vi.fn(),
-  cleanupSystemPromptFile: vi.fn(),
+  createSystemPromptFile: vi.fn((prompt: string) => {
+    const file = { path: `/tmp/droid-sysprompt-${++promptFileSeq.value}/system-prompt.txt`, prompt, cleanup: vi.fn() };
+    promptFiles.push(file);
+    return file;
+  }),
   buildDroidSpawnArgs: vi.fn(() => ["--model", "droid-pro"]),
   parseLine: vi.fn(),
   bridgeHandleEvent: vi.fn(),
@@ -32,7 +43,7 @@ vi.mock("../process-manager.js", () => ({
   registerProcess: mocks.registerProcess,
   cleanupProcess: mocks.cleanupProcess,
   forceKillProcess: mocks.forceKillProcess,
-  cleanupSystemPromptFile: mocks.cleanupSystemPromptFile,
+  createSystemPromptFile: mocks.createSystemPromptFile,
   buildDroidSpawnArgs: mocks.buildDroidSpawnArgs,
 }));
 
@@ -58,6 +69,7 @@ function makeProc() {
 describe("streamViaCli", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    promptFiles.length = 0;
     delete process.env.PI_DROID_CLI_FIRST_LINE_TIMEOUT_MS;
   });
 
@@ -207,4 +219,64 @@ describe("streamViaCli", () => {
       await Promise.resolve();
     },
   );
+
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+  const isolatedCwd = join(tmpdir(), "droid-provider-test-no-agents-md");
+
+  it("gives concurrent invocations their own prompt files and removes each only after its own process completes", async () => {
+    const procA = makeProc();
+    const procB = makeProc();
+    mocks.spawnDroid.mockReturnValueOnce(procA).mockReturnValueOnce(procB);
+
+    streamViaCli({ id: "droid-pro", provider: "droid-cli" } as any, { systemPrompt: "instructions A", messages: [{ role: "user", content: "a" }] } as any, { cwd: isolatedCwd } as any);
+    streamViaCli({ id: "droid-pro", provider: "droid-cli" } as any, { systemPrompt: "instructions B", messages: [{ role: "user", content: "b" }] } as any, { cwd: isolatedCwd } as any);
+    await flush();
+
+    expect(promptFiles.map((file) => file.prompt)).toEqual(["instructions A", "instructions B"]);
+    const [fileA, fileB] = promptFiles;
+    expect(fileA.path).not.toBe(fileB.path);
+    expect(mocks.spawnDroid.mock.calls[0][1]).toBe(fileA.path);
+    expect(mocks.spawnDroid.mock.calls[1][1]).toBe(fileB.path);
+
+    procB.emit("close", 0, null);
+    await flush();
+    expect(fileB.cleanup).toHaveBeenCalledTimes(1);
+    expect(fileA.cleanup).not.toHaveBeenCalled();
+
+    procA.emit("close", 0, null);
+    await flush();
+    expect(fileA.cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it("removes its prompt file and reports the failure when the launch throws", async () => {
+    mocks.spawnDroid.mockImplementationOnce(() => {
+      throw new Error("Cannot launch droid without a command shell");
+    });
+    const stream = streamViaCli({ id: "droid-pro", provider: "droid-cli" } as any, { systemPrompt: "instructions", messages: [{ role: "user", content: "a" }] } as any, { cwd: isolatedCwd } as any);
+    const result = await stream.result();
+    expect(promptFiles[0].cleanup).toHaveBeenCalledTimes(1);
+    expect(result.errorMessage).toContain("Cannot launch droid");
+  });
+
+  it("launches in the requested cwd with the configured binary and marks a crash as an error", async () => {
+    const proc = makeProc();
+    mocks.spawnDroid.mockReturnValue(proc);
+    const stream = streamViaCli({ id: "droid-pro", provider: "droid-cli" } as any, { messages: [{ role: "user", content: "a" }] } as any, { cwd: "C:\\worktrees\\task-a", binaryPath: "C:\\tools\\droid.exe" } as any);
+    await flush();
+    expect(mocks.spawnDroid).toHaveBeenCalledWith("droid-pro", undefined, expect.objectContaining({ cwd: "C:\\worktrees\\task-a", binaryPath: "C:\\tools\\droid.exe" }));
+    proc.emit("close", 1, null);
+    const result = await stream.result();
+    expect(result.errorMessage).toContain("exited unexpectedly with code 1");
+  });
+
+  it("settles instead of hanging when the signal is already aborted", async () => {
+    const proc = makeProc();
+    mocks.spawnDroid.mockReturnValue(proc);
+    const controller = new AbortController();
+    controller.abort();
+    const stream = streamViaCli({ id: "droid-pro", provider: "droid-cli" } as any, { messages: [{ role: "user", content: "a" }] } as any, { cwd: isolatedCwd, signal: controller.signal } as any);
+    const result = await stream.result();
+    expect(mocks.forceKillProcess).toHaveBeenCalledWith(proc);
+    expect(result.errorMessage).toContain("aborted");
+  });
 });

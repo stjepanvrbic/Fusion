@@ -7,26 +7,66 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { writeFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { killProcessTree, resolveShellFreeLaunch } from "@fusion/plugin-sdk";
 
 function debugLog(message: string): void {
   if (process.env.PI_DROID_CLI_DEBUG !== "1") return;
   console.error(`[droid-cli] ${message}`);
 }
 
+/** A system prompt written for exactly one Droid invocation. */
+export interface SystemPromptFile {
+  path: string;
+  /** Remove this invocation's file. Idempotent and never throws. */
+  cleanup(): void;
+}
+
+export interface SystemPromptFileOptions {
+  rm?: typeof rmSync;
+}
+
 /**
- * Spawn a Droid CLI subprocess with all required flags for stream-json communication.
+ * Write a system prompt to a file owned by one invocation.
+ *
+ * FNXC:DroidCli 2026-10-07-18:02:
+ * The prompt goes through a file because a long `--append-system-prompt` argv hits ENAMETOOLONG on Windows.
+ * Every Droid run in one Fusion process used the same PID-named file, so a concurrent session overwrote another's instructions before its CLI read them and any run's cleanup deleted the file another was starting with.
+ * Each invocation now owns a private temp directory that only its own cleanup removes, after its process completes.
+ */
+export function createSystemPromptFile(systemPrompt: string, options: SystemPromptFileOptions = {}): SystemPromptFile {
+  const directory = mkdtempSync(join(tmpdir(), "droid-cli-sysprompt-"));
+  const path = join(directory, "system-prompt.txt");
+  writeFileSync(path, systemPrompt, "utf-8");
+  const rm = options.rm ?? rmSync;
+  let removed = false;
+  return {
+    path,
+    cleanup() {
+      if (removed) return;
+      removed = true;
+      try {
+        // Windows can briefly hold a just-read file open; retry, then leave the private directory for the OS temp sweeper.
+        rm(dirname(path), { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch (error) {
+        debugLog(`system prompt cleanup failed for ${path}: ${(error as Error).message}`);
+      }
+    },
+  };
+}
+
+/**
+ * Build the Droid CLI argv for stream-json communication. Pure: writes no files.
  *
  * @param modelId - The model ID to pass via --model flag
- * @param systemPrompt - Optional system prompt appended via --append-system-prompt
- * @param options - Optional cwd, AbortSignal, and effort level
- * @returns The spawned ChildProcess with piped stdin/stdout/stderr
+ * @param systemPromptFile - Optional path from `createSystemPromptFile`, appended via --append-system-prompt
+ * @param options - Optional effort, MCP config, and session ids
  */
 export function buildDroidSpawnArgs(
   modelId: string,
-  systemPrompt?: string,
+  systemPromptFile?: string,
   options?: {
     effort?: string;
     mcpConfigPath?: string;
@@ -54,15 +94,9 @@ export function buildDroidSpawnArgs(
     args.push("--session-id", options.newSessionId);
   }
 
-  if (systemPrompt) {
-    // Write system prompt to a temp file to avoid ENAMETOOLONG on Windows.
+  if (systemPromptFile) {
     // Droid CLI's --append-system-prompt accepts a file path or literal text.
-    const tmpFile = join(
-      tmpdir(),
-      `droid-cli-sysprompt-${process.pid}.txt`,
-    );
-    writeFileSync(tmpFile, systemPrompt, "utf-8");
-    args.push("--append-system-prompt", tmpFile);
+    args.push("--append-system-prompt", systemPromptFile);
   }
 
   if (options?.effort) {
@@ -76,10 +110,17 @@ export function buildDroidSpawnArgs(
   return args;
 }
 
+/**
+ * Spawn a Droid CLI subprocess with piped stdio.
+ *
+ * @param systemPromptFile - Optional path from `createSystemPromptFile`; the caller owns its cleanup
+ */
 export function spawnDroid(
   modelId: string,
-  systemPrompt?: string,
+  systemPromptFile?: string,
   options?: {
+    /** Configured `droidBinaryPath`; the probe checks the same binary. Defaults to `droid` on PATH. */
+    binaryPath?: string;
     cwd?: string;
     signal?: AbortSignal;
     effort?: string;
@@ -88,33 +129,29 @@ export function spawnDroid(
     newSessionId?: string;
   },
 ): ChildProcess {
-  const args = buildDroidSpawnArgs(modelId, systemPrompt, {
+  const args = buildDroidSpawnArgs(modelId, systemPromptFile, {
     effort: options?.effort,
     mcpConfigPath: options?.mcpConfigPath,
     resumeSessionId: options?.resumeSessionId,
     newSessionId: options?.newSessionId,
   });
 
-  const proc = spawn("droid", args, {
+  /*
+  FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+  An npm-installed Droid is `droid.cmd`, which a bare shell-free spawn cannot find (ENOENT); resolve through the shared launch seam, as the probe does.
+  Sessions launch the configured binary the probe reported available, not always the bare `droid`.
+  */
+  const launch = resolveShellFreeLaunch(options?.binaryPath ?? "droid", args);
+  const proc = spawn(launch.command, launch.args, {
     stdio: ["pipe", "pipe", "pipe"],
     cwd: options?.cwd ?? process.cwd(),
+    shell: false,
+    windowsHide: true,
   });
 
   debugLog(`spawnDroid: pid=${proc.pid} model=${modelId}`);
 
   return proc as ChildProcess;
-}
-
-/**
- * Clean up the temp system prompt file created by spawnDroid.
- * Safe to call multiple times or when no file exists.
- */
-export function cleanupSystemPromptFile(): void {
-  try {
-    unlinkSync(join(tmpdir(), `droid-cli-sysprompt-${process.pid}.txt`));
-  } catch {
-    // File doesn't exist or already deleted — ignore
-  }
 }
 
 /**
@@ -145,15 +182,13 @@ export function writeUserMessage(
 }
 
 /**
- * Force-kill a subprocess immediately via SIGKILL.
- * No-ops if the process is already dead (killed or exited).
- * Cross-platform safe: Node.js treats SIGKILL as forceful termination on Windows.
+ * Force-kill a subprocess and every process it started. No-ops once it has exited.
+ * On Windows `proc.kill` ends only the direct child, so the shared tree kill is used.
  *
  * @param proc - The subprocess to force-kill
  */
 export function forceKillProcess(proc: ChildProcess): void {
-  if (proc.killed || proc.exitCode !== null) return;
-  proc.kill("SIGKILL");
+  killProcessTree(proc);
 }
 
 /** Registry of active subprocesses for cleanup on teardown. */
@@ -235,18 +270,15 @@ function runDroidProbe(args: string[], timeoutMs = 45000): Promise<number> {
   return new Promise((resolve) => {
     let proc: ChildProcess;
     try {
-      proc = spawn("droid", args, { stdio: "ignore" });
+      const launch = resolveShellFreeLaunch("droid", args);
+      proc = spawn(launch.command, launch.args, { stdio: "ignore", shell: false, windowsHide: true });
     } catch {
       resolve(127);
       return;
     }
 
     const timer = setTimeout(() => {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        // already dead
-      }
+      forceKillProcess(proc);
       resolve(124);
     }, timeoutMs);
     proc.once("error", () => {
@@ -329,7 +361,8 @@ export async function discoverDroidModels(): Promise<string[]> {
   return new Promise<string[]>((resolve) => {
     let proc: ChildProcess;
     try {
-      proc = spawn("droid", ["exec", "--help"], { stdio: ["ignore", "pipe", "ignore"] });
+      const launch = resolveShellFreeLaunch("droid", ["exec", "--help"]);
+      proc = spawn(launch.command, launch.args, { stdio: ["ignore", "pipe", "ignore"], shell: false, windowsHide: true });
     } catch {
       resolve([]);
       return;
@@ -345,11 +378,7 @@ export async function discoverDroidModels(): Promise<string[]> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try {
-        if (!proc.killed) proc.kill("SIGKILL");
-      } catch {
-        // already dead
-      }
+      forceKillProcess(proc);
       resolve(value);
     };
     const timer = setTimeout(() => settle([]), DROID_MODEL_DISCOVERY_TIMEOUT_MS);

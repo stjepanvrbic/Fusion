@@ -3,8 +3,16 @@ import { EventEmitter } from "node:events";
 
 const spawnMock = vi.hoisted(() => vi.fn());
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: spawnMock,
+}));
+
+// Termination goes through the shared tree kill (taskkill /T on Windows); assert that seam, not a platform-specific signal.
+const killProcessTreeMock = vi.hoisted(() => vi.fn());
+vi.mock("@fusion/plugin-sdk", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@fusion/plugin-sdk")>()),
+  killProcessTree: killProcessTreeMock,
 }));
 
 import { validateCliAuthAsync, validateCliPresenceAsync } from "../process-manager.js";
@@ -21,9 +29,13 @@ function makeProbeProc() {
 describe("Droid startup validation probes", () => {
   beforeEach(() => {
     spawnMock.mockReset();
+    killProcessTreeMock.mockReset();
+    // An empty PATH keeps launch resolution hermetic on hosts that have a real droid installed.
+    vi.stubEnv("PATH", "");
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -61,7 +73,7 @@ describe("Droid startup validation probes", () => {
     await vi.advanceTimersByTimeAsync(45_001);
 
     await expect(pending).resolves.toMatchObject({ ok: false });
-    expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(killProcessTreeMock).toHaveBeenCalledWith(proc);
   });
 
   it("resolves false when `droid auth status` exits non-zero", async () => {

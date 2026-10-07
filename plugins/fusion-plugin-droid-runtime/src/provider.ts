@@ -37,8 +37,9 @@ import {
   captureStderr,
   forceKillProcess,
   registerProcess,
-  cleanupSystemPromptFile,
+  createSystemPromptFile,
   buildDroidSpawnArgs,
+  type SystemPromptFile,
 } from "./process-manager.js";
 import { parseLine } from "./stream-parser.js";
 import { createEventBridge } from "./event-bridge.js";
@@ -98,6 +99,8 @@ function debugLog(message: string): void {
 type StreamViaCLiOptions = SimpleStreamOptions & {
   cwd?: string;
   mcpConfigPath?: string;
+  /** Configured Droid binary; defaults to `droid` on PATH. */
+  binaryPath?: string;
 };
 
 /**
@@ -129,6 +132,8 @@ export function streamViaCli(
   (async () => {
     let proc: ReturnType<typeof spawnDroid> | undefined;
     let abortHandler: (() => void) | undefined;
+    // Owned by this invocation only; removed in `finally` once its process has completed.
+    let promptFile: SystemPromptFile | undefined;
 
     try {
       const cwd = options?.cwd ?? process.cwd();
@@ -159,6 +164,7 @@ export function streamViaCli(
       );
 
       const spawnOptions = {
+        binaryPath: options?.binaryPath,
         cwd,
         signal: options?.signal,
         effort,
@@ -168,7 +174,8 @@ export function streamViaCli(
       };
 
       // Spawn subprocess
-      proc = spawnDroid(model.id, systemPrompt || undefined, spawnOptions);
+      promptFile = systemPrompt ? createSystemPromptFile(systemPrompt) : undefined;
+      proc = spawnDroid(model.id, promptFile?.path, spawnOptions);
       const getStderr = captureStderr(proc);
 
       // Register in global process registry for teardown cleanup
@@ -193,6 +200,8 @@ export function streamViaCli(
       // Guard against double stream.end() and double error events.
       // First error path wins; subsequent ones are no-ops.
       let streamEnded = false;
+      // Guard against buffered readline lines firing after rl.close()
+      let broken = false;
 
       /**
        * End the stream with an error, using a "done" event instead of "error".
@@ -202,6 +211,9 @@ export function streamViaCli(
        * then calls message.content.filter() on the result, crashing because
        * a string has no .content property. By pushing "done" with a valid
        * AssistantMessage (content:[]), pi gets a well-formed object.
+       *
+       * FNXC:DroidCli 2026-10-07-18:02:
+       * The message carries `errorMessage` so runtime callers can tell a failed turn from a completed one; without it a crash read as an empty success.
        */
       function endStreamWithError(errMsg: string) {
         if (streamEnded || broken) return;
@@ -213,6 +225,7 @@ export function streamViaCli(
             ? output.content
             : [{ type: "text" as const, text: `Error: ${errMsg}` }],
           stopReason: "stop" as const,
+          errorMessage: errMsg,
         };
         stream.push({
           type: "done",
@@ -245,6 +258,8 @@ export function streamViaCli(
 
         if (options.signal.aborted) {
           abortHandler();
+          // Settle the stream: a consumer awaiting a terminal event would otherwise wait forever.
+          endStreamWithError("Droid CLI run was aborted before it started");
           return;
         }
         options.signal.addEventListener("abort", abortHandler, { once: true });
@@ -253,8 +268,6 @@ export function streamViaCli(
       // Track tool_use blocks for break-early decision at message_stop
       let sawBuiltInOrCustomTool = false;
       let firstLineReceived = false;
-      // Guard against buffered readline lines firing after rl.close()
-      let broken = false;
 
       // Set up readline for line-by-line NDJSON parsing
       const rl = createInterface({
@@ -446,6 +459,7 @@ export function streamViaCli(
           model: model.id,
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
           stopReason: "stop" as const,
+          errorMessage: errMsg,
           timestamp: Date.now(),
         },
       });
@@ -455,7 +469,7 @@ export function streamViaCli(
       if (options?.signal && abortHandler) {
         options.signal.removeEventListener("abort", abortHandler);
       }
-      cleanupSystemPromptFile();
+      promptFile?.cleanup();
     }
   })();
 
