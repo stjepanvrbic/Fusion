@@ -4,6 +4,7 @@ import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   HeartbeatMonitor,
+  HeartbeatTriggerScheduler,
   HEARTBEAT_SYSTEM_PROMPT,
   HEARTBEAT_NO_TASK_SYSTEM_PROMPT,
   HEARTBEAT_PROCEDURE,
@@ -4359,6 +4360,92 @@ describe("executeHeartbeat", () => {
       expect(run.status).toBe("completed");
       expect(store.startHeartbeatRun).toHaveBeenCalledTimes(2);
       expect(session.prompt).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("in-run liveness", () => {
+    /*
+    FNXC:AgentHeartbeat 2026-10-07-19:20:
+    An active, progressing heartbeat session is never reported missed, never reaped or killed, and never shadowed by a second dispatch.
+    Session activity (text, thinking, tool start and end) refreshes in-memory liveness on every event and persisted lastHeartbeatAt at a bounded cadence.
+    The persisted-row reapers in the scheduler (timer tick and timer audit) never reap a run that a live in-process session still owns.
+    */
+    it("keeps a 5-minute session that emits tool events every 10s alive across the missed check, tick and audit", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const start = new Date("2026-10-07T12:00:00.000Z").getTime();
+      vi.setSystemTime(start);
+      const store = createStoreWithAgentForExec({
+        runtimeConfig: { heartbeatIntervalMs: 60_000 },
+        lastHeartbeatAt: new Date(start - 60 * 60_000).toISOString(),
+      });
+      const liveRun = { id: "run-001", agentId: "agent-001", startedAt: new Date(start).toISOString(), endedAt: null, status: "active" } as AgentHeartbeatRun;
+      let sessionRunning = false;
+      vi.mocked(store.getActiveHeartbeatRun).mockImplementation(async () => (sessionRunning ? liveRun : null));
+      (store as unknown as { listAgents: () => Promise<Agent[]> }).listAgents = vi.fn(async () => [mockAgent]);
+      (store as unknown as { on: () => void; off: () => void }).on = vi.fn();
+      (store as unknown as { on: () => void; off: () => void }).off = vi.fn();
+      const onMissed = vi.fn();
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp", onMissed });
+      const dispatch = vi.fn(async () => undefined);
+      const scheduler = new HeartbeatTriggerScheduler(store, dispatch, mockTaskStore);
+      scheduler.start();
+      const schedulerInternals = scheduler as unknown as { onTimerTick: (agentId: string, intervalMs: number, armId?: number) => Promise<void> };
+
+      const session = createMockAgentSession();
+      session.prompt = vi.fn(async () => {
+        sessionRunning = true;
+        const options = mockedCreateFnAgent.mock.calls.at(-1)![0] as {
+          onToolStart?: (name: string, args?: unknown) => void;
+          onToolEnd?: (name: string, isError: boolean, result?: unknown) => void;
+        };
+        for (let step = 1; step <= 30; step++) {
+          vi.setSystemTime(start + step * 10_000);
+          options.onToolStart?.("bash", { command: "pnpm test" });
+          options.onToolEnd?.("bash", false, "ok");
+          await (monitor as unknown as { checkMissedHeartbeats: () => Promise<void> }).checkMissedHeartbeats();
+          await schedulerInternals.onTimerTick("agent-001", 60_000);
+          await scheduler.auditTimerRegistrations("interval");
+        }
+      });
+      mockedCreateFnAgent.mockResolvedValue({ session: session as any });
+
+      try {
+        const run = await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer" });
+
+        expect(run.status).toBe("completed");
+        expect(onMissed).not.toHaveBeenCalled();
+        expect(session.dispose).toHaveBeenCalledTimes(1);
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(store.startHeartbeatRun).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(store.saveRun).mock.calls.filter(([saved]) => saved.status === "terminated")).toEqual([]);
+        const okWrites = vi.mocked(store.recordHeartbeat).mock.calls.filter(([, status]) => status === "ok");
+        expect(okWrites.length).toBeGreaterThanOrEqual(10);
+        expect(okWrites.length).toBeLessThanOrEqual(12);
+      } finally {
+        scheduler.stop();
+        monitor.stop();
+      }
+    });
+
+    it("still reports and recovers a session that emits nothing past the timeout", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const start = new Date("2026-10-07T12:00:00.000Z").getTime();
+      vi.setSystemTime(start);
+      const store = createStoreWithAgentForExec();
+      const onMissed = vi.fn();
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp", onMissed });
+      const session = { dispose: vi.fn() };
+      monitor.trackAgent("agent-001", session as any, "run-hung");
+      const internals = monitor as unknown as { checkMissedHeartbeats: () => Promise<void> };
+
+      vi.setSystemTime(start + 61_000);
+      await internals.checkMissedHeartbeats();
+      expect(onMissed).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(start + 121_000);
+      await internals.checkMissedHeartbeats();
+      expect(session.dispose).toHaveBeenCalledTimes(1);
+      monitor.stop();
     });
   });
 

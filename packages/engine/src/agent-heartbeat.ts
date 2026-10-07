@@ -119,6 +119,22 @@ A heartbeat worktree-acquisition failure is worktree recovery, which lifecycle c
 The card is never moved: the former requeue through the rebound target moved WIP and review cards backward and, on a board with no hold lane, into intake.
 These lanes decide, against the live row, whether recovery may write at all: never on a terminal card, never over a user or approval pause, and never on a review card owned by a human merge (autoMerge:false).
 */
+/*
+FNXC:AgentHeartbeat 2026-10-07-19:20:
+Heartbeat run ids that a live session in this process still owns, from startRun until its serialized run settles.
+HeartbeatMonitor and HeartbeatTriggerScheduler are constructed independently at each runtime wiring site with no reference to each other, so the run id is the shared identity.
+The scheduler's persisted-row reapers key on lastHeartbeatAt, which a long silent tool call can let go stale; a run listed here is owned and supervised by the monitor's own missed-heartbeat check, so it is never reaped as orphaned.
+*/
+const inProcessLiveHeartbeatRunIds = new Set<string>();
+
+/** True while a session in this process still owns the heartbeat run. */
+export function isHeartbeatRunLiveInProcess(runId: string): boolean {
+  return inProcessLiveHeartbeatRunIds.has(runId);
+}
+
+/** Minimum gap between persisted liveness writes driven by session activity. */
+const HEARTBEAT_ACTIVITY_PERSIST_INTERVAL_MS = 30_000;
+
 /** Classifies provider-credential and model-registry misses that need operator configuration. */
 function isHeartbeatModelUnavailableError(errorMessage: string): boolean {
   const normalized = errorMessage.toLowerCase();
@@ -372,6 +388,8 @@ interface TrackedAgent {
   abortController?: AbortController;
   runId: string;
   lastSeen: number; // timestamp from Date.now()
+  /** Last time session activity was persisted as an "ok" heartbeat (Date.now()). */
+  lastPersistedAt: number;
   missedHeartbeatReported: boolean;
   /** Session ID before this execution started */
   sessionIdBefore?: string;
@@ -792,6 +810,8 @@ export class HeartbeatMonitor {
 
   private trackedAgents: Map<string, TrackedAgent> = new Map();
   private agentStartLocks: Map<string, Promise<unknown>> = new Map();
+  /** Run id each agent's current serialized executeHeartbeat owns (mirrored in inProcessLiveHeartbeatRunIds). */
+  private liveRunIdByAgent: Map<string, string> = new Map();
   private pollInterval: NodeJS.Timeout | null = null;
   private isRunning = false;
   /**
@@ -1372,7 +1392,8 @@ export class HeartbeatMonitor {
         }
         if (!reason && !activeRun) {
           reason = "no active run";
-        } else if (!reason && activeRun && !this.trackedAgents.has(agent.id)) {
+        } else if (!reason && activeRun && !this.trackedAgents.has(agent.id) && !isHeartbeatRunLiveInProcess(activeRun.id)) {
+          // FNXC:AgentHeartbeat 2026-10-07-19:20: a run still in its pre-session phase (for example worktree acquisition) is live but not yet tracked.
           const timeoutMs = this.resolveAgentConfig(agent.id).heartbeatTimeoutMs;
           const heartbeatAgeMs = getHeartbeatAgeMs(agent, now);
           // NOTE(FN-4278): this stale gate intentionally uses a per-run work-budget
@@ -1468,12 +1489,14 @@ export class HeartbeatMonitor {
     sessionIdBefore?: string,
     abortController?: AbortController,
   ): void {
+    const now = Date.now();
     const tracked: TrackedAgent = {
       agentId,
       session,
       abortController,
       runId,
-      lastSeen: Date.now(),
+      lastSeen: now,
+      lastPersistedAt: now,
       missedHeartbeatReported: false,
       sessionIdBefore,
     };
@@ -1506,6 +1529,7 @@ export class HeartbeatMonitor {
         // Because withAgentStartLock serializes runs per agent, the finally runs after each
         // run completes but before the next concurrent call's callback starts.
         this.clearRunState(agentId);
+        this.releaseLiveRun(agentId);
       }
     });
     const tail: Promise<void> = operation.then(() => undefined, () => undefined);
@@ -1516,6 +1540,19 @@ export class HeartbeatMonitor {
       }
     });
     return operation;
+  }
+
+  private markRunLive(agentId: string, runId: string): void {
+    this.releaseLiveRun(agentId);
+    this.liveRunIdByAgent.set(agentId, runId);
+    inProcessLiveHeartbeatRunIds.add(runId);
+  }
+
+  private releaseLiveRun(agentId: string): void {
+    const runId = this.liveRunIdByAgent.get(agentId);
+    if (runId === undefined) return;
+    this.liveRunIdByAgent.delete(agentId);
+    inProcessLiveHeartbeatRunIds.delete(runId);
   }
 
   /**
@@ -2051,15 +2088,35 @@ export class HeartbeatMonitor {
     const tracked = this.trackedAgents.get(agentId);
     if (!tracked) return;
 
-    tracked.lastSeen = Date.now();
+    /*
+    FNXC:AgentHeartbeat 2026-10-07-19:20:
+    Called from every session activity callback, so in-memory liveness is exact while persisted liveness is written at most once per HEARTBEAT_ACTIVITY_PERSIST_INTERVAL_MS.
+    The persisted "ok" write advances lastHeartbeatAt, which keeps another process's view of a live run fresh.
+    */
+    const now = Date.now();
+    tracked.lastSeen = now;
 
     // If recovering from a missed heartbeat
     if (tracked.missedHeartbeatReported) {
       tracked.missedHeartbeatReported = false;
-      void this.store.recordHeartbeat(agentId, "recovered", tracked.runId);
+      this.persistHeartbeatEvent(agentId, "recovered", tracked.runId);
       this.onRecovered?.(agentId);
-    } else {
-      void this.store.recordHeartbeat(agentId, "ok", tracked.runId);
+    }
+    if (now - tracked.lastPersistedAt >= HEARTBEAT_ACTIVITY_PERSIST_INTERVAL_MS) {
+      tracked.lastPersistedAt = now;
+      this.persistHeartbeatEvent(agentId, "ok", tracked.runId);
+    }
+  }
+
+  /** Best-effort liveness write: a failed write must never break the session callback that triggered it. */
+  private persistHeartbeatEvent(agentId: string, status: "ok" | "recovered", runId: string): void {
+    const warn = (err: unknown) => {
+      heartbeatLog.warn(`recordHeartbeat(${status}) failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+    };
+    try {
+      void Promise.resolve(this.store.recordHeartbeat(agentId, status, runId)).catch(warn);
+    } catch (err) {
+      warn(err);
     }
   }
 
@@ -2243,6 +2300,8 @@ export class HeartbeatMonitor {
         triggerDetail,
         contextSnapshot: Object.keys(runContextSnapshot).length > 0 ? runContextSnapshot : undefined,
       });
+      // FNXC:AgentHeartbeat 2026-10-07-19:20: owned by this serialized run until the start lock settles, covering pre-session work such as worktree acquisition.
+      this.markRunLive(agentId, run.id);
 
       // Build run context for mutation correlation
       const runContext: RunMutationContext = {
@@ -3234,20 +3293,29 @@ export class HeartbeatMonitor {
           runAuditor: audit,
           settings: heartbeatModelSettings,
           mcpServers: heartbeatMcp.servers,
+          /*
+          FNXC:AgentHeartbeat 2026-10-07-19:20:
+          Every session event is proof the run is progressing, so each one refreshes liveness through recordHeartbeat.
+          Without it lastSeen and lastHeartbeatAt froze at run start, and any session longer than the timeout was reported missed, killed and re-dispatched.
+          */
           onText: (delta) => {
             outputLength += delta.length;
             appendStdoutExcerpt(delta);
             agentLogger?.onText(delta);
+            this.recordHeartbeat(agentId);
           },
           onThinking: (delta) => {
             agentLogger?.onThinking(delta);
+            this.recordHeartbeat(agentId);
           },
           onToolStart: (name, args) => {
             agentLogger?.onToolStart(name, args);
+            this.recordHeartbeat(agentId);
           },
           onToolEnd: (name, isError, result) => {
             toolCallCount++;
             agentLogger?.onToolEnd(name, isError, result);
+            this.recordHeartbeat(agentId);
           },
           // FNXC:PluginSkills 2026-07-12-00:00: Heartbeat sessions forward plugin skill body dirs with waking-agent requested names so durable agents can use plugin-provided guidance.
           ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
@@ -3805,10 +3873,10 @@ export class HeartbeatMonitor {
                   fallbackModelId: heartbeatSessionModels.fallbackModelId,
                   fallbackThinkingLevel: resolveExecutorFallbackThinkingLevel(undefined, heartbeatModelSettings), runAuditor: audit, settings: heartbeatModelSettings,
                   mcpServers: heartbeatMcp.servers,
-                  onText: (delta) => { outputLength += delta.length; appendStdoutExcerpt(delta); agentLogger?.onText(delta); },
-                  onThinking: (delta) => agentLogger?.onThinking(delta),
-                  onToolStart: (name, args) => agentLogger?.onToolStart(name, args),
-                  onToolEnd: (name, isError, result) => { toolCallCount++; agentLogger?.onToolEnd(name, isError, result); },
+                  onText: (delta) => { outputLength += delta.length; appendStdoutExcerpt(delta); agentLogger?.onText(delta); this.recordHeartbeat(agentId); },
+                  onThinking: (delta) => { agentLogger?.onThinking(delta); this.recordHeartbeat(agentId); },
+                  onToolStart: (name, args) => { agentLogger?.onToolStart(name, args); this.recordHeartbeat(agentId); },
+                  onToolEnd: (name, isError, result) => { toolCallCount++; agentLogger?.onToolEnd(name, isError, result); this.recordHeartbeat(agentId); },
                   ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
                   ...(skillContext.additionalSkillPaths.length > 0 ? { additionalSkillPaths: skillContext.additionalSkillPaths } : {}),
                   actionGateContext: this.buildActionGateContext(agent, taskId, run.id, heartbeatModelSettings?.defaultAgentPermissionPolicy),
@@ -5536,6 +5604,14 @@ export class HeartbeatTriggerScheduler {
 
     const thresholdMs = this.getActiveRunStaleThresholdMs(agent, staleMultiplier);
     const elapsedMs = getHeartbeatAgeMs(agent);
+    /*
+    FNXC:AgentHeartbeat 2026-10-07-19:20:
+    A run that a live session in this process owns is not orphaned, however stale lastHeartbeatAt looks; the monitor's missed-heartbeat check supervises it.
+    Reaping it let the tick and audit dispatch a second heartbeat that queued behind the live run, so one wake burned several model sessions back-to-back.
+    */
+    if (isHeartbeatRunLiveInProcess(activeRun.id)) {
+      return { reaped: false, elapsedMs, thresholdMs };
+    }
     if (!Number.isFinite(elapsedMs) || elapsedMs <= thresholdMs) {
       return { reaped: false, elapsedMs, thresholdMs };
     }
