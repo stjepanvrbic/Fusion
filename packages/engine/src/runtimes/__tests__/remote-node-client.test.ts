@@ -361,3 +361,157 @@ describe("RemoteNodeClient", () => {
     }
   });
 });
+
+/** A body whose headers arrived but whose bytes never do. `cancelled` records reader cancellation. */
+function stalledBody(firstChunk?: string): { body: ReadableStream<Uint8Array>; cancelled: ReturnType<typeof vi.fn> } {
+  const cancelled = vi.fn();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (firstChunk) controller.enqueue(new TextEncoder().encode(firstChunk));
+    },
+    cancel: cancelled,
+  });
+  return { body, cancelled };
+}
+
+/** fetch that resolves headers and ignores its signal, so only the client itself can end the body. */
+function fetchReturningHeaders(body: ReadableStream<Uint8Array>, contentType: string) {
+  return vi.fn().mockResolvedValue(new Response(body, { status: 200, headers: { "content-type": contentType } }));
+}
+
+/*
+FNXC:RemoteNodeRuntime 2026-10-07-19:50:
+Cancellation and the request deadline must stay connected after headers arrive: a stalled stream body ends on abort, a stalled JSON body ends on the deadline or abort, and an abort ends retry backoff.
+*/
+describe("RemoteNodeClient body cancellation after headers", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  for (const [label, contentType, firstChunk] of [
+    ["SSE", "text/event-stream", 'data: {"type":"task:created","payload":{"id":"KB-1"},"timestamp":"t"}\n\n'],
+    ["NDJSON", "application/x-ndjson", '{"type":"task:created","payload":{"id":"KB-1"},"timestamp":"t"}\n'],
+  ] as const) {
+    it(`ends a ${label} stream whose body stalls after headers when the caller aborts`, async () => {
+      const { body, cancelled } = stalledBody(firstChunk);
+      globalThis.fetch = fetchReturningHeaders(body, contentType) as unknown as typeof fetch;
+      const client = new RemoteNodeClient({ baseUrl: BASE_URL, apiKey: API_KEY });
+      const controller = new AbortController();
+
+      const events: unknown[] = [];
+      const consumed = (async () => {
+        for await (const event of client.streamEvents({ signal: controller.signal })) {
+          events.push(event);
+          setTimeout(() => controller.abort(), 0);
+        }
+      })();
+
+      await expect(consumed).resolves.toBeUndefined();
+      expect(events).toEqual([{ type: "task:created", payload: { id: "KB-1" }, timestamp: "t" }]);
+      expect(cancelled).toHaveBeenCalled();
+    });
+  }
+
+  it("keeps a long-lived stream open past the request timeout until the caller aborts", async () => {
+    const { body, cancelled } = stalledBody();
+    globalThis.fetch = fetchReturningHeaders(body, "text/event-stream") as unknown as typeof fetch;
+    const client = new RemoteNodeClient({ baseUrl: BASE_URL, apiKey: API_KEY, timeoutMs: 5 });
+    const controller = new AbortController();
+
+    let settled = false;
+    const consumed = (async () => {
+      for await (const _event of client.streamEvents({ signal: controller.signal })) {
+        // no events
+      }
+    })().finally(() => {
+      settled = true;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(settled).toBe(false);
+    expect(cancelled).not.toHaveBeenCalled();
+
+    controller.abort();
+    await expect(consumed).resolves.toBeUndefined();
+    expect(cancelled).toHaveBeenCalled();
+  });
+
+  it("cancels the stream body when the consumer stops iterating early", async () => {
+    const { body, cancelled } = stalledBody('data: {"type":"a","timestamp":"t"}\n\n');
+    globalThis.fetch = fetchReturningHeaders(body, "text/event-stream") as unknown as typeof fetch;
+    const client = new RemoteNodeClient({ baseUrl: BASE_URL, apiKey: API_KEY });
+
+    for await (const _event of client.streamEvents()) {
+      break;
+    }
+
+    expect(cancelled).toHaveBeenCalled();
+  });
+
+  it("bounds a JSON stream fallback body by the request timeout", async () => {
+    const { body } = stalledBody("[");
+    globalThis.fetch = fetchReturningHeaders(body, "application/json") as unknown as typeof fetch;
+    const client = new RemoteNodeClient({ baseUrl: BASE_URL, apiKey: API_KEY, timeoutMs: 5 });
+
+    const consumed = (async () => {
+      for await (const _event of client.streamEvents()) {
+        // unreachable
+      }
+    })();
+
+    await expect(consumed).rejects.toThrow("timed out");
+  });
+
+  it("bounds a JSON request body by the request timeout on every attempt", async () => {
+    vi.useFakeTimers();
+    const bodies: Array<ReturnType<typeof stalledBody>> = [];
+    const fetchMock = vi.fn().mockImplementation(() => {
+      const stalled = stalledBody('{"status":');
+      bodies.push(stalled);
+      return Promise.resolve(new Response(stalled.body, { status: 200, headers: { "content-type": "application/json" } }));
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const client = new RemoteNodeClient({ baseUrl: BASE_URL, apiKey: API_KEY, timeoutMs: 5 });
+
+    const expectation = expect(client.health()).rejects.toThrow("timed out");
+    await vi.runAllTimersAsync();
+    await expectation;
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    for (const { cancelled } of bodies) expect(cancelled).toHaveBeenCalled();
+  });
+
+  it("aborts a JSON request whose body stalls after headers, without retrying", async () => {
+    const { body, cancelled } = stalledBody('{"status":');
+    const fetchMock = fetchReturningHeaders(body, "application/json");
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const client = new RemoteNodeClient({ baseUrl: BASE_URL, apiKey: API_KEY });
+    const controller = new AbortController();
+
+    const request = client.health({ signal: controller.signal });
+    setTimeout(() => controller.abort(), 5);
+
+    await expect(request).rejects.toThrow("aborted");
+    expect(cancelled).toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("ends retry backoff when the caller aborts", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("network down"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const client = new RemoteNodeClient({ baseUrl: BASE_URL, apiKey: API_KEY });
+    const controller = new AbortController();
+
+    const request = client.pollPendingAssignments({ signal: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+
+    const started = Date.now();
+    await expect(request).rejects.toThrow("aborted");
+    expect(Date.now() - started).toBeLessThan(900);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

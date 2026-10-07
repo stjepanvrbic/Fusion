@@ -87,6 +87,10 @@ export class RemoteNodeRuntime
     }
   }
 
+  /**
+   * FNXC:RemoteNodeRuntime 2026-10-07-19:50:
+   * Stop aborts the event-stream loop and waits for it; every request that loop makes (the stream body, the reconnect-time assignment poll and health check, and retry backoffs) is bound to that abort so stop always settles.
+   */
   async stop(): Promise<void> {
     if (this.status === "stopped" || this.status === "stopping") {
       return;
@@ -228,7 +232,7 @@ export class RemoteNodeRuntime
             `(attempt ${reconnectAttempts}/${this.maxReconnectAttempts})`
         );
 
-        await this.pollPendingAssignments("cross-node-poll");
+        await this.pollPendingAssignments("cross-node-poll", signal);
 
         await this.sleep(delayMs, signal);
         if (signal.aborted) {
@@ -236,8 +240,11 @@ export class RemoteNodeRuntime
         }
 
         try {
-          await this.client.health();
+          await this.client.health({ signal });
         } catch (healthError) {
+          if (signal.aborted) {
+            return;
+          }
           this.emitRuntimeError(this.toError(healthError));
         }
       }
@@ -289,15 +296,21 @@ export class RemoteNodeRuntime
     }
   }
 
-  private async pollPendingAssignments(source: "cross-node-poll" | "cross-node-reconcile"): Promise<void> {
+  private async pollPendingAssignments(
+    source: "cross-node-poll" | "cross-node-reconcile",
+    signal?: AbortSignal
+  ): Promise<void> {
     try {
       const assignments = await this.client.pollPendingAssignments({
         since: this.lastAssignmentCursor ?? undefined,
+        signal,
       });
       for (const assignment of assignments) {
         this.emitAssignmentWake(assignment, source);
       }
     } catch (error) {
+      // A stop-time cancellation is not a runtime error.
+      if (signal?.aborted) return;
       this.emitRuntimeError(this.toError(error));
     }
   }
