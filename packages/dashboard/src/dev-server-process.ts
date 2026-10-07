@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
-import { superviseSpawn } from "@fusion/core";
+import { superviseSpawn, type SupervisedChild } from "@fusion/core";
 import type { DevServerState, DevServerStore } from "./dev-server-store.js";
 import {
   detectPortFromLogLine,
@@ -22,8 +22,6 @@ export interface DevServerProcessManagerOptions {
   probeTimeoutMs?: number;
   /** Test seam for lifecycle assertions without a shell child process. */
   spawn?: typeof superviseSpawn;
-  /** Test seam for proving stop dispatches the process-tree signal without killing an OS process. */
-  killManagedProcess?: (child: ChildProcess, signal: NodeJS.Signals) => void;
 }
 
 interface UrlDetectedEventPayload {
@@ -37,29 +35,6 @@ const DEFAULT_STOP_TIMEOUT_MS = 5_000;
 const DEFAULT_PROBE_DELAY_MS = 10_000;
 const DEFAULT_PROBE_HOST = "127.0.0.1";
 const DEFAULT_PROBE_TIMEOUT_MS = 1_000;
-
-function killManagedProcess(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (typeof child.pid !== "number") {
-    return;
-  }
-
-  if (process.platform !== "win32") {
-    try {
-      // Supervised POSIX children remain process-group leaders, so a negative
-      // PID still tears down the shell wrapper and its descendants.
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // Fall back to the direct child PID when the group no longer exists.
-    }
-  }
-
-  try {
-    process.kill(child.pid, signal);
-  } catch {
-    // Process may already have exited.
-  }
-}
 
 /**
  * Reject dev-server commands whose strings contain command-substitution
@@ -83,6 +58,7 @@ function assertSafeDevServerCommand(command: string): void {
 
 export class DevServerProcessManager extends EventEmitter {
   private childProcess: ChildProcess | null = null;
+  private supervised: SupervisedChild | null = null;
   private portProbeTimer: NodeJS.Timeout | null = null;
   private hasDetectedUrl = false;
   private closePromise: Promise<DevServerState> | null = null;
@@ -95,7 +71,6 @@ export class DevServerProcessManager extends EventEmitter {
   private readonly probeDelayMs: number;
   private readonly probeTimeoutMs: number;
   private readonly spawn: typeof superviseSpawn;
-  private readonly kill: (child: ChildProcess, signal: NodeJS.Signals) => void;
 
   constructor(
     private readonly store: DevServerStore,
@@ -108,11 +83,18 @@ export class DevServerProcessManager extends EventEmitter {
     /*
     FNXC:DevServerProcessTests 2026-07-19-18:45:
     FN-8394 rescues lifecycle coverage from a second load-sensitive quarantine.
-    Inject only spawn and process-tree signaling so unit tests retain start/stop,
+    Inject only spawn so unit tests retain start/stop,
     output, URL, fallback-timer, and restart invariants without real shell children.
+
+    FNXC:ProcessLifecycle 2026-10-07-18:00:
+    Stop and restart must free the dev server's port on every platform, so every kill goes through the supervisor's tree kill.
+    The manager's own direct-pid kill reached only cmd.exe on Windows and left the real server bound to its port.
     */
     this.spawn = options?.spawn ?? superviseSpawn;
-    this.kill = options?.killManagedProcess ?? killManagedProcess;
+  }
+
+  private kill(supervised: SupervisedChild | null, signal: NodeJS.Signals): void {
+    supervised?.kill(signal);
   }
 
   async start(
@@ -162,6 +144,7 @@ export class DevServerProcessManager extends EventEmitter {
     const child = supervised.child;
 
     this.childProcess = child;
+    this.supervised = supervised;
     this.closePromise = new Promise<DevServerState>((resolve) => {
       this.resolveClosePromise = resolve;
     });
@@ -193,8 +176,8 @@ export class DevServerProcessManager extends EventEmitter {
     this.attachOutput(child.stdout, "stdout", handleLine);
     this.attachOutput(child.stderr, "stderr", handleLine);
 
-    child.on("close", (code) => {
-      if (lifecycleSettled) {
+    void supervised.waitExit().then(({ code }) => {
+      if (lifecycleSettled || this.supervised !== supervised) {
         return;
       }
       lifecycleSettled = true;
@@ -222,16 +205,17 @@ export class DevServerProcessManager extends EventEmitter {
     }
 
     const child = this.childProcess;
+    const supervised = this.supervised;
     const closePromise = this.closePromise;
     const pid = child.pid;
 
     if (typeof pid === "number") {
-      this.kill(child, "SIGTERM");
+      this.kill(supervised, "SIGTERM");
     }
 
     const killTimer = setTimeout(() => {
       if (this.childProcess === child && this.isRunning()) {
-        this.kill(child, "SIGKILL");
+        this.kill(supervised, "SIGKILL");
       }
     }, this.stopTimeoutMs);
 
@@ -273,11 +257,12 @@ export class DevServerProcessManager extends EventEmitter {
     this.clearTimers();
 
     if (this.childProcess && typeof this.childProcess.pid === "number") {
-      this.kill(this.childProcess, "SIGTERM");
+      this.kill(this.supervised, "SIGTERM");
       this.childProcess.removeAllListeners();
       this.childProcess.stdout?.removeAllListeners();
       this.childProcess.stderr?.removeAllListeners();
       this.childProcess = null;
+      this.supervised = null;
     }
 
     this.removeAllListeners();
@@ -388,6 +373,7 @@ export class DevServerProcessManager extends EventEmitter {
     });
 
     this.childProcess = null;
+    this.supervised = null;
     this.resolveClosePromise?.(updated);
     this.resolveClosePromise = null;
     this.closePromise = null;
@@ -405,6 +391,7 @@ export class DevServerProcessManager extends EventEmitter {
     });
 
     this.childProcess = null;
+    this.supervised = null;
     this.resolveClosePromise?.(updated);
     this.resolveClosePromise = null;
     this.closePromise = null;

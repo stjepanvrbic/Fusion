@@ -774,7 +774,8 @@ async function runVerificationCommandUnlocked(
     });
 
     // ── Process exit ─────────────────────────────────────────────────────────
-    child.on("close", (code, signal) => {
+    // FNXC:ProcessLifecycle 2026-10-07-18:00: settle on the supervisor's exit, which a kill bounds even while a descendant holds the pipes, and which reports a win32 tree kill with the POSIX signal shape.
+    void supervised.waitExit().then(({ code, signal }) => {
       if (settled) return;
       settled = true;
       clearInterval(quietTimer);

@@ -1114,8 +1114,9 @@ export {
   hasProjectIdentity,
   PROJECT_IDENTITY_FILENAME,
 } from "./central/project-identity.js";
-export { ProcessSupervisor, superviseSpawn } from "./process/process-supervisor.js";
+export { ProcessSupervisor, superviseSpawn, killProcessTree } from "./process/process-supervisor.js";
 export type {
+  KillProcessTreeOptions,
   SuperviseSpawnOptions,
   SupervisedChild,
   SupervisedExit,

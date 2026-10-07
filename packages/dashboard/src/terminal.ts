@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { superviseSpawn, type SupervisedChild } from "@fusion/core";
 
 /**
  * Command validation patterns for the allowlist.
@@ -219,6 +220,7 @@ export interface TerminalOutputEvent {
  */
 export class TerminalSessionManager extends EventEmitter {
   private sessions = new Map<string, TerminalSession>();
+  private readonly supervisedChildren = new Map<string, SupervisedChild>();
   private readonly defaultTimeout = 30_000; // 30 seconds
   
   /**
@@ -234,13 +236,20 @@ export class TerminalSessionManager extends EventEmitter {
     
     const sessionId = randomUUID();
     
-    // Spawn the process in a shell to support pipes, redirects, etc.
-    const childProcess = spawn(command, [], {
+    /*
+    FNXC:ProcessLifecycle 2026-10-07-18:00:
+    Killing or timing out a terminal command must end everything it started, on every platform.
+    Spawn under the supervisor so the kill is its process-group kill on POSIX and its taskkill tree kill on Windows; the raw spawn was never a group leader, so its group kill always fell back to killing only the shell.
+    */
+    const supervised = superviseSpawn(command, [], {
       cwd,
       shell: true,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, FORCE_COLOR: "1", TERM: "xterm-256color" },
+      maxLifetimeMs: this.defaultTimeout + 10_000,
     });
+    const childProcess = supervised.child;
+    this.supervisedChildren.set(sessionId, supervised);
     
     const session: TerminalSession = {
       id: sessionId,
@@ -334,17 +343,7 @@ export class TerminalSessionManager extends EventEmitter {
     }
     
     session.killed = true;
-    
-    // Kill the process group to handle child processes
-    try {
-      if (session.process.pid) {
-        process.kill(-session.process.pid, signal);
-      }
-    } catch {
-      // Fallback to killing just the main process
-      session.process.kill(signal);
-    }
-    
+    this.supervisedChildren.get(sessionId)?.kill(signal);
     return true;
   }
   
@@ -361,6 +360,7 @@ export class TerminalSessionManager extends EventEmitter {
     }
     
     this.sessions.delete(sessionId);
+    this.supervisedChildren.delete(sessionId);
     return true;
   }
   

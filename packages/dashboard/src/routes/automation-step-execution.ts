@@ -1,7 +1,6 @@
 import type { TaskStore } from "@fusion/core";
-import { AUTOMATION_SELECTABLE_TOOLS, THINKING_LEVELS, resolveExecutionSettingsModel } from "@fusion/core";
+import { AUTOMATION_SELECTABLE_TOOLS, THINKING_LEVELS, resolveExecutionSettingsModel, runCommandAsync } from "@fusion/core";
 import { createFnAgent as engineCreateFnAgentForRefine, promptWithFallback as enginePromptWithFallback, resolveMcpServersForStore, isInProcessBackupCommand, isInProcessMemoryBackupCommand, formatInProcessBackupError } from "@fusion/engine";
-import { ApiError } from "../api-error.js";
 import { AUTOMATION_MAX_BUFFER, AUTOMATION_MAX_OUTPUT, DEFAULT_AUTOMATION_TIMEOUT_MS, MANUAL_RUN_AI_SYSTEM_PROMPT, type AutomationLiveRunCallbacks } from "./automation-live-run.js";
 
 /**
@@ -134,41 +133,36 @@ export async function executeSingleCommand(
     }
   }
 
-  const { exec } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const execAsyncFn = promisify(exec);
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  A manual automation command's timeout must end the command's whole tree and return on time on every platform.
+  `exec` killed only the cmd.exe or /bin/sh wrapper and then waited for the surviving command to release the pipes, so a timed-out step could hang the manual run.
+  `runCommandAsync` runs under the process supervisor (group kill on POSIX, taskkill tree kill on Windows) and bounds the wait; output past the buffer cap is dropped instead of failing the step.
+  */
+  const effectiveTimeoutMs = timeoutMs ?? DEFAULT_AUTOMATION_TIMEOUT_MS;
+  const result = await runCommandAsync(command, {
+    timeoutMs: effectiveTimeoutMs,
+    maxBuffer: AUTOMATION_MAX_BUFFER,
+  });
+  const output = truncateAutomationOutput(result.stdout, result.stderr);
+  const completedAt = new Date().toISOString();
 
-  const isWindows = process.platform === "win32";
-
-  try {
-    const { stdout, stderr } = await execAsyncFn(command, {
-      timeout: timeoutMs ?? DEFAULT_AUTOMATION_TIMEOUT_MS,
-      maxBuffer: AUTOMATION_MAX_BUFFER,
-      shell: isWindows ? "cmd.exe" : "/bin/sh",
-    });
-
-    return {
-      success: true,
-      output: truncateAutomationOutput(stdout, stderr),
-      startedAt,
-      completedAt: new Date().toISOString(),
-    };
-  } catch (err: unknown) {
-    if (err instanceof ApiError) {
-      throw err;
-    }
-    const execErr = err as NodeJS.ErrnoException & { stdout?: string; stderr?: string; killed?: boolean };
-
+  if (result.spawnError) {
+    return { success: false, output, error: result.spawnError.message, startedAt, completedAt };
+  }
+  if (result.timedOut) {
+    return { success: false, output, error: `Command timed out after ${effectiveTimeoutMs / 1000}s`, startedAt, completedAt };
+  }
+  if (result.exitCode !== 0) {
     return {
       success: false,
-      output: truncateAutomationOutput(execErr.stdout ?? "", execErr.stderr ?? ""),
-      error: execErr.killed
-        ? `Command timed out after ${(timeoutMs ?? DEFAULT_AUTOMATION_TIMEOUT_MS) / 1000}s`
-        : (err instanceof Error ? err.message : String(err)),
+      output,
+      error: `Command failed: ${command}${result.stderr ? `\n${result.stderr}` : ""}`,
       startedAt,
-      completedAt: new Date().toISOString(),
+      completedAt,
     };
   }
+  return { success: true, output, startedAt, completedAt };
 }
 
 function truncateAutomationOutput(stdout: string, stderr: string): string {

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { tmpdir } from "node:os";
-import { mkdtempSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SandboxBackend } from "../sandbox/types.js";
 import { fileURLToPath } from "node:url";
@@ -514,6 +514,46 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
         await sleep(100);
       }
       expect(isProcessAlive(leakedPid)).toBe(false);
+    });
+
+    /*
+    FNXC:ProcessLifecycle 2026-10-07-18:00:
+    The hard timeout bounds fn_run_verification on every platform and kills the whole command tree.
+    The grandchild inherits the output pipes, which is the shape that hung the tool forever on Windows.
+    */
+    it("times out a command whose grandchild holds the pipes, settles promptly, and kills the tree", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "fn-verify-tree-"));
+      const script = join(dir, "tree.cjs");
+      const pidFile = join(dir, "grandchild.pid");
+      writeFileSync(
+        script,
+        [
+          "const { spawn } = require('node:child_process');",
+          "const { writeFileSync } = require('node:fs');",
+          "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });",
+          "writeFileSync(process.argv[2], String(g.pid));",
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+      );
+
+      const result = await runVerificationCommand({
+        command: `"${process.execPath}" "${script}" "${pidFile}"`,
+        cwd: dir,
+        timeoutMs: 1_500,
+        onHeartbeat: vi.fn(),
+        bypassVerificationSlot: true,
+      });
+      const grandchildPid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
+
+      expect(result.timedOut).toBe(true);
+      expect(result.durationMs).toBeLessThan(1_500 + 3_000);
+      for (let i = 0; i < 40 && isProcessAlive(grandchildPid); i++) {
+        await sleep(50);
+      }
+      const alive = isProcessAlive(grandchildPid);
+      if (alive) process.kill(grandchildPid, "SIGKILL");
+      expect(alive).toBe(false);
+      rmSync(dir, { recursive: true, force: true });
     });
 
     it("escalates non-timeout process-group reaping with fake timers", () => {

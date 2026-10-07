@@ -133,17 +133,30 @@ describe("NativeSandboxBackend.runStreaming", () => {
     await expect(promise).resolves.toEqual({ outcome: "success", stdout: "", stderr: "abcde", bufferOverflow: true });
   });
 
-  it("uses win32 branch without process group", async () => {
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  On win32 a sandbox timeout kills the command's whole tree with taskkill, not just the cmd.exe wrapper.
+  */
+  it("uses the win32 tree kill without a process group", async () => {
     platformSpy.mockReturnValue("win32");
     const child = new FakeChild(8877);
-    spawnMock.mockReturnValue(child as any);
+    const taskkillCalls: Array<{ command: string; args: string[] }> = [];
+    spawnMock.mockImplementation((command: string, args: string[]) => {
+      if (/taskkill(\.exe)?$/i.test(command)) {
+        taskkillCalls.push({ command, args });
+        return Object.assign(new EventEmitter(), { unref: () => undefined });
+      }
+      return child;
+    });
     const backend = new NativeSandboxBackend();
 
     const promise = backend.runStreaming("sleep", { cwd: "/tmp", timeout: 100, maxBuffer: 1024 });
     await vi.advanceTimersByTimeAsync(100);
-    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(taskkillCalls[0]?.args).toEqual(["/PID", "8877", "/T", "/F"]);
+    expect(child.kill).not.toHaveBeenCalled();
     expect(processKillSpy).not.toHaveBeenCalledWith(-8877, "SIGTERM");
-    child.emit("close", null, "SIGTERM");
+    child.emit("exit", 1, null);
+    child.emit("close", 1, null);
 
     await expect(promise).resolves.toMatchObject({ outcome: "timeout", timeoutMs: 100 });
     expect(spawnMock).toHaveBeenCalledWith("sleep", [], expect.objectContaining({ detached: false }));

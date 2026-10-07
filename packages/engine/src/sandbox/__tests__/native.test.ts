@@ -1,4 +1,4 @@
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cwd } from "node:process";
@@ -145,4 +145,104 @@ setInterval(() => {}, 1000);
     await expect(backend.dispose()).resolves.toBeUndefined();
     await expect(backend.dispose()).resolves.toBeUndefined();
   });
+
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  Sandbox timeouts and aborts settle promptly and kill the command's whole tree on every platform.
+  The grandchild inherits the output pipes, which is the shape that kept `close` pending on Windows.
+  */
+  describe("process tree teardown", () => {
+    async function writeTreeScript(): Promise<{ command: string; pidFile: string }> {
+      const script = join(tempDir, "tree.cjs");
+      const pidFile = join(tempDir, "grandchild.pid");
+      await writeFile(
+        script,
+        [
+          "const { spawn } = require('node:child_process');",
+          "const { writeFileSync } = require('node:fs');",
+          "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });",
+          "writeFileSync(process.argv[2], String(g.pid));",
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+      );
+      return { command: `"${process.execPath}" "${script}" "${pidFile}"`, pidFile };
+    }
+
+    async function readPid(pidFile: string): Promise<number> {
+      for (let i = 0; i < 100; i++) {
+        try {
+          const pid = Number.parseInt(await readFile(pidFile, "utf8"), 10);
+          if (pid > 0) return pid;
+        } catch {
+          // Not written yet.
+        }
+        await delay(25);
+      }
+      throw new Error("grandchild pid was never written");
+    }
+
+    async function expectGone(pid: number): Promise<void> {
+      for (let i = 0; i < 40 && isAlive(pid); i++) await delay(50);
+      const alive = isAlive(pid);
+      if (alive) process.kill(pid, "SIGKILL");
+      expect(alive).toBe(false);
+    }
+
+    it("run() timeout settles and kills the grandchild holding the pipes", async () => {
+      const { command, pidFile } = await writeTreeScript();
+      const startedAt = Date.now();
+      const result = await new NativeSandboxBackend().run(command, {
+        cwd: tempDir,
+        timeoutMs: 1_000,
+        maxBuffer: 1024 * 1024,
+        encoding: "utf-8",
+      });
+
+      expect(result.timedOut).toBe(true);
+      expect(Date.now() - startedAt).toBeLessThan(1_000 + 3_000);
+      await expectGone(await readPid(pidFile));
+    });
+
+    it("runStreaming() timeout settles and kills the grandchild holding the pipes", async () => {
+      const { command, pidFile } = await writeTreeScript();
+      const startedAt = Date.now();
+      const result = await new NativeSandboxBackend().runStreaming(command, {
+        cwd: tempDir,
+        timeout: 1_000,
+        maxBuffer: 1024 * 1024,
+      });
+
+      expect(result.outcome).toBe("timeout");
+      expect(Date.now() - startedAt).toBeLessThan(1_000 + 3_000);
+      await expectGone(await readPid(pidFile));
+    });
+
+    it("runStreaming() abort settles and kills the grandchild holding the pipes", async () => {
+      const { command, pidFile } = await writeTreeScript();
+      const controller = new AbortController();
+      const pending = new NativeSandboxBackend().runStreaming(command, {
+        cwd: tempDir,
+        timeout: 30_000,
+        maxBuffer: 1024 * 1024,
+        signal: controller.signal,
+      });
+      const grandchildPid = await readPid(pidFile);
+      const abortedAt = Date.now();
+      controller.abort();
+
+      const result = await pending;
+      expect(result.outcome).toBe("aborted");
+      expect(Date.now() - abortedAt).toBeLessThan(3_000);
+      await expectGone(grandchildPid);
+    });
+  });
 });
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}

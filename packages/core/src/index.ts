@@ -1353,6 +1353,7 @@ export { resolveShellFreeLaunch, withPlatformBaseEnvKeys, killProcessTree, Unlau
 export type { ShellFreeLaunch, ShellFreeLaunchDeps, KillProcessTreeDeps } from "./process/windows-launch.js";
 export { isPostgresUniqueError } from "./db/postgres-errors.js";
 export type {
+  KillProcessTreeOptions,
   SuperviseSpawnOptions,
   SupervisedChild,
   SupervisedExit,
