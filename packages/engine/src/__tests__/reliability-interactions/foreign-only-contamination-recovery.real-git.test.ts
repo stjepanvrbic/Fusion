@@ -50,6 +50,7 @@ describe("reliability interaction: foreign-only contamination recovery", () => {
       updateTask: vi.fn(async () => {}),
     } as any;
     const runAudit = { database: vi.fn(async () => {}), git: vi.fn(), filesystem: vi.fn(), sandbox: vi.fn() } as any;
+    const resumeInPlace = vi.fn();
 
     const result = await recoverForeignOnlyContamination({
       id: "FN-8001",
@@ -58,20 +59,19 @@ describe("reliability interaction: foreign-only contamination recovery", () => {
       baseCommitSha: baseSha,
       baseBranch: "main",
       executionStartBranch: "fusion/fn-y",
-      /*
-      FNXC:LifecycleContainment 2026-09-22-14:05:
-      A recovery snapshot can become stale while its real-git repair awaits. The persisted column
-      must remain the authority so a concurrent operator move is never rebound from this old value.
-      */
-      column: "todo",
-    } as any, { repoDir, taskStore: store, runAudit, integrationBranch: "main" });
+      column: "in-progress",
+    } as any, { repoDir, taskStore: store, runAudit, integrationBranch: "main", resumeInPlace });
 
+    /*
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The repaired card stays in its lane: the former contained move (and its live-column re-read and
+    "retained in" log) was an FN-217 no-op and is gone. The unpark write is the repair, and the WIP
+    lane is re-dispatched in place.
+    */
     expect(result.recovered).toBe(true);
-    expect(store.getTask).toHaveBeenCalledWith("FN-8001");
-    expect(store.logEntry).toHaveBeenCalledWith(
-      "FN-8001",
-      expect.stringContaining("'in-review'"),
-    );
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.updateTask).toHaveBeenCalledWith("FN-8001", expect.objectContaining({ error: null, paused: false }));
+    expect(resumeInPlace).toHaveBeenCalledWith("FN-8001");
     expect(["reanchor", "branch-discard"]).toContain(result.subtype);
     if (result.subtype === "reanchor") {
       expect(await gitFixture(repoDir, ["rev-parse", "fusion/fn-x"])).toBe(baseSha);
@@ -87,6 +87,7 @@ describe("reliability interaction: foreign-only contamination recovery", () => {
       updateTask: vi.fn(async () => {}),
     } as any;
     const runAudit = { database: vi.fn(async () => {}), git: vi.fn(), filesystem: vi.fn(), sandbox: vi.fn() } as any;
+    const resumeInPlace = vi.fn();
 
     const missingWorktree = path.join(repoDir, "missing-worktree");
     vi.spyOn(activeSessionRegistry, "isPathActive").mockReturnValue(true);
@@ -98,9 +99,10 @@ describe("reliability interaction: foreign-only contamination recovery", () => {
       baseCommitSha: baseSha,
       baseBranch: "main",
       executionStartBranch: "fusion/fn-y",
-    } as any, { repoDir, taskStore: store, runAudit, integrationBranch: "main" });
+    } as any, { repoDir, taskStore: store, runAudit, integrationBranch: "main", resumeInPlace });
 
     expect(result.recovered).toBe(false);
+    expect(resumeInPlace).not.toHaveBeenCalled();
     expect(result.reason).toBe("active-session");
     expect(store.moveTask).not.toHaveBeenCalled();
   });

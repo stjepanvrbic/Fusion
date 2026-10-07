@@ -61,6 +61,20 @@ function moveTaskCallsTo(store: { moveTask: { mock: { calls: unknown[][] } } }, 
   return store.moveTask.mock.calls.filter((call) => call[0] === id && call[1] === column);
 }
 
+
+/*
+FNXC:LifecycleContainment 2026-10-07-18:04: executor recoveries in these cases (dependency abort, refusals)
+retry in place; a real armed re-dispatch would re-execute a mock task during a later case and hold the
+process-wide executor lock. Cases that assert the retry spy on their own instance.
+*/
+let inPlaceResumeStub: { mockRestore: () => void } | undefined;
+beforeEach(() => {
+  inPlaceResumeStub = vi.spyOn(TaskExecutor.prototype as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
+});
+afterEach(() => {
+  inPlaceResumeStub?.mockRestore();
+});
+
 describe("TaskExecutor enginePaused soft pause (no agent termination)", () => {
   beforeEach(() => {
     resetExecutorMocks();
