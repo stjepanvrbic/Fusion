@@ -27,6 +27,10 @@
  *   the vitest process by the SIGTERM diagnostics in vitest-setup.ts.
  */
 
+import { spawnSync } from "node:child_process";
+
+import { resolveCommandInvocation } from "./pnpm-invocation.mjs";
+
 const MINUTE = 60_000;
 
 /**
@@ -182,10 +186,23 @@ export function captureHangDiagnostics({ label, command, args, budgetMs, started
  * @param {string} [opts.cwd]       working directory for the spawned child (preserves callers that
  *   ran the test command from a fixed root, e.g. test-changed.mjs's rootDir)
  * @param {() => number} [opts.now] injected clock (defaults to Date.now)
+ * @param {NodeJS.Platform} [opts.platform] injectable platform; selects pnpm launch resolution and tree kill
+ * @param {(pid: number) => boolean} [opts.taskkill] injectable win32 tree killer (defaults to `taskkill /T /F /PID`)
  * @param {(signal: string, groupId: number|null) => void} [opts.killGroup] injected group-signaller
  *   (defaults to a process-group `process.kill(-pid)` with child.kill fallback);
  *   override in tests so signals are captured instead of hitting real groups.
  */
+/**
+ * Kill a Windows process tree. Returns false when taskkill could not kill it (already gone, or not launchable).
+ *
+ * @param {number} pid
+ * @returns {boolean}
+ */
+function defaultTaskkill(pid) {
+  const result = spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore", windowsHide: true });
+  return result.status === 0;
+}
+
 export function runWithWatchdog({
   command,
   args,
@@ -199,6 +216,8 @@ export function runWithWatchdog({
   spawn,
   now = () => Date.now(),
   killGroup = null,
+  platform = process.platform,
+  taskkill = defaultTaskkill,
 }) {
   if (typeof spawn !== "function") {
     throw new Error("runWithWatchdog requires an injected `spawn` function");
@@ -212,12 +231,19 @@ export function runWithWatchdog({
     let forceKillTimer = null;
     let settled = false;
 
+    /*
+    FNXC:WindowsPnpmLaunch 2026-10-07-18:03:
+    Resolve the pnpm shim here so every watchdog caller launches it on Windows.
+    Windows has no POSIX process groups and `detached` opens a new console there, so only POSIX children get their own group.
+    */
+    const invocation = resolveCommandInvocation(command, args, { platform, env });
     // process-supervisor-allowlist: foreground wrapper signals the whole vitest
     // process group on death/timeout; not a background daemon.
-    const child = spawn(command, args, {
-      detached: true,
+    const child = spawn(invocation.command, invocation.args, {
+      detached: platform !== "win32",
       stdio: "inherit",
       env,
+      ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
       ...(cwd ? { cwd } : {}),
     });
     // Capture the detached process-group identity while this ChildProcess is
@@ -239,7 +265,13 @@ export function runWithWatchdog({
 
     function defaultSignalGroup(signal) {
       if (childHasExited()) return;
-      if (groupId !== null) {
+      /*
+      FNXC:WindowsPnpmLaunch 2026-10-07-18:03:
+      A timeout must kill the whole tree on every platform. On Windows `process.kill(-pid)` throws and `child.kill` reaches only pnpm, leaving vitest workers alive, so kill the tree with taskkill.
+      Windows has no catchable SIGTERM for console children, so every escalation step is the forced tree kill.
+      */
+      if (platform === "win32" && groupId !== null && taskkill(groupId)) return;
+      if (platform !== "win32" && groupId !== null) {
         try {
           process.kill(-groupId, signal);
           return;

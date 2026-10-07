@@ -690,11 +690,17 @@ test("U6 fix: computePackageDurationWeight excludes slow-tier files from weighti
 
 test("CI evidence: an early preflight failure emits a collector-compatible diagnostic payload", (t) => {
   const binDir = mkdtempSync(path.join(tmpdir(), "ci-shard-failing-pnpm-"));
-  const fakePnpm = path.join(binDir, "pnpm");
+  /*
+  FNXC:WindowsPnpmLaunch 2026-10-07-18:03:
+  The shim on PATH must be the one the runner launches on every platform: Windows resolves `pnpm.cmd`, and npm_execpath would bypass PATH, so it is removed from the child env.
+  */
+  const fakePnpm = path.join(binDir, process.platform === "win32" ? "pnpm.cmd" : "pnpm");
   const diagnosticFile = path.join(REPO_ROOT, ".timings", "timings-shard4-diagnostic.json");
   const priorDiagnostic = existsSync(diagnosticFile) ? readFileSync(diagnosticFile) : null;
-  writeFileSync(fakePnpm, "#!/bin/sh\nexit 23\n");
+  writeFileSync(fakePnpm, process.platform === "win32" ? "@exit /b 23\r\n" : "#!/bin/sh\nexit 23\n");
   chmodSync(fakePnpm, 0o755);
+  const childEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
+  delete childEnv.npm_execpath;
   t.after(() => {
     rmSync(binDir, { recursive: true, force: true });
     if (priorDiagnostic) writeFileSync(diagnosticFile, priorDiagnostic);
@@ -707,7 +713,7 @@ test("CI evidence: an early preflight failure emits a collector-compatible diagn
     {
       cwd: REPO_ROOT,
       encoding: "utf8",
-      env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` },
+      env: childEnv,
     },
   );
 

@@ -21,18 +21,22 @@ import { fileURLToPath } from "node:url";
 import { ensureTestArtifacts } from "./ensure-test-artifacts.mjs";
 import { listWorkspacePackageInfos } from "./test-changed.mjs";
 import { deriveBudgetMs, runWithWatchdog } from "./lib/run-vitest-watchdog.mjs";
+import { describeSpawnFailure, resolveCommandInvocation } from "./lib/pnpm-invocation.mjs";
 
 // Quick, non-test commands (e.g. skill-sync check) stay synchronous — they have
 // no hang risk and no benefit from the watchdog.
+// FNXC:WindowsPnpmLaunch 2026-10-07-18:03: preflight pnpm steps use the shared launcher so the shard runner starts on Windows.
 function run(command, commandArgs, options = {}) {
-  const result = spawnSync(command, commandArgs, {
+  const invocation = resolveCommandInvocation(command, commandArgs, { env: options.env ?? process.env });
+  const result = spawnSync(invocation.command, invocation.args, {
     cwd: process.cwd(),
     stdio: "inherit",
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     ...options,
   });
 
   if (result.status !== 0) {
-    const error = new Error(`Command failed: ${command}`);
+    const error = new Error(`Command failed: ${command} (${describeSpawnFailure(result)})`);
     error.shardDiagnostic = {
       stage: "preflight",
       exitCode: result.status ?? 1,

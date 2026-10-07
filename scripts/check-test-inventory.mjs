@@ -42,6 +42,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { dirname, join, resolve, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveCommandInvocation } from "./lib/pnpm-invocation.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -101,7 +102,10 @@ function runVitestList(packageDir, projects, { repoRoot = REPO_ROOT, filesOnly =
   for (const project of projects || []) {
     args.push("--project", project);
   }
-  const result = spawnSync("pnpm", args, {
+  // FNXC:WindowsPnpmLaunch 2026-10-07-18:03: launch pnpm through the shared launcher; a bare "pnpm" spawn is ENOENT on Windows.
+  const invocation = resolveCommandInvocation("pnpm", args);
+  const result = spawnSync(invocation.command, invocation.args, {
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     cwd,
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,

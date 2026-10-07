@@ -64,7 +64,7 @@ import { mkdirSync, writeFileSync, mkdtempSync, rmSync, existsSync, utimesSync }
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const thisFile = fileURLToPath(import.meta.url);
 const scriptModulePath = path.resolve(path.dirname(thisFile), "..", "test-changed.mjs");
@@ -1553,7 +1553,7 @@ function makeChainRepo(dir) {
  */
 function runInRepo(repoDir, snippet) {
   const code = `
-    import * as mod from ${JSON.stringify(scriptModulePath)};
+    import * as mod from ${JSON.stringify(pathToFileURL(scriptModulePath).href)};
     const out = (${snippet})(mod);
     console.log(JSON.stringify(out));
   `;

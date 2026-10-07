@@ -11,6 +11,7 @@ import { ensureTestArtifacts } from "./ensure-test-artifacts.mjs";
 import { isSkillSyncCheckCached } from "./sync-fusion-skill-tools.mjs";
 import { computeContentHash, createRepoContentSnapshot } from "./lib/content-hash.mjs";
 import { deriveBudgetMs, runWithWatchdog } from "./lib/run-vitest-watchdog.mjs";
+import { describeSpawnFailure, resolveCommandInvocation } from "./lib/pnpm-invocation.mjs";
 
 /** Generous local full-suite budget (60min): far above a real full run, far below an infinite hang. */
 const FULL_SUITE_BUDGET_MS = 60 * 60 * 1000;
@@ -162,15 +163,18 @@ const SHARED_HASH_INPUT_PATHS = [
 /** @type {number} Max age (ms) for a cache entry to count as a pass. */
 const CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+// FNXC:WindowsPnpmLaunch 2026-10-07-18:03: synchronous pnpm steps use the shared launcher too; a launch error is reported, not hidden behind "exit code 1".
 function run(command, commandArgs, options = {}) {
-  const result = spawnSync(command, commandArgs, {
+  const invocation = resolveCommandInvocation(command, commandArgs, { env: options.env ?? process.env });
+  const result = spawnSync(invocation.command, invocation.args, {
     cwd: rootDir,
     stdio: "inherit",
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     ...options,
   });
 
   if (result.status !== 0) {
-    const error = new Error(`${command} ${commandArgs.join(" ")} failed with exit code ${result.status ?? 1}`);
+    const error = new Error(`${command} ${commandArgs.join(" ")} failed (${describeSpawnFailure(result)})`);
     error.exitCode = result.status ?? 1;
     throw error;
   }

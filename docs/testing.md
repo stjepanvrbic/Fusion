@@ -129,6 +129,7 @@ pnpm verify:workspace  # deep opt-in verification: lint -> test:full -> build (N
 - `check-pi-versions-pinned`
 - `check-workspace-package-graph`
 - `check-no-test-timeout-appeasement`
+- `check-no-comment-assertions-in-tests`
 - `check-changeset-format`
 - `check-pre-json-anchor`
 - `check-routes-modular`
