@@ -46,7 +46,6 @@ import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { createPostgresDdlAdmissionGate } from "./pg-ddl-admission.js";
 import { tmpdir } from "node:os";
 import {
   createPgTimeoutBoundaryObserver,
@@ -232,12 +231,6 @@ export function resolvePgAvailability(
 
 export const PG_AVAILABLE = resolvePgAvailability(process.env, PG_TEST_URL_BASE, probeTcpReachable).available;
 
-/** Test-only observation seam for proving harness DDL remains structurally bounded. */
-export const __pgTestDdlAdmission = createPostgresDdlAdmissionGate({
-  available: () => PG_AVAILABLE,
-  urlBase: PG_TEST_URL_BASE,
-});
-
 /**
  * A conditional `describe` that runs when PG is available and skips otherwise.
  * Use this instead of bare `describe` for any test file that needs a real
@@ -418,6 +411,10 @@ function createPgTimeoutBoundaryProbe(): (signal: AbortSignal, bounds: PgTimeout
  * the recorded ungated baseline. Keep this harness helper direct: the reusable
  * primitive remains independently tested, but its wiring is intentionally not
  * shipped until a candidate proves it improves the loaded 12-worker lane.
+ *
+ * FNXC:PgTestDdlAdmission 2026-10-07-21:17:
+ * The harness no longer builds an admission gate per module instance: nothing read it, and each one was a candidate beforeExit registrant.
+ * A future wiring creates its gate here, and the gate module keeps one process-wide exit backstop for all of them.
  */
 async function gatedDdl(client: ReturnType<typeof postgres>, statement: string): Promise<void> {
   await client.unsafe(statement);
