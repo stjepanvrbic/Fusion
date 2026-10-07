@@ -2553,7 +2553,8 @@ describe("refreshAutomatedPrHead", () => {
 
     expect(execFileCalls).toContainEqual(expect.objectContaining({
       file: "git",
-      args: ["worktree", "remove", "--force", expect.stringMatching(/\/projects\/repo-a\/\.fusion\/worktrees\/pr-refresh-/)],
+      // The removed path is join()-built, so it uses the platform separator while git's porcelain listing uses `/`.
+      args: ["worktree", "remove", "--force", expect.stringMatching(/[\\/]projects[\\/]repo-a[\\/]\.fusion[\\/]worktrees[\\/]pr-refresh-/)],
     }));
   });
 

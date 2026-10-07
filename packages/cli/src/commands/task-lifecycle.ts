@@ -354,10 +354,10 @@ function scheduleRetainedRefreshReconciliation(root: string, path: string, reser
 FNXC:PullRequestFreshness 2026-10-07-17:57:
 The git registration and the directory of a refresh worktree are removed together.
 Git prints worktree paths with forward slashes (`C:/Users/...`) while ours come from `join()` (`C:\Users\...`), so an exact string compare never matched on Windows: `git worktree remove` was skipped, only the directory was deleted, and the stale registration kept holding the branch.
-Compare canonical paths: realpath when the path exists, otherwise resolve, case-folded on win32.
+Compare canonical paths: realpath when the path exists, then resolve (which also normalizes separators and the drive), case-folded on win32.
 */
 async function canonicalWorktreePath(path: string): Promise<string> {
-  const canonical = await realpath(path).catch(() => resolve(path));
+  const canonical = resolve(await realpath(path).catch(() => path));
   return process.platform === "win32" ? canonical.toLowerCase() : canonical;
 }
 
