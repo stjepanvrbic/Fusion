@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **4 active observation records** (entries 2, 13, 20, and 21), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **12 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **4 active observation records** (entries 2, 13, 20, and 21), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **14 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -369,6 +369,39 @@ FN-9425 closes entry 19 after a second independent timeout-shaped Full Suite sig
 runs and six passing siblings while the 14-day CLI quarantine excludes routine discovery but keeps
 explicit-file diagnostics runnable; timeout, retry, and assertion appeasement remain prohibited.
 -->
+<!--
+FNXC:TestFlakeRegister 2026-10-07-18:04:
+Entries 22 and 23 record same-day second sightings on the fork's Full Suite. Both files are quarantined through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
+-->
+### 22. Planning Mode duplicate-response reconciliation re-sighting
+
+- **Status:** Closed — quarantined 2026-10-07 after a re-sighting of entry 8's exact case; deletion deadline 2026-10-21.
+- **File:** `packages/dashboard/app/components/__tests__/PlanningModeModal.planning-flow.test.tsx`
+- **Exact test:** `PlanningModeModal sequential flow > silently reconciles duplicate-response generation conflicts on $viewport with $label`
+- **Observed tree/SHA:** fork Full Suite run [37648267708](https://github.com/stjepanvrbic/Fusion/actions/runs/37648267708) at `1359c449cd`, job `112884602084`, lane `dashboard-app-quality-backfill --shard=3/4`.
+- **Observed frequency:** 1 failed / 6008 passed in that lane; the concrete row was `'desktop'` with `'a durable next question'`.
+
+The failure was `expect(element).toBeEnabled()` on the primary planning action (`.planning-actions-primary` stayed `disabled`) inside a `waitFor` at `PlanningModeModal.planning-flow.test.tsx:81`. Entry 8 closed this exact case on 2026-08-16 as a product race fixed by FN-9116, and the lane-sharding entry below recorded two more moving-case sightings in the same file at `c82e420ba0`. A re-sighting after a claimed structural fix is an ordinary on-sight quarantine.
+
+This is the file's third register history after entries 4, 5 and 8, so the AGENTS.md repeated-quarantine rule treats it as a product-race smell. Before the deletion deadline, inspect `handleSubmitResponse`'s duplicate-response reconciliation in `PlanningModeModal`: the disabled primary action means a reconciliation or recovery write left the view in a busy state after the duplicate rejection. No product code changed in this quarantine.
+
+### 23. Planning Mode browser E2E Chromium lifecycle
+
+- **Status:** Closed — quarantined 2026-10-07 after two Full Suite sightings in one day; deletion deadline 2026-10-21.
+- **File:** `packages/dashboard/src/__tests__/planning-browser-e2e.test.ts`
+- **Exact test:** `Planning Mode browser E2E` suite `beforeAll` hook and every case that depends on its shared browser.
+- **Observed trees/SHAs:** fork Full Suite runs [37648267708](https://github.com/stjepanvrbic/Fusion/actions/runs/37648267708) at `1359c449cd` (job `112884602255`) and [37652972793](https://github.com/stjepanvrbic/Fusion/actions/runs/37652972793) at `595b2f5fad` (job `112900802405`), lane `dashboard-api-quality-backfill --shard=1/2`.
+- **Observed frequency:** 2 of the last 13 fork Full Suite runs.
+
+| run | result |
+|---|---|
+| 37648267708 | suite failed: `Hook timed out in 30000ms` at the `beforeAll` that starts Vite and launches Chromium; 1955 lane tests passed |
+| 37652972793 | 5 of 5 cases failed: `page.goto: Target page, context or browser has been closed` on the first navigation; 1955 lane tests passed |
+
+Classification: a load-sensitive Chromium lifecycle flake, not a product defect. Both shapes are the shared browser failing to start or dying before any Planning Mode assertion runs, while the lane reported `import` times above 300 s for 167 files. No run shows a Planning Mode assertion failing. The `@lydell/node-pty` lockfile integrity mismatch printed in the CLI shard of the same runs is environmental and unrelated; no lockfile changed.
+
+Rescue lead: the fixture passes `server.port: 0`, but Vite treats `0` as unset and binds its default port 5173, walking upward on conflict, so the server never had an ephemeral port. That is a fixture defect worth fixing in any rescue, though neither sighting shows it caused the failure. The opt-in `dashboard-browser-touch` project does not run in CI, so moving the file there would only hide it.
+
 ### 19. Built skills-get global flag completion
 
 - **Status:** Closed — quarantined 2026-09-29 by FN-9425 after the second sighting triggered the deletion ratchet; deletion deadline 2026-10-13.
@@ -531,6 +564,7 @@ The failure exercises the pre-existing mobile tab transition, while the task-cre
 ### 8. Planning Mode duplicate-response generation reconciliation
 
 - **Status:** Closed 2026-08-16 by FN-9116 — resolved (product race).
+- **Re-sighted:** 2026-10-07 in fork Full Suite run 37648267708; the file is quarantined under entry 22.
 
 - **File:** `packages/dashboard/app/components/__tests__/PlanningModeModal.planning-flow.test.tsx`
 - **Exact test:** `PlanningModeModal sequential flow > silently reconciles duplicate-response generation conflicts on $viewport with $label`
@@ -725,6 +759,8 @@ not mention the rescue — the evidence is in the test-file diff.
 ---
 
 ## Entry: `PlanningModeModal.planning-flow` under dashboard lane sharding (first sighting)
+
+- **Superseded 2026-10-07:** the file is quarantined under archived entry 22.
 
 - **File:** `packages/dashboard/app/components/__tests__/PlanningModeModal.planning-flow.test.tsx`
 - **Exact tests:** a DIFFERENT case failed on each of two consecutive full-lane runs —
