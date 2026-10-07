@@ -3,6 +3,7 @@ import type { Settings, Task, TaskStore } from "@fusion/core";
 import { ProjectEngine } from "../project-engine.js";
 import { executingTaskLock } from "../agents/active-session-registry.js";
 import * as pushRecovery from "../merge/recover-confirmed-merge-push.js";
+import * as publication from "../merge/landed-commit-publication.js";
 
 /*
 FNXC:PostMergeEvidenceHold 2026-10-03-23:32:
@@ -54,7 +55,7 @@ describe("landed task post-merge holds", () => {
     }
   });
 
-  it("schedules a due evidence recheck once while keeping the merge queue blocked", async () => {
+  function dueRecheckFixture() {
     const { task, store, poll } = fixture();
     task.status = undefined;
     task.autoMerge = true;
@@ -68,11 +69,39 @@ describe("landed task post-merge holds", () => {
         items.push(input); return { seeded: true };
       }),
     });
-    for (let n = 0; n < 3; n++) expect(await poll()).toBe(false);
-    expect(items).toHaveLength(1);
-    expect(items[0]).toMatchObject({ nodeId: "post-merge-verification", sourceColumn: "in-review", targetColumn: "in-review" });
-    expect(task.workflowStepResults![0]).toMatchObject({ status: "failed", verdict: "REVISE" });
-    expect(store.updateTaskAtomic).not.toHaveBeenCalled();
+    return { task, store, poll, items };
+  }
+
+  it("schedules a due evidence recheck once while keeping the merge queue blocked", async () => {
+    // FNXC:PostMergePublication 2026-10-07-13:00: The built-in gate reseeds only for a landing proven on the push remote.
+    const probe = vi.spyOn(publication, "probeLandedCommitPublication").mockImplementation(async (_store, task) => ({
+      state: "published", sha: task.mergeDetails!.commitSha!, target: { branch: "main", remote: "origin", targetBranch: "main", target: "origin/main" },
+    }));
+    try {
+      const { task, store, poll, items } = dueRecheckFixture();
+      for (let n = 0; n < 3; n++) expect(await poll()).toBe(false);
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({ nodeId: "post-merge-verification", sourceColumn: "in-review", targetColumn: "in-review" });
+      expect(task.workflowStepResults![0]).toMatchObject({ status: "failed", verdict: "REVISE" });
+      expect(store.updateTaskAtomic).not.toHaveBeenCalled();
+    } finally {
+      probe.mockRestore();
+    }
+  });
+
+  it("keeps the merge queue blocked without rerunning verification for an unpublished landing", async () => {
+    const probe = vi.spyOn(publication, "probeLandedCommitPublication").mockImplementation(async (_store, task) => ({
+      state: "unpublished", sha: task.mergeDetails!.commitSha!, target: { branch: "main", remote: "origin", targetBranch: "main", target: "origin/main" },
+    }));
+    try {
+      const { task, store, poll, items } = dueRecheckFixture();
+      for (let n = 0; n < 3; n++) expect(await poll()).toBe(false);
+      expect(items).toEqual([]);
+      expect(task.workflowStepResults![0]).toMatchObject({ status: "failed", verdict: "REVISE" });
+      expect(vi.mocked(store.logEntry).mock.calls.filter(([, message]) => String(message).includes("waiting for publication"))).toHaveLength(1);
+    } finally {
+      probe.mockRestore();
+    }
   });
 
   it.each(["failed", "pending", "skipped"])("does not repeatedly admit %s evidence or report active landing", async (status) => {

@@ -1,19 +1,21 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { allowsAutoMergeProcessing, getPostMergeFinalizeBlocker, type Settings, type Task, type TaskStore } from "@fusion/core";
 import { activeSessionRegistry, executingTaskLock } from "../agents/active-session-registry.js";
 import { isTaskExecutionLive } from "./merge-execution-exclusion.js";
 import { isPushAfterMergeEnabled } from "./push-after-merge-policy.js";
 import { createMergeWriteFence, type MergeWriteFence } from "./merge-write-fence.js";
+import { isCommitOnRemoteBranch, resolveConfirmedMergePushTarget, runGit, type GitRun } from "./landed-commit-publication.js";
 
-const execFileAsync = promisify(execFile);
 const COOLDOWN_MS = 5 * 60_000;
 const branchAttempts = new Map<string, number>();
-type Run = (args: string[], cwd: string, timeout: number, signal?: AbortSignal) => Promise<string>;
-const runGit: Run = async (args, cwd, timeout, signal) => (await execFileAsync("git", args, {
-  cwd, timeout, signal, maxBuffer: 1024 * 1024, encoding: "utf8",
-  env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-})).stdout.trim();
+type Run = GitRun;
+
+/**
+ * FNXC:PostMergePublication 2026-10-07-13:00:
+ * `delivered` means THIS call verified or pushed the landed commit onto the remote. `failed` covers a
+ * transport/proof error or a durable failure backoff; `skipped` covers ineligibility, an attempt owned
+ * elsewhere, or an earlier recorded delivery. Only `delivered` lets the publication precondition reseed.
+ */
+export type ConfirmedMergePushOutcome = "delivered" | "failed" | "skipped";
 
 function eligible(task: Task, settings: Settings): boolean {
   const leaseAge = Date.now() - Date.parse(task.checkoutLeaseRenewedAt ?? "");
@@ -35,24 +37,20 @@ export async function recoverConfirmedMergePush(
   settings: Settings,
   run: Run = runGit,
   suppliedFence?: MergeWriteFence,
-): Promise<void> {
-  if (!store.rootDir || !eligible(task, settings)) return;
+): Promise<ConfirmedMergePushOutcome> {
+  if (!store.rootDir || !eligible(task, settings)) return "skipped";
   const details = task.mergeDetails!;
-  const branch = details.mergeTargetBranch;
   const sha = details.commitSha;
-  if (!branch || !sha || !/^[a-f0-9]{40,64}$/i.test(sha)) return;
-  const [remote = "origin", ...targetParts] = (settings.pushRemote?.trim() || "origin").split(/\s+/);
-  const targetBranch = targetParts.join(" ") || branch;
-  // Only configured remote names, never arbitrary URLs, options, or shell expressions.
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(remote)) return;
-  const target = `${remote}/${targetBranch}`;
+  const resolved = resolveConfirmedMergePushTarget(details, settings);
+  if (!resolved || !sha || !/^[a-f0-9]{40,64}$/i.test(sha)) return "skipped";
+  const { branch, remote, targetBranch, target } = resolved;
   const recorded = details.pushRecovery;
   const now = Date.now();
   if (recorded?.target === target && recorded.commitSha === sha
-    && (recorded.pushedAt || Date.parse(recorded.nextAttemptAt) > now)) return;
+    && (recorded.pushedAt || Date.parse(recorded.nextAttemptAt) > now)) return !recorded.pushedAt && recorded.error ? "failed" : "skipped";
   for (const [key, until] of branchAttempts) if (until <= now) branchAttempts.delete(key);
   const key = `${store.rootDir}\0${target}`;
-  if (branchAttempts.has(key)) return;
+  if (branchAttempts.has(key)) return "skipped";
   branchAttempts.set(key, now + COOLDOWN_MS);
   const nextAttemptAt = new Date(now + COOLDOWN_MS).toISOString();
   const deadline = now + 10_000;
@@ -80,32 +78,22 @@ export async function recoverConfirmedMergePush(
       claimed = true;
       return { mergeDetails: { ...live.mergeDetails, pushRecovery: { target, commitSha: sha, nextAttemptAt } } };
     }));
-    if (!claimed) return;
+    if (!claimed) return "skipped";
     const current = await store.getTask(task.id);
     const currentSettings = await store.getSettings();
-    if (!eligible(current, currentSettings) || currentSettings.pushRemote !== settings.pushRemote || !ownsAttempt(current)) return;
-    const advertised = await git(["ls-remote", "--heads", remote, `refs/heads/${targetBranch}`]);
-    const remoteSha = advertised.split(/\s+/)[0];
-    let delivered = remoteSha === sha;
-    if (!delivered && /^[a-f0-9]{40,64}$/i.test(remoteSha)) {
-      // A newer remote tip may already contain this task; missing objects fall through to safe push.
-      try {
-        await git(["cat-file", "-e", `${remoteSha}^{commit}`]);
-      } catch {
-        await git(["fetch", "--no-tags", "--no-write-fetch-head", remote, `refs/heads/${targetBranch}`]);
-      }
-      try { await git(["merge-base", "--is-ancestor", sha, remoteSha]); delivered = true; } catch { /* non-force push decides */ }
-    }
-    if (!delivered) {
+    if (!eligible(current, currentSettings) || currentSettings.pushRemote !== settings.pushRemote || !ownsAttempt(current)) return "skipped";
+    // A newer remote tip may already contain this task; an unproven ancestry falls through to safe push.
+    if (!await isCommitOnRemoteBranch(git, remote, targetBranch, sha)) {
       const beforePush = await store.getTask(task.id);
       const beforePushSettings = await store.getSettings();
-      if (!eligible(beforePush, beforePushSettings) || beforePushSettings.pushRemote !== settings.pushRemote || !ownsAttempt(beforePush)) return;
+      if (!eligible(beforePush, beforePushSettings) || beforePushSettings.pushRemote !== settings.pushRemote || !ownsAttempt(beforePush)) return "skipped";
       await git(["push", remote, `${sha}:refs/heads/${targetBranch}`]);
     }
     await fence.write("finalization", () => store.updateTaskAtomic(task.id, (live) => ownsAttempt(live)
       ? { mergeDetails: { ...live.mergeDetails, pushRecovery: { target, commitSha: sha, nextAttemptAt, pushedAt: new Date().toISOString() } } }
       : null));
     await fence.write("log", () => store.logEntry(task.id, `[post-merge] Confirmed landed commit ${sha.slice(0, 12)} is available on ${target}; verification may collect hosted CI evidence.`));
+    return "delivered";
   } catch (error) {
     failed = true;
     const message = (error instanceof Error ? error.message : String(error)).slice(0, 1000);
@@ -113,6 +101,7 @@ export async function recoverConfirmedMergePush(
       ? { mergeDetails: { ...live.mergeDetails, pushRecovery: { target, commitSha: sha, nextAttemptAt, error: message } } }
       : null)).catch(() => undefined);
     await fence.write("log", () => store.logEntry(task.id, `[post-merge] Remote delivery recovery failed for ${target}; retry after ${nextAttemptAt}. ${message}`)).catch(() => undefined);
+    return "failed";
   } finally {
     if (!failed) branchAttempts.delete(key);
   }

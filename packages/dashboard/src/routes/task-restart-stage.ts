@@ -104,6 +104,8 @@ export async function restartTaskStage(deps: RestartTaskStageDeps): Promise<Rest
       const retryLandedVerification = async (landedTask: Task): Promise<Task> => {
         if (isLiveMergeRestart(landedTask, deps)) throw conflict("Retry is unavailable while a merge is active");
         const resumed = await resumeMissingPostMergeGate(store, taskId, { manualRetry: true });
+        // FNXC:PostMergePublication 2026-10-07-13:00: Retry against an unpublished landing reports why instead of running the reviewer.
+        if (resumed.outcome === "awaiting-publication") throw conflict(resumed.message);
         if (resumed.outcome !== "resumed") {
           throw conflict("Post-merge verification cannot be retried while pending, active, held, or already approved; landing proof is preserved");
         }

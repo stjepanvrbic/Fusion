@@ -60,6 +60,18 @@ export interface MergeDetails {
     error?: string;
   };
   /**
+   * FNXC:PostMergePublication 2026-10-07-13:00:
+   * Last reported reason the built-in post-merge verification gate is waiting for the landed commit to
+   * reach the push remote. Dedupes the operator log and audit row per commit, target, and reason;
+   * it never grants or withholds approval by itself.
+   */
+  publicationWait?: {
+    commitSha: string;
+    target: string;
+    reason: "push-disabled" | "push-failed" | "publication-unknown";
+    recordedAt: string;
+  };
+  /**
    * FNXC:WorkflowMergeRecovery 2026-09-21-10:40:
    * Missing merge proof is repairable only while durable execution evidence changes.
    * This JSON-backed marker keys a bounded retry ladder to that evidence so restart and
