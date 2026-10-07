@@ -4,8 +4,16 @@ import { PassThrough } from "node:stream";
 
 const spawnMock = vi.hoisted(() => vi.fn());
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: spawnMock,
+}));
+
+// Termination goes through the shared tree kill (taskkill /T on Windows); assert that seam, not a platform-specific signal.
+const killProcessTreeMock = vi.hoisted(() => vi.fn());
+vi.mock("@fusion/plugin-sdk", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@fusion/plugin-sdk")>()),
+  killProcessTree: killProcessTreeMock,
 }));
 
 import { probeDroidBinary, resolveDroidBinaryPath } from "../probe.js";
@@ -24,10 +32,14 @@ function makeProbeProc() {
 describe("probeDroidBinary", () => {
   beforeEach(() => {
     spawnMock.mockReset();
+    killProcessTreeMock.mockReset();
+    // An empty PATH keeps launch resolution hermetic on hosts that have a real droid installed.
+    vi.stubEnv("PATH", "");
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
   });
 
   it("returns unavailable when binary is missing", async () => {
@@ -61,7 +73,7 @@ describe("probeDroidBinary", () => {
       available: false,
       reason: "Probe timed out after 50ms",
     });
-    expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(killProcessTreeMock).toHaveBeenCalledWith(proc);
   });
 
   it("returns unavailable when spawn throws synchronously", async () => {

@@ -1,9 +1,6 @@
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
+import { resolveShellFreeLaunch, superviseSpawn } from "@fusion/core";
 import { redact } from "./redact.js";
 import type { GeneratedCliArtifact, RunResult } from "./types.js";
-
-const execAsync = promisify(exec);
 
 export interface RunGeneratedCliInput {
   artifact: GeneratedCliArtifact;
@@ -13,6 +10,9 @@ export interface RunGeneratedCliInput {
   timeoutMs?: number;
   cwd?: string;
 }
+
+/** Per-stream output cap; excess output is dropped rather than buffered without bound. */
+const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 
 function toFlagName(key: string): string {
   return key.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
@@ -30,15 +30,17 @@ function createArgs(endpointId: string, params: Record<string, string | number |
   return args;
 }
 
-function quoteArg(arg: string): string {
-  return JSON.stringify(arg);
-}
-
-// Credentials are passed only via env vars: CLIPP_CRED_<UPPER_SNAKE_KEY>.
+/**
+ * Run a generated CLI against one endpoint. Credentials are passed only via env vars: CLIPP_CRED_<UPPER_SNAKE_KEY>.
+ *
+ * FNXC:CliPrintingPress 2026-10-07-18:02:
+ * Endpoint parameters are data. They arrive from the HTTP run route and the agent tool, so they are passed as a separate argv array to node through a supervised, shell-free spawn.
+ * The former `exec` of a JSON-quoted command string let `$(...)` run on POSIX and `%VAR%`, quotes and `&` be interpreted by cmd.exe on Windows.
+ */
 export async function runGeneratedCli({ artifact, endpointId, params, credentials, timeoutMs = 30_000, cwd }: RunGeneratedCliInput): Promise<RunResult> {
   const args = createArgs(endpointId, params);
   const argv = [artifact.binPath, ...args];
-  const command = ["node", ...argv].map(quoteArg).join(" ");
+  const secrets = Object.values(credentials ?? {});
 
   const credEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries(credentials ?? {})) {
@@ -46,34 +48,54 @@ export async function runGeneratedCli({ artifact, endpointId, params, credential
   }
 
   const start = Date.now();
-  try {
-    const { stdout, stderr } = await execAsync(command, {
-      cwd,
-      timeout: timeoutMs,
-      maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, ...credEnv },
-    });
+  const finish = (stdout: string, stderr: string, exitCode: number | null, timedOut: boolean): RunResult => ({
+    stdout: redact(stdout, secrets),
+    stderr: redact(stderr, secrets),
+    exitCode,
+    durationMs: Date.now() - start,
+    timedOut,
+    argv: argv.map((part) => redact(part, secrets)),
+  });
 
-    const secrets = Object.values(credentials ?? {});
-    return {
-      stdout: redact(stdout, secrets),
-      stderr: redact(stderr, secrets),
-      exitCode: 0,
-      durationMs: Date.now() - start,
-      timedOut: false,
-      argv: argv.map((part) => redact(part, secrets)),
-    };
+  let supervised: ReturnType<typeof superviseSpawn>;
+  try {
+    // The generated artifact is a `.mjs` entry, which the shared launcher runs with node.
+    const launch = resolveShellFreeLaunch(artifact.binPath, args);
+    supervised = superviseSpawn(launch.command, launch.args, {
+      cwd,
+      env: { ...process.env, ...credEnv },
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: false,
+      windowsHide: true,
+    });
   } catch (error) {
-    const err = error as { stdout?: string; stderr?: string; code?: number | null; killed?: boolean; signal?: string };
-    const timedOut = Boolean(err.killed && err.signal === "SIGTERM");
-    const secrets = Object.values(credentials ?? {});
-    return {
-      stdout: redact(err.stdout ?? "", secrets),
-      stderr: redact(err.stderr ?? (timedOut ? "Command timed out" : ""), secrets),
-      exitCode: timedOut ? null : (typeof err.code === "number" ? err.code : null),
-      durationMs: Date.now() - start,
-      timedOut,
-      argv: argv.map((part) => redact(part, secrets)),
-    };
+    return finish("", error instanceof Error ? error.message : String(error), null, false);
   }
+
+  const { child } = supervised;
+  return new Promise<RunResult>((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    const append = (current: string, chunk: Buffer): string => (current.length >= MAX_OUTPUT_BYTES ? current : current + chunk.toString("utf8"));
+    const settle = (result: RunResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      supervised.kill("SIGKILL");
+    }, timeoutMs);
+
+    child.stdout?.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
+    child.stderr?.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
+    child.once("error", (error: Error) => settle(finish(stdout, stderr || error.message, null, false)));
+    child.once("close", (code: number | null) => {
+      if (timedOut) settle(finish(stdout, stderr || "Command timed out", null, true));
+      else settle(finish(stdout, stderr, code, false));
+    });
+  });
 }

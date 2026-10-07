@@ -16,6 +16,7 @@ import {
   probePaperclipViaCli,
   resolvePaperclipConfig,
   wakeAgent,
+  PAPERCLIP_REQUEST_TIMEOUT_MS,
 } from "../paperclip-client.js";
 
 // ---------------------------------------------------------------------------
@@ -700,5 +701,48 @@ describe("probePaperclipViaCli", () => {
         expect(r.reason).toMatch(/Could not reach/);
       },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Request cancellation and deadlines
+// ---------------------------------------------------------------------------
+
+describe("request cancellation and deadlines", () => {
+  function stalledFetch() {
+    return vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    }));
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("aborts every run-path request when the caller's signal aborts", async () => {
+    const calls: Array<(signal: AbortSignal) => Promise<unknown>> = [
+      (signal) => wakeAgent("http://localhost:3100", "k", "AG-1", { source: "on_demand", triggerDetail: "manual", reason: "r", idempotencyKey: "i", payload: {} }, { signal }),
+      (signal) => getRunEvents("http://localhost:3100", "k", "RUN-1", 0, 200, { signal }),
+      (signal) => getIssue("http://localhost:3100", "k", "ISS-1", { signal }),
+      (signal) => getIssueComments("http://localhost:3100", "k", "ISS-1", { signal }),
+      (signal) => createIssue("http://localhost:3100", "k", "CO-1", { title: "t", description: "d", status: "todo", assigneeAgentId: "AG-1" }, { signal }),
+      (signal) => agentsMe("http://localhost:3100", "k", { signal }),
+    ];
+    for (const call of calls) {
+      vi.stubGlobal("fetch", stalledFetch());
+      const controller = new AbortController();
+      const pending = call(controller.signal);
+      controller.abort();
+      await expect(pending).rejects.toThrow(/aborted/);
+    }
+  });
+
+  it("gives a stalled request a deadline instead of waiting forever", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", stalledFetch());
+    const pending = getRunEvents("http://localhost:3100", "k", "RUN-1", 0);
+    const settled = expect(pending).rejects.toThrow(/timed out/);
+    await vi.advanceTimersByTimeAsync(PAPERCLIP_REQUEST_TIMEOUT_MS);
+    await settled;
   });
 });

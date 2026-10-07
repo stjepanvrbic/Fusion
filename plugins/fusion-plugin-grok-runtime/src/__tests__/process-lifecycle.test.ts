@@ -7,8 +7,10 @@ but this suite exercises listener ownership and child cleanup. Stub that unrelat
 core dependency so reset/import coverage cannot spend a shard's transform budget
 on the full @fusion/core graph.
 */
+const killProcessTree = vi.hoisted(() => vi.fn());
 vi.mock("@fusion/core", () => ({
   redactSecrets: (value: string) => value,
+  killProcessTree,
 }));
 
 const EVENTS = ["exit", "beforeExit", "SIGTERM", "SIGINT"] as const;
@@ -66,7 +68,8 @@ describe("Grok plugin process lifecycle", () => {
     for (const cleanup of process.listeners("exit")) {
       if (cleanup.name === "killAllProcesses") cleanup(0);
     }
-    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    // Exit cleanup terminates each registered agent's whole process tree.
+    expect(killProcessTree).toHaveBeenCalledWith(child);
     expect(manager.activeProcessCount()).toBe(0);
   });
 });

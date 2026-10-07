@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { ChildProcess } from "node:child_process";
 
 // Mock child_process.spawn before importing process-manager
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: vi.fn(() => {
     const EventEmitter = require("node:events");
     const proc = new EventEmitter();
@@ -18,24 +19,42 @@ vi.mock("node:child_process", () => ({
   }),
 }));
 
-const mocks = vi.hoisted(() => ({
-  writeFileSync: vi.fn(),
-  unlinkSync: vi.fn(),
-  existsSync: vi.fn(),
-  readFileSync: vi.fn(),
-  tmpdir: vi.fn(() => "/mock-tmp"),
-}));
+const mocks = vi.hoisted(() => {
+  let dirSeq = 0;
+  return {
+    writeFileSync: vi.fn(),
+    unlinkSync: vi.fn(),
+    existsSync: vi.fn(),
+    readFileSync: vi.fn(),
+    mkdtempSync: vi.fn((prefix: string) => `${prefix}${++dirSeq}`),
+    rmSync: vi.fn(),
+    tmpdir: vi.fn(() => "/mock-tmp"),
+  };
+});
 
-vi.mock("node:fs", () => ({
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
   writeFileSync: mocks.writeFileSync,
   unlinkSync: mocks.unlinkSync,
   existsSync: mocks.existsSync,
   readFileSync: mocks.readFileSync,
+  mkdtempSync: mocks.mkdtempSync,
+  rmSync: mocks.rmSync,
 }));
 
-vi.mock("node:os", () => ({
+vi.mock("node:os", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:os")>()),
   tmpdir: mocks.tmpdir,
 }));
+
+/*
+FNXC:PluginTests 2026-10-07-18:56:
+These cases assert POSIX launch and SIGKILL semantics on fake processes. Pin a POSIX host so a Windows runner, where launches resolve through PATHEXT and kills go through taskkill, exercises the same contract.
+The Windows launch and tree-kill behavior is covered by core's windows-launch tests and the Droid plugin's tests.
+*/
+beforeEach(() => {
+  vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+});
 
 import { spawn } from "node:child_process";
 import {
@@ -49,7 +68,7 @@ import {
   forceKillProcess,
   registerProcess,
   killAllProcesses,
-  cleanupSystemPromptFile,
+  createSystemPromptFile,
   discoverDroidModels,
 } from "../process-manager";
 
@@ -134,30 +153,13 @@ describe("spawnDroid", () => {
     expect(options.cwd).toBe("/custom/path");
   });
 
-  it("writes system prompt to temp file and passes path via --append-system-prompt", () => {
-    spawnDroid("claude-sonnet-4-5-20250929", "You are a helpful assistant.");
+  it("passes the caller's system prompt file via --append-system-prompt and writes nothing itself", () => {
+    spawnDroid("claude-sonnet-4-5-20250929", "/mock-tmp/droid-cli-sysprompt-1/system-prompt.txt");
     const args = (spawn as any).mock.calls[0][1] as string[];
-    const expectedTmpFile = `/mock-tmp/droid-cli-sysprompt-${process.pid}.txt`;
 
-    expect(mocks.writeFileSync).toHaveBeenCalledWith(
-      expectedTmpFile,
-      "You are a helpful assistant.",
-      "utf-8",
-    );
-    expect(args).toContain("--append-system-prompt");
     const idx = args.indexOf("--append-system-prompt");
-    expect(args[idx + 1]).toContain("droid-cli-sysprompt-");
-    expect(args[idx + 1]).toBe(expectedTmpFile);
-  });
-
-  it("temp file contains the system prompt text", () => {
-    spawnDroid("claude-sonnet-4-5-20250929", "You are a helpful assistant.");
-
-    expect(mocks.writeFileSync).toHaveBeenCalledWith(
-      `/mock-tmp/droid-cli-sysprompt-${process.pid}.txt`,
-      "You are a helpful assistant.",
-      "utf-8",
-    );
+    expect(args[idx + 1]).toBe("/mock-tmp/droid-cli-sysprompt-1/system-prompt.txt");
+    expect(mocks.writeFileSync).not.toHaveBeenCalled();
   });
 
   it("does not include --append-system-prompt when no system prompt", () => {
@@ -718,28 +720,37 @@ describe("resume session flag", () => {
   });
 });
 
-describe("cleanupSystemPromptFile", () => {
+describe("createSystemPromptFile", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.unlinkSync.mockReset();
-    mocks.tmpdir.mockReset();
     mocks.tmpdir.mockReturnValue("/mock-tmp");
+    mocks.rmSync.mockReset();
   });
 
-  it("deletes the temp file when it exists", () => {
-    cleanupSystemPromptFile();
-
-    expect(mocks.unlinkSync).toHaveBeenCalledWith(
-      `/mock-tmp/droid-cli-sysprompt-${process.pid}.txt`,
-    );
+  it("writes each invocation's prompt into its own temp directory", () => {
+    const a = createSystemPromptFile("prompt A");
+    const b = createSystemPromptFile("prompt B");
+    expect(a.path).not.toBe(b.path);
+    expect(mocks.writeFileSync).toHaveBeenCalledWith(a.path, "prompt A", "utf-8");
+    expect(mocks.writeFileSync).toHaveBeenCalledWith(b.path, "prompt B", "utf-8");
   });
 
-  it("does not throw when file does not exist", () => {
-    mocks.unlinkSync.mockImplementation(() => {
-      throw new Error("ENOENT");
+  it("removes only its own directory, once", () => {
+    const a = createSystemPromptFile("prompt A");
+    const b = createSystemPromptFile("prompt B");
+    b.cleanup();
+    b.cleanup();
+    expect(mocks.rmSync).toHaveBeenCalledTimes(1);
+    const removed = (mocks.rmSync.mock.calls[0] as [string])[0];
+    expect(b.path.startsWith(removed)).toBe(true);
+    expect(a.path.startsWith(removed)).toBe(false);
+  });
+
+  it("does not throw when removal fails", () => {
+    mocks.rmSync.mockImplementation(() => {
+      throw new Error("EBUSY");
     });
-
-    expect(() => cleanupSystemPromptFile()).not.toThrow();
+    expect(() => createSystemPromptFile("prompt").cleanup()).not.toThrow();
   });
 });
 

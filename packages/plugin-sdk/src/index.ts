@@ -143,6 +143,19 @@ export {
   createBoardActionServices,
 } from "@fusion/core";
 
+/*
+FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+Plugins that spawn operator-installed CLIs must launch them shell-free with a Windows-complete env and tree kill.
+Expose core's one launch seam to plugins that depend only on the SDK so none re-implements PATHEXT or shim handling.
+*/
+export {
+  resolveShellFreeLaunch,
+  withPlatformBaseEnvKeys,
+  killProcessTree,
+  UnlaunchableCommandError,
+} from "@fusion/core";
+export type { ShellFreeLaunch, ShellFreeLaunchDeps, KillProcessTreeDeps } from "@fusion/core";
+
 // ── Step-inversion IR types (type-only) ──────────────────────────────────────
 // TYPE-ONLY re-exports of the workflow-modelable step constructs (KTD-3/12/13/15)
 // so plugin authors can author/validate workflow IR and step parsers against the

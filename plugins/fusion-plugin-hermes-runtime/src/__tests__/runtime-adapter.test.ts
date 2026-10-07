@@ -179,3 +179,55 @@ describe("HermesRuntimeAdapter — dispose", () => {
     await expect(adapter.dispose!(session)).resolves.toBeUndefined();
   });
 });
+
+describe("HermesRuntimeAdapter — task working directory", () => {
+  it("runs first and resumed turns of each session in that session's cwd", async () => {
+    const adapter = new HermesRuntimeAdapter({});
+    const a = await adapter.createSession({ cwd: "C:\worktrees\task-a", systemPrompt: "sys" });
+    const b = await adapter.createSession({ cwd: "/worktrees/task-b", systemPrompt: "sys" });
+    await Promise.all([adapter.promptWithFallback(a.session, "one"), adapter.promptWithFallback(b.session, "one")]);
+    await adapter.promptWithFallback(a.session, "two");
+    const cwds = mockInvoke.mock.calls.map((call) => (call[3] as { cwd?: string } | undefined)?.cwd);
+    expect(cwds).toEqual(["C:\worktrees\task-a", "/worktrees/task-b", "C:\worktrees\task-a"]);
+    expect(mockInvoke.mock.calls[2]![2]).toBe("20260427_120000_abc123");
+  });
+});
+
+describe("HermesRuntimeAdapter — disposal during an active turn", () => {
+  it("aborts the running CLI, settles the prompt, and delivers no late text", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    mockInvoke.mockImplementationOnce((_prompt: string, _settings: unknown, _resume: unknown, options: { signal?: AbortSignal }) => {
+      capturedSignal = options.signal;
+      return new Promise((_resolve, reject) => {
+        options.signal?.addEventListener("abort", () => reject(new Error("hermes: invocation aborted")), { once: true });
+      });
+    });
+    const adapter = new HermesRuntimeAdapter({});
+    const onText = vi.fn();
+    const { session } = await adapter.createSession({ cwd: "/repo", systemPrompt: "sys", onText });
+    const pending = adapter.promptWithFallback(session, "long task");
+    await Promise.resolve();
+    expect(capturedSignal?.aborted).toBe(false);
+
+    await adapter.dispose!(session);
+
+    expect(capturedSignal?.aborted).toBe(true);
+    await expect(pending).rejects.toThrow("hermes: invocation aborted");
+    expect(onText).not.toHaveBeenCalled();
+  });
+
+  it("session.dispose() alone also aborts the active turn", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    mockInvoke.mockImplementationOnce((_p: string, _s: unknown, _r: unknown, options: { signal?: AbortSignal }) => {
+      capturedSignal = options.signal;
+      return new Promise((_resolve, reject) => options.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+    });
+    const adapter = new HermesRuntimeAdapter({});
+    const { session } = await adapter.createSession({ cwd: "/repo", systemPrompt: "sys" });
+    const pending = adapter.promptWithFallback(session, "x");
+    await Promise.resolve();
+    session.dispose();
+    expect(capturedSignal?.aborted).toBe(true);
+    await expect(pending).rejects.toThrow("aborted");
+  });
+});

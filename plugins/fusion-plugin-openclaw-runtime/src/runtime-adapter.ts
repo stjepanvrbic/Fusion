@@ -29,6 +29,12 @@ import {
 import { toolsToMcpToolDefs, writeOpenClawMcpBridgeFiles, type ToolLike } from "./mcp-config.js";
 import { randomUUID } from "node:crypto";
 
+/*
+FNXC:OpenClawCli 2026-10-07-18:02:
+Sessions carry the task cwd into every turn. Disposal (adapter `dispose` or `session.dispose`) aborts the active turn, because the engine disposes on step timeout and a no-op disposer left the CLI running.
+*/
+const activeTurns = new WeakMap<GatewaySession, AbortController>();
+
 export class OpenClawRuntimeAdapter implements AgentRuntime {
   readonly id = "openclaw";
   readonly name = "OpenClaw Runtime";
@@ -62,6 +68,7 @@ export class OpenClawRuntimeAdapter implements AgentRuntime {
     }
 
     const session = createCliSession({
+      cwd: options.cwd,
       systemPrompt: options.systemPrompt,
       agentId: this.config.agentId,
       mcpProfile,
@@ -74,6 +81,10 @@ export class OpenClawRuntimeAdapter implements AgentRuntime {
       },
     });
 
+    session.dispose = () => {
+      activeTurns.get(session)?.abort();
+    };
+
     return { session, sessionFile: undefined };
   }
 
@@ -85,14 +96,20 @@ export class OpenClawRuntimeAdapter implements AgentRuntime {
     const overrideCallbacks = (options ?? undefined) as
       | Parameters<typeof promptCli>[3]
       | undefined;
-    await promptCli(session, prompt, this.config, overrideCallbacks);
+    const turn = new AbortController();
+    activeTurns.set(session, turn);
+    try {
+      await promptCli(session, prompt, this.config, overrideCallbacks, turn.signal);
+    } finally {
+      if (activeTurns.get(session) === turn) activeTurns.delete(session);
+    }
   }
 
   describeModel(session: GatewaySession): string {
     return describeCliModel(session);
   }
 
-  async dispose(_session: GatewaySession): Promise<void> {
-    // No persistent resources — each prompt spawns a fresh subprocess.
+  async dispose(session: GatewaySession): Promise<void> {
+    await session.dispose?.();
   }
 }

@@ -13,6 +13,12 @@ export default defineConfig({
       */
       "@fusion-plugin-examples/droid-runtime/probe": resolve(__dirname, "../../plugins/fusion-plugin-droid-runtime/src/probe.ts"),
       "@fusion-plugin-examples/droid-runtime": resolve(__dirname, "../../plugins/fusion-plugin-droid-runtime/src/index.ts"),
+      /*
+      FNXC:PluginTests 2026-10-07-18:56:
+      The re-exported Droid modules launch through the plugin SDK's shell-free seam. Resolve the SDK and core from source, as the plugin's own config does, so a clean checkout without built dist/ still loads them.
+      */
+      "@fusion/plugin-sdk": resolve(__dirname, "../plugin-sdk/src/index.ts"),
+      "@fusion/core": resolve(__dirname, "../core/src/index.ts"),
     },
   },
   test: {

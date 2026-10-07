@@ -44,6 +44,33 @@ describe("runGeneratedCli", () => {
     expect(result.exitCode).toBeNull();
   });
 
+  it("delivers endpoint parameters as literal argv data, never shell syntax", async () => {
+    const { artifact, root } = await writeFixture("process.stdout.write(JSON.stringify(process.argv.slice(2)))");
+    const params = {
+      substitution: "$(echo pwned) `echo pwned`",
+      percent: "%PATH% %USERPROFILE%",
+      quotes: `a"b'c`,
+      separators: "x & y | z ; w > out.txt",
+      newline: "line1\nline2",
+      spaces: "a  b",
+      windowsPath: "C:\\Program Files\\dir with space\\",
+      caret: "^&^|",
+    };
+    const result = await runGeneratedCli({ artifact, endpointId: "list items", params, cwd: root });
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([
+      "--endpoint", "list items",
+      "--substitution", params.substitution,
+      "--percent", params.percent,
+      "--quotes", params.quotes,
+      "--separators", params.separators,
+      "--newline", params.newline,
+      "--spaces", params.spaces,
+      "--windows-path", params.windowsPath,
+      "--caret", params.caret,
+    ]);
+  });
+
   it("redacts credentials from stdout and argv echo", async () => {
     const secret = "super-secret-value";
     const { artifact, root } = await writeFixture("console.log(process.env.CLIPP_CRED_API_KEY)");

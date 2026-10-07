@@ -5,6 +5,9 @@
  */
 
 import { EventEmitter } from "node:events";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildOpenClawArgs,
@@ -87,7 +90,8 @@ function emitFailure(child: FakeChild, code: number, stderrMsg: string): void {
 
 const spawnMock = vi.fn();
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: (...args: unknown[]) => spawnMock(...args),
 }));
 
@@ -525,6 +529,75 @@ describe("promptCli", () => {
 
       const [, args] = spawnMock.mock.calls[spawnMock.mock.calls.length - 1] as [string, string[]];
       expect(args).not.toContain("--local");
+    }
+  });
+});
+
+describe("promptCli launch boundary", () => {
+  const config: CliConfig = {
+    binaryPath: "openclaw",
+    agentId: "main",
+    model: undefined,
+    thinking: "off",
+    cliTimeoutSec: 0,
+    cliTimeoutMs: 300_000,
+    useGateway: false,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // An empty PATH keeps launch resolution hermetic on hosts with a real openclaw installed.
+    vi.stubEnv("PATH", "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("runs every turn of each session in that session's cwd, without a shell", async () => {
+    const a = createCliSession({ systemPrompt: "sys", cwd: "C:\worktrees\task a" });
+    const b = createCliSession({ systemPrompt: "sys", cwd: "/worktrees/task-b" });
+    for (const session of [a, b, a]) {
+      const child = makeFakeChild();
+      spawnMock.mockReturnValue(child);
+      const run = promptCli(session, "hi", config);
+      emitSuccess(child, makeSuccessJson({ text: "ok" }));
+      await run;
+    }
+    const options = spawnMock.mock.calls.map((call) => call[2] as { cwd?: string; shell?: boolean; windowsHide?: boolean });
+    expect(options.map((o) => o.cwd)).toEqual(["C:\worktrees\task a", "/worktrees/task-b", "C:\worktrees\task a"]);
+    for (const o of options) expect(o).toMatchObject({ shell: false, windowsHide: true });
+  });
+
+  it("settles on abort, terminates the process, and drops late output", async () => {
+    const child = makeFakeChild();
+    spawnMock.mockReturnValue(child);
+    const onText = vi.fn();
+    const session = createCliSession({ systemPrompt: "sys", cwd: "/repo", callbacks: { onText } });
+    const controller = new AbortController();
+    const run = promptCli(session, "hi", config, undefined, controller.signal);
+    controller.abort();
+    await expect(run).rejects.toThrow("openclaw: invocation aborted");
+    expect(child.kill).toHaveBeenCalled();
+    emitSuccess(child, makeSuccessJson({ text: "late" }));
+    await Promise.resolve();
+    expect(onText).not.toHaveBeenCalled();
+  });
+
+  it("configures MCP through the same shell-free launch", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "openclaw-mcp-"));
+    try {
+      const serverConfigPath = join(dir, "server.json");
+      await writeFile(serverConfigPath, '{"command":"node","args":["a b"]}');
+      spawnMock.mockImplementation(() => {
+        const child = makeFakeChild();
+        setImmediate(() => child.emit("close", 0));
+        return child;
+      });
+      await configureOpenClawMcpServer({ binaryPath: "openclaw", profile: "p", serverName: "s", serverConfigPath });
+      expect(spawnMock.mock.calls[0]![2]).toMatchObject({ shell: false, windowsHide: true });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

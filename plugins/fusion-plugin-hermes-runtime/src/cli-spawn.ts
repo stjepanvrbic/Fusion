@@ -341,15 +341,20 @@ export function buildHermesArgs(
  * @param prompt - The user prompt to send.
  * @param settings - Resolved CLI settings.
  * @param resumeSessionId - Hermes session id from a prior call, if continuing.
- * @param signal - Optional AbortSignal; will SIGTERM the subprocess on abort.
+ * @param options.signal - Optional AbortSignal; terminates the subprocess on abort.
+ * @param options.cwd - Working directory for the CLI, normally the task worktree.
  * @returns Parsed response body and the new/existing session id.
+ *
+ * FNXC:HermesCli 2026-10-07-18:02:
+ * The CLI must run in the session's working directory; inheriting Fusion's cwd launched it in the primary checkout instead of the task worktree.
  */
 export async function invokeHermesCli(
   prompt: string,
   settings: HermesCliSettings,
   resumeSessionId?: string,
-  signal?: AbortSignal,
+  options: { signal?: AbortSignal; cwd?: string } = {},
 ): Promise<HermesCliResult> {
+  const { signal, cwd } = options;
   const args = buildHermesArgs(prompt, settings, resumeSessionId);
   const spawnEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONUNBUFFERED: "1" };
   if (settings.profile) {
@@ -367,6 +372,7 @@ export async function invokeHermesCli(
     const supervised = superviseSpawn(launch.command, launch.args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: spawnEnv,
+      cwd,
       windowsVerbatimArguments: launch.windowsVerbatimArguments,
       maxLifetimeMs: settings.cliTimeoutMs + 2_100,
       killGraceMs: 2_000,

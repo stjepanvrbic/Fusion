@@ -2,7 +2,10 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("node:child_process", () => ({ spawn: vi.fn() }));
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
+  spawn: vi.fn(),
+}));
 
 import { spawn } from "node:child_process";
 import { runGrokCommand } from "../cli-spawn.js";
@@ -28,14 +31,17 @@ describe("runGrokCommand", () => {
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    // An empty PATH keeps launch resolution hermetic on hosts with a real grok installed.
+    vi.stubEnv("PATH", "");
   });
 
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
-  it("uses the Windows shell so PATH .cmd and .bat Grok shims can run", async () => {
+  it("never hands a Windows Grok invocation to a shell", async () => {
     mockPlatform("win32");
     const child = createMockChild();
 
@@ -43,7 +49,8 @@ describe("runGrokCommand", () => {
 
     expect(spawn).toHaveBeenCalledWith("grok", ["--version"], {
       stdio: ["ignore", "pipe", "pipe"],
-      shell: true,
+      shell: false,
+      windowsHide: true,
     });
 
     child.stdout.write("grok 1.0.0\n");
@@ -66,8 +73,18 @@ describe("runGrokCommand", () => {
     expect(spawn).toHaveBeenCalledWith("grok", ["--version"], {
       stdio: ["ignore", "pipe", "pipe"],
       shell: false,
+      windowsHide: true,
     });
 
+    child.emit("close", 0);
+    await expect(resultPromise).resolves.toMatchObject({ code: 0 });
+  });
+
+  it("launches a configured JS entry through node, as ACP sessions do", async () => {
+    mockPlatform("win32");
+    const child = createMockChild();
+    const resultPromise = runGrokCommand("C:\\tools\\grok\\cli.js", ["--version"], 1000);
+    expect(spawn).toHaveBeenCalledWith(process.execPath, ["C:\\tools\\grok\\cli.js", "--version"], expect.objectContaining({ shell: false }));
     child.emit("close", 0);
     await expect(resultPromise).resolves.toMatchObject({ code: 0 });
   });

@@ -6,6 +6,19 @@
  * internals — it is a pure HTTP client.
  */
 
+import { killProcessTree, resolveShellFreeLaunch } from "@fusion/plugin-sdk";
+
+/*
+FNXC:PaperclipRuntime 2026-10-07-18:02:
+Every request carries a deadline and the caller's cancellation signal. A stalled request otherwise blocked the run poll forever, so neither the local run timeout nor session disposal could end the turn.
+*/
+export const PAPERCLIP_REQUEST_TIMEOUT_MS = 30_000;
+
+/** Cancellation for one client call; session disposal aborts it. */
+export interface PaperclipRequestOptions {
+  signal?: AbortSignal;
+}
+
 // ---------------------------------------------------------------------------
 // Public error types
 // ---------------------------------------------------------------------------
@@ -147,6 +160,7 @@ async function request<T>(
     apiKey?: string;
     body?: unknown;
     query?: URLSearchParams;
+    signal?: AbortSignal;
   },
 ): Promise<T> {
   const method = options?.method ?? "GET";
@@ -159,15 +173,32 @@ async function request<T>(
     bodyStr = JSON.stringify(options.body);
   }
 
+  const callerSignal = options?.signal;
+  const controller = new AbortController();
+  let timedOut = false;
+  const deadline = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error("Paperclip request deadline exceeded"));
+  }, PAPERCLIP_REQUEST_TIMEOUT_MS);
+  const onCallerAbort = () => controller.abort(callerSignal?.reason);
+  if (callerSignal?.aborted) onCallerAbort();
+  else callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+
   let response: Response;
+  let value: unknown;
+  let raw: string;
   try {
-    response = await fetch(url, { method, headers, body: bodyStr });
+    response = await fetch(url, { method, headers, body: bodyStr, signal: controller.signal });
+    ({ value, raw } = await parseJsonBody(response));
   } catch (err) {
+    if (callerSignal?.aborted) throw new Error(`Paperclip request aborted (${method} ${path})`);
+    if (timedOut) throw new Error(`Paperclip API request timed out after ${PAPERCLIP_REQUEST_TIMEOUT_MS}ms (${method} ${path})`);
     const reason = err instanceof Error ? err.message : String(err);
     throw new Error(`Paperclip API network error (${method} ${url}): ${reason}`);
+  } finally {
+    clearTimeout(deadline);
+    callerSignal?.removeEventListener("abort", onCallerAbort);
   }
-
-  const { value, raw } = await parseJsonBody(response);
 
   if (!response.ok) {
     const msg = toErrorMessage(response.status, response.statusText, value, raw);
@@ -411,8 +442,9 @@ export async function discoverPaperclipCliConfig(
 export async function agentsMe(
   apiUrl: string,
   apiKey?: string,
+  options: PaperclipRequestOptions = {},
 ): Promise<AgentsMeResponse> {
-  const raw = await request<Record<string, unknown>>(apiUrl, "/agents/me", { apiKey });
+  const raw = await request<Record<string, unknown>>(apiUrl, "/agents/me", { apiKey, signal: options.signal });
   const id = typeof raw.id === "string" ? raw.id : undefined;
   const name = typeof raw.name === "string" ? raw.name : undefined;
   const role = typeof raw.role === "string" ? raw.role : undefined;
@@ -432,11 +464,13 @@ export async function createIssue(
   apiKey: string | undefined,
   companyId: string,
   body: CreateIssueBody,
+  options: PaperclipRequestOptions = {},
 ): Promise<Record<string, unknown>> {
   return request<Record<string, unknown>>(apiUrl, `/companies/${companyId}/issues`, {
     method: "POST",
     apiKey,
     body,
+    signal: options.signal,
   });
 }
 
@@ -447,8 +481,9 @@ export async function getIssue(
   apiUrl: string,
   apiKey: string | undefined,
   issueId: string,
+  options: PaperclipRequestOptions = {},
 ): Promise<Record<string, unknown>> {
-  return request<Record<string, unknown>>(apiUrl, `/issues/${issueId}`, { apiKey });
+  return request<Record<string, unknown>>(apiUrl, `/issues/${issueId}`, { apiKey, signal: options.signal });
 }
 
 /**
@@ -458,8 +493,9 @@ export async function getIssueComments(
   apiUrl: string,
   apiKey: string | undefined,
   issueId: string,
+  options: PaperclipRequestOptions = {},
 ): Promise<Array<Record<string, unknown>>> {
-  return request<Array<Record<string, unknown>>>(apiUrl, `/issues/${issueId}/comments`, { apiKey });
+  return request<Array<Record<string, unknown>>>(apiUrl, `/issues/${issueId}/comments`, { apiKey, signal: options.signal });
 }
 
 /**
@@ -474,11 +510,13 @@ export async function wakeAgent(
   apiKey: string | undefined,
   agentId: string,
   body: WakeAgentBody,
+  options: PaperclipRequestOptions = {},
 ): Promise<WakeAgentResponse> {
   return request<WakeAgentResponse>(apiUrl, `/agents/${agentId}/wakeup`, {
     method: "POST",
     apiKey,
     body,
+    signal: options.signal,
   });
 }
 
@@ -493,6 +531,7 @@ export async function getRunEvents(
   runId: string,
   afterSeq: number,
   limit = 100,
+  options: PaperclipRequestOptions = {},
 ): Promise<RunEvent[]> {
   const query = new URLSearchParams({
     afterSeq: String(afterSeq),
@@ -501,6 +540,7 @@ export async function getRunEvents(
   const result = await request<unknown>(apiUrl, `/heartbeat-runs/${runId}/events`, {
     apiKey,
     query,
+    signal: options.signal,
   });
   // Accept both { events: RunEvent[] } and RunEvent[] response shapes
   if (Array.isArray(result)) return result as RunEvent[];
@@ -747,7 +787,6 @@ function stripAnsi(str: string): string {
  * run `paperclipai onboard`.
  */
 export async function mintAgentApiKeyViaCli(opts: MintCliKeyOptions): Promise<MintedApiKey> {
-  const { spawn } = await import("node:child_process");
 
   const bin = opts.cliBinaryPath ?? "paperclipai";
   const args: string[] = [
@@ -771,23 +810,14 @@ export async function mintAgentApiKeyViaCli(opts: MintCliKeyOptions): Promise<Mi
 
   const timeoutMs = opts.cliTimeoutMs ?? 30_000;
 
+  let child: Awaited<ReturnType<typeof spawnPaperclipCli>>;
+  try {
+    child = await spawnPaperclipCli(bin, args);
+  } catch (err) {
+    throw remapSpawnError(err, bin);
+  }
+
   return new Promise<MintedApiKey>((resolve, reject) => {
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") {
-        reject(
-          new Error(
-            `paperclipai binary not found at ${bin}; install via \`npm i -g paperclipai\``,
-          ),
-        );
-      } else {
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
-      return;
-    }
 
     const stdoutChunks: Buffer[] = [];
     const stderrLines: string[] = [];
@@ -795,7 +825,7 @@ export async function mintAgentApiKeyViaCli(opts: MintCliKeyOptions): Promise<Mi
 
     const timer = setTimeout(() => {
       killed = true;
-      child.kill("SIGKILL");
+      killProcessTree(child);
       reject(new Error(`paperclipai agent local-cli timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
@@ -905,6 +935,18 @@ interface CliJsonOptions {
   cliBinaryPath?: string;
   cliConfigPath?: string;
   cliTimeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/*
+FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+`paperclipai` installs through npm, which is a `.cmd` shim on Windows that a shell-free spawn cannot run.
+Launch it through the shared shell-free seam so issue titles and descriptions (prompt text) stay literal argv.
+*/
+async function spawnPaperclipCli(bin: string, args: string[]) {
+  const { spawn } = await import("node:child_process");
+  const launch = resolveShellFreeLaunch(bin, args);
+  return spawn(launch.command, launch.args, { stdio: ["ignore", "pipe", "pipe"], shell: false, windowsHide: true });
 }
 
 function remapSpawnError(err: unknown, bin: string): Error {
@@ -921,7 +963,6 @@ async function spawnPaperclipCliJson<T = unknown>(
   args: string[],
   opts: CliJsonOptions,
 ): Promise<T> {
-  const { spawn } = await import("node:child_process");
   const bin = opts.cliBinaryPath ?? "paperclipai";
   const fullArgs = [...args, "--json"];
   if (opts.cliConfigPath) {
@@ -930,24 +971,33 @@ async function spawnPaperclipCliJson<T = unknown>(
   const timeoutMs = opts.cliTimeoutMs ?? 15_000;
   const label = ["paperclipai", ...args].join(" ");
 
-  return new Promise<T>((resolve, reject) => {
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn(bin, fullArgs, { stdio: ["ignore", "pipe", "pipe"] });
-    } catch (err) {
-      reject(remapSpawnError(err, bin));
-      return;
-    }
+  let child: Awaited<ReturnType<typeof spawnPaperclipCli>>;
+  try {
+    child = await spawnPaperclipCli(bin, fullArgs);
+  } catch (err) {
+    throw remapSpawnError(err, bin);
+  }
 
+  return new Promise<T>((resolve, reject) => {
     const stdoutChunks: Buffer[] = [];
     const stderrLines: string[] = [];
     let killed = false;
 
     const timer = setTimeout(() => {
       killed = true;
-      child.kill("SIGKILL");
+      killProcessTree(child);
       reject(new Error(`${label} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
+    const onAbort = () => {
+      if (killed) return;
+      killed = true;
+      clearTimeout(timer);
+      killProcessTree(child);
+      reject(new Error(`${label} aborted`));
+    };
+    if (opts.signal?.aborted) onAbort();
+    else opts.signal?.addEventListener("abort", onAbort, { once: true });
+    child.once("close", () => opts.signal?.removeEventListener("abort", onAbort));
 
     child.stdout?.on("data", (chunk: Buffer) => {
       stdoutChunks.push(chunk);

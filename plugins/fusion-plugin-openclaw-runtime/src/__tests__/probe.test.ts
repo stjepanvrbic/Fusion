@@ -14,7 +14,7 @@
  */
 
 import { EventEmitter } from "node:events";
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { probeOpenClawBinary } from "../probe.js";
 
 // ---------------------------------------------------------------------------
@@ -37,7 +37,8 @@ function makeFakeChild(): FakeChild {
 
 const spawnMock = vi.fn();
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: (...args: unknown[]) => spawnMock(...args),
 }));
 
@@ -94,6 +95,12 @@ async function waitForVersionSpawn(): Promise<void> {
 describe("probeOpenClawBinary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // An empty PATH keeps launch resolution hermetic on hosts with a real openclaw installed.
+    vi.stubEnv("PATH", "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it("returns available=true when the binary exits 0 with version output", async () => {

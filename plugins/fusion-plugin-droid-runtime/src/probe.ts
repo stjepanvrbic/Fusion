@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { killProcessTree, resolveShellFreeLaunch } from "@fusion/plugin-sdk";
 
 export interface DroidBinaryStatus {
   available: boolean;
@@ -22,7 +23,9 @@ async function run(binary: string, args: string[], timeoutMs = 2000): Promise<{ 
     let stderr = "";
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(binary, args, { stdio: ["ignore", "pipe", "pipe"] });
+      // FNXC:WindowsProcessLaunch 2026-10-07-18:02: Probe through the same shell-free launch resolution as sessions so "available" implies spawnable.
+      const launch = resolveShellFreeLaunch(binary, args);
+      child = spawn(launch.command, launch.args, { stdio: ["ignore", "pipe", "pipe"], shell: false, windowsHide: true });
     } catch {
       resolve({ code: 127, stdout, stderr });
       return;
@@ -40,9 +43,7 @@ async function run(binary: string, args: string[], timeoutMs = 2000): Promise<{ 
       resolve({ code, stdout, stderr });
     };
     const timer = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch {
-        // ignore kill errors
-      }
+      killProcessTree(child);
       settle(124);
     }, timeoutMs);
     child.stdout?.on("data", (c: Buffer) => { stdout += c.toString("utf-8"); });

@@ -58,6 +58,8 @@ export interface GatewaySession {
   /** Optional path to the server JSON used to configure MCP for this session. */
   mcpConfigPath?: string;
   callbacks?: GatewayCallbacks;
+  /** Working directory every CLI turn runs in: the task worktree from `AgentRuntimeOptions.cwd`. */
+  cwd?: string;
   dispose?: () => Promise<void> | void;
 }
 
