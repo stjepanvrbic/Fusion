@@ -9,7 +9,7 @@ import { emitBoundedRunAudit } from "../run-audit/emit-bounded-run-audit.js";
  * instance as its first parameter and performs byte-identical work.
  */
 import { and, eq, isNull } from "drizzle-orm";
-import {TaskStore} from "../store.js";
+import {TaskStore, storeLog} from "../store.js";
 import type { Task, TaskDetail, TaskLogEntry, RunMutationContext } from "../types.js";
 import {findWorkflowColumn} from "../plugins/plugin-gate-verdict.js";
 import {getTraitRegistry} from "../workflows/trait-registry.js";
@@ -27,6 +27,12 @@ import { buildTaskLogReadOnlyMessage, buildTaskNotFoundMessage } from "./task-lo
 import * as schema from "../postgres/schema/index.js";
 import { observeOverlapWaitTransitionInTransaction } from "./overlap-wait-ops.js";
 import { publishCommittedTaskJson } from "./task-row-mappers.js";
+
+/** An error's class name when it is identifier-shaped, else "Error"; never message text. */
+function auditFailureClass(error: unknown): string {
+  const name = error instanceof Error ? error.name : undefined;
+  return typeof name === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "Error";
+}
 
 export async function runPluginColumnTransitionHooksImpl(store: TaskStore, taskId: string, workflowIr: WorkflowIr, fromColumn: string, toColumn: string,): Promise<void> {
     const registry = getTraitRegistry();
@@ -83,8 +89,15 @@ export async function runPluginColumnTransitionHooksImpl(store: TaskStore, taskI
     const remaining = ["default-workflow:postCommit", ...hookIds];
     for (const { traitId, hookKind } of pending) {
       const resolved = registry.resolveTraitHook(traitId, hookKind);
+      /*
+      FNXC:RunAudit 2026-10-07-21:40:
+      Run-audit metadata is ids, counts and fixed outcomes only. The warning text and a hook's raw error message can carry
+      credential-bearing URLs or task content, so they go to the diagnostic log; the audit row keeps the trait id, the hook
+      kind, a fixed reason and, for a throw, an identifier-shaped error class.
+      */
       if (resolved.warning) {
         // Degraded (no impl / force-disabled) → passive no-op, audit the warning.
+        storeLog.warn("plugin trait hook degraded", { taskId, traitId, hookKind, reason: "no-impl", message: resolved.warning.message });
         void emitBoundedRunAudit(store, {
           taskId,
           agentId: "system",
@@ -92,13 +105,14 @@ export async function runPluginColumnTransitionHooksImpl(store: TaskStore, taskI
           domain: "database",
           mutationType: "plugin:trait-hook-degraded",
           target: taskId,
-          metadata: { traitId, hookKind, reason: "no-impl", message: resolved.warning.message },
+          metadata: { traitId, hookKind, reason: "no-impl" },
         });
       } else if (resolved.impl) {
         try {
           await resolved.impl({ task: taskDetail, context: { fromColumn, toColumn, hookKind } });
         } catch (err) {
           // A throwing plugin hook DEGRADES — audited, never wedges the lock.
+          storeLog.warn("plugin trait hook threw", { taskId, traitId, hookKind, error: err instanceof Error ? err.message : String(err) });
           void emitBoundedRunAudit(store, {
             taskId,
             agentId: "system",
@@ -106,12 +120,7 @@ export async function runPluginColumnTransitionHooksImpl(store: TaskStore, taskI
             domain: "database",
             mutationType: "plugin:trait-hook-degraded",
             target: taskId,
-            metadata: {
-              traitId,
-              hookKind,
-              reason: "threw",
-              error: err instanceof Error ? err.message : String(err),
-            },
+            metadata: { traitId, hookKind, reason: "threw", failureClass: auditFailureClass(err) },
           });
         }
       }
@@ -362,7 +371,8 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
           domain: "database",
           mutationType: "task:log",
           target: task.id,
-          metadata: { action, outcome },
+          // FNXC:RunAudit 2026-10-07-21:40: the entry's action and outcome are prose and live in the task log this row audits; metadata stays fixed-shape.
+          metadata: { hasOutcome: outcome !== undefined },
         });
 
         if (store.isWatching) store.taskCache.set(id, { ...task });
