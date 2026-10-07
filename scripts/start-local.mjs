@@ -10,14 +10,15 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { hasLocalProjectMigrationInput } from "./lib/start-local-project.mjs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { hasLocalProjectMigrationInput, pnpmSpawnSpec, resolvePnpmLauncher } from "./lib/start-local-project.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const pnpm = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+const pnpmLauncher = resolvePnpmLauncher();
 
 const HELP = `
 Fusion local startup
@@ -147,19 +148,21 @@ function parseArgs(argv) {
   return opts;
 }
 
-function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
+function runPnpm(args, options = {}) {
+  const spec = pnpmSpawnSpec(pnpmLauncher, args);
+  const result = spawnSync(spec.command, spec.args, {
     cwd: repoRoot,
     stdio: options.capture ? "pipe" : "inherit",
     encoding: "utf8",
     env: process.env,
+    windowsVerbatimArguments: spec.windowsVerbatimArguments,
   });
 
   if (result.error) {
-    fail(`${command} failed: ${result.error.message}`);
+    fail(`pnpm failed: ${result.error.message}`);
   }
   if (result.status !== 0) {
-    fail(`${command} ${args.join(" ")} exited with code ${result.status}`);
+    fail(`pnpm ${args.join(" ")} exited with code ${result.status}`);
   }
 
   return result.stdout?.trim() ?? "";
@@ -192,7 +195,7 @@ function ensureDependencies(opts) {
   }
 
   info("Installing dependencies with pnpm install --frozen-lockfile");
-  run(pnpm, ["install", "--frozen-lockfile"]);
+  runPnpm(["install", "--frozen-lockfile"]);
 }
 
 function projectNameFromPackage() {
@@ -214,7 +217,7 @@ function ensureProjectInitialized() {
 
   const name = projectNameFromPackage();
   info(`Initializing Fusion project as ${name}`);
-  run(pnpm, ["exec", "tsx", "packages/cli/src/bin.ts", "init", "--name", name]);
+  runPnpm(["exec", "tsx", "packages/cli/src/bin.ts", "init", "--name", name]);
 }
 
 function ensureProjectRegistered(opts) {
@@ -226,10 +229,11 @@ function ensureProjectRegistered(opts) {
   info("Checking Fusion project registry");
   const rootLiteral = JSON.stringify(repoRoot);
   const nameLiteral = JSON.stringify(projectNameFromPackage());
+  const coreModule = (relativePath) => JSON.stringify(pathToFileURL(resolve(repoRoot, "packages/core/src", relativePath)).href);
   const helper = `
-    import { CentralCore } from "./packages/core/src/central-core.ts";
-    import { readProjectIdentity, writeProjectIdentity } from "./packages/core/src/db.ts";
-    import { ensureMemoryFileWithBackend } from "./packages/core/src/project-memory.ts";
+    import { CentralCore } from ${coreModule("central/central-core.ts")};
+    import { readProjectIdentity, writeProjectIdentity } from ${coreModule("central/project-identity.ts")};
+    import { ensureMemoryFileWithBackend } from ${coreModule("memory/project-memory.ts")};
 
     async function main() {
       const root = ${rootLiteral};
@@ -297,7 +301,19 @@ function ensureProjectRegistered(opts) {
     });
   `;
 
-  run(pnpm, ["exec", "tsx", "--eval", helper]);
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  The registry helper runs from a temp file, not `--eval`: a multiline program cannot survive a cmd.exe shim command line on Windows.
+  It imports core by absolute file URL; the old relative paths pointed at modules the core reorganization had moved, so the check failed on every platform.
+  */
+  const helperDir = mkdtempSync(join(tmpdir(), "fusion-start-local-"));
+  const helperPath = join(helperDir, "register-project.mts");
+  writeFileSync(helperPath, helper);
+  try {
+    runPnpm(["exec", "tsx", helperPath]);
+  } finally {
+    rmSync(helperDir, { recursive: true, force: true });
+  }
 }
 
 function canListen(port, host) {

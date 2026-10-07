@@ -112,7 +112,8 @@ export function runCommandAsync(
       });
     });
 
-    child.on("close", (code, signal) => {
+    // FNXC:ProcessLifecycle 2026-10-07-18:00: settle on the supervisor's exit so a win32 tree kill reports the same signal shape as POSIX.
+    void supervised.waitExit().then(({ code, signal }) => {
       if (timer) clearTimeout(timer);
       if (forceKillTimer) {
         clearTimeout(forceKillTimer);
@@ -122,6 +123,7 @@ export function runCommandAsync(
       // in its process group (for example test runners, qmd indexers, or dev
       // servers launched with `&`). Clean the group after every run so Fusion
       // agents do not leak processes beyond the command lifecycle.
+      // FNXC:ProcessLifecycle 2026-10-07-18:00: Windows has no group that outlives its root, so this reap is POSIX-only; the supervisor tree-kills on win32 only while the root lives, because a dead root's pid may be reused.
       signalProcessGroup("SIGTERM");
       scheduleForceKill(NORMAL_CLEANUP_FORCE_KILL_DELAY_MS);
       resolve({

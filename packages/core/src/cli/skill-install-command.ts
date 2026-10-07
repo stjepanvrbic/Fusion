@@ -2,8 +2,14 @@
 FNXC:SkillInstall 2026-10-07-17:57:
 Skill installation parameters are data, never shell syntax. The dashboard route, the `fn skills install` CLI command and the `fn_skills_install` extension tool all build their installer invocation here.
 The old surfaces passed a weakly validated `owner/repo` source and an unvalidated skill name to `spawn("npx", args, { shell: true })`, so `a/b&calc` or `--skill "x & powershell ..."` ran extra commands under cmd.exe or sh.
-Inputs must match a strict slug grammar, and the installer is spawned without `shell: true`. On win32 `npx` is a `.cmd` shim that Node refuses to spawn directly, so it runs through `cmd.exe /d /s /c` with only grammar-validated tokens; the grammar excludes every cmd.exe and POSIX shell metacharacter, so no token can change the command.
+Inputs must match a strict slug grammar, and the installer is spawned without `shell: true`.
+
+FNXC:ProcessLifecycle 2026-10-07-18:00:
+On win32 `npx` is a `.cmd` shim; it is unwrapped to `node npx-cli.js` through resolveShellFreeLaunch, so no user-supplied token ever reaches cmd.exe, validated or not.
+When the shim cannot be unwrapped, the bare name is returned and the spawn reports the failure.
 */
+
+import { resolveShellFreeLaunch, UnlaunchableCommandError, type ShellFreeLaunchDeps } from "../process/windows-launch.js";
 
 /** GitHub-style `owner/repo`: each segment starts alphanumeric (no option injection) and holds only `[A-Za-z0-9_.-]`. */
 export const SKILL_INSTALL_SOURCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
@@ -19,8 +25,8 @@ export interface SkillInstallInvocationInput {
   source: string;
   skill?: string;
   platform?: NodeJS.Platform;
-  /** cmd.exe path on win32; defaults to `%ComSpec%`. */
-  comSpec?: string;
+  /** Resolution seams for the win32 shim unwrap (tests). */
+  launchDeps?: Omit<ShellFreeLaunchDeps, "platform">;
 }
 
 export function isValidSkillInstallSource(source: string): boolean {
@@ -55,9 +61,12 @@ export function buildSkillInstallInvocation(input: SkillInstallInvocationInput):
   npxArgs.push("-y", "-a", "pi");
 
   const platform = input.platform ?? process.platform;
-  if (platform === "win32") {
-    const comSpec = input.comSpec ?? process.env.ComSpec ?? "cmd.exe";
-    return { ok: true, command: comSpec, args: ["/d", "/s", "/c", "npx", ...npxArgs] };
+  if (platform !== "win32") return { ok: true, command: "npx", args: npxArgs };
+  try {
+    const launch = resolveShellFreeLaunch("npx", npxArgs, { ...input.launchDeps, platform });
+    return { ok: true, command: launch.command, args: launch.args };
+  } catch (error) {
+    if (error instanceof UnlaunchableCommandError) return { ok: true, command: "npx", args: npxArgs };
+    throw error;
   }
-  return { ok: true, command: "npx", args: npxArgs };
 }

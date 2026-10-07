@@ -59,17 +59,26 @@ function createFixture(options?: { closeOnSignal?: NodeJS.Signals[]; stopTimeout
   const managerOptions: DevServerProcessManagerOptions = {
     probeDelayMs: 10_000,
     stopTimeoutMs: options?.stopTimeoutMs,
+    // FNXC:ProcessLifecycle 2026-10-07-18:00: the manager must kill only through the supervised child, whose kill is the platform tree kill.
     spawn: (() => {
       const child = new FakeChildProcess();
       children.push(child);
-      return { child: child as unknown as ChildProcess };
-    }) as DevServerProcessManagerOptions["spawn"],
-    killManagedProcess: (child, signal) => {
-      signals.push(signal);
-      if (closeOnSignal.includes(signal)) {
-        (child as unknown as FakeChildProcess).close();
-      }
-    },
+      return {
+        child: child as unknown as ChildProcess,
+        pid: child.pid,
+        pgid: child.pid,
+        kill: (signal: NodeJS.Signals = "SIGTERM") => {
+          signals.push(signal);
+          if (closeOnSignal.includes(signal)) {
+            child.close();
+          }
+        },
+        waitExit: () =>
+          new Promise((resolve) => {
+            child.once("close", (code: number | null) => resolve({ code, signal: null }));
+          }),
+      };
+    }) as unknown as DevServerProcessManagerOptions["spawn"],
   };
   return { store, children, signals, manager: new DevServerProcessManager(store as unknown as DevServerStore, managerOptions) };
 }

@@ -1,4 +1,6 @@
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -62,6 +64,36 @@ const winEnv = { PATH: "C:\\first;C:\\npm;C:\\Program Files\\nodejs", PATHEXT: "
 const winBase = { platform: "win32" as const, env: winEnv, execPath: "C:\\Program Files\\nodejs\\node.exe", isElectron: false };
 
 describe("resolveShellFreeLaunch", () => {
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  Node's own npx.cmd forwards through SET variables; it must unwrap to node + npx-cli.js so `npx` runs without a shell on a stock install.
+  */
+  it("unwraps Node's bundled npx.cmd launcher to node and its CLI script", () => {
+    const npxShim = [
+      ":: Created by npm, please don't edit manually.",
+      "@ECHO OFF",
+      "SETLOCAL",
+      "SET \"NODE_EXE=%~dp0\\node.exe\"",
+      "IF NOT EXIST \"%NODE_EXE%\" (",
+      "  SET \"NODE_EXE=node\"",
+      ")",
+      "SET \"NPM_PREFIX_JS=%~dp0\\node_modules\\npm\\bin\\npm-prefix.js\"",
+      "SET \"NPX_CLI_JS=%~dp0\\node_modules\\npm\\bin\\npx-cli.js\"",
+      "\"%NODE_EXE%\" \"%NPX_CLI_JS%\" %*",
+    ].join("\r\n");
+    const fs = fakeFs({
+      "C:\\Program Files\\nodejs\\npx.cmd": npxShim,
+      "C:\\Program Files\\nodejs\\node.exe": "",
+      "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js": "",
+    });
+
+    expect(resolveShellFreeLaunch("npx", ["skills", "add", "a/b"], { ...winBase, env: { ...winEnv, PATH: "C:\\Program Files\\nodejs" }, ...fs })).toEqual({
+      command: "C:\\Program Files\\nodejs\\node.exe",
+      args: ["C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js", "skills", "add", "a/b"],
+      resolvedPath: "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js",
+    });
+  });
+
   it("never returns a batch file or a shell for any Windows shim shape", () => {
     const cases: Array<{ name: string; files: Record<string, string>; command: string; expect: { command: string; args: string[] } }> = [
       {
@@ -167,7 +199,7 @@ describe("killProcessTree", () => {
     const child = fakeChild(4321);
     const spawnImpl = vi.fn(() => new EventEmitter() as unknown as ChildProcess);
     killProcessTree(child, { platform: "win32", spawnImpl });
-    expect(spawnImpl).toHaveBeenCalledWith("taskkill", ["/PID", "4321", "/T", "/F"], expect.objectContaining({ shell: false, windowsHide: true }));
+    expect(spawnImpl).toHaveBeenCalledWith(expect.stringMatching(/taskkill(\.exe)?$/i), ["/PID", "4321", "/T", "/F"], expect.objectContaining({ shell: false, windowsHide: true }));
     expect(child.kill).not.toHaveBeenCalled();
   });
 
@@ -192,5 +224,21 @@ describe("killProcessTree", () => {
     Object.assign(alreadyKilled, { killed: true });
     killProcessTree(alreadyKilled, { platform: "linux", spawnImpl });
     expect(alreadyKilled.kill).not.toHaveBeenCalled();
+  });
+});
+
+/*
+FNXC:ProcessLifecycle 2026-10-07-18:00:
+windows-launch.ts is copied verbatim into the published CLI bundle (dist/pi-claude-cli), so it may import Node built-ins only.
+This is a code-construct guard: a relative or package import here breaks the shipped bundle.
+*/
+describe("windows-launch module boundary", () => {
+  it("imports only node: built-ins", () => {
+    const source = readFileSync(join(import.meta.dirname, "..", "process", "windows-launch.ts"), "utf8");
+    const specifiers = [...source.matchAll(/^\s*(?:import|export)\b[^'"]*?\bfrom\s+["']([^"']+)["']/gm)].map((match) => match[1]);
+    const dynamic = [...source.matchAll(/\bimport\(\s*["']([^"']+)["']\s*\)|\brequire\(\s*["']([^"']+)["']\s*\)/g)].map((match) => match[1] ?? match[2]);
+
+    expect(specifiers.length).toBeGreaterThan(0);
+    expect([...specifiers, ...dynamic].filter((specifier) => !specifier.startsWith("node:"))).toEqual([]);
   });
 });

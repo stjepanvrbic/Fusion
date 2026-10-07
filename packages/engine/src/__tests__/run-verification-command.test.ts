@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { tmpdir } from "node:os";
-import { mkdtempSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SandboxBackend } from "../sandbox/types.js";
 import { fileURLToPath } from "node:url";
@@ -166,7 +166,9 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
 
     it("leaves commands with unterminated shell quotes unchanged", () => {
       const command = "pnpm --filter @fusion/dashboard test -- --run 'src/__tests__/routes-tasks.test.ts";
-      expect(normalizeVerificationCommand(command, workspaceRoot)).toEqual({ command, warnings: [] });
+      expect(normalizeVerificationCommand(command, workspaceRoot, "linux")).toEqual({ command, warnings: [] });
+      const cmdCommand = 'pnpm --filter @fusion/dashboard test -- --run "src/__tests__/routes-tasks.test.ts';
+      expect(normalizeVerificationCommand(cmdCommand, workspaceRoot, "win32")).toEqual({ command: cmdCommand, warnings: [] });
     });
 
     it("preserves pnpm global flags that precede --filter", () => {
@@ -195,6 +197,38 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       if (process.platform !== "win32") return;
       const command = 'pnpm --filter @fusion/dashboard test -- --run packages/dashboard/src/__tests__/routes-tasks.test.ts -t "100% done"';
       expect(normalizeVerificationCommand(command, workspaceRoot)).toEqual({ command, warnings: [] });
+    });
+
+    /*
+    FNXC:Verification 2026-10-07-18:00:
+    The rewrite never changes which tests a command selects, under both cmd.exe and POSIX tokenization:
+    Windows backslash paths keep their separators, multi-word -t names stay one argument, and glob filters are left alone.
+    */
+    it("keeps Windows backslash test paths intact and double-quotes -t names for cmd.exe", () => {
+      const result = normalizeVerificationCommand(
+        'pnpm --filter @fusion/dashboard test -- --run packages\\dashboard\\src\\__tests__\\routes-tasks.test.ts -t "handles drive paths"',
+        workspaceRoot,
+        "win32",
+      );
+      expect(result.command).toBe(
+        'pnpm --filter @fusion/dashboard exec vitest run src/__tests__/routes-tasks.test.ts -t "handles drive paths" --silent=passed-only --reporter=dot',
+      );
+    });
+
+    it("keeps POSIX escaped spaces as one -t argument", () => {
+      const result = normalizeVerificationCommand(
+        "pnpm --filter @fusion/dashboard test -- --run packages/dashboard/src/__tests__/routes-tasks.test.ts -t handles\\ drive\\ paths",
+        workspaceRoot,
+        "linux",
+      );
+      expect(result.command).toBe(
+        "pnpm --filter @fusion/dashboard exec vitest run src/__tests__/routes-tasks.test.ts -t 'handles drive paths' --silent=passed-only --reporter=dot",
+      );
+    });
+
+    it.each(["win32", "linux"] as const)("leaves a glob test filter unrewritten on %s", (platform) => {
+      const command = "pnpm --filter @fusion/dashboard test -- --run packages/dashboard/src/**/routes-*.test.ts";
+      expect(normalizeVerificationCommand(command, workspaceRoot, platform)).toEqual({ command, warnings: [] });
     });
 
     it("verifies the CLI package directory through package.json before rewriting", () => {
@@ -514,6 +548,46 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
         await sleep(100);
       }
       expect(isProcessAlive(leakedPid)).toBe(false);
+    });
+
+    /*
+    FNXC:ProcessLifecycle 2026-10-07-18:00:
+    The hard timeout bounds fn_run_verification on every platform and kills the whole command tree.
+    The grandchild inherits the output pipes, which is the shape that hung the tool forever on Windows.
+    */
+    it("times out a command whose grandchild holds the pipes, settles promptly, and kills the tree", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "fn-verify-tree-"));
+      const script = join(dir, "tree.cjs");
+      const pidFile = join(dir, "grandchild.pid");
+      writeFileSync(
+        script,
+        [
+          "const { spawn } = require('node:child_process');",
+          "const { writeFileSync } = require('node:fs');",
+          "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });",
+          "writeFileSync(process.argv[2], String(g.pid));",
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+      );
+
+      const result = await runVerificationCommand({
+        command: `"${process.execPath}" "${script}" "${pidFile}"`,
+        cwd: dir,
+        timeoutMs: 1_500,
+        onHeartbeat: vi.fn(),
+        bypassVerificationSlot: true,
+      });
+      const grandchildPid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
+
+      expect(result.timedOut).toBe(true);
+      expect(result.durationMs).toBeLessThan(1_500 + 3_000);
+      for (let i = 0; i < 40 && isProcessAlive(grandchildPid); i++) {
+        await sleep(50);
+      }
+      const alive = isProcessAlive(grandchildPid);
+      if (alive) process.kill(grandchildPid, "SIGKILL");
+      expect(alive).toBe(false);
+      rmSync(dir, { recursive: true, force: true });
     });
 
     it("escalates non-timeout process-group reaping with fake timers", () => {

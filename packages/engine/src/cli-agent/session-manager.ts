@@ -30,6 +30,9 @@
 
 import {
   CliSessionStore,
+  killProcessTreeByPid,
+  resolveShellFreeLaunch,
+  withPlatformBaseEnvKeys,
   type CliAutonomyPosture,
   type CliSession,
   type CliSessionPurpose,
@@ -57,6 +60,35 @@ const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 
 const textEncoder = new TextEncoder();
+
+/*
+FNXC:ProcessLifecycle 2026-10-07-18:00:
+A resumed CLI must relaunch with the same launch settings as the original (model, command override, extra args, env additions), so they are persisted on the session row under the free-form posture.
+Hook script paths are per-session scratch files and are re-issued at resume, so they are not persisted.
+*/
+export const LAUNCH_SETTINGS_POSTURE_KEY = "launchSettings";
+const VOLATILE_LAUNCH_SETTING_KEYS = new Set(["hookScripts", "settingsPath"]);
+
+function persistableLaunchSettings(settings: Record<string, unknown>): Record<string, unknown> | null {
+  const kept = Object.fromEntries(Object.entries(settings).filter(([key]) => !VOLATILE_LAUNCH_SETTING_KEYS.has(key)));
+  return Object.keys(kept).length > 0 ? kept : null;
+}
+
+/** The launch settings recorded for a session at its original launch, if any. */
+export function recordedLaunchSettings(session: Pick<CliSession, "autonomyPosture">): Record<string, unknown> {
+  const recorded = session.autonomyPosture?.[LAUNCH_SETTINGS_POSTURE_KEY];
+  return recorded && typeof recorded === "object" && !Array.isArray(recorded) ? { ...(recorded as Record<string, unknown>) } : {};
+}
+
+/** Release node-pty's handles. Windows node-pty throws for any signal argument, so it gets none there. */
+function releasePty(pty: IPty): void {
+  try {
+    if (process.platform === "win32") pty.kill();
+    else pty.kill("SIGKILL");
+  } catch {
+    // already gone
+  }
+}
 
 // ── Errors ───────────────────────────────────────────────────────────────
 
@@ -89,6 +121,68 @@ export class CliResumeUnsupportedError extends Error {
     this.name = "CliResumeUnsupportedError";
   }
 }
+
+/** Rejects readiness and injection waits when the session's PTY ended before it became ready. */
+export class CliSessionEndedError extends Error {
+  readonly code = "CLI_SESSION_ENDED";
+  constructor(public readonly sessionId: string) {
+    super(`CLI session ended before it was ready: ${sessionId}`);
+    this.name = "CliSessionEndedError";
+  }
+}
+
+/** Rejects a readiness wait that outlived its timeout. */
+export class CliReadinessTimeoutError extends Error {
+  readonly code = "CLI_READINESS_TIMEOUT";
+  constructor(
+    public readonly sessionId: string,
+    public readonly timeoutMs: number,
+  ) {
+    super(`CLI session ${sessionId} was not ready within ${timeoutMs}ms`);
+    this.name = "CliReadinessTimeoutError";
+  }
+}
+
+/** Thrown when a resume targets a session that is already live or already being resumed. */
+export class CliSessionAlreadyLiveError extends Error {
+  readonly code = "CLI_SESSION_ALREADY_LIVE";
+  constructor(public readonly sessionId: string) {
+    super(`CLI session is already live or resuming: ${sessionId}`);
+    this.name = "CliSessionAlreadyLiveError";
+  }
+}
+
+/** Thrown when a spawn is attempted on, or completes after, a disposed manager. */
+export class CliSessionManagerDisposedError extends Error {
+  readonly code = "CLI_SESSION_MANAGER_DISPOSED";
+  constructor() {
+    super("CLI session manager has been disposed");
+    this.name = "CliSessionManagerDisposedError";
+  }
+}
+
+/** How a session's PTY ended: delivered once to every `onSessionEnd` listener. */
+export interface CliSessionEnd {
+  sessionId: string;
+  exitCode: number;
+  signal: number | undefined;
+  /** True when the engine killed the session (hard cancel, reap, shutdown) rather than the CLI exiting. */
+  killed: boolean;
+  /** Termination reason recorded on the session row. */
+  reason: CliTerminationReason;
+  /** Tail of the session's output (raw PTY text), for crash/auth classification. */
+  recentOutput: string;
+}
+
+/*
+FNXC:ProcessLifecycle 2026-10-07-18:00:
+A CLI session's child must keep the OS essentials it needs on Windows, and operator `envAllowlist` additions apply to every adapter.
+The adapters declare POSIX-only allowlists, so Node children of a Windows CLI lost SystemRoot, TEMP and APPDATA; the essentials come from core's single list (`withPlatformBaseEnvKeys`), and only the generic adapter used to read `envAllowlist`.
+*/
+
+const RECENT_OUTPUT_BYTES = 4096;
+const MAX_RECENT_ENDS = 256;
+const textDecoder = new TextDecoder();
 
 // ── Injection neutralization (security-critical) ───────────────────────────
 
@@ -326,8 +420,10 @@ interface LiveSession {
   scrollback: ScrollbackRing;
   readiness: CliReadinessDetector;
   ready: boolean;
-  /** Resolvers waiting on readiness. */
-  readyWaiters: (() => void)[];
+  /** Waiters on readiness; rejected when the PTY ends first. */
+  readyWaiters: { resolve: () => void; reject: (error: Error) => void }[];
+  /** Listeners told once how the PTY ended. */
+  endListeners: Set<(end: CliSessionEnd) => void>;
   /** True while bracketed paste is active (observed enable, no later disable). */
   bracketedPasteActive: boolean;
   /** Live attach streams. */
@@ -385,8 +481,18 @@ export class CliSessionManager {
   /** Process registry: session id → live session. Self-cleaning on exit. */
   private readonly sessions = new Map<string, LiveSession>();
 
-  /** Bound exit handler so it can be removed on dispose. */
-  private readonly onProcessExit = () => this.killAll();
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  The PTY concurrency ceiling holds under concurrent spawns. A spawn reserves its slot synchronously, before its first await, and releases it on every failure path; a resume of a session that is live or already resuming is refused.
+  */
+  private pendingSpawns = 0;
+  private readonly resumingIds = new Set<string>();
+  private disposed = false;
+  /** How recently ended sessions ended, for `onSessionEnd` listeners that subscribe late. */
+  private readonly recentEnds = new Map<string, CliSessionEnd>();
+
+  /** Bound exit handler so it can be removed on dispose. `exit` handlers are synchronous, so the tree kill is too. */
+  private readonly onProcessExit = () => this.killAll({ sync: true });
   private exitHookInstalled = false;
 
   constructor(options: CliSessionManagerOptions) {
@@ -400,9 +506,9 @@ export class CliSessionManager {
     this.installExitHook();
   }
 
-  /** Number of currently live PTY sessions (slots consumed). */
+  /** Number of consumed slots: live PTY sessions plus spawns still in flight. */
   activeCount(): number {
-    return this.sessions.size;
+    return this.sessions.size + this.pendingSpawns;
   }
 
   /** Configured ceiling on concurrently live PTY sessions. */
@@ -412,7 +518,7 @@ export class CliSessionManager {
 
   /** Free concurrency slots remaining before the ceiling (never negative). */
   availableSlots(): number {
-    return Math.max(0, this.concurrencyCeiling - this.sessions.size);
+    return Math.max(0, this.concurrencyCeiling - this.activeCount());
   }
 
   /** Whether a session id is currently live. */
@@ -429,10 +535,29 @@ export class CliSessionManager {
    * waitForReady).
    */
   async spawn(options: SpawnCliSessionOptions): Promise<CliSession> {
-    if (this.sessions.size >= this.concurrencyCeiling) {
-      throw new CliConcurrencyLimitError(this.concurrencyCeiling, this.sessions.size);
+    if (this.disposed) {
+      throw new CliSessionManagerDisposedError();
+    }
+    if (this.activeCount() >= this.concurrencyCeiling) {
+      throw new CliConcurrencyLimitError(this.concurrencyCeiling, this.activeCount());
+    }
+    const resumeId = options.resume?.sessionId;
+    if (resumeId !== undefined && (this.sessions.has(resumeId) || this.resumingIds.has(resumeId))) {
+      throw new CliSessionAlreadyLiveError(resumeId);
     }
 
+    // Reserve synchronously: everything below may await.
+    this.pendingSpawns += 1;
+    if (resumeId !== undefined) this.resumingIds.add(resumeId);
+    try {
+      return await this.spawnReserved(options);
+    } finally {
+      this.pendingSpawns -= 1;
+      if (resumeId !== undefined) this.resumingIds.delete(resumeId);
+    }
+  }
+
+  private async spawnReserved(options: SpawnCliSessionOptions): Promise<CliSession> {
     const adapter = this.registry.get(options.adapterId);
     const posture = options.posture ?? null;
     const launchCtx = {
@@ -461,6 +586,7 @@ export class CliSessionManager {
       launch = adapter.buildLaunch(launchCtx);
       // Persist the session record BEFORE spawning so a crash mid-spawn still has
       // a durable record to reason about.
+      const launchSettings = persistableLaunchSettings(launchCtx.settings);
       record = this.store.createSession({
         adapterId: options.adapterId,
         projectId: options.projectId,
@@ -468,7 +594,7 @@ export class CliSessionManager {
         taskId: options.taskId ?? null,
         chatSessionId: options.chatSessionId ?? null,
         worktreePath: options.worktreePath ?? null,
-        autonomyPosture: posture,
+        autonomyPosture: launchSettings ? { ...(posture ?? {}), [LAUNCH_SETTINGS_POSTURE_KEY]: launchSettings } : posture,
         agentState: "starting",
       });
     }
@@ -479,18 +605,28 @@ export class CliSessionManager {
     await this.store.flush();
 
     const allowlist = adapter.buildEnvAllowlist(launchCtx);
-    const env = this.buildEnv(allowlist);
+    const env = this.buildEnv(allowlist, launchCtx.settings);
 
     const pty = await this.loadPty();
     let child: IPty;
     try {
-      child = pty.spawn(launch.command, launch.args, {
-        name: "xterm-color",
-        cols: options.cols ?? 80,
-        rows: options.rows ?? 24,
-        cwd: options.worktreePath ?? process.cwd(),
-        env: env as { [key: string]: string },
-      });
+      /*
+      FNXC:ProcessLifecycle 2026-10-07-18:00:
+      ConPTY resolves a bare name to `.exe` only, so an npm `.cmd` install is unwrapped to the program or `node <entry>` it forwards to.
+      Launch arguments can carry agent text (one-shot prompts), so they never pass through cmd.exe; a shim that cannot be unwrapped fails the spawn here.
+      */
+      const shellFree = resolveShellFreeLaunch(launch.command, launch.args, { env });
+      child = pty.spawn(
+        shellFree.command,
+        shellFree.args,
+        {
+          name: "xterm-color",
+          cols: options.cols ?? 80,
+          rows: options.rows ?? 24,
+          cwd: options.worktreePath ?? process.cwd(),
+          env: env as { [key: string]: string },
+        },
+      );
     } catch (err) {
       /*
       FNXC:CliAgentPostgres 2026-07-14-21:33:
@@ -508,6 +644,17 @@ export class CliSessionManager {
       throw err;
     }
 
+    if (this.disposed) {
+      // Disposal raced this spawn's awaits: the new PTY must not outlive the manager.
+      killProcessTreeByPid(child.pid, "SIGKILL", { onSettled: () => releasePty(child) });
+      try {
+        this.store.updateSession(record.id, { agentState: "dead", terminationReason: "engineDeath" });
+      } catch {
+        // store may be closed during shutdown
+      }
+      throw new CliSessionManagerDisposedError();
+    }
+
     const live: LiveSession = {
       id: record.id,
       adapter,
@@ -517,6 +664,7 @@ export class CliSessionManager {
       readiness: adapter.createReadinessDetector(),
       ready: false,
       readyWaiters: [],
+      endListeners: new Set(),
       bracketedPasteActive: false,
       streams: new Set(),
       queue: [],
@@ -559,9 +707,13 @@ export class CliSessionManager {
    * `process.env`. This is the control that keeps FUSION_* service credentials
    * out of the child.
    */
-  private buildEnv(allowlist: string[]): NodeJS.ProcessEnv {
+  private buildEnv(allowlist: string[], settings: Record<string, unknown>): NodeJS.ProcessEnv {
+    // Operator additions are honored for every adapter, but can never carry FUSION_* service credentials.
+    const operatorKeys = Array.isArray(settings.envAllowlist)
+      ? settings.envAllowlist.filter((k): k is string => typeof k === "string" && !/^FUSION_/i.test(k))
+      : [];
     const env: NodeJS.ProcessEnv = {};
-    for (const key of allowlist) {
+    for (const key of withPlatformBaseEnvKeys([...allowlist, ...operatorKeys])) {
       const value = process.env[key];
       if (typeof value === "string") env[key] = value;
     }
@@ -585,7 +737,7 @@ export class CliSessionManager {
     if (!live.ready && live.readiness.observe(data)) {
       live.ready = true;
       const waiters = live.readyWaiters.splice(0);
-      for (const w of waiters) w();
+      for (const w of waiters) w.resolve();
       this.maybeUpdateState(live, "ready");
     }
 
@@ -639,6 +791,67 @@ export class CliSessionManager {
     } catch {
       // Store may be closed during shutdown; teardown must not throw.
     }
+    this.announceEnd(live, { exitCode, signal, killed: false, reason });
+  }
+
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  Every PTY end, a CLI exit or an engine kill, produces exactly one terminal outcome for its owner.
+  The exit used to reach only the exit waiters and the store row: readiness waits hung forever and the task session's state machine never learned the process was gone.
+  Reject readiness waiters and tell each end listener once; a listener that subscribes after the end still hears it.
+  */
+  private announceEnd(
+    live: LiveSession,
+    end: { exitCode: number; signal: number | undefined; killed: boolean; reason: CliTerminationReason },
+  ): void {
+    const waiters = live.readyWaiters.splice(0);
+    for (const waiter of waiters) waiter.reject(new CliSessionEndedError(live.id));
+
+    const snapshot = live.scrollback.snapshot();
+    const info: CliSessionEnd = {
+      sessionId: live.id,
+      ...end,
+      recentOutput: textDecoder.decode(snapshot.subarray(Math.max(0, snapshot.byteLength - RECENT_OUTPUT_BYTES))),
+    };
+    this.recentEnds.set(live.id, info);
+    if (this.recentEnds.size > MAX_RECENT_ENDS) {
+      const oldest = this.recentEnds.keys().next().value;
+      if (oldest !== undefined) this.recentEnds.delete(oldest);
+    }
+    const listeners = [...live.endListeners];
+    live.endListeners.clear();
+    for (const listener of listeners) {
+      try {
+        listener(info);
+      } catch {
+        // A listener failure must not block teardown or the other listeners.
+      }
+    }
+  }
+
+  /**
+   * Be told once how a session's PTY ended. A session that already ended within this manager's
+   * memory is reported on the next microtask. Returns an unsubscribe function.
+   */
+  onSessionEnd(sessionId: string, listener: (end: CliSessionEnd) => void): () => void {
+    const live = this.sessions.get(sessionId);
+    if (live && !live.terminated) {
+      live.endListeners.add(listener);
+      return () => {
+        live.endListeners.delete(listener);
+      };
+    }
+    const ended = this.recentEnds.get(sessionId);
+    if (ended) {
+      let active = true;
+      queueMicrotask(() => {
+        if (active) listener(ended);
+      });
+      return () => {
+        active = false;
+      };
+    }
+    return () => {};
   }
 
   private maybeUpdateState(live: LiveSession, state: CliSession["agentState"]): void {
@@ -651,11 +864,36 @@ export class CliSessionManager {
 
   // ── Readiness ────────────────────────────────────────────────────────────
 
-  /** Resolve once the session has been observed ready. */
-  waitForReady(sessionId: string): Promise<void> {
+  /**
+   * Resolve once the session has been observed ready. Rejects with `CliSessionEndedError` when the PTY
+   * ends first, and with `CliReadinessTimeoutError` when `timeoutMs` elapses first.
+   */
+  waitForReady(sessionId: string, options: { timeoutMs?: number } = {}): Promise<void> {
     const live = this.require(sessionId);
     if (live.ready) return Promise.resolve();
-    return new Promise((resolve) => live.readyWaiters.push(resolve));
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const waiter = {
+        resolve: () => {
+          if (timer) clearTimeout(timer);
+          resolve();
+        },
+        reject: (error: Error) => {
+          if (timer) clearTimeout(timer);
+          reject(error);
+        },
+      };
+      live.readyWaiters.push(waiter);
+      const timeoutMs = options.timeoutMs ?? 0;
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          const index = live.readyWaiters.indexOf(waiter);
+          if (index >= 0) live.readyWaiters.splice(index, 1);
+          reject(new CliReadinessTimeoutError(sessionId, timeoutMs));
+        }, timeoutMs);
+        timer.unref?.();
+      }
+    });
   }
 
   /**
@@ -849,7 +1087,7 @@ export class CliSessionManager {
     this.killLive(live, reason);
   }
 
-  private killLive(live: LiveSession, reason: CliTerminationReason): void {
+  private killLive(live: LiveSession, reason: CliTerminationReason, options: { sync?: boolean } = {}): void {
     if (live.terminated) {
       this.sessions.delete(live.id);
       return;
@@ -866,13 +1104,14 @@ export class CliSessionManager {
     }
     live.queue = [];
 
-    // Scoped SIGKILL — ONLY this session's registered pid (never port 4040 /
-    // dashboard / unrelated processes).
-    try {
-      live.pty.kill("SIGKILL");
-    } catch {
-      // already gone
-    }
+    /*
+    FNXC:ProcessLifecycle 2026-10-07-18:00:
+    Once a session is recorded dead, no process of that session remains, on every platform.
+    Windows node-pty throws for any signal argument, and the throw was swallowed as "already gone" (or, before the terminal was ready, thrown later from a socket handler), so the CLI kept editing the worktree.
+    Kill ONLY this session's registered pid tree (never port 4040, the dashboard or unrelated processes), then release the PTY handles once the tree is gone.
+    */
+    const pty = live.pty;
+    killProcessTreeByPid(live.pid, "SIGKILL", { sync: options.sync, onSettled: () => releasePty(pty) });
 
     try {
       this.store.updateSession(live.id, {
@@ -882,21 +1121,24 @@ export class CliSessionManager {
     } catch {
       // store may be closed during shutdown
     }
+    this.announceEnd(live, { exitCode: -1, signal: 9, killed: true, reason });
   }
 
   /**
    * Kill every registered session. Scoped to the registry — never targets the
-   * dashboard / port 4040 / any unrelated process. Invoked on `process.exit`.
+   * dashboard / port 4040 / any unrelated process. Invoked on `process.exit`
+   * with `sync`, because an exit handler cannot wait for an async tree kill.
    */
-  killAll(): void {
+  killAll(options: { sync?: boolean } = {}): void {
     for (const live of [...this.sessions.values()]) {
-      this.killLive(live, "engineDeath");
+      this.killLive(live, "engineDeath", options);
     }
     this.sessions.clear();
   }
 
-  /** Remove the process-exit hook and tear down all sessions. */
+  /** Remove the process-exit hook and tear down all sessions; spawns still in flight are killed when they land. */
   dispose(): void {
+    this.disposed = true;
     this.killAll();
     if (this.exitHookInstalled) {
       process.off("exit", this.onProcessExit);

@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { probeClaudeCli } from "../claude-cli-probe.js";
 
 /**
@@ -38,6 +41,64 @@ describe("probeClaudeCli", () => {
     // Either it completed fast enough or hit the timeout — both fine.
     if (!result.available && result.reason?.includes("timed out")) {
       expect(result.reason).toContain("50ms");
+    }
+  });
+
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  The probe reports an installed CLI as available for every install method: an npm `.cmd` shim on Windows, an
+  executable script on POSIX, both under a directory with spaces. A missing binary reports unavailable with a reason.
+  */
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("finds an installed claude shim on PATH, including in a directory with spaces", async () => {
+    // The fixture shim only prints a version; opt out of the real-AI-CLI guard for this bounded launch.
+    vi.stubEnv("FUSION_TEST_ALLOW_REAL_AI_CLI", "1");
+    const root = mkdtempSync(join(tmpdir(), "fn claude probe "));
+    try {
+      const versionScript = join(root, "version.cjs");
+      writeFileSync(versionScript, "process.stdout.write('9.9.9 (Claude Code)\\n');");
+      if (process.platform === "win32") {
+        // npm cmd-shim shape: the probe unwraps it to `node version.cjs` and never runs cmd.exe.
+        writeFileSync(join(root, "claude.cmd"), `@ECHO off\r\nnode "%~dp0\\version.cjs" %*\r\n`);
+        // The extensionless POSIX wrapper npm also installs must not shadow the shim.
+        writeFileSync(join(root, "claude"), "#!/bin/sh\nexit 1\n");
+      } else {
+        writeFileSync(join(root, "claude"), `#!/bin/sh\nexec "${process.execPath}" "${versionScript}" "$@"\n`);
+        chmodSync(join(root, "claude"), 0o755);
+      }
+
+      const result = await probeClaudeCli({ timeoutMs: 10_000, env: { ...process.env, PATH: `${root}${delimiter}${process.env.PATH ?? ""}` } });
+
+      expect(result).toMatchObject({ available: true, version: "9.9.9 (Claude Code)" });
+      expect(result.binaryPath?.toLowerCase().startsWith(root.toLowerCase())).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform === "win32")("reports a shim it cannot unwrap as unavailable instead of running it through cmd.exe", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fn-claude-probe-batch-"));
+    try {
+      writeFileSync(join(root, "claude.cmd"), "@echo off\r\ncall some-launcher %*\r\n");
+      const result = await probeClaudeCli({ timeoutMs: 10_000, env: { ...process.env, PATH: root } });
+      expect(result.available).toBe(false);
+      expect(result.reason).toContain("without a command shell");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a missing claude as unavailable with a reason", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fn-claude-probe-empty-"));
+    try {
+      const result = await probeClaudeCli({ timeoutMs: 10_000, env: { ...process.env, PATH: root } });
+      expect(result.available).toBe(false);
+      expect(result.reason).toBeTruthy();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

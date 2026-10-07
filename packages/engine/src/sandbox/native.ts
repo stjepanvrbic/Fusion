@@ -131,7 +131,8 @@ export class NativeSandboxBackend implements SandboxBackend {
         stderr = append(stderr, chunk);
       });
       child.on("error", (error) => finish(error, null, null));
-      child.on("close", (code, signal) => finish(null, code, signal));
+      // FNXC:ProcessLifecycle 2026-10-07-18:00: settle on the supervisor's exit so a win32 tree kill reports the same signal shape as POSIX.
+      void supervised.waitExit().then(({ code, signal }) => finish(null, code, signal));
     });
   }
 
@@ -258,7 +259,7 @@ export class NativeSandboxBackend implements SandboxBackend {
       };
 
       child.on("error", (err) => finish(err, null, null));
-      child.on("close", (code, signal) => finish(null, code, signal));
+      void supervised.waitExit().then(({ code, signal }) => finish(null, code, signal));
     });
   }
 

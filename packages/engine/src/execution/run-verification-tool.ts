@@ -54,7 +54,13 @@ export const MARATHON_SOFT_CAP_SEC = 120;
 
 const packageDirCache = new Map<string, string | null>();
 
-function shellSplit(input: string): string[] | null {
+/*
+FNXC:Verification 2026-10-07-18:00:
+The verification rewrite must never change which tests a command selects.
+The command runs in the native shell, so tokenize by that shell's rules: on Windows cmd.exe a backslash is a path separator, not an escape, and only double quotes group, so `src\__tests__\foo.test.ts` must not collapse to `src__tests__foo.test.ts`.
+*/
+function shellSplit(input: string, platform: NodeJS.Platform = process.platform): string[] | null {
+  const win32 = platform === "win32";
   const tokens: string[] = [];
   let current = "";
   let quote: "'" | "\"" | null = null;
@@ -66,7 +72,7 @@ function shellSplit(input: string): string[] | null {
       escaped = false;
       continue;
     }
-    if (char === "\\" && quote !== "'") {
+    if (char === "\\" && quote !== "'" && !win32) {
       escaped = true;
       continue;
     }
@@ -78,7 +84,7 @@ function shellSplit(input: string): string[] | null {
       }
       continue;
     }
-    if (char === "'" || char === "\"") {
+    if (char === "\"" || (char === "'" && !win32)) {
       quote = char;
       continue;
     }
@@ -187,9 +193,9 @@ The rewritten verification command runs in the native shell (cmd.exe on Windows)
 Quote non-plain tokens for that shell via the same rule as inferred verification commands; null means the token cannot be carried safely, and the caller keeps the agent's original command.
 `%` is not plain because cmd.exe expands it.
 */
-function shellQuote(value: string): string | null {
+function shellQuote(value: string, platform: NodeJS.Platform = process.platform): string | null {
   if (/^[A-Za-z0-9_@+=:,./-]+$/.test(value)) return value;
-  return quoteInferredCommandArg(value);
+  return quoteInferredCommandArg(value, platform);
 }
 
 function findWorkspacePackageDir(rootDir: string, packageName: string): string | null {
@@ -265,8 +271,12 @@ function toPackageRelativeFilter(token: string, rootDir: string, packageDir: str
   return token;
 }
 
-export function normalizeVerificationCommand(command: string, rootDir: string): { command: string; warnings: string[] } {
-  const tokens = shellSplit(command);
+export function normalizeVerificationCommand(
+  command: string,
+  rootDir: string,
+  platform: NodeJS.Platform = process.platform,
+): { command: string; warnings: string[] } {
+  const tokens = shellSplit(command, platform);
   const warnings: string[] = [];
   if (!tokens) return { command, warnings };
   if (tokens[0] !== "pnpm") return { command, warnings };
@@ -285,6 +295,8 @@ export function normalizeVerificationCommand(command: string, rootDir: string): 
 
   const forwarded = tokens.slice(separatorIndex + 1);
   if (!forwarded.includes("--run")) return { command, warnings };
+  // A glob filter is expanded (or not) by the original shell; a quoted rewrite would hand vitest the literal pattern instead.
+  if (forwarded.some((token) => !token.startsWith("-") && /[*?[\]]/.test(token))) return { command, warnings };
 
   const packageDir = findWorkspacePackageDir(rootDir, packageName);
   if (!packageDir) return { command, warnings };
@@ -312,7 +324,7 @@ export function normalizeVerificationCommand(command: string, rootDir: string): 
     ...(hasSilent ? [] : ["--silent=passed-only"]),
     ...(hasReporter ? [] : ["--reporter=dot"]),
   ];
-  const quotedTokens = normalizedTokens.map(shellQuote);
+  const quotedTokens = normalizedTokens.map((token) => shellQuote(token, platform));
   if (quotedTokens.some((token) => token === null)) return { command, warnings };
   const normalizedCommand = quotedTokens.join(" ");
 
@@ -774,7 +786,8 @@ async function runVerificationCommandUnlocked(
     });
 
     // ── Process exit ─────────────────────────────────────────────────────────
-    child.on("close", (code, signal) => {
+    // FNXC:ProcessLifecycle 2026-10-07-18:00: settle on the supervisor's exit, which a kill bounds even while a descendant holds the pipes, and which reports a win32 tree kill with the POSIX signal shape.
+    void supervised.waitExit().then(({ code, signal }) => {
       if (settled) return;
       settled = true;
       clearInterval(quietTimer);

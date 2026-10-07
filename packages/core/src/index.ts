@@ -1349,8 +1349,8 @@ export {
   writeProjectIdentityAsync,
 } from "./central/project-identity.js";
 export { ProcessSupervisor, superviseSpawn, releaseSupervisedChild, FUSION_RESTART_EXIT_CODE, FUSION_NON_RETRYABLE_EXIT_CODE } from "./process/process-supervisor.js";
-export { resolveShellFreeLaunch, withPlatformBaseEnvKeys, killProcessTree, UnlaunchableCommandError, WINDOWS_BASE_ENV_KEYS } from "./process/windows-launch.js";
-export type { ShellFreeLaunch, ShellFreeLaunchDeps, KillProcessTreeDeps } from "./process/windows-launch.js";
+export { resolveShellFreeLaunch, withPlatformBaseEnvKeys, killProcessTree, killProcessTreeByPid, UnlaunchableCommandError, WINDOWS_BASE_ENV_KEYS } from "./process/windows-launch.js";
+export type { ShellFreeLaunch, ShellFreeLaunchDeps, KillProcessTreeDeps, KillProcessTreeOptions } from "./process/windows-launch.js";
 export { isPostgresUniqueError } from "./db/postgres-errors.js";
 export type {
   SuperviseSpawnOptions,

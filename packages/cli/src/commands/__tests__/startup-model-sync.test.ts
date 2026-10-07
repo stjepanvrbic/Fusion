@@ -1,11 +1,25 @@
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockSpawn } = vi.hoisted(() => ({
+const { mockSpawn, launchOverride } = vi.hoisted(() => ({
   mockSpawn: vi.fn(),
+  launchOverride: { current: null as null | ((command: string, args: readonly string[]) => { command: string; args: string[] }) },
 }));
 
-vi.mock("node:child_process", () => ({
+vi.mock("@fusion/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@fusion/core")>();
+  return {
+    ...actual,
+    resolveShellFreeLaunch: (command: string, args: readonly string[], deps?: Parameters<typeof actual.resolveShellFreeLaunch>[2]) =>
+      launchOverride.current ? launchOverride.current(command, args) : actual.resolveShellFreeLaunch(command, args, deps),
+  };
+});
+
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: mockSpawn,
 }));
 
@@ -413,7 +427,14 @@ describe("startup-model-sync", () => {
     });
 
     const registerProvider = vi.fn();
-    await refreshOpencodeGoModels({ modelRegistry: { registerProvider }, log: vi.fn(), apiKey: "test-key" });
+    const emptyPath = mkdtempSync(join(tmpdir(), "fn-opencode-empty-"));
+    vi.stubEnv("PATH", emptyPath);
+    try {
+      await refreshOpencodeGoModels({ modelRegistry: { registerProvider }, log: vi.fn(), apiKey: "test-key" });
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(emptyPath, { recursive: true, force: true });
+    }
 
     expect(mockSpawn).toHaveBeenCalledWith(
       "opencode",
@@ -422,5 +443,46 @@ describe("startup-model-sync", () => {
         env: expect.objectContaining({ OPENCODE_API_KEY: "test-key" }),
       }),
     );
+  });
+
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  An npm-installed opencode on Windows is a `.cmd` shim; model refresh must launch it through cmd.exe with escaped arguments instead of failing with ENOENT.
+  */
+  it("spawns what the shell-free launch seam resolves an npm opencode shim to, never cmd.exe", async () => {
+    launchOverride.current = (_command, args) => ({ command: "C:/Program Files/nodejs/node.exe", args: ["C:/npm/node_modules/opencode-ai/bin/opencode.js", ...args] });
+    mockSpawn.mockImplementation(() => {
+      const proc = createSpawnProcess();
+      queueMicrotask(() => {
+        proc.stdout.emit("data", Buffer.from("opencode/foo\n"));
+        proc.emit("exit", 0);
+      });
+      return proc;
+    });
+    try {
+      await refreshOpencodeGoModels({ modelRegistry: { registerProvider: vi.fn() }, log: vi.fn() });
+    } finally {
+      launchOverride.current = null;
+    }
+
+    const [command, args, options] = mockSpawn.mock.calls[0] as [string, string[], Record<string, unknown>];
+    expect(command).toBe("C:/Program Files/nodejs/node.exe");
+    expect(args).toEqual(["C:/npm/node_modules/opencode-ai/bin/opencode.js", "models", "opencode", "--refresh"]);
+    expect(options.shell).toBeUndefined();
+    expect(options.windowsVerbatimArguments).toBeUndefined();
+  });
+
+  it("reports a shim the launch seam cannot unwrap as a CLI failure without spawning", async () => {
+    launchOverride.current = () => {
+      throw new Error("Cannot launch opencode without a command shell");
+    };
+    let result: Awaited<ReturnType<typeof refreshOpencodeGoModels>>;
+    try {
+      result = await refreshOpencodeGoModels({ modelRegistry: { registerProvider: vi.fn() }, log: vi.fn() });
+    } finally {
+      launchOverride.current = null;
+    }
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(result.reason).toBe("cli-failed");
   });
 });

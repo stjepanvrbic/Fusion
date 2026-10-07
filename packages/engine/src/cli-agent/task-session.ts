@@ -49,8 +49,8 @@ import type {
   CliSession,
   CliTerminationReason,
 } from "@fusion/core";
-import type { CliSessionManager } from "./session-manager.js";
-import type { TelemetryHub } from "./telemetry-hub.js";
+import { CliReadinessTimeoutError, type CliSessionEnd, type CliSessionManager } from "./session-manager.js";
+import { stripAnsiControl, type TelemetryHub } from "./telemetry-hub.js";
 import type { CliAdapterRegistry } from "./adapter.js";
 import type { CliMachineState } from "./state-machine.js";
 import {
@@ -163,6 +163,53 @@ export interface LaunchCliTaskSessionOptions {
    * Optional logger for lifecycle breadcrumbs. Best-effort; never throws.
    */
   log?: (msg: string) => void;
+  /**
+   * How long the CLI may take to become ready for the prompt before the session resolves as
+   * needs-attention (a hung auth prompt or a wedged startup). Default 2 minutes; 0 disables.
+   */
+  readyTimeoutMs?: number;
+}
+
+/** Options for adopting a session the resume coordinator relaunched. */
+export interface AdoptCliTaskSessionOptions {
+  taskId: string;
+  sessionId: string;
+  config: ResolvedCliExecutorConfig;
+  manager: CliSessionManager;
+  hub: TelemetryHub;
+  registry: CliAdapterRegistry;
+  hookEndpointUrl: string;
+  /** The resumed session's hook scratch dir (cleaned up at teardown), when known. */
+  hookDir: string | null;
+  /** Prompt that re-drives the resumed CLI. Defaults to a continuation instruction. */
+  prompt?: string;
+  readyTimeoutMs?: number;
+  log?: (msg: string) => void;
+}
+
+/** Default readiness bound for a launched task session. */
+export const DEFAULT_CLI_TASK_READY_TIMEOUT_MS = 2 * 60_000;
+
+/** The prompt that re-drives a session resumed after an engine restart. */
+export const CLI_RESUME_CONTINUATION_PROMPT =
+  "Your session was interrupted by an engine restart and has been resumed. Continue the task from where you left off.";
+
+/**
+ * Launch settings that point a CLI at the session-scoped hook scripts written into `hookDir`. Claude's
+ * settings flow reads `hookScripts` + `settingsPath`; other adapters ignore unknown keys.
+ */
+export function buildHookLaunchSettings(hookDir: string): { hookScripts: Record<string, string>; settingsPath: string } {
+  const hookScriptPath = join(hookDir, HOOK_SCRIPT_NAMES.hook);
+  return {
+    hookScripts: {
+      stopScript: hookScriptPath,
+      notificationScript: hookScriptPath,
+      permissionScript: hookScriptPath,
+      sessionStartScript: hookScriptPath,
+      toolActivityScript: hookScriptPath,
+    },
+    settingsPath: join(hookDir, "settings.json"),
+  };
 }
 
 // ── CliTaskSession ─────────────────────────────────────────────────────────────
@@ -180,7 +227,7 @@ export class CliTaskSession {
   private readonly manager: CliSessionManager;
   private readonly hub: TelemetryHub;
   private readonly registry: CliAdapterRegistry;
-  private readonly hookDir: string;
+  private readonly hookDir: string | null;
   private readonly hookEndpointUrl: string;
   private readonly log: (msg: string) => void;
 
@@ -188,6 +235,8 @@ export class CliTaskSession {
   private resolveResult!: (outcome: CliTaskOutcome) => void;
   private resultPromise: Promise<CliTaskOutcome>;
   private unsubscribe: (() => void) | null = null;
+  private unwatchEnd: (() => void) | null = null;
+  private readonly readyTimeoutMs: number;
 
   private constructor(args: {
     taskId: string;
@@ -196,9 +245,10 @@ export class CliTaskSession {
     manager: CliSessionManager;
     hub: TelemetryHub;
     registry: CliAdapterRegistry;
-    hookDir: string;
+    hookDir: string | null;
     hookEndpointUrl: string;
     log: (msg: string) => void;
+    readyTimeoutMs: number;
   }) {
     this.taskId = args.taskId;
     this.sessionId = args.sessionId;
@@ -209,6 +259,7 @@ export class CliTaskSession {
     this.hookDir = args.hookDir;
     this.hookEndpointUrl = args.hookEndpointUrl;
     this.log = args.log;
+    this.readyTimeoutMs = args.readyTimeoutMs;
     this.resultPromise = new Promise<CliTaskOutcome>((resolve) => {
       this.resolveResult = resolve;
     });
@@ -248,8 +299,6 @@ export class CliTaskSession {
     // up — readiness gates the first prompt injection, and the SessionStart hook
     // fires around the same time). To avoid a race we write the scripts as part of
     // launch, immediately after spawn, before injecting.
-    const hookScriptPath = join(hookDir, HOOK_SCRIPT_NAMES.hook);
-    const settingsPath = join(hookDir, "settings.json");
 
     // Fold the per-adapter operator settings (U15) into the launch settings bag
     // so they actually reach the child: command override → `command`, extra args
@@ -278,14 +327,7 @@ export class CliTaskSession {
         ? { extraArgs: [...cliAgentSettings.extraArgs] }
         : {}),
       envAllowlist: [...new Set([...priorAllowlist, ...operatorEnvAdditions])],
-      hookScripts: {
-        stopScript: hookScriptPath,
-        notificationScript: hookScriptPath,
-        permissionScript: hookScriptPath,
-        sessionStartScript: hookScriptPath,
-        toolActivityScript: hookScriptPath,
-      },
-      settingsPath,
+      ...buildHookLaunchSettings(hookDir),
     };
 
     // 2. Spawn (reserves the concurrency slot; throws CliConcurrencyLimitError at
@@ -343,16 +385,45 @@ export class CliTaskSession {
       hookDir,
       hookEndpointUrl: opts.hookEndpointUrl,
       log,
+      readyTimeoutMs: opts.readyTimeoutMs ?? DEFAULT_CLI_TASK_READY_TIMEOUT_MS,
     });
 
     // 4. Subscribe to the authoritative state machine BEFORE injecting so a fast
-    // done is never missed.
+    // done is never missed, and watch the PTY so an exit always settles the result.
     session.subscribe();
+    session.watchProcessEnd();
 
     // 5. Inject the prompt after readiness (fire-and-forget; readiness gates it).
     void session.injectAfterReady(opts.prompt, adapter.capabilities.nativeDone);
 
     log(`cli-task-session ${record.id}: launched for task ${opts.taskId} (adapter ${opts.config.cliAdapterId})`);
+    return session;
+  }
+
+  /**
+   * Take ownership of a session the resume coordinator relaunched after an engine restart, so it is
+   * observed exactly like a launched one (state machine, PTY end, readiness bound) and re-driven with a
+   * continuation prompt: a resumed CLI waits for input rather than continuing on its own.
+   */
+  static adopt(opts: AdoptCliTaskSessionOptions): CliTaskSession {
+    const log = opts.log ?? (() => {});
+    const adapter = opts.registry.get(opts.config.cliAdapterId);
+    const session = new CliTaskSession({
+      taskId: opts.taskId,
+      sessionId: opts.sessionId,
+      config: opts.config,
+      manager: opts.manager,
+      hub: opts.hub,
+      registry: opts.registry,
+      hookDir: opts.hookDir,
+      hookEndpointUrl: opts.hookEndpointUrl,
+      log,
+      readyTimeoutMs: opts.readyTimeoutMs ?? DEFAULT_CLI_TASK_READY_TIMEOUT_MS,
+    });
+    session.subscribe();
+    session.watchProcessEnd();
+    void session.injectAfterReady(opts.prompt ?? CLI_RESUME_CONTINUATION_PROMPT, adapter.capabilities.nativeDone);
+    log(`cli-task-session ${opts.sessionId}: adopted resumed session for task ${opts.taskId}`);
     return session;
   }
 
@@ -497,10 +568,14 @@ export class CliTaskSession {
 
   private async injectAfterReady(prompt: string, _nativeDone: boolean): Promise<void> {
     try {
-      await this.manager.waitForReady(this.sessionId);
-    } catch {
-      // Session may have died before readiness — the state machine / exit handler
-      // resolves the result; nothing to inject.
+      await this.manager.waitForReady(this.sessionId, { timeoutMs: this.readyTimeoutMs });
+    } catch (err) {
+      if (err instanceof CliReadinessTimeoutError && !this.settled) {
+        // A CLI that never becomes ready (hung auth prompt, wedged startup) needs a human; the PTY stays attachable.
+        this.log(`cli-task-session ${this.sessionId}: not ready within ${this.readyTimeoutMs}ms — needs attention`);
+        this.finish({ kind: "needs-attention", sessionId: this.sessionId, terminationReason: null });
+      }
+      // Otherwise the session ended before readiness; the PTY end handler resolves the result.
       return;
     }
     if (this.settled) return;
@@ -513,11 +588,15 @@ export class CliTaskSession {
       // not yet landed the machine may still be `starting`, so mark it ready
       // first. Native adapters that also emit `busy` telemetry are idempotent
       // here (signalBusy from busy re-arms the watchdog).
+      // A resumed session's machine may still hold its pre-restart state (busy / waitingOnInput /
+      // resuming), so every state starts the turn and arms the stall watchdog.
       const machine = this.hub.getStateMachine(this.sessionId);
       if (machine) {
         try {
           if (machine.getState() === "starting") machine.markReady();
-          if (machine.getState() === "ready") machine.injectPrompt();
+          const state = machine.getState();
+          if (state === "ready" || state === "resuming" || state === "done") machine.injectPrompt();
+          else if (state === "busy" || state === "waitingOnInput" || state === "idle") machine.signalBusy();
         } catch {
           // best-effort transition
         }
@@ -526,6 +605,58 @@ export class CliTaskSession {
     } catch {
       // Inject can fail if the session died mid-readiness — the terminal handler
       // resolves the outcome.
+    }
+  }
+
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  Every PTY exit produces exactly one terminal outcome for its task session, so the graph node awaiting result() always returns.
+  Nothing used to forward the exit to the state machine: an exit before readiness hung the node forever, and an exit mid-turn waited for the 5-minute stall and never classified crashed, authFailed or userExited.
+  A natural exit is classified by the machine and escalated to needs-attention (no in-run resume driver owns a crash); an engine kill resolves as killed.
+  */
+  private watchProcessEnd(): void {
+    this.unwatchEnd?.();
+    this.unwatchEnd = this.manager.onSessionEnd(this.sessionId, (end) => this.onProcessEnd(end));
+  }
+
+  private onProcessEnd(end: CliSessionEnd): void {
+    if (this.settled) return;
+    const machine = this.hub.getStateMachine(this.sessionId);
+    if (end.killed) {
+      if (machine && end.reason === "killed") {
+        try {
+          machine.processEnded({ cancelled: true });
+        } catch {
+          // best-effort transition; the fallback below still settles
+        }
+      }
+      if (!this.settled) {
+        this.finish({ kind: "killed", sessionId: this.sessionId, terminationReason: end.reason });
+      }
+      return;
+    }
+
+    let reason: CliTerminationReason | null = null;
+    if (machine) {
+      try {
+        reason = machine.processEnded({
+          exitCode: end.exitCode,
+          signal: end.signal ?? null,
+          recentOutput: stripAnsiControl(end.recentOutput),
+        });
+        // The dead landing may already have settled the outcome; escalate anyway so the session row shows needsAttention.
+        if (reason !== "completed") machine.escalateToNeedsAttention();
+      } catch {
+        // best-effort transition; the fallback below still settles
+      }
+    }
+    if (!this.settled) {
+      const terminationReason = reason ?? (end.exitCode === 0 && !end.signal ? "userExited" : "crashed");
+      this.finish({
+        kind: terminationReason === "authFailed" ? "auth-failed" : terminationReason === "userExited" ? "user-exited" : "needs-attention",
+        sessionId: this.sessionId,
+        terminationReason,
+      });
     }
   }
 
@@ -549,13 +680,15 @@ export class CliTaskSession {
   private async teardown(): Promise<void> {
     this.unsubscribe?.();
     this.unsubscribe = null;
+    this.unwatchEnd?.();
+    this.unwatchEnd = null;
     try {
       this.hub.flush(this.sessionId);
     } catch {
       // best-effort
     }
     this.hub.invalidate(this.sessionId);
-    await cleanupSessionHookDir(this.hookDir).catch(() => {});
+    if (this.hookDir) await cleanupSessionHookDir(this.hookDir).catch(() => {});
   }
 }
 
