@@ -3,8 +3,9 @@
  * Worktree registry helpers peeled from TaskExecutor (U4 Slice B).
  * Take rootDir/store as injected deps instead of TaskExecutor instance state.
  */
-import { isAbsolute, relative, resolve as resolvePath } from "node:path";
+import { resolve as resolvePath } from "node:path";
 import { exec } from "node:child_process";
+import { isPathInside, isSamePath } from "@fusion/core";
 import { promisify } from "node:util";
 import {
   getRegisteredWorktreePaths,
@@ -16,7 +17,7 @@ const execAsync = promisify(exec);
 /** Failures that should not be retried by the worktree creation loop. */
 export class NonRetryableWorktreeError extends Error {}
 
-/** Check if a path is registered as a git worktree under rootDir. */
+/** Check if a path is registered as a git worktree under rootDir. Throws `WorktreeRegistrationUnknownError` when git cannot list registrations. */
 export async function isRegisteredWorktree(rootDir: string, path: string): Promise<boolean> {
   return isRegisteredGitWorktree(rootDir, path);
 }
@@ -32,15 +33,17 @@ export async function assertWorktreePathNotNested(
   path: string,
   taskId: string,
 ): Promise<void> {
+  /*
+  FNXC:PathIdentity 2026-10-07-19:23:
+  The root and exact-match exemptions compare path identity, not strings: git prints the main checkout in on-disk case while the registered project root may be stored in another case, and win32 `relative` folds case, so a string mismatch made every task path look nested and refused all creation.
+  */
   const target = resolvePath(path);
-  const rootResolved = resolvePath(rootDir);
   const registered = await getRegisteredWorktreePaths(rootDir);
 
   for (const wt of registered) {
-    if (wt === rootResolved) continue; // root is allowed as ancestor
-    if (wt === target) continue; // exact match handled later as "already registered"
-    const rel = relative(wt, target);
-    if (rel && !rel.startsWith("..") && !isAbsolute(rel)) {
+    if (isSamePath(wt, rootDir)) continue; // root is allowed as ancestor
+    if (isSamePath(wt, target)) continue; // exact match handled later as "already registered"
+    if (isPathInside(wt, target)) {
       await store.logEntry(
         taskId,
         `Refusing to create nested worktree`,

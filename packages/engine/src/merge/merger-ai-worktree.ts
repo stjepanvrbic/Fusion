@@ -6,12 +6,12 @@ FNXC:MergerAiSplit 2026-06-25-00:00:
 Keep importing MIN_TEMP_WORKTREE_REAP_AGE_MS from self-healing.js here. Do not reverse the dependency: self-healing owns the stale-temp age policy and merger-ai-worktree only consumes it for pre-merge pruning, preserving the established self-healing import-cycle constraint.
 */
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import type { Settings } from "@fusion/core";
+import { isPathInside, isSamePath, type Settings } from "@fusion/core";
 
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
 import type { RunAuditor } from "../util/run-audit.js";
@@ -93,6 +93,51 @@ function getAiMergeTempSearchRoots(projectRootDir: string, settings?: Settings):
   return Array.from(new Set(roots));
 }
 
+/*
+FNXC:AiMergeTempPrune 2026-10-07-19:23:
+A task-id prefix and an age never authorize recursive deletion. Before any removal a candidate must be a real directory (never a symlink or junction), a direct child of the canonical search root, and owned by THIS repository:
+either its `.git` names an admin entry inside this repository's common git dir, or it sits in a clean-room root contained by the project itself.
+Two repositories can both run task FN-1, and the shared OS temp root holds both; another repository's checkout, or a symlink target outside the roots, is skipped and logged.
+*/
+type AiMergeCandidateVerdict = { owned: true } | { owned: false; reason: string };
+
+async function proveAiMergeCandidateOwnership(input: {
+  candidatePath: string;
+  canonicalPath: string;
+  tempRoot: string;
+  projectRootDir: string;
+  commonGitDir: () => Promise<string | null>;
+}): Promise<AiMergeCandidateVerdict> {
+  try {
+    if (lstatSync(input.candidatePath).isSymbolicLink()) return { owned: false, reason: "symlink or junction" };
+  } catch (err: unknown) {
+    return { owned: false, reason: `unreadable (${getErrorMessage(err)})` };
+  }
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = realpathSync(input.tempRoot);
+  } catch {
+    canonicalRoot = input.tempRoot;
+  }
+  if (!isSamePath(dirname(input.canonicalPath), canonicalRoot)) return { owned: false, reason: "resolves outside its search root" };
+
+  let gitEntry: string | null = null;
+  try {
+    gitEntry = readFileSync(join(input.canonicalPath, ".git"), "utf-8");
+  } catch {
+    gitEntry = null;
+  }
+  const pointer = gitEntry ? /^gitdir:\s*(.+)$/m.exec(gitEntry)?.[1]?.trim() : undefined;
+  if (pointer) {
+    const commonDir = await input.commonGitDir();
+    const adminPath = isAbsolute(pointer) ? pointer : resolve(input.canonicalPath, pointer);
+    if (commonDir && isPathInside(commonDir, adminPath)) return { owned: true };
+    return { owned: false, reason: "its .git names another repository" };
+  }
+  if (isPathInside(input.projectRootDir, input.canonicalPath)) return { owned: true };
+  return { owned: false, reason: "no .git link and outside the project, so its repository is unproven" };
+}
+
 export async function pruneExistingAiMergeWorktrees(
   taskId: string,
   projectRootDir: string,
@@ -104,6 +149,13 @@ export async function pruneExistingAiMergeWorktrees(
 ): Promise<number> {
   const prefix = `fusion-ai-merge-${taskId.toLowerCase()}-`;
   const tempRoots = getAiMergeTempSearchRoots(projectRootDir, settings);
+  let commonGitDirProbe: Promise<string | null> | undefined;
+  const commonGitDir = (): Promise<string | null> => {
+    commonGitDirProbe ??= git(["rev-parse", "--git-common-dir"], projectRootDir, { timeout: 10_000 })
+      .then((out) => (out ? resolve(projectRootDir, out) : null))
+      .catch(() => null);
+    return commonGitDirProbe;
+  };
 
   let pruned = 0;
   let cleanupAttempted = false;
@@ -141,6 +193,7 @@ export async function pruneExistingAiMergeWorktrees(
         continue;
       }
 
+
       try {
         const stat = statSync(canonicalPath);
         const ageMs = Date.now() - stat.mtimeMs;
@@ -150,6 +203,12 @@ export async function pruneExistingAiMergeWorktrees(
         }
       } catch (err: unknown) {
         await log(`AI merge pre-merge prune: failed to stat ${canonicalPath}: ${getErrorMessage(err)} — skipping candidate`);
+        continue;
+      }
+
+      const ownership = await proveAiMergeCandidateOwnership({ candidatePath, canonicalPath, tempRoot, projectRootDir, commonGitDir });
+      if (!ownership.owned) {
+        await log(`AI merge pre-merge prune: skipping ${candidatePath}: ${ownership.reason}`);
         continue;
       }
 

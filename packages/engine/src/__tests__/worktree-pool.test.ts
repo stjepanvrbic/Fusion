@@ -502,7 +502,8 @@ describe("reapOrphanWorktrees", () => {
     expect(mockedRmSync).not.toHaveBeenCalledWith("/root/.worktrees/.fusion-recovery", expect.anything());
   });
 
-  it("reaps a proven dangling .git pointer recursively", async () => {
+  // FNXC:WorktreeOrphanReap 2026-10-07-19:23: a dangling pointer proves the admin entry is gone, not that the files are disposable; only marker-authorized residue is reaped (real-fs coverage in worktree-orphan-residue-reap.test.ts).
+  it("preserves a dangling .git pointer that no deletion-authorized removal marked", async () => {
     mockedReaddirSync.mockReturnValue([makeDirEntry("leaked-wt")] as any);
     mockedLstatSync.mockImplementation((p: any) =>
       (String(p).endsWith("/.git")
@@ -519,8 +520,8 @@ describe("reapOrphanWorktrees", () => {
       secretsEnv: { filename: ".runtime-secrets" },
     } as any);
 
-    expect(removed).toBe(1);
-    expect(mockedRmSync).toHaveBeenCalledWith("/root/.worktrees/leaked-wt", { recursive: true, force: true });
+    expect(removed).toBe(0);
+    expect(mockedRmSync).not.toHaveBeenCalledWith("/root/.worktrees/leaked-wt", expect.anything());
   });
 
   it("skips a dir with a valid .git pointer (admin gitdir exists)", async () => {

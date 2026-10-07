@@ -65,13 +65,14 @@ function commandError(err: unknown): string {
   return String(err);
 }
 
+/**
+ * FNXC:MergeAdvanceSync 2026-10-07-19:23:
+ * A failed listing throws instead of returning an empty list.
+ * Every caller reads an empty list as "clean", so swallowing a timeout or lock error here authorized `reset --hard` over operator edits.
+ */
 async function listFiles(cwd: string, args: string[]): Promise<string[]> {
-  try {
-    const { stdout } = await runGit(args, cwd, 10_000);
-    return stdout.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-  } catch {
-    return [];
-  }
+  const { stdout } = await runGit(args, cwd, 10_000);
+  return stdout.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
 }
 
 /**
@@ -195,11 +196,12 @@ export async function syncWorktreeToHead(input: SyncWorktreeInput): Promise<Sync
     // 2. Save untracked files to the stage dir. Persist the patch alongside
     //    them now (not only on conflict) so a crash between this point and
     //    `git apply` doesn't lose the user's edits.
+    // FNXC:MergeAdvanceSync 2026-10-07-19:23: The on-disk snapshot is the only recovery copy once `reset --hard` runs, so a patch or untracked file that cannot be saved aborts the sync before anything destructive happens.
     if (patch.length > 0) {
       try {
         writeFileSync(patchPath, patch);
-      } catch {
-        // best-effort; patch still lives in memory for the apply attempt
+      } catch (err: unknown) {
+        return { kind: "failed", stage: "snapshot", error: commandError(err) };
       }
     }
     for (const rel of untrackedFiles) {
@@ -208,8 +210,10 @@ export async function syncWorktreeToHead(input: SyncWorktreeInput): Promise<Sync
       try {
         mkdirSync(dirname(dst), { recursive: true });
         copyFileSync(src, dst);
-      } catch {
-        // best-effort; missing / unreadable entries skipped
+      } catch (err: unknown) {
+        // A file deleted since the listing has nothing to lose; an unreadable one does.
+        if (!existsSync(src)) continue;
+        return { kind: "failed", stage: "snapshot", error: commandError(err) };
       }
     }
 
@@ -268,7 +272,7 @@ export async function syncWorktreeToHead(input: SyncWorktreeInput): Promise<Sync
         // Index-staged unmerged paths take priority; fall back to patch-header
         // parsing when git apply failed too early to stage anything (e.g. the
         // patch referenced a file deleted or renamed at the new tip).
-        const stagedConflicts = await listFiles(worktreePath, ["diff", "--name-only", "--diff-filter=U"]);
+        const stagedConflicts = await listFiles(worktreePath, ["diff", "--name-only", "--diff-filter=U"]).catch(() => []);
         conflictedFiles = stagedConflicts.length > 0 ? stagedConflicts : extractFilesFromPatch(patch);
       }
     }
@@ -280,7 +284,18 @@ export async function syncWorktreeToHead(input: SyncWorktreeInput): Promise<Sync
     //    untracked files, so `existsSync(dst)` is true for paths that the
     //    user already had on disk — only the tracked-at-HEAD check
     //    distinguishes a genuine collision from a survivor.
-    const trackedAtHead = new Set(await listFiles(worktreePath, ["ls-tree", "-r", "--name-only", "HEAD"]));
+    // FNXC:MergeAdvanceSync 2026-10-07-19:23: An unreadable HEAD listing cannot prove any path is free of a newly tracked collision, so nothing is restored and the saved copies stay in the stage dir.
+    let trackedAtHead: Set<string>;
+    try {
+      trackedAtHead = new Set(await listFiles(worktreePath, ["ls-tree", "-r", "--name-only", "HEAD"]));
+    } catch (err: unknown) {
+      preserveStageDir = true;
+      return {
+        kind: "failed",
+        stage: "untracked-restore",
+        error: `${commandError(err)}\nUntracked files were not restored; saved copies are in ${untrackedDir}${patch.length > 0 ? ` and edits in ${patchPath}` : ""}.`,
+      };
+    }
     const restored: string[] = [];
     const untrackedSkippedAsTracked: string[] = [];
     for (const rel of untrackedFiles) {

@@ -14,6 +14,7 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { Task, TaskStore, TaskMoveLanes, RunMutationContext } from "@fusion/core";
 import {
   canonicalizeWorktreePath,
+  isSamePath,
   registerArchiveWorkspaceWorktreeDisposer,
   registerArchiveWorktreeDisposer,
   registerTaskMoveDisposer,
@@ -186,7 +187,8 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
     */
     const externalExecutionRoute = await resolveExternalExecutionCheckoutRoute(task);
     if (externalExecutionRoute.configured) return;
-    if (!task.worktree || await canonicalizeWorktreePath(task.worktree) === await canonicalizeWorktreePath(deps.rootDir)) return;
+    // FNXC:PathIdentity 2026-10-07-19:23: Compare by path identity; a case or junction spelling of the root must never be disposed as a task worktree.
+    if (!task.worktree || isSamePath(await canonicalizeWorktreePath(task.worktree), await canonicalizeWorktreePath(deps.rootDir))) return;
     await deps.awaitAbortInFlightTaskWork(task.id, "task archived");
     for (const path of activeSessionRegistry.pathsForTask(task.id)) activeSessionRegistry.unregisterPath(path);
     await deps.removeOwnWorktreeWithReconcile({worktreePath: task.worktree, settings: await deps.store.getSettings(), taskId: task.id, reason: RemovalReason.ExecutorDispose});
@@ -198,7 +200,7 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
     await deps.awaitAbortInFlightTaskWork(task.id, "workspace task archived");
     for (const entry of plan) {
       try {
-        if (await canonicalizeWorktreePath(entry.worktreePath) === await canonicalizeWorktreePath(entry.repoRootDir)) throw new Error("Refusing to remove workspace repository root");
+        if (isSamePath(await canonicalizeWorktreePath(entry.worktreePath), await canonicalizeWorktreePath(entry.repoRootDir))) throw new Error("Refusing to remove workspace repository root");
         activeSessionRegistry.unregisterPath(entry.worktreePath);
         await removeWorktree({worktreePath: entry.worktreePath, rootDir: entry.repoRootDir, settings: await deps.store.getSettings(), taskId: task.id, reason: RemovalReason.ExecutorDispose, force: true});
         /* FNXC:WorkflowLifecycle 2026-07-16-16:00: Archive metadata can contain valid Git refs with shell metacharacters. Pass the ref as an argv value so cleanup never evaluates it as shell code. */

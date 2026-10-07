@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
@@ -112,7 +112,8 @@ describe("FN-009: verifyWorktreeInvariants with missing worktree directory", () 
     const result = await (executor as any).verifyWorktreeInvariants(task);
 
     expect(result).toEqual({ ok: true });
-    expect(store.updateTask).toHaveBeenCalledWith("FN-9004", { worktree: "/repo/.worktrees/gentle-flame" });
+    // Canonical absolute root: identical on POSIX, drive-qualified on win32.
+    expect(store.updateTask).toHaveBeenCalledWith("FN-9004", { worktree: resolve("/repo/.worktrees/gentle-flame") });
   });
 
   it("preserves wrong_toplevel for non-reanchorable mismatch", async () => {

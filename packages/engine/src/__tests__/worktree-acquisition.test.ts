@@ -13,6 +13,7 @@ import * as desktopArtifacts from "../worktree/worktree-desktop-artifacts.js";
 import * as branchConflicts from "../execution/branch-conflicts.js";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
 import { NativeWorktreeBackend } from "../worktree/worktree-backend.js";
+import { markAuthorizedCheckoutResidue } from "../worktree/remove-checkout.js";
 
 
 vi.mock("../worktree/worktree-pool.js", async () => {
@@ -489,8 +490,10 @@ describe("acquireTaskWorktree", () => {
   FNXC:TaskPinnedWorktrees 2026-10-07-15:11:
   On Windows a just-failed removal can leave a lingering handle on the broken pinned folder, so the
   preserve-aside rename fails with EPERM/EBUSY and the KB-003 re-acquire failed forever. The rename now
-  retries with the bounded filesystem backoff; if it still fails and the folder is filesystem-proven
-  residue (no live `.git` link, no independent repository) it is deleted instead, otherwise the error stands.
+  retries with the bounded filesystem backoff.
+
+  FNXC:TaskPinnedWorktrees 2026-10-07-19:23:
+  Failed preservation never grants deletion authority. Only residue a deletion-authorized removal marked is deleted; an unmarked `.git`-less or dangling folder keeps its bytes and acquisition fails with an actionable error.
   */
   it("retries a transient EBUSY preserve-aside rename before recreating", async () => {
     const rootDir = makeRepo();
@@ -522,11 +525,45 @@ describe("acquireTaskWorktree", () => {
     expect(readFileSync(join(recoveryRoot, readdirSync(recoveryRoot)[0], ".build", "cache"), "utf-8")).toBe("stale\n");
   });
 
-  it("deletes proven pinned residue when the preserve-aside rename keeps failing", async () => {
+  const unpreservableShapes: Array<{ label: string; classification: "incomplete" | "unregistered"; seed: (path: string) => void }> = [
+    { label: ".git absent", classification: "incomplete", seed: () => {} },
+    {
+      label: "dangling gitdir pointer",
+      classification: "unregistered",
+      seed: (path) => writeFileSync(join(path, ".git"), `gitdir: ${join(path, "..", "missing-admin", "fn-1")}\n`, "utf-8"),
+    },
+  ];
+  for (const shape of unpreservableShapes) {
+    it(`keeps an unmarked pinned folder (${shape.label}) and fails actionably when it cannot be preserved aside`, async () => {
+      const rootDir = makeRepo();
+      const pinnedPath = join(rootDir, ".worktrees", "fn-1");
+      mkdirSync(join(pinnedPath, "src"), { recursive: true });
+      writeFileSync(join(pinnedPath, "src", "uncommitted.ts"), "agent work\n", "utf-8");
+      shape.seed(pinnedPath);
+      vi.mocked(classifyTaskWorktree).mockResolvedValueOnce({ ok: false, classification: shape.classification, reason: shape.label });
+      const denied = Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+      const renameWorktreeDirectory = vi.fn().mockRejectedValue(denied);
+
+      await expect(acquireTaskWorktree({
+        task: { ...task, worktree: pinnedPath, branch: "fusion/fn-1" },
+        rootDir,
+        store,
+        settings: { worktreeNaming: "task-id", recycleWorktrees: false },
+        renameWorktreeDirectory,
+        filesystemRetrySleep: vi.fn(),
+      })).rejects.toMatchObject({ code: "EPERM", cause: denied, message: expect.stringContaining("Close programs using that folder") });
+
+      expect(renameWorktreeDirectory.mock.calls.length).toBeGreaterThan(1);
+      expect(readFileSync(join(pinnedPath, "src", "uncommitted.ts"), "utf-8")).toBe("agent work\n");
+    });
+  }
+
+  it("deletes marker-authorized pinned residue when the preserve-aside rename keeps failing", async () => {
     const rootDir = makeRepo();
     const pinnedPath = join(rootDir, ".worktrees", "fn-1");
     mkdirSync(join(pinnedPath, "locked"), { recursive: true });
     writeFileSync(join(pinnedPath, "locked", "file.txt"), "stale\n", "utf-8");
+    expect(await markAuthorizedCheckoutResidue(pinnedPath, { taskId: "FN-1", source: "test" })).toBe(true);
     vi.mocked(classifyTaskWorktree).mockResolvedValueOnce({ ok: false, classification: "incomplete", reason: "missing .git metadata" });
     const renameWorktreeDirectory = vi.fn().mockRejectedValue(Object.assign(new Error("operation not permitted"), { code: "EPERM" }));
 
@@ -540,7 +577,6 @@ describe("acquireTaskWorktree", () => {
     });
 
     expect(result).toMatchObject({ worktreePath: pinnedPath, source: "fresh" });
-    expect(renameWorktreeDirectory.mock.calls.length).toBeGreaterThan(1);
     expect(existsSync(join(pinnedPath, "locked", "file.txt"))).toBe(false);
     expect(existsSync(join(pinnedPath, ".git"))).toBe(true);
     expect(store.logEntry).toHaveBeenCalledWith(
@@ -551,7 +587,7 @@ describe("acquireTaskWorktree", () => {
     );
   });
 
-  it("keeps the rename failure when the pinned folder is not proven residue", async () => {
+  it("keeps the rename failure when the pinned folder is an independent repository", async () => {
     const rootDir = makeRepo();
     const pinnedPath = join(rootDir, ".worktrees", "fn-1");
     mkdirSync(join(pinnedPath, ".git"), { recursive: true });
@@ -567,10 +603,11 @@ describe("acquireTaskWorktree", () => {
       settings: { worktreeNaming: "task-id", recycleWorktrees: false },
       renameWorktreeDirectory,
       filesystemRetrySleep: vi.fn(),
-    })).rejects.toBe(denied);
+    })).rejects.toMatchObject({ code: "EPERM", cause: denied });
 
     expect(readFileSync(join(pinnedPath, "work.txt"), "utf-8")).toBe("independent repository\n");
   });
+
 
   it("retains only the newest ten generated orphan directories in the primary recovery root", async () => {
     const rootDir = makeRepo();

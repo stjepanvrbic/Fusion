@@ -7,6 +7,7 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync } from "node:fs";
 import type { Task, TaskStore } from "@fusion/core";
+import { isSamePath } from "@fusion/core";
 import { attemptBranchAutocorrect } from "../execution/branch-autocorrect.js";
 import {
   detectNestedWorktreeRoot,
@@ -178,7 +179,7 @@ export async function verifyWorktreeInvariants(
         const observedTopLevelRaw = stdout.trim();
         if (observedTopLevelRaw) {
           const observedTopLevel = canonicalizePath(observedTopLevelRaw);
-          if (observedTopLevel !== expectedWorktreeRealpath) {
+          if (!isSamePath(observedTopLevel, expectedWorktreeRealpath)) {
             return {
               ok: false,
               reason: "wrong_toplevel",
@@ -305,6 +306,7 @@ export async function verifyWorktreeInvariants(
   }
 
   const expectedRoot = canonicalizePath(deps.rootDir);
+  // FNXC:PathIdentity 2026-10-07-19:23: Top-level, root, and expected-worktree checks compare path identity (isSamePath), never raw strings.
   let expectedWorktreeRealpath: string;
   try {
     expectedWorktreeRealpath = canonicalizePath(worktreePath);
@@ -346,12 +348,12 @@ export async function verifyWorktreeInvariants(
       An operator-routed checkout must match its validated Git top-level exactly. Nested-worktree re-anchoring is reserved for Fusion-managed worktrees and must not widen this ownership boundary.
       */
       const violatesCheckoutBoundary = externalExecutionRoute.configured
-        ? observedTopLevel !== expectedWorktreeRealpath
-        : observedTopLevel === expectedRoot
+        ? !isSamePath(observedTopLevel, expectedWorktreeRealpath)
+        : isSamePath(observedTopLevel, expectedRoot)
           || !isInsideWorktreesDir(deps.rootDir, observedTopLevel, settings)
-          || observedTopLevel !== expectedWorktreeRealpath;
+          || !isSamePath(observedTopLevel, expectedWorktreeRealpath);
       if (violatesCheckoutBoundary) {
-        if (!externalExecutionRoute.configured && allowReanchor && observedTopLevel !== expectedRoot && isInsideWorktreesDir(deps.rootDir, observedTopLevel, settings)) {
+        if (!externalExecutionRoute.configured && allowReanchor && !isSamePath(observedTopLevel, expectedRoot) && isInsideWorktreesDir(deps.rootDir, observedTopLevel, settings)) {
           const reanchor = await detectNestedWorktreeRoot(deps.rootDir, worktreePath, settings);
           if (reanchor.reanchored) {
             await deps.store.updateTask(task.id, { worktree: reanchor.root });

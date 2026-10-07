@@ -1,6 +1,6 @@
 import {execFile} from "node:child_process";
 import {promisify} from "node:util";
-import {canonicalizeWorktreePath, evaluateArchiveTaskLiveness, LiveTaskWorktreeRemovalRefusedError, getArchiveWorkspaceWorktreeDisposer, getArchiveWorktreeDisposer, registerArchiveWorkspaceWorktreeDisposer, registerArchiveWorktreeDisposer, type Settings, type TaskStore} from "@fusion/core";
+import {canonicalizeWorktreePath, isSamePath, evaluateArchiveTaskLiveness, LiveTaskWorktreeRemovalRefusedError, getArchiveWorkspaceWorktreeDisposer, getArchiveWorktreeDisposer, registerArchiveWorkspaceWorktreeDisposer, registerArchiveWorktreeDisposer, type Settings, type TaskStore} from "@fusion/core";
 import {removeWorktree, RemovalReason} from "../worktree/worktree-backend.js";
 
 const execFileAsync = promisify(execFile);
@@ -15,7 +15,8 @@ export function installBaselineArchiveWorktreeDisposer(store: TaskStore, input: 
   const allowLiveRemoval = input.allowLiveRemoval ?? (() => false);
   const unregisterSingle = getArchiveWorktreeDisposer(store) ? () => {} : registerArchiveWorktreeDisposer(store, async (task) => {
     if (!task.worktree) return;
-    if (await canonicalizeWorktreePath(task.worktree) === await canonicalizeWorktreePath(input.rootDir)) return;
+    // FNXC:PathIdentity 2026-10-07-19:23: Root and worktree compare by path identity so a case or junction spelling of the root is never force-removed as a task worktree.
+    if (isSamePath(await canonicalizeWorktreePath(task.worktree), await canonicalizeWorktreePath(input.rootDir))) return;
     /*
     FNXC:WorkflowLifecycle 2026-08-15-06:35:
     This executor-less baseline cannot await in-process abort/session signals. Its durable row check is
@@ -34,7 +35,7 @@ export function installBaselineArchiveWorktreeDisposer(store: TaskStore, input: 
     if (verdict.live && !allowLiveRemoval()) return {removed, failed: plan.map((entry) => ({repoRel: entry.repoRel, error: new LiveTaskWorktreeRemovalRefusedError(task.id, entry.repoRel, entry.worktreePath, verdict.reasons)}))};
     for (const entry of plan) {
       try {
-        if (await canonicalizeWorktreePath(entry.worktreePath) === await canonicalizeWorktreePath(entry.repoRootDir)) throw new Error("Refusing to remove workspace repository root");
+        if (isSamePath(await canonicalizeWorktreePath(entry.worktreePath), await canonicalizeWorktreePath(entry.repoRootDir))) throw new Error("Refusing to remove workspace repository root");
         await removeWorktree({worktreePath: entry.worktreePath, rootDir: entry.repoRootDir, settings: await input.getSettings(), taskId: task.id, reason: RemovalReason.ExecutorDispose, force: true});
         /* FNXC:WorkflowLifecycle 2026-07-16-16:00: Archive metadata can contain valid Git refs with shell metacharacters. Pass the ref as an argv value so cleanup never evaluates it as shell code. */
         await execFileAsync("git", ["branch", "-D", entry.branch], {cwd: entry.repoRootDir, timeout: 120_000, maxBuffer: 10 * 1024 * 1024});

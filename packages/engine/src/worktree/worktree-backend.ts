@@ -1469,13 +1469,21 @@ export async function removeWorktree(input: {
   residue is finished off and reported as a removal. A checkout that is still usable after the failure
   (dirty, locked, foreign) keeps today's throw, so the defensive refusal semantics never weaken.
   */
-  const usableBeforeRemoval = requiresCleanWorktree && existsSync(resolve(input.worktreePath, ".git"));
+  /*
+  FNXC:WorktreeCleanup 2026-10-07-19:23:
+  Explicit force teardown (hard cancel, executor dispose and archive, transient retry, stuck kill, workspace rollback) is deletion authority by itself, so it settles a failure too.
+  A folder that was already `.git`-less or dangling made git exit "is not a working tree"; the error propagated, the archived row kept its pointer, and the residue was never reclaimed.
+  Force still never deletes a folder with a live `gitdir:` link or a `.git` directory: the seam leaves those unresolved and the error propagates.
+  */
+  const forceTeardown = input.force === true && ALLOWED_FORCE_REASONS.has(input.reason);
+  const deletionAuthorized = forceTeardown
+    || (requiresCleanWorktree && existsSync(resolve(input.worktreePath, ".git")));
   const settleFailure = async (error: unknown): Promise<WorktreeRemoveOutcome | null> => {
-    if (!usableBeforeRemoval) return null;
+    if (!deletionAuthorized) return null;
     const settlement = await settleFailedCheckoutRemoval({
       rootDir: input.rootDir,
       worktreePath: input.worktreePath,
-      usableBefore: true,
+      deletionAuthorized: true,
       taskId: input.taskId,
       source: input.postLandingProof?.source ?? input.reason,
       pruneReason: input.postLandingProof ? "post-landing-partial-removal" : "defensive-partial-removal",

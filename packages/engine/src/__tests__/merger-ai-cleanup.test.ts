@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -216,6 +216,14 @@ function historicWorktreesAiMergeDir(projectRoot: string, name: string): string 
 function tempProjectRoot(): string {
   const dir = mkdtempSync(join(tmpdir(), "fusion-ai-merge-project-"));
   tracked.add(dir);
+  git(dir, "init -q -b main");
+  return dir;
+}
+
+/** A shared-temp clean room whose `.git` names an admin entry of `projectRoot`: the shape `git worktree add` leaves behind. */
+function ownedTempAiMergeDir(projectRoot: string, name: string): string {
+  const dir = tempAiMergeDir(name);
+  writeFileSync(join(dir, ".git"), `gitdir: ${join(projectRoot, ".git", "worktrees", name)}\n`);
   return dir;
 }
 
@@ -357,7 +365,7 @@ describe("AI merge temp worktree cleanup", () => {
     const staleNew = localAiMergeDir(projectRoot, "fusion-ai-merge-fn-777-stale-new");
     const staleLegacyRepo = legacyRepoAiMergeDir(projectRoot, "fusion-ai-merge-fn-777-stale-legacy-repo");
     const staleLegacyWorktrees = historicWorktreesAiMergeDir(projectRoot, "fusion-ai-merge-fn-777-stale-legacy-worktrees");
-    const staleLegacyTmp = tempAiMergeDir("fusion-ai-merge-fn-777-stale-tmp");
+    const staleLegacyTmp = ownedTempAiMergeDir(projectRoot, "fusion-ai-merge-fn-777-stale-tmp");
     for (const stale of [staleNew, staleLegacyRepo, staleLegacyWorktrees, staleLegacyTmp]) {
       makeAge(stale, MIN_TEMP_WORKTREE_REAP_AGE_MS + 1_000);
     }
@@ -467,7 +475,7 @@ describe("AI merge temp worktree cleanup", () => {
 
   it("retries the pre-merge filesystem fallback without bypassing stale-path pruning", async () => {
     const projectRoot = tempProjectRoot();
-    const stale = tempAiMergeDir("fusion-ai-merge-fn-9169-premerge-retry");
+    const stale = ownedTempAiMergeDir(projectRoot, "fusion-ai-merge-fn-9169-premerge-retry");
     makeAge(stale, MIN_TEMP_WORKTREE_REAP_AGE_MS + 1_000);
     const canonical = realpathSync(stale);
     fsState.rmFailurePath = canonical;
@@ -485,7 +493,7 @@ describe("AI merge temp worktree cleanup", () => {
 
   it("treats a pre-merge registered-but-missing clean room as idempotent without retrying", async () => {
     const projectRoot = tempProjectRoot();
-    const stale = tempAiMergeDir("fusion-ai-merge-fn-9169-premerge-r1");
+    const stale = ownedTempAiMergeDir(projectRoot, "fusion-ai-merge-fn-9169-premerge-r1");
     makeAge(stale, MIN_TEMP_WORKTREE_REAP_AGE_MS + 1_000);
     const canonical = realpathSync(stale);
     const registeredMissing = Object.assign(new Error(`fatal: '${canonical}' is not a working tree`), { code: "1" });
@@ -508,7 +516,7 @@ describe("AI merge temp worktree cleanup", () => {
 
   it("records a residual pre-merge clean room after bounded retries", async () => {
     const projectRoot = tempProjectRoot();
-    const stale = tempAiMergeDir("fusion-ai-merge-fn-9169-premerge-r3");
+    const stale = ownedTempAiMergeDir(projectRoot, "fusion-ai-merge-fn-9169-premerge-r3");
     makeAge(stale, MIN_TEMP_WORKTREE_REAP_AGE_MS + 1_000);
     const canonical = realpathSync(stale);
     fsState.rmFailurePath = canonical;
@@ -524,6 +532,52 @@ describe("AI merge temp worktree cleanup", () => {
     expect(events).toEqual(expect.arrayContaining([
       expect.objectContaining({ metadata: expect.objectContaining({ phase: "pre-merge-prune", success: false, attempts, residual: true, registrationRetained: true, code: "EBUSY" }) }),
     ]));
+  });
+
+  /*
+  FNXC:AiMergeTempPrune 2026-10-07-19:23:
+  A task-id prefix and an age never authorize deletion: two repositories share the OS temp root and may both run FN-777.
+  Only real directories, directly under their search root, owned by this repository are pruned.
+  */
+  it("never prunes another repository's same-task clean room from the shared temp root", async () => {
+    const projectRoot = tempProjectRoot();
+    const otherRepo = tempProjectRoot();
+    const foreign = ownedTempAiMergeDir(otherRepo, "fusion-ai-merge-fn-777-foreign");
+    writeFileSync(join(foreign, "work.txt"), "repository B\n");
+    makeAge(foreign, MIN_TEMP_WORKTREE_REAP_AGE_MS + 1_000);
+    const logs: string[] = [];
+
+    await expect(pruneExistingAiMergeWorktrees("FN-777", projectRoot, makeAudit().audit, vi.fn(async (message: string) => { logs.push(message); }))).resolves.toBe(0);
+
+    expect(readFileSync(join(foreign, "work.txt"), "utf-8")).toBe("repository B\n");
+    expect(logs.join("\n")).toContain("names another repository");
+    expect(childState.execFileCalls.some((args) => args[0] === "worktree" && args[1] === "remove")).toBe(false);
+  });
+
+  it("never prunes a metadata-less same-task folder outside the project", async () => {
+    const projectRoot = tempProjectRoot();
+    const legacy = tempAiMergeDir("fusion-ai-merge-fn-777-legacy");
+    writeFileSync(join(legacy, "work.txt"), "unknown owner\n");
+    makeAge(legacy, MIN_TEMP_WORKTREE_REAP_AGE_MS + 1_000);
+
+    await expect(pruneExistingAiMergeWorktrees("FN-777", projectRoot, makeAudit().audit, vi.fn(async () => undefined))).resolves.toBe(0);
+
+    expect(readFileSync(join(legacy, "work.txt"), "utf-8")).toBe("unknown owner\n");
+  });
+
+  it("never follows a same-task symlink or junction to its target", async () => {
+    const projectRoot = tempProjectRoot();
+    const target = mkdtempSync(join(tmpdir(), "fusion-ai-merge-symlink-target-"));
+    tracked.add(target);
+    writeFileSync(join(target, "precious.txt"), "outside every root\n");
+    const link = join(tmpdir(), `fusion-ai-merge-fn-777-link-${process.pid}-${Date.now()}`);
+    symlinkSync(target, link, "junction");
+    tracked.add(link);
+    makeAge(target, MIN_TEMP_WORKTREE_REAP_AGE_MS + 1_000);
+
+    await expect(pruneExistingAiMergeWorktrees("FN-777", projectRoot, makeAudit().audit, vi.fn(async () => undefined))).resolves.toBe(0);
+
+    expect(readFileSync(join(target, "precious.txt"), "utf-8")).toBe("outside every root\n");
   });
 
   it("pruneExistingAiMergeWorktrees skips too-new same-task directories", async () => {
@@ -586,7 +640,7 @@ describe("AI merge temp worktree cleanup", () => {
   it("runAiMerge calls pre-merge prune before creating worktree", async () => {
     const taskId = "FN-777";
     const { dir } = initRepoWithBranch(taskId);
-    const orphan = tempAiMergeDir("fusion-ai-merge-fn-777-orphan");
+    const orphan = ownedTempAiMergeDir(dir, "fusion-ai-merge-fn-777-orphan");
     makeAge(orphan, MIN_TEMP_WORKTREE_REAP_AGE_MS + 1_000);
     const { store, audits } = makeStore(taskId);
 
