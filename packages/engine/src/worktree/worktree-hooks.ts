@@ -129,7 +129,8 @@ async function resolveGitPath(worktreePath: string, gitPath: string): Promise<st
  *
  * FNXC:WorktreeHooks 2026-10-07-20:25:
  * `git commit --amend -m` must be allowed on every OS. Under Git for Windows the hook's parent is the native git.exe, invisible to `ps` and `/proc`, so every reword was refused as empty.
- * The parent command line now also resolves through the shell's Windows pid, and the amend check runs only once the staged diff is empty, so ordinary commits never pay for that lookup.
+ * A commit whose exported author line differs from HEAD's is not an amend; a matching one is settled by resolving git.exe's command line through the shell's Windows pid.
+ * The amend check runs only once the staged diff is empty, so ordinary commits never pay for it.
  */
 export function buildPrepareCommitMsgEmptyGuardHook(taskId: string): string {
   return `#!/bin/sh
@@ -175,10 +176,15 @@ fi
 #   - Alpine/busybox 'ps' may not support '-o args='; fall back to
 #     /proc/$PPID/cmdline (Linux including busybox).
 #   - Git for Windows runs hooks in an msys shell whose parent is the native
-#     git.exe, so $PPID is 1 and neither source can see it. The shell's
-#     Windows pid (/proc/$$/winpid) leads to the parent's command line
-#     through CIM. That costs a PowerShell start, which is why this runs only
-#     after the staged diff proved empty.
+#     git.exe, so $PPID is 1 and neither source can see it. git exports the
+#     commit's author to the hook, and an amend keeps HEAD's author line
+#     verbatim while a new commit is authored now, so a different author line
+#     proves this is not an amend. A matching line (an amend, or a new commit
+#     in the same second) is settled exactly: the shell's Windows pid
+#     (/proc/$$/winpid) leads to git.exe's command line through CIM. That
+#     costs a PowerShell start, so it runs only after the staged diff proved
+#     empty and the author line matched. If the lookup is unavailable, the
+#     matching author line is taken as the amend it almost always is.
 #
 # Matching: tokenize PARENT_CMD by whitespace and require an EXACT '--amend'
 # token APPEARING BEFORE the first message-supplying flag ('-m', '-F',
@@ -194,14 +200,19 @@ if [ -z "$PARENT_CMD" ] && [ -r "/proc/$PPID/cmdline" ]; then
   PARENT_CMD=$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null || echo "")
 fi
 if [ -z "$PARENT_CMD" ] && [ -r "/proc/$$/winpid" ]; then
-  WINPID=$(cat "/proc/$$/winpid" 2>/dev/null || echo "")
-  case "$WINPID" in
-    ''|*[!0-9]*) ;;
-    *)
-      PS_SCRIPT='$p=(Get-CimInstance Win32_Process -Filter "ProcessId='"$WINPID"'").ParentProcessId; (Get-CimInstance Win32_Process -Filter "ProcessId=$p").CommandLine'
-      PARENT_CMD=$(powershell.exe -NoProfile -NonInteractive -Command "$PS_SCRIPT" 2>/dev/null | tr -d '\\r' || echo "")
-      ;;
-  esac
+  HEAD_AUTHOR=$(git cat-file commit HEAD 2>/dev/null | sed -n '/^$/q;s/^author //p' || echo "")
+  AUTHOR_DATE="\${GIT_AUTHOR_DATE:-}"
+  if [ -n "$HEAD_AUTHOR" ] && [ "$HEAD_AUTHOR" = "\${GIT_AUTHOR_NAME:-} <\${GIT_AUTHOR_EMAIL:-}> \${AUTHOR_DATE#@}" ]; then
+    WINPID=$(cat "/proc/$$/winpid" 2>/dev/null || echo "")
+    case "$WINPID" in
+      ''|*[!0-9]*) ;;
+      *)
+        PS_SCRIPT='$p=(Get-CimInstance Win32_Process -Filter "ProcessId='"$WINPID"'").ParentProcessId; (Get-CimInstance Win32_Process -Filter "ProcessId=$p").CommandLine'
+        PARENT_CMD=$(powershell.exe -NoProfile -NonInteractive -Command "$PS_SCRIPT" 2>/dev/null | tr -d '\\r' || echo "")
+        ;;
+    esac
+    [ -n "$PARENT_CMD" ] || exit 0
+  fi
 fi
 for tok in $PARENT_CMD; do
   case "$tok" in
