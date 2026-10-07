@@ -36,6 +36,7 @@ import {assertSafeGitBranchName} from "../task-store/shell-safety.js";
 import {isFusionDeletableBranch} from "../branch/branch-assignment.js";
 import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction, resolveActiveTaskWedgeEpisodeRow} from "../task-store/async/async-persistence.js";
 import {findArchivedTaskEntry, upsertArchivedTaskEntry} from "./async/async-archive-lineage.js";
+import {isPathInside} from "../fs/path-identity.js";
 import { appendPatchnodeEntry } from "./async/async-patchnode.js";
 import { buildPatchnodeEntryInput } from "../board/patchnode.js";
 import { resolveProjectColumnsForRoles } from "../project-lane-vocabulary.js";
@@ -1811,39 +1812,65 @@ export async function cleanupArchivedTasksImpl(store: TaskStore): Promise<string
     const patchnodeCompleteColumns = await resolveProjectColumnsForRoles(store, ["complete"])
       .catch(() => new Set<string>());
 
+    /*
+    FNXC:ArchiveCleanup 2026-10-07-21:40:
+    Cold storage is the authoritative terminal snapshot and housekeeping must never degrade it. Rebuilding the entry from the
+    soft-deleted row overwrote its pre-archive column with the archive marker and its log with one line, so a later unarchive
+    restored a card archived mid-flight to the complete lane. An existing entry is now kept as written by archiveTask.
+    archiveTask always writes that entry in the same transaction as its soft-delete, so a marker row with no entry is a
+    deleteTask tombstone, not an archive, and is left in place.
+    Each task is isolated: a failure is logged and the sweep moves on. The directory is removed only inside this store's
+    tasks root, with Node's transient-error retry, and residue after the row is gone is logged rather than thrown.
+    */
     for (const row of archivedRows) {
       const task = store.rowToTask(store.pgRowToTaskRow(row));
       const dir = store.taskDir(task.id);
-      /*
-      FNXC:PatchnodeLedger 2026-08-28-12:16:
-      A pre-Patchnode archived row reaches its last surviving summary here. Consult the existing cold snapshot before rewriting it, and leave the row intact when capture fails so a later cleanup can retry instead of hard-deleting the only evidence.
-      */
-      const existingEntry = await findArchivedTaskEntry(layer.db, task.id, layer.projectId);
-      if (
-        patchnodeCompleteColumns.has(existingEntry?.preArchiveColumn ?? "")
-        && task.columnMovedAt
-        && Number.isFinite(Date.parse(task.columnMovedAt))
-      ) {
+      try {
+        const existingEntry = await findArchivedTaskEntry(layer.db, task.id, layer.projectId);
+        if (!existingEntry) continue;
+        /*
+        FNXC:PatchnodeLedger 2026-08-28-12:16:
+        A pre-Patchnode archived row reaches its last surviving summary here. Consult the existing cold snapshot before rewriting it, and leave the row intact when capture fails so a later cleanup can retry instead of hard-deleting the only evidence.
+        */
+        if (
+          patchnodeCompleteColumns.has(existingEntry.preArchiveColumn ?? "")
+          && task.columnMovedAt
+          && Number.isFinite(Date.parse(task.columnMovedAt))
+        ) {
+          try {
+            await appendPatchnodeEntry(layer, buildPatchnodeEntryInput(task, "completed", task.columnMovedAt));
+          } catch (error) {
+            storeLog.warn(`[patchnode] skipping archived cleanup after capture failure for ${task.id}`, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            continue;
+          }
+        }
+
+        await purgeTaskWorkflowSelectionRowsAsyncImpl(store, task.id);
+        await layer.db
+          .delete(schema.project.tasks)
+          .where(and(eq(schema.project.tasks.projectId, projectId), eq(schema.project.tasks.id, task.id)));
+      } catch (error) {
+        storeLog.warn("archived-task cleanup skipped a task after a failure", {
+          phase: "cleanupArchivedTasks",
+          taskId: task.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+
+      if (isPathInside(store.tasksDir, dir) && existsSync(dir)) {
         try {
-          await appendPatchnodeEntry(layer, buildPatchnodeEntryInput(task, "completed", task.columnMovedAt));
+          await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
         } catch (error) {
-          storeLog.warn(`[patchnode] skipping archived cleanup after capture failure for ${task.id}`, {
+          storeLog.warn("archived-task directory removal left residue after the row was removed", {
+            phase: "cleanupArchivedTasks:task-dir",
+            taskId: task.id,
+            taskDir: dir,
             error: error instanceof Error ? error.message : String(error),
           });
-          continue;
         }
-      }
-      // Guarantee a cold-storage snapshot before the destructive delete.
-      const entry = await store.taskToArchiveEntry(task, task.deletedAt ?? new Date().toISOString());
-      await upsertArchivedTaskEntry(layer.db, entry, layer.projectId);
-
-      await purgeTaskWorkflowSelectionRowsAsyncImpl(store, task.id);
-      await layer.db
-        .delete(schema.project.tasks)
-        .where(and(eq(schema.project.tasks.projectId, projectId), eq(schema.project.tasks.id, task.id)));
-
-      if (existsSync(dir)) {
-        await rm(dir, { recursive: true, force: true });
       }
       if (store.isWatching) {
         store.taskCache.delete(task.id);
