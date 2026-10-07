@@ -54,7 +54,7 @@ import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
 import {getActivityLog as getActivityLogAsync} from "../task-store/async/async-audit.js";
 import {insertArtifactRow as insertArtifactRowAsync} from "../task-store/async/async-comments-attachments.js";
 import {appendConfigurationRevision, createConfigurationRevision, getConfigurationRevision, rollbackConfiguration} from "../async-stores/async-configuration-revision-store.js";
-import {readProjectConfig, writeProjectConfig} from "./async/async-settings.js";
+import {readProjectConfig, readProjectConfigForUpdate, writeProjectConfig} from "./async/async-settings.js";
 import {publishSettingsUpdated} from "./settings-ops.js";
 import {loadWorkspaceConfig} from "../git/git-repository.js";
 import { mergeRestoredProjectSettings } from "../config/settings-schema.js";
@@ -1241,11 +1241,17 @@ export async function updateWorkflowSettingValuesImpl(store: TaskStore, workflow
 FNXC:ConfigVersioning 2026-08-09-04:09:
 Exact project restores must retain the live heartbeat: new snapshots omit it while legacy snapshots can carry stale values that fabricate downtime. Extraction makes the same-transaction restore contract directly testable.
 */
+/*
+FNXC:ConfigVersioning 2026-10-07-21:40:
+The rollback's `before` snapshot and its replacement must describe one serialized state. A plain read let a concurrent
+settings write commit between them, so the revision recorded a stale `before`. readProjectConfigForUpdate holds the config
+row lock for the rest of the transaction; updateSettings takes the same lock, so it waits for the rollback to commit.
+*/
 export function createProjectSettingsRollbackSnapshotOps(layer: AsyncDataLayer, tx: DbTransaction) {
   return {
-    readCurrent: async () => (await readProjectConfig(layer, tx)).settings ?? {},
+    readCurrent: async () => (await readProjectConfigForUpdate(layer, tx)).settings ?? {},
     replace: async (snapshot: unknown) => {
-      const live = (await readProjectConfig(layer, tx)).settings ?? {};
+      const live = (await readProjectConfigForUpdate(layer, tx)).settings ?? {};
       await writeProjectConfig(layer, mergeRestoredProjectSettings(snapshot as Record<string, unknown>, live), undefined, tx);
     },
   };
