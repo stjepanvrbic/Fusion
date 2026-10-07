@@ -29,7 +29,7 @@ import {validateSettingValuePatch, WorkflowSettingRejectionError} from "../workf
 import "../builtin-traits.js";
 import {toJson} from "../db/db.js";
 import {resolveSameAgentDuplicateIntake} from "./task-creation.js";
-import {type TaskRow, TASK_COLUMN_DESCRIPTORS} from "../task-store/persistence.js";
+import {type TaskRow} from "../task-store/persistence.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {assertSafeGitBranchName} from "../task-store/shell-safety.js";
 import {isFusionDeletableBranch} from "../branch/branch-assignment.js";
@@ -60,6 +60,7 @@ import type {ConfigChangedBy, ConfigurationRevision} from "../types.js";
 import { resolveArchivedLanes } from "../project-lane-vocabulary.js";
 import { invalidateSupersededRepositoryScopeReviews } from "../tasks/repository-scope.js";
 import { TaskAtomicPersistGuardRefusedError, type TaskAtomicPersistFence } from "./project-store-ops.js";
+import { rememberTaskRowBaseline, taskRowBaselineOf, TaskWriteConflictError } from "./task-row-merge.js";
 import { STALE_REVIEW_CALLBACK_WAIVER_ACTOR, STALE_REVIEW_CALLBACK_WAIVER_POLICY_VERSION, STALE_REVIEW_CALLBACK_WAIVER_REASON, type StaleReviewCallbackWaiverReceipt } from "../merge/pre-merge-approval.js";
 import { deriveStaleReviewCallbackAttemptId } from "../workflows/workflow-step-results.js";
 
@@ -109,20 +110,6 @@ export function getTaskSelectClauseWithActivityLogLimitImpl(store: TaskStore, li
     return [...columns, limitedLog].join(", ");
   }
 
-export function getChangedTaskColumnsImpl(store: TaskStore, existingRow: TaskRow, task: Task): Set<keyof TaskRow> {
-    const nextValues = store.getTaskPersistValues(task, existingRow);
-    const changedColumns = new Set<keyof TaskRow>();
-    for (const [index, descriptor] of TASK_COLUMN_DESCRIPTORS.entries()) {
-      if (descriptor.column === "updatedAt") {
-        continue;
-      }
-      if (!Object.is(existingRow[descriptor.column], nextValues[index])) {
-        changedColumns.add(descriptor.column);
-      }
-    }
-    return changedColumns;
-  }
-
 export function getSoftDeletedWriteConflictImpl(store: TaskStore, id: string, task: Task, existingRow?: TaskRow): string | undefined {
     const existing = existingRow ?? store.readTaskRowFromDb(id, { includeDeleted: true });
     if (!existing?.deletedAt || task.deletedAt !== undefined) {
@@ -147,7 +134,9 @@ export async function readTaskJsonImpl(store: TaskStore, dir: string): Promise<T
       if (pgRow.deletedAt) {
         throw new TaskDeletedError(id, pgRow.deletedAt as string);
       }
-      return store.rowToTask(store.pgRowToTaskRow(pgRow));
+      // FNXC:TaskRowConcurrency 2026-10-07-21:40: the read row is the baseline a later write of this snapshot merges against.
+      const taskRow = store.pgRowToTaskRow(pgRow);
+      return rememberTaskRowBaseline(store.rowToTask(taskRow), taskRow);
     }
     const filePath = join(dir, "task.json");
     const raw = await readFile(filePath, "utf-8");
@@ -389,18 +378,32 @@ export async function renewCheckoutLeaseImpl(store: TaskStore, taskId: string, u
     return current;
 }
 
+/** Updater runs per updateTaskAtomic call before a persistent cross-process conflict is surfaced to the caller. */
+const UPDATE_TASK_ATOMIC_MAX_ATTEMPTS = 5;
+
 export async function updateTaskAtomicImpl(store: TaskStore, id: string, updater: ( current: Task, ) => Parameters<TaskStore["updateTask"]>[1] | null | undefined | Promise<Parameters<TaskStore["updateTask"]>[1] | null | undefined>, runContext?: RunMutationContext, shouldPersist?: () => boolean, persistFence?: TaskAtomicPersistFence,): Promise<Task> {
+    /*
+    FNXC:TaskRowConcurrency 2026-10-07-21:40:
+    withTaskLock orders callers inside this store only. An updater computes its patch from `current`, so a column another
+    process changed after that read makes the patch stale (two increments of one counter would land as one). The write
+    refuses with TaskWriteConflictError when a column it writes moved since `current`, and the updater re-runs on a fresh
+    read, a bounded number of times.
+    */
     return store.withTaskLock(id, async () => {
-      const current = await store.readTaskJson(store.taskDir(id));
-      const updates = await updater(current);
-      if (!updates || Object.values(updates).every((value) => value === undefined)) {
-        return current;
-      }
-      try {
-        return await store.updateTaskUnlocked(id, updates, runContext, shouldPersist, persistFence);
-      } catch (error) {
-        if (error instanceof TaskAtomicPersistGuardRefusedError) return current;
-        throw error;
+      for (let attempt = 1; ; attempt++) {
+        const current = await store.readTaskJson(store.taskDir(id));
+        const updates = await updater(current);
+        if (!updates || Object.values(updates).every((value) => value === undefined)) {
+          return current;
+        }
+        const observedRow = taskRowBaselineOf(current);
+        try {
+          return await store.updateTaskUnlocked(id, updates, runContext, shouldPersist, persistFence, observedRow ? { observedRow } : undefined);
+        } catch (error) {
+          if (error instanceof TaskAtomicPersistGuardRefusedError) return current;
+          if (error instanceof TaskWriteConflictError && attempt < UPDATE_TASK_ATOMIC_MAX_ATTEMPTS) continue;
+          throw error;
+        }
       }
     });
   }

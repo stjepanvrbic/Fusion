@@ -134,7 +134,7 @@ import { getTaskCommitAssociationsByLineageIdImpl, replaceLegacyTaskCommitAssoci
 import { findRecentTasksBySourceParentTaskIdImpl } from "./task-store/branch-and-pr-entities.js";
 import { addTaskCommentImpl, applyBuiltInPromptOverridesAsyncImpl, applyBuiltInPromptOverridesSyncImpl, areAllDependenciesDoneImpl, artifactStoredNameImpl, assertWorkflowIrTraitsValidImpl, clearActivityLogImpl, clearTaskWorkflowSelectionImpl, deleteTaskByIdImpl, getDefaultWorkflowIdImpl, resolveOriginWorkflowOverrideIdImpl, type TaskOriginWorkflowKind, getInsightStoreImpl, getMergeQueuedTaskIdsImpl, getMergeRequestRecordImpl, getMergeRequestRecordAsyncImpl, getMergeRequestRecordsAsyncImpl, getResearchStoreImpl, getTaskIdFromDirImpl, getTodoStoreImpl, getWorkflowWorkItemByIdentityImpl, hasActiveTaskImpl, invalidateConfigCacheAfterMigrationImpl, isTaskIdConflictErrorImpl, listLegacyAutoMergeStampCandidatesImpl, readTaskRowFromDbImpl, recordBranchGroupMemberLandedImpl, refreshDatabaseHealthAsyncImpl, refreshDatabaseHealthImpl, resolveTaskCustomFieldDefsSyncImpl, resolveWorkflowBypassGuardsImpl, serializeConfigForDiskImpl, setPluginWorkflowStepTemplatesImpl, shouldSkipWorkflowMovePoliciesImpl, suppressWatcherImpl, upsertTaskWithFtsRecoveryImpl } from "./task-store/task-store-helpers.js";
 import { getTaskSelectClauseImpl2, createTaskPersistSerializationContextImpl, getTaskPersistValuesImpl, getTaskPatchDescriptorsImpl, normalizeTaskFromDiskImpl, writeTaskJsonFileImpl, rowToPrEntityImpl, generatePrEntityIdImpl, readTaskForMoveImpl, rowToMergeQueueEntryImpl, rowToMergeRequestRecordImpl, rowToCompletionHandoffMarkerImpl, rowToWorkflowWorkItemImpl, rowToRunAuditEventImpl } from "./task-store/task-row-mappers.js";
-import { getTaskSelectClauseWithActivityLogLimitImpl, getChangedTaskColumnsImpl, getSoftDeletedWriteConflictImpl, readTaskJsonImpl, writeConfigImpl, _maybeAutoArchiveSameAgentDuplicateBackendImpl, updateBranchGroupImpl, updatePrEntityImpl, listTasksForGithubTrackingReconcileImpl, listTasksForGitlabTrackingReconcileImpl, renewCheckoutLeaseImpl, updateTaskAtomicImpl, updateWorkflowStepResultsFencedImpl, updateWorkflowStepResultsWithLogFencedImpl, issueStaleReviewCallbackWaiverImpl, linkTaskRecommendationImpl, normalizeWorkspaceTaskWorktreeMetadataImpl, mergeWorkspaceWorktreeEntryImpl, updateTaskRepositoryScopeImpl, updateWorkspaceReviewStateImpl, publishWorkspaceCodeReviewEvidenceImpl, resolveTaskWedgeNotificationEpisodeImpl, getWorkflowPromptOverridesImpl, updateWorkflowSettingValuesImpl, rollbackConfigurationImpl, cancelActiveWorkflowWorkItemsForTaskImpl, setCompletionHandoffAcceptedMarkerImpl, reconcileLegacyAutoMergeStampsImpl, recoverExpiredMergeQueueLeasesImpl, rewriteDependentsForRemovalImpl, cleanupBranchForTaskImpl, addAttachmentImpl, deleteAttachmentImpl, registerArtifactImpl, updatePrInfoImpl, unlinkGithubIssueImpl, cleanupArchivedTasksImpl, generatePromptFromArchiveEntryImpl, listWorkflowOccupantTaskIdsImpl, listApprovedCliAutonomyAdaptersImpl, closeImpl, getActivityLogImpl } from "./task-store/task-mutation-ops.js";
+import { getTaskSelectClauseWithActivityLogLimitImpl, getSoftDeletedWriteConflictImpl, readTaskJsonImpl, writeConfigImpl, _maybeAutoArchiveSameAgentDuplicateBackendImpl, updateBranchGroupImpl, updatePrEntityImpl, listTasksForGithubTrackingReconcileImpl, listTasksForGitlabTrackingReconcileImpl, renewCheckoutLeaseImpl, updateTaskAtomicImpl, updateWorkflowStepResultsFencedImpl, updateWorkflowStepResultsWithLogFencedImpl, issueStaleReviewCallbackWaiverImpl, linkTaskRecommendationImpl, normalizeWorkspaceTaskWorktreeMetadataImpl, mergeWorkspaceWorktreeEntryImpl, updateTaskRepositoryScopeImpl, updateWorkspaceReviewStateImpl, publishWorkspaceCodeReviewEvidenceImpl, resolveTaskWedgeNotificationEpisodeImpl, getWorkflowPromptOverridesImpl, updateWorkflowSettingValuesImpl, rollbackConfigurationImpl, cancelActiveWorkflowWorkItemsForTaskImpl, setCompletionHandoffAcceptedMarkerImpl, reconcileLegacyAutoMergeStampsImpl, recoverExpiredMergeQueueLeasesImpl, rewriteDependentsForRemovalImpl, cleanupBranchForTaskImpl, addAttachmentImpl, deleteAttachmentImpl, registerArtifactImpl, updatePrInfoImpl, unlinkGithubIssueImpl, cleanupArchivedTasksImpl, generatePromptFromArchiveEntryImpl, listWorkflowOccupantTaskIdsImpl, listApprovedCliAutonomyAdaptersImpl, closeImpl, getActivityLogImpl } from "./task-store/task-mutation-ops.js";
 import { getOrCreateForProjectImpl, listGoalCitationsImpl, atomicWriteTaskJsonWithAuditImpl, type PlanningDependencyInvalidation, type TaskAtomicPersistFence, duplicateTaskImpl, listStrandedRefinementsImpl, tryClaimCheckoutImpl, evaluateWorkflowMovePoliciesImpl, recordRunAuditEventImpl, getRunAuditEventsImpl, dequeueMergeQueueOnColumnExitImpl, updateIssueInfoImpl, listWorkflowStepsImpl, getWorkflowStepImpl, createWorkflowDefinitionImpl, countActiveInCapacitySlotSyncImpl, countActiveInCapacitySlotAsyncImpl, generateSpecifiedPromptImpl, recordActivityImpl, getEvalStoreImpl } from "./task-store/project-store-ops.js";
 import { markLegacyAutoMergeStampsOnceImpl, appendAgentLogImpl, importLegacyAgentLogsImpl, cleanupNoOpTaskMovedActivityRowsOnceImpl, backfillCommitAssociationDiffStatsImpl } from "./task-store/workflow-integrity.js";
 import { saveWorkflowRunBranchImpl, clearNearDuplicateReferencesToImpl, selectNextTaskForAgentImpl, pauseTaskImpl, clearLinkedAgentTaskIdsImpl, listArtifactsImpl, rehomeOccupantImpl, type RehomeOccupantResult } from "./task-store/branch-group-ops.js";
@@ -167,6 +167,7 @@ import { updateSettingsImpl, updateGlobalSettingsImpl } from "./task-store/setti
 import { createTaskBackendImpl, _createTaskInternalBackendImpl, createTaskImpl, createTaskWithReservedIdImpl, _createTaskInternalImpl, _maybeAutoArchiveSameAgentDuplicateImpl } from "./task-store/task-creation.js";
 import { getTaskImpl, listTasksImpl, searchTasksImpl, listTasksModifiedSinceImpl, getTaskVerificationRequestAsyncImpl, listTaskRecommendationsImpl, findTaskByProposalClaimIdImpl, listTasksBySourceLineageImpl, type ListTasksOptions } from "./task-store/reads.js";
 import { updateTaskUnlockedImpl } from "./task-store/task-update.js";
+import type { TaskRowWriteOptions } from "./task-store/task-row-merge.js";
 import { __setTaskActivityLogLimitsForTesting } from "./task-store/comments.js";
 import { columnsWithFlag, declaresAnyLifecycleTrait, resolveLifecycleColumns, resolveReviewColumns, type LifecycleColumns } from "./workflows/workflow-lifecycle-traits.js";
 import { isReviewColumnRole, isTerminalColumnRole, isWipColumnRole } from "./column-roles.js";
@@ -922,9 +923,6 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public getTaskPatchDescriptors(changedColumns: Iterable<keyof TaskRow>): TaskColumnDescriptor[] {
     return getTaskPatchDescriptorsImpl(this, changedColumns);
   }
-  public getChangedTaskColumns(existingRow: TaskRow, task: Task): Set<keyof TaskRow> {
-    return getChangedTaskColumnsImpl(this, existingRow, task);
-  }
   public patchTaskRowInTransaction( id: string, task: Task, changedColumns: Iterable<keyof TaskRow>, existingRow?: TaskRow, ): { deletedAt?: string; current?: Task } {
     return patchTaskRowInTransactionImpl(this, id, task, changedColumns, existingRow);
   }
@@ -1229,8 +1227,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     }
     return queryPatchnodeEntries(this.asyncLayer, query);
   }
-  public async atomicWriteTaskJsonWithAudit( dir: string, task: Task, auditInput?: RunAuditEventInput, planningInvalidation?: PlanningDependencyInvalidation, specPlanPrompt?: string, shouldPersist?: () => boolean, persistFence?: TaskAtomicPersistFence, ): Promise<void> {
-    return atomicWriteTaskJsonWithAuditImpl(this, dir, task, auditInput, planningInvalidation, specPlanPrompt, shouldPersist, persistFence);
+  public async atomicWriteTaskJsonWithAudit( dir: string, task: Task, auditInput?: RunAuditEventInput, planningInvalidation?: PlanningDependencyInvalidation, specPlanPrompt?: string, shouldPersist?: () => boolean, persistFence?: TaskAtomicPersistFence, writeOptions?: TaskRowWriteOptions, ): Promise<void> {
+    return atomicWriteTaskJsonWithAuditImpl(this, dir, task, auditInput, planningInvalidation, specPlanPrompt, shouldPersist, persistFence, writeOptions);
   }
   /*
   FNXC:TaskTiming 2026-07-15-00:00:
@@ -2461,8 +2459,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async rollbackConfiguration(revisionId: string, changedBy?: import("./types.js").ConfigChangedBy): Promise<import("./types.js").ConfigurationRevision> {
     return rollbackConfigurationImpl(this, revisionId, changedBy);
   }
-  public async updateTaskUnlocked( id: string, updates: Parameters<TaskStore["updateTask"]>[1], runContext?: RunMutationContext, shouldPersist?: () => boolean, persistFence?: TaskAtomicPersistFence, ): Promise<Task> {
-    return updateTaskUnlockedImpl(this, id, updates, runContext, shouldPersist, persistFence);
+  public async updateTaskUnlocked( id: string, updates: Parameters<TaskStore["updateTask"]>[1], runContext?: RunMutationContext, shouldPersist?: () => boolean, persistFence?: TaskAtomicPersistFence, writeOptions?: TaskRowWriteOptions, ): Promise<Task> {
+    return updateTaskUnlockedImpl(this, id, updates, runContext, shouldPersist, persistFence, writeOptions);
   }
   async pauseTask( id: string, paused: boolean, runContext?: RunMutationContext, agentOptions?: { pausedByAgentId?: string; pausedReason?: string; userPaused?: boolean; expectedUpdatedAt?: string }, ): Promise<Task> {
     return pauseTaskImpl(this, id, paused, runContext, agentOptions);

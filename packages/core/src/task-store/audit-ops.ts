@@ -18,7 +18,8 @@ import {writeTransitionPendingAsync} from "./async/async-transition-pending.js";
 import type {WorkflowIr} from "../workflows/workflow-ir-types.js";
 import "../builtin-traits.js";
 import {__setTaskActivityLogLimitsForTesting, truncateTaskLogOutcome, getTaskActivityLogEntryLimit} from "../task-store/comments.js";
-import {readTaskRow, updateTaskColumns} from "../task-store/async/async-persistence.js";
+import {readTaskRow, readTaskRowInTransaction} from "../task-store/async/async-persistence.js";
+import {projectScopeFor} from "../postgres/data-layer.js";
 import { getLiveTaskColumn } from "./async/async-comments-attachments.js";
 import { acquireTaskAdvisoryXactLock } from "./task-advisory-lock.js";
 import { resolveArchivedLanes } from "../project-lane-vocabulary.js";
@@ -377,7 +378,16 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
       // sync this.db.prepare() path which throws "SQLite Database is not
       // available in backend mode" (discovered by sqlite-final-removal session 3).
             const layer = store.asyncLayer!;
-      const pgRow = await readTaskRow(layer, id, { includeDeleted: true });
+      const archivedLanes = await resolveArchivedLanes(store);
+      /*
+      FNXC:TaskRowConcurrency 2026-10-07-21:40:
+      The read-append-write of the log column was three separate statements, so two processes appending at once each wrote
+      back their own copy and one entry vanished. The read and the write now share one transaction holding the per-task
+      advisory lock every generic task-row writer takes.
+      */
+      const updatedRow = await layer.transactionImmediate(async (tx) => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const pgRow = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
       if (!pgRow) {
         throw new Error(buildTaskNotFoundMessage(id));
       }
@@ -434,7 +444,6 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
       front of it, no encoding's count moves, and an unwired or degraded caller behaves exactly as
       before — the same additive shape as the six Drizzle LANE sites.
       */
-      const archivedLanes = await resolveArchivedLanes(store);
       const rowIsArchivedLane = archivedLanes
         ? archivedLanes.has(String(pgRow.column ?? ""))
         /* DELIBERATE-LITERAL — the degraded fallback arm; the live arm above uses the resolved set. */
@@ -450,10 +459,13 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
         existingLog.splice(0, existingLog.length - _entryLimit);
       }
       const updatedAt = new Date().toISOString();
-      await updateTaskColumns(layer, id, { log: existingLog, updatedAt });
+      const [written] = await tx.update(schema.project.tasks)
+        .set({ log: existingLog, updatedAt })
+        .where(and(eq(schema.project.tasks.id, id), projectScopeFor(schema.project.tasks.projectId, layer.projectId)))
+        .returning();
+      return written as Record<string, unknown> | undefined;
+      });
 
-      // Re-read the task for event emission (full row → Task).
-      const updatedRow = await readTaskRow(layer, id, { includeDeleted: false });
       if (updatedRow) {
         const current = store.rowToTask(store.pgRowToTaskRow(updatedRow));
         await store.writeTaskJsonFile(store.taskDir(id), current);
@@ -463,8 +475,6 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
         store.emitTaskLifecycleEventSafely("task:updated", [current]);
         return current;
       }
-      const emittedTask = ({ id, log: existingLog, updatedAt } as unknown) as Task;
-      store.emitTaskLifecycleEventSafely("task:updated", [emittedTask]);
-      return emittedTask;
+      throw new Error(buildTaskNotFoundMessage(id));
 });
   }

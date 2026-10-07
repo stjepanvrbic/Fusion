@@ -23,6 +23,7 @@ import {type TaskRow, type TaskPersistSerializationContext, type TaskColumnDescr
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {readTaskRow as readTaskRowAsync} from "../task-store/async/async-persistence.js";
 import {findArchivedTaskEntry} from "../task-store/async/async-archive-lineage.js";
+import {rememberTaskRowBaseline} from "./task-row-merge.js";
 import type {PrEntityRow, RunAuditEventRow, MergeQueueRow, MergeRequestRow, CompletionHandoffMarkerRow, WorkflowWorkItemRow} from "../task-store/row-types.js";
 
 export function getTaskSelectClauseImpl2(store: TaskStore, slim: boolean, tableAlias?: string): string {
@@ -164,7 +165,9 @@ export async function readTaskForMoveImpl(store: TaskStore, id: string): Promise
       if (pgRow.deletedAt) {
         throw new TaskDeletedError(id, pgRow.deletedAt as string);
       }
-      return store.rowToTask(store.pgRowToTaskRow(pgRow));
+      // FNXC:TaskRowConcurrency 2026-10-07-21:40: the move transaction merges this snapshot against the row it was read from.
+      const taskRow = store.pgRowToTaskRow(pgRow);
+      return rememberTaskRowBaseline(store.rowToTask(taskRow), taskRow);
     }
     // Fall back to archive lookup (soft-deleted/archived tasks).
     const entry = await findArchivedTaskEntry(layer.db, id, layer.projectId);

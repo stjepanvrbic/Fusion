@@ -47,7 +47,8 @@ import {recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
 import {getTaskMergeBlocker} from "../merge/task-merge.js";
 import {resolveRequiredPreMergeStepIds} from "../merge/required-pre-merge-steps.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
-import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction, upsertTaskRowInTransaction} from "./async/async-persistence.js";
+import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction} from "./async/async-persistence.js";
+import {mergeWriteTaskRowInTransaction} from "./task-row-merge.js";
 import {disposeTaskBeforeMove} from "../tasks/task-move-disposer.js";
 import {resolveTaskSymbolsForTask} from "../tasks/task-symbol-resolution.js";
 
@@ -1220,7 +1221,12 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
       // Upsert the task row (update column + all mutated fields).
       // FNXC:MultiProjectIsolation 2026-07-10: pass the bound projectId (stamped
       // on insert, preserved on update) so partitioning survives moves.
-      await upsertTaskRowInTransaction(tx, task as unknown as Record<string, unknown>, context, layer.projectId);
+      /*
+      FNXC:TaskRowConcurrency 2026-10-07-21:40:
+      The move held a snapshot across awaits before this transaction; a full-row upsert wrote every column of it back over
+      whatever another process committed meanwhile. Merge-write it against its read baseline under the advisory lock above.
+      */
+      await mergeWriteTaskRowInTransaction(store, tx, task, context, layer.projectId);
 
       // U4 (flag-ON) parity with the SQLite branch below: write the
       // crash-safe transitionPending marker in the SAME transaction as the

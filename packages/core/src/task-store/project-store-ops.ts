@@ -40,6 +40,8 @@ import {isWorkflowDefinitionIdPrimaryKeyCollision, nextWorkflowDefinitionIdAsync
 import {upsertTaskRowInTransaction, buildTaskInsertValues} from "./async/async-persistence.js";
 import {readTaskRowInTransaction} from "./async/async-persistence.js";
 import {withTaskWorkflowSerialization} from "./async/async-workflow-workitems.js";
+import {acquireTaskAdvisoryXactLock} from "./task-advisory-lock.js";
+import {adoptCommittedTaskRow, planTaskRowWrite, type TaskRowWriteOptions} from "./task-row-merge.js";
 import {recordActivityLogEntry as recordActivityLogEntryAsync} from "./async/async-audit.js";
 import {applyOriginalDescription} from "../tasks/original-description-policy.js";
 import {isPlanReviewSatisfied} from "../planner/plan-approval.js";
@@ -139,7 +141,7 @@ export type TaskAtomicPersistFence = {
   expectedCheckoutLeaseEpoch: number;
 };
 
-export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: string, task: Task, auditInput?: RunAuditEventInput, planningInvalidation?: PlanningDependencyInvalidation, specPlanPrompt?: string, shouldPersist?: () => boolean, persistFence?: TaskAtomicPersistFence,): Promise<void> {
+export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: string, task: Task, auditInput?: RunAuditEventInput, planningInvalidation?: PlanningDependencyInvalidation, specPlanPrompt?: string, shouldPersist?: () => boolean, persistFence?: TaskAtomicPersistFence, writeOptions?: TaskRowWriteOptions,): Promise<void> {
     const id = store.getTaskIdFromDir(dir);
     // FNXC:RuntimeTaskOrchestrationAsync 2026-06-24-14:10:
     // Backend mode: upsert the task row + audit event in one async Drizzle
@@ -159,6 +161,13 @@ export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: st
         const layer = store.asyncLayer!;
     const existingRow = await layer.transactionImmediate(async (tx) => {
       const persist = async () => {
+      /*
+      FNXC:TaskRowConcurrency 2026-10-07-21:40:
+      Every generic task-row writer serializes on the one per-task advisory key before its row read, so the merge below
+      decides against a row no other locking writer can change before this commit. A planning-invalidation write reaches
+      here already holding it, after its dependency targets' locks; re-acquiring the same key is a no-op.
+      */
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
       const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
       /*
       FNXC:LandedReviewRecovery 2026-10-01-00:29:
@@ -203,6 +212,10 @@ export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: st
       column another writer committed since the caller's read — the
       lost-update class behind triage's `status` clear never sticking. Only
       an absent row falls back to the full upsert (create-recovery).
+
+      FNXC:TaskRowConcurrency 2026-10-07-21:40:
+      Diffing against this live row still wrote back every column another process committed after the caller's read.
+      planTaskRowWrite diffs against the caller's read baseline instead and leaves foreign columns as committed.
       */
       if (row) {
         const existing = store.pgRowToTaskRow(row);
@@ -213,7 +226,9 @@ export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: st
           throw new Error(`Planning dependency invalidation conflict for ${id}: dependencies changed before the lifecycle mutation committed`);
         }
         preserveDurableTaskWedgeInvariants(existing, task);
-        const changedColumns = store.getChangedTaskColumns(existing, task);
+        const plan = planTaskRowWrite(store, existing, task, writeOptions);
+        const changedColumns = plan.writeColumns;
+        let committedRow = existing;
         if (changedColumns.size > 0) {
           const context = store.createTaskPersistSerializationContext(task, existing);
           const allValues = buildTaskInsertValues(task as unknown as Record<string, unknown>, context);
@@ -240,9 +255,11 @@ export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: st
             .update(schema.project.tasks)
             .set(setValues as never)
             .where(and(...updateConds))
-            .returning({ id: schema.project.tasks.id });
+            .returning();
           if (persistFence && persisted.length === 0) throw new TaskAtomicPersistGuardRefusedError();
+          if (persisted[0]) committedRow = store.pgRowToTaskRow(persisted[0] as Record<string, unknown>);
         }
+        adoptCommittedTaskRow(store, task, committedRow, plan);
       } else {
         // FNXC:MultiProjectIsolation 2026-07-10: preserve the bound projectId partition key.
         const context = store.createTaskPersistSerializationContext(task);
