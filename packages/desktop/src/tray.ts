@@ -83,15 +83,43 @@ function applyTrayMenu(tray: Tray, state: TrayState): void {
   tray.setContextMenu(Menu.buildFromTemplate(contextTemplate));
 }
 
+export interface TrayIconLocation {
+  platform: NodeJS.Platform;
+  isPackaged: boolean;
+  resourcesPath: string;
+  /** Directory of the running module: `dist/` when bundled, `src/` under tests. */
+  moduleDir: string;
+}
+
+/*
+FNXC:DesktopTray 2026-10-07-18:02:
+tray.ts is bundled into dist/main.js and nothing copies the icons beside it, so loading from the module directory produced an empty image and the Windows "Minimize to tray" default left the window hidden behind a blank notification-area slot.
+Packaged builds read the icons electron-builder ships as extraResources under `<resources>/icons`; development reads them from `src/icons`.
+*/
+export function resolveTrayIconPath(location: TrayIconLocation): string {
+  const fileName = location.platform === "darwin" ? "tray-32.png" : "tray-48.png";
+  const iconDir = location.isPackaged
+    ? path.join(location.resourcesPath, "icons")
+    : path.join(location.moduleDir, "..", "src", "icons");
+  return path.join(iconDir, fileName);
+}
+
 export function createTrayIcon(): NativeImage {
-  if (process.platform === "darwin") {
-    const iconPath = path.join(import.meta.dirname, "icons", "tray-32.png");
-    const retinaIcon = nativeImage.createFromPath(iconPath);
-    return retinaIcon.resize({ width: 16, height: 16 });
+  const iconPath = resolveTrayIconPath({
+    platform: process.platform,
+    isPackaged: app.isPackaged === true,
+    resourcesPath: process.resourcesPath ?? "",
+    moduleDir: import.meta.dirname,
+  });
+  const image = nativeImage.createFromPath(iconPath);
+  if (image.isEmpty()) {
+    console.warn(`[desktop/tray] Could not load the tray icon from ${iconPath}`);
   }
 
-  const iconPath = path.join(import.meta.dirname, "icons", "tray-48.png");
-  return nativeImage.createFromPath(iconPath);
+  if (process.platform === "darwin") {
+    return image.resize({ width: 16, height: 16 });
+  }
+  return image;
 }
 
 export function buildTrayContextMenu(options: TrayMenuOptions): MenuItemConstructorOptions[] {

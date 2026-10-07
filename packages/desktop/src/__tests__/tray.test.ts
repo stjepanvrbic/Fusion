@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
+const desktopRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
 
 function mockPlatform(platform: NodeJS.Platform): void {
@@ -26,6 +30,7 @@ const mocks = vi.hoisted(() => {
   const nativeImage = {
     createFromPath: vi.fn(() => ({
       resize: vi.fn(() => ({ id: "resized-image" })),
+      isEmpty: vi.fn(() => false),
     })),
   };
 
@@ -99,6 +104,60 @@ describe("tray module", () => {
     if (platformDescriptor) {
       Object.defineProperty(process, "platform", platformDescriptor);
     }
+  });
+
+  /*
+   * C-043: tray.ts is bundled into dist/main.js, and nothing copied the icons next to it, so the
+   * packaged tray loaded an empty image and a window hidden to the tray had no visible way back.
+   * The packaged icon must resolve where electron-builder actually ships it, and the dev icon must
+   * resolve to a real file, for every platform variant.
+   */
+  const trayIconCases = [
+    ["darwin", "tray-32.png"],
+    ["win32", "tray-48.png"],
+    ["linux", "tray-48.png"],
+  ] as const;
+
+  it.each(trayIconCases)("packaged %s tray icon resolves under resources/icons, where electron-builder ships it", async (platform, file) => {
+    const { resolveTrayIconPath } = await import("../tray.ts");
+    const resourcesPath = path.join(path.sep, "opt", "Fusion", "resources");
+
+    const resolved = resolveTrayIconPath({
+      platform,
+      isPackaged: true,
+      resourcesPath,
+      moduleDir: path.join(resourcesPath, "app.asar", "dist"),
+    });
+
+    expect(resolved).toBe(path.join(resourcesPath, "icons", file));
+    const builderConfig = readFileSync(path.join(desktopRoot, "electron-builder.yml"), "utf-8");
+    expect(builderConfig).toMatch(/extraResources:\s*\n\s*-\s*from:\s*src\/icons\s*\n\s*to:\s*icons\s*\n\s*filter:\s*\n\s*-\s*"tray-\*\.png"/m);
+    expect(existsSync(path.join(desktopRoot, "src", "icons", file))).toBe(true);
+  });
+
+  it.each(trayIconCases)("development %s tray icon resolves to an existing file from both dist and src", async (platform, file) => {
+    const { resolveTrayIconPath } = await import("../tray.ts");
+
+    for (const moduleDir of [path.join(desktopRoot, "dist"), path.join(desktopRoot, "src")]) {
+      const resolved = resolveTrayIconPath({ platform, isPackaged: false, resourcesPath: "", moduleDir });
+      expect(path.basename(resolved)).toBe(file);
+      expect(existsSync(resolved)).toBe(true);
+    }
+  });
+
+  it("warns instead of silently installing an empty tray icon", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    mocks.nativeImage.createFromPath.mockReturnValueOnce({
+      resize: vi.fn(() => ({ id: "resized-image" })),
+      isEmpty: vi.fn(() => true),
+    });
+    mockPlatform("win32");
+    const { createTrayIcon } = await import("../tray.ts");
+
+    createTrayIcon();
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("tray icon"));
+    warn.mockRestore();
   });
 
   it("getTrayTooltip returns running label", async () => {
