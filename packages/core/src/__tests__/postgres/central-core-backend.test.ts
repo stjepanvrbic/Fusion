@@ -20,11 +20,12 @@
  */
 
 import { it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { CentralCore } from "../../central/central-core.js";
 import type { AsyncDataLayer } from "../../postgres/data-layer.js";
+import * as asyncCentralCore from "../../async-stores/async-central-core.js";
 import {
   pgDescribe,
   createSharedPgTaskStoreTestHarness,
@@ -128,6 +129,57 @@ pgDescribe("CentralCore backend mode (PostgreSQL)", () => {
     const health = await ctx.central.getProjectHealth(created.id);
     expect(health?.projectId).toBe(created.id);
     expect(health?.status).toBe("initializing");
+  });
+
+  /*
+  FNXC:PathIdentity 2026-10-07-18:30:
+  One directory is one project whatever spelling registers or looks it up: drive and component case, separators, extended-length prefixes and junction/symlink aliases.
+  */
+  function aliasesOf(ctx: TestCtx, dir: string): string[] {
+    const alias = join(mkdtempSync(join(tmpdir(), "kb-cc-pg-alias-")), "link");
+    ctx.projectDirs.push(join(alias, ".."));
+    symlinkSync(dir, alias, process.platform === "win32" ? "junction" : "dir");
+    const spellings = [alias, `${dir}${sep}`];
+    if (process.platform === "win32") spellings.push(dir.toUpperCase(), dir.toLowerCase(), `\\\\?\\${dir}`);
+    return spellings;
+  }
+
+  it("registers a project under its canonical path and resolves every spelling of it", async () => {
+    const dir = realpathSync.native(makeProjectDir(ctx, "identity"));
+    const [first, ...rest] = aliasesOf(ctx, dir);
+    const created = await ctx.central.registerProject({ name: "Identity", path: first!, isolationMode: "in-process" });
+    expect(created.path).toBe(dir);
+    for (const spelling of [dir, first!, ...rest]) {
+      expect((await ctx.central.getProjectByPath(spelling))?.id).toBe(created.id);
+      expect(await ctx.central.isProjectRegistered(spelling)).toBe(true);
+      await expect(ctx.central.registerProject({ name: "Dup", path: spelling })).rejects.toThrow("already registered");
+    }
+    expect(await ctx.central.autoRegisterProject(rest[0]!)).toMatchObject({ id: created.id });
+    mkdirSync(join(dir, "child"));
+    await expect(ctx.central.autoRegisterProject(join(first!, "child"))).rejects.toThrow("overlaps an existing registered project");
+  });
+
+  it("finds a legacy row stored under a non-canonical spelling and keeps its identity on reattach", async () => {
+    const dir = realpathSync.native(makeProjectDir(ctx, "legacy"));
+    const [stored] = aliasesOf(ctx, dir);
+    const now = new Date().toISOString();
+    const id = "proj_0123456789abcdef";
+    await asyncCentralCore.insertProjectRow(ctx.layer, {
+      id, name: "Legacy", path: stored!, status: "active", isolationMode: "in-process",
+      createdAt: now, updatedAt: now, lastActivityAt: now,
+    }, now);
+    expect((await ctx.central.getProjectByPath(dir))?.id).toBe(id);
+    expect((await ctx.central.reattachProject({ id, name: "Legacy", path: dir })).id).toBe(id);
+
+    const readiness = async () => ({ outcome: "existing" as const, integrationBranches: [] });
+    const central = new CentralCore(ctx.globalDir, { asyncLayer: ctx.layer, ensureProjectGitReadiness: readiness as never });
+    await central.init();
+    try {
+      const ensured = await central.ensureProjectForPath({ path: `${dir}${sep}`, identity: { id, createdAt: now } as never });
+      expect(ensured).toMatchObject({ outcome: "existing", project: { id } });
+    } finally {
+      await central.close();
+    }
   });
 
   it("updates a project and reconciles stale statuses", async () => {
