@@ -434,7 +434,11 @@ function openPrClaims(files) {
   try {
     /* One bulk call — per-PR `gh pr view` would be a request per PR and is what made this too slow
        to be habitual. --limit is generous because a partial list reads as "unclaimed". */
-    raw = execFileSync("gh", ["pr", "list", "--state", "open", "--limit", "200", "--json", "number,title,files"], {
+    /* FNXC:LifecycleColumnCensus 2026-10-07-18:04: FUSION_CENSUS_GH_SCRIPT runs a Node stub in place of `gh`.
+       A PATH shell-script stub cannot shadow gh.exe on Windows, where execFileSync resolves only real executables. */
+    const ghArgs = ["pr", "list", "--state", "open", "--limit", "200", "--json", "number,title,files"];
+    const ghStub = process.env.FUSION_CENSUS_GH_SCRIPT;
+    raw = execFileSync(ghStub ? process.execPath : "gh", ghStub ? [ghStub, ...ghArgs] : ghArgs, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 30_000,

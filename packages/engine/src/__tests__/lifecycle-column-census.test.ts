@@ -621,16 +621,17 @@ describe("the baseline can always be re-recorded", () => {
     it actively tells the reader to start work another lane already holds, which is the exact failure
     this flag exists to prevent (three overlapping conversions on self-healing.ts, two on executor.ts).
     */
-    function runWithStubbedGh(stub: string, extraArgs: string[] = []): string {
+    /* FNXC:LifecycleColumnCensus 2026-10-07-18:04: the stub is a Node program passed through FUSION_CENSUS_GH_SCRIPT,
+       because a POSIX shell-script `gh` on PATH cannot shadow gh.exe on Windows. */
+    function runWithStubbedGh(stubSource: string, extraArgs: string[] = []): string {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-census-gh-"));
-      const ghPath = path.join(dir, "gh");
-      fs.writeFileSync(ghPath, stub);
-      fs.chmodSync(ghPath, 0o755);
+      const ghStub = path.join(dir, "gh-stub.mjs");
+      fs.writeFileSync(ghStub, stubSource);
       try {
         return execFileSync("node", [cliPath, "--claims", ...extraArgs], {
           encoding: "utf8",
           cwd: repoRoot,
-          env: { ...process.env, PATH: `${dir}${path.delimiter}${process.env.PATH}` },
+          env: { ...process.env, FUSION_CENSUS_GH_SCRIPT: ghStub },
         }) as string;
       } catch (err) {
         return (err as { stdout?: string }).stdout ?? "";
@@ -652,7 +653,7 @@ describe("the baseline can always be re-recorded", () => {
         return;
       }
       const payload = JSON.stringify([{ number: 9999, title: "stub pr", files: [{ path: target }] }]);
-      const out = runWithStubbedGh(`#!/bin/sh\ncat <<'JSON'\n${payload}\nJSON\n`);
+      const out = runWithStubbedGh(`process.stdout.write(${JSON.stringify(payload)});\n`);
 
       const claimed = out.slice(out.indexOf("CLAIMED by an open PR"), out.indexOf("UNCLAIMED:"));
       expect(claimed).toContain(target);
@@ -684,7 +685,7 @@ describe("the baseline can always be re-recorded", () => {
     */
     it("never lists a deferral-noted or sync-resolver file under start-here", () => {
       const payload = JSON.stringify([]);
-      const out = runWithStubbedGh(`#!/bin/sh\ncat <<'JSON'\n${payload}\nJSON\n`);
+      const out = runWithStubbedGh(`process.stdout.write(${JSON.stringify(payload)});\n`);
 
       const section = (start: string, end?: string) => {
         const from = out.indexOf(start);
@@ -719,7 +720,7 @@ describe("the baseline can always be re-recorded", () => {
     });
 
     it("says so loudly when gh cannot answer, instead of reporting everything as unclaimed", () => {
-      const out = runWithStubbedGh("#!/bin/sh\nexit 1\n");
+      const out = runWithStubbedGh("process.exit(1);\n");
       expect(out).toContain("CLAIMS: unavailable");
       expect(out).toContain("POSSIBLY CLAIMED");
       /* The dangerous output is the one that invites a duplicate claim. */
