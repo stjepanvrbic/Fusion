@@ -37,8 +37,35 @@ const VALID_MODES: ReadonlySet<PaperclipMode> = new Set([
   "wakeup-only",
 ]);
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/*
+FNXC:PaperclipRuntime 2026-10-07-18:02:
+Session disposal (adapter `dispose` or `session.dispose`) owns cancellation of the active turn: it aborts in-flight requests and CLI calls, stops run-event polling, and settles the prompt with an abort error.
+No session callback fires after disposal. The Paperclip run itself continues server-side; Fusion stops waiting on it.
+*/
+const activeTurns = new WeakMap<PaperclipSession, AbortController>();
+
+class PaperclipTurnAbortedError extends Error {
+  constructor() {
+    super("Paperclip turn aborted: the session was disposed");
+    this.name = "PaperclipTurnAbortedError";
+  }
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new PaperclipTurnAbortedError();
+}
+
+/** Wait between polls; disposal ends the wait at once. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
 }
 
 function asString(value: unknown): string | undefined {
@@ -188,7 +215,9 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
       onThinking: options.onThinking,
       onToolStart: options.onToolStart,
       onToolEnd: options.onToolEnd,
-      dispose: () => undefined,
+      dispose: () => {
+        activeTurns.get(session)?.abort();
+      },
     };
 
     return { session, sessionFile: undefined };
@@ -199,6 +228,16 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
     prompt: string,
     _options?: unknown,
   ): Promise<void> {
+    const turnControl = new AbortController();
+    activeTurns.set(session, turnControl);
+    try {
+      await this.runTurn(session, prompt, turnControl.signal);
+    } finally {
+      if (activeTurns.get(session) === turnControl) activeTurns.delete(session);
+    }
+  }
+
+  private async runTurn(session: PaperclipSession, prompt: string, signal: AbortSignal): Promise<void> {
     session.turnIndex += 1;
     const turn = session.turnIndex;
     session.onToolStart?.("paperclip.run", {
@@ -210,13 +249,14 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
     // ---- Stage 1: issue create/reuse ------------------------------------
     let issueId: string | undefined;
     if (session.mode === "issue-per-prompt") {
-      issueId = await this.createIssueForPrompt(session, prompt);
+      issueId = await this.createIssueForPrompt(session, prompt, signal);
     } else if (session.mode === "rolling-issue") {
       if (!session.issueId) {
-        session.issueId = await this.createIssueForPrompt(session, prompt);
+        session.issueId = await this.createIssueForPrompt(session, prompt, signal);
       }
       issueId = session.issueId;
     }
+    throwIfAborted(signal);
     // wakeup-only: no issue side-effect.
 
     // ---- Stage 2: wakeup -------------------------------------------------
@@ -233,7 +273,8 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
           prompt,
           issueId,
         },
-      });
+      }, { signal });
+      throwIfAborted(signal);
 
       if (wakeResponse.status === "skipped") {
         session.onToolEnd?.("paperclip.run", true, {
@@ -253,6 +294,7 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
         return;
       }
     } catch (error) {
+      throwIfAborted(signal);
       const reason = error instanceof Error ? error.message : String(error);
       this.logger.warn(`Paperclip wakeup failed: ${reason}`);
       session.onToolEnd?.("paperclip.run", true, { issueId, reason });
@@ -260,7 +302,7 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
     }
 
     // ---- Stage 3: stream run events --------------------------------------
-    const stream = await this.streamRunEvents(session, runId);
+    const stream = await this.streamRunEvents(session, runId, signal);
 
     // ---- Stage 4: collect final results ----------------------------------
     let issueStatus: string | undefined;
@@ -273,8 +315,9 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
                 issueId,
                 cliBinaryPath: session.cliBinaryPath,
                 cliConfigPath: session.cliConfigPath,
+                signal,
               })
-            : await getIssue(session.apiUrl, session.apiKey, issueId);
+            : await getIssue(session.apiUrl, session.apiKey, issueId, { signal });
         issueStatus = asString(issue.status) ?? undefined;
 
         // Comment fallback: if no streaming text was captured, use the latest
@@ -282,17 +325,19 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
         // `issue comments list` command, so this stays on HTTP — in CLI mode
         // it relies on the apiKey discovered from the local paperclipai config.
         if (!finalText) {
-          const comments = await getIssueComments(session.apiUrl, session.apiKey, issueId);
+          const comments = await getIssueComments(session.apiUrl, session.apiKey, issueId, { signal });
           const latest = pickLatestVisibleComment(comments);
           if (latest) finalText = latest;
         }
       } catch (error) {
+        throwIfAborted(signal);
         // Non-fatal — we still have whatever we streamed.
         const reason = error instanceof Error ? error.message : String(error);
         this.logger.warn(`Paperclip post-run fetch failed: ${reason}`);
       }
     }
 
+    throwIfAborted(signal);
     if (finalText) session.onText?.(finalText);
     if (stream.thinking) session.onThinking?.(stream.thinking);
 
@@ -313,8 +358,8 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
     return `paperclip/${session.agentId}`;
   }
 
-  async dispose(_session: PaperclipSession): Promise<void> {
-    // no-op: Paperclip manages run/session lifecycle server-side
+  async dispose(session: PaperclipSession): Promise<void> {
+    session.dispose?.();
   }
 
   // ---------------------------------------------------------------------
@@ -324,6 +369,7 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
   private async createIssueForPrompt(
     session: PaperclipSession,
     prompt: string,
+    signal: AbortSignal,
   ): Promise<string> {
     const body = {
       title: deriveIssueTitle(prompt),
@@ -341,14 +387,16 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
             body,
             cliBinaryPath: session.cliBinaryPath,
             cliConfigPath: session.cliConfigPath,
+            signal,
           })
-        : await createIssue(session.apiUrl, session.apiKey, session.companyId, body);
+        : await createIssue(session.apiUrl, session.apiKey, session.companyId, body, { signal });
     return pickIssueId(created);
   }
 
   private async streamRunEvents(
     session: PaperclipSession,
     runId: string,
+    signal: AbortSignal,
   ): Promise<{
     text: string;
     thinking: string;
@@ -364,6 +412,7 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
     let thinkBuf = "";
 
     while (true) {
+      throwIfAborted(signal);
       let events: RunEvent[] = [];
       try {
         events = await getRunEvents(
@@ -372,12 +421,15 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
           runId,
           afterSeq,
           200,
+          { signal },
         );
       } catch (error) {
+        throwIfAborted(signal);
         const reason = error instanceof Error ? error.message : String(error);
         this.logger.warn(`Paperclip getRunEvents failed: ${reason}`);
       }
 
+      throwIfAborted(signal);
       for (const ev of events) {
         if (typeof ev.seq === "number" && ev.seq > afterSeq) afterSeq = ev.seq;
         const type = ev.type ?? "";
@@ -412,7 +464,7 @@ export class PaperclipRuntimeAdapter implements AgentRuntime {
         break;
       }
 
-      await sleep(interval);
+      await sleep(interval, signal);
       interval = Math.min(interval * 2, session.pollIntervalMaxMs);
     }
 

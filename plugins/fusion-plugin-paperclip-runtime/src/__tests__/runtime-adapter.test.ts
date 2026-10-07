@@ -379,9 +379,59 @@ describe("PaperclipRuntimeAdapter — describeModel/dispose", () => {
     expect(adapter.describeModel(session)).toBe("paperclip/AG-XYZ");
   });
 
-  it("dispose is a no-op", async () => {
+  it("dispose without an active turn resolves", async () => {
     const adapter = makeAdapter({ agentId: "AG-1", companyId: "CO-1" });
     const { session } = await adapter.createSession({ ...baseSessionOpts });
     await expect(adapter.dispose!(session)).resolves.toBeUndefined();
+  });
+});
+
+describe("PaperclipRuntimeAdapter — disposal during an active turn", () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+  it("stops polling, settles the prompt, and fires no late callbacks", async () => {
+    mockGetRunEvents.mockResolvedValue([{ seq: 1, type: "heartbeat.run.status", payload: { status: "running" } }]);
+    const onText = vi.fn();
+    const onToolEnd = vi.fn();
+    const adapter = makeAdapter({ agentId: "AG-1", companyId: "CO-1" });
+    const { session } = await adapter.createSession({ ...baseSessionOpts, onText, onToolEnd });
+    const pending = adapter.promptWithFallback(session, "long task");
+    const settled = expect(pending).rejects.toThrow(/aborted/);
+    while (mockGetRunEvents.mock.calls.length < 2) await tick();
+
+    await adapter.dispose!(session);
+    await settled;
+    const pollsAtDispose = mockGetRunEvents.mock.calls.length;
+    await tick();
+    await tick();
+    expect(mockGetRunEvents.mock.calls.length).toBe(pollsAtDispose);
+    expect(onText).not.toHaveBeenCalled();
+    expect(onToolEnd).not.toHaveBeenCalled();
+  });
+
+  it("cancels a stalled request instead of waiting for it", async () => {
+    let wakeSignal: AbortSignal | undefined;
+    mockWakeAgent.mockImplementationOnce((_url: string, _key: string, _agent: string, _body: unknown, options: { signal?: AbortSignal }) => {
+      wakeSignal = options?.signal;
+      return new Promise((_resolve, reject) => options?.signal?.addEventListener("abort", () => reject(new Error("Paperclip request aborted")), { once: true }));
+    });
+    const adapter = makeAdapter({ agentId: "AG-1", companyId: "CO-1", mode: "wakeup-only" });
+    const { session } = await adapter.createSession({ ...baseSessionOpts });
+    const pending = adapter.promptWithFallback(session, "x");
+    while (!wakeSignal) await tick();
+    session.dispose?.();
+    expect(wakeSignal.aborted).toBe(true);
+    await expect(pending).rejects.toThrow(/aborted/);
+  });
+
+  it("passes the turn's signal to every client call", async () => {
+    const adapter = makeAdapter({ agentId: "AG-1", companyId: "CO-1" });
+    const { session } = await adapter.createSession({ ...baseSessionOpts });
+    mockGetIssueComments.mockResolvedValue([]);
+    await adapter.promptWithFallback(session, "x");
+    for (const mock of [mockCreateIssue, mockWakeAgent, mockGetRunEvents, mockGetIssue]) {
+      const options = mock.mock.calls[0]!.at(-1) as { signal?: AbortSignal };
+      expect(options?.signal).toBeInstanceOf(AbortSignal);
+    }
   });
 });
