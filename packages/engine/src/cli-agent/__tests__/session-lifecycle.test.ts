@@ -6,21 +6,27 @@
  * the concurrency ceiling holds under concurrent spawns, Windows children keep their OS essentials,
  * and a resume after an engine restart is bounded, relaunches with the original settings and has an owner.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CliSession, CliSessionStore } from "@fusion/core";
 
 const killTreeCalls = vi.hoisted(() => [] as Array<{ pid: number; signal: string; sync: boolean }>);
+const launchCalls = vi.hoisted(() => [] as Array<{ command: string; args: readonly string[] }>);
+const launchOverride = vi.hoisted(() => ({ current: null as null | ((command: string, args: readonly string[]) => { command: string; args: string[] }) }));
 
 vi.mock("@fusion/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@fusion/core")>();
   return {
     ...actual,
-    killProcessTree: (pid: number, signal: string, options: { sync?: boolean; onSettled?: () => void } = {}) => {
+    killProcessTreeByPid: (pid: number, signal: string, options: { sync?: boolean; onSettled?: () => void } = {}) => {
       killTreeCalls.push({ pid, signal, sync: Boolean(options.sync) });
       options.onSettled?.();
+    },
+    resolveShellFreeLaunch: (command: string, args: readonly string[], deps?: Parameters<typeof actual.resolveShellFreeLaunch>[2]) => {
+      launchCalls.push({ command, args });
+      return launchOverride.current ? launchOverride.current(command, args) : actual.resolveShellFreeLaunch(command, args, deps);
     },
   };
 });
@@ -426,22 +432,34 @@ describe("CLI session child environment and command", () => {
     vi.unstubAllEnvs();
   });
 
-  it("launches an npm .cmd install of the CLI through cmd.exe on Windows", async () => {
-    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    writeFileSync(join(scratch, "codex.cmd"), "@node codex.js %*\r\n");
-    vi.stubEnv("PATH", scratch);
-    vi.stubEnv("PATHEXT", ".EXE;.CMD");
-    vi.stubEnv("ComSpec", "C:\\Windows\\system32\\cmd.exe");
+  it("launches the CLI through the shell-free launch seam, so an npm .cmd install runs as node + its entry", async () => {
+    launchOverride.current = (_command, args) => ({ command: "C:/nodejs/node.exe", args: ["C:/npm/node_modules/@openai/codex/bin/codex.js", ...args] });
     const h = harness();
+    try {
+      await h.manager.spawn({ adapterId: "codex", projectId: "project-a", purpose: "execute", worktreePath: scratch });
+    } finally {
+      launchOverride.current = null;
+    }
 
-    await h.manager.spawn({ adapterId: "codex", projectId: "project-a", purpose: "execute", worktreePath: scratch });
-
+    expect(launchCalls.at(-1)?.command).toBe("codex");
     const { file, args } = h.ptys[0];
-    expect(file).toBe("C:\\Windows\\system32\\cmd.exe");
-    expect(typeof args).toBe("string");
-    expect(String(args).startsWith("/d /s /c ")).toBe(true);
-    expect(String(args)).toContain("codex.cmd");
-    vi.unstubAllEnvs();
+    expect(file).toBe("C:/nodejs/node.exe");
+    expect(Array.isArray(args) && args[0]).toBe("C:/npm/node_modules/@openai/codex/bin/codex.js");
+  });
+
+  it("fails the spawn and records the session dead when the CLI shim cannot be launched without a shell", async () => {
+    launchOverride.current = () => {
+      throw new Error("Cannot launch codex without a command shell");
+    };
+    const h = harness();
+    try {
+      await expect(h.manager.spawn({ adapterId: "codex", projectId: "project-a", purpose: "execute", worktreePath: scratch })).rejects.toThrow("without a command shell");
+    } finally {
+      launchOverride.current = null;
+    }
+    expect(h.ptys).toHaveLength(0);
+    expect(h.store.listSessions()[0]).toMatchObject({ agentState: "dead", terminationReason: "crashed" });
+    expect(h.manager.availableSlots()).toBe(h.manager.capacity());
   });
 });
 

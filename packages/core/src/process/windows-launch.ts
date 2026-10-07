@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { posix, win32 } from "node:path";
+import { killProcessTreeByPid } from "./process-supervisor.js";
 
 /*
 FNXC:WindowsProcessLaunch 2026-10-07-18:02:
@@ -146,7 +147,30 @@ function launchShim(command: string, shimPath: string, args: readonly string[], 
     if (NATIVE_EXTENSIONS.has(extension)) return { command: target, args: [...args], resolvedPath: target };
     if (SCRIPT_EXTENSIONS.has(extension)) return { command: nodeRuntime(ctx, shimDirectory), args: [target, ...args], resolvedPath: target };
   }
+  const npmLauncher = npmLauncherTarget(body, shimDirectory);
+  if (npmLauncher) {
+    if (!ctx.isFile(npmLauncher)) {
+      throw new UnlaunchableCommandError(command, shimPath, `its target ${npmLauncher} does not exist`);
+    }
+    return { command: nodeRuntime(ctx, shimDirectory), args: [npmLauncher, ...args], resolvedPath: npmLauncher };
+  }
   throw new UnlaunchableCommandError(command, shimPath, "it is not a recognized npm/pnpm shim; configure the native executable instead");
+}
+
+/*
+FNXC:ProcessLifecycle 2026-10-07-18:00:
+Node's own `npm.cmd`/`npx.cmd` launchers forward through variables, `"%NODE_EXE%" "%NPX_CLI_JS%" %*`, with `SET "NPX_CLI_JS=%~dp0\node_modules\npm\bin\npx-cli.js"`.
+Unwrap that shape too, so `npx` runs shell-free on a stock Windows Node install. The launcher's optional prefix-npm override is not followed; the bundled CLI is used.
+*/
+const NPM_LAUNCHER_FORWARD = /"%NODE_EXE%"\s+"%([A-Za-z_][A-Za-z0-9_]*)%"\s+%\*/i;
+
+function npmLauncherTarget(body: string, shimDirectory: string): string | undefined {
+  const forward = NPM_LAUNCHER_FORWARD.exec(body);
+  if (!forward) return undefined;
+  const assignment = new RegExp(`SET\\s+"${forward[1]}=(?:%~dp0|%dp0%)([^"%]*)"`, "i").exec(body);
+  if (!assignment) return undefined;
+  const target = win32.join(shimDirectory, assignment[1]);
+  return SCRIPT_EXTENSIONS.has(win32.extname(target).toLowerCase()) ? target : undefined;
 }
 
 /**
@@ -198,6 +222,9 @@ function directKill(child: ChildProcess): void {
  * Force-terminate a child and, on Windows, every process it started.
  * `child.kill` on Windows ends only the direct child, so an agent's own subprocesses (the real CLI behind a bridge, MCP servers) would outlive the session.
  * `taskkill /T` must run before the root dies because it walks the tree from the root's PID.
+ *
+ * FNXC:ProcessLifecycle 2026-10-07-18:00:
+ * A thin child-process wrapper over core's single tree kill (`killProcessTreeByPid`); it adds the already-exited no-op and keeps a direct SIGKILL off Windows.
  */
 export function killProcessTree(child: ChildProcess, deps: KillProcessTreeDeps = {}): void {
   // `killed` means a signal was already delivered; repeat teardown (dispose, then exit-time sweep) is a no-op.
@@ -207,14 +234,11 @@ export function killProcessTree(child: ChildProcess, deps: KillProcessTreeDeps =
     directKill(child);
     return;
   }
-  try {
-    const killer = (deps.spawnImpl ?? spawn)("taskkill", ["/PID", String(child.pid), "/T", "/F"], { shell: false, windowsHide: true, stdio: "ignore" });
-    killer.once("error", () => directKill(child));
-    killer.once("exit", (code: number | null) => {
-      if (code !== 0 && !hasExited(child)) directKill(child);
-    });
-    killer.unref?.();
-  } catch {
-    directKill(child);
-  }
+  killProcessTreeByPid(child.pid, "SIGKILL", {
+    platform,
+    spawnImpl: deps.spawnImpl,
+    onTreeKillFailed: () => {
+      if (!hasExited(child)) directKill(child);
+    },
+  });
 }

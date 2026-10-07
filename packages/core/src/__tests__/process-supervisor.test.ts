@@ -10,7 +10,7 @@ import {
   __resetProcessSupervisorForTests,
   __setProcessTreeKillLauncherForTests,
   __terminateSupervisedChildrenForTests,
-  killProcessTree,
+  killProcessTreeByPid,
   releaseSupervisedChild,
   superviseSpawn,
 } from "../process/process-supervisor.js";
@@ -415,7 +415,7 @@ describe("process-supervisor win32 tree kill", () => {
 
   it("exposes the same tree kill to callers that own a raw pid", () => {
     installWin32();
-    killProcessTree(777, "SIGTERM");
+    killProcessTreeByPid(777, "SIGTERM");
     expect(spawnCalls).toEqual([expect.objectContaining({ args: ["/PID", "777", "/T", "/F"] })]);
   });
 
@@ -424,7 +424,7 @@ describe("process-supervisor win32 tree kill", () => {
     const settled = vi.fn();
     const failed = vi.fn();
 
-    killProcessTree(777, "SIGKILL", { onSettled: settled, onTreeKillFailed: failed });
+    killProcessTreeByPid(777, "SIGKILL", { onSettled: settled, onTreeKillFailed: failed });
     expect(settled).not.toHaveBeenCalled();
     killers[0].emit("exit", 128);
     killers[0].emit("error", new Error("late"));
@@ -432,7 +432,7 @@ describe("process-supervisor win32 tree kill", () => {
     expect(settled).toHaveBeenCalledTimes(1);
     expect(failed).toHaveBeenCalledTimes(1);
 
-    killProcessTree(778, "SIGKILL", { sync: true, onSettled: settled });
+    killProcessTreeByPid(778, "SIGKILL", { sync: true, onSettled: settled });
     expect(settled).toHaveBeenCalledTimes(2);
   });
 });

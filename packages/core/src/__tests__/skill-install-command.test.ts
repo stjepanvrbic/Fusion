@@ -62,11 +62,38 @@ describe("buildSkillInstallInvocation", () => {
     });
   });
 
-  it("routes the npx shim through cmd.exe with only validated tokens on win32", () => {
-    expect(buildSkillInstallInvocation({ source: "Owner.Name/repo_1", platform: "win32", comSpec: "C:\\Windows\\System32\\cmd.exe" })).toEqual({
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  On win32 no install token reaches cmd.exe: npx.cmd is unwrapped to node + npx-cli.js, and an unwrappable shim yields the bare name so the spawn fails instead of falling back to a shell.
+  */
+  it("unwraps the npx shim to node on win32 so no token reaches cmd.exe", () => {
+    const files = new Map([
+      ["c:\\nodejs\\npx.cmd", "SET \"NODE_EXE=%~dp0\\node.exe\"\r\nSET \"NPX_CLI_JS=%~dp0\\node_modules\\npm\\bin\\npx-cli.js\"\r\n\"%NODE_EXE%\" \"%NPX_CLI_JS%\" %*\r\n"],
+      ["c:\\nodejs\\node.exe", ""],
+      ["c:\\nodejs\\node_modules\\npm\\bin\\npx-cli.js", ""],
+    ]);
+    const launchDeps = {
+      env: { PATH: "C:\\nodejs", PATHEXT: ".EXE;.CMD" },
+      isFile: (p: string) => files.has(p.toLowerCase()),
+      readFile: (p: string) => files.get(p.toLowerCase()) ?? "",
+    };
+    expect(buildSkillInstallInvocation({ source: "Owner.Name/repo_1", platform: "win32", launchDeps })).toEqual({
       ok: true,
-      command: "C:\\Windows\\System32\\cmd.exe",
-      args: ["/d", "/s", "/c", "npx", "skills", "add", "Owner.Name/repo_1", "-y", "-a", "pi"],
+      command: "C:\\nodejs\\node.exe",
+      args: ["C:\\nodejs\\node_modules\\npm\\bin\\npx-cli.js", "skills", "add", "Owner.Name/repo_1", "-y", "-a", "pi"],
+    });
+  });
+
+  it("returns the bare npx name rather than a shell when the win32 shim cannot be unwrapped", () => {
+    const launchDeps = {
+      env: { PATH: "C:\\nodejs", PATHEXT: ".CMD" },
+      isFile: (p: string) => p.toLowerCase() === "c:\\nodejs\\npx.cmd",
+      readFile: () => "@echo off\r\ncall something-else %*\r\n",
+    };
+    expect(buildSkillInstallInvocation({ source: "owner/repo", platform: "win32", launchDeps })).toEqual({
+      ok: true,
+      command: "npx",
+      args: ["skills", "add", "owner/repo", "-y", "-a", "pi"],
     });
   });
 

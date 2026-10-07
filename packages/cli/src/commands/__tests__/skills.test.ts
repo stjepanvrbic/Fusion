@@ -4,6 +4,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
+import { buildSkillInstallInvocation } from "@fusion/core";
 
 // ─── Mock setup ────────────────────────────────────────────────────────────────
 
@@ -338,9 +339,13 @@ describe("runSkillsSearch", () => {
 
 // ─── runSkillsInstall tests ────────────────────────────────────────────────────
 
-// win32 runs the npx shim through cmd.exe with validated tokens; POSIX spawns npx directly.
-const INSTALLER_COMMAND = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "npx";
-const INSTALLER_PREFIX = process.platform === "win32" ? ["/d", "/s", "/c", "npx"] : [];
+// FNXC:ProcessLifecycle 2026-10-07-18:00: the surface spawns exactly the shared shell-free invocation (on win32, npx.cmd unwrapped to node); never cmd.exe.
+function expectedInstaller(source: string, skill?: string): [string, string[]] {
+  const invocation = buildSkillInstallInvocation({ source, skill });
+  if (!invocation.ok) throw new Error(invocation.error);
+  expect(invocation.command).not.toMatch(/(cmd\.exe|\.cmd|\.bat)$/i);
+  return [invocation.command, invocation.args];
+}
 
 describe("runSkillsInstall", () => {
   beforeEach(() => {
@@ -407,8 +412,7 @@ describe("runSkillsInstall", () => {
     await runSkillsInstall(["firebase/agent-skills"]);
 
     expect(mocks.spawn).toHaveBeenCalledWith(
-      INSTALLER_COMMAND,
-      [...INSTALLER_PREFIX, "skills", "add", "firebase/agent-skills", "-y", "-a", "pi"],
+      ...expectedInstaller("firebase/agent-skills"),
       expect.not.objectContaining({ shell: true }),
     );
   });
@@ -417,8 +421,7 @@ describe("runSkillsInstall", () => {
     await runSkillsInstall(["firebase/agent-skills"], { skill: "firebase-basics" });
 
     expect(mocks.spawn).toHaveBeenCalledWith(
-      INSTALLER_COMMAND,
-      [...INSTALLER_PREFIX, "skills", "add", "firebase/agent-skills", "--skill", "firebase-basics", "-y", "-a", "pi"],
+      ...expectedInstaller("firebase/agent-skills", "firebase-basics"),
       expect.not.objectContaining({ shell: true }),
     );
   });

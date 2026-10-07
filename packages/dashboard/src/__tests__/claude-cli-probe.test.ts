@@ -61,7 +61,8 @@ describe("probeClaudeCli", () => {
       const versionScript = join(root, "version.cjs");
       writeFileSync(versionScript, "process.stdout.write('9.9.9 (Claude Code)\\n');");
       if (process.platform === "win32") {
-        writeFileSync(join(root, "claude.cmd"), `@"${process.execPath}" "${versionScript}" %*\r\n`);
+        // npm cmd-shim shape: the probe unwraps it to `node version.cjs` and never runs cmd.exe.
+        writeFileSync(join(root, "claude.cmd"), `@ECHO off\r\nnode "%~dp0\\version.cjs" %*\r\n`);
         // The extensionless POSIX wrapper npm also installs must not shadow the shim.
         writeFileSync(join(root, "claude"), "#!/bin/sh\nexit 1\n");
       } else {
@@ -73,6 +74,18 @@ describe("probeClaudeCli", () => {
 
       expect(result).toMatchObject({ available: true, version: "9.9.9 (Claude Code)" });
       expect(result.binaryPath?.toLowerCase().startsWith(root.toLowerCase())).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform === "win32")("reports a shim it cannot unwrap as unavailable instead of running it through cmd.exe", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fn-claude-probe-batch-"));
+    try {
+      writeFileSync(join(root, "claude.cmd"), "@echo off\r\ncall some-launcher %*\r\n");
+      const result = await probeClaudeCli({ timeoutMs: 10_000, env: { ...process.env, PATH: root } });
+      expect(result.available).toBe(false);
+      expect(result.reason).toContain("without a command shell");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

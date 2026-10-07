@@ -1114,7 +1114,9 @@ export {
   hasProjectIdentity,
   PROJECT_IDENTITY_FILENAME,
 } from "./central/project-identity.js";
-export { ProcessSupervisor, superviseSpawn, killProcessTree } from "./process/process-supervisor.js";
+export { ProcessSupervisor, superviseSpawn, killProcessTreeByPid } from "./process/process-supervisor.js";
+export { resolveShellFreeLaunch, withPlatformBaseEnvKeys, killProcessTree, UnlaunchableCommandError, WINDOWS_BASE_ENV_KEYS } from "./process/windows-launch.js";
+export type { ShellFreeLaunch, ShellFreeLaunchDeps, KillProcessTreeDeps } from "./process/windows-launch.js";
 export type {
   KillProcessTreeOptions,
   SuperviseSpawnOptions,
@@ -1314,8 +1316,6 @@ export type { ScheduleType, ScheduledTask, ScheduledTaskCreateInput, ScheduledTa
 export { AutomationStore } from "./automation/automation-store.js";
 export type { AutomationStoreEvents } from "./automation/automation-store.js";
 export { runCommandAsync } from "./process/run-command.js";
-export { prepareNativeCommand, resolveWindowsExecutable } from "./process/windows-command.js";
-export type { PreparedCommand, WindowsCommandOptions } from "./process/windows-command.js";
 export type { RunCommandOptions, RunCommandResult } from "./process/run-command.js";
 export { resolvePosixShell, findPosixShell, resetPosixShellCache, withPosixShell, bindPosixShell, execPosix } from "./process/posix-shell.js";
 export type { PosixShellHost } from "./process/posix-shell.js";

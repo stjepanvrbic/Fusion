@@ -30,8 +30,9 @@
 
 import {
   CliSessionStore,
-  killProcessTree,
-  prepareNativeCommand,
+  killProcessTreeByPid,
+  resolveShellFreeLaunch,
+  withPlatformBaseEnvKeys,
   type CliAutonomyPosture,
   type CliSession,
   type CliSessionPurpose,
@@ -176,31 +177,8 @@ export interface CliSessionEnd {
 /*
 FNXC:ProcessLifecycle 2026-10-07-18:00:
 A CLI session's child must keep the OS essentials it needs on Windows, and operator `envAllowlist` additions apply to every adapter.
-The adapters declare POSIX-only allowlists, so Node children of a Windows CLI lost SystemRoot, TEMP and APPDATA and failed TLS and temp-file work; only the generic adapter read `envAllowlist`.
+The adapters declare POSIX-only allowlists, so Node children of a Windows CLI lost SystemRoot, TEMP and APPDATA; the essentials come from core's single list (`withPlatformBaseEnvKeys`), and only the generic adapter used to read `envAllowlist`.
 */
-export const WINDOWS_ESSENTIAL_ENV_KEYS: readonly string[] = [
-  "SystemRoot",
-  "SystemDrive",
-  "windir",
-  "ComSpec",
-  "PATHEXT",
-  "TEMP",
-  "TMP",
-  "USERPROFILE",
-  "USERNAME",
-  "HOMEDRIVE",
-  "HOMEPATH",
-  "APPDATA",
-  "LOCALAPPDATA",
-  "ProgramData",
-  "ProgramFiles",
-  "ProgramFiles(x86)",
-  "ProgramW6432",
-  "CommonProgramFiles",
-  "NUMBER_OF_PROCESSORS",
-  "PROCESSOR_ARCHITECTURE",
-  "OS",
-];
 
 const RECENT_OUTPUT_BYTES = 4096;
 const MAX_RECENT_ENDS = 256;
@@ -628,15 +606,19 @@ export class CliSessionManager {
 
     const allowlist = adapter.buildEnvAllowlist(launchCtx);
     const env = this.buildEnv(allowlist, launchCtx.settings);
-    // FNXC:ProcessLifecycle 2026-10-07-18:00: ConPTY resolves a bare name to `.exe` only; resolve npm `.cmd` installs through PATH/PATHEXT and pass the cmd.exe line verbatim.
-    const prepared = prepareNativeCommand(launch.command, launch.args, { env });
 
     const pty = await this.loadPty();
     let child: IPty;
     try {
+      /*
+      FNXC:ProcessLifecycle 2026-10-07-18:00:
+      ConPTY resolves a bare name to `.exe` only, so an npm `.cmd` install is unwrapped to the program or `node <entry>` it forwards to.
+      Launch arguments can carry agent text (one-shot prompts), so they never pass through cmd.exe; a shim that cannot be unwrapped fails the spawn here.
+      */
+      const shellFree = resolveShellFreeLaunch(launch.command, launch.args, { env });
       child = pty.spawn(
-        prepared.command,
-        prepared.windowsVerbatimArguments ? prepared.args.join(" ") : prepared.args,
+        shellFree.command,
+        shellFree.args,
         {
           name: "xterm-color",
           cols: options.cols ?? 80,
@@ -664,7 +646,7 @@ export class CliSessionManager {
 
     if (this.disposed) {
       // Disposal raced this spawn's awaits: the new PTY must not outlive the manager.
-      killProcessTree(child.pid, "SIGKILL", { onSettled: () => releasePty(child) });
+      killProcessTreeByPid(child.pid, "SIGKILL", { onSettled: () => releasePty(child) });
       try {
         this.store.updateSession(record.id, { agentState: "dead", terminationReason: "engineDeath" });
       } catch {
@@ -730,9 +712,8 @@ export class CliSessionManager {
     const operatorKeys = Array.isArray(settings.envAllowlist)
       ? settings.envAllowlist.filter((k): k is string => typeof k === "string" && !/^FUSION_/i.test(k))
       : [];
-    const platformKeys = process.platform === "win32" ? WINDOWS_ESSENTIAL_ENV_KEYS : [];
     const env: NodeJS.ProcessEnv = {};
-    for (const key of new Set([...allowlist, ...platformKeys, ...operatorKeys])) {
+    for (const key of withPlatformBaseEnvKeys([...allowlist, ...operatorKeys])) {
       const value = process.env[key];
       if (typeof value === "string") env[key] = value;
     }
@@ -1130,7 +1111,7 @@ export class CliSessionManager {
     Kill ONLY this session's registered pid tree (never port 4040, the dashboard or unrelated processes), then release the PTY handles once the tree is gone.
     */
     const pty = live.pty;
-    killProcessTree(live.pid, "SIGKILL", { sync: options.sync, onSettled: () => releasePty(pty) });
+    killProcessTreeByPid(live.pid, "SIGKILL", { sync: options.sync, onSettled: () => releasePty(pty) });
 
     try {
       this.store.updateSession(live.id, {

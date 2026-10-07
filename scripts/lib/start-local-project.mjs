@@ -7,7 +7,7 @@ FNXC:ProcessLifecycle 2026-10-07-18:00:
 `pnpm local` must start on Windows for every pnpm install method.
 `spawnSync("pnpm.cmd")` without a shell fails with EINVAL, and adding `shell: true` to an argument array lets cmd.exe re-parse the arguments.
 Prefer pnpm's own entry (`npm_execpath`) run through `process.execPath`; otherwise resolve pnpm through PATH and PATHEXT and launch a `.cmd` shim through `cmd.exe /d /s /c` with escaped arguments.
-The escaping mirrors packages/core/src/process/windows-command.ts, which this plain script cannot import.
+The cmd.exe fallback is the opt-in path for fixed, trusted argument lists only: start-local passes internal arguments (install flags, a sanitized project name, a temp-file path) and never user, agent or plugin text. Everything in core launches shell-free through resolveShellFreeLaunch instead; this plain script cannot import it.
 */
 const CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
 

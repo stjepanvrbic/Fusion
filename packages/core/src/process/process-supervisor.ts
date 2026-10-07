@@ -60,6 +60,10 @@ export interface KillProcessTreeOptions {
   onTreeKillFailed?: () => void;
   /** Called exactly once after the tree kill finished, whatever its outcome (synchronously on POSIX and with `sync`). */
   onSettled?: () => void;
+  /** Platform override for tests. */
+  platform?: NodeJS.Platform;
+  /** Launcher override for the async `taskkill` (tests and plugin seams). */
+  spawnImpl?: (command: string, args: string[], options: { shell: false; windowsHide: true; stdio: "ignore" }) => ChildProcess;
 }
 
 /**
@@ -68,12 +72,16 @@ export interface KillProcessTreeOptions {
  * POSIX signals the process group `-pid` (the caller must have spawned the root `detached`) and falls
  * back to the single pid. Windows runs `taskkill /PID <pid> /T /F`. The call never throws.
  */
-export function killProcessTree(
+/*
+FNXC:ProcessLifecycle 2026-10-07-18:00:
+This is the ONE process-tree termination implementation in core. The child-process form plugins use (`killProcessTree` in windows-launch.ts) is a thin wrapper over it; do not add a second taskkill path.
+*/
+export function killProcessTreeByPid(
   pid: number,
   signal: NodeJS.Signals = "SIGTERM",
   options: KillProcessTreeOptions = {},
 ): void {
-  if (currentPlatform() !== "win32") {
+  if ((options.platform ?? currentPlatform()) !== "win32") {
     try {
       process.kill(-pid, signal);
     } catch {
@@ -117,7 +125,8 @@ function killWindowsProcessTrees(pids: readonly number[], options: KillProcessTr
     return;
   }
   try {
-    const killer = currentTreeKillLauncher().spawn(taskkillExecutable(), args, { stdio: "ignore", windowsHide: true });
+    const launch = options.spawnImpl ?? currentTreeKillLauncher().spawn;
+    const killer = launch(taskkillExecutable(), args, { shell: false, stdio: "ignore", windowsHide: true });
     killer.once("error", () => settle(true));
     killer.once("exit", (code) => settle(code !== 0));
     killer.unref?.();
@@ -570,7 +579,7 @@ export function releaseSupervisedChild(pid: number | undefined): boolean {
 export const ProcessSupervisor = {
   superviseSpawn,
   releaseSupervisedChild,
-  killProcessTree,
+  killProcessTreeByPid,
 } as const;
 
 /** Replace the launcher that runs `taskkill`, so tests can observe win32 tree kills on any host. */

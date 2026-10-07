@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { killProcessTree, prepareNativeCommand } from "@fusion/core";
+import { killProcessTree, resolveShellFreeLaunch } from "@fusion/core";
 
 const OPENROUTER_PUBLIC_MODELS_URL = "https://openrouter.ai/api/v1/models";
 const OPENROUTER_USER_MODELS_URL = "https://openrouter.ai/api/v1/models/user";
@@ -302,24 +302,25 @@ export async function discoverOpencodeGoModels(apiKey?: string): Promise<string[
     /*
     FNXC:ProcessLifecycle 2026-10-07-18:00:
     OpenCode model refresh must work for an npm-installed `opencode` on Windows, whose `.cmd` shim a shell-less spawn cannot run.
-    Resolve through PATH and PATHEXT, launch a shim through cmd.exe with escaped arguments, and kill the whole tree on timeout.
+    Resolve through PATH and PATHEXT, unwrap the shim to the program or `node <entry>` it forwards to (never cmd.exe), and kill the whole tree on timeout.
     */
-    const launch = prepareNativeCommand("opencode", ["models", "opencode", "--refresh"], { env });
+    let launch: ReturnType<typeof resolveShellFreeLaunch>;
+    try {
+      launch = resolveShellFreeLaunch("opencode", ["models", "opencode", "--refresh"], { env });
+    } catch (error) {
+      reject(error);
+      return;
+    }
     const proc = spawn(launch.command, launch.args, {
       stdio: ["ignore", "pipe", "pipe"],
       env,
       windowsHide: true,
-      windowsVerbatimArguments: launch.windowsVerbatimArguments,
     });
 
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
-      if (typeof proc.pid === "number") {
-        killProcessTree(proc.pid, "SIGKILL");
-      } else {
-        proc.kill("SIGKILL");
-      }
+      killProcessTree(proc);
       reject(new Error(`Timed out after ${OPENCODE_MODELS_TIMEOUT_MS}ms`));
     }, OPENCODE_MODELS_TIMEOUT_MS);
 

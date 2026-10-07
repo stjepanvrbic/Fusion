@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { buildSkillInstallInvocation } from "@fusion/core";
 import { createMockApi, registerExtension, requireTool } from "./pg-extension-harness.js";
 
 /*
@@ -66,6 +67,8 @@ describe("fn_skills_install argument boundary", () => {
     const [command, args, options] = spawnMock.mock.calls[0] as [string, string[], Record<string, unknown>];
     expect(options.shell).toBeUndefined();
     expect(args.slice(-8)).toEqual(["skills", "add", "firebase/agent-skills", "--skill", "firebase-basics", "-y", "-a", "pi"]);
-    expect(command).toBe(process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "npx");
+    const expected = buildSkillInstallInvocation({ source: "firebase/agent-skills", skill: "firebase-basics" });
+    expect(expected.ok && command === expected.command).toBe(true);
+    expect(command).not.toMatch(/(cmd\.exe|\.cmd|\.bat)$/i);
   });
 });

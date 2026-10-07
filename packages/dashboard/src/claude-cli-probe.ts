@@ -18,11 +18,11 @@
  *
  * - No authorization. We never shell-interpolate PATH or user input.
  *   We spawn `claude --version` directly with argv, no shell. On Windows an
- *   npm `.cmd` shim runs through cmd.exe with its fixed arguments escaped.
+ *   npm `.cmd` shim is unwrapped to the program it forwards to.
  */
 
 import { spawn } from "node:child_process";
-import { killProcessTree, prepareNativeCommand, resolveWindowsExecutable } from "@fusion/core";
+import { killProcessTree, resolveShellFreeLaunch, type ShellFreeLaunch } from "@fusion/core";
 
 /** Result shape returned to the dashboard status endpoint. */
 export interface ClaudeCliBinaryStatus {
@@ -58,17 +58,27 @@ export async function probeClaudeCli(
   /*
   FNXC:ProcessLifecycle 2026-10-07-18:00:
   An npm-installed Claude CLI must probe as available on Windows.
-  `where claude` can return the extensionless POSIX wrapper and spawn without a shell cannot run the `.cmd` shim, so Windows resolves through PATH and PATHEXT and launches a shim via cmd.exe with escaped arguments.
+  `where claude` can return the extensionless POSIX wrapper and spawn without a shell cannot run the `.cmd` shim, so Windows resolves through PATH and PATHEXT and unwraps the shim to the program or `node <entry>` it forwards to (core's resolveShellFreeLaunch); "available" then means spawnable without a shell.
   */
+  let launch: ShellFreeLaunch | null = null;
+  let launchError: string | undefined;
+  try {
+    launch = resolveShellFreeLaunch("claude", ["--version"], { env });
+  } catch (err) {
+    launchError = err instanceof Error ? err.message : String(err);
+  }
   const binaryPath = process.platform === "win32"
-    ? resolveWindowsExecutable("claude", { env }) ?? undefined
+    ? launch?.resolvedPath
     : await tryResolveBinaryPath("claude", env);
-  const launch = prepareNativeCommand(binaryPath ?? "claude", ["--version"], { env });
 
   return new Promise<ClaudeCliBinaryStatus>((resolvePromise) => {
     const finish = (result: Omit<ClaudeCliBinaryStatus, "probeDurationMs">): void => {
       resolvePromise({ ...result, probeDurationMs: Date.now() - startedAt });
     };
+    if (!launch) {
+      finish({ available: false, binaryPath, reason: launchError ?? "`claude` cannot be launched" });
+      return;
+    }
 
     let settled = false;
     let child: ReturnType<typeof spawn>;
@@ -77,7 +87,6 @@ export async function probeClaudeCli(
         stdio: ["ignore", "pipe", "pipe"],
         env,
         windowsHide: true,
-        windowsVerbatimArguments: launch.windowsVerbatimArguments,
       });
     } catch (err) {
       finish({ available: false, binaryPath, reason: err instanceof Error ? err.message : String(err) });
@@ -87,10 +96,8 @@ export async function probeClaudeCli(
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      if (typeof child.pid === "number") {
-        // A cmd.exe shim wrapper has the real CLI as a child; end the whole tree.
-        killProcessTree(child.pid, "SIGKILL");
-      }
+      // A hung CLI may have started children of its own; end the whole tree.
+      killProcessTree(child);
       finish({
         available: false,
         binaryPath,

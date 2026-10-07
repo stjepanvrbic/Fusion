@@ -1,12 +1,22 @@
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockSpawn } = vi.hoisted(() => ({
+const { mockSpawn, launchOverride } = vi.hoisted(() => ({
   mockSpawn: vi.fn(),
+  launchOverride: { current: null as null | ((command: string, args: readonly string[]) => { command: string; args: string[] }) },
 }));
+
+vi.mock("@fusion/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@fusion/core")>();
+  return {
+    ...actual,
+    resolveShellFreeLaunch: (command: string, args: readonly string[], deps?: Parameters<typeof actual.resolveShellFreeLaunch>[2]) =>
+      launchOverride.current ? launchOverride.current(command, args) : actual.resolveShellFreeLaunch(command, args, deps),
+  };
+});
 
 vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:child_process")>()),
@@ -439,12 +449,8 @@ describe("startup-model-sync", () => {
   FNXC:ProcessLifecycle 2026-10-07-18:00:
   An npm-installed opencode on Windows is a `.cmd` shim; model refresh must launch it through cmd.exe with escaped arguments instead of failing with ENOENT.
   */
-  it("launches an npm opencode .cmd shim on Windows through cmd.exe", async () => {
-    const shimDir = mkdtempSync(join(tmpdir(), "fn-opencode-shim-"));
-    writeFileSync(join(shimDir, "opencode.cmd"), "@node opencode.js %*\r\n");
-    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    vi.stubEnv("PATH", shimDir);
-    vi.stubEnv("PATHEXT", ".EXE;.CMD");
+  it("spawns what the shell-free launch seam resolves an npm opencode shim to, never cmd.exe", async () => {
+    launchOverride.current = (_command, args) => ({ command: "C:/Program Files/nodejs/node.exe", args: ["C:/npm/node_modules/opencode-ai/bin/opencode.js", ...args] });
     mockSpawn.mockImplementation(() => {
       const proc = createSpawnProcess();
       queueMicrotask(() => {
@@ -456,16 +462,27 @@ describe("startup-model-sync", () => {
     try {
       await refreshOpencodeGoModels({ modelRegistry: { registerProvider: vi.fn() }, log: vi.fn() });
     } finally {
-      vi.restoreAllMocks();
-      vi.unstubAllEnvs();
-      rmSync(shimDir, { recursive: true, force: true });
+      launchOverride.current = null;
     }
 
-    const [command, args, options] = mockSpawn.mock.calls[0] as [string, string[], { windowsVerbatimArguments?: boolean }];
-    expect(command.toLowerCase()).toMatch(/cmd(\.exe)?$/);
-    expect(args.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
-    expect(args[3]).toContain("opencode.cmd");
-    expect(args[3]).toContain("--refresh");
-    expect(options.windowsVerbatimArguments).toBe(true);
+    const [command, args, options] = mockSpawn.mock.calls[0] as [string, string[], Record<string, unknown>];
+    expect(command).toBe("C:/Program Files/nodejs/node.exe");
+    expect(args).toEqual(["C:/npm/node_modules/opencode-ai/bin/opencode.js", "models", "opencode", "--refresh"]);
+    expect(options.shell).toBeUndefined();
+    expect(options.windowsVerbatimArguments).toBeUndefined();
+  });
+
+  it("reports a shim the launch seam cannot unwrap as a CLI failure without spawning", async () => {
+    launchOverride.current = () => {
+      throw new Error("Cannot launch opencode without a command shell");
+    };
+    let result: Awaited<ReturnType<typeof refreshOpencodeGoModels>>;
+    try {
+      result = await refreshOpencodeGoModels({ modelRegistry: { registerProvider: vi.fn() }, log: vi.fn() });
+    } finally {
+      launchOverride.current = null;
+    }
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(result.reason).toBe("cli-failed");
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createSkillsAdapter, extractSkillName, computeSkillId, bareSkillName } from "../skills-adapter.js";
-import { resolvePluginSkillEnabled } from "@fusion/core";
+import { buildSkillInstallInvocation, resolvePluginSkillEnabled } from "@fusion/core";
 import { writeFile, mkdir, access, readFile, rm, mkdtemp } from "node:fs/promises";
 import { join, dirname, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -707,11 +707,14 @@ describe("createSkillsAdapter - installSkill", () => {
     const result = await adapter.installSkill(input);
 
     expect(result).toEqual({ success: true });
-    // win32 runs the npx shim through cmd.exe with validated tokens; POSIX spawns npx directly.
-    const win32 = process.platform === "win32";
+    // FNXC:ProcessLifecycle 2026-10-07-18:00: the adapter spawns the shared shell-free invocation (on win32, npx.cmd unwrapped to node); never cmd.exe.
+    const expected = buildSkillInstallInvocation({ source: input.source, skill: input.skill });
+    if (!expected.ok) throw new Error(expected.error);
+    expect(expected.command).not.toMatch(/(cmd\.exe|\.cmd|\.bat)$/i);
+    expect(expected.args.slice(-expectedArgs.length)).toEqual(expectedArgs);
     expect(superviseSpawnMock).toHaveBeenCalledWith(
-      win32 ? (process.env.ComSpec ?? "cmd.exe") : "npx",
-      win32 ? ["/d", "/s", "/c", "npx", ...expectedArgs] : expectedArgs,
+      expected.command,
+      expected.args,
       expect.objectContaining({
         cwd: "/tmp/project",
         stdio: ["ignore", "pipe", "pipe"],
