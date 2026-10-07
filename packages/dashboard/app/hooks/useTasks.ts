@@ -4,7 +4,7 @@ import {
   releaseGateEvidenceFingerprint,
 } from "../utils/releaseGate";
 import { useState, useEffect, useCallback, useRef } from "react";
-import type { Task, Column, ColumnId, TaskCreateInput, MergeResult, GithubIssueAction, AgentLogEntry, TaskColumnSortMode, ArchiveAllDoneResult } from "@fusion/core";
+import type { Task, ColumnId, TaskCreateInput, MergeResult, GithubIssueAction, AgentLogEntry, TaskColumnSortMode, ArchiveAllDoneResult } from "@fusion/core";
 // FNXC:WorkflowLifecycleColumns 2026-07-30-11:50: these are AGENT ROLE comparisons, not
 // column guards — the planner LANE keeps the name `triage`; U11 removed only the COLUMN.
 import { PLANNER_AGENT_ROLE, normalizeColumnId } from "@fusion/core";
@@ -1486,17 +1486,25 @@ export function useTasks(options?: UseTasksOptions) {
         pushTrace("useTasks", "soft-deleted-task-suppressed", { event: "task:merged", id: normalizedTask.id });
         return;
       }
-      const mergedTask = { ...normalizedTask, column: "done" as Column };
-      recordLiveMutation(mergedTask, false);
+      /*
+      FNXC:WorkflowColumns 2026-10-07-17:59:
+      The merged task's column is the server's resolved completion column. Workflows may complete into a custom lane (e.g. "shipped"), so forcing "done" misplaced the card, and a board without a "done" column showed it under intake until revalidation.
+      Lifecycle position is never inferred from an event name; the snapshot reconciles through the same freshness merge as task:updated, so an older merge snapshot cannot roll a newer move back.
+      */
+      recordLiveMutation(normalizedTask, false);
       applyLiveTasks((prev) => {
-        const existingIndex = prev.findIndex((t) => t.id === mergedTask.id);
+        const existingIndex = prev.findIndex((t) => t.id === normalizedTask.id);
         if (existingIndex === -1) {
-          return [...prev, mergedTask];
+          return [...prev, normalizedTask];
         }
+        const current = prev[existingIndex]!;
+        const merged = mergeIncomingTask(current, normalizedTask, { authoritativeLifecycle: true });
+        if (merged === current) return prev;
         const next = [...prev];
-        next[existingIndex] = mergedTask;
+        next[existingIndex] = merged;
         return next;
       });
+      advanceFreshnessClockForLiveUpdate();
     };
 
     const handleAgentLog = (e: MessageEvent) => {
@@ -1556,12 +1564,55 @@ export function useTasks(options?: UseTasksOptions) {
     };
   }, [projectId, sseEnabled, revalidateAfterResume]);
 
+  /*
+  FNXC:TaskMutationProjectScope 2026-10-07-17:59:
+  A mutation response belongs to the project that issued it. Task ids are project-local, so after a project switch a late response must not replace, append to, or delete the new project's rows, must not bump the shared fetch version (that discards the new project's pending board fetch), and must not rebuild its own cache from the new project's rows.
+  The response still updates its originating project's existing cache entry, and it reconciles visible rows again once they belong to that project (A -> B -> A).
+  Every mutation commits through this one seam so the ownership rule cannot drift between call sites.
+  */
+  const ownsVisibleRowsFor = (originProjectId: string | undefined): boolean =>
+    previousProjectIdRef.current === originProjectId && tasksProjectIdRef.current === originProjectId;
+
+  const commitMutationResult = (
+    originProjectId: string | undefined,
+    change: { rows: (rows: Task[]) => Task[]; cache?: boolean; invalidateFetches?: boolean },
+  ): void => {
+    const ownsVisibleRows = ownsVisibleRowsFor(originProjectId);
+    if (ownsVisibleRows && change.invalidateFetches) fetchVersionRef.current++;
+    if (change.cache && originProjectId) {
+      const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${originProjectId}`;
+      const cachedTasks = readCache<unknown>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
+      if (Array.isArray(cachedTasks)) {
+        const cacheContainsOnlyTaskRows = cachedTasks.every((task) =>
+          Boolean(task && typeof task === "object" && typeof (task as Task).id === "string"),
+        );
+        if (cacheContainsOnlyTaskRows) {
+          writeTaskCacheSnapshot(cacheKey, change.rows(cachedTasks.map((task) => normalizeTask(task as Task))));
+        } else {
+          clearCache(cacheKey);
+        }
+      } else if (cachedTasks === null) {
+        if (ownsVisibleRows) writeTaskCacheSnapshot(cacheKey, change.rows(tasksRef.current));
+      } else {
+        clearCache(cacheKey);
+      }
+    }
+    if (ownsVisibleRows) {
+      setTasks((previousTasks) => {
+        const nextTasks = change.rows(previousTasks);
+        tasksRef.current = nextTasks;
+        return nextTasks;
+      });
+    }
+  };
+
+  const appendIfAbsent = (task: Task) => (rows: Task[]) => rows.some((row) => row.id === task.id) ? rows : [...rows, task];
+  const replaceById = (task: Task) => (rows: Task[]) => rows.map((row) => (row.id === task.id ? task : row));
+
   const createTask = useCallback(async (input: TaskCreateInput): Promise<Task> => {
-    const task = normalizeNonBoardTask(await api.createTask(input, projectId));
-    setTasks((prev) => {
-      if (prev.some((t) => t.id === task.id)) return prev;
-      return [...prev, task];
-    });
+    const originProjectId = projectId;
+    const task = normalizeNonBoardTask(await api.createTask(input, originProjectId));
+    commitMutationResult(originProjectId, { rows: appendIfAbsent(task) });
     return task;
   }, [projectId]);
 
@@ -1571,7 +1622,7 @@ export function useTasks(options?: UseTasksOptions) {
   immediately shows the new column. A stale card invited a second Start that could hard-cancel work,
   so lifecycle mutations share one reconciliation seam rather than waiting for an eventual refresh.
   */
-  const reconcileConfirmedTask = useCallback((confirmedTask: Task): Task => {
+  const reconcileConfirmedTask = useCallback((originProjectId: string | undefined, confirmedTask: Task): Task => {
     const normalizedConfirmedRow = normalizeNonBoardTask(confirmedTask);
     // Preserve cleared lifecycle fields as own `undefined` properties so every downstream
     // snapshot host can distinguish the confirmed deletion from an unrelated sparse update.
@@ -1583,58 +1634,38 @@ export function useTasks(options?: UseTasksOptions) {
       pausedReason: normalizedConfirmedRow.pausedReason,
       status: normalizedConfirmedRow.status,
     };
-    const currentTask = tasksRef.current.find((task) => task.id === confirmedRow.id);
+    // Only rows owned by the originating project may arbitrate this id (FNXC:TaskMutationProjectScope).
+    const currentTask = ownsVisibleRowsFor(originProjectId)
+      ? tasksRef.current.find((task) => task.id === confirmedRow.id)
+      : undefined;
     // A live event that arrived while the mutation was pending may be newer than its response.
     // Start from the confirmed row so equal clocks retain the mutation, then admit only newer state.
     const updatedTask = currentTask ? mergeIncomingTask(confirmedRow, currentTask) : confirmedRow;
-    fetchVersionRef.current++;
-    const replaceConfirmedTask = (currentTasks: Task[]) =>
-      currentTasks.map((task) => task.id === updatedTask.id ? mergeIncomingTask(updatedTask, task) : task);
-
-    if (projectId) {
-      const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
-      const cachedTasks = readCache<unknown>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
-      if (Array.isArray(cachedTasks)) {
-        const cacheContainsOnlyTaskRows = cachedTasks.every((task) =>
-          Boolean(task && typeof task === "object" && typeof (task as Task).id === "string"),
-        );
-        if (cacheContainsOnlyTaskRows) {
-          const nextCachedTasks = cachedTasks.map((task) =>
-            (task as Task).id === updatedTask.id ? updatedTask : normalizeTask(task as Task),
-          );
-          writeTaskCacheSnapshot(cacheKey, nextCachedTasks);
-        } else {
-          clearCache(cacheKey);
-        }
-      } else if (cachedTasks === null) {
-        writeTaskCacheSnapshot(cacheKey, replaceConfirmedTask(tasksRef.current));
-      } else {
-        clearCache(cacheKey);
-      }
-    }
-
-    setTasks((previousTasks) => {
-      const nextTasks = replaceConfirmedTask(previousTasks);
-      tasksRef.current = nextTasks;
-      return nextTasks;
+    commitMutationResult(originProjectId, {
+      rows: (rows) => rows.map((task) => task.id === updatedTask.id ? mergeIncomingTask(updatedTask, task) : task),
+      cache: true,
+      invalidateFetches: true,
     });
     return updatedTask;
-  }, [projectId]);
+  }, []);
 
   const moveTask = useCallback(async (
     id: string,
     column: ColumnId,
     optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number,
   ): Promise<Task> => {
-    return reconcileConfirmedTask(await api.moveTask(id, column, projectId, optionsOrPosition));
+    const originProjectId = projectId;
+    return reconcileConfirmedTask(originProjectId, await api.moveTask(id, column, originProjectId, optionsOrPosition));
   }, [projectId, reconcileConfirmedTask]);
 
   const pauseTask = useCallback(async (id: string): Promise<Task> => {
-    return reconcileConfirmedTask(await api.pauseTask(id, projectId));
+    const originProjectId = projectId;
+    return reconcileConfirmedTask(originProjectId, await api.pauseTask(id, originProjectId));
   }, [projectId, reconcileConfirmedTask]);
 
   const unpauseTask = useCallback(async (id: string): Promise<Task> => {
-    return reconcileConfirmedTask(await api.unpauseTask(id, projectId));
+    const originProjectId = projectId;
+    return reconcileConfirmedTask(originProjectId, await api.unpauseTask(id, originProjectId));
   }, [projectId, reconcileConfirmedTask]);
 
   const deleteTask = useCallback(async (
@@ -1646,7 +1677,8 @@ export function useTasks(options?: UseTasksOptions) {
       allowResurrection?: boolean;
     },
   ): Promise<Task> => {
-    const deletedTask = normalizeNonBoardTask(await api.deleteTask(id, projectId, options));
+    const originProjectId = projectId;
+    const deletedTask = normalizeNonBoardTask(await api.deleteTask(id, originProjectId, options));
     /*
     FNXC:TaskDeletion 2026-06-29-18:52:
     Local deletes must update the shared useTasks array immediately because the Board and right-dock Tasks list both render from this state and should not wait for SSE or a refetch after the API confirms deletion.
@@ -1657,26 +1689,11 @@ export function useTasks(options?: UseTasksOptions) {
     FNXC:TaskDeletionCache 2026-06-29-21:04:
     Delete success must also invalidate refreshes that began before the API call completed; otherwise a late pre-delete snapshot can rehydrate the removed card in Board and the right-dock Tasks list until the next live update.
     */
-    // Invalidate refreshes that started before the delete succeeded so an older
-    // server snapshot cannot overwrite the locally removed row after this point.
-    fetchVersionRef.current++;
-
-    if (projectId) {
-      const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
-      const cachedTasks = readCache<unknown>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
-      if (Array.isArray(cachedTasks)) {
-        const nextCachedTasks = cachedTasks.filter((task): task is Task => {
-          return Boolean(task && typeof task === "object" && (task as Task).id !== id);
-        });
-        writeCache(cacheKey, nextCachedTasks, { maxBytes: 500_000 });
-      } else if (cachedTasks === null) {
-        const nextCurrentTasks = tasksRef.current.filter((task) => task.id !== id);
-        writeCache(cacheKey, nextCurrentTasks.length > 500 ? nextCurrentTasks.slice(0, 500) : nextCurrentTasks, { maxBytes: 500_000 });
-      } else {
-        clearCache(cacheKey);
-      }
-    }
-    setTasks((prev) => prev.filter((task) => task.id !== id));
+    commitMutationResult(originProjectId, {
+      rows: (rows) => rows.filter((task) => task.id !== id),
+      cache: true,
+      invalidateFetches: true,
+    });
     return deletedTask;
   }, [projectId]);
 
@@ -1685,7 +1702,8 @@ export function useTasks(options?: UseTasksOptions) {
   }, [projectId]);
 
   const retryTask = useCallback(async (id: string): Promise<Task> => {
-    const retriedTask = normalizeNonBoardTask(await api.retryTask(id, projectId));
+    const originProjectId = projectId;
+    const retriedTask = normalizeNonBoardTask(await api.retryTask(id, originProjectId));
     /*
     FNXC:DashboardTaskRetry 2026-06-30-12:57:
     Manual retry success is a user-visible state boundary. Replace matching rows in shared hook state and the project SWR cache as soon as the retry API returns so Board/List/detail/right-dock retry affordances do not depend on later SSE, polling, remount, or route re-entry to clear stale failed/stuck state.
@@ -1693,34 +1711,7 @@ export function useTasks(options?: UseTasksOptions) {
     FNXC:DashboardTaskRetry 2026-06-30-12:58:
     Retry success also invalidates refreshes that began before the API returned; a late pre-retry fetch snapshot must not rehydrate the failed card after the operator has already received server confirmation for the retry.
     */
-    fetchVersionRef.current++;
-
-    const projectUpdatedTasks = (currentTasks: Task[]) => currentTasks.map((task) => (task.id === id ? retriedTask : task));
-
-    if (projectId) {
-      const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
-      const cachedTasks = readCache<unknown>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
-      if (Array.isArray(cachedTasks)) {
-        const cacheContainsOnlyTaskRows = cachedTasks.every((task) => Boolean(task && typeof task === "object" && typeof (task as Task).id === "string"));
-        if (cacheContainsOnlyTaskRows) {
-          const nextCachedTasks = cachedTasks.map((task) => ((task as Task).id === id ? retriedTask : normalizeTask(task as Task)));
-          writeCache(cacheKey, nextCachedTasks.length > 500 ? nextCachedTasks.slice(0, 500) : nextCachedTasks, { maxBytes: 500_000 });
-        } else {
-          clearCache(cacheKey);
-        }
-      } else if (cachedTasks === null) {
-        const nextCurrentTasks = projectUpdatedTasks(tasksRef.current);
-        writeCache(cacheKey, nextCurrentTasks.length > 500 ? nextCurrentTasks.slice(0, 500) : nextCurrentTasks, { maxBytes: 500_000 });
-      } else {
-        clearCache(cacheKey);
-      }
-    }
-
-    setTasks((prev) => {
-      const next = projectUpdatedTasks(prev);
-      tasksRef.current = next;
-      return next;
-    });
+    commitMutationResult(originProjectId, { rows: replaceById(retriedTask), cache: true, invalidateFetches: true });
     return retriedTask;
   }, [projectId]);
 
@@ -1731,35 +1722,9 @@ export function useTasks(options?: UseTasksOptions) {
   failed-step indicator after the operator receives server confirmation.
   */
   const bypassReview = useCallback(async (id: string, reason: string): Promise<Task> => {
-    const bypassedTask = normalizeNonBoardTask(await api.bypassReview(id, reason, projectId));
-    fetchVersionRef.current++;
-
-    const projectUpdatedTasks = (currentTasks: Task[]) => currentTasks.map((task) => (task.id === id ? bypassedTask : task));
-
-    if (projectId) {
-      const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
-      const cachedTasks = readCache<unknown>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
-      if (Array.isArray(cachedTasks)) {
-        const cacheContainsOnlyTaskRows = cachedTasks.every((task) => Boolean(task && typeof task === "object" && typeof (task as Task).id === "string"));
-        if (cacheContainsOnlyTaskRows) {
-          const nextCachedTasks = cachedTasks.map((task) => ((task as Task).id === id ? bypassedTask : normalizeTask(task as Task)));
-          writeCache(cacheKey, nextCachedTasks.length > 500 ? nextCachedTasks.slice(0, 500) : nextCachedTasks, { maxBytes: 500_000 });
-        } else {
-          clearCache(cacheKey);
-        }
-      } else if (cachedTasks === null) {
-        const nextCurrentTasks = projectUpdatedTasks(tasksRef.current);
-        writeCache(cacheKey, nextCurrentTasks.length > 500 ? nextCurrentTasks.slice(0, 500) : nextCurrentTasks, { maxBytes: 500_000 });
-      } else {
-        clearCache(cacheKey);
-      }
-    }
-
-    setTasks((prev) => {
-      const next = projectUpdatedTasks(prev);
-      tasksRef.current = next;
-      return next;
-    });
+    const originProjectId = projectId;
+    const bypassedTask = normalizeNonBoardTask(await api.bypassReview(id, reason, originProjectId));
+    commitMutationResult(originProjectId, { rows: replaceById(bypassedTask), cache: true, invalidateFetches: true });
     return bypassedTask;
   }, [projectId]);
 
@@ -1770,48 +1735,21 @@ export function useTasks(options?: UseTasksOptions) {
   the in-memory board nor its project-scoped cache because the API call completes before reconciliation.
   */
   const resumeWorkflowStep = useCallback(async (id: string, stepId: string, reason: string): Promise<Task> => {
-    const resumedTask = normalizeNonBoardTask(await api.resumeWorkflowStep(id, stepId, reason, projectId));
-    fetchVersionRef.current++;
-
-    const projectUpdatedTasks = (currentTasks: Task[]) => currentTasks.map((task) => (task.id === id ? resumedTask : task));
-
-    if (projectId) {
-      const cacheKey = `${SWR_CACHE_KEYS.TASKS_PREFIX}${projectId}`;
-      const cachedTasks = readCache<unknown>(cacheKey, { maxAgeMs: SWR_TASKS_MAX_AGE_MS });
-      if (Array.isArray(cachedTasks)) {
-        const cacheContainsOnlyTaskRows = cachedTasks.every((task) => Boolean(task && typeof task === "object" && typeof (task as Task).id === "string"));
-        if (cacheContainsOnlyTaskRows) {
-          const nextCachedTasks = cachedTasks.map((task) => ((task as Task).id === id ? resumedTask : normalizeTask(task as Task)));
-          writeCache(cacheKey, nextCachedTasks.length > 500 ? nextCachedTasks.slice(0, 500) : nextCachedTasks, { maxBytes: 500_000 });
-        } else {
-          clearCache(cacheKey);
-        }
-      } else if (cachedTasks === null) {
-        const nextCurrentTasks = projectUpdatedTasks(tasksRef.current);
-        writeCache(cacheKey, nextCurrentTasks.length > 500 ? nextCurrentTasks.slice(0, 500) : nextCurrentTasks, { maxBytes: 500_000 });
-      } else {
-        clearCache(cacheKey);
-      }
-    }
-
-    setTasks((prev) => {
-      const next = projectUpdatedTasks(prev);
-      tasksRef.current = next;
-      return next;
-    });
+    const originProjectId = projectId;
+    const resumedTask = normalizeNonBoardTask(await api.resumeWorkflowStep(id, stepId, reason, originProjectId));
+    commitMutationResult(originProjectId, { rows: replaceById(resumedTask), cache: true, invalidateFetches: true });
     return resumedTask;
   }, [projectId]);
 
   const resetTask = useCallback(async (id: string, options?: TaskResetOptions): Promise<Task> => {
-    return reconcileConfirmedTask(await api.resetTask(id, options, projectId));
+    const originProjectId = projectId;
+    return reconcileConfirmedTask(originProjectId, await api.resetTask(id, options, originProjectId));
   }, [projectId, reconcileConfirmedTask]);
 
   const duplicateTask = useCallback(async (id: string, options?: { workflowId?: string }): Promise<Task> => {
-    const task = normalizeNonBoardTask(await api.duplicateTask(id, options, projectId));
-    setTasks((prev) => {
-      if (prev.some((t) => t.id === task.id)) return prev;
-      return [...prev, task];
-    });
+    const originProjectId = projectId;
+    const task = normalizeNonBoardTask(await api.duplicateTask(id, options, originProjectId));
+    commitMutationResult(originProjectId, { rows: appendIfAbsent(task) });
     return task;
   }, [projectId]);
 
@@ -1819,28 +1757,23 @@ export function useTasks(options?: UseTasksOptions) {
     id: string,
     updates: { title?: string; description?: string; dependencies?: string[]; dismissNearDuplicate?: boolean; githubTracking?: { enabled?: boolean } }
   ): Promise<Task> => {
-    const previousTask = tasksRef.current.find((t) => t.id === id);
+    const originProjectId = projectId;
+    const previousTask = ownsVisibleRowsFor(originProjectId) ? tasksRef.current.find((t) => t.id === id) : undefined;
     const optimisticTask = previousTask
       ? { ...previousTask, ...updates, updatedAt: new Date().toISOString() }
       : undefined;
 
     if (optimisticTask) {
-      setTasks((prev) =>
-        prev.map((t) => (t.id === id ? optimisticTask : t))
-      );
+      commitMutationResult(originProjectId, { rows: replaceById(optimisticTask) });
     }
 
     try {
-      const updatedTask = normalizeNonBoardTask(await api.updateTask(id, updates, projectId));
-      setTasks((prev) =>
-        prev.map((t) => (t.id === id ? updatedTask : t))
-      );
+      const updatedTask = normalizeNonBoardTask(await api.updateTask(id, updates, originProjectId));
+      commitMutationResult(originProjectId, { rows: replaceById(updatedTask) });
       return updatedTask;
     } catch (err) {
       if (previousTask) {
-        setTasks((prev) =>
-          prev.map((t) => (t.id === id ? previousTask : t))
-        );
+        commitMutationResult(originProjectId, { rows: replaceById(previousTask) });
       }
       throw err;
     }
@@ -1850,18 +1783,16 @@ export function useTasks(options?: UseTasksOptions) {
     id: string,
     options?: { removeLineageReferences?: boolean },
   ): Promise<Task> => {
-    const task = normalizeNonBoardTask(await api.archiveTask(id, projectId, options));
-    setTasks((prev) =>
-      prev.map((t) => (t.id === id ? task : t))
-    );
+    const originProjectId = projectId;
+    const task = normalizeNonBoardTask(await api.archiveTask(id, originProjectId, options));
+    commitMutationResult(originProjectId, { rows: replaceById(task) });
     return task;
   }, [projectId]);
 
   const unarchiveTask = useCallback(async (id: string): Promise<Task> => {
-    const task = normalizeNonBoardTask(await api.unarchiveTask(id, projectId));
-    setTasks((prev) =>
-      prev.map((t) => (t.id === id ? task : t))
-    );
+    const originProjectId = projectId;
+    const task = normalizeNonBoardTask(await api.unarchiveTask(id, originProjectId));
+    commitMutationResult(originProjectId, { rows: replaceById(task) });
     return task;
   }, [projectId]);
 
@@ -1885,14 +1816,12 @@ export function useTasks(options?: UseTasksOptions) {
   }, [projectId]);
 
   const archiveAllDone = useCallback(async (): Promise<ArchiveAllDoneResult> => {
-    const result = await api.archiveAllDone(projectId);
+    const originProjectId = projectId;
+    const result = await api.archiveAllDone(originProjectId);
     const normalized = result.archived.map(normalizeNonBoardTask);
-    setTasks((prev) =>
-      prev.map((t) => {
-        const updated = normalized.find((archived) => archived.id === t.id);
-        return updated || t;
-      })
-    );
+    commitMutationResult(originProjectId, {
+      rows: (rows) => rows.map((t) => normalized.find((archived) => archived.id === t.id) || t),
+    });
     return { archived: normalized, skipped: result.skipped };
   }, [projectId]);
 
