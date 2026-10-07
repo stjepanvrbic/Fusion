@@ -201,37 +201,87 @@ describe("deep-link module", () => {
   });
 
   describe("setupDeepLinkHandler", () => {
-    it("requests single instance lock", async () => {
+    /*
+     * C-044: the single-instance lock is taken by main's run() before boot, so registering the
+     * relaunch handlers must not request it again or quit.
+     */
+    it("registers open-url and second-instance handlers without owning the single-instance lock", async () => {
       const { setupDeepLinkHandler } = await importDeepLinkModule();
 
-      setupDeepLinkHandler(mocks.browserWindow as never);
-
-      expect(mocks.app.requestSingleInstanceLock).toHaveBeenCalledTimes(1);
-    });
-
-    it("quits when single instance lock is not granted", async () => {
-      const { setupDeepLinkHandler } = await importDeepLinkModule();
-      mocks.app.requestSingleInstanceLock.mockReturnValueOnce(false);
-
-      setupDeepLinkHandler(mocks.browserWindow as never);
-
-      expect(mocks.app.quit).toHaveBeenCalledTimes(1);
-      expect(mocks.app.on).not.toHaveBeenCalled();
-    });
-
-    it("registers open-url and second-instance handlers", async () => {
-      const { setupDeepLinkHandler } = await importDeepLinkModule();
-
-      setupDeepLinkHandler(mocks.browserWindow as never);
+      setupDeepLinkHandler(() => mocks.browserWindow as never);
 
       expect(mocks.app.on).toHaveBeenCalledWith("open-url", expect.any(Function));
       expect(mocks.app.on).toHaveBeenCalledWith("second-instance", expect.any(Function));
+      expect(mocks.app.requestSingleInstanceLock).not.toHaveBeenCalled();
+      expect(mocks.app.quit).not.toHaveBeenCalled();
+    });
+
+    /*
+     * C-043: a hidden window must always be recoverable. Relaunching Fusion from the Start menu,
+     * dock or a shortcut carries no fusion:// argument and must still reveal the window.
+     */
+    it.each([
+      ["hidden", { visible: false, minimized: false }],
+      ["minimized", { visible: true, minimized: true }],
+      ["already visible", { visible: true, minimized: false }],
+    ])("second-instance without a deep link reveals a %s window", async (_label, state) => {
+      const { setupDeepLinkHandler } = await importDeepLinkModule();
+      mocks.browserWindow.isVisible.mockReturnValue(state.visible);
+      mocks.browserWindow.isMinimized.mockReturnValue(state.minimized);
+
+      setupDeepLinkHandler(() => mocks.browserWindow as never);
+      mocks.appHandlers.get("second-instance")?.({}, ["Fusion.exe"]);
+
+      expect(mocks.browserWindow.show).toHaveBeenCalledTimes(state.visible ? 0 : 1);
+      expect(mocks.browserWindow.restore).toHaveBeenCalledTimes(state.minimized ? 1 : 0);
+      expect(mocks.browserWindow.focus).toHaveBeenCalledTimes(1);
+      expect(mocks.browserWindow.webContents.send).not.toHaveBeenCalled();
+    });
+
+    it("second-instance with an unsupported fusion:// link still reveals the window", async () => {
+      const { setupDeepLinkHandler } = await importDeepLinkModule();
+      mocks.browserWindow.isVisible.mockReturnValue(false);
+
+      setupDeepLinkHandler(() => mocks.browserWindow as never);
+      mocks.appHandlers.get("second-instance")?.({}, ["Fusion.exe", "fusion://settings/general"]);
+
+      expect(mocks.browserWindow.show).toHaveBeenCalledTimes(1);
+      expect(mocks.browserWindow.focus).toHaveBeenCalledTimes(1);
+      expect(mocks.browserWindow.webContents.send).not.toHaveBeenCalled();
+    });
+
+    /*
+     * C-044: the handlers are registered before the window exists. A link that arrives during boot
+     * is held and delivered once the window is created, instead of being dropped.
+     */
+    it.each(["open-url", "second-instance"] as const)("holds a %s deep link that arrives before the window and delivers it on flush", async (source) => {
+      const { setupDeepLinkHandler } = await importDeepLinkModule();
+      let window: typeof mocks.browserWindow | null = null;
+
+      const router = setupDeepLinkHandler(() => window as never);
+      if (source === "open-url") {
+        mocks.appHandlers.get("open-url")?.({ preventDefault: vi.fn() }, "fusion://task/FN-900");
+      } else {
+        mocks.appHandlers.get("second-instance")?.({}, ["Fusion.exe", "fusion://task/FN-900"]);
+      }
+      expect(mocks.browserWindow.webContents.send).not.toHaveBeenCalled();
+
+      window = mocks.browserWindow;
+      router.flushPending();
+      router.flushPending();
+
+      expect(mocks.browserWindow.webContents.send).toHaveBeenCalledTimes(1);
+      expect(mocks.browserWindow.webContents.send).toHaveBeenCalledWith("deep-link", {
+        type: "task",
+        id: "FN-900",
+        raw: "fusion://task/FN-900",
+      });
     });
 
     it("open-url handler prevents default and routes URL", async () => {
       const { setupDeepLinkHandler } = await importDeepLinkModule();
 
-      setupDeepLinkHandler(mocks.browserWindow as never);
+      setupDeepLinkHandler(() => mocks.browserWindow as never);
 
       const event = { preventDefault: vi.fn() };
       mocks.appHandlers.get("open-url")?.(event, "fusion://task/FN-777");
@@ -247,7 +297,7 @@ describe("deep-link module", () => {
     it("second-instance handler extracts fusion URL from argv", async () => {
       const { setupDeepLinkHandler } = await importDeepLinkModule();
 
-      setupDeepLinkHandler(mocks.browserWindow as never);
+      setupDeepLinkHandler(() => mocks.browserWindow as never);
 
       mocks.appHandlers.get("second-instance")?.({}, [
         "electron",
@@ -263,10 +313,10 @@ describe("deep-link module", () => {
       });
     });
 
-    it("second-instance handler ignores argv without deep links", async () => {
+    it("second-instance handler sends no deep link when argv has none", async () => {
       const { setupDeepLinkHandler } = await importDeepLinkModule();
 
-      setupDeepLinkHandler(mocks.browserWindow as never);
+      setupDeepLinkHandler(() => mocks.browserWindow as never);
       mocks.appHandlers.get("second-instance")?.({}, ["electron", "main.js", "--help"]);
 
       expect(mocks.browserWindow.webContents.send).not.toHaveBeenCalled();

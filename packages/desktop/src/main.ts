@@ -528,7 +528,6 @@ export async function initializeApp(): Promise<void> {
     getDesktopLaunchContext: () => currentRemoteLaunch,
   });
   registerDeepLinkProtocol();
-  setupDeepLinkHandler(createdWindow);
   setupAutoUpdater(createdWindow);
   stopUpdateCheckInterval = startUpdateCheckInterval(createdWindow);
 
@@ -538,10 +537,25 @@ export async function initializeApp(): Promise<void> {
 }
 
 export function run(): void {
+  /*
+  FNXC:DesktopSingleInstance 2026-10-07-18:02:
+  Only the single-instance lock holder may ever start a runtime.
+  The lock used to be taken at the end of initializeApp, so every fusion:// click and Start-menu relaunch first booted a duplicate embedded PostgreSQL lease, store, engines, plugins (with onLoad side effects), dashboard server and window, then quit mid-teardown.
+  Take it before whenReady and before any boot work; the lock is keyed on userData, which the module prologue has already redirected, and the user-data migration it runs first is a one-time copy that a losing instance skips.
+  */
+  if (!app.requestSingleInstanceLock()) {
+    app.quit();
+    return;
+  }
+  const deepLinkRouter = setupDeepLinkHandler(() => mainWindow);
+
   const appWithQuitFlag = getAppWithQuitFlag();
   appWithQuitFlag.isQuitting = false;
 
-  void app.whenReady().then(() => initializeApp());
+  void app
+    .whenReady()
+    .then(() => initializeApp())
+    .then(() => deepLinkRouter.flushPending());
 
   app.on("window-all-closed", () => {
     if (process.platform !== "darwin") {

@@ -94,6 +94,7 @@ const mocks = vi.hoisted(() => {
 
   const setupDeepLinkHandler = vi.fn(() => {
     callLog.push("setupDeepLinkHandler");
+    return { flushPending: vi.fn() };
   });
 
   const setupAutoUpdater = vi.fn(() => {
@@ -278,7 +279,6 @@ describe("main integration", () => {
       "setupTray",
       "registerIpcHandlers",
       "registerDeepLinkProtocol",
-      "setupDeepLinkHandler",
       "setupAutoUpdater",
       "startUpdateCheckInterval",
     ]);

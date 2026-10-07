@@ -147,6 +147,7 @@ vi.mock("electron", () => ({
 }));
 
 const mainDeps = vi.hoisted(() => {
+  const deepLinkRouter = { flushPending: vi.fn() };
   const startLocal = vi.fn(async () => ({ source: "embedded-local", state: "running", port: 4545 }));
   const stopLocal = vi.fn(async () => ({ source: "none", state: "stopped" }));
   const getStatus = vi.fn(() => ({ source: "none", state: "stopped" }));
@@ -158,7 +159,8 @@ const mainDeps = vi.hoisted(() => {
     buildAppMenu: vi.fn(),
     setupTray: vi.fn(),
     registerDeepLinkProtocol: vi.fn(),
-    setupDeepLinkHandler: vi.fn(),
+    setupDeepLinkHandler: vi.fn(() => deepLinkRouter),
+    deepLinkRouter,
     setupAutoUpdater: vi.fn(),
     loadWindowState: vi.fn(async () => null),
     loadDesktopLaunchMode,
@@ -667,6 +669,56 @@ describe("main process", () => {
 
     const [options] = mocks.BrowserWindow.mock.calls[0] as Array<Record<string, unknown>>;
     expect(options).toMatchObject({ x: 100, y: 100 });
+  });
+
+  /*
+   * C-044: only the single-instance lock holder may ever boot a runtime. A losing process must quit
+   * before migration, store creation, engine start, plugin load or window creation, whatever its
+   * launch arguments.
+   */
+  it.each([
+    ["a plain relaunch", [] as string[], undefined],
+    ["a relaunch carrying a deep link", ["fusion://task/FN-1"], undefined],
+    ["FUSION_SERVER_PORT attach mode", [] as string[], "51234"],
+  ])("a second instance that loses the lock quits without booting (%s)", async (_label, extraArgv, serverPort) => {
+    mocks.app.requestSingleInstanceLock.mockReturnValueOnce(false);
+    const originalArgv = process.argv;
+    const originalServerPort = process.env.FUSION_SERVER_PORT;
+    process.argv = [...originalArgv, ...extraArgv];
+    if (serverPort) process.env.FUSION_SERVER_PORT = serverPort;
+    try {
+      const { run } = await importMainModule();
+      run();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(mocks.app.quit).toHaveBeenCalledTimes(1);
+      expect(mocks.app.whenReady).not.toHaveBeenCalled();
+      expect(mainDeps.LocalRuntimeManager).not.toHaveBeenCalled();
+      expect(mainDeps.startLocal).not.toHaveBeenCalled();
+      expect(mocks.BrowserWindow).not.toHaveBeenCalled();
+      expect(mainDeps.setupDeepLinkHandler).not.toHaveBeenCalled();
+    } finally {
+      process.argv = originalArgv;
+      if (originalServerPort === undefined) delete process.env.FUSION_SERVER_PORT;
+      else process.env.FUSION_SERVER_PORT = originalServerPort;
+    }
+  });
+
+  it("the lock holder takes the lock and registers relaunch handlers before boot, then flushes held deep links", async () => {
+    const { run } = await importMainModule();
+
+    run();
+
+    const lockOrder = mocks.app.requestSingleInstanceLock.mock.invocationCallOrder[0];
+    const handlerOrder = mainDeps.setupDeepLinkHandler.mock.invocationCallOrder[0];
+    const readyOrder = mocks.app.whenReady.mock.invocationCallOrder[0];
+    expect(lockOrder).toBeLessThan(handlerOrder);
+    expect(handlerOrder).toBeLessThan(readyOrder);
+    expect(mainDeps.deepLinkRouter.flushPending).not.toHaveBeenCalled();
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.BrowserWindow).toHaveBeenCalledTimes(1);
+    expect(mainDeps.deepLinkRouter.flushPending).toHaveBeenCalledTimes(1);
   });
 
   it("importing main does not auto-start", async () => {
