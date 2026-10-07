@@ -402,13 +402,19 @@ export async function restoreTaskFromArchive(
           deletedAt: null,
           workspaceWorktrees: reconciledWorktreeState.workspaceWorktrees,
           worktree: reconciledWorktreeState.worktree,
-          /*
-          FNXC:TaskStoreArchiveLineage 2026-08-01-23:23 DELIBERATE-LITERAL — STATE MARKER:
-          Without a resolved lane, restore exposes the durable row before the caller's validated move out of the archive state.
-          This is a physical transition sentinel, not the custom workflow's archived lane id.
-          */
-          column: options.toColumn ?? "archived",
-          ...(options.toColumn ? { columnMovedAt: now } : {}),
+          ...(options.toColumn
+            ? { column: options.toColumn, columnMovedAt: now }
+            : {
+              /*
+              FNXC:TaskStoreArchiveLineage 2026-08-01-23:23 DELIBERATE-LITERAL — STATE MARKER:
+              Without a resolved lane, restore exposes the durable row before the caller's validated move out of the archive state.
+              This is a physical transition sentinel, not the custom workflow's archived lane id.
+
+              FNXC:TaskStoreArchiveLineage 2026-10-07-20:08:
+              Kept as a literal-valued property so the lifecycle-column census still sees this reviewed sentinel; the resolved-lane branch above carries no literal.
+              */
+              column: "archived",
+            }),
           updatedAt: now,
         })
         .where(and(
