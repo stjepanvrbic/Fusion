@@ -1,25 +1,8 @@
 /*
-FNXC:WorkflowLifecycleColumns 2026-07-28-09:10 (U11 conversion — engine recovery core):
-
-When worktree acquisition fails, the heartbeat requeues the card to the BACKLOG so
-another cycle can retry it. Both requeue sites hardcoded `"todo"`, so for a
-workflow whose hold column is named anything else the card was shoved into a
-column that workflow does not declare.
-
-This is the rebound-target shape already converted in mesh-lease-manager and
-`recoverStrandedCompletedTodoTasks`: the target is the KTD-10 ordering
-`resolveReboundTarget` (hold -> intake -> first column), not the literal `todo`.
-
-It matters more than usual here because U11 DELETES the `todo` column from the
-builtin workflows. After that these two sites would requeue every
-acquisition-failed card into a column that no longer exists.
-
-Both sites are covered, because they are different branches of the same failure:
-the bounded-retry requeue and the retry-cap-exhausted terminal park. Converting
-one and not the other would leave the rarer path — the one that fires only after
-three consecutive failures — still writing the literal.
-
-Written against the literal implementation and observed FAILING first.
+FNXC:WorktreeAcquisition 2026-10-07-18:20:
+Heartbeat worktree-acquisition recovery stays in the card's current lifecycle role on every board shape.
+It used to requeue the card through the rebound target (hold, else intake, else first column), which moved WIP cards backward and, on a board without a hold lane, into intake where they were re-triaged as new work.
+These cases pin containment on renamed lanes and on a board that declares no hold lane at all, so the intake fallthrough can never return.
 */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Agent, AgentHeartbeatRun, WorkflowIr } from "@fusion/core";
@@ -29,7 +12,7 @@ import * as piModule from "../pi.js";
 
 const WF = "custom:wf";
 
-/** A workflow whose hold column is `drafting` — it declares NO `todo` column. */
+/** A workflow whose hold column is `drafting`; it declares no `todo` column. */
 function renamedIr(): WorkflowIr {
   return {
     version: "v2",
@@ -45,9 +28,26 @@ function renamedIr(): WorkflowIr {
   } as unknown as WorkflowIr;
 }
 
-describe("heartbeat worktree-acquisition requeue under a renamed hold column", () => {
+/** A workflow with no hold lane, where the old rebound target fell through to intake. */
+function noHoldIr(): WorkflowIr {
+  return {
+    version: "v2",
+    id: WF,
+    nodes: [],
+    edges: [],
+    columns: [
+      { id: "inbox", name: "inbox", traits: [{ trait: "intake" }] },
+      { id: "building", name: "building", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
+      { id: "shipped", name: "shipped", traits: [{ trait: "complete" }] },
+    ],
+  } as unknown as WorkflowIr;
+}
+
+describe("heartbeat worktree-acquisition containment on custom boards", () => {
   let store: any;
   let taskStore: any;
+  let liveTask: Record<string, unknown>;
+  let ir: WorkflowIr;
   const agent: Agent = {
     id: "a1", name: "A", role: "executor", state: "active", taskId: "FN-1",
     createdAt: "", updatedAt: "", metadata: {},
@@ -79,20 +79,28 @@ describe("heartbeat worktree-acquisition requeue under a renamed hold column", (
       recordHeartbeat: vi.fn(),
     };
     const selection = { workflowId: WF, stepIds: [] };
+    ir = renamedIr();
+    liveTask = { id: "FN-1", title: "t", description: "d", column: "building", dependencies: [], steps: [], log: [] };
     taskStore = {
       getSettings: vi.fn().mockResolvedValue({}),
-      getTask: vi.fn().mockResolvedValue({
-        id: "FN-1", title: "t", description: "d", column: "drafting", dependencies: [], steps: [], log: [],
-      }),
+      getTask: vi.fn(async () => ({ ...liveTask })),
       moveTask: vi.fn(),
-      updateTask: vi.fn(),
+      updateTask: vi.fn(async (_id: string, patch: Record<string, unknown>) => {
+        liveTask = { ...liveTask, ...patch };
+        return liveTask;
+      }),
+      updateTaskAtomic: vi.fn(async (_id: string, updater: (current: Record<string, unknown>) => unknown) => {
+        const patch = await updater({ ...liveTask });
+        if (patch) liveTask = { ...liveTask, ...(patch as Record<string, unknown>) };
+        return liveTask;
+      }),
       logEntry: vi.fn(),
       appendAgentLog: vi.fn(),
       listTasks: vi.fn().mockResolvedValue([]),
       selectNextTaskForAgent: vi.fn().mockResolvedValue(null),
       getTaskWorkflowSelection: vi.fn(() => selection),
       getTaskWorkflowSelectionAsync: vi.fn(async () => selection),
-      getWorkflowDefinition: vi.fn(async () => ({ ir: renamedIr() })),
+      getWorkflowDefinition: vi.fn(async () => ({ ir })),
     };
   });
 
@@ -100,59 +108,33 @@ describe("heartbeat worktree-acquisition requeue under a renamed hold column", (
     vi.restoreAllMocks();
   });
 
-  it("requeues to the workflow's HOLD column, not the literal todo", async () => {
-    vi.spyOn(worktreeAcquisition, "acquireTaskWorktree").mockRejectedValueOnce(new Error("nope"));
-    const monitor = new HeartbeatMonitor({ store, taskStore, rootDir: "/repo" });
-
-    await monitor.executeHeartbeat({ agentId: "a1", source: "on_demand" });
-
-    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-1", "drafting", { preserveProgress: true });
-    expect(taskStore.moveTask).not.toHaveBeenCalledWith("FN-1", "todo", expect.anything());
-  });
-
-  it("parks to the HOLD column on the retry-cap-exhausted path too", async () => {
-    /*
-    The rarer branch, which only fires after three consecutive failures. It keeps
-    `preserveStatus: true` so the `status: "failed"` written just before is not
-    wiped by reopen-to-todo semantics (FN-7721) — converting the column must not
-    disturb that flag.
-    */
+  it.each([
+    ["renamed lanes", "building"],
+    ["renamed lanes", "drafting"],
+    ["no hold lane", "building"],
+  ] as const)("keeps the card in place on %s (column %s) for in-budget and exhausted failures", async (board, column) => {
+    ir = board === "no hold lane" ? noHoldIr() : renamedIr();
+    liveTask = { ...liveTask, column };
     vi.spyOn(worktreeAcquisition, "acquireTaskWorktree").mockRejectedValue(new Error("branch exists"));
     const monitor = new HeartbeatMonitor({ store, taskStore, rootDir: "/repo" });
 
-    let recoveryRetryCount: number | null | undefined;
-    taskStore.updateTask.mockImplementation((_id: string, patch: Record<string, unknown>) => {
-      if ("recoveryRetryCount" in patch) recoveryRetryCount = patch.recoveryRetryCount as number | null;
-      return Promise.resolve();
-    });
-
     for (let cycle = 0; cycle < 3; cycle++) {
-      taskStore.getTask.mockResolvedValue({
-        id: "FN-1", title: "t", description: "d", column: "drafting",
-        dependencies: [], steps: [], log: [], recoveryRetryCount,
-      });
       await monitor.executeHeartbeat({ agentId: "a1", source: "on_demand" });
     }
 
-    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-1", "drafting", {
-      preserveProgress: true,
-      preserveStatus: true,
-    });
-    expect(taskStore.moveTask).not.toHaveBeenCalledWith("FN-1", "todo", expect.anything());
+    expect(taskStore.moveTask).not.toHaveBeenCalled();
+    expect(liveTask).toMatchObject({ column, status: "failed", recoveryRetryCount: null });
   });
 
-  it("still requeues to todo when the workflow cannot be resolved (regression floor)", async () => {
-    /* Conservative fallback: an unresolvable workflow must behave exactly as it
-       did before this conversion rather than guessing a column. */
-    taskStore.getWorkflowDefinition = vi.fn(async () => null);
-    taskStore.getTask.mockResolvedValue({
-      id: "FN-1", title: "t", description: "d", column: "todo", dependencies: [], steps: [], log: [],
-    });
-    vi.spyOn(worktreeAcquisition, "acquireTaskWorktree").mockRejectedValueOnce(new Error("nope"));
+  it("treats the board's renamed complete lane as terminal", async () => {
+    liveTask = { ...liveTask, column: "shipped", recoveryRetryCount: 1 };
+    vi.spyOn(worktreeAcquisition, "acquireTaskWorktree").mockRejectedValue(new Error("nope"));
     const monitor = new HeartbeatMonitor({ store, taskStore, rootDir: "/repo" });
 
     await monitor.executeHeartbeat({ agentId: "a1", source: "on_demand" });
 
-    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-1", "todo", { preserveProgress: true });
+    expect(taskStore.moveTask).not.toHaveBeenCalled();
+    expect(liveTask).toMatchObject({ column: "shipped", recoveryRetryCount: 1 });
+    expect(liveTask.status).toBeUndefined();
   });
 });

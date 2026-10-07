@@ -17,7 +17,7 @@
  * - onTerminated: Called when a heartbeat run is terminated
  */
 
-import { DEFAULT_PROVIDER_INSTANCE_ID, type AgentStore, type AgentHeartbeatRun, type HeartbeatInvocationSource, type AgentHeartbeatConfig, type AgentBudgetStatus, type Message, type MessageStore, type TaskStore, type TaskDetail, type AgentRole, type Agent, type InboxTask, type RunMutationContext, type Settings, type AgentConfigRevision, type ReflectionStore, type ChatStore, type ChatRoom, type ChatRoomMessage, type AgentMemoryInclusionMode } from "@fusion/core";
+import { DEFAULT_PROVIDER_INSTANCE_ID, type AgentStore, type AgentHeartbeatRun, type HeartbeatInvocationSource, type AgentHeartbeatConfig, type AgentBudgetStatus, type Message, type MessageStore, type TaskStore, type TaskDetail, type Task, type AgentRole, type Agent, type InboxTask, type RunMutationContext, type Settings, type AgentConfigRevision, type ReflectionStore, type ChatStore, type ChatRoom, type ChatRoomMessage, type AgentMemoryInclusionMode } from "@fusion/core";
 import { AutoClaimSnapshotManager, resolveFreshAutoClaimCandidates, type AutoClaimCandidate } from "./scheduling/auto-claim-snapshot.js";
 import {
   ApprovalRequestStore,
@@ -37,7 +37,8 @@ import {
   resolveEffectiveSettingsById,
   resolveEffectivePlannerHeartbeatPatrolEnabled,
   resolveEffectiveMemoryConsolidationEnabled,
-  resolveReboundTarget,
+  resolveReviewColumns,
+  resolveTerminalColumns,
   resolveWorkflowIrForTask,
   columnsWithFlag,
   resolveTaskLifecycleColumns,
@@ -113,27 +114,40 @@ import { evaluateParkedAgentTaskLink, isParkedTaskColumn, type AgentTaskLinkExec
 import { MemoryConsolidationError, MemoryConsolidationService, resolveMemoryConsolidationPorts } from "./memory/index.js";
 
 /*
-FNXC:WorkflowLifecycleColumns 2026-07-28-09:25 (U11 conversion):
-Where a worktree-acquisition failure requeues the card. KTD-10 ordering via
-`resolveReboundTarget` (hold -> intake -> first column) — the same helper
-self-healing and mesh-lease-manager use for "requeue a recovered card", so the
-recovery paths cannot drift apart.
-
-This matters beyond renamed workflows: U11 DELETES the `todo` column from the
-builtin workflows, after which the old literal would requeue every
-acquisition-failed card into a column that no longer exists.
-
-Fail-soft to the legacy id: a requeue must not be abandoned because a workflow
-lookup failed, or the card is left holding a worktree it could not acquire.
+FNXC:WorktreeAcquisition 2026-10-07-18:20:
+A heartbeat worktree-acquisition failure is worktree recovery, which lifecycle containment (FN-207/FN-217) keeps in the card's current lifecycle role.
+The card is never moved: the former requeue through the rebound target moved WIP and review cards backward and, on a board with no hold lane, into intake.
+These lanes decide, against the live row, whether recovery may write at all: never on a terminal card, never over a user or approval pause, and never on a review card owned by a human merge (autoMerge:false).
 */
-async function resolveHeartbeatReboundColumn(taskStore: TaskStore, taskId: string): Promise<string> {
+interface HeartbeatAcquisitionLanes {
+  terminal: ReadonlySet<string>;
+  review: ReadonlySet<string>;
+}
+
+type HeartbeatAcquisitionRecoveryHold = "terminal" | "user-paused" | "approval-blocked" | "human-review";
+
+async function resolveHeartbeatAcquisitionLanes(taskStore: TaskStore, taskId: string): Promise<HeartbeatAcquisitionLanes | undefined> {
   try {
-    return resolveReboundTarget(await resolveWorkflowIrForTask(taskStore, taskId)) ?? "todo";
+    const ir = await resolveWorkflowIrForTask(taskStore, taskId);
+    return { terminal: new Set(resolveTerminalColumns(ir)), review: new Set(resolveReviewColumns(ir)) };
   } catch {
-    return "todo";
+    return undefined;
   }
 }
+
+function resolveHeartbeatAcquisitionRecoveryHold(
+  task: Task,
+  lanes: HeartbeatAcquisitionLanes,
+  settings: Settings | undefined,
+): HeartbeatAcquisitionRecoveryHold | undefined {
+  if (lanes.terminal.has(task.column)) return "terminal";
+  const humanControl = evaluateOverseerHumanControl(task, settings ?? null);
+  if (humanControl.reason === "approval-blocked" || humanControl.reason === "user-paused") return humanControl.reason;
+  if (humanControl.reason === "auto-merge-off-human-review" && lanes.review.has(task.column)) return "human-review";
+  return undefined;
+}
 import { classifyReportHealth } from "./reports-health.js";
+import { evaluateOverseerHumanControl } from "./overseer/overseer-human-control-policy.js";
 import { accumulateSessionTokenUsage, captureSessionTokenBaseline } from "./execution/session-token-usage.js";
 
 const promptSizeLog = createLogger("prompt-size");
@@ -3074,6 +3088,7 @@ export class HeartbeatMonitor {
               ? worktreeErr.refresh.kind
               : undefined;
             heartbeatLog.warn(`Heartbeat worktree acquisition failed for ${agentId}: ${detail}`);
+            const acquisitionLanes = await resolveHeartbeatAcquisitionLanes(taskStore, taskDetail.id);
 
             /*
              * FNXC:WorktreeBaseRefresh 2026-08-01-16:33:
@@ -3081,18 +3096,19 @@ export class HeartbeatMonitor {
              * broken acquisition. Their typed outcome remains in task/run records and is retried
              * only on a later heartbeat after git state can change; never consume the generic
              * three-strike acquisition budget or replace the reason with terminal failure.
+             *
+             * FNXC:WorktreeAcquisition 2026-10-07-18:20:
+             * The refusal parks the card where it is; it records only the task-log reason.
              */
             if (refreshKind) {
-              if (!(await isTaskInTerminalLane(taskStore, taskDetail))) {
+              const isTerminal = acquisitionLanes
+                ? acquisitionLanes.terminal.has(taskDetail.column)
+                : await isTaskInTerminalLane(taskStore, taskDetail);
+              if (!isTerminal) {
                 await taskStore.logEntry(
                   taskDetail.id,
                   `Worktree base refresh blocked heartbeat execution (${refreshKind})`,
                   detail,
-                );
-                await taskStore.moveTask(
-                  taskDetail.id,
-                  await resolveHeartbeatReboundColumn(taskStore, taskDetail.id),
-                  { preserveProgress: true },
                 );
               }
               await this.completeRun(agentId, run.id, {
@@ -3109,44 +3125,40 @@ export class HeartbeatMonitor {
              * Bound consecutive cross-heartbeat acquisition failures for this task
              * (see MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES doc comment). On cap
              * exhaustion, terminally fail the task (matching the executor's
-             * `status: "failed"` convention) instead of requeuing to "todo" again,
-             * and surface the exhaustion via onTaskAcquisitionExhausted so the
-             * owning runtime can record the failure in CentralCore stats (FN-7721).
+             * `status: "failed"` convention) instead of retrying again, and surface
+             * the exhaustion via onTaskAcquisitionExhausted so the owning runtime
+             * can record the failure in CentralCore stats (FN-7721).
+             *
+             * FNXC:WorktreeAcquisition 2026-10-07-18:20:
+             * The counter and the terminal park are one atomic write decided against the live row, and neither moves the card.
+             * A pause or human-merge ownership that lands while acquisition is failing wins: recovery writes nothing and the exhaustion callback does not fire.
+             * Unresolvable lanes also write nothing, because a terminal or human-owned card cannot be ruled out.
              */
-            const priorAttempts = taskDetail.recoveryRetryCount ?? 0;
-            const attemptsSoFar = priorAttempts + 1;
-            const retryCapExhausted = attemptsSoFar >= MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES;
-
-            if (!(await isTaskInTerminalLane(taskStore, taskDetail))) {
-              if (retryCapExhausted) {
-                const exhaustionMessage = `Worktree acquisition failed after ${MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES} heartbeat attempts for branch "${taskDetail.branch ?? `fusion/${taskDetail.id.toLowerCase()}`}": ${detail}`;
-                await taskStore.updateTask(taskDetail.id, {
-                  status: "failed",
-                  error: exhaustionMessage,
-                  recoveryRetryCount: null,
-                });
-                await taskStore.logEntry(taskDetail.id, `Worktree acquisition retry cap reached (${MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES} attempts); task marked failed`, exhaustionMessage);
-                /*
-                 * FNXC:WorktreeAcquisition 2026-07-09-00:00:
-                 * `moveTask(..., "todo", ...)` reopen-to-todo semantics clear
-                 * task.status/task.error back to undefined unless `preserveStatus`
-                 * is passed (see store.ts isReopenToTodoOrTriage clause and
-                 * move-task-preserve-status.test.ts) — without this flag the
-                 * `status: "failed"` just written above would be silently wiped,
-                 * leaving the task looking like a normal todo task that gets
-                 * reassigned and retried from scratch, defeating the terminal-
-                 * failure intent of this fix (FN-7721).
-                 */
-                await taskStore.moveTask(taskDetail.id, await resolveHeartbeatReboundColumn(taskStore, taskDetail.id), { preserveProgress: true, preserveStatus: true });
-                this.onTaskAcquisitionExhausted?.(taskDetail.id, exhaustionMessage);
-              } else {
-                await taskStore.updateTask(taskDetail.id, { recoveryRetryCount: attemptsSoFar });
-                await taskStore.moveTask(taskDetail.id, await resolveHeartbeatReboundColumn(taskStore, taskDetail.id), { preserveProgress: true });
-              }
+            const branchLabel = taskDetail.branch ?? `fusion/${taskDetail.id.toLowerCase()}`;
+            let attemptsSoFar = (taskDetail.recoveryRetryCount ?? 0) + 1;
+            let retryCapExhausted = attemptsSoFar >= MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES;
+            let recoveryHold: HeartbeatAcquisitionRecoveryHold | "lanes-unresolved" | undefined = acquisitionLanes ? undefined : "lanes-unresolved";
+            let exhaustionMessage: string | undefined;
+            if (acquisitionLanes) {
+              await taskStore.updateTaskAtomic(taskDetail.id, (current) => {
+                recoveryHold = resolveHeartbeatAcquisitionRecoveryHold(current, acquisitionLanes, heartbeatModelSettings);
+                if (recoveryHold) return null;
+                attemptsSoFar = (current.recoveryRetryCount ?? 0) + 1;
+                retryCapExhausted = attemptsSoFar >= MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES;
+                if (!retryCapExhausted) return { recoveryRetryCount: attemptsSoFar };
+                exhaustionMessage = `Worktree acquisition failed after ${MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES} heartbeat attempts for branch "${branchLabel}": ${detail}`;
+                return { status: "failed", error: exhaustionMessage, recoveryRetryCount: null };
+              });
+            }
+            if (exhaustionMessage) {
+              await taskStore.logEntry(taskDetail.id, `Worktree acquisition retry cap reached (${MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES} attempts); task marked failed`, exhaustionMessage);
+              this.onTaskAcquisitionExhausted?.(taskDetail.id, exhaustionMessage);
+            } else if (recoveryHold) {
+              heartbeatLog.log(`Heartbeat worktree acquisition recovery for ${taskDetail.id} wrote nothing (hold=${recoveryHold})`);
             }
             await this.completeRun(agentId, run.id, {
               status: "completed",
-              resultJson: { reason: "worktree_acquisition_failed", detail, attempt: attemptsSoFar, retryCapExhausted },
+              resultJson: { reason: "worktree_acquisition_failed", detail, attempt: attemptsSoFar, retryCapExhausted, ...(recoveryHold ? { recoveryHold } : {}) },
               stderrExcerpt: detail,
               skipStateTransition: true,
             });
