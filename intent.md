@@ -48,7 +48,7 @@ Two independent features, built in parallel:
 ### A3. Identity and binding
 
 - Fusion authenticates to Linear as **agent-svrbic**, with a personal API key held in Fusion's encrypted secrets store, project-scoped. The plain-text plugin `apiKey` setting goes away; an existing value is migrated into the secrets store.
-- One Fusion project binds to **one Linear Project** inside its team. Today that is team **STJ**. A Linear Project named **Fusion** is created in STJ for this repo.
+- One Fusion project binds to **one Linear Project** inside its team. Today that is team **STJ**. This repo is bound to the Linear Project **Fusion Factory** in STJ.
 - Membership:
   - Issues in the bound Linear Project are in sync scope.
   - Moving an issue out of the Project archives the Fusion card. Moving one in creates a card.
@@ -304,7 +304,7 @@ Two tracks run in parallel, each in its own worktree with subagents per slice. E
 |---|---|---|
 | L1 | Plugin SDK: update/delete hooks, import-provider slot, card badge slot, project secrets access | — |
 | L2 | Linear tab in Import Tasks | Import from Linear in the main view |
-| L3 | Linear-backed binding, initial reconcile, sync loop, state map, assignee signal, comments, crash-safe create | Fusion project bound to Linear Project "Fusion" |
+| L3 | Linear-backed binding, initial reconcile, sync loop, state map, assignee signal, comments, crash-safe create | Fusion project bound to Linear Project "Fusion Factory" |
 | L4 | Linear UI: settings dialog, card badge, sync status | — |
 | P1 | Provider interface + public-write gate + Private PR data model (GitHub) + `private-pr` mode | Tasks stop opening public PRs |
 | P2 | Private PR review page (`@pierre/diffs`), private inline comments, Send to agent, inbox item | Review and iterate privately |
