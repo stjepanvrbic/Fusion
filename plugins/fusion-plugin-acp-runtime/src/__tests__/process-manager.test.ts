@@ -1,5 +1,8 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   MissingAcpEnvError,
   buildSpawnEnv,
@@ -37,7 +40,7 @@ describe("buildSpawnEnv (KTD6b allow-list)", () => {
   it("returns an empty env for an empty allow-list", () => {
     process.env.ACP_TEST_SECRET = "super-secret-value";
     try {
-      const env = buildSpawnEnv([]);
+      const env = buildSpawnEnv([], { platform: "linux" });
       expect(Object.keys(env)).toHaveLength(0);
       expect(env.ACP_TEST_SECRET).toBeUndefined();
     } finally {
@@ -51,7 +54,7 @@ describe("buildSpawnEnv (KTD6b allow-list)", () => {
     process.env.ANTHROPIC_API_KEY = "do-not-forward";
     process.env.ANTHROPIC_AUTH_TOKEN = "do-not-forward";
     try {
-      const env = buildSpawnEnv(["ACP_TEST_ALLOWED"]);
+      const env = buildSpawnEnv(["ACP_TEST_ALLOWED"], { platform: "linux" });
       expect(env).toEqual({ ACP_TEST_ALLOWED: "ok" });
       expect(env.ACP_TEST_SECRET).toBeUndefined();
       expect(env.ANTHROPIC_API_KEY).toBeUndefined();
@@ -76,6 +79,26 @@ describe("buildSpawnEnv (KTD6b allow-list)", () => {
       },
     });
     expect(env).toEqual({ HOME: "/Users/tester", PATH: "/usr/bin" });
+  });
+
+  it("adds the non-secret Windows startup keys on win32 while still excluding secrets", () => {
+    const env = buildSpawnEnv(["HOME", "PATH"], {
+      platform: "win32",
+      sourceEnv: {
+        HOME: "C:\\Users\\tester",
+        PATH: "C:\\Windows\\System32",
+        SystemRoot: "C:\\Windows",
+        PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        USERPROFILE: "C:\\Users\\tester",
+        APPDATA: "C:\\Users\\tester\\AppData\\Roaming",
+        LOCALAPPDATA: "C:\\Users\\tester\\AppData\\Local",
+        TEMP: "C:\\Temp",
+        ANTHROPIC_API_KEY: "do-not-forward",
+      },
+    });
+    for (const key of ["SystemRoot", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP"]) expect(env[key]).toBeDefined();
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(buildSpawnEnv(["HOME"], { platform: "linux", sourceEnv: { HOME: "/h", SystemRoot: "C:\\Windows" } })).toEqual({ HOME: "/h" });
   });
 
   it("rejects the Claude bridge env when HOME is missing", () => {
@@ -108,6 +131,24 @@ describe("redactSecrets (Risk S8)", () => {
 
   it("leaves benign text intact", () => {
     expect(redactSecrets("hello world")).toBe("hello world");
+  });
+});
+
+describe("spawnAgent launch resolution", () => {
+  it("launches a JS agent entry through node without a shell, delivering argv literally", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acp-launch-"));
+    try {
+      const entry = join(dir, "agent.js");
+      writeFileSync(entry, "process.stdout.write(JSON.stringify(process.argv.slice(2)))");
+      const args = ["a b", "%PATH%", "$(echo x)", 'q"uote', "C:\\dir with space\\x"];
+      const child = track(spawnAgent({ binaryPath: entry, args, cwd: dir, env: buildSpawnEnv(["PATH"]) }));
+      let out = "";
+      child.stdout?.on("data", (chunk: Buffer) => { out += chunk.toString(); });
+      await waitForExit(child);
+      expect(JSON.parse(out)).toEqual(args);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

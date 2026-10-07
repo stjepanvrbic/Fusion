@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { access, constants } from "node:fs/promises";
+import { killProcessTree, resolveShellFreeLaunch } from "@fusion/plugin-sdk";
 
 export interface AgentBrowserProbeResult {
   available: boolean;
@@ -12,18 +13,29 @@ export interface AgentBrowserProbeResult {
 export async function probeAgentBrowserBinary(opts?: { binaryPath?: string; timeoutMs?: number }): Promise<AgentBrowserProbeResult> {
   const binary = opts?.binaryPath?.trim() || "agent-browser";
   const timeoutMs = opts?.timeoutMs ?? 2000;
-  const resolvedPath = await tryResolveBinaryPath(binary);
+  /*
+  FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+  On Windows `where agent-browser` lists the extensionless npm sh-script first and the `.cmd` shim next; neither can be spawned without a shell.
+  Probe through the shared shell-free launch resolution so the shim is unwrapped to the executable it wraps and availability is truthful.
+  */
+  let launch: { command: string; args: string[]; resolvedPath?: string };
+  try {
+    launch = resolveShellFreeLaunch(binary, ["--version"]);
+  } catch (error) {
+    return { available: false, reason: (error as Error).message };
+  }
+  const resolvedPath = launch.resolvedPath ?? (await tryResolveBinaryPath(binary));
 
   return new Promise((resolve) => {
     let settled = false;
-    const child = spawn(resolvedPath ?? binary, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(launch.command, launch.args, { stdio: ["ignore", "pipe", "pipe"], shell: false, windowsHide: true });
     let stdout = "";
     let stderr = "";
 
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      child.kill("SIGKILL");
+      killProcessTree(child);
       resolve({ available: false, binaryPath: resolvedPath, reason: `Probe timed out after ${timeoutMs}ms` });
     }, timeoutMs);
 

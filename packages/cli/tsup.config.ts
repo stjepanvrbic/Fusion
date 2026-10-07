@@ -1,6 +1,6 @@
 import { defineConfig } from "tsup";
 import { spawn } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -292,17 +292,12 @@ export async function bundlePluginEntry({ pluginId, srcDir, destDir, withMcpAsse
     cpSync(join(launcherSourceDir, "bin"), join(launcherDestDir, "bin"), { recursive: true });
     cpSync(launcherPackageJson, join(launcherDestDir, "package.json"));
 
-    const bridgeWrapper = join(bridgeDest, `claude-code-cli-acp${process.platform === "win32" ? ".cmd" : ""}`);
-    if (process.platform === "win32") {
-      writeFileSync(bridgeWrapper, "@echo off\r\nnode \"%~dp0node_modules\\claude-code-cli-acp\\bin\\claude-code-cli-acp.js\" %*\r\n");
-    } else {
-      writeFileSync(
-        bridgeWrapper,
-        "#!/usr/bin/env node\nimport \"./node_modules/claude-code-cli-acp/bin/claude-code-cli-acp.js\";\n",
-      );
-      chmodSync(bridgeWrapper, 0o755);
-    }
-
+    /*
+     * FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+     * The runtime launches the staged JS entry with node on every platform. No `.cmd`/shebang
+     * wrapper is written: its form followed the build host, so a Linux-built package shipped no
+     * Windows wrapper, and Node cannot spawn a `.cmd` without a shell.
+     */
     if (!existsSync(join(launcherDestDir, "bin", "claude-code-cli-acp.js"))) {
       throw new Error(`[tsup] Missing required Claude ACP launcher after staging`);
     }

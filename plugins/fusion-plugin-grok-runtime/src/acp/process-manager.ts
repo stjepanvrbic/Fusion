@@ -14,7 +14,7 @@
 // to the agent.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { redactSecrets } from "@fusion/core";
+import { killProcessTree, redactSecrets, resolveShellFreeLaunch, withPlatformBaseEnvKeys } from "@fusion/core";
 
 function debugLog(message: string): void {
   if (process.env.PI_ACP_DEBUG !== "1" && process.env.FUSION_GROK_ACP_DEBUG !== "1") return;
@@ -58,16 +58,12 @@ export function activeProcessCount(): number {
 }
 
 /**
- * Force-kill a subprocess via SIGKILL. No-op if already dead (killed or exited).
- * Cross-platform safe: Node treats SIGKILL as forceful termination on Windows.
+ * Force-kill a subprocess and every process it started. No-op once it has exited.
+ *
+ * FNXC:WindowsProcessLaunch 2026-10-07-18:02: Windows `child.kill` ends only the direct child, so the agent's own subprocesses outlived the session; core's `killProcessTree` uses `taskkill /T /F` there and SIGKILL elsewhere.
  */
 export function forceKill(child: ChildProcess): void {
-  if (child.killed || child.exitCode !== null) return;
-  try {
-    child.kill("SIGKILL");
-  } catch {
-    // already gone
-  }
+  killProcessTree(child);
 }
 
 /**
@@ -110,6 +106,7 @@ export class MissingAcpEnvError extends Error {
 export interface BuildSpawnEnvOptions {
   required?: string[];
   sourceEnv?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
 }
 
 /**
@@ -126,7 +123,12 @@ export function buildSpawnEnv(allowList: string[], options: BuildSpawnEnvOptions
   */
   const sourceEnv = options.sourceEnv ?? process.env;
   const env: NodeJS.ProcessEnv = {};
-  for (const key of allowList) {
+  /*
+  FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+  POSIX allow-lists (HOME, TMPDIR, XDG_*) mean nothing on Windows, where an agent without SystemRoot, PATHEXT, USERPROFILE, APPDATA, LOCALAPPDATA and TEMP cannot start or find its config and auth.
+  The platform's non-secret base keys are always added; credentials still cross only when explicitly allow-listed.
+  */
+  for (const key of withPlatformBaseEnvKeys(allowList, options.platform)) {
     const value = sourceEnv[key];
     if (typeof value === "string") env[key] = value;
   }
@@ -151,10 +153,18 @@ export interface SpawnAgentOptions {
  * stdin/stdout into a web stream for `ndJsonStream`.
  */
 export function spawnAgent(options: SpawnAgentOptions): ChildProcess {
-  const child = spawn(options.binaryPath, options.args, {
+  /*
+  FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+  Node refuses `.cmd` bridges and npm shims without a shell (EINVAL) and resolves bare names to `.exe` only, so every Windows ACP session failed before the handshake while the shell-based probe reported "available".
+  Resolve through core's shell-free launch seam against the child's own PATH, exactly as the probe does, so the untrusted agent's argv never reaches cmd.exe.
+  */
+  const launch = resolveShellFreeLaunch(options.binaryPath, options.args, { env: options.env });
+  const child = spawn(launch.command, launch.args, {
     stdio: ["pipe", "pipe", "pipe"],
     cwd: options.cwd,
     env: options.env,
+    shell: false,
+    windowsHide: true,
   });
   registerProcess(child);
   debugLog(`spawnAgent: pid=${child.pid} binary=${options.binaryPath}`);

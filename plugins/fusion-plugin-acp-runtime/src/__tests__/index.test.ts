@@ -120,7 +120,7 @@ describe("resolveCliSettings", () => {
 
   it("builds a read-only Claude bridge ask profile without changing generic ACP defaults", () => {
     const generic = resolveCliSettings(undefined);
-    const ask = resolveClaudeBridgeAskSettings({ acpModel: "claude-sonnet-4" });
+    const ask = resolveClaudeBridgeAskSettings({ acpModel: "claude-sonnet-4" }, "linux");
 
     expect(generic.binaryPath).toBe("acp-agent");
     expect(ask.binaryPath).toContain("plugins/fusion-plugin-acp-runtime/node_modules/.bin/claude-code-cli-acp");
@@ -130,6 +130,7 @@ describe("resolveCliSettings", () => {
     expect(ask.model).toBe("claude-sonnet-4");
     expect(ask.envAllowList).toEqual(["HOME", "PATH"]);
     expect(ask.requiredEnv).toEqual(["HOME"]);
+    expect(resolveClaudeBridgeAskSettings({ acpModel: "claude-sonnet-4" }, "win32").requiredEnv).toEqual(["USERPROFILE"]);
     expect(ask.allowUnrestricted).toBe(false);
   });
 });

@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { killProcessTree, resolveShellFreeLaunch } from "@fusion/core";
 
 function formatSpawnError(error: Error & { code?: unknown }): string {
   const code = typeof error.code === "string" ? `${error.code}: ` : "";
@@ -20,19 +21,25 @@ export async function runGrokCommand(binary: string, args: string[], timeoutMs: 
     };
 
     /*
-    FNXC:GrokCli 2026-07-08-00:00:
-    Windows Grok installers/npm-style shims can expose `grok.cmd` or `grok.bat` on PATH, and Node cannot direct-spawn those batch wrappers without the command shell.
-    Keep Unix/macOS on direct spawn so only the known Grok CLI probe/discovery seam uses shell resolution where Windows requires it. Copied verbatim from the Cursor plugin's cli-spawn seam (FN-7705).
+    FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+    The probe/discovery runner launches through core's shell-free resolution, the same seam ACP sessions use.
+    A `shell:true` probe reported Windows npm shims available while every session spawn failed with ENOENT/EINVAL, and passed argv through cmd.exe.
     */
-    const child = spawn(binary, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      shell: process.platform === "win32",
-    });
+    let child: ChildProcess;
+    try {
+      const launch = resolveShellFreeLaunch(binary, args);
+      child = spawn(launch.command, launch.args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: false,
+        windowsHide: true,
+      });
+    } catch (error) {
+      finish({ code: 127, stdout, stderr: `spawn error: ${(error as Error).message}` });
+      return;
+    }
 
     timer = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch {
-        // best effort
-      }
+      killProcessTree(child);
       finish({ code: 124, stdout, stderr });
     }, timeoutMs);
 

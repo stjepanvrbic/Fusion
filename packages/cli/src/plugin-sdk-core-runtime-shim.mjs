@@ -27,7 +27,21 @@ import { AgentStore } from "../../core/src/agents/agent-store.js";
 import { redactSecrets } from "../../core/src/secrets/redact-secrets.js";
 import { getErrorMessage } from "../../core/src/process/error-message.js";
 
+/*
+ * FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+ * Runtime plugins launch their CLIs and bridges through core's shell-free launch resolver, env
+ * allow-list extension, and process-tree kill. Bundled plugins reach core only through this shim,
+ * so the shared seam must be re-exported here or every bundled runtime fails to load.
+ */
+import {
+  killProcessTree,
+  resolveShellFreeLaunch,
+  UnlaunchableCommandError,
+  withPlatformBaseEnvKeys,
+} from "../../core/src/process/windows-launch.js";
+
 export { AgentStore, postgresSchema, redactSecrets, getErrorMessage };
+export { killProcessTree, resolveShellFreeLaunch, UnlaunchableCommandError, withPlatformBaseEnvKeys };
 
 /*
  * FNXC:BundledPlugins 2026-07-31-09:55:

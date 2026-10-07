@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { killProcessTree, resolveShellFreeLaunch } from "@fusion/core";
 
 function formatSpawnError(error: Error & { code?: unknown }): string {
   const code = typeof error.code === "string" ? `${error.code}: ` : "";
@@ -24,22 +25,25 @@ export async function runOmpCommand(
     };
 
     /*
-    FNXC:OmpAcp 2026-07-11-23:35:
-    Windows installers/npm-style shims can expose `omp.cmd` or `omp.bat` on PATH;
-    Node cannot direct-spawn those batch wrappers without the command shell.
-    Keep Unix/macOS on direct spawn.
+    FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+    The probe/discovery runner launches through core's shell-free resolution, the same seam ACP sessions use.
+    A `shell:true` probe reported Windows npm shims available while every session spawn failed with ENOENT/EINVAL, and passed argv through cmd.exe.
     */
-    const child = spawn(binary, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      shell: process.platform === "win32",
-    });
+    let child: ChildProcess;
+    try {
+      const launch = resolveShellFreeLaunch(binary, args);
+      child = spawn(launch.command, launch.args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: false,
+        windowsHide: true,
+      });
+    } catch (error) {
+      finish({ code: 127, stdout, stderr: `spawn error: ${(error as Error).message}` });
+      return;
+    }
 
     timer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // best effort
-      }
+      killProcessTree(child);
       finish({ code: 124, stdout, stderr });
     }, timeoutMs);
 

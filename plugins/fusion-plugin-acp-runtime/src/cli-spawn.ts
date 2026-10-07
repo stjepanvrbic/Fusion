@@ -173,7 +173,15 @@ function asAuthenticateSettings(value: unknown): AcpCliSettings["authenticate"] 
   };
 }
 
-export function resolveClaudeBridgeAskSettings(settings?: Record<string, unknown>): AcpCliSettings {
+/*
+FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+The bridge needs the operator's profile directory to find Claude auth. That is HOME on POSIX and USERPROFILE on Windows, where HOME is normally unset, so requiring HOME failed every Windows setup check.
+*/
+export function profileHomeEnvKey(platform: NodeJS.Platform = process.platform): "HOME" | "USERPROFILE" {
+  return platform === "win32" ? "USERPROFILE" : "HOME";
+}
+
+export function resolveClaudeBridgeAskSettings(settings?: Record<string, unknown>, platform: NodeJS.Platform = process.platform): AcpCliSettings {
   const resolved = resolveCliSettings({
     ...settings,
     acpBinaryPath: CLAUDE_CODE_CLI_ACP_BINARY,
@@ -183,5 +191,5 @@ export function resolveClaudeBridgeAskSettings(settings?: Record<string, unknown
     acpEnvAllowList: ["HOME", "PATH"],
     acpAllowUnrestricted: false,
   });
-  return { ...resolved, requiredEnv: ["HOME"] };
+  return { ...resolved, requiredEnv: [profileHomeEnvKey(platform)] };
 }
