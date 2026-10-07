@@ -91,6 +91,79 @@ export async function readProjectConfig(
 }
 
 /**
+ * FNXC:SettingsPersistence 2026-10-07-17:59:
+ * Read the config row for a read-modify-write and hold its row lock until `tx` ends.
+ * PostgreSQL runs these transactions at READ COMMITTED, so a plain SELECT let two writers
+ * read the same settings and the later wholesale rewrite reverted the other writer's key.
+ * The row is created first when absent so even a first write has a row to lock.
+ */
+export async function readProjectConfigForUpdate(
+  layer: AsyncDataLayer,
+  tx: DbTransaction,
+): Promise<ProjectConfigRow> {
+  await tx
+    .insert(schema.project.config)
+    .values({
+      id: CONFIG_ROW_ID,
+      projectId: layer.projectId ?? "",
+      nextId: 1,
+      nextWorkflowStepId: 1,
+      nextWorkflowDefinitionId: 1,
+      settings: {},
+      workflowSteps: [],
+      updatedAt: new Date().toISOString(),
+    })
+    .onConflictDoNothing({ target: schema.project.config.projectId });
+  const rows = await tx
+    .select({
+      nextId: schema.project.config.nextId,
+      nextWorkflowStepId: schema.project.config.nextWorkflowStepId,
+      nextWorkflowDefinitionId: schema.project.config.nextWorkflowDefinitionId,
+      settings: schema.project.config.settings,
+    })
+    .from(schema.project.config)
+    .where(configScope(layer))
+    .for("update");
+  const row = rows[0];
+  return {
+    nextId: row?.nextId ?? 1,
+    nextWorkflowStepId: row?.nextWorkflowStepId ?? 1,
+    nextWorkflowDefinitionId: row?.nextWorkflowDefinitionId ?? 1,
+    settings: (row?.settings as Record<string, unknown> | null) ?? null,
+  };
+}
+
+/**
+ * FNXC:SettingsPersistence 2026-10-07-17:59:
+ * Advance the workflow-step or workflow-definition allocator without touching `settings`.
+ * Counter bumps used to rewrite the settings blob they had read earlier, which reverted any
+ * settings write that committed in between.
+ */
+export async function setProjectConfigCounters(
+  layer: AsyncDataLayer,
+  counters: { nextWorkflowStepId?: number; nextWorkflowDefinitionId?: number },
+  handle: AsyncDataLayer["db"] | DbTransaction = layer.db,
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+  const set: Record<string, unknown> = { updatedAt: nowIso };
+  if (counters.nextWorkflowStepId !== undefined) set.nextWorkflowStepId = counters.nextWorkflowStepId;
+  if (counters.nextWorkflowDefinitionId !== undefined) set.nextWorkflowDefinitionId = counters.nextWorkflowDefinitionId;
+  await handle
+    .insert(schema.project.config)
+    .values({
+      id: CONFIG_ROW_ID,
+      projectId: layer.projectId ?? "",
+      nextId: 1,
+      nextWorkflowStepId: counters.nextWorkflowStepId ?? 1,
+      nextWorkflowDefinitionId: counters.nextWorkflowDefinitionId ?? 1,
+      settings: {},
+      workflowSteps: [],
+      updatedAt: nowIso,
+    })
+    .onConflictDoUpdate({ target: schema.project.config.projectId, set });
+}
+
+/**
  * Read just the project-level settings object (the fast-path settings read).
  * Returns null when the config row or settings column is absent.
  */

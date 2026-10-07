@@ -18,7 +18,7 @@ import {hasSyncPassphraseConfigured} from "../secrets/secrets-sync-passphrase.js
 import {ensureMemoryFileWithBackend} from "../memory/project-memory.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {canonicalizeSettings, isPlainObject, deepMergeWithNullDelete} from "../task-store/settings-helpers.js";
-import {readProjectConfig as readProjectConfigAsync, writeProjectConfig as writeProjectConfigAsync} from "../task-store/async/async-settings.js";
+import {readProjectConfig as readProjectConfigAsync, readProjectConfigForUpdate, writeProjectConfig as writeProjectConfigAsync} from "../task-store/async/async-settings.js";
 import {appendConfigurationRevision, createConfigurationRevision} from "../async-stores/async-configuration-revision-store.js";
 import {isValidProviderInstanceId} from "../provider-instance.js";
 import {applyWorkspaceModeToggle, withWorkspaceModeLock, type WorkspaceModeToggleOps} from "../git/git-repository.js";
@@ -137,9 +137,18 @@ export async function publishSettingsUpdated(
           return;
         }
         if (result.enabled !== requested) {
-          const fresh = await readProjectConfigAsync(layer);
-          if ((fresh.settings?.workspaceMode === true) !== requested) {
-            settings.workspaceMode = fresh.settings?.workspaceMode === true;
+          // FNXC:SettingsPersistence 2026-10-07-17:59: the stale check and the correction write share one row-locked transaction so a concurrent settings writer is never reverted.
+          const corrected = await layer.transactionImmediate(async (tx) => {
+            const fresh = await readProjectConfigForUpdate(layer, tx);
+            if ((fresh.settings?.workspaceMode === true) !== requested) {
+              return { applied: false as const, committedMode: fresh.settings?.workspaceMode === true };
+            }
+            // Write from the locked row, not the published snapshot: unrelated concurrent fields survive.
+            await writeProjectConfigAsync(layer, { ...(fresh.settings ?? {}), workspaceMode: result.enabled }, undefined, tx);
+            return { applied: true as const };
+          });
+          if (!corrected.applied) {
+            settings.workspaceMode = corrected.committedMode;
             storeLog.warn("Workspace mode correction yielded to newer settings writer", {
               phase: "updateSettings:workspace-toggle", rootDir: store.rootDir, requested,
               achieved: result.enabled, failureReason: result.failureReason, mirrorDivergent: result.mirrorDivergent,
@@ -147,8 +156,6 @@ export async function publishSettingsUpdated(
             });
             return;
           }
-          // Write from a fresh row, not the published snapshot: unrelated concurrent fields survive.
-          await writeProjectConfigAsync(layer, { ...(fresh.settings ?? {}), workspaceMode: result.enabled });
           settings.workspaceMode = result.enabled;
         }
         if (result.enabled !== requested || result.failureReason || result.mirrorDivergent) {
@@ -234,7 +241,8 @@ export async function updateSettingsImpl(store: TaskStore, patch: Partial<Settin
       */
       const layer = store.asyncLayer!;
       const transactionResult = await layer.transactionImmediate(async (tx) => {
-        const projectConfig = await readProjectConfigAsync(layer, tx);
+        // FNXC:SettingsPersistence 2026-10-07-17:59: lock the row so a concurrent writer of another key (CLI, agent, second dashboard) is serialized, not overwritten.
+        const projectConfig = await readProjectConfigForUpdate(layer, tx);
         const config: BoardConfig = {
           nextId: projectConfig.nextId ?? 1,
           settings: (projectConfig.settings ?? {}) as Settings,
@@ -283,7 +291,11 @@ export async function updateSettingsImpl(store: TaskStore, patch: Partial<Settin
         }
 
         const globalSettings = await store.globalSettingsStore.getSettings();
-        const previousMerged = canonicalizeSettings({ ...DEFAULT_SETTINGS, ...globalSettings, ...config.settings } as Settings);
+        /*
+        FNXC:SettingsPersistence 2026-10-07-17:59:
+        `previous` comes from the untouched snapshot. config.settings has already lost the keys this patch clears, so deriving it there made a null-cleared key look unchanged to settings:updated listeners.
+        */
+        const previousMerged = canonicalizeSettings({ ...DEFAULT_SETTINGS, ...globalSettings, ...beforeProjectSettings } as Settings);
         const updatedProjectSettings = canonicalizeSettings({ ...config.settings, ...projectPatch } as Settings);
         /*
         FNXC:DisabledBuiltinWorkflows 2026-08-19-00:18:

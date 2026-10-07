@@ -15,6 +15,7 @@ vi.mock("../task-store/async/async-settings.js", async (importOriginal) => {
   return {
     ...actual,
     readProjectConfig: config.read,
+    readProjectConfigForUpdate: config.read,
     writeProjectConfig: config.write,
   };
 });
@@ -48,7 +49,11 @@ const root = () => {
 afterEach(() => roots.splice(0).forEach((path) => rmSync(path, { recursive: true, force: true })));
 
 function store(rootDir: string) {
-  return { rootDir, asyncLayer: { projectId: "test" }, emit: vi.fn() } as never;
+  return {
+    rootDir,
+    asyncLayer: { projectId: "test", transactionImmediate: async (fn: (tx: unknown) => Promise<unknown>) => fn({}) },
+    emit: vi.fn(),
+  } as never;
 }
 
 function productionStore(rootDir: string): TaskStore {
@@ -153,7 +158,7 @@ describe("publishSettingsUpdated workspace reconciliation", () => {
     });
 
     expect((await loadWorkspaceConfig(rootDir))?.repos).toEqual(["repo-a"]);
-    expect(config.write).toHaveBeenCalledWith(expect.anything(), { workspaceMode: true, taskPrefix: "concurrent" });
+    expect(config.write).toHaveBeenCalledWith(expect.anything(), { workspaceMode: true, taskPrefix: "concurrent" }, undefined, expect.anything());
     expect(settings.workspaceMode).toBe(true);
     expect(taskStore.emit).toHaveBeenCalledWith("settings:updated", {
       settings, previous: { workspaceMode: true },

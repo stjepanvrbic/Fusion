@@ -13,7 +13,7 @@ const persistence = vi.hoisted(() => ({
 }));
 vi.mock("../../../core/src/task-store/async/async-settings.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../../core/src/task-store/async/async-settings.js")>();
-  return { ...actual, readProjectConfig: persistence.read, writeProjectConfig: persistence.write };
+  return { ...actual, readProjectConfig: persistence.read, readProjectConfigForUpdate: persistence.read, writeProjectConfig: persistence.write };
 });
 vi.mock("../../../core/src/task-store/async-stores/async-configuration-revision-store.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../../core/src/task-store/async-stores/async-configuration-revision-store.js")>();
