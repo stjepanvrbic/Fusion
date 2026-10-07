@@ -1438,22 +1438,41 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
     pre-implementation lane is hold when one exists and intake otherwise.
     */
     if (fromColumn === (moveLifecycle?.review ?? "in-review") && toColumn === (moveLifecycle?.hold ?? moveLifecycle?.intake ?? "todo") && moveSource === "user") {
-      const handoffAccepted = await store.getCompletionHandoffAcceptedMarker(id);
-      const mergeRequest = await store.getMergeRequestRecordAsync(id);
-      if (handoffAccepted && mergeRequest && mergeRequest.state !== "succeeded" && mergeRequest.state !== "cancelled") {
-        if (mergeRequest.state === "queued" || mergeRequest.state === "running" || mergeRequest.state === "retrying" || mergeRequest.state === "manual-required") {
-          await store.transitionMergeRequestState(id, "cancelled", {
-            attemptCount: mergeRequest.attemptCount,
-            lastError: mergeRequest.lastError ?? "cancelled-by-user-hard-cancel",
+      /*
+      FNXC:WorkflowTaskCancellation 2026-10-07-21:40:
+      The move is committed by now, so this merge cleanup is best-effort like the continuation cleanup below. Two of these
+      calls were fire-and-forget: a rejection became an unhandled rejection, which the process supervisor treats as fatal,
+      and an awaited failure rejected a move that had already landed. Each step is awaited and logged on failure.
+      */
+      const hardCancelCleanup = async (phase: string, step: () => Promise<unknown>): Promise<void> => {
+        try {
+          await step();
+        } catch (err) {
+          storeLog.warn("Operator hard-cancel merge cleanup failed (degraded)", {
+            phase,
+            taskId: id,
+            error: err instanceof Error ? err.message : String(err),
           });
         }
-      }
-      void store.cancelActiveWorkflowWorkItemsForTask(id, {
+      };
+      await hardCancelCleanup("moveTaskInternal:cancel-merge-request", async () => {
+        const handoffAccepted = await store.getCompletionHandoffAcceptedMarker(id);
+        const mergeRequest = await store.getMergeRequestRecordAsync(id);
+        if (handoffAccepted && mergeRequest && mergeRequest.state !== "succeeded" && mergeRequest.state !== "cancelled") {
+          if (mergeRequest.state === "queued" || mergeRequest.state === "running" || mergeRequest.state === "retrying" || mergeRequest.state === "manual-required") {
+            await store.transitionMergeRequestState(id, "cancelled", {
+              attemptCount: mergeRequest.attemptCount,
+              lastError: mergeRequest.lastError ?? "cancelled-by-user-hard-cancel",
+            });
+          }
+        }
+      });
+      await hardCancelCleanup("moveTaskInternal:cancel-merge-work-items", () => store.cancelActiveWorkflowWorkItemsForTask(id, {
         kinds: ["merge", "manual-hold"],
         now: movedAt,
         lastError: "cancelled-by-user-hard-cancel",
-      });
-      void store.clearCompletionHandoffAcceptedMarker(id);
+      }));
+      await hardCancelCleanup("moveTaskInternal:clear-handoff-marker", () => store.clearCompletionHandoffAcceptedMarker(id));
     }
     if (toColumn === (moveLifecycle?.hold ?? moveLifecycle?.intake ?? "todo") && moveSource === "user" && (fromIsImplementation || fromColumn === (moveLifecycle?.review ?? "in-review"))) {
       // FNXC:WorkflowTaskCancellation 2026-07-21-11:51:
