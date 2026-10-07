@@ -346,19 +346,22 @@ export async function renewCheckoutLeaseImpl(store: TaskStore, taskId: string, u
       if (row?.deletedAt) {
         return { deletedAt: row.deletedAt as string, current: undefined };
       }
-      const result = await tx
+      /*
+      FNXC:CheckoutLease 2026-10-07-21:40:
+      Without RETURNING the driver result has no rows, so every successful renewal took the not-found branch and threw after
+      its timestamp committed. The UPDATE also lacked the project predicate, so a renewal by one project's store rewrote a
+      same-id task in another project. RETURNING yields the renewed row, and the row is scoped like every other task write.
+      */
+      const [renewed] = await tx
         .update(schema.project.tasks)
         .set({
           checkoutRunId: update.checkoutRunId,
           checkoutLeaseRenewedAt: update.checkoutLeaseRenewedAt,
           updatedAt: update.checkoutLeaseRenewedAt,
         })
-        .where(and(eq(schema.project.tasks.id, taskId), isNull(schema.project.tasks.deletedAt)));
-      if (result.length === 0) {
-        return { deletedAt: undefined, current: undefined };
-      }
-      const fresh = await readTaskRowInTransaction(tx, taskId, undefined, layer.projectId);
-      return { deletedAt: undefined, current: fresh };
+        .where(and(eq(schema.project.tasks.id, taskId), taskProjectScope(layer), isNull(schema.project.tasks.deletedAt)))
+        .returning();
+      return { deletedAt: undefined, current: renewed as Record<string, unknown> | undefined };
     });
 
     if (outcome.deletedAt) {
