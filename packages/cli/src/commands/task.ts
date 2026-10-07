@@ -1,4 +1,4 @@
-import { TaskStore, COLUMNS, COLUMN_LABELS, MAX_TASK_MESSAGE_LENGTH, resolveProjectColumnsForRoles, TERMINAL_ROLES, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, resolvePreMergeGateForTask, resolveEffectiveAutoMerge, CentralCore, buildAutoPauseClearPatch, buildManualRetryResetPatch, buildManualRetryResetPatchIfCurrent, extractIntentSignature, findNearDuplicates, getTaskDuplicateLineage, isValidRepoSlug, isWorkspaceTask, reconcileDeterministicDuplicate, resolveTaskGithubTracking, runDeterministicDuplicateGuard, evaluateArchiveTaskLiveness, describeArchiveLiveness, TaskIsLiveError, type Settings, type Column, type ColumnId, type StepStatus, type AgentLogType, type AgentLogEntry, type IntentSignature, type NearDuplicateCandidate, type NearDuplicateMatch, type TaskDependencyMutation } from "@fusion/core";
+import { TaskStore, COLUMNS, COLUMN_LABELS, MAX_TASK_MESSAGE_LENGTH, resolveProjectColumnsForRoles, TERMINAL_ROLES, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, resolvePreMergeGateForTask, resolveEffectiveAutoMerge, CentralCore, buildAutoPauseClearPatch, buildManualRetryResetPatch, buildManualRetryResetPatchIfCurrent, extractIntentSignature, findNearDuplicates, getTaskDuplicateLineage, isValidRepoSlug, isWorkspaceTask, reconcileDeterministicDuplicate, resolveTaskGithubTracking, runDeterministicDuplicateGuard, evaluateArchiveTaskLiveness, describeArchiveLiveness, TaskIsLiveError, claimEmbeddedPostgresSignalShutdown, type Settings, type Column, type ColumnId, type StepStatus, type AgentLogType, type AgentLogEntry, type IntentSignature, type NearDuplicateCandidate, type NearDuplicateMatch, type TaskDependencyMutation } from "@fusion/core";
 import { isFailedNoVerdictPreMergeReviewResult, isInReviewMissingWorktreeSessionStartFailure, runAiMerge, landWorkspaceTask, withWorkspaceMergeDispatchLease, installBaselineArchiveWorktreeDisposer, clearOwnedMergeStamp, reconcileUnownedStaleMergeStamp, SelfHealingManager } from "@fusion/engine";
 import { createInterface } from "node:readline/promises";
 import type { PlanningQuestion, PlanningSummary } from "@fusion/core";
@@ -1310,6 +1310,22 @@ export async function runTaskReconcile(id: string, projectName?: string) {
   }
 }
 
+/**
+ * FNXC:PostgresShutdownOrder 2026-10-07-21:17:
+ * Upper bound a signalled `fn task merge` waits for its aborted merge body to settle, so the body's finally can remove its temp merge worktree before the store closes and the process exits.
+ * A body that never settles must not keep an interrupted foreground command alive indefinitely.
+ */
+export const MERGE_SIGNAL_SETTLE_TIMEOUT_MS = 10_000;
+
+async function settleWithin(work: Promise<unknown>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    work.then(() => undefined, () => undefined),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+  ]);
+  if (timer) clearTimeout(timer);
+}
+
 export async function runTaskMerge(id: string, projectName?: string) {
   // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): resolve context ONCE.
   const context = await resolveBoardContext(projectName, id, "resolve project");
@@ -1321,6 +1337,8 @@ export async function runTaskMerge(id: string, projectName?: string) {
   let handlersInstalled = false;
   let storeClosed = false;
   let signalShutdown: Promise<void> | undefined;
+  let mergeBody: Promise<unknown> | undefined;
+  let releaseSignalShutdownClaim: (() => void) | undefined;
 
   const closeStoreOnce = async () => {
     if (storeClosed) return;
@@ -1354,6 +1372,8 @@ export async function runTaskMerge(id: string, projectName?: string) {
   const removeSignalHandlers = () => {
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(signal, onSignal);
     handlersInstalled = false;
+    releaseSignalShutdownClaim?.();
+    releaseSignalShutdownClaim = undefined;
   };
   const onSignal = (signal: NodeJS.Signals) => {
     if (handlingSignal) return;
@@ -1364,6 +1384,7 @@ export async function runTaskMerge(id: string, projectName?: string) {
     // path exits and it cannot terminate before authorization-B cleanup commits.
     signalShutdown = (async () => {
       abortController.abort();
+      if (mergeBody) await settleWithin(mergeBody, MERGE_SIGNAL_SETTLE_TIMEOUT_MS);
       if (wroteLocalMergeStamp) {
         await clearOwnedMergeStamp(store, id, "MergeAborted").catch(() => undefined);
       }
@@ -1392,12 +1413,18 @@ export async function runTaskMerge(id: string, projectName?: string) {
     and exiting 129; ignoring it would leave an invisible detached merge and Node otherwise exits.
     */
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, onSignal);
+    /*
+    FNXC:PostgresShutdownOrder 2026-10-07-21:17:
+    This command owns its signal teardown: abort, let the merge body clean its temp worktree, clear the owned merge stamp, close the store (which releases the backend), then exit.
+    Claim embedded-PostgreSQL signal shutdown while the handlers are installed so the lifecycle hook cannot stop the database beneath that cleanup or re-raise the signal into an early exit; the claim is released with the handlers.
+    */
+    releaseSignalShutdownClaim = claimEmbeddedPostgresSignalShutdown();
     handlersInstalled = true;
 
     const mergeTaskRecord = await store.getTask(id).catch(() => null);
     const isWorkspaceMerge = !!mergeTaskRecord && isWorkspaceTask(mergeTaskRecord);
     if (isWorkspaceMerge) {
-      const workspaceResult = await withWorkspaceMergeDispatchLease(mergeStore, id, (workspaceDispatchFence) =>
+      const workspaceBody = withWorkspaceMergeDispatchLease(mergeStore, id, (workspaceDispatchFence) =>
         landWorkspaceTask(mergeStore, mergeTaskRecord!, projectPath, {
           onAgentText: (delta) => process.stdout.write(delta),
           signal: abortController.signal,
@@ -1405,6 +1432,8 @@ export async function runTaskMerge(id: string, projectName?: string) {
           manual: true,
         }),
       );
+      mergeBody = workspaceBody;
+      const workspaceResult = await workspaceBody;
       console.log();
       for (const repo of workspaceResult.repos) {
         const label = repo.status === "landed" ? `landed ${repo.landedSha?.slice(0, 8) ?? ""} → ${repo.integrationBranch}` : repo.status === "empty" ? "no net changes" : `failed: ${repo.error ?? "unknown"}`;
@@ -1426,10 +1455,12 @@ export async function runTaskMerge(id: string, projectName?: string) {
     routing decision lost its only record. `grok-runtime-bootstrap.test.ts` pins it here for exactly
     that reason.
     */
-    const result = await runAiMerge(mergeStore, projectPath, id, {
+    const singleRepoBody = runAiMerge(mergeStore, projectPath, id, {
       onAgentText: (delta) => process.stdout.write(delta),
       signal: abortController.signal,
     });
+    mergeBody = singleRepoBody;
+    const result = await singleRepoBody;
     console.log();
     if (result.merged) {
       console.log(`  ✓ Merged ${result.task.id}`);

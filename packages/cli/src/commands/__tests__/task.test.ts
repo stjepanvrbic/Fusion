@@ -265,7 +265,7 @@ import { createInterface } from "node:readline/promises";
 import { TaskStore, CentralCore, extractIntentSignature, findNearDuplicates, MAX_TASK_MESSAGE_LENGTH, runDeterministicDuplicateGuard, reconcileDeterministicDuplicate, TaskIsLiveError } from "@fusion/core";
 import { watchFile, unwatchFile, statSync, existsSync, readFileSync } from "node:fs";
 import { exec } from "node:child_process";
-import { runTaskShow, runTaskCreate, runTaskList, runTaskDuplicate, runTaskRefine, runTaskDelete, runTaskRetry, runTaskLogs, runTaskComment, runTaskComments, runTaskPrCreate, runTaskPlan, runTaskMove, runTaskAttach, runTaskPause, runTaskUnpause, runTaskArchive, runTaskUnarchive, runTaskSteer, runTaskSetNode, runTaskClearNode, runTaskImportFromGitHub, runTaskImportGitHubInteractive, runTaskUpdate, runTaskLog, runTaskMerge, type LogsOptions } from "../task.js";
+import { runTaskShow, runTaskCreate, runTaskList, runTaskDuplicate, runTaskRefine, runTaskDelete, runTaskRetry, runTaskLogs, runTaskComment, runTaskComments, runTaskPrCreate, runTaskPlan, runTaskMove, runTaskAttach, runTaskPause, runTaskUnpause, runTaskArchive, runTaskUnarchive, runTaskSteer, runTaskSetNode, runTaskClearNode, runTaskImportFromGitHub, runTaskImportGitHubInteractive, runTaskUpdate, runTaskLog, runTaskMerge, MERGE_SIGNAL_SETTLE_TIMEOUT_MS, type LogsOptions } from "../task.js";
 import {
   getCurrentRepo,
   isGhAuthenticated,
@@ -1686,6 +1686,128 @@ describe("project-aware task command behavior", () => {
     expect(close).toHaveBeenCalledOnce();
     expect(exitSpy).toHaveBeenCalledWith(130);
     exitSpy.mockRestore();
+  });
+
+  /*
+   * FNXC:PostgresShutdownOrder 2026-10-07-21:17:
+   * `fn task merge` owns its signal teardown, so it claims embedded-PostgreSQL signal shutdown for the whole merge on both the single-repo and workspace surfaces.
+   * Without the claim the lifecycle hook stopped the database and re-raised the signal before the owned stamp clear and the body's temp-worktree cleanup could run.
+   */
+  const mergeSurfaces = [
+    ["single-repo", undefined],
+    ["workspace", { "repo-a": { worktreePath: "/tmp/a", branch: "fusion/fn-claim" } }],
+  ] as const;
+
+  function stubMergeBody(surface: string, body: (options: { signal?: AbortSignal }) => Promise<unknown>): void {
+    if (surface === "workspace") {
+      vi.mocked(landWorkspaceTask).mockImplementation(((_store, _task, _path, options) => body(options)) as never);
+    } else {
+      vi.mocked(runAiMerge).mockImplementation(((_store, _path, _id, options) => body(options)) as never);
+    }
+  }
+
+  it.each(mergeSurfaces)("holds the signal-shutdown claim for the %s merge body and releases it afterwards", async (surface, workspaceWorktrees) => {
+    const { isEmbeddedPostgresSignalShutdownClaimed } = await import("@fusion/core");
+    const task = makeTask({ id: "FN-CLAIM", column: "in-review", ...(workspaceWorktrees ? { workspaceWorktrees } : {}) });
+    const close = vi.fn().mockResolvedValue(undefined);
+    const resolvedStore = { getTask: vi.fn().mockResolvedValue(task), close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+    let claimedDuringBody: boolean | undefined;
+    stubMergeBody(surface, async () => {
+      claimedDuringBody = isEmbeddedPostgresSignalShutdownClaimed();
+      return surface === "workspace"
+        ? { allLanded: true, finalized: true, repos: [{ repo: "repo-a", status: "empty", integrationBranch: "main" }] }
+        : { merged: true, task, branch: "fusion/fn-claim", worktreeRemoved: true, branchDeleted: true };
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      expect(isEmbeddedPostgresSignalShutdownClaimed()).toBe(false);
+      await runTaskMerge(task.id, "demo-project");
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(claimedDuringBody).toBe(true);
+    expect(isEmbeddedPostgresSignalShutdownClaimed()).toBe(false);
+  });
+
+  it.each(mergeSurfaces)("on a signal waits for the aborted %s body's cleanup, then closes the store under the claim", async (surface, workspaceWorktrees) => {
+    const { isEmbeddedPostgresSignalShutdownClaimed } = await import("@fusion/core");
+    const task = makeTask({ id: "FN-CLEANUP", column: "in-review", ...(workspaceWorktrees ? { workspaceWorktrees } : {}) });
+    let claimedDuringClose: boolean | undefined;
+    const close = vi.fn().mockImplementation(async () => { claimedDuringClose = isEmbeddedPostgresSignalShutdownClaimed(); });
+    const resolvedStore = { getTask: vi.fn().mockResolvedValue(task), close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+    let finishCleanup!: () => void;
+    const cleanupDone = vi.fn();
+    stubMergeBody(surface, (options) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener("abort", () => {
+        // Models the body's finally removing its temp merge worktree after the abort.
+        new Promise<void>((resolve) => { finishCleanup = resolve; }).then(() => {
+          cleanupDone();
+          reject(new Error("merge aborted"));
+        });
+      }, { once: true });
+    }));
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      const pending = runTaskMerge(task.id, "demo-project");
+      await vi.waitFor(() => expect(process.listenerCount("SIGTERM")).toBeGreaterThan(0));
+      process.emit("SIGTERM", "SIGTERM");
+      await vi.waitFor(() => expect(finishCleanup).toBeTypeOf("function"));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(close).not.toHaveBeenCalled();
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      finishCleanup();
+      await pending;
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(cleanupDone).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(claimedDuringClose).toBe(true);
+    expect(exitSpy).toHaveBeenCalledWith(143);
+    expect(isEmbeddedPostgresSignalShutdownClaimed()).toBe(false);
+    exitSpy.mockRestore();
+  });
+
+  it("exits after a bounded wait when an aborted merge body never settles", async () => {
+    const task = makeTask({ id: "FN-HUNG", column: "in-review" });
+    const close = vi.fn().mockResolvedValue(undefined);
+    const resolvedStore = { getTask: vi.fn().mockResolvedValue(task), close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+    vi.mocked(runAiMerge).mockImplementation((() => new Promise(() => undefined)) as never);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    try {
+      const pending = runTaskMerge(task.id, "demo-project");
+      await vi.waitFor(() => expect(process.listenerCount("SIGINT")).toBeGreaterThan(0));
+      process.emit("SIGINT", "SIGINT");
+      await vi.advanceTimersByTimeAsync(MERGE_SIGNAL_SETTLE_TIMEOUT_MS - 1);
+      expect(exitSpy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(130));
+      expect(close).toHaveBeenCalledOnce();
+      void pending;
+    } finally {
+      vi.useRealTimers();
+      exitSpy.mockRestore();
+    }
   });
 
   it("exits non-zero when a workspace finalize is blocked after all repos landed", async () => {
