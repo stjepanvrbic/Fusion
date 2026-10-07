@@ -274,6 +274,21 @@ export function createTaskFromRecommendation(
   });
 }
 
+/** Server answer to "would Create task succeed for this source's recommendations right now?". */
+export interface RecommendationEligibilityResponse {
+  actionable: boolean;
+  /** Operator-facing explanation when not actionable, otherwise null. */
+  reason: string | null;
+}
+
+/*
+FNXC:TaskRecommendations 2026-10-07-19:59:
+The mailbox notice arrives at accepted fn_task_done, before the source lands. It asks the create route's own eligibility rule so Create task is enabled exactly when the server would accept it.
+*/
+export function fetchRecommendationEligibility(taskId: string, projectId?: string): Promise<RecommendationEligibilityResponse> {
+  return api<RecommendationEligibilityResponse>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/recommendations/eligibility`, projectId));
+}
+
 export async function createTask(
   input: CreateTaskInput,
   projectId?: string,

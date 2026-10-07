@@ -8,6 +8,7 @@ vi.mock("../../api", () => ({
 }));
 
 import { createTaskFromRecommendation, fetchTaskRecommendations } from "../../api";
+import { ApiRequestError } from "../../api/client/client";
 
 const mockFetchTaskRecommendations = vi.mocked(fetchTaskRecommendations);
 const mockCreateTaskFromRecommendation = vi.mocked(createTaskFromRecommendation);
@@ -89,8 +90,30 @@ describe("useTaskRecommendations", () => {
     const { result } = renderHook(() => useTaskRecommendations("project-a"));
     await waitFor(() => expect(result.current.loading).toBe(false));
     await act(async () => { await result.current.createTask("FN-1", "same"); });
-    expect(result.current.createStates.get("FN-1:same")).toEqual({ running: false, error: "create unavailable" });
+    expect(result.current.createStates.get("FN-1:same")).toEqual({ running: false, failed: true, refusal: null });
     expect(result.current.createStates.get("FN-2:same")).toBeUndefined();
+  });
+
+  it("keeps a 4xx refusal reason, drops 5xx and transport text, and clears the reason on a successful retry", async () => {
+    mockFetchTaskRecommendations.mockResolvedValueOnce(page([item("FN-1", "REC-1")]) as never);
+    const refusal = "Recommendations from FN-1 can be filed as tasks after FN-1 lands or completes";
+    mockCreateTaskFromRecommendation
+      .mockRejectedValueOnce(new ApiRequestError(refusal, 409))
+      .mockRejectedValueOnce(new ApiRequestError("Internal error", 500))
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({ task: { id: "FN-9" }, parent: { id: "FN-1" } } as never);
+    const { result } = renderHook(() => useTaskRecommendations("project-a"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => { await result.current.createTask("FN-1", "REC-1"); });
+    expect(result.current.createStates.get("FN-1:REC-1")).toEqual({ running: false, failed: true, refusal });
+    await act(async () => { await result.current.createTask("FN-1", "REC-1"); });
+    expect(result.current.createStates.get("FN-1:REC-1")).toEqual({ running: false, failed: true, refusal: null });
+    await act(async () => { await result.current.createTask("FN-1", "REC-1"); });
+    expect(result.current.createStates.get("FN-1:REC-1")).toEqual({ running: false, failed: true, refusal: null });
+    await act(async () => { await result.current.createTask("FN-1", "REC-1"); });
+    expect(result.current.createStates.get("FN-1:REC-1")).toEqual({ running: false, failed: false, refusal: null });
+    expect(result.current.items[0]?.recommendation.createdTaskId).toBe("FN-9");
   });
 
   it("drops stale project responses and restarts paging when the project changes", async () => {

@@ -1,10 +1,15 @@
-import type { MailReport, Message, MessageStore } from "@fusion/core";
+import type { MailReport, Message, MessageFilter } from "@fusion/core";
 
 /*
 FNXC:OperatorMailDedup 2026-10-07-12:56:
 A durable heartbeat agent sent seven near-identical operator reports in seven hours because fn_read_messages shows only its inbox, so it never saw what it had already told the operator.
-Two deterministic seams close that gap: every heartbeat prompt lists the agent's own recent agent->user mail (titles only, bounded), and fn_send_message refuses an exact normalized duplicate the recipient has not read yet.
-Semantic dedupe ("same blocker, reworded title") stays the model's job, informed by the prompt listing; the send guard only catches literal repeats.
+Two deterministic seams close that gap: every heartbeat prompt lists the agent's own recent agent->user mail (titles only, bounded), and fn_send_message refuses a duplicate the recipient has not read yet.
+Semantic dedupe ("same blocker, reworded title") stays the model's job, informed by the prompt listing.
+
+FNXC:OperatorMailDedup 2026-10-07-20:39:
+The guard keys on thread plus content: a reply to one parent never suppresses a reply to a different parent, so identical "Done" replies to two separate requests are both delivered.
+Beyond the exact repeat it catches the structural repeat typical heartbeat reports produce: same mail kind, same title once counts and timestamps are ignored, and the same referenced task set. Such a send is refused unless it carries an explicit note of what changed, so a legitimate new report stays deliverable.
+The check and the insert run atomically at the message-store seam (sendMessageUnlessDuplicate), so concurrent sessions sharing an agent identity cannot both deliver the same report.
 */
 
 /** Heartbeat outbox listing covers the last 24h of the agent's operator mail. */
@@ -67,25 +72,64 @@ export function operatorMessageFingerprint(content: string, report?: MailReport)
   return `${collapseWhitespace(content).toLowerCase()}\u0001${normalizedReport.toLowerCase()}`;
 }
 
+/** Task-style identifiers (FN-123, KB-003) referenced anywhere in the body or report. */
+const TASK_ID_PATTERN = /\b[A-Z][A-Z0-9]*-\d+\b/g;
+
+function referencedTaskIds(content: string, report?: MailReport): string[] {
+  const text = [content, report?.title ?? "", ...(report?.sections ?? []).flatMap((section) => [section.heading, section.body])].join("\n");
+  return [...new Set(text.match(TASK_ID_PATTERN) ?? [])].sort();
+}
+
 /**
- * Find the newest unread agent->user message from `fromAgentId` to `toId` inside the duplicate window whose fingerprint equals the candidate send.
- * Read messages, older messages, other recipients, and other senders never match: a read report means the operator has seen it, so a repeat is a deliberate re-ping.
+ * Identity of a report that is stable under changing counts and timestamps: mail kind, the title with task ids removed and digit runs collapsed, and the referenced task id set.
+ * "Push main: 7 tasks waiting" and "Push main: 8 tasks waiting" share a key; a report about a different task set does not.
  */
-export async function findUnreadDuplicateOperatorMessage(
-  messageStore: Pick<MessageStore, "getOutbox">,
-  candidate: { fromAgentId: string; toId: string; content: string; report?: MailReport; nowMs?: number },
-): Promise<Message | null> {
-  const cutoffMs = (candidate.nowMs ?? Date.now()) - DUPLICATE_OPERATOR_MESSAGE_WINDOW_MS;
-  const fingerprint = operatorMessageFingerprint(candidate.content, candidate.report);
-  const unread = await messageStore.getOutbox(candidate.fromAgentId, "agent", {
-    type: "agent-to-user",
-    read: false,
-    limit: DUPLICATE_OPERATOR_MESSAGE_SCAN_LIMIT,
-  });
-  return unread.find((message) =>
-    !message.read
-    && message.toId === candidate.toId
-    && Date.parse(message.createdAt) >= cutoffMs
-    && operatorMessageFingerprint(message.content, message.metadata?.report) === fingerprint,
-  ) ?? null;
+export function operatorMailStructuralKey(content: string, report?: MailReport, mailKind?: string): string {
+  const rawTitle = report?.title?.trim() || (content.split(/\r?\n/).find((line) => line.trim().length > 0) ?? "");
+  const title = collapseWhitespace(rawTitle.replace(TASK_ID_PATTERN, " ").replace(/\d+/g, "#")).toLowerCase();
+  return `${mailKind ?? "message"}\u0001${title}\u0001${referencedTaskIds(content, report).join(",")}`;
+}
+
+/** The parent a message replies to; unsolicited mail has no thread. */
+function threadOf(message: Message): string | null {
+  return message.metadata?.replyTo?.messageId ?? null;
+}
+
+export type OperatorMailDuplicateKind = "exact" | "structural";
+
+/**
+ * Classify whether `prior` makes `candidate` a duplicate agent->user send.
+ * Never a duplicate when the prior was read, went to another recipient, is outside the window, or belongs to a different reply thread.
+ * A structural match counts only when the candidate carries no change note.
+ */
+export function classifyOperatorMailDuplicate(
+  candidate: Message,
+  prior: Message,
+  options: { hasChangeNote: boolean; nowMs?: number },
+): OperatorMailDuplicateKind | null {
+  if (prior.read || prior.type !== "agent-to-user" || prior.toId !== candidate.toId) return null;
+  if (Date.parse(prior.createdAt) < (options.nowMs ?? Date.now()) - DUPLICATE_OPERATOR_MESSAGE_WINDOW_MS) return null;
+  if (threadOf(prior) !== threadOf(candidate)) return null;
+  const candidateReport = candidate.metadata?.report;
+  const priorReport = prior.metadata?.report;
+  if (operatorMessageFingerprint(candidate.content, candidateReport) === operatorMessageFingerprint(prior.content, priorReport)) {
+    return "exact";
+  }
+  if (!options.hasChangeNote
+    && operatorMailStructuralKey(candidate.content, candidateReport, candidate.metadata?.mailKind)
+      === operatorMailStructuralKey(prior.content, priorReport, prior.metadata?.mailKind)) {
+    return "structural";
+  }
+  return null;
+}
+
+/** Store guard for `MessageStore.sendMessageUnlessDuplicate`: scans the sender's unread operator mail and applies `classifyOperatorMailDuplicate`. */
+export function operatorMailDuplicateGuard(options: { hasChangeNote: boolean; nowMs?: number }): {
+  scan: MessageFilter;
+  isDuplicate: (candidate: Message, prior: Message) => boolean;
+} {
+  return {
+    scan: { type: "agent-to-user", read: false, limit: DUPLICATE_OPERATOR_MESSAGE_SCAN_LIMIT },
+    isDuplicate: (candidate, prior) => classifyOperatorMailDuplicate(candidate, prior, options) !== null,
+  };
 }

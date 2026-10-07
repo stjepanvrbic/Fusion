@@ -239,9 +239,17 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
         archived: req.query.archived === "true",
         type: req.query.type as MessageType | undefined,
       };
-      const messages = await msgStore.getInbox(DASHBOARD_USER_ID, "user", filter);
-      const mailbox = await msgStore.getMailbox(DASHBOARD_USER_ID, "user");
-      res.json({ messages, total: messages.length, unreadCount: mailbox.unreadCount });
+      /*
+      FNXC:Mailbox 2026-10-07-20:18:
+      total is the real size of the filtered inbox and hasMore says another page exists, so a message beyond the first page stays reachable.
+      Reporting the returned page length as total hid every older message, including unread reports that kept the badge nonzero.
+      */
+      const [messages, total, mailbox] = await Promise.all([
+        msgStore.getInbox(DASHBOARD_USER_ID, "user", filter),
+        msgStore.countInbox(DASHBOARD_USER_ID, "user", filter),
+        msgStore.getMailbox(DASHBOARD_USER_ID, "user"),
+      ]);
+      res.json({ messages, total, hasMore: filter.offset + messages.length < total, unreadCount: mailbox.unreadCount });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -259,8 +267,11 @@ export function registerMessagingScriptRoutes(ctx: ApiRoutesContext): void {
         archived: req.query.archived === "true",
         type: req.query.type as MessageType | undefined,
       };
-      const messages = await msgStore.getOutbox(DASHBOARD_USER_ID, "user", filter);
-      res.json({ messages, total: messages.length });
+      const [messages, total] = await Promise.all([
+        msgStore.getOutbox(DASHBOARD_USER_ID, "user", filter),
+        msgStore.countOutbox(DASHBOARD_USER_ID, "user", filter),
+      ]);
+      res.json({ messages, total, hasMore: filter.offset + messages.length < total });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;

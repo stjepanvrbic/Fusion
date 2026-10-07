@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { MessageMetadata, TaskRecommendation } from "@fusion/core";
 import { parseRecommendationSnapshot } from "../../../core/src/tasks/recommendation-validation";
-import { createTaskFromRecommendation, fetchTaskDetail } from "../api";
-import { ApiRequestError } from "../api/client/client";
+import { createTaskFromRecommendation, fetchRecommendationEligibility, fetchTaskDetail } from "../api";
+import type { RecommendationEligibilityResponse } from "../api/tasks/tasks";
+import { recommendationCreateRefusalReason } from "../utils/recommendationCreateRefusal";
 import "./MailboxTaskRecommendations.css";
 
 type TaskRecommendationNoticeMetadata = MessageMetadata & {
@@ -57,6 +58,14 @@ export function MailboxTaskRecommendations({
   */
   const [errorActions, setErrorActions] = useState<Record<string, string | true>>({});
   const creatingIdsRef = useRef(new Set<string>());
+  /*
+  FNXC:TaskRecommendations 2026-10-07-20:11:
+  The notice is sent at accepted fn_task_done, so for review and merge Create task would be refused.
+  Every surface must enable Create task exactly when the create route would accept it, so the parent's eligibility comes from that route's own rule and an ineligible action renders disabled with the server's explanation.
+  An unreadable eligibility leaves the action enabled: the server stays the authority and its refusal reason is still shown on click.
+  */
+  const [eligibility, setEligibility] = useState<RecommendationEligibilityResponse | null>(null);
+  const hintIdPrefix = useId();
 
   const taskId = target?.taskId;
   const recommendationIds = target?.recommendationIds;
@@ -76,7 +85,9 @@ export function MailboxTaskRecommendations({
     setCreatedIds({});
     setCreatingActions({});
     setErrorActions({});
+    setEligibility(null);
     if (!taskId) return () => { active = false; };
+    const eligibilityRequest = fetchRecommendationEligibility(taskId, projectId).catch(() => null);
 
     /*
     FNXC:TaskRecommendations 2026-08-15-22:39:
@@ -84,11 +95,13 @@ export function MailboxTaskRecommendations({
     live recommendation prose and link state from the parent task so notices never copy operator text
     into metadata or offer stale creates after a task has already been linked.
     */
-    void fetchTaskDetail(taskId, projectId).then((task) => {
+    void fetchTaskDetail(taskId, projectId).then(async (task) => {
+      const resolvedEligibility = await eligibilityRequest;
       if (!active) return;
       const allowedIds = recommendationIds ? new Set(recommendationIds) : null;
       const matched = (task.recommendations ?? []).filter((recommendation) => !allowedIds || allowedIds.has(recommendation.id));
       if (matched.length > 0) {
+        setEligibility(resolvedEligibility);
         setRecommendations(matched);
         return;
       }
@@ -130,9 +143,7 @@ export function MailboxTaskRecommendations({
       const response = await createTaskFromRecommendation(target.taskId, recommendation.id, projectId);
       setCreatedIds((current) => ({ ...current, [actionKey]: response.task.id }));
     } catch (cause) {
-      const reason = cause instanceof ApiRequestError && cause.status >= 400 && cause.status < 500 && cause.message.trim()
-        ? cause.message.trim()
-        : true;
+      const reason = recommendationCreateRefusalReason(cause) ?? true;
       setErrorActions((current) => ({ ...current, [actionKey]: reason }));
     } finally {
       creatingIdsRef.current.delete(actionKey);
@@ -152,6 +163,9 @@ export function MailboxTaskRecommendations({
     return <p className="mailbox-task-recommendations__unavailable" data-testid="mailbox-task-recommendations-unavailable">{t("mailbox.recommendationsUnavailable", "Recommendations are no longer available.")} <span>{reason}</span></p>;
   }
   if (!recommendations) return null;
+  const blockedReason = eligibility && !eligibility.actionable
+    ? eligibility.reason ?? t("mailbox.recommendationNotYetActionable", "These recommendations can be filed as tasks after the source task lands or completes.")
+    : null;
 
   return <section className="mailbox-task-recommendations" data-testid="mailbox-task-recommendations" aria-label={t("mailbox.taskRecommendations", "Task recommendations")}>
     {recommendations.map((recommendation) => {
@@ -160,6 +174,7 @@ export function MailboxTaskRecommendations({
       const creating = creatingActions[actionKey] === true;
       const failure = errorActions[actionKey];
       const failed = failure !== undefined;
+      const hintId = `${hintIdPrefix}-${recommendation.id}`;
       /*
       FNXC:MailboxTaskCards 2026-09-01-05:06:
       The board `.card` primitive imposes raw-pixel padding, hover repaint, container sizing, and
@@ -174,9 +189,10 @@ export function MailboxTaskRecommendations({
           <button type="button" className="btn btn-primary" onClick={() => onOpenTask?.(createdTaskId)}>{t("mailbox.viewTask", "View task {{id}}", { id: createdTaskId })}</button>
         ) : (
           <div className="mailbox-task-recommendations__action">
-            <button type="button" className="btn btn-primary" disabled={creating} onClick={() => void createRecommendation(recommendation)}>
+            <button type="button" className="btn btn-primary" disabled={creating || blockedReason !== null} aria-describedby={blockedReason !== null ? hintId : undefined} onClick={() => void createRecommendation(recommendation)}>
               {creating ? t("mailbox.creatingTask", "Creating…") : failed ? t("mailbox.retryCreatingTask", "Retry creating task") : t("mailbox.createTask", "Create task")}
             </button>
+            {blockedReason !== null && <span id={hintId} className="mailbox-task-recommendations__hint">{blockedReason}</span>}
             {failed && <span className="mailbox-task-recommendations__error" role="status">{typeof failure === "string" ? failure : t("mailbox.createTaskError", "Could not create task. Try again.")}</span>}
           </div>
         )}

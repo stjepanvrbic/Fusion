@@ -99,6 +99,38 @@ pgTest("MessageStore send (PostgreSQL backend mode)", () => {
     await expect(store.archiveMessage("missing-message")).rejects.toThrow("Message missing-message not found");
   });
 
+  /*
+  FNXC:Mailbox 2026-10-07-20:15:
+  Mailbox pagination needs the real size of a filtered inbox or outbox, not the returned page length, so a 51st message stays reachable and the UI knows another page exists.
+  The count must apply exactly the same participant, read, type and archive predicates as the page query, including the dashboard user's legacy ID aliases.
+  */
+  it("counts inbox and outbox messages with the same filters as the page queries", async () => {
+    const { MessageStore } = await import("../../stores/message-store.js");
+    const { DASHBOARD_USER_ID } = await import("../../types/messaging/messages.js");
+    const store = new MessageStore(null, { asyncLayer: h.layer() });
+    const sent: string[] = [];
+    for (let index = 0; index < 51; index += 1) {
+      const message = await store.sendMessage({ fromId: "agent-a", fromType: "agent", toId: DASHBOARD_USER_ID, toType: "user", content: `report ${index}`, type: "agent-to-user" });
+      sent.push(message.id);
+    }
+    await h.adminSql()`INSERT INTO project.messages (project_id, id, from_id, from_type, to_id, to_type, content, type, read, archived, created_at, updated_at)
+      VALUES ('', 'legacy-alias-inbox', 'agent-a', 'agent', 'user:dashboard', 'user', 'legacy alias', 'agent-to-user', 1, 0, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`;
+    await store.archiveMessage(sent[0]!);
+    await store.markAsRead(sent[1]!);
+    for (let index = 0; index < 3; index += 1) {
+      await store.sendMessage({ fromId: DASHBOARD_USER_ID, fromType: "user", toId: "agent-a", toType: "agent", content: `request ${index}`, type: "user-to-agent" });
+    }
+
+    expect(await store.countInbox(DASHBOARD_USER_ID, "user")).toBe(51);
+    expect((await store.getInbox(DASHBOARD_USER_ID, "user", { limit: 1000 }))).toHaveLength(51);
+    expect(await store.countInbox(DASHBOARD_USER_ID, "user", { archived: true })).toBe(1);
+    expect(await store.countInbox(DASHBOARD_USER_ID, "user", { read: false })).toBe(49);
+    expect(await store.countInbox(DASHBOARD_USER_ID, "user", { type: "user-to-agent" })).toBe(0);
+    expect(await store.countInbox(DASHBOARD_USER_ID, "user", { limit: 10, offset: 40 })).toBe(51);
+    expect(await store.countOutbox(DASHBOARD_USER_ID, "user")).toBe(3);
+    expect(await store.countOutbox("agent-a", "agent")).toBe(51);
+  });
+
   it("treats legacy NULL archive values as active correspondence", async () => {
     const { MessageStore } = await import("../../stores/message-store.js");
     const store = new MessageStore(null, { asyncLayer: h.layer() });
@@ -155,6 +187,39 @@ pgTest("MessageStore send (PostgreSQL backend mode)", () => {
     const completionMessages = (await store.getInbox("dashboard", "user"))
       .filter((message) => message.metadata?.kind === "postgres-migration-complete");
     expect(completionMessages).toHaveLength(1);
+  });
+
+  /*
+  FNXC:OperatorMailDedup 2026-10-07-20:33:
+  Duplicate operator mail is decided atomically with the insert. Concurrent sessions sharing one agent identity race the same report over separate pool connections; exactly one may insert, the rest must see that row as their duplicate.
+  The predicate still decides: a different recipient, or a duplicate the recipient has since read, is delivered.
+  */
+  it("inserts exactly one of several concurrent duplicate sends and keeps distinct sends deliverable", async () => {
+    const { MessageStore } = await import("../../stores/message-store.js");
+    const store = new MessageStore(null, { asyncLayer: h.layer() });
+    const guard = {
+      scan: { type: "agent-to-user" as const, read: false, limit: 20 },
+      isDuplicate: (candidate: { toId: string; content: string }, prior: { toId: string; content: string; read: boolean }) =>
+        !prior.read && prior.toId === candidate.toId && prior.content === candidate.content,
+    };
+    const input = { fromId: "agent-ceo", fromType: "agent" as const, toId: "dashboard", toType: "user" as const, content: "Push main: tasks waiting", type: "agent-to-user" as const };
+    // Open every pooled connection first; a cold pool connects lazily, so the first transaction would commit before any rival connected and the race would never happen.
+    const { drizzleSql } = await import("../../index.js");
+    await Promise.all(Array.from({ length: 5 }, () => h.layer().db.execute(drizzleSql`SELECT pg_sleep(0.05)`)));
+
+    const outcomes = await Promise.all(Array.from({ length: 8 }, () => store.sendMessageUnlessDuplicate(input, guard)));
+    const inserted = outcomes.filter((outcome) => outcome.sent);
+    expect(inserted).toHaveLength(1);
+    const winnerId = inserted[0]!.sent ? inserted[0]!.message.id : "";
+    expect(outcomes.filter((outcome) => !outcome.sent).every((outcome) => !outcome.sent && outcome.duplicateOf.id === winnerId)).toBe(true);
+    expect((await store.getOutbox("agent-ceo", "agent")).filter((message) => message.content === input.content)).toHaveLength(1);
+
+    const otherRecipient = await store.sendMessageUnlessDuplicate({ ...input, toId: "cli" }, guard);
+    expect(otherRecipient.sent).toBe(true);
+
+    await store.markAsRead(winnerId);
+    const afterRead = await store.sendMessageUnlessDuplicate(input, guard);
+    expect(afterRead.sent).toBe(true);
   });
 
   /*

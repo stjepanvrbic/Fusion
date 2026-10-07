@@ -589,6 +589,7 @@ import {
   CheckoutConflictError,
   WorkspaceTaskMergeError,
   DUPLICATE_OF_METADATA_KEY,
+  WEDGE_DELIVERY_RETRY_LEASE_MS,
   WEDGE_RENOTIFY_COOLDOWN_MS,
 } from "./types/task/task-core.js";
 export {
@@ -597,6 +598,7 @@ export {
   CheckoutConflictError,
   WorkspaceTaskMergeError,
   DUPLICATE_OF_METADATA_KEY,
+  WEDGE_DELIVERY_RETRY_LEASE_MS,
   WEDGE_RENOTIFY_COOLDOWN_MS,
 };
 

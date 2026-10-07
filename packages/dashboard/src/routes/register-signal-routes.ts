@@ -177,7 +177,12 @@ export interface SignalIngestResult {
   /** True only when this delivery's conditional update resolved the newest open incident. */
   recoveryResolved?: boolean;
   error?: string;
+  /** Set with a 503 when the same delivery is still being processed by another request. */
+  retryAfterSeconds?: number;
 }
+
+/** Retry hint for a duplicate that arrives while the original delivery is still in flight. */
+export const SIGNAL_IN_FLIGHT_RETRY_AFTER_SECONDS = 5;
 
 export async function ingestSignal(deps: SignalIngestDeps): Promise<SignalIngestResult> {
   const { source, store, rawBody, headers, body, nonceCache } = deps;
@@ -202,10 +207,35 @@ export async function ingestSignal(deps: SignalIngestDeps): Promise<SignalIngest
   }
 
   // 3. Replay nonce dedup (same delivery id within the replay window) → 401.
-  if (!nonceCache.check(`${signal.source}:${signal.externalId}`)) {
+  /*
+  FNXC:CommandCenterSignals 2026-10-07-19:45:
+  The nonce is reserved, not consumed, until this delivery is accepted. A lookup or task-creation failure releases it so the provider's redelivery is processed; a duplicate arriving mid-flight gets a retryable 503 instead of a replay 401, because the in-flight original may still fail.
+  */
+  const reservation = nonceCache.reserve(`${signal.source}:${signal.externalId}`);
+  if (reservation.status === "replayed") {
     return { status: 401, error: "Replayed delivery rejected" };
   }
+  if (reservation.status === "in-flight") {
+    return {
+      status: 503,
+      error: "Delivery is already being processed",
+      retryAfterSeconds: SIGNAL_IN_FLIGHT_RETRY_AFTER_SECONDS,
+    };
+  }
 
+  let result: SignalIngestResult;
+  try {
+    result = await acceptSignal(store, signal);
+  } catch (err) {
+    reservation.release();
+    throw err;
+  }
+  reservation.commit();
+  return result;
+}
+
+/** Steps 4-5: persistent dedup, then recovery resolve or task creation. Throws when nothing was durably accepted. */
+async function acceptSignal(store: TaskStore, signal: Signal): Promise<SignalIngestResult> {
   // 4. Persistent external-id dedup → 200 with the existing task, no new task.
   const existing = await findExistingSignalTask(store, signal.source, signal.externalId);
   if (existing) {
@@ -338,9 +368,13 @@ export const registerSignalRoutes: ApiRouteRegistrar = (ctx) => {
     if (result.status === 400) {
       throw badRequest(result.error ?? "Malformed payload");
     }
+    if (result.retryAfterSeconds !== undefined) {
+      res.setHeader("Retry-After", String(result.retryAfterSeconds));
+    }
 
     res.status(result.status).json({
       ok: result.status < 400,
+      ...(result.error && result.status >= 400 ? { error: result.error } : {}),
       taskId: result.taskId,
       deduped: result.deduped ?? false,
       recoveryResolved: result.recoveryResolved ?? false,

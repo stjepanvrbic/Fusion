@@ -3127,6 +3127,11 @@ describe("executeHeartbeat", () => {
             byId.set(id, msg);
             return msg;
           }),
+          // Operator replies go through the atomic dedupe seam; this conversation never repeats a reply.
+          sendMessageUnlessDuplicate: vi.fn(async (input: Omit<Message, "id" | "read" | "createdAt" | "updatedAt">) => ({
+            sent: true,
+            message: fakeMessageStore.sendMessage(input as never),
+          })),
           /*
           FNXC:EngineTests 2026-07-22-03:15:
           fn_send_message looks up reply_to_message_id via getMessage before persisting linked replies.

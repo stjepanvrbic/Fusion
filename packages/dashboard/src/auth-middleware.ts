@@ -37,6 +37,32 @@ export function hasVerifiedDaemonRequest(req: Request): boolean {
 const EXEMPT_PATHS = ["/api/health", "/api/cli-agent/hooks"];
 
 /**
+ * FNXC:DaemonAuth 2026-10-07-19:55:
+ * Provider-signed webhook ingress cannot carry the daemon bearer token: a provider holds only its own HMAC or ingest secret, and putting the daemon token in a webhook URL would hand a third party the dashboard's full non-expiring credential.
+ * These exact method+path pairs bypass the daemon gate, so a correctly signed delivery reaches the route's own mandatory verification, which runs before any side effect: signal adapters verify HMAC per provider, the GitHub App route verifies X-Hub-Signature-256, routine webhooks require the routine secret, and monitor ingestion requires its constant-time ingest secret.
+ * Only POST to the ingress path itself (with Express's optional trailing slash) is exempt; every neighbouring management or read route stays gated.
+ */
+const SELF_AUTHENTICATING_WEBHOOK_INGRESS: ReadonlyArray<{ method: "POST"; path: RegExp }> = [
+  { method: "POST", path: /^\/api\/signals\/[^/]+\/?$/ },
+  { method: "POST", path: /^\/api\/github\/webhooks\/?$/ },
+  { method: "POST", path: /^\/api\/routines\/[^/]+\/webhook\/?$/ },
+  { method: "POST", path: /^\/api\/monitor\/(?:incidents|deployments)\/?$/ },
+];
+
+/**
+ * FNXC:DaemonAuth 2026-10-07-19:55:
+ * Express matches mount paths and routes case-insensitively, so `/API/tasks` reaches the `/api` router.
+ * Every gate decision here compares the lower-cased path, otherwise a case variant skips the daemon check entirely.
+ */
+function normalizeGatePath(path: string): string {
+  return path.toLowerCase();
+}
+
+function isSelfAuthenticatingWebhookIngress(method: string | undefined, path: string): boolean {
+  return SELF_AUTHENTICATING_WEBHOOK_INGRESS.some((entry) => entry.method === method?.toUpperCase() && entry.path.test(path));
+}
+
+/**
  * Only /api/* paths are gated by this middleware. The SPA shell (index.html,
  * /assets/*, favicon, etc.) must load unauthenticated so the frontend JS can
  * run, read ?token= off the URL, and start injecting Bearer headers on API
@@ -149,7 +175,7 @@ export function authenticateUpgradeRequest(token: string, req: IncomingMessage):
  * Create Express middleware that enforces bearer token authentication.
  *
  * Uses constant-time comparison to prevent timing attacks.
- * Exempts /api/health and paths starting with /api/health/ from auth.
+ * Exempts /api/health, the CLI-agent hook route, and the provider-signed webhook ingress routes from auth.
  * Accepts the token either in the `Authorization: Bearer <token>` header
  * (preferred) or as a `fn_token=<token>` query parameter — the latter is
  * needed by EventSource and WebSocket clients which can't send headers.
@@ -167,14 +193,22 @@ export function createAuthMiddleware(token: string, options?: { validateRemoteSe
   };
 
   return function authMiddleware(req: Request, res: Response, next: NextFunction): void {
+    const gatePath = normalizeGatePath(req.path);
+
     // The SPA shell and static assets are public — only /api/* is gated.
-    if (!isApiPath(req.path)) {
+    if (!isApiPath(gatePath)) {
       next();
       return;
     }
 
     // Always allow exempt paths (liveness probes)
-    if (isExemptPath(req.path)) {
+    if (isExemptPath(gatePath)) {
+      next();
+      return;
+    }
+
+    // Provider-signed webhook ingress authenticates itself at the route.
+    if (isSelfAuthenticatingWebhookIngress(req.method, gatePath)) {
       next();
       return;
     }

@@ -119,6 +119,12 @@ export async function request(
     req.emit("data", normalizedBody);
     }
     req.complete = true;
+    /*
+    FNXC:TestHarness 2026-10-07-19:58:
+    A real IncomingMessage is no longer readable once its body is consumed, which is how a second body parser (express.json after the GitHub webhook's express.raw) knows to skip it.
+    Mirror that before emitting end, because the first parser hands off to the next middleware synchronously inside the end event; otherwise the second parser waits for an end that already fired and the request hangs.
+    */
+    req.readable = false;
     req.emit("end");
   });
 

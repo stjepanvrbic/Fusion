@@ -625,12 +625,15 @@ describe("MailboxModal", () => {
     window.history.replaceState({}, "", "?view=mailbox&mailbox-message=missing#message-missing");
     mockFetchInbox.mockResolvedValue({ messages: [], total: 0, unreadCount: 0 });
     mockFetchConversation.mockResolvedValue([]);
+    // An unknown id is looked up directly (it may be older than the loaded page) and the server answers 404.
+    mockFetchMessage.mockRejectedValue(new Error("Message not found"));
 
     render(<MailboxModal {...defaultProps} />);
 
     await waitFor(() => {
       expect(screen.getByTestId("mailbox-inbox-empty")).toBeDefined();
     });
+    await waitFor(() => expect(mockFetchMessage).toHaveBeenCalledWith("missing", undefined));
 
     expect(screen.queryByTestId("mailbox-message-detail")).toBeNull();
     expect(mockMarkMessageRead).not.toHaveBeenCalled();

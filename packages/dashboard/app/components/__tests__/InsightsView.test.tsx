@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import { loadAllAppCss, loadAllAppCssBaseOnly } from "../../test/cssFixture";
 import { InsightsView } from "../InsightsView";
 
@@ -1561,6 +1561,26 @@ describe("InsightsView", () => {
 
       fireEvent.click(screen.getAllByRole("button", { name: "Create task" })[1]!);
       expect(createTask).toHaveBeenCalledWith("FN-2", "shared-id");
+    });
+
+    /*
+    FNXC:TaskRecommendations 2026-10-07-20:00:
+    Insights must show a server refusal reason exactly like the task-detail and mailbox surfaces do, and keep the generic retry prompt for transport and 5xx failures.
+    */
+    it.each([
+      { label: "a 4xx refusal shows the server reason", state: { running: false, failed: true, refusal: "Recommendations from FN-1 can be filed as tasks after FN-1 lands or completes" }, text: "Recommendations from FN-1 can be filed as tasks after FN-1 lands or completes" },
+      { label: "a transport or 5xx failure shows the generic prompt", state: { running: false, failed: true, refusal: null }, text: "Could not create task. Try again." },
+    ])("$label", async ({ state, text }) => {
+      mockUseTaskRecommendations.mockReturnValue({
+        items: [recommendations[0]], loading: false, loadingMore: false, error: null,
+        hasMore: false, totalRowCount: 1, truncated: false, refresh: vi.fn(), loadMore: vi.fn(),
+        createTask: vi.fn(), createStates: new Map([[`${recommendations[0].taskId}:${recommendations[0].recommendation.id}`, state]]),
+      });
+      render(<InsightsView {...defaultProps} />);
+      await waitFor(() => expect(screen.getByRole("button", { name: "Retry creating task" })).toBeInTheDocument());
+      const row = within(screen.getByTestId("task-recommendation-FN-1:shared-id"));
+      expect(row.getByRole("status")).toHaveTextContent(text);
+      expect(row.getAllByRole("status")).toHaveLength(1);
     });
 
     it("does not offer creates for linked recommendations and preserves retryable page errors", async () => {

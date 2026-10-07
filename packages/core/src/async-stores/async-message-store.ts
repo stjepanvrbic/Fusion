@@ -169,6 +169,32 @@ export async function sendMessageOnce(
 }
 
 /**
+ * FNXC:OperatorMailDedup 2026-10-07-20:32:
+ * Duplicate suppression must be atomic with the insert: a separate outbox read followed by an ordinary insert let two concurrent sessions sharing one agent identity both see "no duplicate" and both deliver.
+ * The check and the insert run in one transaction under an advisory lock scoped to project, sender and recipient, so concurrent sends for the same pair serialize and the loser sees the winner's row.
+ * The lock is per pair and per transaction, never a permanent fingerprint ban: the caller's predicate decides what counts as a duplicate (unread, inside a window, same thread).
+ * Returns the earlier message that made this send a duplicate, or null after inserting it.
+ */
+export async function sendMessageUnlessDuplicate(
+  layer: Pick<AsyncDataLayer, "transactionImmediate">,
+  message: PersistedMessage,
+  scan: MessageFilter,
+  isDuplicate: (prior: Message) => boolean,
+): Promise<Message | null> {
+  return layer.transactionImmediate(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(
+      CONCAT('message-send-dedupe:', COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'), ':', CAST(${message.fromId} AS text), '->', CAST(${message.toId} AS text)),
+      0
+    ))`);
+    const priors = await queryMessagesByParticipant(tx, "from", message.fromId, message.fromType as ParticipantType, scan);
+    const duplicate = priors.find(isDuplicate) ?? null;
+    if (duplicate) return duplicate;
+    await sendMessage(tx, message);
+    return null;
+  });
+}
+
+/**
  * Get a single message by id.
  */
 export async function getMessage(handle: QueryHandle, id: string): Promise<Message | null> {
@@ -222,13 +248,12 @@ export async function reconcileProposalCreation(handle: QueryHandle, messageId: 
  * Query messages by participant direction (to = inbox, from = outbox).
  * Handles the dashboard-user multi-id lookup and optional filters.
  */
-export async function queryMessagesByParticipant(
-  handle: QueryHandle,
+function participantMessageConditions(
   direction: "to" | "from",
   ownerId: string,
   ownerType: ParticipantType,
   filter?: MessageFilter,
-): Promise<Message[]> {
+) {
   const idCol = direction === "to" ? schema.project.messages.toId : schema.project.messages.fromId;
   const typeCol = direction === "to" ? schema.project.messages.toType : schema.project.messages.fromType;
   const participantIds = participantIdsForLookup(ownerId, ownerType);
@@ -243,16 +268,45 @@ export async function queryMessagesByParticipant(
     conditions.push(eq(schema.project.messages.read, filter.read ? 1 : 0));
   }
   conditions.push(archivedCondition(filter?.archived));
+  return and(...conditions);
+}
+
+export async function queryMessagesByParticipant(
+  handle: QueryHandle,
+  direction: "to" | "from",
+  ownerId: string,
+  ownerType: ParticipantType,
+  filter?: MessageFilter,
+): Promise<Message[]> {
   const limit = filter?.limit ?? 100;
   const offset = filter?.offset ?? 0;
   const rows = await handle
     .select(messageColumns)
     .from(schema.project.messages)
-    .where(and(...conditions))
+    .where(participantMessageConditions(direction, ownerId, ownerType, filter))
     .orderBy(desc(schema.project.messages.createdAt), desc(schema.project.messages.id))
     .limit(limit)
     .offset(offset);
   return rows.map((row) => rowToMessage(row as MessageRow));
+}
+
+/**
+ * FNXC:Mailbox 2026-10-07-20:16:
+ * Total size of a participant's filtered inbox or outbox, using the same predicates as `queryMessagesByParticipant` and ignoring limit/offset.
+ * Mailbox pagination reports this instead of the returned page length, so messages past the first page stay reachable.
+ */
+export async function countMessagesByParticipant(
+  handle: QueryHandle,
+  direction: "to" | "from",
+  ownerId: string,
+  ownerType: ParticipantType,
+  filter?: MessageFilter,
+): Promise<number> {
+  const [row] = await handle
+    .select({ count: sql<number>`count(*)::int` })
+    .from(schema.project.messages)
+    .where(participantMessageConditions(direction, ownerId, ownerType, filter));
+  return row?.count ?? 0;
 }
 
 /**

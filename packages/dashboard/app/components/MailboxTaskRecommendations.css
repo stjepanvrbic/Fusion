@@ -66,6 +66,11 @@ silently invalidates its declaration and previously erased card padding, spacing
   font-size: var(--font-size-xs);
 }
 
+.mailbox-task-recommendations__hint {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
 .mailbox-task-recommendations__unavailable {
   color: var(--color-warning);
   font-size: var(--font-size-sm);

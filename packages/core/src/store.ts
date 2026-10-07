@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import type { TaskMoveLanes } from "./workflows/workflow-lifecycle-traits.js";
 import { TaskLaneCache } from "./task-lane-cache.js";
 import { randomUUID } from "node:crypto";
-import { WEDGE_RENOTIFY_COOLDOWN_MS } from "./types/task/task-core.js";
+import { WEDGE_DELIVERY_RETRY_LEASE_MS, WEDGE_RENOTIFY_COOLDOWN_MS } from "./types/task/task-core.js";
 import { clearTerminalFailureAutoRecoveryBudget } from "./tasks/terminal-failure-auto-recovery.js";
 import { join } from "node:path";
 import { and, desc, eq, isNull, ne, sql } from "drizzle-orm";
@@ -2006,16 +2006,26 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         if (!prior || prior.status === "resolved") return null;
         return { wedgeNotification: { ...prior, status: "resolved", transitionedAt: new Date().toISOString() } };
       }
-      if (prior?.status === "active" && prior.reasonKey === reasonKey) return null;
-
       const now = Date.now();
+      /*
+      FNXC:TaskWedgeNotifications 2026-10-07-20:54:
+      An active episode whose delivery is still owed is re-claimed with its own id once the previous attempt's lease has lapsed, so the retry reuses the same idempotency key. Any other observation of the active reason is declined.
+      */
+      if (prior?.status === "active" && prior.reasonKey === reasonKey) {
+        const lastAttempt = Date.parse(prior.deliveryAttemptAt ?? "");
+        const leaseLapsed = !Number.isFinite(lastAttempt) || lastAttempt > now || now - lastAttempt >= WEDGE_DELIVERY_RETRY_LEASE_MS;
+        if (prior.deliveryOwed !== true || !prior.episodeId || !leaseLapsed) return null;
+        result = { episodeId: prior.episodeId, claimed: true };
+        return { wedgeNotification: { ...prior, deliveryAttemptAt: new Date(now).toISOString() } };
+      }
+
       const lastNotifiedAtByReason = Object.fromEntries(Object.entries(prior?.lastNotifiedAtByReason ?? {}).filter(([, timestamp]) => {
         const notifiedAt = Date.parse(timestamp);
         return Number.isFinite(notifiedAt) && notifiedAt <= now && now - notifiedAt < WEDGE_RENOTIFY_COOLDOWN_MS;
       }));
       const episodeId = randomUUID();
+      // Only an acknowledged delivery starts the cooldown; see acknowledgeTaskWedgeNotificationDelivery.
       const suppressed = reasonKey in lastNotifiedAtByReason;
-      if (!suppressed) lastNotifiedAtByReason[reasonKey] = new Date(now).toISOString();
       result = suppressed ? { claimed: false } : { episodeId, claimed: true };
       return {
         wedgeNotification: {
@@ -2023,6 +2033,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
           episodeId,
           status: "active",
           transitionedAt: new Date(now).toISOString(),
+          ...(suppressed ? {} : { deliveryOwed: true, deliveryAttemptAt: new Date(now).toISOString() }),
           ...(Object.keys(lastNotifiedAtByReason).length > 0 ? { lastNotifiedAtByReason } : {}),
           ...(prior?.autoRecovery ? { autoRecovery: prior.autoRecovery } : {}),
           ...(prior?.budgetRevision !== undefined ? { budgetRevision: prior.budgetRevision } : {}),
@@ -2030,6 +2041,27 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       };
     });
     return result;
+  }
+  /**
+   * FNXC:TaskWedgeNotifications 2026-10-07-20:54:
+   * Records that a channel confirmed delivery of the active episode: clears the owed marker and starts the per-reason cooldown.
+   * A stale acknowledgement (another episode is active, or it was already acknowledged) changes nothing.
+   */
+  async acknowledgeTaskWedgeNotificationDelivery(taskId: string, episodeId: string): Promise<boolean> {
+    let acknowledged = false;
+    await this.updateTaskAtomic(taskId, (current) => {
+      const prior = current.wedgeNotification;
+      if (!prior || prior.episodeId !== episodeId || prior.deliveryOwed !== true) return null;
+      const { deliveryOwed: _owed, deliveryAttemptAt: _attempt, ...rest } = prior;
+      acknowledged = true;
+      return {
+        wedgeNotification: {
+          ...rest,
+          lastNotifiedAtByReason: { ...(prior.lastNotifiedAtByReason ?? {}), [prior.reasonKey]: new Date().toISOString() },
+        },
+      };
+    });
+    return acknowledged;
   }
   /** Atomically records the durable evidence needed to complete a deferred wedge notification. */
   async markTaskWedgeNotificationPending(
@@ -2042,7 +2074,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     await this.updateTaskAtomic(taskId, (current) => {
       const prior = current.wedgeNotification;
       const pending = prior?.pending;
-      if (prior?.status === "active" && prior.reasonKey === descriptor.reasonKey) {
+      // An owed active episode still needs a delivery driver, so it may carry a retry hold.
+      if (prior?.status === "active" && prior.reasonKey === descriptor.reasonKey && prior.deliveryOwed !== true) {
         return null;
       }
       const pendingSince = pending ? Date.parse(pending.since) : Number.NaN;

@@ -203,32 +203,53 @@ export function isWithinReplayWindow(
   return Math.abs(nowMs - timestampMs) <= windowMs;
 }
 
+/** Outcome of {@link DeliveryNonceCache.reserve}. */
+export type DeliveryNonceReservation =
+  | { status: "fresh"; commit(nowMs?: number): void; release(): void }
+  | { status: "in-flight" }
+  | { status: "replayed" };
+
 /**
  * In-memory delivery-id nonce store with TTL eviction. Used to reject replayed
  * deliveries (same external/delivery id) within the replay window. Mirrors the
  * spirit of `github-tracking-dedup.ts` for the inbound path.
+ *
+ * FNXC:CommandCenterSignals 2026-10-07-19:45:
+ * A delivery Fusion did not durably accept must stay retryable. `reserve` claims the nonce while the delivery is in flight, so a concurrent duplicate cannot create a second task.
+ * The owner then calls `commit` once the delivery is accepted, or `release` when lookup or task creation fails, so the provider's redelivery is processed instead of rejected as a replay.
+ * In-flight claims expire with the same TTL, so a hung handler cannot block the delivery forever.
  */
 export class DeliveryNonceCache {
-  private readonly seen = new Map<string, number>();
+  private readonly entries = new Map<string, { atMs: number; state: "in-flight" | "committed"; owner: symbol }>();
   constructor(private readonly ttlMs: number = SIGNAL_REPLAY_WINDOW_MS) {}
 
-  /** Returns true if this is a fresh delivery; false if a replay. */
-  check(nonce: string, nowMs: number = Date.now()): boolean {
+  reserve(nonce: string, nowMs: number = Date.now()): DeliveryNonceReservation {
     this.evict(nowMs);
-    if (this.seen.has(nonce)) return false;
-    this.seen.set(nonce, nowMs);
-    return true;
+    const existing = this.entries.get(nonce);
+    if (existing) return { status: existing.state === "committed" ? "replayed" : "in-flight" };
+    const owner = Symbol(nonce);
+    this.entries.set(nonce, { atMs: nowMs, state: "in-flight", owner });
+    const owned = () => this.entries.get(nonce)?.owner === owner;
+    return {
+      status: "fresh",
+      commit: (committedAtMs: number = Date.now()) => {
+        if (owned()) this.entries.set(nonce, { atMs: committedAtMs, state: "committed", owner });
+      },
+      release: () => {
+        if (owned()) this.entries.delete(nonce);
+      },
+    };
   }
 
   private evict(nowMs: number): void {
-    for (const [key, ts] of this.seen) {
-      if (nowMs - ts > this.ttlMs) this.seen.delete(key);
+    for (const [key, entry] of this.entries) {
+      if (nowMs - entry.atMs > this.ttlMs) this.entries.delete(key);
     }
   }
 
   /** Test/diagnostic helper. */
   size(): number {
-    return this.seen.size;
+    return this.entries.size;
   }
 }
 

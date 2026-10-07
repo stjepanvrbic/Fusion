@@ -647,6 +647,40 @@ describe("recommendation task creation route", () => {
     expect(unlanded.store.createTask).not.toHaveBeenCalled();
   });
 
+  /*
+  FNXC:TaskRecommendations 2026-10-07-19:59:
+  The eligibility route is what lets the mailbox disable Create task before landing, so it must agree with the create route on every source shape.
+  */
+  it.each([
+    { name: "complete lane", seed: () => parent(), custom: false, expected: true },
+    { name: "renamed complete lane", seed: () => parent({ column: "shipped" as Column }), custom: true, expected: true },
+    { name: "physically archived source", seed: () => parent({ column: "archived", preArchiveColumn: "shipped", archivedAt: "2026-09-20T18:54:00.000Z" }), custom: true, expected: true },
+    { name: "live archived-named lane", seed: () => parent({ column: "archived", archivedAt: "2026-09-20T18:54:00.000Z" }), custom: "live-archived" as const, expected: false },
+    { name: "landed review parent", seed: () => parent({ column: "in-review", mergeDetails: { mergeConfirmed: true, commitSha: "8ff7e7ae7" } }), custom: false, expected: true },
+    { name: "unlanded review parent", seed: () => parent({ column: "in-review", mergeDetails: { mergeConfirmed: false } }), custom: false, expected: false },
+    { name: "review parent without merge details", seed: () => parent({ column: "in-review" }), custom: false, expected: false },
+    { name: "todo parent", seed: () => parent({ column: "todo" }), custom: false, expected: false },
+  ])("reports eligibility that matches the create route for a $name", async ({ seed, custom, expected }) => {
+    const built = buildApp([seed()]);
+    if (custom) installCustomRecommendationWorkflow(built.store, ["FN-1"], custom === "live-archived" ? { declareLegacyArchivedAsLive: true } : {});
+
+    const eligibility = await performRequest(built.app, "GET", "/api/tasks/FN-1/recommendations/eligibility");
+    expect(eligibility.status).toBe(200);
+    expect(eligibility.body).toEqual({
+      actionable: expected,
+      reason: expected ? null : "Recommendations from FN-1 can be filed as tasks after FN-1 lands or completes",
+    });
+
+    const created = await performRequest(built.app, "POST", "/api/tasks/FN-1/recommendations/rec-1/create", undefined);
+    expect(created.status === 201).toBe(eligibility.body.actionable);
+  });
+
+  it("reports a missing recommendation source as not found", async () => {
+    const built = buildApp([parent()]);
+    const response = await performRequest(built.app, "GET", "/api/tasks/FN-404/recommendations/eligibility");
+    expect(response.status).toBe(404);
+  });
+
   it("rejects non-complete parents and stale linked children without creating another task", async () => {
     const incomplete = buildApp([parent({ column: "todo" })]);
     const incompleteResponse = await performRequest(incomplete.app, "POST", "/api/tasks/FN-1/recommendations/rec-1/create", undefined);

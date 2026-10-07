@@ -2368,6 +2368,64 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
     };
   };
 
+  /*
+  FNXC:TaskRecommendations 2026-10-07-19:59:
+  One eligibility answer for a recommendation source, shared by the create route and the read-only eligibility route.
+  Every surface must enable Create task exactly when the create route would accept it, so the mailbox asks this rule instead of re-deriving workflow lanes client-side.
+  */
+  async function resolveRecommendationSourceEligibility(scopedStore: TaskStore, parent: Task): Promise<{
+    actionable: boolean;
+    completeColumns: Set<string>;
+    landedReviewColumns: Set<string>;
+  }> {
+    /*
+    FNXC:TaskRecommendations 2026-10-07-12:56:
+    A landed card in a review lane (core's single review definition, resolveReviewColumns / REVIEW_ROLES) is an actionable source because its implementation never re-runs, so resolve those lanes alongside the complete lanes from the parent's own workflow.
+    */
+    const { completeColumns, landedReviewColumns } = await (async () => {
+      try {
+        const ir = await resolveWorkflowIrForTask(scopedStore, parent.id);
+        const complete = columnsWithFlag(ir, "complete");
+        const review = resolveReviewColumns(ir);
+        return {
+          completeColumns: new Set(complete.length > 0 ? complete : ["done"]),
+          landedReviewColumns: new Set(review.length > 0 ? review : ["in-review"]),
+        };
+      } catch {
+        return { completeColumns: new Set(["done"]), landedReviewColumns: new Set(["in-review"]) };
+      }
+    })();
+    const archivedColumns = await archivedColumnsForTask(scopedStore, parent.id);
+    const archivedSourceRecord = typeof parent.archivedAt === "string"
+      ? await scopedStore.getTask(parent.id, { includeDeleted: true }).catch(() => null)
+      : null;
+    /*
+    FNXC:MailboxRecommendationCreation 2026-10-04-08:53:
+    Cold archive detail normalizes its display column, so the snapshot's captured pre-archive
+    column is the physical-snapshot signal when the display value cannot resolve to an archived
+    trait. The forensic row proves it is retained and soft-deleted; it does not carry the archive
+    entry's pre-archive field. An active custom lane has no such retained proof and remains ineligible.
+    */
+    const isPhysicalArchivedSource = Boolean(
+      typeof parent.archivedAt === "string"
+      && archivedSourceRecord?.deletedAt
+      && (archivedColumns.has(parent.column) || parent.preArchiveColumn),
+    );
+    return {
+      actionable: isRecommendationSourceActionable(parent, completeColumns, landedReviewColumns) || isPhysicalArchivedSource,
+      completeColumns,
+      landedReviewColumns,
+    };
+  }
+
+  router.get("/tasks/:id/recommendations/eligibility", async (req, res) => {
+    const { store: scopedStore } = await getProjectContext(req);
+    const parent = await scopedStore.getTask(req.params.id).catch(() => null);
+    if (!parent || parent.deletedAt) throw notFound("Task not found");
+    const { actionable } = await resolveRecommendationSourceEligibility(scopedStore, parent);
+    res.json({ actionable, reason: actionable ? null : recommendationSourceNotActionableMessage(parent.id) });
+  });
+
   router.post("/tasks/:id/recommendations/:recommendationId/create", async (req, res) => {
     let releaseParentRecommendationLock: (() => void) | undefined;
     let releaseRecommendationLock: (() => void) | undefined;
@@ -2389,40 +2447,8 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       // Re-read only after acquiring the recommendation identity lock; this is the queue winner's authority.
       const parent = await scopedStore.getTask(req.params.id).catch(() => null);
       if (!parent || parent.deletedAt) throw notFound("Task not found");
-      /*
-      FNXC:TaskRecommendations 2026-10-07-12:56:
-      A landed card in a review lane (core's single review definition, resolveReviewColumns / REVIEW_ROLES) is an actionable source because its implementation never re-runs, so resolve those lanes alongside the complete lanes from the parent's own workflow.
-      */
-      const { completeColumns, landedReviewColumns } = await (async () => {
-        try {
-          const ir = await resolveWorkflowIrForTask(scopedStore, parent.id);
-          const complete = columnsWithFlag(ir, "complete");
-          const review = resolveReviewColumns(ir);
-          return {
-            completeColumns: new Set(complete.length > 0 ? complete : ["done"]),
-            landedReviewColumns: new Set(review.length > 0 ? review : ["in-review"]),
-          };
-        } catch {
-          return { completeColumns: new Set(["done"]), landedReviewColumns: new Set(["in-review"]) };
-        }
-      })();
-      const archivedColumns = await archivedColumnsForTask(scopedStore, parent.id);
-      const archivedSourceRecord = typeof parent.archivedAt === "string"
-        ? await scopedStore.getTask(parent.id, { includeDeleted: true }).catch(() => null)
-        : null;
-      /*
-      FNXC:MailboxRecommendationCreation 2026-10-04-08:53:
-      Cold archive detail normalizes its display column, so the snapshot's captured pre-archive
-      column is the physical-snapshot signal when the display value cannot resolve to an archived
-      trait. The forensic row proves it is retained and soft-deleted; it does not carry the archive
-      entry's pre-archive field. An active custom lane has no such retained proof and remains ineligible.
-      */
-      const isPhysicalArchivedSource = Boolean(
-        typeof parent.archivedAt === "string"
-        && archivedSourceRecord?.deletedAt
-        && (archivedColumns.has(parent.column) || parent.preArchiveColumn),
-      );
-      if (!isRecommendationSourceActionable(parent, completeColumns, landedReviewColumns) && !isPhysicalArchivedSource) {
+      const { actionable, completeColumns, landedReviewColumns } = await resolveRecommendationSourceEligibility(scopedStore, parent);
+      if (!actionable) {
         throw conflict(recommendationSourceNotActionableMessage(parent.id));
       }
       const recommendation = parent.recommendations?.find((item) => item.id === req.params.recommendationId);
