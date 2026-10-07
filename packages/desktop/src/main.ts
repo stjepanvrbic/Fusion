@@ -49,6 +49,7 @@ import {
 import { setupTray } from "./tray.js";
 import { getRendererUrl, getRendererFilePath, isUrlRenderer } from "./renderer.js";
 import { LocalRuntimeManager } from "./local-runtime.js";
+import { installQuitCoordinator } from "./quit-coordinator.js";
 import { readShellSettings, writeShellSettings } from "./shell-settings.js";
 
 // Re-export for backward compatibility
@@ -552,22 +553,22 @@ export function run(): void {
     osSessionEnding = true;
   });
 
-  app.on("before-quit", () => {
-    appWithQuitFlag.isQuitting = true;
+  // FNXC:DesktopShutdown 2026-10-07-18:02: quit is held until runtime teardown settles or its bound expires (see quit-coordinator.ts).
+  installQuitCoordinator(app, {
+    onBeforeQuit: () => {
+      appWithQuitFlag.isQuitting = true;
 
-    if (stopUpdateCheckInterval) {
-      stopUpdateCheckInterval();
-      stopUpdateCheckInterval = null;
-    }
+      if (stopUpdateCheckInterval) {
+        stopUpdateCheckInterval();
+        stopUpdateCheckInterval = null;
+      }
 
-    if (tray) {
-      tray.destroy();
-      tray = null;
-    }
-
-    if (localRuntimeManager) {
-      void localRuntimeManager.stopLocal({ keepEmbeddedPostgres: keepEmbeddedPostgresOnQuit });
-    }
+      if (tray) {
+        tray.destroy();
+        tray = null;
+      }
+    },
+    teardown: () => localRuntimeManager?.stopLocal({ keepEmbeddedPostgres: keepEmbeddedPostgresOnQuit }),
   });
 
   app.on("activate", () => {

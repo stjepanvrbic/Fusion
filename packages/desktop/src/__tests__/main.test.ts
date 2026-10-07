@@ -65,6 +65,8 @@ const mocks = vi.hoisted(() => {
     getVersion: vi.fn(() => "0.1.0"),
     getPath: vi.fn(() => "/mock/home"),
     quit: vi.fn(),
+    exit: vi.fn(),
+    requestSingleInstanceLock: vi.fn(() => true),
     on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
       appHandlers.set(event, handler);
       return app;
@@ -517,13 +519,59 @@ describe("main process", () => {
 
     closeHandler?.(event);
     mocks.appHandlers.get("window-all-closed")?.();
-    mocks.appHandlers.get("before-quit")?.();
+    const quitEvent = { preventDefault: vi.fn() };
+    mocks.appHandlers.get("before-quit")?.(quitEvent);
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mainDeps.saveWindowState).toHaveBeenCalledWith(mocks.browserWindowInstance);
     expect(event.preventDefault).not.toHaveBeenCalled();
     expect(mocks.browserWindowInstance.hide).not.toHaveBeenCalled();
-    expect(mocks.app.quit).toHaveBeenCalledTimes(1);
+    expect(quitEvent.preventDefault).toHaveBeenCalledTimes(1);
     expect(mainDeps.stopLocal).toHaveBeenCalledTimes(1);
+    expect(mainDeps.stopLocal).toHaveBeenCalledWith({ keepEmbeddedPostgres: false });
+    // window-all-closed quit, then the coordinator's re-quit once teardown settled.
+    expect(mocks.app.quit).toHaveBeenCalledTimes(2);
+  });
+
+  /*
+   * C-041: before-quit must hold the process until stopLocal settles; Electron otherwise exits
+   * within milliseconds and kills in-flight merges with leases and the engine lock still held.
+   */
+  it.each([
+    ["Exit and stop PostgreSQL", 1, false],
+    ["Exit, leave PostgreSQL running", 2, true],
+  ])("before-quit after '%s' awaits stopLocal before quitting again", async (_label, choice, keepEmbeddedPostgres) => {
+    mockPlatform("win32");
+    mocks.dialog.showMessageBoxSync.mockReturnValue(choice);
+    let releaseStop!: () => void;
+    mainDeps.stopLocal.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        releaseStop = () => resolve({ source: "none", state: "stopped" });
+      }),
+    );
+    const { initializeApp, run } = await importMainModule();
+    await initializeApp();
+    run();
+    mainDeps.LocalRuntimeManager.mock.results.at(-1)?.value.getStatus.mockReturnValueOnce({ source: "embedded-local", state: "running" });
+    const closeHandler = mocks.browserWindowHandlers.get("close") as (event: { preventDefault: () => void }) => void;
+    closeHandler({ preventDefault: vi.fn() });
+
+    const quitEvent = { preventDefault: vi.fn() };
+    mocks.appHandlers.get("before-quit")?.(quitEvent);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(quitEvent.preventDefault).toHaveBeenCalledTimes(1);
+    expect(mainDeps.stopLocal).toHaveBeenCalledWith({ keepEmbeddedPostgres });
+    expect(mocks.app.quit).not.toHaveBeenCalled();
+    expect(mocks.app.exit).not.toHaveBeenCalled();
+
+    releaseStop();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.app.quit).toHaveBeenCalledTimes(1);
+
+    const finalQuit = { preventDefault: vi.fn() };
+    mocks.appHandlers.get("before-quit")?.(finalQuit);
+    expect(finalQuit.preventDefault).not.toHaveBeenCalled();
   });
 
   it("windows window close with Minimize to tray hides instead of quitting", async () => {

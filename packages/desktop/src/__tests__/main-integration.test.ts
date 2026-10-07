@@ -50,6 +50,8 @@ const mocks = vi.hoisted(() => {
       appEvents.set(event, handler);
     }),
     quit: vi.fn(),
+    exit: vi.fn(),
+    requestSingleInstanceLock: vi.fn(() => true),
     isQuitting: false,
   };
 
@@ -398,7 +400,7 @@ describe("main integration", () => {
     await flushPromises();
 
     const beforeQuitHandler = mocks.appEvents.get("before-quit");
-    beforeQuitHandler?.();
+    beforeQuitHandler?.({ preventDefault: vi.fn() });
 
     const [trayInstance] = mocks.trayInstances;
     expect(mocks.app.isQuitting).toBe(true);

@@ -9,6 +9,7 @@ import type { AddressInfo } from "node:net";
 import { resolveDesktopRuntimePrimaryProject } from "./engine-runtime.js";
 import { resolveDesktopBundlePluginDirs } from "./bundled-plugin-dirs.js";
 import { closeServerDraining, listenOnLoopback, trackServerSockets } from "./server-lifecycle.js";
+import { DESKTOP_SHUTDOWN_TIMEOUT_MS } from "./quit-coordinator.js";
 
 /*
  * FNXC:DesktopRuntime 2026-07-02-14:35:
@@ -258,9 +259,14 @@ omitted and the System panel disables its restart controls. Rebuild controls
 never appear on desktop (no sourceWorkspaceRoot — nothing to rebuild).
 Cross-reference: local-server.ts carries the matching wiring for the other
 desktop startup path.
+
+FNXC:DesktopShutdown 2026-10-07-18:02:
+quit() alone never ran teardown: before-quit discarded the stop promise and Electron exited immediately.
+The quit coordinator in main.ts now holds the quit until teardown settles, bounded by DESKTOP_SHUTDOWN_TIMEOUT_MS.
+This fallback only covers a quit that never begins, so it must fire after that bound rather than cut a running teardown short.
 */
 const DESKTOP_RESTART_FLUSH_MS = 300;
-const DESKTOP_QUIT_FALLBACK_MS = 5_000;
+const DESKTOP_QUIT_FALLBACK_MS = DESKTOP_SHUTDOWN_TIMEOUT_MS + 5_000;
 
 export async function resolveDesktopSystemControl(): Promise<
   Pick<import("@fusion/dashboard").ServerOptions, "systemControl">
