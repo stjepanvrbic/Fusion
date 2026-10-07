@@ -86,7 +86,7 @@ The current implementation exposes a `MasterKeyProvider` abstraction consumed by
 - Required contract: async provider that returns a **32-byte** key.
 - Validation failures return non-sensitive `SecretCryptoError` codes.
 
-Runtime keychain/filesystem resolution is shipped via `MasterKeyManager` (`packages/core/src/master-key.ts`) with keychain-primary lookup and `~/.fusion/master.key` fallback (mode `0600`); rotation UX remains follow-up work.
+Runtime keychain/filesystem resolution is shipped via `MasterKeyManager` (`packages/core/src/master-key.ts`) with keychain-primary lookup and `~/.fusion/master.key` fallback, restricted to the owning user (mode `0600` on POSIX, an ACL granting only the current user on Windows) before the key is published; rotation UX remains follow-up work.
 
 ## Access Policies
 

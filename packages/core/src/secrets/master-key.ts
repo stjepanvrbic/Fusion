@@ -1,11 +1,13 @@
 import { createLogger } from "../process/logger.js";
 
 const severityAuditLog = createLogger("core-master-key");
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { join } from "node:path";
+import { userInfo } from "node:os";
 import { createRequire } from "node:module";
 import { resolveGlobalDir } from "../config/global-settings.js";
+import { superviseSpawn } from "../process/process-supervisor.js";
 
 export const MASTER_KEY_KEYCHAIN_SERVICE = "fusion";
 export const MASTER_KEY_KEYCHAIN_ACCOUNT = "master-key";
@@ -18,7 +20,7 @@ export type KeytarLike = {
 };
 
 export class MasterKeyPermissionError extends Error {
-  constructor(message = "master key file permissions must be 0600") {
+  constructor(message = "master key file must be readable only by its owner") {
     super(message);
     this.name = "MasterKeyPermissionError";
   }
@@ -31,19 +33,52 @@ export class MasterKeyCorruptError extends Error {
   }
 }
 
-type FsLike = Pick<typeof fs, "mkdir" | "open" | "chmod" | "stat" | "readFile">;
+type FsLike = Pick<typeof fs, "mkdir" | "open" | "chmod" | "stat" | "readFile" | "link" | "rename" | "unlink">;
+
+/** Runs `icacls` with the given arguments; injectable so the Windows policy is testable on every platform. */
+export type WindowsAclRunner = (args: string[]) => Promise<{ exitCode: number | null; stderr: string }>;
+
+const ICACLS_TIMEOUT_MS = 15_000;
+
+const runIcacls: WindowsAclRunner = (args) => new Promise((resolve) => {
+  const supervised = superviseSpawn("icacls", args, {
+    stdio: ["ignore", "ignore", "pipe"],
+    windowsHide: true,
+    maxLifetimeMs: ICACLS_TIMEOUT_MS,
+  });
+  let stderr = "";
+  supervised.child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf-8"); });
+  supervised.child.once("error", (error) => resolve({ exitCode: null, stderr: error.message }));
+  void supervised.waitExit().then(({ code }) => resolve({ exitCode: code, stderr }));
+});
+
+function currentWindowsPrincipal(): string {
+  const user = process.env.USERNAME || userInfo().username;
+  const domain = process.env.USERDOMAIN;
+  return domain ? `${domain}\\${user}` : user;
+}
 
 export class MasterKeyManager {
   private readonly globalDir: string;
   private readonly filePath: string;
   private readonly injectedKeytar?: KeytarLike;
   private readonly fsModule: FsLike;
+  private readonly platform: NodeJS.Platform;
+  private readonly windowsAclRunner: WindowsAclRunner;
 
-  constructor(options?: { globalDir?: string; keytarModule?: KeytarLike; fsModule?: FsLike }) {
+  constructor(options?: {
+    globalDir?: string;
+    keytarModule?: KeytarLike;
+    fsModule?: FsLike;
+    platform?: NodeJS.Platform;
+    windowsAclRunner?: WindowsAclRunner;
+  }) {
     this.globalDir = resolveGlobalDir(options?.globalDir);
     this.filePath = join(this.globalDir, MASTER_KEY_FILENAME);
     this.injectedKeytar = options?.keytarModule;
     this.fsModule = options?.fsModule ?? fs;
+    this.platform = options?.platform ?? process.platform;
+    this.windowsAclRunner = options?.windowsAclRunner ?? runIcacls;
   }
 
   async getOrCreateKey(): Promise<Buffer> {
@@ -192,18 +227,52 @@ export class MasterKeyManager {
     }
   }
 
+  /*
+  FNXC:SecretsMasterKey 2026-10-07-17:59:
+  The key is staged in an owner-only temp file and only then published under master.key, so a key whose protection failed never exists for the next read to accept, and a failed rotation leaves the current key intact.
+  Owner-only means POSIX mode 0600, verified by stat, or on Windows an ACL with inheritance removed that grants only the current user (POSIX mode bits always read 0666 there).
+  A first write publishes with link(), which fails if a racing writer published first; rotation publishes with rename().
+  */
   private async writeFileKey(value: Buffer, options: { overwrite: boolean }): Promise<void> {
     await this.fsModule.mkdir(this.globalDir, { recursive: true });
-    const handle = await this.fsModule.open(this.filePath, options.overwrite ? "w" : "wx");
+    const stagingPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      await handle.writeFile(value);
+      const created = await this.fsModule.open(stagingPath, "wx", 0o600);
+      await created.close();
+      await this.restrictToOwner(stagingPath);
+      const handle = await this.fsModule.open(stagingPath, "r+");
+      try {
+        await handle.writeFile(value);
+      } finally {
+        await handle.close();
+      }
+      if (options.overwrite) {
+        await this.fsModule.rename(stagingPath, this.filePath);
+      } else {
+        await this.fsModule.link(stagingPath, this.filePath);
+      }
     } finally {
-      await handle.close();
+      await this.fsModule.unlink(stagingPath).catch(() => undefined);
     }
-    await this.fsModule.chmod(this.filePath, 0o600);
-    const fileStat = await this.fsModule.stat(this.filePath);
+  }
+
+  private async restrictToOwner(path: string): Promise<void> {
+    if (this.platform === "win32") {
+      const { exitCode, stderr } = await this.windowsAclRunner([
+        path,
+        "/inheritance:r",
+        "/grant:r",
+        `${currentWindowsPrincipal()}:F`,
+      ]);
+      if (exitCode !== 0) {
+        throw new MasterKeyPermissionError(`master key file ACL could not be restricted to the current user: ${stderr.trim() || `icacls exit ${exitCode}`}`);
+      }
+      return;
+    }
+    await this.fsModule.chmod(path, 0o600);
+    const fileStat = await this.fsModule.stat(path);
     if ((fileStat.mode & 0o777) !== 0o600) {
-      throw new MasterKeyPermissionError();
+      throw new MasterKeyPermissionError("master key file permissions must be 0600");
     }
   }
 
