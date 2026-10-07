@@ -1,5 +1,5 @@
 import { Capacitor } from "@capacitor/core";
-import { EventEmitter } from "node:events";
+import { BrowserEventEmitter } from "./event-emitter.js";
 import type { PluginEventMap } from "../types.js";
 
 export interface PushNotificationEventMap extends PluginEventMap {
@@ -34,7 +34,7 @@ export interface PushNotificationManagerOptions {
 
 type PushNotificationsModule = typeof import("@capacitor/push-notifications");
 
-export class PushNotificationManager extends EventEmitter {
+export class PushNotificationManager extends BrowserEventEmitter {
   private deviceToken: string | undefined;
   private ntfyBaseUrl: string;
   private settingsFetcher?: PushNotificationManagerOptions["settingsFetcher"];

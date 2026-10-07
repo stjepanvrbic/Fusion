@@ -468,23 +468,36 @@ export function runPlannedBuilds(plannedPackages, rootDir, spawnFn = spawnSync, 
 /**
  * Record hashes for packages that built successfully (plugins and non-plugins).
  *
- * @param {object[]} builtPackages
+ * FNXC:WorkspaceBuild 2026-10-07-19:30:
+ * A cache entry must prove that dist was built from exactly those inputs.
+ * Each built package carries the `sourceHash` taken when the build was planned; the entry is written only when the post-build hash still equals it.
+ * When inputs changed while the build ran (another agent editing the tree), any existing entry is dropped so the next build rebuilds instead of trusting stale output.
+ *
+ * @param {object[]} builtPackages Planned packages, each with the pre-build `sourceHash`.
  * @param {object} options
  * @param {string} options.rootDir
  * @param {ReturnType<typeof readPluginBuildCache>} options.cache
  * @param {(args: string[], cwd: string) => string|null} [options.gitFn]
+ * @returns {{ recorded: string[], driftedDuringBuild: string[] }}
  */
 export function recordSuccessfulPackageBuilds(builtPackages, { rootDir, cache, gitFn = defaultGitRunner } = {}) {
   const nextCache = { version: BUILD_CACHE_VERSION, entries: { ...(cache?.entries ?? {}) } };
-  let changed = false;
+  const recorded = [];
+  const driftedDuringBuild = [];
   const snapshot = createRepoContentSnapshot({ rootDir, gitFn });
   for (const pkg of builtPackages) {
     const sourceHash = computePackageSourceHash(pkg, rootDir, { gitFn, snapshot });
     if (sourceHash === null) continue;
+    if (sourceHash !== pkg.sourceHash) {
+      delete nextCache.entries[pkg.name];
+      driftedDuringBuild.push(pkg.name);
+      continue;
+    }
     nextCache.entries[pkg.name] = { sourceHash, builtAt: new Date().toISOString() };
-    changed = true;
+    recorded.push(pkg.name);
   }
-  if (changed) writePluginBuildCache(rootDir, nextCache);
+  if (recorded.length > 0 || driftedDuringBuild.length > 0) writePluginBuildCache(rootDir, nextCache);
+  return { recorded, driftedDuringBuild };
 }
 
 /** @deprecated Use recordSuccessfulPackageBuilds */
@@ -603,7 +616,10 @@ export function main({
 
   // When force used empty cache for planning, still merge into on-disk cache.
   const persistCache = force ? readPluginBuildCache(rootDir) : cache;
-  recordSuccessfulPackageBuilds(plannedPackages, { rootDir, cache: persistCache, gitFn });
+  const { driftedDuringBuild } = recordSuccessfulPackageBuilds(plannedPackages, { rootDir, cache: persistCache, gitFn });
+  if (driftedDuringBuild.length > 0) {
+    console.log(`[build-workspace] inputs changed during the build; not cached, will rebuild next run: ${driftedDuringBuild.join(", ")}`);
+  }
   return 0;
 }
 

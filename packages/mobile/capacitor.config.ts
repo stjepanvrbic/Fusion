@@ -36,11 +36,20 @@ const config: CapacitorConfig = {
       disableBackButtonHandler: false,
     },
   },
+  /*
+  FNXC:MobileShell 2026-10-07-19:30:
+  The packaged app boots the bundled dashboard and src/bootstrap.ts hands the WebView off to the operator's saved server.
+  Saved servers are arbitrary hosts, so every host must stay in the WebView; otherwise Capacitor opens the server in the system browser and the shell is lost.
+  The bootstrap's foreign-link guard keeps other origins out of the WebView, because iOS injects the plugin bridge into every page it allows.
+  When the server fails to load, Capacitor loads errorPath, the bundled dashboard, whose bootstrap stays put after a handoff so the connection manager can recover.
+  */
   server: {
     url: liveReloadEnabled
       ? process.env.FUSION_SERVER_URL || "http://localhost:5173"
       : undefined,
     cleartext: liveReloadEnabled,
+    allowNavigation: ["*"],
+    errorPath: "index.html",
   },
 };
 

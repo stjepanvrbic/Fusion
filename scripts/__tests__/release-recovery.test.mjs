@@ -1,90 +1,108 @@
-import test from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath, URL } from "node:url";
-import { spawnSync } from "node:child_process";
 
-const script = fileURLToPath(new URL("../release.mjs", import.meta.url));
+import { createReleaseRepo, runRelease } from "./helpers/release-harness.mjs";
 
-function release({ channel = "beta", dryRun = false, auth = false, resume = true, subject, tagged = false, notes = true, answer = "y" } = {}) {
-  const cwd = mkdtempSync(join(tmpdir(), "fusion-release-recovery-test-"));
-  const version = channel === "beta" ? "0.78.0-beta.5" : "0.78.0";
+/*
+ * `--resume` recovers a committed release whose publish failed: it rebuilds, proves the tree, publishes, pushes and tags without another version bump.
+ */
+
+const versions = { beta: "0.78.0-beta.5", stable: "0.78.0" };
+const branchOf = (channel) => (channel === "beta" ? "main" : "release");
+
+async function withCommittedRelease(channel, options, fn) {
+  const version = versions[channel];
+  const fixture = createReleaseRepo({ channel, version, preJson: null, subject: options.subject ?? `chore(release): v${version}` });
   try {
-    mkdirSync(join(cwd, "bin"));
-    mkdirSync(join(cwd, "packages/cli"), { recursive: true });
-    for (const path of ["package.json", "packages/cli/package.json"]) {
-      writeFileSync(join(cwd, path), JSON.stringify({ version }));
+    if (options.tagged) fixture.git("tag", `v${version}`);
+    if (options.notes === false) {
+      fixture.write("CHANGELOG.md", "# Fusion changelog\n");
+      fixture.git("commit", "-q", "-am", "docs: drop notes");
+      fixture.git("push", "-q", "origin", branchOf(channel));
     }
-    writeFileSync(join(cwd, "CHANGELOG.md"), notes ? `# Changelog\n\n## ${version}\n\nRecovered notes.\n` : "# Changelog\n");
-    const executable = `#!${process.execPath}
-const fs = require('node:fs');
-const command = require('node:path').basename(process.argv[1]);
-const args = process.argv.slice(2).join(' ');
-fs.appendFileSync('commands.log', command + ' ' + args + '\\n');
-if (command === 'npm') process.exit(${auth ? 0 : 1});
-if (command === 'pnpm') { console.error('BUILD_SENTINEL'); process.exit(23); }
-if (args === 'rev-parse --abbrev-ref HEAD') console.log(${JSON.stringify(channel === "beta" ? "main" : "release")});
-else if (args.startsWith('rev-list')) console.log('0');
-else if (args.startsWith('log')) console.log(${JSON.stringify(subject ?? `chore(release): v${version}`)});
-else if (args.startsWith('show-ref')) process.exit(${tagged ? 0 : 1});
-`;
-    for (const name of ["git", "npm", "pnpm"]) writeFileSync(join(cwd, "bin", name), executable, { mode: 0o755 });
-    const result = spawnSync(process.execPath, [script, "--channel", channel, ...(resume ? ["--resume"] : []), ...(dryRun ? ["--dry-run"] : [])], {
-      cwd, env: { ...process.env, PATH: `${join(cwd, "bin")}:${process.env.PATH}` }, input: `${answer}\n`, encoding: "utf8", timeout: 5000,
-    });
-    return { ...result, output: result.stdout + result.stderr, commands: readFileSync(join(cwd, "commands.log"), "utf8") };
+    return await fn(fixture, version);
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    fixture.cleanup();
   }
 }
 
-for (const channel of ["beta", "stable"]) {
-  test(`${channel} recovery previews the committed version without changesets or authentication`, () => {
-    const result = release({ channel, dryRun: true });
-    assert.equal(result.status, 0, result.output);
-    assert.match(result.output, /Would resume/);
-    assert.doesNotMatch(result.commands, /npm |pnpm |git (add|commit|push|tag)/);
-  });
+describe("release --resume", { concurrency: true }, () => {
+  for (const channel of ["beta", "stable"]) {
+    it(`${channel}: previews the committed version without authentication, build or publish`, () =>
+      withCommittedRelease(channel, {}, async (fixture, version) => {
+        const result = await runRelease(fixture, { channel, args: ["--resume", "--dry-run"] });
 
-  test(`${channel} recovery rebuilds without another version bump after confirmation`, () => {
-    const result = release({ channel, auth: true });
-    assert.match(result.output, /BUILD_SENTINEL/);
-    assert.match(result.commands, /npm whoami/);
-    assert.match(result.commands, /pnpm build:full/);
-    assert.doesNotMatch(result.commands, /changeset|release:version|git (add|commit|push|tag)/);
-  });
-}
+        assert.equal(result.status, 0, result.output);
+        assert.match(result.output, /Would resume/);
+        assert.equal(result.commands, "");
+        assert.equal(fixture.git("tag", "--list", `v${version}`), "");
+      }));
 
-test("invalid npm authentication stops a new release before version mutation", () => {
-  const result = release({ resume: false });
-  assert.equal(result.status, 1);
-  assert.match(result.output, /npm login/);
-  assert.doesNotMatch(result.commands, /pnpm |git (add|commit|push|tag)/);
-});
+    it(`${channel}: rebuilds, publishes and tags the committed release without another version bump`, () =>
+      withCommittedRelease(channel, {}, async (fixture, version) => {
+        const head = fixture.git("rev-parse", "HEAD");
+        const result = await runRelease(fixture, { channel, args: ["--resume"] });
 
-test("resume refuses a version without its release commit", () => {
-  const result = release({ dryRun: true, subject: "fix: unrelated change" });
-  assert.equal(result.status, 1);
-  assert.match(result.output, /release commit/);
-});
+        assert.equal(result.status, 0, result.output);
+        assert.match(result.commands, /npm whoami/);
+        assert.match(result.commands, /pnpm build:full/);
+        assert.match(result.commands, /pnpm -r publish/);
+        assert.doesNotMatch(result.commands, /changeset|release:version/);
+        assert.equal(fixture.git("rev-parse", "HEAD"), head, "no new commit");
+        assert.equal(fixture.originGit("rev-parse", `v${version}^{commit}`), head);
+      }));
 
-test("resume refuses an already tagged release", () => {
-  const result = release({ dryRun: true, tagged: true });
-  assert.equal(result.status, 1);
-  assert.match(result.output, /already tagged/);
-});
+    it(`${channel}: a tree dirtied before publish stops the resume before publish and tag`, () =>
+      withCommittedRelease(channel, {}, async (fixture, version) => {
+        const result = await runRelease(fixture, { channel, args: ["--resume"], scenario: { duringBuild: "dirty" } });
 
-test("resume refuses missing release notes", () => {
-  const result = release({ dryRun: true, notes: false });
-  assert.equal(result.status, 1);
-  assert.match(result.output, /release notes .* missing/);
-});
+        assert.equal(result.status, 1, result.output);
+        assert.match(result.output, /packages\/engine\/src\/injected\.ts/);
+        assert.doesNotMatch(result.commands, /publish/);
+        assert.equal(fixture.originGit("tag", "--list", `v${version}`), "");
+      }));
+  }
 
-test("declining recovery performs no build or publish", () => {
-  const result = release({ auth: true, answer: "n" });
-  assert.equal(result.status, 0);
-  assert.match(result.output, /Aborted by user/);
-  assert.doesNotMatch(result.commands, /pnpm |git (add|commit|push|tag)/);
+  it("a failed publish leaves the release untagged and names the resume command", () =>
+    withCommittedRelease("beta", {}, async (fixture, version) => {
+      const result = await runRelease(fixture, { args: ["--resume"], scenario: { publishFails: true } });
+
+      assert.equal(result.status, 1, result.output);
+      assert.match(result.output, /--resume/);
+      assert.equal(fixture.git("tag", "--list", `v${version}`), "");
+      assert.equal(fixture.originGit("tag", "--list", `v${version}`), "");
+    }));
+
+  it("refuses a version without its release commit", () =>
+    withCommittedRelease("beta", { subject: "fix: unrelated change" }, async (fixture) => {
+      const result = await runRelease(fixture, { args: ["--resume", "--dry-run"] });
+
+      assert.equal(result.status, 1);
+      assert.match(result.output, /release commit/);
+    }));
+
+  it("refuses an already tagged release", () =>
+    withCommittedRelease("beta", { tagged: true }, async (fixture) => {
+      const result = await runRelease(fixture, { args: ["--resume", "--dry-run"] });
+
+      assert.equal(result.status, 1);
+      assert.match(result.output, /already tagged/);
+    }));
+
+  it("refuses missing release notes", () =>
+    withCommittedRelease("beta", { notes: false }, async (fixture) => {
+      const result = await runRelease(fixture, { args: ["--resume", "--dry-run"] });
+
+      assert.equal(result.status, 1);
+      assert.match(result.output, /release notes .* missing/);
+    }));
+
+  it("declining recovery performs no build or publish", () =>
+    withCommittedRelease("beta", {}, async (fixture) => {
+      const result = await runRelease(fixture, { args: ["--resume"], confirm: "n" });
+
+      assert.equal(result.status, 0, result.output);
+      assert.match(result.output, /Aborted by user/);
+      assert.doesNotMatch(result.commands, /pnpm /);
+    }));
 });

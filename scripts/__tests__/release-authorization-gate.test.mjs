@@ -23,7 +23,7 @@ test("release script no longer prompts for a typed authorization phrase", () => 
   const source = readFileSync(new URL("../release.mjs", import.meta.url), "utf8");
   const dryRunExitIndex = source.indexOf("if (DRY_RUN) {");
   const confirmIndex = source.indexOf("Proceed with ${CHANNEL} release");
-  const versionBumpIndex = source.indexOf('run("pnpm release:version")');
+  const versionBumpIndex = source.indexOf('run("pnpm", ["release:version"])');
 
   assert.notEqual(dryRunExitIndex, -1, "release.mjs should retain the dry-run early exit");
   assert.notEqual(confirmIndex, -1, "release.mjs should still confirm before mutation");

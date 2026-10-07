@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -11,6 +11,7 @@ import {
   computePluginSourceHash,
   discoverWorkspacePackages,
   ensureFullPackageCliPlanned,
+  main,
   planWorkspaceBuild,
   readPluginBuildCache,
   requiredPluginOutputs,
@@ -319,4 +320,53 @@ test("wantsFullCliPackage matches CLI packaging env rules", () => {
   assert.equal(wantsFullCliPackage({ FUSION_CLI_FULL_PACKAGE: "1" }, { fullFlag: false }), true);
   assert.equal(wantsFullCliPackage({ FUSION_CLI_FULL_PACKAGE: "0", CI: "true" }, { fullFlag: true }), false);
   assert.equal(wantsFullCliPackage({ npm_lifecycle_event: "prepack" }, { fullFlag: false }), true);
+});
+
+/*
+ * A build reads its inputs at plan time; an edit that lands while it runs is not in dist.
+ * The cache may only record a package whose inputs are unchanged across the build, across every input surface.
+ */
+function buildWithConcurrentEdit(root, edit) {
+  writePluginDist(root);
+  mkdirSync(path.join(root, "packages/core", "dist"), { recursive: true });
+  writeFileSync(path.join(root, "packages/core", "dist", "index.js"), "export const core = 1;\n");
+  initGit(root);
+  const spawnFn = () => {
+    edit?.(root);
+    return { status: 0 };
+  };
+  const log = console.log;
+  console.log = () => {};
+  try {
+    assert.equal(main({ rootDir: root, spawnFn, env: {} }), 0);
+  } finally {
+    console.log = log;
+  }
+  return planWorkspaceBuild({ rootDir: root, cache: readPluginBuildCache(root) });
+}
+
+const concurrentEdits = {
+  "own source modified": (root) => writeFileSync(path.join(root, "plugins/fusion-plugin-alpha/src/index.ts"), "export const alpha = 2;\n"),
+  "own source added": (root) => writeFileSync(path.join(root, "plugins/fusion-plugin-alpha/src/extra.json"), "{}\n"),
+  "own source deleted": (root) => unlinkSync(path.join(root, "plugins/fusion-plugin-alpha/src/index.ts")),
+  "workspace dependency modified": (root) => writeFileSync(path.join(root, "packages/core/src/index.ts"), "export const core = 2;\n"),
+};
+
+for (const [label, edit] of Object.entries(concurrentEdits)) {
+  test(`inputs changed during the build (${label}) are not cached as built`, () => {
+    withWorkspace((root) => {
+      const plan = buildWithConcurrentEdit(root, edit);
+      const plannedPlugin = packageByName(plan.plannedPackages, "@fusion-plugin-examples/alpha");
+      assert.ok(plannedPlugin, `alpha must rebuild after a concurrent ${label}`);
+      assert.notEqual(plannedPlugin.buildReason, "unchanged");
+    });
+  });
+}
+
+test("inputs unchanged across the build are cached and skipped next time", () => {
+  withWorkspace((root) => {
+    const plan = buildWithConcurrentEdit(root, null);
+    assert.deepEqual(plan.plannedPackages.map((pkg) => pkg.name), []);
+    assert.deepEqual(plan.skippedPackages.map((pkg) => pkg.name).sort(), ["@fusion-plugin-examples/alpha", "@fusion/core"]);
+  });
 });

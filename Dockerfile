@@ -13,6 +13,8 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 # FNXC:DockerBuild 2026-08-10-18:03: This list is derived from pnpm-workspace.yaml.
 # Every selected workspace manifest must be copied before frozen install, or pnpm
 # omits its dependencies and the later full-workspace image build can fail.
+# FNXC:DockerBuild 2026-10-07-19:30: The antigravity runtime plugin joined the workspace without a COPY here, so its links were never installed while the dashboard depends on it via workspace:*.
+# scripts/__tests__/dockerfile-workspace-manifests.test.mjs enforces that this list equals the workspace package set.
 COPY packages/cli/package.json ./packages/cli/package.json
 COPY packages/cli-alias/package.json ./packages/cli-alias/package.json
 COPY packages/core/package.json ./packages/core/package.json
@@ -40,6 +42,7 @@ COPY plugins/fusion-plugin-openclaw-runtime/package.json ./plugins/fusion-plugin
 COPY plugins/fusion-plugin-hermes-runtime/package.json ./plugins/fusion-plugin-hermes-runtime/package.json
 COPY plugins/fusion-plugin-droid-runtime/package.json ./plugins/fusion-plugin-droid-runtime/package.json
 COPY plugins/fusion-plugin-cursor-runtime/package.json ./plugins/fusion-plugin-cursor-runtime/package.json
+COPY plugins/fusion-plugin-antigravity-runtime/package.json ./plugins/fusion-plugin-antigravity-runtime/package.json
 COPY plugins/fusion-plugin-grok-runtime/package.json ./plugins/fusion-plugin-grok-runtime/package.json
 COPY plugins/fusion-plugin-claude-runtime/package.json ./plugins/fusion-plugin-claude-runtime/package.json
 COPY plugins/fusion-plugin-omp-runtime/package.json ./plugins/fusion-plugin-omp-runtime/package.json

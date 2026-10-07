@@ -1,5 +1,5 @@
 import { Capacitor } from "@capacitor/core";
-import { EventEmitter } from "node:events";
+import { BrowserEventEmitter } from "./event-emitter.js";
 
 export interface DeepLinkPayload {
   url: string;
@@ -26,7 +26,7 @@ type AppListenerHandle = { remove: () => Promise<void> };
 
 type HashChangeEventHandler = (event: HashChangeEvent) => void;
 
-export class DeepLinkManager extends EventEmitter {
+export class DeepLinkManager extends BrowserEventEmitter {
   private readonly scheme: string;
   private readonly universalLinkHosts: string[];
   private initialized = false;

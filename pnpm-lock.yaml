@@ -435,6 +435,9 @@ importers:
         specifier: ^3.25.76
         version: 3.25.76
     devDependencies:
+      '@fusion/mobile':
+        specifier: workspace:*
+        version: link:../mobile
       '@testing-library/jest-dom':
         specifier: ^6.9.1
         version: 6.9.1

@@ -7,6 +7,7 @@ import { installAuthFetch } from "./auth";
 import { installVersionCheck } from "./versionCheck";
 import { installSwUpdate } from "./swUpdate";
 import { bootstrapShellHostContext } from "./shell-host";
+import { runDashboardStartup } from "./nativeShellStartup";
 import { registerBundledPluginViews } from "./plugins/registerBundledPluginViews";
 import { i18nReady } from "./i18n";
 import "@fontsource/pixelify-sans/400.css";
@@ -18,23 +19,33 @@ import "./styles.css";
 // stored from a previous session.
 installAuthFetch();
 installVersionCheck();
-bootstrapShellHostContext();
-registerBundledPluginViews();
 
-// Gate first paint on the active locale's catalogs so the UI never flashes raw
-// translation keys. The catalog is a small local chunk, so this is a brief
-// wait; `.finally` ensures we still render if i18n init fails (strings then
-// fall back to keys/en rather than blocking the app).
-void i18nReady.finally(() => {
-  createRoot(document.getElementById("root")!).render(
-    <StrictMode>
-      <RootErrorBoundary>
-        <DesktopLaunchGate>
-          <App />
-        </DesktopLaunchGate>
-      </RootErrorBoundary>
-    </StrictMode>,
-  );
+/*
+FNXC:MobileShell 2026-10-07-19:30:
+In the packaged Capacitor app the native mobile shell must be installed before shell-host detection and before React mounts; see nativeShellStartup.ts.
+In a browser startApp still runs synchronously at module load.
+*/
+function startApp(): void {
+  bootstrapShellHostContext();
+  registerBundledPluginViews();
 
-  installSwUpdate();
-});
+  // Gate first paint on the active locale's catalogs so the UI never flashes raw
+  // translation keys. The catalog is a small local chunk, so this is a brief
+  // wait; `.finally` ensures we still render if i18n init fails (strings then
+  // fall back to keys/en rather than blocking the app).
+  void i18nReady.finally(() => {
+    createRoot(document.getElementById("root")!).render(
+      <StrictMode>
+        <RootErrorBoundary>
+          <DesktopLaunchGate>
+            <App />
+          </DesktopLaunchGate>
+        </RootErrorBoundary>
+      </StrictMode>,
+    );
+
+    installSwUpdate();
+  });
+}
+
+void runDashboardStartup(startApp);

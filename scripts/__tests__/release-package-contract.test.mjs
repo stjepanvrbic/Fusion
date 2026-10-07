@@ -8,7 +8,7 @@ const source = readFileSync(new URL("../release.mjs", import.meta.url), "utf8");
 test("local releases build the complete published package surface", () => {
   assert.match(
     source,
-    /info\("Building all packages…"\);\s*run\("pnpm build:full"\);/,
+    /info\("Building all packages…"\);\s*run\("pnpm", \["build:full"\]\);/,
     "release.mjs must enable the full CLI package build before packing",
   );
 });
@@ -27,7 +27,7 @@ test("release smoke typechecks a consumer of the packed plugin SDK", () => {
   assert.match(smoke, /skipLibCheck:\s*false/);
   assert.match(smoke, /createRequire\(join\(installDir, "package\.json"\)\)/);
   assert.match(smoke, /consumerRequire\.resolve\("typescript\/bin\/tsc"\)/);
-  assert.match(smoke, /spawnSync\(\s*"node",\s*\[consumerTsc, "--project", consumerTsconfigPath\],\s*\{ cwd: installDir,/);
+  assert.match(smoke, /spawnSync\(\s*process\.execPath,\s*\[consumerTsc, "--project", consumerTsconfigPath\],\s*\{ cwd: installDir,/);
   assert.doesNotMatch(smoke, /pnpm",\s*\["exec", "tsc"/);
   assert.match(smoke, /timeout: 120_000/);
   assert.match(smoke, /if \(typecheck\.status !== 0\)/);
