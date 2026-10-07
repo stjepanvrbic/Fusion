@@ -348,10 +348,14 @@ function removePrunedRootWithRetry(rawPath, { retries = PRUNE_REMOVE_RETRIES, de
   return false;
 }
 
-function pruneFusionTestRoots(prefix, maxEntries = PRUNE_MAX_ENTRIES, retryOptions = {}) {
+/*
+FNXC:TestIsolation 2026-10-07-18:04:
+`tempRoot` defaults to the OS temp dir for real runs. Tests pass their own root, because scanning the shared temp dir let a test that stubs pid liveness delete other concurrent sessions' live worker roots, and made its results depend on whatever those sessions left there.
+*/
+function pruneFusionTestRoots(prefix, maxEntries = PRUNE_MAX_ENTRIES, { tempRoot = tmpdir(), ...retryOptions } = {}) {
   let tmpEntries = [];
   try {
-    tmpEntries = readdirSync(tmpdir(), { withFileTypes: true });
+    tmpEntries = readdirSync(tempRoot, { withFileTypes: true });
   } catch {
     return;
   }
@@ -361,7 +365,7 @@ function pruneFusionTestRoots(prefix, maxEntries = PRUNE_MAX_ENTRIES, retryOptio
     if (processed >= maxEntries) break;
     if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
     processed++;
-    const rawPath = path.join(tmpdir(), entry.name);
+    const rawPath = path.join(tempRoot, entry.name);
     try {
       realpathSync(rawPath);
     } catch {

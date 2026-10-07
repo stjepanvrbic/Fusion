@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **4 active observation records** (entries 2, 13, 20, and 21), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **14 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **4 active observation records** (entries 2, 13, 20, and 21), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -373,6 +373,16 @@ explicit-file diagnostics runnable; timeout, retry, and assertion appeasement re
 FNXC:TestFlakeRegister 2026-10-07-18:04:
 Entries 22 and 23 record same-day second sightings on the fork's Full Suite. Both files are quarantined through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
 -->
+### 24. test-changed prune cases scanning the shared temp dir
+
+- **Status:** Closed 2026-10-07 — structurally resolved on first sighting; no quarantine.
+- **File:** `scripts/__tests__/test-changed.test.mjs`
+- **Exact test:** the `pruneFusionTestWorkers: ...` node:test cases (the observer did not record which case failed).
+- **Observed tree/SHA:** a local Windows run by the test-gate-integrity session on 2026-10-07, while other sessions' Vitest worker roots were live; the observer did not capture the SHA.
+- **Observed frequency:** failed once, then passed on 3 reruns.
+
+The prune cases scanned the shared OS temp dir, so their result depended on whatever concurrent sessions had left there, and the pid-liveness stub made every other session's worker root look dead to the prune. `pruneFusionTestRoots` now takes a `tempRoot` option that defaults to the OS temp dir, and every prune case scans its own private root. All 125 cases in the file pass. No timeout, retry, or assertion changed.
+
 ### 22. Planning Mode duplicate-response reconciliation re-sighting
 
 - **Status:** Closed — quarantined 2026-10-07 after a re-sighting of entry 8's exact case; deletion deadline 2026-10-21.
