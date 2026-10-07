@@ -2,17 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
+import { gitFixture } from "../../../../core/src/__test-utils__/git-fixture";
 import { recoverForeignOnlyContamination } from "../../recovery/foreign-only-contamination.js";
 import { activeSessionRegistry } from "../../agents/active-session-registry.js";
-
-const execAsync = promisify(exec);
-
-async function run(command: string, cwd: string): Promise<string> {
-  const { stdout } = await execAsync(command, { cwd, encoding: "utf-8" });
-  return stdout.trim();
-}
 
 describe("reliability interaction: foreign-only contamination recovery", () => {
   const dirs: string[] = [];
@@ -25,23 +17,26 @@ describe("reliability interaction: foreign-only contamination recovery", () => {
   async function setupRepo() {
     const repoDir = await mkdtemp(path.join(tmpdir(), "fn-4887-ri-"));
     dirs.push(repoDir);
-    await run("git init -b main", repoDir);
-    await run("git config user.email test@example.com", repoDir);
-    await run("git config user.name 'Test User'", repoDir);
+    await gitFixture(repoDir, ["init", "-b", "main"]);
+    await gitFixture(repoDir, ["config", "user.email", "test@example.com"]);
+    await gitFixture(repoDir, ["config", "user.name", "Test User"]);
     await writeFile(path.join(repoDir, "note.txt"), "base\n", "utf-8");
-    await run("git add note.txt && git commit -m 'chore: base'", repoDir);
-    const baseSha = await run("git rev-parse HEAD", repoDir);
+    await gitFixture(repoDir, ["add", "note.txt"]);
+    await gitFixture(repoDir, ["commit", "-m", "chore: base"]);
+    const baseSha = await gitFixture(repoDir, ["rev-parse", "HEAD"]);
 
-    await run("git checkout -b fusion/fn-y", repoDir);
+    await gitFixture(repoDir, ["checkout", "-b", "fusion/fn-y"]);
     await appendFile(path.join(repoDir, "note.txt"), "foreign-1\n", "utf-8");
-    await run("git add note.txt && git commit -m 'feat(FN-7001): y1' -m 'Fusion-Task-Id: FN-7001'", repoDir);
+    await gitFixture(repoDir, ["add", "note.txt"]);
+    await gitFixture(repoDir, ["commit", "-m", "feat(FN-7001): y1", "-m", "Fusion-Task-Id: FN-7001"]);
     await appendFile(path.join(repoDir, "note.txt"), "foreign-2\n", "utf-8");
-    await run("git add note.txt && git commit -m 'fix(FN-7001): y2' -m 'Fusion-Task-Id: FN-7001'", repoDir);
+    await gitFixture(repoDir, ["add", "note.txt"]);
+    await gitFixture(repoDir, ["commit", "-m", "fix(FN-7001): y2", "-m", "Fusion-Task-Id: FN-7001"]);
 
-    await run("git checkout -b fusion/fn-x", repoDir);
-    await run("git checkout main", repoDir);
+    await gitFixture(repoDir, ["checkout", "-b", "fusion/fn-x"]);
+    await gitFixture(repoDir, ["checkout", "main"]);
     const worktreePath = path.join(repoDir, "wt-fn-x");
-    await run(`git worktree add ${JSON.stringify(worktreePath)} fusion/fn-x`, repoDir);
+    await gitFixture(repoDir, ["worktree", "add", worktreePath, "fusion/fn-x"]);
     dirs.push(worktreePath);
     return { repoDir, baseSha, worktreePath };
   }
@@ -79,9 +74,9 @@ describe("reliability interaction: foreign-only contamination recovery", () => {
     );
     expect(["reanchor", "branch-discard"]).toContain(result.subtype);
     if (result.subtype === "reanchor") {
-      expect(await run("git rev-parse fusion/fn-x", repoDir)).toBe(baseSha);
+      expect(await gitFixture(repoDir, ["rev-parse", "fusion/fn-x"])).toBe(baseSha);
     }
-    expect(await run("git rev-list --count main..fusion/fn-y", repoDir)).toBe("2");
+    expect(await gitFixture(repoDir, ["rev-list", "--count", "main..fusion/fn-y"])).toBe("2");
     expect(runAudit.database).toHaveBeenCalledWith(expect.objectContaining({ type: "task:auto-recover-foreign-only-contamination" }));
   });
 

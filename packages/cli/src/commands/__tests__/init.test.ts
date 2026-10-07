@@ -8,8 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInit } from "../init.js";
 import { installShippedSkillsIntoProject, SHIPPED_SKILL_NAMES, type ShippedSkillName } from "../claude-skills.js";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
+import { gitFixture } from "../../../../core/src/__test-utils__/git-fixture";
 import { ensureProjectGitReadiness, GitRepositoryInitializationError } from "@fusion/core";
 
 function makeConstructibleMock<T extends (...args: any[]) => unknown>(impl?: T) {
@@ -27,7 +26,6 @@ function makeConstructibleMock<T extends (...args: any[]) => unknown>(impl?: T) 
   return mock;
 }
 
-const execAsync = promisify(exec);
 
 const mockCentralInit = vi.fn();
 const mockCentralClose = vi.fn();
@@ -69,10 +67,6 @@ function tempDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-async function git(command: string, cwd: string): Promise<string> {
-  const { stdout } = await execAsync(command, { cwd, timeout: 10_000 });
-  return stdout.trim();
-}
 
 const localStorageGitignoreEntries = [
   ".fusion/",
@@ -417,12 +411,12 @@ describe("init command", () => {
     await runInit({ path: tempProjectDir, ...(compatibilityFlag ? { git: true } : {}) });
 
     expect(existsSync(join(tempProjectDir, ".git"))).toBe(true);
-    await expect(git("git rev-parse --verify HEAD^{commit}", tempProjectDir)).resolves.toMatch(/^[0-9a-f]+$/);
-    const tree = await git("git ls-tree -r --name-only HEAD", tempProjectDir);
+    await expect(gitFixture(tempProjectDir, ["rev-parse", "--verify", "HEAD^{commit}"])).resolves.toMatch(/^[0-9a-f]+$/);
+    const tree = await gitFixture(tempProjectDir, ["ls-tree", "-r", "--name-only", "HEAD"]);
     expect(tree).toBe(".gitignore");
     const worktree = join(tempProjectDir, "task-worktree");
-    await git(`git worktree add -b fusion/init-${compatibilityFlag ? "git" : "default"} ${worktree} HEAD`, tempProjectDir);
-    await git(`git worktree remove --force ${worktree}`, tempProjectDir);
+    await gitFixture(tempProjectDir, ["worktree", "add", "-b", `fusion/init-${compatibilityFlag ? "git" : "default"}`, worktree, "HEAD"]);
+    await gitFixture(tempProjectDir, ["worktree", "remove", "--force", worktree]);
     for (const entry of localStorageGitignoreEntries) {
       expect(toLines(readFileSync(join(tempProjectDir, ".gitignore"), "utf8"))).toContain(entry);
     }
@@ -431,22 +425,22 @@ describe("init command", () => {
   it("creates an initial commit when --git initializes a repository", async () => {
     await runInit({ path: tempProjectDir, git: true });
 
-    const commitCount = await git("git rev-list --count HEAD", tempProjectDir);
+    const commitCount = await gitFixture(tempProjectDir, ["rev-list", "--count", "HEAD"]);
     expect(Number(commitCount)).toBeGreaterThanOrEqual(1);
   });
 
   it("does not reinitialize git when repository already exists", async () => {
-    await git("git init", tempProjectDir);
-    await git("git checkout -b main", tempProjectDir);
-    await git('git config user.name "Existing User"', tempProjectDir);
-    await git('git config user.email "existing@example.com"', tempProjectDir);
+    await gitFixture(tempProjectDir, ["init"]);
+    await gitFixture(tempProjectDir, ["checkout", "-b", "main"]);
+    await gitFixture(tempProjectDir, ["config", "user.name", "Existing User"]);
+    await gitFixture(tempProjectDir, ["config", "user.email", "existing@example.com"]);
     writeFileSync(join(tempProjectDir, "README.md"), "# Existing Repo\n");
-    await git("git add README.md", tempProjectDir);
-    await git('git commit -m "existing commit"', tempProjectDir);
+    await gitFixture(tempProjectDir, ["add", "README.md"]);
+    await gitFixture(tempProjectDir, ["commit", "-m", "existing commit"]);
 
     await runInit({ path: tempProjectDir, git: true });
 
-    const commitCount = await git("git rev-list --count HEAD", tempProjectDir);
+    const commitCount = await gitFixture(tempProjectDir, ["rev-list", "--count", "HEAD"]);
     expect(Number(commitCount)).toBe(1);
   });
 

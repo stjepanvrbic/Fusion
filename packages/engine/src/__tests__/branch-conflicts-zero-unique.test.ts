@@ -4,16 +4,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm, writeFile, appendFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
+import { gitFixture } from "../../../core/src/__test-utils__/git-fixture";
 import { inspectBareBranchCollision, inspectBranchConflict, listUniqueBranchCommits } from "../execution/branch-conflicts.js";
-
-const execAsync = promisify(exec);
-
-async function run(command: string, cwd: string): Promise<string> {
-  const { stdout } = await execAsync(command, { cwd, encoding: "utf-8" });
-  return stdout.trim();
-}
 
 describe("inspectBranchConflict zero-unique behavior", () => {
   const dirs: string[] = [];
@@ -24,20 +16,21 @@ describe("inspectBranchConflict zero-unique behavior", () => {
   async function setupRepo() {
     const repoDir = await mkdtemp(path.join(tmpdir(), "fn-4500-branch-conflict-"));
     dirs.push(repoDir);
-    await run("git init -b main", repoDir);
-    await run("git config user.email test@example.com", repoDir);
-    await run("git config user.name 'Test User'", repoDir);
+    await gitFixture(repoDir, ["init", "-b", "main"]);
+    await gitFixture(repoDir, ["config", "user.email", "test@example.com"]);
+    await gitFixture(repoDir, ["config", "user.name", "Test User"]);
     await writeFile(path.join(repoDir, "note.txt"), "base\n", "utf-8");
-    await run("git add note.txt && git commit -m 'chore: base'", repoDir);
+    await gitFixture(repoDir, ["add", "note.txt"]);
+    await gitFixture(repoDir, ["commit", "-m", "chore: base"]);
     return repoDir;
   }
 
   it("returns tip-already-merged when branch tip is ancestor of main", async () => {
     const repoDir = await setupRepo();
-    await run("git checkout -b fusion/fn-9001", repoDir);
-    await run("git checkout main", repoDir);
+    await gitFixture(repoDir, ["checkout", "-b", "fusion/fn-9001"]);
+    await gitFixture(repoDir, ["checkout", "main"]);
     const livePath = path.join(repoDir, "wt-live-9001");
-    await run(`git worktree add ${JSON.stringify(livePath)} fusion/fn-9001`, repoDir);
+    await gitFixture(repoDir, ["worktree", "add", livePath, "fusion/fn-9001"]);
     const stalePath = path.join(repoDir, "wt-stale-9001");
     await mkdir(stalePath, { recursive: true });
 
@@ -47,16 +40,16 @@ describe("inspectBranchConflict zero-unique behavior", () => {
 
   it("classifies branch patch already existing upstream as merged/subsumed", async () => {
     const repoDir = await setupRepo();
-    await run("git checkout -b fusion/fn-9001", repoDir);
+    await gitFixture(repoDir, ["checkout", "-b", "fusion/fn-9001"]);
     await appendFile(path.join(repoDir, "note.txt"), "change\n", "utf-8");
-    await run("git add note.txt", repoDir);
-    await run("git commit -m 'feat(FN-9001): change' -m 'Fusion-Task-Id: FN-9001'", repoDir);
-    const branchCommit = await run("git rev-parse HEAD", repoDir);
-    await run("git checkout main", repoDir);
-    await run(`git cherry-pick ${branchCommit}`, repoDir);
+    await gitFixture(repoDir, ["add", "note.txt"]);
+    await gitFixture(repoDir, ["commit", "-m", "feat(FN-9001): change", "-m", "Fusion-Task-Id: FN-9001"]);
+    const branchCommit = await gitFixture(repoDir, ["rev-parse", "HEAD"]);
+    await gitFixture(repoDir, ["checkout", "main"]);
+    await gitFixture(repoDir, ["cherry-pick", branchCommit]);
 
     const livePath = path.join(repoDir, "wt-live-9001-upstream");
-    await run(`git worktree add ${JSON.stringify(livePath)} fusion/fn-9001`, repoDir);
+    await gitFixture(repoDir, ["worktree", "add", livePath, "fusion/fn-9001"]);
     const stalePath = path.join(repoDir, "wt-stale-9001-upstream");
     await mkdir(stalePath, { recursive: true });
 
@@ -66,16 +59,17 @@ describe("inspectBranchConflict zero-unique behavior", () => {
 
   it("uses the current integration branch rather than an old task base", async () => {
     const repoDir = await setupRepo();
-    const oldBase = await run("git rev-parse HEAD", repoDir);
-    await run("git checkout -b fusion/fn-9001", repoDir);
+    const oldBase = await gitFixture(repoDir, ["rev-parse", "HEAD"]);
+    await gitFixture(repoDir, ["checkout", "-b", "fusion/fn-9001"]);
     await appendFile(path.join(repoDir, "note.txt"), "task change\n", "utf-8");
-    await run("git add note.txt && git commit -m 'feat(FN-9001): task change' -m 'Fusion-Task-Id: FN-9001'", repoDir);
-    const taskTip = await run("git rev-parse HEAD", repoDir);
-    await run("git checkout main", repoDir);
-    await run(`git merge --no-ff ${taskTip} -m 'merge task work'`, repoDir);
+    await gitFixture(repoDir, ["add", "note.txt"]);
+    await gitFixture(repoDir, ["commit", "-m", "feat(FN-9001): task change", "-m", "Fusion-Task-Id: FN-9001"]);
+    const taskTip = await gitFixture(repoDir, ["rev-parse", "HEAD"]);
+    await gitFixture(repoDir, ["checkout", "main"]);
+    await gitFixture(repoDir, ["merge", "--no-ff", taskTip, "-m", "merge task work"]);
 
     const livePath = path.join(repoDir, "wt-live-9001-current-base");
-    await run(`git worktree add ${JSON.stringify(livePath)} fusion/fn-9001`, repoDir);
+    await gitFixture(repoDir, ["worktree", "add", livePath, "fusion/fn-9001"]);
     const stalePath = path.join(repoDir, "wt-stale-9001-current-base");
     await mkdir(stalePath, { recursive: true });
 
@@ -91,7 +85,7 @@ describe("inspectBranchConflict zero-unique behavior", () => {
       integrationRef: "main",
     });
     expect(result.kind).toBe("tip-already-merged");
-    await run(`git worktree remove --force ${JSON.stringify(livePath)}`, repoDir);
+    await gitFixture(repoDir, ["worktree", "remove", "--force", livePath]);
 
     const bare = await inspectBareBranchCollision({
       repoDir,
@@ -106,14 +100,14 @@ describe("inspectBranchConflict zero-unique behavior", () => {
 
   it("returns reclaimable when branch still has unique commit", async () => {
     const repoDir = await setupRepo();
-    await run("git checkout -b fusion/fn-9001", repoDir);
+    await gitFixture(repoDir, ["checkout", "-b", "fusion/fn-9001"]);
     await appendFile(path.join(repoDir, "note.txt"), "unique\n", "utf-8");
-    await run("git add note.txt", repoDir);
-    await run("git commit -m 'feat(FN-9001): unique' -m 'Fusion-Task-Id: FN-9001'", repoDir);
-    await run("git checkout main", repoDir);
+    await gitFixture(repoDir, ["add", "note.txt"]);
+    await gitFixture(repoDir, ["commit", "-m", "feat(FN-9001): unique", "-m", "Fusion-Task-Id: FN-9001"]);
+    await gitFixture(repoDir, ["checkout", "main"]);
 
     const livePath = path.join(repoDir, "wt-live-9001-unique");
-    await run(`git worktree add ${JSON.stringify(livePath)} fusion/fn-9001`, repoDir);
+    await gitFixture(repoDir, ["worktree", "add", livePath, "fusion/fn-9001"]);
     const stalePath = path.join(repoDir, "wt-stale-9001-unique");
     await mkdir(stalePath, { recursive: true });
 
@@ -123,14 +117,14 @@ describe("inspectBranchConflict zero-unique behavior", () => {
 
   it("keeps zero-attributed foreign branch as live-foreign", async () => {
     const repoDir = await setupRepo();
-    await run("git checkout -b topic/other", repoDir);
+    await gitFixture(repoDir, ["checkout", "-b", "topic/other"]);
     await appendFile(path.join(repoDir, "note.txt"), "other\n", "utf-8");
-    await run("git add note.txt", repoDir);
-    await run("git commit -m 'chore: other work'", repoDir);
-    await run("git checkout main", repoDir);
+    await gitFixture(repoDir, ["add", "note.txt"]);
+    await gitFixture(repoDir, ["commit", "-m", "chore: other work"]);
+    await gitFixture(repoDir, ["checkout", "main"]);
 
     const livePath = path.join(repoDir, "wt-live-other");
-    await run(`git worktree add ${JSON.stringify(livePath)} topic/other`, repoDir);
+    await gitFixture(repoDir, ["worktree", "add", livePath, "topic/other"]);
     const stalePath = path.join(repoDir, "wt-stale-other");
     await mkdir(stalePath, { recursive: true });
 
