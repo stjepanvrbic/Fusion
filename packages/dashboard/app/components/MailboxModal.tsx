@@ -321,7 +321,7 @@ export function MailboxModal({
   const [structuralFilter, setStructuralFilter] = useState<"all" | "structural">("all");
   const [outbox, setOutbox] = useState<OutboxResponse | null>(() => initialOutbox ?? null);
   const [archivedInbox, setArchivedInbox] = useState<ArchivedMailboxState | null>(null);
-  const [loadingMore, setLoadingMore] = useState<"inbox" | "outbox" | "archived" | null>(null);
+  const [loadingMore, setLoadingMore] = useState<"inbox" | "outbox" | "archive" | null>(null);
   /* FNXC:Mailbox 2026-10-07-20:23: Refreshes keep every page already on screen, so the refresh callbacks read the loaded lists through refs instead of re-subscribing SSE on each page. */
   const inboxRef = useRef(inbox);
   const outboxRef = useRef(outbox);
@@ -478,7 +478,7 @@ export function MailboxModal({
   const loadMoreArchived = useCallback(async () => {
     const current = archivedInboxRef.current;
     if (!current?.hasMore) return;
-    setLoadingMore("archived");
+    setLoadingMore("archive");
     try {
       setArchivedInbox(await loadMoreArchivedMailbox(projectId, current));
     } catch {
@@ -1169,7 +1169,7 @@ export function MailboxModal({
                 <div className="mailbox-list" data-testid="mailbox-archived-list">
                   {archivedInbox?.messages.length === 0 && <div className="mailbox-empty" data-testid="mailbox-archived-empty">{t("mailbox.noArchivedMessages", "No archived messages")}</div>}
                   {archivedInbox?.messages.map((message) => <button type="button" className="mailbox-item" key={message.id} onClick={() => void handleOpenMessage(message)} data-testid={`mailbox-item-${message.id}`}>{message.content}</button>)}
-                  {archivedInbox?.hasMore && <MailboxLoadMore loading={loadingMore === "archived"} onLoadMore={() => void loadMoreArchived()} testId="mailbox-archived-load-more" />}
+                  {archivedInbox?.hasMore && <MailboxLoadMore loading={loadingMore === "archive"} onLoadMore={() => void loadMoreArchived()} testId="mailbox-archived-load-more" />}
                 </div>
               )}
               {activeTab === "inbox" && (
