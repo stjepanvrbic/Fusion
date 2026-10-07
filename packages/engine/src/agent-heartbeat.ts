@@ -1460,30 +1460,32 @@ export class HeartbeatMonitor {
    * @param fn - Function to execute with the lock
    */
   async withAgentStartLock<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
+    /*
+    FNXC:AgentHeartbeat 2026-10-07-17:49:
+    A rejected run must never affect the next run's admission. The stored queue tail is rejection-neutral, so a predecessor's failure is seen only by its own caller and the successor still runs after it settles.
+    The tail entry is deleted when the operation that set it settles while still being the current tail, so the map cannot grow or retain a settled promise.
+    */
     const existing = this.agentStartLocks.get(agentId) ?? Promise.resolve();
-    const operation = existing.then(
-      async () => {
-        try {
-          return await fn();
-        } finally {
-          // Clean up accumulated run state for this agent at end of each serialized run.
-          // This guarantees cleanup even when the run path throws without calling completeRun
-          // (e.g., execution error before completeRun is reached, or completeRun itself throws).
-          // Because withAgentStartLock serializes runs per agent, the finally runs after each
-          // run completes but before the next concurrent call's callback starts.
-          this.clearRunState(agentId);
-        }
-      },
-      async (err) => {
-        try {
-          throw err;
-        } finally {
-          this.clearRunState(agentId);
-        }
-      },
-    );
-    this.agentStartLocks.set(agentId, operation);
-    return operation as Promise<T>;
+    const operation = existing.then(async () => {
+      try {
+        return await fn();
+      } finally {
+        // Clean up accumulated run state for this agent at end of each serialized run.
+        // This guarantees cleanup even when the run path throws without calling completeRun
+        // (e.g., execution error before completeRun is reached, or completeRun itself throws).
+        // Because withAgentStartLock serializes runs per agent, the finally runs after each
+        // run completes but before the next concurrent call's callback starts.
+        this.clearRunState(agentId);
+      }
+    });
+    const tail: Promise<void> = operation.then(() => undefined, () => undefined);
+    this.agentStartLocks.set(agentId, tail);
+    void tail.then(() => {
+      if (this.agentStartLocks.get(agentId) === tail) {
+        this.agentStartLocks.delete(agentId);
+      }
+    });
+    return operation;
   }
 
   /**

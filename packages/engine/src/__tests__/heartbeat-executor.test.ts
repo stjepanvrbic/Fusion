@@ -4159,6 +4159,86 @@ describe("executeHeartbeat", () => {
     });
   });
 
+  describe("per-agent start lock containment", () => {
+    /*
+    FNXC:AgentHeartbeat 2026-10-07-17:49:
+    A rejected heartbeat run must never affect the admission of the next run for the same agent.
+    Every wake surface (timer, assignment, message, resume, self-healing restart) funnels into executeHeartbeat, so the lock is the single seam to prove.
+    */
+    it("runs a queued successor and later runs after a predecessor rejects, preserving each caller's result", async () => {
+      const store = createStoreWithAgentForExec();
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+      const order: string[] = [];
+
+      const first = monitor.withAgentStartLock("agent-001", async () => {
+        order.push("first");
+        throw new Error("transient postgres outage");
+      });
+      const queued = monitor.withAgentStartLock("agent-001", async () => {
+        order.push("queued");
+        return "queued-result";
+      });
+
+      await expect(first).rejects.toThrow("transient postgres outage");
+      await expect(queued).resolves.toBe("queued-result");
+      await expect(monitor.withAgentStartLock("agent-001", async () => "later-result")).resolves.toBe("later-result");
+      expect(order).toEqual(["first", "queued"]);
+      expect((monitor as unknown as { agentStartLocks: Map<string, unknown> }).agentStartLocks.has("agent-001")).toBe(false);
+    });
+
+    it("never overlaps a queued successor with its predecessor", async () => {
+      const store = createStoreWithAgentForExec();
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+      let active = 0;
+      let maxActive = 0;
+      const body = (fail: boolean) => async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await Promise.resolve();
+        await Promise.resolve();
+        active -= 1;
+        if (fail) throw new Error("boom");
+        return "ok";
+      };
+
+      const results = await Promise.allSettled([
+        monitor.withAgentStartLock("agent-001", body(true)),
+        monitor.withAgentStartLock("agent-001", body(false)),
+        monitor.withAgentStartLock("agent-001", body(true)),
+        monitor.withAgentStartLock("agent-001", body(false)),
+      ]);
+
+      expect(results.map((result) => result.status)).toEqual(["rejected", "fulfilled", "rejected", "fulfilled"]);
+      expect(maxActive).toBe(1);
+    });
+
+    it("keeps an independent agent's lock unaffected by another agent's rejection", async () => {
+      const store = createStoreWithAgentForExec();
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+      const rejected = monitor.withAgentStartLock("agent-001", async () => { throw new Error("boom"); });
+      await expect(monitor.withAgentStartLock("agent-002", async () => "independent")).resolves.toBe("independent");
+      await expect(rejected).rejects.toThrow("boom");
+    });
+
+    it("executes the next heartbeat after startHeartbeatRun rejects once", async () => {
+      const store = createStoreWithAgentForExec();
+      const session = createMockAgentSession();
+      mockedCreateFnAgent.mockResolvedValue({ session: session as any });
+      vi.mocked(store.startHeartbeatRun).mockRejectedValueOnce(new Error("transient postgres outage"));
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+      const first = monitor.executeHeartbeat({ agentId: "agent-001", source: "timer" });
+      const second = monitor.executeHeartbeat({ agentId: "agent-001", source: "timer" });
+
+      await expect(first).rejects.toThrow("transient postgres outage");
+      const run = await second;
+      expect(run.status).toBe("completed");
+      expect(store.startHeartbeatRun).toHaveBeenCalledTimes(2);
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("error handling", () => {
     it("completes run as failed when createFnAgent throws", async () => {
       const store = createStoreWithAgentForExec();
