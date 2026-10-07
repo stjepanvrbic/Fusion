@@ -98,6 +98,7 @@ import {
   getPlannerInterventionTimeline,
   isBuiltinWorkflowId,
   resolveProjectColumnsForRoles,
+  REVIEW_ROLES,
   canonicalizeWorktreePath,
   acquireWorktreePathReservation,
   disposeTaskBeforeReset,
@@ -1618,7 +1619,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       let landedReviewColumns: ReadonlySet<string>;
       try {
         completeColumns = await resolveProjectColumnsForRoles(scopedStore, ["complete"]);
-        landedReviewColumns = await resolveProjectColumnsForRoles(scopedStore, ["mergeBlocker", "humanReview"]);
+        landedReviewColumns = await resolveProjectColumnsForRoles(scopedStore, REVIEW_ROLES);
       } catch {
         completeColumns = new Set(["done"]);
         landedReviewColumns = new Set(["in-review"]);
@@ -2390,13 +2391,13 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       if (!parent || parent.deletedAt) throw notFound("Task not found");
       /*
       FNXC:TaskRecommendations 2026-10-07-12:56:
-      A landed card in a review lane (merge-blocker or human-review, matching the dashboard's isReviewColumnRole) is an actionable source because its implementation never re-runs, so resolve those lanes alongside the complete lanes from the parent's own workflow.
+      A landed card in a review lane (core's single review definition, resolveReviewColumns / REVIEW_ROLES) is an actionable source because its implementation never re-runs, so resolve those lanes alongside the complete lanes from the parent's own workflow.
       */
       const { completeColumns, landedReviewColumns } = await (async () => {
         try {
           const ir = await resolveWorkflowIrForTask(scopedStore, parent.id);
           const complete = columnsWithFlag(ir, "complete");
-          const review = [...columnsWithFlag(ir, "mergeBlocker"), ...columnsWithFlag(ir, "humanReview")];
+          const review = resolveReviewColumns(ir);
           return {
             completeColumns: new Set(complete.length > 0 ? complete : ["done"]),
             landedReviewColumns: new Set(review.length > 0 ? review : ["in-review"]),
