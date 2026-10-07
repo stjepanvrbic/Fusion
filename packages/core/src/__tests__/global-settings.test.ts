@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { GlobalSettingsStore, defaultGlobalDir } from "../config/global-settings.js";
 import { DEFAULT_GLOBAL_SETTINGS } from "../types.js";
-import { readFile, rm, writeFile, mkdir } from "node:fs/promises";
+import { readFile, readdir, rm, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -597,8 +597,7 @@ describe("GlobalSettingsStore", () => {
       await store.init();
       await store.updateSettings({ themeMode: "light" });
 
-      const tmpPath = join(dir, "settings.json.tmp");
-      expect(existsSync(tmpPath)).toBe(false);
+      expect((await readdir(dir)).filter((name) => name.endsWith(".tmp") || name.endsWith(".lock"))).toEqual([]);
     });
   });
 
@@ -997,6 +996,78 @@ describe("GlobalSettingsStore", () => {
       // @ts-expect-error null intentionally removes an unknown key.
       await sibling.updateSettings({ futureSetting: null });
       expect((await store.getSettings() as Record<string, unknown>).futureSetting).toBeUndefined();
+    });
+  });
+
+  /*
+  FNXC:SettingsPersistence 2026-10-07-17:59:
+  Separate GlobalSettingsStore instances (dashboard remote-token writers, the Settings modal, CLI processes) share one settings.json.
+  A committed write must never be lost to a sibling's read-modify-write or reverted by a sibling's failure compensation.
+  */
+  describe("cross-instance write safety", () => {
+    const LIVE_FOREIGN_PID = process.ppid;
+    const DEAD_PID = 2 ** 22 + 4093;
+
+    it("keeps every disjoint patch from concurrent writers on separate instances", async () => {
+      await store.init();
+      const sibling = new GlobalSettingsStore(dir);
+      const keys = ["ntfyTopic", "ntfyBaseUrl", "ntfyDashboardHost", "webhookUrl", "language", "themeMode"] as const;
+      const values: Record<string, string> = {
+        ntfyTopic: "topic-a", ntfyBaseUrl: "https://ntfy.example", ntfyDashboardHost: "http://host",
+        webhookUrl: "https://hook.example", language: "fr", themeMode: "light",
+      };
+      await Promise.all(keys.map((key, index) => (index % 2 === 0 ? store : sibling).updateSettings({ [key]: values[key] })));
+
+      const onDisk = JSON.parse(await readFile(join(dir, "settings.json"), "utf-8")) as Record<string, unknown>;
+      for (const key of keys) expect(onDisk[key]).toBe(values[key]);
+      expect((await readdir(dir)).filter((name) => name.endsWith(".tmp") || name.endsWith(".lock"))).toEqual([]);
+    });
+
+    it("never reverts a sibling's committed write when its own revision append fails", async () => {
+      await store.init();
+      const sibling = new GlobalSettingsStore(dir);
+      let siblingWrite: Promise<unknown> | undefined;
+      const failingLayer = {
+        transactionImmediate: async () => {
+          siblingWrite = sibling.updateSettings({ ntfyTopic: "sibling-committed" });
+          await Promise.race([siblingWrite, new Promise((resolve) => setTimeout(resolve, 50))]);
+          throw new Error("revision append failed");
+        },
+      };
+      const failing = new GlobalSettingsStore(dir, failingLayer as never);
+
+      await expect(failing.updateSettings({ themeMode: "light" })).rejects.toThrow("revision append failed");
+      await siblingWrite;
+
+      const onDisk = JSON.parse(await readFile(join(dir, "settings.json"), "utf-8")) as Record<string, unknown>;
+      expect(onDisk.ntfyTopic).toBe("sibling-committed");
+      expect(onDisk.themeMode).toBe(DEFAULT_GLOBAL_SETTINGS.themeMode);
+      expect(existsSync(join(dir, "settings.json.configuration-revision-intent.json"))).toBe(false);
+    });
+
+    it("waits for a lock held by another live process before writing", async () => {
+      await store.init();
+      const lockPath = join(dir, "settings.json.lock");
+      await writeFile(lockPath, JSON.stringify({ pid: LIVE_FOREIGN_PID, acquiredAt: Date.now() }));
+
+      let settled = false;
+      const write = store.updateSettings({ ntfyTopic: "after-foreign-release" }).then(() => { settled = true; });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(settled).toBe(false);
+
+      await unlink(lockPath);
+      await write;
+      expect((await store.getSettings()).ntfyTopic).toBe("after-foreign-release");
+      expect(existsSync(lockPath)).toBe(false);
+    });
+
+    it("reclaims a lock left behind by a process that no longer exists", async () => {
+      await store.init();
+      await writeFile(join(dir, "settings.json.lock"), JSON.stringify({ pid: DEAD_PID, acquiredAt: Date.now() }));
+
+      await store.updateSettings({ ntfyTopic: "after-stale-lock" });
+      expect((await store.getSettings()).ntfyTopic).toBe("after-stale-lock");
+      expect(existsSync(join(dir, "settings.json.lock"))).toBe(false);
     });
   });
 });

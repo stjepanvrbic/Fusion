@@ -15,7 +15,8 @@
 
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { mkdir, readFile, writeFile, rename, chmod, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, writeFile, rename, chmod, stat, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, realpathSync, renameSync } from "node:fs";
 import type { ConfigChangedBy, ConfigKind, ConfigurationRevision, ConfigurationTarget, GlobalSettings } from "../types.js";
 import { CONFIG_CHANGED_BY_SYSTEM } from "../types.js";
@@ -45,6 +46,107 @@ function bumpSettingsCacheEpoch(settingsPath: string): number {
   const next = getSettingsCacheEpoch(settingsPath) + 1;
   settingsCacheEpochs.set(settingsPath, next);
   return next;
+}
+
+/*
+FNXC:SettingsPersistence 2026-10-07-17:59:
+Every GlobalSettingsStore instance on one settings.json shares a single write lock: a process-wide promise chain keyed by the settings path, plus a `settings.json.lock` file for other processes (CLI, a second dashboard).
+A per-instance lock let a remote-token writer and the Settings modal interleave their read-modify-write, so one patch was lost, and a sibling's failure compensation could restore an older snapshot over a committed write.
+A lockfile whose holder process is gone, or that is older than SETTINGS_LOCK_STALE_MS, is reclaimed; a live holder that never releases fails the write after SETTINGS_LOCK_ACQUIRE_TIMEOUT_MS instead of writing unlocked.
+*/
+const SETTINGS_LOCK_ACQUIRE_TIMEOUT_MS = 10_000;
+const SETTINGS_LOCK_STALE_MS = 30_000;
+const SETTINGS_LOCK_UNREADABLE_STALE_MS = 2_000;
+const SETTINGS_LOCK_RETRY_MS = 20;
+
+const settingsWriteChains = new Map<string, Promise<void>>();
+
+function settingsLockKey(settingsPath: string): string {
+  return process.platform === "win32" ? settingsPath.toLowerCase() : settingsPath;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function isStaleSettingsLock(lockPath: string): Promise<boolean> {
+  let content: string;
+  let mtimeMs: number;
+  try {
+    [content, mtimeMs] = await Promise.all([readFile(lockPath, "utf-8"), stat(lockPath).then((info) => info.mtimeMs)]);
+  } catch (error) {
+    // Released between the failed create and this read: retry the create.
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+  const ageMs = Date.now() - mtimeMs;
+  let holder: { pid?: unknown } | null = null;
+  try {
+    holder = JSON.parse(content) as { pid?: unknown };
+  } catch {
+    return ageMs > SETTINGS_LOCK_UNREADABLE_STALE_MS;
+  }
+  if (typeof holder?.pid !== "number") return ageMs > SETTINGS_LOCK_UNREADABLE_STALE_MS;
+  if (ageMs > SETTINGS_LOCK_STALE_MS) return true;
+  return holder.pid !== process.pid && !isProcessAlive(holder.pid);
+}
+
+async function acquireSettingsFileLock(lockPath: string): Promise<void> {
+  const deadline = Date.now() + SETTINGS_LOCK_ACQUIRE_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      try {
+        await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }));
+      } finally {
+        await handle.close();
+      }
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // Windows reports EPERM while a just-unlinked lockfile is pending deletion.
+      if (code !== "EEXIST" && !(code === "EPERM" && process.platform === "win32")) throw error;
+    }
+    if (await isStaleSettingsLock(lockPath)) {
+      await unlink(lockPath).catch(() => undefined);
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for the global settings lock at ${lockPath}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, SETTINGS_LOCK_RETRY_MS));
+  }
+}
+
+async function withSettingsWriteLock<T>(settingsPath: string, fn: () => Promise<T>): Promise<T> {
+  const key = settingsLockKey(settingsPath);
+  const previous = settingsWriteChains.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => current);
+  settingsWriteChains.set(key, tail);
+  await previous;
+  try {
+    const lockPath = `${settingsPath}.lock`;
+    await mkdir(dirname(settingsPath), { recursive: true });
+    await acquireSettingsFileLock(lockPath);
+    try {
+      return await fn();
+    } finally {
+      await unlink(lockPath).catch(() => undefined);
+    }
+  } finally {
+    release();
+    if (settingsWriteChains.get(key) === tail) settingsWriteChains.delete(key);
+  }
+}
+
+function uniqueTempPath(path: string): string {
+  return `${path}.${process.pid}.${randomUUID()}.tmp`;
 }
 
 function getHomeDir(): string {
@@ -167,9 +269,6 @@ export class GlobalSettingsStore {
   private cachedSettings: GlobalSettings | null = null;
   private cachedSettingsEpoch = 0;
 
-  /** Promise chain for serializing read-modify-write cycles */
-  private lock: Promise<void> = Promise.resolve();
-
   /**
    * Create a GlobalSettingsStore.
    * @param dir — Directory to store settings.json. Defaults to `~/.fusion/`.
@@ -211,12 +310,14 @@ export class GlobalSettingsStore {
    */
   async init(): Promise<boolean> {
     await mkdir(this.dir, { recursive: true });
-    if (!existsSync(this.settingsPath)) {
+    if (existsSync(this.settingsPath)) return false;
+    // Re-check under the write lock so first-run defaults never replace a sibling's concurrent first write.
+    return this.withLock(async () => {
+      if (existsSync(this.settingsPath)) return false;
       await this.atomicWrite(DEFAULT_GLOBAL_SETTINGS);
       bumpSettingsCacheEpoch(this.settingsPath);
       return true;
-    }
-    return false;
+    });
   }
 
   /**
@@ -448,23 +549,31 @@ export class GlobalSettingsStore {
   ): Promise<void> {
     await mkdir(this.dir, { recursive: true });
     await this.writeRevisionIntent(revision);
+    let published = false;
     try {
       await this.atomicWrite(after as GlobalSettings);
+      published = true;
       await appendGlobalConfigurationRevision(layer, revision);
       await unlink(this.revisionIntentPath);
     } catch (error) {
       // A caught failure is compensated immediately. A process crash retains
-      // the intent and is reconciled before the next mutation.
-      await this.atomicWrite(before as GlobalSettings).catch(() => undefined);
+      // the intent and is reconciled before the next mutation. Only a write this
+      // call published is undone; the shared write lock keeps siblings out meanwhile.
+      if (published) await this.atomicWrite(before as GlobalSettings).catch(() => undefined);
       await unlink(this.revisionIntentPath).catch(() => undefined);
       throw error;
     }
   }
 
   private async writeRevisionIntent(revision: ConfigurationRevision): Promise<void> {
-    const temporary = `${this.revisionIntentPath}.tmp`;
-    await writeFile(temporary, JSON.stringify({ revision }), { mode: 0o600 });
-    await rename(temporary, this.revisionIntentPath);
+    const temporary = uniqueTempPath(this.revisionIntentPath);
+    try {
+      await writeFile(temporary, JSON.stringify({ revision }), { mode: 0o600 });
+      await rename(temporary, this.revisionIntentPath);
+    } catch (error) {
+      await unlink(temporary).catch(() => undefined);
+      throw error;
+    }
   }
 
   private async reconcileRevisionIntent(layer: AsyncDataLayer | undefined): Promise<void> {
@@ -496,9 +605,14 @@ export class GlobalSettingsStore {
    * is a bearer credential for the HTTP API. POSIX-only; no-op on Windows.
    */
   private async atomicWrite(settings: GlobalSettings): Promise<void> {
-    const tmpPath = this.settingsPath + ".tmp";
-    await writeFile(tmpPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
-    await rename(tmpPath, this.settingsPath);
+    const tmpPath = uniqueTempPath(this.settingsPath);
+    try {
+      await writeFile(tmpPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
+      await rename(tmpPath, this.settingsPath);
+    } catch (error) {
+      await unlink(tmpPath).catch(() => undefined);
+      throw error;
+    }
     // `writeFile` with `mode` honors umask on some platforms, so re-chmod the
     // final path to guarantee 0600. Ignore failures (Windows has no POSIX
     // permission bits; some filesystems may reject chmod).
@@ -511,20 +625,10 @@ export class GlobalSettingsStore {
   }
 
   /**
-   * Serialize operations via promise chain to prevent lost-update races.
+   * Serialize read-modify-write cycles across every store instance and process
+   * that shares this settings file. See withSettingsWriteLock.
    */
   private withLock<T>(fn: () => Promise<T>): Promise<T> {
-    let resolve: () => void;
-    const next = new Promise<void>((r) => { resolve = r; });
-    const prev = this.lock;
-    this.lock = next;
-
-    return prev.then(async () => {
-      try {
-        return await fn();
-      } finally {
-        resolve!();
-      }
-    });
+    return withSettingsWriteLock(this.settingsPath, fn);
   }
 }
