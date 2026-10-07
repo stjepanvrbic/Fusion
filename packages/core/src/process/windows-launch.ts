@@ -200,7 +200,8 @@ function directKill(child: ChildProcess): void {
  * `taskkill /T` must run before the root dies because it walks the tree from the root's PID.
  */
 export function killProcessTree(child: ChildProcess, deps: KillProcessTreeDeps = {}): void {
-  if (hasExited(child)) return;
+  // `killed` means a signal was already delivered; repeat teardown (dispose, then exit-time sweep) is a no-op.
+  if (child.killed || hasExited(child)) return;
   const platform = deps.platform ?? process.platform;
   if (platform !== "win32" || typeof child.pid !== "number") {
     directKill(child);

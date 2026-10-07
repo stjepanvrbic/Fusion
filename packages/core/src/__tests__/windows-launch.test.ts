@@ -188,5 +188,9 @@ describe("killProcessTree", () => {
     const spawnImpl = vi.fn();
     killProcessTree(exited, { platform: "win32", spawnImpl });
     expect(spawnImpl).not.toHaveBeenCalled();
+    const alreadyKilled = fakeChild(12);
+    Object.assign(alreadyKilled, { killed: true });
+    killProcessTree(alreadyKilled, { platform: "linux", spawnImpl });
+    expect(alreadyKilled.kill).not.toHaveBeenCalled();
   });
 });
