@@ -1,5 +1,6 @@
 # Dependencies
-node_modules/
+# FNXC:DockerBuild 2026-10-07-19:30: Nested workspace node_modules hold host-specific pnpm links (absolute junctions on Windows); copying them over the frozen install broke `docker build` from a developer checkout with "Cannot find module .../typescript/bin/tsc".
+**/node_modules/
 
 # Build output
 dist/
