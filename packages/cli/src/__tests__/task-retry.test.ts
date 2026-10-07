@@ -17,6 +17,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { pgDescribe } from "../../../core/src/__test-utils__/pg-test-harness.js";
 import { createPgExtensionHarness } from "./pg-extension-harness.js";
+import { MANUAL_RETRY_RESET_COUNTER_KEYS } from "@fusion/core";
 
 // `runTaskRetry` resolves its store via resolveProject() (commands/task.ts →
 // project-context.ts), a separate cache from the extension store the harness
@@ -107,6 +108,55 @@ pgTest("runTaskRetry", () => {
     });
 
     await expect(runTaskRetry(task.id)).rejects.toThrow(/not in a retryable state/);
+  });
+
+  /*
+  FNXC:TaskRetry 2026-10-07-17:57:
+  A manual retry either fully resets or fully refuses, and never leaves a half-applied state.
+  The generic and in-review branches moved first; the reopen move clears worktree (and branch from review), so the fenced reset saw a "newer lifecycle" and threw "superseded" after the card had already moved, leaving retry counters, mergeRetries and stale base refs in place.
+  Every branch is exercised on a card that still holds a worktree and branch, which is the ordinary failed-task shape.
+  */
+  const nonZeroRetryCounters = Object.fromEntries(MANUAL_RETRY_RESET_COUNTER_KEYS.map((key, index) => [key, index + 1]));
+  it.each([
+    { branch: "generic failure", toReview: false, patch: {} },
+    { branch: "in-review execution failure", toReview: true, patch: { steps: [{ name: "implemented", status: "done" }, { name: "fix", status: "pending" }] } },
+    { branch: "deadlock auto-pause", toReview: true, patch: { paused: true, pausedReason: "in-review-stall-deadlock", steps: [{ name: "implemented", status: "done" }] } },
+  ])("fully resets a $branch retry on a card that holds a worktree and branch", async ({ toReview, patch }) => {
+    const store = h.store();
+    const task = await store.createTask({ title: "failed with a checkout", description: "test", column: "todo" });
+    await store.moveTask(task.id, "in-progress");
+    if (toReview) await store.moveTask(task.id, "in-review");
+    await store.updateTask(task.id, {
+      status: "failed",
+      error: "boom",
+      worktree: "/tmp/fusion-retry-worktree",
+      branch: `fusion/${task.id}`,
+      branchWriteOrigin: "engine" as const,
+      mergeRetries: 4,
+      nextRecoveryAt: new Date(Date.now() + 60_000).toISOString(),
+      ...nonZeroRetryCounters,
+      ...patch,
+    } as never);
+
+    const provenance: Array<string | undefined> = [];
+    const onMoved = (data: { workflowMoveSource?: string }) => { provenance.push(data.workflowMoveSource); };
+    store.on("task:moved", onMoved as never);
+    try {
+      await expect(runTaskRetry(task.id)).resolves.toBeUndefined();
+    } finally {
+      store.off("task:moved", onMoved as never);
+    }
+
+    store.taskCache.delete(task.id);
+    const updated = await store.getTask(task.id);
+    expect(updated.column).toBe("todo");
+    expect(updated.status).toBeFalsy();
+    expect(updated.error).toBeFalsy();
+    expect(updated.userPaused).not.toBe(true);
+    expect(updated.paused).toBeFalsy();
+    for (const key of MANUAL_RETRY_RESET_COUNTER_KEYS) expect(updated[key] ?? 0).toBe(0);
+    expect(updated.nextRecoveryAt ?? null).toBeNull();
+    expect(provenance).toEqual(["manual-retry"]);
   });
 
   it("clears the deadlock auto-pause when retrying a failed task", async () => {
