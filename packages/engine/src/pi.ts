@@ -1911,7 +1911,33 @@ exactly the same boundary rejection as file tools.
 FNXC:WorkspaceBoundary 2026-10-07-15:46:
 Drive-qualified targets (`cd C:\Users\...`, `C:/...`) are absolute paths on Windows and must be inspected too; matching only `/`-rooted text let any Windows absolute path bypass this check.
 On POSIX such text is relative and resolves inside cwd, so the extra alternative cannot reject anything there.
+
+FNXC:WorkspaceBoundary 2026-10-07-17:57:
+Boundary decisions must be the same for every spelling of the same path, and win32 has no kernel sandbox backend, so this text check is the only bash boundary there.
+Operands are tokenized quote-aware (`"C:/x"`, `'../..'`, `C:/"Program Files"/x`, spaces inside quotes) after whitespace or a redirection, then checked when they spell an absolute, UNC, home or parent-relative path (`..`, `../`, `..\`).
+Device sinks (`/dev/null` and the std streams) are not workspace paths and stay allowed; MSYS `/c/...` maps to `C:\...` on win32 instead of resolving to `C:\c\...`.
 */
+const BASH_OPERAND_PATTERN = /(?<=^|[\s<>(])(?:"[^"]*"|'[^']*'|[^\s;&|<>()"'])+/g;
+const BASH_PATH_CANDIDATE_PATTERN = /^(?:\/|\\\\|\.\.(?:[\\/]|$)|[A-Za-z]:[\\/]|~(?:[\\/]|$))/;
+const BASH_DEVICE_SINKS = new Set(["/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/tty"]);
+
+/** FNXC:WorkspaceBoundary 2026-10-07-17:57: Git Bash spells `C:\x` as `/c/x`; translate it on win32 so in-worktree targets are not rejected and outside ones resolve to the real drive. */
+export function translateMsysDrivePath(target: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform !== "win32") return target;
+  const match = /^\/([A-Za-z])(?:\/(.*))?$/.exec(target);
+  if (!match) return target;
+  return `${match[1].toUpperCase()}:\\${(match[2] ?? "").replace(/\//g, "\\")}`;
+}
+
+function resolveBashPathOperand(operand: string, cwd: string): string {
+  let target = operand;
+  // Backslash separators are fail-closed on POSIX too: `..\..\x` or `\\server\share` is treated as the path it spells on Windows.
+  if (process.platform !== "win32") target = target.replace(/\\/g, "/");
+  target = translateMsysDrivePath(target);
+  if (target === "~" || /^~[\\/]/.test(target)) target = join(homedir(), target.slice(1));
+  return isAbsolute(target) ? target : resolve(cwd, target);
+}
+
 function bashCommandTargetsOutsideBoundary(
   command: string,
   cwd: string,
@@ -1919,11 +1945,11 @@ function bashCommandTargetsOutsideBoundary(
   projectRoot: string,
   readOnlyExtraRoots: readonly string[],
 ): boolean {
-  const targets = command.matchAll(/(?:\b(?:cd|pushd)\s+|(?<!\S))(\/[^\s;&|]+|\.\.\/[^\s;&|]+|[A-Za-z]:[\\/][^\s;&|]*)/g);
-  for (const match of targets) {
-    const target = match[1]?.replace(/["']/g, "");
-    if (!target) continue;
-    const resolvedTarget = isAbsolute(target) ? target : resolve(cwd, target);
+  for (const match of command.matchAll(BASH_OPERAND_PATTERN)) {
+    const operand = match[0].replace(/["']/g, "");
+    if (!BASH_PATH_CANDIDATE_PATTERN.test(operand)) continue;
+    if (BASH_DEVICE_SINKS.has(operand.toLowerCase())) continue;
+    const resolvedTarget = resolveBashPathOperand(operand, cwd);
     if (!isWorktreeAllowedPath(worktreePath, projectRoot, resolvedTarget, "bash", readOnlyExtraRoots)) return true;
   }
   return false;

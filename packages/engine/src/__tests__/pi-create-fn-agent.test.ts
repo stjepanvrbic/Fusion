@@ -583,6 +583,89 @@ describe("worktree path boundary helpers", () => {
       expect(bash.execute).not.toHaveBeenCalled();
     });
 
+    /*
+    FNXC:WorkspaceBoundary 2026-10-07-17:57:
+    Boundary decisions must be the same for every spelling of the same path: quoted or unquoted, either separator, paths with spaces, parent traversal with `..`, `../` or `..\`, UNC, `~`, and `cd`/`pushd`/`git -C` operands.
+    Win32 has no kernel sandbox backend, so this text check is the only bash boundary there.
+    */
+    it("rejects every quoted, backslash-relative, UNC and home spelling of an outside target", async () => {
+      const bash = { name: "bash", label: "bash", description: "bash", parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) };
+      const { wrapToolsWithBoundary } = await import("../pi.js");
+      const wrapped = wrapToolsWithBoundary([bash] as any, "/project/.worktrees/fn-158", "/project");
+      const outside = nativeFixturePath("/host/private");
+      const outsideForward = outside.replace(/\\/g, "/");
+      const outsideWithSpace = nativeFixturePath("/host/with space");
+
+      const commands = [
+        `cd "${outside}" && touch x`,
+        `cd '${outsideForward}' && touch x`,
+        `pushd "${outside}"`,
+        `git -C "${outsideForward}" commit -am x`,
+        `git -C '${outside}' status`,
+        `cd "${outsideWithSpace}" && touch x`,
+        `touch "${outsideForward}/new file.txt"`,
+        `echo x >"${outsideForward}/out.txt"`,
+        `cd "../.." && touch x`,
+        `cd '..' && touch x`,
+        `cd .. && touch x`,
+        "cd ..\\..\\other && touch x",
+        "cd \"..\\..\\other\" && touch x",
+        "type \\\\server\\share\\secret.txt",
+        "cd ~ && touch x",
+        "cat ~/notes.txt",
+      ];
+      for (const command of commands) {
+        const result = await (wrapped[0] as any).execute("bash", { command });
+        expect({ command, result }).toMatchObject({ command, result: { ok: false, error: expect.stringContaining("outside the worktree boundary") } });
+      }
+      expect(bash.execute).not.toHaveBeenCalled();
+    });
+
+    it("allows device sinks and quoted in-worktree targets in bash commands", async () => {
+      const bash = { name: "bash", label: "bash", description: "bash", parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) };
+      const { wrapToolsWithBoundary } = await import("../pi.js");
+      const worktree = nativeFixturePath("/project/.worktrees/fn-158");
+      const wrapped = wrapToolsWithBoundary([bash] as any, "/project/.worktrees/fn-158", "/project");
+
+      const commands = [
+        "pnpm build > /dev/null 2>&1",
+        "git status 2>/dev/null",
+        "pnpm lint >/dev/null",
+        "echo ok > NUL",
+        `cd "${worktree}/packages" && ls`,
+        `cd '${worktree.replace(/\\/g, "/")}/src' && ls`,
+        `git -C "${worktree}" status`,
+        "git log HEAD..main",
+        "curl https://registry.npmjs.org/react",
+      ];
+      for (const command of commands) {
+        bash.execute.mockClear();
+        const result = await (wrapped[0] as any).execute("bash", { command });
+        expect({ command, result }).toEqual({ command, result: { ok: true } });
+        expect(bash.execute).toHaveBeenCalledTimes(1);
+      }
+    });
+
+    it("resolves Git Bash /c/... spellings of the worktree as inside on win32", async () => {
+      const bash = { name: "bash", label: "bash", description: "bash", parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) };
+      const { wrapToolsWithBoundary } = await import("../pi.js");
+      const worktree = nativeFixturePath("/project/.worktrees/fn-158");
+      const wrapped = wrapToolsWithBoundary([bash] as any, "/project/.worktrees/fn-158", "/project");
+      // On win32 C:\project\... is spelled /c/project/... by Git Bash; on POSIX the native spelling is already /project/...
+      const gitBashSpelling = worktree.replace(/^([A-Za-z]):[\\/]/, (_m, drive: string) => `/${drive.toLowerCase()}/`).replace(/\\/g, "/");
+
+      const result = await (wrapped[0] as any).execute("bash", { command: `cd ${gitBashSpelling}/src && touch x` });
+      expect(result).toEqual({ ok: true });
+    });
+
+    it("translates MSYS drive paths only on win32", async () => {
+      const { translateMsysDrivePath } = await import("../pi.js");
+      expect(translateMsysDrivePath("/c/Users/x/repo", "win32")).toBe("C:\\Users\\x\\repo");
+      expect(translateMsysDrivePath("/d", "win32")).toBe("D:\\");
+      expect(translateMsysDrivePath("/cache/x", "win32")).toBe("/cache/x");
+      expect(translateMsysDrivePath("/c/Users/x/repo", "linux")).toBe("/c/Users/x/repo");
+    });
+
     it("allows task attachments from worktree session", async () => {
       const mockReadTool = {
         name: "read",
