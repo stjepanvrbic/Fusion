@@ -2143,7 +2143,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue([]),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2203,7 +2203,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue(messages),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2222,8 +2222,9 @@ describe("executeHeartbeat", () => {
       expect(result.status).toBe("completed");
       // Messages should be fetched for no-task runs too
       expect(messageStore.getInbox).toHaveBeenCalledWith("agent-001", "agent", { read: false, limit: 10 });
-      // Messages should be marked as read after successful execution
-      expect(messageStore.markAllAsRead).toHaveBeenCalledWith("agent-001", "agent");
+      // Only the delivered messages are marked read after successful execution
+      expect(messageStore.markAsRead).toHaveBeenCalledWith("msg-notask-1");
+      expect(messageStore.markAsRead).toHaveBeenCalledWith("msg-notask-2");
 
       // Verify execution prompt included the messages
       const promptCalls = mockSession.prompt.mock.calls;
@@ -2261,7 +2262,7 @@ describe("executeHeartbeat", () => {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue([]),
         getOutbox: vi.fn().mockResolvedValue(outbox),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
       const monitor = new HeartbeatMonitor({ store, messageStore, taskStore: mockTaskStore, rootDir: "/tmp" });
       const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer", triggerDetail: "scheduled" });
@@ -2499,7 +2500,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue(messages),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2559,7 +2560,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue([]),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2604,7 +2605,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue([]),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2698,7 +2699,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue([]),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2737,7 +2738,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue(messages),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2754,7 +2755,7 @@ describe("executeHeartbeat", () => {
       });
 
       expect(result.status).toBe("completed");
-      expect(messageStore.markAllAsRead).toHaveBeenCalledWith("agent-001", "agent");
+      expect(messageStore.markAsRead).toHaveBeenCalledWith("msg-1");
     });
 
     it("does not mark messages as read on failed heartbeat execution", async () => {
@@ -2774,7 +2775,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue(messages),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2791,7 +2792,7 @@ describe("executeHeartbeat", () => {
       });
 
       expect(result.status).toBe("failed");
-      expect(messageStore.markAllAsRead).not.toHaveBeenCalled();
+      expect(messageStore.markAsRead).not.toHaveBeenCalled();
     });
 
     it("fetches messages for timer-triggered runs when messageStore is available", async () => {
@@ -2810,7 +2811,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue(messages),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2831,7 +2832,7 @@ describe("executeHeartbeat", () => {
       // Messages should be fetched even for timer triggers
       expect(messageStore.getInbox).toHaveBeenCalledWith("agent-001", "agent", { read: false, limit: 10 });
       // Messages should be marked as read after successful execution
-      expect(messageStore.markAllAsRead).toHaveBeenCalledWith("agent-001", "agent");
+      expect(messageStore.markAsRead).toHaveBeenCalledWith("msg-1");
 
       // Verify execution prompt included the messages
       const promptCalls = mockSession.prompt.mock.calls;
@@ -2857,7 +2858,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue(messages),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2876,7 +2877,7 @@ describe("executeHeartbeat", () => {
 
       expect(result.status).toBe("completed");
       expect(messageStore.getInbox).toHaveBeenCalledWith("agent-001", "agent", { read: false, limit: 10 });
-      expect(messageStore.markAllAsRead).toHaveBeenCalledWith("agent-001", "agent");
+      expect(messageStore.markAsRead).toHaveBeenCalledWith("msg-assign-1");
 
       // Verify execution prompt included the messages
       const promptCalls = mockSession.prompt.mock.calls;
@@ -2902,7 +2903,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue(messages),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2921,7 +2922,7 @@ describe("executeHeartbeat", () => {
 
       expect(result.status).toBe("completed");
       expect(messageStore.getInbox).toHaveBeenCalledWith("agent-001", "agent", { read: false, limit: 10 });
-      expect(messageStore.markAllAsRead).toHaveBeenCalledWith("agent-001", "agent");
+      expect(messageStore.markAsRead).toHaveBeenCalledWith("msg-od-1");
 
       // Verify execution prompt included the messages
       const promptCalls = mockSession.prompt.mock.calls;
@@ -2947,7 +2948,7 @@ describe("executeHeartbeat", () => {
       const messageStore = {
         setMessageToAgentHook: vi.fn(),
         getInbox: vi.fn().mockReturnValue(messages),
-        markAllAsRead: vi.fn(),
+        markAsRead: vi.fn(),
       } as unknown as MessageStore;
 
       const monitor = new HeartbeatMonitor({
@@ -2965,7 +2966,7 @@ describe("executeHeartbeat", () => {
 
       expect(result.status).toBe("completed");
       expect(messageStore.getInbox).toHaveBeenCalledWith("agent-001", "agent", { read: false, limit: 10 });
-      expect(messageStore.markAllAsRead).toHaveBeenCalledWith("agent-001", "agent");
+      expect(messageStore.markAsRead).toHaveBeenCalledWith("msg-wom-1");
 
       // Verify execution prompt included the messages
       const promptCalls = mockSession.prompt.mock.calls;
@@ -2973,6 +2974,130 @@ describe("executeHeartbeat", () => {
       const executionPrompt = promptCalls[promptCalls.length - 1][0];
       expect(executionPrompt).toContain("Pending Messages:");
       expect(executionPrompt).toContain("Hello from agent-2");
+    });
+
+    /*
+    FNXC:AgentMailbox 2026-10-07-18:05:
+    A message is marked read only after its content reached a heartbeat prompt.
+    Excess unread mail beyond the prompt limit, mail arriving during the session, and mail from failed runs stay unread so a later heartbeat or fn_read_messages unreadOnly can still surface it.
+    */
+    describe("delivered-message acknowledgement", () => {
+      function createStatefulMessageStore(initial: Message[]) {
+        const inbox: Message[] = [...initial];
+        const store = {
+          inbox,
+          setMessageToAgentHook: vi.fn(),
+          getInbox: vi.fn(async (_id: string, _type: string, opts?: { read?: boolean; limit?: number }) => {
+            const unread = opts?.read === false ? inbox.filter((message) => !message.read) : inbox;
+            return unread.slice(0, opts?.limit ?? unread.length).map((message) => ({ ...message }));
+          }),
+          getOutbox: vi.fn(async () => []),
+          markAsRead: vi.fn(async (messageId: string) => {
+            const message = inbox.find((entry) => entry.id === messageId);
+            if (!message) throw new Error(`Message ${messageId} not found`);
+            message.read = true;
+            return message;
+          }),
+          markAllAsRead: vi.fn(async () => {
+            let count = 0;
+            for (const message of inbox) {
+              if (!message.read) { message.read = true; count += 1; }
+            }
+            return count;
+          }),
+        };
+        return store;
+      }
+
+      const unreadIds = (store: { inbox: Message[] }) => store.inbox.filter((message) => !message.read).map((message) => message.id);
+      const inboxMessages = (count: number) => Array.from({ length: count }, (_, index) => createMessage({
+        id: `msg-${index + 1}`,
+        fromId: "user-1",
+        content: `Instruction ${index + 1}`,
+      }));
+
+      it.each([
+        ["timer", "scheduled", "FN-001"],
+        ["assignment", "task-assigned", "FN-001"],
+        ["on_demand", "wake-on-message", "FN-001"],
+        ["timer", "scheduled", undefined],
+      ] as const)("leaves mail beyond the prompt limit unread (source=%s, task=%s)", async (source, triggerDetail, taskId) => {
+        const store = createStoreWithAgentForExec(taskId ? { taskId } : { taskId: undefined, soul: "Keeps the board healthy" });
+        const session = createMockAgentSession();
+        mockedCreateFnAgent.mockResolvedValue({ session: session as any });
+        const messageStore = createStatefulMessageStore(inboxMessages(11));
+        const monitor = new HeartbeatMonitor({ store, messageStore: messageStore as unknown as MessageStore, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+        const result = await monitor.executeHeartbeat({ agentId: "agent-001", source, triggerDetail });
+
+        expect(result.status).toBe("completed");
+        const prompt = session.prompt.mock.calls.at(-1)?.[0] as string;
+        expect(prompt).toContain("Instruction 10");
+        expect(prompt).not.toContain("Instruction 11");
+        expect(unreadIds(messageStore)).toEqual(["msg-11"]);
+        expect(messageStore.markAllAsRead).not.toHaveBeenCalled();
+      });
+
+      it("leaves a message that arrives during the session unread", async () => {
+        const store = createStoreWithAgentForExec();
+        const messageStore = createStatefulMessageStore(inboxMessages(1));
+        const session = createMockAgentSession();
+        session.prompt = vi.fn(async () => {
+          messageStore.inbox.push(createMessage({ id: "msg-mid-run", fromId: "user-1", content: "Arrived mid-run" }));
+        });
+        mockedCreateFnAgent.mockResolvedValue({ session: session as any });
+        const monitor = new HeartbeatMonitor({ store, messageStore: messageStore as unknown as MessageStore, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+        const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer", triggerDetail: "scheduled" });
+
+        expect(result.status).toBe("completed");
+        expect(unreadIds(messageStore)).toEqual(["msg-mid-run"]);
+      });
+
+      it("acknowledges nothing when the run fails", async () => {
+        const store = createStoreWithAgentForExec();
+        const session = createMockAgentSession();
+        session.prompt = vi.fn().mockRejectedValue(new Error("Execution failed"));
+        mockedCreateFnAgent.mockResolvedValue({ session: session as any });
+        const messageStore = createStatefulMessageStore(inboxMessages(2));
+        const monitor = new HeartbeatMonitor({ store, messageStore: messageStore as unknown as MessageStore, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+        const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "on_demand", triggerDetail: "wake-on-message" });
+
+        expect(result.status).toBe("failed");
+        expect(unreadIds(messageStore)).toEqual(["msg-1", "msg-2"]);
+      });
+
+      it("makes no acknowledgement write for an empty inbox", async () => {
+        const store = createStoreWithAgentForExec();
+        const session = createMockAgentSession();
+        mockedCreateFnAgent.mockResolvedValue({ session: session as any });
+        const messageStore = createStatefulMessageStore([]);
+        const monitor = new HeartbeatMonitor({ store, messageStore: messageStore as unknown as MessageStore, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+        await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer", triggerDetail: "scheduled" });
+
+        expect(messageStore.markAsRead).not.toHaveBeenCalled();
+        expect(messageStore.markAllAsRead).not.toHaveBeenCalled();
+      });
+
+      it("still acknowledges the remaining delivered messages when one was deleted mid-run", async () => {
+        const store = createStoreWithAgentForExec();
+        const messageStore = createStatefulMessageStore(inboxMessages(3));
+        const session = createMockAgentSession();
+        session.prompt = vi.fn(async () => {
+          messageStore.inbox.splice(messageStore.inbox.findIndex((message) => message.id === "msg-2"), 1);
+        });
+        mockedCreateFnAgent.mockResolvedValue({ session: session as any });
+        const monitor = new HeartbeatMonitor({ store, messageStore: messageStore as unknown as MessageStore, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+        const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer", triggerDetail: "scheduled" });
+
+        expect(result.status).toBe("completed");
+        expect(unreadIds(messageStore)).toEqual([]);
+        expect(messageStore.markAsRead).toHaveBeenCalledWith("msg-1");
+        expect(messageStore.markAsRead).toHaveBeenCalledWith("msg-3");
+      });
     });
 
     describe("end-to-end message flow", () => {
@@ -3017,13 +3142,11 @@ describe("executeHeartbeat", () => {
             const inbox = messages.get(key) || [];
             return { unreadCount: inbox.filter((message) => !message.read).length, messages: inbox };
           }),
-          markAllAsRead: vi.fn((participantId: string, participantType: string) => {
-            const key = `${participantId}:${participantType}`;
-            const inbox = messages.get(key) || [];
-            inbox.forEach((message) => {
-              message.read = true;
-            });
-            messages.set(key, inbox);
+          markAsRead: vi.fn(async (messageId: string) => {
+            const message = byId.get(messageId);
+            if (!message) throw new Error(`Message ${messageId} not found`);
+            message.read = true;
+            return message;
           }),
         } as unknown as MessageStore;
 

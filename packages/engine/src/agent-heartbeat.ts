@@ -3865,12 +3865,19 @@ export class HeartbeatMonitor {
 
           await flushAgentLogger();
 
-          // Mark messages as read after successful processing (only if messages were included in prompt)
+          /*
+          FNXC:AgentMailbox 2026-10-07-18:05:
+          Acknowledge only the messages this run rendered into its prompt, by id, after successful processing.
+          A bulk inbox acknowledgement also consumed unread mail beyond the prompt limit and mail that arrived mid-session, so no later heartbeat or unread-only read could surface it.
+          One failed acknowledgement (for example a message deleted mid-run) must not block the others.
+          */
           if (pendingMessages.length > 0 && this.messageStore) {
-            try {
-              await this.messageStore.markAllAsRead(agentId, "agent");
-            } catch (markReadErr) {
-              heartbeatLog.warn(`Failed to mark messages as read for ${agentId}: ${markReadErr instanceof Error ? markReadErr.message : String(markReadErr)}`);
+            for (const delivered of pendingMessages) {
+              try {
+                await this.messageStore.markAsRead(delivered.id);
+              } catch (markReadErr) {
+                heartbeatLog.warn(`Failed to mark message ${delivered.id} as read for ${agentId}: ${markReadErr instanceof Error ? markReadErr.message : String(markReadErr)}`);
+              }
             }
           }
 
