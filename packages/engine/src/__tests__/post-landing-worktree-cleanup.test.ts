@@ -49,6 +49,8 @@ vi.mock("../worktree/worktree-backend.js", () => ({
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
 import { finalizeProvenAutoMergeTask } from "../merge/auto-merge-finalization.js";
 import { cleanupLandedTaskWorktree, cleanupLandedWorkspaceTaskWorktrees } from "../merge/post-landing-worktree-cleanup.js";
+import { createRunAuditor } from "../util/run-audit.js";
+import { RUN_AUDIT_EMIT_TIMEOUT_MS } from "../util/emit-bounded-run-audit.js";
 
 function createFinalizationStore(options: { column?: string; worktree?: string | null } = {}) {
   const task: any = {
@@ -694,6 +696,173 @@ describe("cleanupLandedWorkspaceTaskWorktrees", () => {
   function workspaceTask(workspaceWorktrees: Record<string, { worktreePath: string; branch: string }>) {
     return { id: "FN-268", workspaceWorktrees } as any;
   }
+
+  /*
+  FNXC:WorktreeCleanup 2026-10-07-14:44:
+  KB-006 — workspace cleanup's live-session short-circuit must leave the same best-effort
+  `worktree:removal-refused-active-session` audit as single-repo cleanup (KB-005), plus repoRelPath.
+  These cases use the real registry so the short-circuit itself is exercised, and assert that audit
+  sink failures never change which checkouts are preserved or the returned result.
+  */
+  describe("active-session refusal audit (KB-006 workspace parity)", () => {
+    const apiPath = "/workspace/.fusion/worktrees/fn-268/api";
+    const webPath = "/workspace/.fusion/worktrees/fn-268/web";
+    const canonicalApiPath = "/canonical/workspace/.fusion/worktrees/fn-268/api";
+    const registration = { taskId: "FN-268", kind: "executor" as const, ownerKey: "kb-006-test" };
+    const refusalAudit = {
+      type: "worktree:removal-refused-active-session",
+      target: apiPath,
+      metadata: { taskId: "FN-268", reason: "completion-landed-cleanup", kind: "executor", repoRelPath: "api" },
+    };
+
+    afterEach(() => {
+      activeSessionRegistry.unregisterPath(apiPath);
+      activeSessionRegistry.unregisterPath(webPath);
+      activeSessionRegistry.unregisterPath(canonicalApiPath);
+      canonicalizeOverride.fn = undefined;
+      vi.useRealTimers();
+    });
+
+    function mixedTask() {
+      return workspaceTask({
+        api: { worktreePath: apiPath, branch: "fusion/fn-268" },
+        web: { worktreePath: webPath, branch: "fusion/fn-268" },
+      });
+    }
+
+    function run(store: unknown, task: unknown, audit?: unknown) {
+      return cleanupLandedWorkspaceTaskWorktrees({
+        store: store as never,
+        task: task as never,
+        workspaceRootDir: "/workspace",
+        source: "workspace-finalize",
+        ...(audit ? { audit: audit as never } : {}),
+      });
+    }
+
+    function expectApiPreservedWebRemoved(
+      result: Awaited<ReturnType<typeof cleanupLandedWorkspaceTaskWorktrees>>,
+      logEntry: ReturnType<typeof vi.fn>,
+    ) {
+      expect(result.preserved).toEqual([
+        { repoRel: "api", worktreePath: apiPath, outcome: "preserved-active-session", reason: "active-session" },
+      ]);
+      expect(result.removedRepoRels).toEqual(["web"]);
+      expect(result.taskDirectoryRemoved).toBe(false);
+      expect(removeWorktreeMock).toHaveBeenCalledOnce();
+      expect(removeWorktreeMock).toHaveBeenCalledWith(expect.objectContaining({ worktreePath: webPath }));
+      expect(rmdirSyncMock).not.toHaveBeenCalled();
+      expect(logEntry).toHaveBeenCalledWith(
+        "FN-268",
+        "Post-landing worktree cleanup preserved",
+        expect.stringContaining(`${apiPath}: active-session`),
+      );
+    }
+
+    it("audits the refusal when the repo session is registered under the raw path", async () => {
+      const { store, logEntry } = createStore();
+      const audit = { git: vi.fn().mockResolvedValue(undefined) };
+      activeSessionRegistry.registerPath(apiPath, registration);
+
+      const result = await run(store, mixedTask(), audit);
+
+      expect(audit.git).toHaveBeenCalledOnce();
+      expect(audit.git).toHaveBeenCalledWith(refusalAudit);
+      expectApiPreservedWebRemoved(result, logEntry);
+    });
+
+    it("audits the refusal when the repo session is registered only under the canonical path", async () => {
+      const { store, logEntry } = createStore();
+      const audit = { git: vi.fn().mockResolvedValue(undefined) };
+      canonicalizeOverride.fn = (path) => (path === apiPath ? canonicalApiPath : path);
+      activeSessionRegistry.registerPath(canonicalApiPath, { ...registration, kind: "merger" as never });
+
+      const result = await run(store, mixedTask(), audit);
+
+      expect(audit.git).toHaveBeenCalledOnce();
+      expect(audit.git).toHaveBeenCalledWith({ ...refusalAudit, metadata: { ...refusalAudit.metadata, kind: "merger" } });
+      expectApiPreservedWebRemoved(result, logEntry);
+    });
+
+    it("emits no refusal audit when no session owns any repo checkout", async () => {
+      const { store } = createStore();
+      const audit = { git: vi.fn().mockResolvedValue(undefined) };
+
+      const result = await run(store, mixedTask(), audit);
+
+      expect(result.removedRepoRels).toEqual(["api", "web"]);
+      expect(result.preserved).toEqual([]);
+      expect(removeWorktreeMock).toHaveBeenCalledTimes(2);
+      expect(audit.git).not.toHaveBeenCalledWith(expect.objectContaining({ type: "worktree:removal-refused-active-session" }));
+    });
+
+    it.each([
+      ["no auditor is supplied", undefined],
+      ["the audit sink rejects", { git: vi.fn().mockRejectedValue(new Error("audit sink down")) }],
+      ["the audit sink throws synchronously", { git: vi.fn().mockImplementation(() => { throw new Error("audit sink broken"); }) }],
+    ])("keeps the identical outcome when %s", async (_label, hostileAudit) => {
+      activeSessionRegistry.registerPath(apiPath, registration);
+      const baseline = createStore();
+      const expected = await run(baseline.store, mixedTask(), { git: vi.fn().mockResolvedValue(undefined) });
+      // The auditor is forwarded to removeWorktree by design; compare every other argument.
+      const withoutAudit = (calls: unknown[][]) => calls.map(([arg]) => ({ ...(arg as Record<string, unknown>), audit: undefined }));
+      const expectedRemoveCalls = withoutAudit(removeWorktreeMock.mock.calls);
+      removeWorktreeMock.mockClear();
+
+      const { store, logEntry } = createStore();
+      const result = await run(store, mixedTask(), hostileAudit);
+
+      expect(result).toEqual(expected);
+      expect(withoutAudit(removeWorktreeMock.mock.calls)).toEqual(expectedRemoveCalls);
+      expect(logEntry.mock.calls).toEqual(baseline.logEntry.mock.calls);
+      if (hostileAudit) expect(hostileAudit.git).toHaveBeenCalledWith(refusalAudit);
+      expectApiPreservedWebRemoved(result, logEntry);
+    });
+
+    it("audits a shared live path once, attributed to the first repo, while preserving both repos", async () => {
+      const { store } = createStore();
+      const audit = { git: vi.fn().mockResolvedValue(undefined) };
+      activeSessionRegistry.registerPath(apiPath, registration);
+      const task = workspaceTask({
+        api: { worktreePath: apiPath, branch: "fusion/fn-268" },
+        web: { worktreePath: apiPath, branch: "fusion/fn-268" },
+      });
+
+      const result = await run(store, task, audit);
+
+      expect(audit.git).toHaveBeenCalledOnce();
+      expect(audit.git).toHaveBeenCalledWith(refusalAudit);
+      expect(result.preserved).toEqual([
+        { repoRel: "api", worktreePath: apiPath, outcome: "preserved-active-session", reason: "active-session" },
+        { repoRel: "web", worktreePath: apiPath, outcome: "preserved-active-session", reason: "active-session" },
+      ]);
+      expect(removeWorktreeMock).not.toHaveBeenCalled();
+      expect(rmdirSyncMock).not.toHaveBeenCalled();
+    });
+
+    it("settles with the identical outcome after the bounded timeout when the real auditor's store sink hangs", async () => {
+      vi.useFakeTimers();
+      activeSessionRegistry.registerPath(apiPath, registration);
+      const { store, logEntry } = createStore();
+      const recordRunAuditEvent = vi.fn(() => new Promise<void>(() => {}));
+      const audit = createRunAuditor(
+        { recordRunAuditEvent } as never,
+        { taskId: "FN-268", agentId: "merger", runId: "run-kb-006", phase: "merge" } as never,
+      );
+
+      let settled: Awaited<ReturnType<typeof cleanupLandedWorkspaceTaskWorktrees>> | undefined;
+      const pending = run(store, mixedTask(), audit).then((value) => { settled = value; });
+      await vi.advanceTimersByTimeAsync(RUN_AUDIT_EMIT_TIMEOUT_MS);
+      await pending;
+
+      expect(recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "worktree:removal-refused-active-session",
+        target: apiPath,
+        metadata: expect.objectContaining({ repoRelPath: "api", kind: "executor" }),
+      }));
+      expectApiPreservedWebRemoved(settled!, logEntry);
+    });
+  });
 
   it("proof-cleans every repository once and retires the empty task directory", async () => {
     const { store } = createStore();

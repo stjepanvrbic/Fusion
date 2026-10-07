@@ -3229,7 +3229,7 @@ export async function landWorkspaceTask(
     callback: its already-pushed commits remain recoverable through landedSha/intent evidence, but
     this stale generation must not write the task outcome. Renewal only improves liveness.
     */
-    const finalize = () => finalizeWorkspaceTask(store, taskId, task, repos, workspaceRootDir, fence);
+    const finalize = () => finalizeWorkspaceTask(store, taskId, task, repos, workspaceRootDir, fence, audit);
     const withValidDispatchLease = (store as Partial<TaskStore>).withValidWorkspaceLease;
     if (options.workspaceDispatchFence && typeof withValidDispatchLease === "function") {
       try {
@@ -3354,6 +3354,7 @@ async function finalizeWorkspaceTask(
   repos: WorkspaceRepoLandResult[],
   workspaceRootDir: string,
   fence?: MergeWriteFence,
+  audit?: RunAuditor,
 ): Promise<boolean> {
   const landed = repos.filter((r) => r.status === "landed" && r.landedSha);
   const workspaceLandedShas: Record<string, string> = {};
@@ -3396,6 +3397,12 @@ async function finalizeWorkspaceTask(
       landedShas: workspaceLandedShas,
       source: "workspace-ai-merge-finalize",
       fence,
+      /*
+      FNXC:WorktreeCleanup 2026-10-07-14:44:
+      KB-006 — the merge auditor records the live-session refusal audit for workspace checkouts (parity with
+      single-repo cleanup) and also reaches removeWorktree's own race-path refusal emission.
+      */
+      audit,
       log: async (message) => {
         if (fence) {
           await fence.write("log", () => store.logEntry(taskId, message, "AiMerge").catch(() => undefined));

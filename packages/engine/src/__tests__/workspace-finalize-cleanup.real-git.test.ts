@@ -19,6 +19,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { MergeResult, Task, TaskStore } from "@fusion/core";
 import { landWorkspaceTask } from "../merge/merger-ai.js";
+import { activeSessionRegistry } from "../agents/active-session-registry.js";
 import { createWorkspaceFixture, hasGit, type WorkspaceFixture } from "./_workspace-fixture.js";
 
 const describeIfGit = hasGit ? describe : describe.skip;
@@ -107,6 +108,8 @@ function createStore(task: Task): TaskStore & RecordingStore {
       return { moved: true, task };
     }),
     upsertTaskCommitAssociation: vi.fn().mockResolvedValue(undefined),
+    // FNXC:WorktreeCleanup 2026-10-07-14:44: KB-006 asserts the merge auditor persists the workspace refusal row here.
+    recordRunAuditEvent: vi.fn().mockResolvedValue(undefined),
     accumulateTokenUsage: vi.fn().mockResolvedValue(undefined),
     emit: (event: string, payload?: unknown) => {
       if (event === "task:merged") merged.push(payload as MergeResult);
@@ -234,5 +237,44 @@ describeIfGit("FN-268 workspace merge finalization removes its worktrees through
     the flag to mean "fully cleaned" while a preserved checkout is still on disk.
     */
     expect(store.merged.at(-1)).toEqual(expect.objectContaining({ worktreeRemoved: true }));
+  });
+
+  /*
+  FNXC:WorktreeCleanup 2026-10-07-14:44:
+  KB-006 - production wiring: landWorkspaceTask must hand its run auditor to workspace cleanup so a
+  checkout held by a live session leaves a `worktree:removal-refused-active-session` row with repoRelPath.
+  The session registers inside the review agent (after landing began) so merge admission is unaffected.
+  */
+  it("persists the refusal audit when a live session holds a repository checkout at cleanup", async () => {
+    fx = await createWorkspaceFixture(["repo-a", "repo-b"]);
+    const repoA = addTaskWorktree(fx, "repo-a", "a feature\n");
+    const repoB = addTaskWorktree(fx, "repo-b", "b feature\n");
+    const store = createStore(makeTask({
+      "repo-a": { worktreePath: repoA.worktreePath, branch: BRANCH },
+      "repo-b": { worktreePath: repoB.worktreePath, branch: BRANCH },
+    }));
+
+    try {
+      const result = await landWorkspaceTask(store, store.task, fx.rootDir, {}, {
+        mergeAgent: squashMergeAgent,
+        reviewAgent: async () => {
+          activeSessionRegistry.registerPath(repoB.worktreePath, { taskId: TASK_ID, kind: "executor", ownerKey: "kb-006-real-git" });
+          return "REVIEW_VERDICT: approve";
+        },
+      });
+
+      expect(result.finalized).toBe(true);
+      expect(store.moveTaskCalls).toEqual([{ id: TASK_ID, column: "done" }]);
+      expect(existsSync(repoB.worktreePath)).toBe(true);
+      expect(existsSync(repoA.worktreePath)).toBe(false);
+      expect(existsSync(taskWorktreeDir(fx))).toBe(true);
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "worktree:removal-refused-active-session",
+        target: repoB.worktreePath,
+        metadata: expect.objectContaining({ taskId: TASK_ID, repoRelPath: "repo-b" }),
+      }));
+    } finally {
+      activeSessionRegistry.unregisterPath(repoB.worktreePath);
+    }
   });
 });

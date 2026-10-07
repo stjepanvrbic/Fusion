@@ -163,10 +163,15 @@ stay audited (pipeline S10 invariant "cleanup refusal is audited"), with the sam
 removeWorktree: owning session taskId, removal reason, and session kind. The session may be registered under
 the raw or the canonical path (Windows / macOS `/private` aliasing), so both forms are looked up.
 Audit persistence is best-effort: a missing, throwing, or rejecting sink never changes the cleanup outcome.
+
+FNXC:WorktreeCleanup 2026-10-07-14:44:
+KB-006 — workspace cleanup shares this helper and appends `repoRelPath` (the repo-relative identifier only)
+via `extraMetadata`. Single-repo callers pass none, so their metadata stays exactly { taskId, reason, kind }.
 */
 async function recordActiveSessionRefusalAudit(
   input: Pick<CleanupLandedTaskWorktreeInput, "audit" | "taskId">,
   worktreePath: string,
+  extraMetadata?: { repoRelPath: string },
 ): Promise<void> {
   try {
     const record = activeSessionRegistry.lookupByPath(worktreePath)
@@ -178,6 +183,7 @@ async function recordActiveSessionRefusalAudit(
         taskId: record?.taskId ?? input.taskId,
         reason: RemovalReason.CompletionLandedCleanup,
         kind: record?.kind ?? "unknown",
+        ...(extraMetadata ?? {}),
       },
     });
   } catch {
@@ -479,9 +485,17 @@ export async function cleanupLandedWorkspaceTaskWorktrees(
       outcomes.set(key, { kind: "settled", removed: false });
       continue;
     }
+    const repoRel = entries.find(([, candidate]) => canonicalizePath(candidate.worktreePath) === key)?.[0] ?? "";
     if (activeSessionRegistry.isPathActive(worktreePath) || activeSessionRegistry.isPathActive(key)) {
       const preservation: WorkspacePathOutcome = { kind: "preserved", outcome: "preserved-active-session", reason: "active-session" };
       outcomes.set(key, preservation);
+      /*
+      FNXC:WorktreeCleanup 2026-10-07-14:44:
+      KB-006 — workspace cleanup's live-session short-circuit must leave the same best-effort refusal audit as
+      single-repo cleanup, plus repoRelPath; one row per distinct canonical path (the first matching repoRel).
+      The removeWorktree race-path refusal emits its own row, so nothing is emitted for it here.
+      */
+      await recordActiveSessionRefusalAudit({ audit: input.audit, taskId: input.task.id }, worktreePath, { repoRelPath: repoRel });
       await recordPreservedOutcome(logInput, worktreePath, { outcome: preservation.outcome, preservedReason: preservation.reason });
       continue;
     }
@@ -492,7 +506,6 @@ export async function cleanupLandedWorkspaceTaskWorktrees(
     unusable child settles (it is not a preserved checkout); recorded child paths stay durable for
     the terminal workspace branch sweep, and residue keeps the task directory via the empty-shell check.
     */
-    const repoRel = entries.find(([, candidate]) => canonicalizePath(candidate.worktreePath) === key)?.[0] ?? "";
     const pathOutcome = await cleanupLandedWorktreePath({
       input: { ...input, landedSha: input.landedShas?.[repoRel] },
       taskId: input.task.id,
