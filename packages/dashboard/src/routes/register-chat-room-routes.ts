@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { THINKING_LEVELS, type ChatAttachment, type ChatRoomCreateInput, type ChatRoomStatus, type ChatRoomUpdateInput } from "@fusion/core";
 import type { Request } from "express";
 import { RoomReplyGenerationError } from "../chat.js";
@@ -9,6 +9,7 @@ import { createProjectScopedChatManager, resolveProjectChatContext } from "../ch
 import { ApiError, badRequest, internalError, notFound } from "../api-error.js";
 import { rateLimit, RATE_LIMITS } from "../rate-limit.js";
 import { CHAT_ALLOWED_MIME_TYPES, CHAT_MAX_VIDEO_ATTACHMENT_SIZE, getChatAttachmentMaxSize } from "./chat-attachment-config.js";
+import { resolveChatAttachmentPath } from "../chat-attachment-path.js";
 import type { ApiRoutesContext } from "./types.js";
 
 function isSlugCollisionError(err: unknown): boolean {
@@ -26,19 +27,6 @@ function parseRoomThinkingLevel(value: unknown): string | null {
 
 interface ChatRoomRouteDeps {
   upload: import("multer").Multer;
-}
-
-function resolveRoomAttachmentPath(rootDir: string, roomId: string, filename: string): { roomDir: string; filePath: string } {
-  const roomDir = resolve(rootDir, ".fusion", "chat-room-attachments", roomId);
-  const safeName = basename(filename);
-  if (safeName !== filename) {
-    throw badRequest("Invalid attachment path");
-  }
-  const filePath = resolve(roomDir, safeName);
-  if (!filePath.startsWith(`${roomDir}/`) && filePath !== roomDir) {
-    throw badRequest("Invalid attachment path");
-  }
-  return { roomDir, filePath };
 }
 
 export function registerChatRoomRoutes(ctx: ApiRoutesContext, deps: ChatRoomRouteDeps): void {
@@ -465,7 +453,7 @@ export function registerChatRoomRoutes(ctx: ApiRoutesContext, deps: ChatRoomRout
       if (!room) throw notFound(`Chat room ${roomId} not found`);
 
       const { store: scopedStore } = await getProjectContext(req);
-      const { filePath } = resolveRoomAttachmentPath(scopedStore.getRootDir(), roomId, String(req.params.filename));
+      const { filePath } = resolveChatAttachmentPath(scopedStore.getRootDir(), "chat-room-attachments", roomId, String(req.params.filename));
       const stream = createReadStream(filePath);
       stream.on("error", () => {
         if (!res.headersSent) {

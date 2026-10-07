@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { archivedColumnsForTask } from "../task-lifecycle-lanes.js";
 import { createReadStream } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
   THINKING_LEVELS,
   createLogger,
@@ -28,6 +28,7 @@ store/chatStore pair only.
 */
 import { getOrCreateScopedChatManager, resolveProjectChatContext } from "../chat-project-services.js";
 import { CHAT_ALLOWED_MIME_TYPES, CHAT_MAX_VIDEO_ATTACHMENT_SIZE, getChatAttachmentMaxSize } from "./chat-attachment-config.js";
+import { resolveChatAttachmentPath } from "../chat-attachment-path.js";
 import { rateLimit, RATE_LIMITS } from "../rate-limit.js";
 import { writeSSEEvent, type SessionBufferedEvent } from "../sse-buffer.js";
 import { ChatReplacementError, TASK_PLANNER_CHAT_AGENT_ID_PREFIX } from "../chat.js";
@@ -64,16 +65,6 @@ export interface ChatRouteDeps {
 }
 
 const CHAT_MESSAGE_MAX_ATTACHMENTS = 10;
-
-function resolveAttachmentPath(rootDir: string, sessionId: string, filename: string): { sessionDir: string; filePath: string } {
-  const sessionDir = resolve(rootDir, ".fusion", "chat-attachments", sessionId);
-  const safeName = basename(filename);
-  const filePath = resolve(sessionDir, safeName);
-  if (!filePath.startsWith(`${sessionDir}/`) && filePath !== sessionDir) {
-    throw badRequest("Invalid attachment path");
-  }
-  return { sessionDir, filePath };
-}
 
 /*
 FNXC:ChatStashBackfillKey 2026-08-21-13:35:
@@ -1403,7 +1394,7 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
     try {
       const { store: scopedStore } = await getProjectContext(req);
       const rootDir = scopedStore.getRootDir();
-      const { filePath } = resolveAttachmentPath(rootDir, String(req.params.id), String(req.params.filename));
+      const { filePath } = resolveChatAttachmentPath(rootDir, "chat-attachments", String(req.params.id), String(req.params.filename));
       const stream = createReadStream(filePath);
       stream.on("error", () => {
         if (!res.headersSent) {
@@ -1424,7 +1415,7 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
     try {
       const { store: scopedStore } = await getProjectContext(req);
       const rootDir = scopedStore.getRootDir();
-      const { filePath } = resolveAttachmentPath(rootDir, String(req.params.id), String(req.params.filename));
+      const { filePath } = resolveChatAttachmentPath(rootDir, "chat-attachments", String(req.params.id), String(req.params.filename));
       await rm(filePath);
       res.json({ success: true });
     } catch (err: unknown) {
