@@ -1027,7 +1027,8 @@ export async function reapOrphanWorktrees(
 export async function scanOrphanedBranches(rootDir: string, store: TaskStore): Promise<string[]> {
   let allBranches: string[];
   try {
-    const result = await execAsync("git branch --list 'fusion/*'", {
+    // FNXC:WindowsShell 2026-10-07-19:23: argv form, no shell. Under cmd.exe the single-quoted `'fusion/*'` reached git with its quotes, matched nothing, and orphan branch pruning silently did nothing.
+    const result = await execFileAsync("git", ["branch", "--list", "fusion/*"], {
       cwd: rootDir,
       encoding: "utf-8",
     });

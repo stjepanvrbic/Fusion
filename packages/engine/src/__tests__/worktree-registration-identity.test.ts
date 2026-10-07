@@ -249,3 +249,22 @@ describe("creation never deletes an unproven pre-existing directory", () => {
     expect(existsSync(join(path, ".git"))).toBe(true);
   });
 });
+
+/*
+FNXC:WindowsShell 2026-10-07-19:23:
+Orphan `fusion/*` branch discovery runs git without a shell, so the glob reaches git unquoted on every platform.
+*/
+describe("scanOrphanedBranches", () => {
+  it("lists fusion branches no active task owns", async () => {
+    const root = repo();
+    git(root, "branch", "fusion/fn-1");
+    git(root, "branch", "fusion/fn-2");
+    git(root, "branch", "feature/other");
+    const taskStore = {
+      listTasks: vi.fn(async () => [{ id: "FN-1", column: "in-progress", branch: "fusion/fn-1" }]),
+      getTaskWorkflowSelectionAsync: vi.fn(async () => undefined),
+    } as never;
+
+    await expect(pool.scanOrphanedBranches(root, taskStore)).resolves.toEqual(["fusion/fn-2"]);
+  });
+});
