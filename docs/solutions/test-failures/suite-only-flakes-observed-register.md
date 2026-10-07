@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **4 active observation records** (entries 2, 13, 20, and 21), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **5 active observation records** (entries 2, 13, 20, 21, and 25), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -310,6 +310,16 @@ The combined ProjectEngine/workspace-merger verification observed an empty recal
 The verified `test-timings-shard-3` artifact (`11332755977`, SHA-256 `85a8465f96e26a8ec9f0d80ff9f051f6a9e66673a0042fdd18c2d434a7577ec4`) reported the badge as `pending` rather than `auto-available` at `AgentDetailView.core.test.tsx:507` after 58.443616 ms. The shard command was `pnpm test:ci:shard --shard 3 --total 4`; its dashboard reporter was otherwise complete (176 suites, 6,008 passing tests, one failure).
 
 FN-9506 reproduced the pending-to-resolved transition with a deferred discovery response. It preserves the stored legacy reference in the tooltip, proves a pending click makes no content request, waits for `data-skill-state="auto-available"`, and then proves one `fetchSkillContent(canonicalId, projectId)` request. Production code was unchanged: `AgentDetailView` deliberately mounts skill discovery only after the agent has loaded, so agent-before-discovery is the reachable lifecycle. No retry, timeout, skip, or weakened assertion was introduced. The file has 55 focused cases and is outside the thin merge gate, so this high-value first sighting remains recorded rather than quarantined. A second sighting of this file requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`.
+
+### 25. Signal-ingest incident capture PostgreSQL teardown hook
+
+- **Status:** Active first sighting — recorded 2026-10-07, unattributed.
+- **File:** `packages/dashboard/src/__tests__/register-signal-routes.test.ts`
+- **Exact test:** `ingestSignal — incident capture > marks resolution events as resolved for every provider`
+- **Observed tree/SHA:** branch `audit/dashboard-mailbox-and-ingress` (PR #24, head `cc88ef119e` when recorded; the observer did not pin the exact commit), on Windows with the machine under load.
+- **Observed frequency:** 1 failure, then 4 passing reruns, including one on `origin/main`.
+
+The failure was `Hook timed out in 15000ms` in the file's top-level `afterEach`, which tears down every PostgreSQL harness the case opened (`harnesses.pop()?.teardown()`). This is the same 15 s PostgreSQL hook mode recorded for entries 2 and 13, here on teardown rather than setup. The case's assertions passed on every rerun. No timeout, retry, or assertion changed. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`.
 
 ### Common shape and investigated result
 
