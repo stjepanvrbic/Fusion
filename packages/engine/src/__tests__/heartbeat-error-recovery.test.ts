@@ -662,7 +662,7 @@ describe("HeartbeatMonitor error-state recovery", () => {
 });
 
 /*
-FNXC:HeartbeatRecovery 2026-10-07-18:40:
+FNXC:HeartbeatRecovery 2026-10-07-18:12:
 Timer registration and timer dispatch must make the same eligibility decision.
 Registration admits an under-budget heartbeat-model-unavailable park, so the tick must deliver it to the monitor's recovery gate instead of unregistering it.
 Exhausted, disabled, ephemeral, and operator-paused agents stay excluded at both points.
@@ -744,7 +744,7 @@ describe("HeartbeatTriggerScheduler to HeartbeatMonitor recovery boundary", () =
 });
 
 /*
-FNXC:HeartbeatRecovery 2026-10-07-18:55:
+FNXC:HeartbeatRecovery 2026-10-07-18:15:
 A repeating model-unavailable failure (missing provider key, unknown model) must become operator-visible within the retry budget for every trigger source.
 Each failure parks the agent with the model-unavailable pause reason and keeps lastError; only real successful work resets the shared budget.
 */

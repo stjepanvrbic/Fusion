@@ -114,13 +114,13 @@ import { evaluateParkedAgentTaskLink, isParkedTaskColumn, type AgentTaskLinkExec
 import { MemoryConsolidationError, MemoryConsolidationService, resolveMemoryConsolidationPorts } from "./memory/index.js";
 
 /*
-FNXC:WorktreeAcquisition 2026-10-07-18:20:
+FNXC:WorktreeAcquisition 2026-10-07-18:02:
 A heartbeat worktree-acquisition failure is worktree recovery, which lifecycle containment (FN-207/FN-217) keeps in the card's current lifecycle role.
 The card is never moved: the former requeue through the rebound target moved WIP and review cards backward and, on a board with no hold lane, into intake.
 These lanes decide, against the live row, whether recovery may write at all: never on a terminal card, never over a user or approval pause, and never on a review card owned by a human merge (autoMerge:false).
 */
 /*
-FNXC:AgentHeartbeat 2026-10-07-19:20:
+FNXC:AgentHeartbeat 2026-10-07-18:24:
 Heartbeat run ids that a live session in this process still owns, from startRun until its serialized run settles.
 HeartbeatMonitor and HeartbeatTriggerScheduler are constructed independently at each runtime wiring site with no reference to each other, so the run id is the shared identity.
 The scheduler's persisted-row reapers key on lastHeartbeatAt, which a long silent tool call can let go stale; a run listed here is owned and supervised by the monitor's own missed-heartbeat check, so it is never reaped as orphaned.
@@ -1393,7 +1393,7 @@ export class HeartbeatMonitor {
         if (!reason && !activeRun) {
           reason = "no active run";
         } else if (!reason && activeRun && !this.trackedAgents.has(agent.id) && !isHeartbeatRunLiveInProcess(activeRun.id)) {
-          // FNXC:AgentHeartbeat 2026-10-07-19:20: a run still in its pre-session phase (for example worktree acquisition) is live but not yet tracked.
+          // FNXC:AgentHeartbeat 2026-10-07-18:24: a run still in its pre-session phase (for example worktree acquisition) is live but not yet tracked.
           const timeoutMs = this.resolveAgentConfig(agent.id).heartbeatTimeoutMs;
           const heartbeatAgeMs = getHeartbeatAgeMs(agent, now);
           // NOTE(FN-4278): this stale gate intentionally uses a per-run work-budget
@@ -1872,7 +1872,7 @@ export class HeartbeatMonitor {
   }
 
   /**
-   * FNXC:HeartbeatRecovery 2026-10-07-18:55:
+   * FNXC:HeartbeatRecovery 2026-10-07-18:15:
    * One outcome for a model-unavailable failure from every trigger source and failure point (session creation or prompt).
    * The run completes without the success state transition, and the agent parks with the model-unavailable pause reason and an actionable lastError.
    * The timer branch used to complete as healthy, which cleared lastError and reset the shared recovery budget, so a missing provider key looped every interval forever with no operator signal.
@@ -2089,7 +2089,7 @@ export class HeartbeatMonitor {
     if (!tracked) return;
 
     /*
-    FNXC:AgentHeartbeat 2026-10-07-19:20:
+    FNXC:AgentHeartbeat 2026-10-07-18:24:
     Called from every session activity callback, so in-memory liveness is exact while persisted liveness is written at most once per HEARTBEAT_ACTIVITY_PERSIST_INTERVAL_MS.
     The persisted "ok" write advances lastHeartbeatAt, which keeps another process's view of a live run fresh.
     */
@@ -2300,7 +2300,7 @@ export class HeartbeatMonitor {
         triggerDetail,
         contextSnapshot: Object.keys(runContextSnapshot).length > 0 ? runContextSnapshot : undefined,
       });
-      // FNXC:AgentHeartbeat 2026-10-07-19:20: owned by this serialized run until the start lock settles, covering pre-session work such as worktree acquisition.
+      // FNXC:AgentHeartbeat 2026-10-07-18:24: owned by this serialized run until the start lock settles, covering pre-session work such as worktree acquisition.
       this.markRunLive(agentId, run.id);
 
       // Build run context for mutation correlation
@@ -3154,7 +3154,7 @@ export class HeartbeatMonitor {
              * only on a later heartbeat after git state can change; never consume the generic
              * three-strike acquisition budget or replace the reason with terminal failure.
              *
-             * FNXC:WorktreeAcquisition 2026-10-07-18:20:
+             * FNXC:WorktreeAcquisition 2026-10-07-18:02:
              * The refusal parks the card where it is; it records only the task-log reason.
              */
             if (refreshKind) {
@@ -3186,7 +3186,7 @@ export class HeartbeatMonitor {
              * the exhaustion via onTaskAcquisitionExhausted so the owning runtime
              * can record the failure in CentralCore stats (FN-7721).
              *
-             * FNXC:WorktreeAcquisition 2026-10-07-18:20:
+             * FNXC:WorktreeAcquisition 2026-10-07-18:02:
              * The counter and the terminal park are one atomic write decided against the live row, and neither moves the card.
              * A pause or human-merge ownership that lands while acquisition is failing wins: recovery writes nothing and the exhaustion callback does not fire.
              * Unresolvable lanes also write nothing, because a terminal or human-owned card cannot be ruled out.
@@ -3294,7 +3294,7 @@ export class HeartbeatMonitor {
           settings: heartbeatModelSettings,
           mcpServers: heartbeatMcp.servers,
           /*
-          FNXC:AgentHeartbeat 2026-10-07-19:20:
+          FNXC:AgentHeartbeat 2026-10-07-18:24:
           Every session event is proof the run is progressing, so each one refreshes liveness through recordHeartbeat.
           Without it lastSeen and lastHeartbeatAt froze at run start, and any session longer than the timeout was reported missed, killed and re-dispatched.
           */
@@ -4756,7 +4756,7 @@ export class HeartbeatTriggerScheduler {
   private currentTimerArm: Map<string, number> = new Map();
   private running = false;
   /*
-   * FNXC:AgentHeartbeat 2026-10-07-19:05:
+   * FNXC:AgentHeartbeat 2026-10-07-18:19:
    * stop() advances this generation so asynchronous work already in flight cannot act afterward.
    * Every async path (multiplier re-arm, lifecycle refresh, timer audit, timer tick, assignment wake, deferred-assignment drain) captures the generation before its first await and re-checks it after each await and immediately before it registers a timer or dispatches a heartbeat.
    * start() does not advance it, so a registration made before start keeps its multiplier refresh.
@@ -5279,7 +5279,7 @@ export class HeartbeatTriggerScheduler {
           }
         }
 
-        // FNXC:AgentHeartbeat 2026-10-07-19:05: an assignment wake that crossed a stop() must not dispatch.
+        // FNXC:AgentHeartbeat 2026-10-07-18:19: an assignment wake that crossed a stop() must not dispatch.
         if (!this.isLiveGeneration(generation)) return;
         heartbeatLog.log(`Assignment trigger for ${agent.id} (task: ${taskId})`);
         await this.callback(agent.id, "assignment", {
@@ -5381,7 +5381,7 @@ export class HeartbeatTriggerScheduler {
         heartbeatLog.warn(`Deferred assignment budget check failed for ${agentId}: ${budgetErr instanceof Error ? budgetErr.message : String(budgetErr)} — proceeding without budget check`);
       }
 
-      // FNXC:AgentHeartbeat 2026-10-07-19:05: a drain that crossed a stop() keeps its pending entry and does not dispatch.
+      // FNXC:AgentHeartbeat 2026-10-07-18:19: a drain that crossed a stop() keeps its pending entry and does not dispatch.
       if (!this.isLiveGeneration(generation)) return;
       this.pendingAssignments.delete(agentId);
       heartbeatLog.log(`Deferred assignment re-fired for ${agentId} (task: ${pending.taskId})`);
@@ -5605,7 +5605,7 @@ export class HeartbeatTriggerScheduler {
     const thresholdMs = this.getActiveRunStaleThresholdMs(agent, staleMultiplier);
     const elapsedMs = getHeartbeatAgeMs(agent);
     /*
-    FNXC:AgentHeartbeat 2026-10-07-19:20:
+    FNXC:AgentHeartbeat 2026-10-07-18:24:
     A run that a live session in this process owns is not orphaned, however stale lastHeartbeatAt looks; the monitor's missed-heartbeat check supervises it.
     Reaping it let the tick and audit dispatch a second heartbeat that queued behind the live run, so one wake burned several model sessions back-to-back.
     */
@@ -5681,7 +5681,7 @@ export class HeartbeatTriggerScheduler {
       let rearmedCount = 0;
       let zombieRearmedCount = 0;
       for (const agent of agents) {
-        // FNXC:AgentHeartbeat 2026-10-07-19:05: a stop() during any await of this pass ends the pass before it re-arms or unregisters anything.
+        // FNXC:AgentHeartbeat 2026-10-07-18:19: a stop() during any await of this pass ends the pass before it re-arms or unregisters anything.
         if (!this.isLiveGeneration(generation)) return;
         /*
          * FNXC:AgentHeartbeat 2026-07-09-00:00:
@@ -5908,7 +5908,7 @@ export class HeartbeatTriggerScheduler {
     this.lastTimerFireAtMs.set(agentId, Date.now());
 
     /*
-     * FNXC:AgentHeartbeat 2026-10-07-19:05:
+     * FNXC:AgentHeartbeat 2026-10-07-18:19:
      * The entry guards above run before any await; a stop, restart, or re-arm can land during the reads below.
      * Re-check the lifecycle generation, running state, and arm identity after every await and immediately before dispatch.
      */
@@ -5929,7 +5929,7 @@ export class HeartbeatTriggerScheduler {
         return;
       }
       /*
-      FNXC:HeartbeatRecovery 2026-10-07-18:40:
+      FNXC:HeartbeatRecovery 2026-10-07-18:12:
       Dispatch uses the same isTimerEligibleAgent decision as registration, with the live recovery limit.
       A separate state check here admitted only tickable or error agents, so it unregistered the under-budget heartbeat-model-unavailable parks that registration deliberately arms.
       */

@@ -1,5 +1,5 @@
 /*
-FNXC:WorktreeAcquisition 2026-10-07-18:20:
+FNXC:WorktreeAcquisition 2026-10-07-18:02:
 Heartbeat worktree-acquisition recovery stays in the card's current lifecycle role on every board shape.
 It used to requeue the card through the rebound target (hold, else intake, else first column), which moved WIP cards backward and, on a board without a hold lane, into intake where they were re-triaged as new work.
 These cases pin containment on renamed lanes and on a board that declares no hold lane at all, so the intake fallthrough can never return.

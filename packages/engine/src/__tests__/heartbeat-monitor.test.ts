@@ -607,7 +607,7 @@ describe("recordHeartbeat", () => {
   });
 
   /*
-  FNXC:AgentHeartbeat 2026-10-07-19:20:
+  FNXC:AgentHeartbeat 2026-10-07-18:24:
   recordHeartbeat runs on every session event, so it persists an "ok" heartbeat at most once per 30s while in-memory lastSeen updates on every call.
   */
   it("persists ok heartbeats to the store at a bounded cadence", () => {

@@ -4365,7 +4365,7 @@ describe("executeHeartbeat", () => {
 
   describe("in-run liveness", () => {
     /*
-    FNXC:AgentHeartbeat 2026-10-07-19:20:
+    FNXC:AgentHeartbeat 2026-10-07-18:24:
     An active, progressing heartbeat session is never reported missed, never reaped or killed, and never shadowed by a second dispatch.
     Session activity (text, thinking, tool start and end) refreshes in-memory liveness on every event and persisted lastHeartbeatAt at a bounded cadence.
     The persisted-row reapers in the scheduler (timer tick and timer audit) never reap a run that a live in-process session still owns.
@@ -4467,7 +4467,7 @@ describe("executeHeartbeat", () => {
     });
 
     /*
-    FNXC:HeartbeatRecovery 2026-10-07-18:55:
+    FNXC:HeartbeatRecovery 2026-10-07-18:15:
     Timer runs share the parked model-unavailable outcome; completing them as healthy reset the recovery budget and hid the cause.
     */
     it.each(["timer", "on_demand", "assignment"] as const)("pauses on %s heartbeat when model provider credentials are unavailable", async (source) => {

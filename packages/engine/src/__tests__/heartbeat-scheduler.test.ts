@@ -3371,7 +3371,7 @@ describe("HeartbeatTriggerScheduler", () => {
 });
 
 /*
-FNXC:AgentHeartbeat 2026-10-07-19:05:
+FNXC:AgentHeartbeat 2026-10-07-18:19:
 stop() is a hard boundary for every piece of asynchronous scheduler work already in flight.
 A multiplier lookup, a lifecycle refresh, the timer audit, a timer tick, and assignment wakes must re-check the scheduler generation after each await, so none of them can install a timer or dispatch a heartbeat after stop, or after a stop/start restart that has superseded them.
 */

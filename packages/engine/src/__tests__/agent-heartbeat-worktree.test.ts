@@ -5,7 +5,7 @@ import * as worktreeAcquisition from "../worktree/worktree-acquisition.js";
 import * as piModule from "../pi.js";
 
 /*
-FNXC:WorktreeAcquisition 2026-10-07-18:20:
+FNXC:WorktreeAcquisition 2026-10-07-18:02:
 A heartbeat worktree-acquisition failure is worktree recovery, which lifecycle containment keeps in the card's current lifecycle role.
 The card never moves: in-budget failures only bump recoveryRetryCount, base-refresh refusals only log, and exhaustion parks the card `failed` in place.
 Every recovery write is decided against the live row, so a terminal card, a user or approval pause, and an autoMerge:false review card are never mutated.
