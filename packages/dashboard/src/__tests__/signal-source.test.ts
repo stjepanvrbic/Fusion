@@ -42,12 +42,38 @@ describe("isWithinReplayWindow", () => {
 });
 
 describe("DeliveryNonceCache", () => {
+  function commitFresh(cache: DeliveryNonceCache, nonce: string, nowMs: number) {
+    const reservation = cache.reserve(nonce, nowMs);
+    expect(reservation.status).toBe("fresh");
+    if (reservation.status === "fresh") reservation.commit(nowMs);
+  }
+
   it("rejects a replayed nonce within the window", () => {
     const cache = new DeliveryNonceCache(1000);
-    expect(cache.check("a", 0)).toBe(true);
-    expect(cache.check("a", 500)).toBe(false);
+    commitFresh(cache, "a", 0);
+    expect(cache.reserve("a", 500).status).toBe("replayed");
     // After TTL the nonce is evictable again.
-    expect(cache.check("a", 2000)).toBe(true);
+    expect(cache.reserve("a", 2000).status).toBe("fresh");
+  });
+
+  it("reports a reserved nonce as in-flight until its owner commits or releases it", () => {
+    const cache = new DeliveryNonceCache(1000);
+    const first = cache.reserve("a", 0);
+    expect(cache.reserve("a", 10).status).toBe("in-flight");
+    if (first.status !== "fresh") throw new Error("expected fresh reservation");
+    first.release();
+    expect(cache.reserve("a", 20).status).toBe("fresh");
+  });
+
+  it("ignores a stale owner's commit after its in-flight claim expired and was re-reserved", () => {
+    const cache = new DeliveryNonceCache(1000);
+    const stale = cache.reserve("a", 0);
+    const successor = cache.reserve("a", 2000);
+    if (stale.status !== "fresh" || successor.status !== "fresh") throw new Error("expected fresh reservations");
+    stale.release();
+    expect(cache.reserve("a", 2010).status).toBe("in-flight");
+    successor.commit(2010);
+    expect(cache.reserve("a", 2020).status).toBe("replayed");
   });
 });
 

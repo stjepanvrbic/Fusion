@@ -1,7 +1,7 @@
 // @vitest-environment node
 
 import { createHmac } from "node:crypto";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockIsGhAuthenticated, mockRunGhJsonAsync } = vi.hoisted(() => ({
   mockIsGhAuthenticated: vi.fn(() => true),
@@ -1220,5 +1220,162 @@ pgDescribe("helpers", () => {
     expect(input.column).toBeUndefined();
     expect(input.priority).toBe("high");
     expect(input.source?.sourceType).toBe("api");
+  });
+});
+
+/*
+FNXC:CommandCenterSignals 2026-10-07-19:40:
+A delivery Fusion did not durably accept must stay retryable. The replay nonce is only defense in depth over the persistent external-id dedup, so it is reserved while a delivery is in flight, released when lookup or task creation fails, and committed only after acceptance.
+*/
+describe("ingestSignal — failed ingestion leaves the delivery retryable", () => {
+  const retryableCases = (): Array<{ source: SignalSource; payload: object; headers(raw: string): Record<string, string> }> => [
+    {
+      source: webhookSource,
+      payload: { id: "wh-retry", title: "Disk full", severity: "critical" },
+      headers: (raw) => ({ "x-fusion-signature": sign(raw, SECRETS.FUSION_SIGNAL_WEBHOOK_SECRET), "x-fusion-timestamp": String(Date.now()) }),
+    },
+    {
+      source: sentrySource,
+      payload: { data: { issue: { id: "sentry-retry", title: "Fatal", level: "fatal" } } },
+      headers: (raw) => ({ "sentry-hook-signature": sign(raw, SECRETS.FUSION_SIGNAL_SENTRY_SECRET) }),
+    },
+    {
+      source: datadogSource,
+      payload: { aggreg_key: "dd-retry", event_id: "dd-retry-event", title: "Warn", alert_type: "warning" },
+      headers: (raw) => ({ "x-datadog-signature": sign(raw, SECRETS.FUSION_SIGNAL_DATADOG_SECRET) }),
+    },
+    {
+      source: pagerdutySource,
+      payload: { event: { id: "pd-retry-event", event_type: "incident.triggered", occurred_at: new Date().toISOString(), data: { id: "pd-retry", title: "Pager", urgency: "high", status: "triggered" } } },
+      headers: (raw) => ({ "x-pagerduty-signature": `v1=${sign(raw, SECRETS.FUSION_SIGNAL_PAGERDUTY_SECRET)}` }),
+    },
+    {
+      source: gitlabSource,
+      payload: gitlabIssuePayload({ object_attributes: { iid: 91, title: "GitLab retry", severity: "critical" } }),
+      headers: () => ({ "x-gitlab-token": SECRETS.FUSION_SIGNAL_GITLAB_SECRET, "x-gitlab-event-uuid": "gl-retry" }),
+    },
+    {
+      source: githubSource,
+      payload: githubPayload("check_suite", "failure"),
+      headers: (raw) => ({ "x-hub-signature-256": `sha256=${sign(raw, SECRETS.FUSION_SIGNAL_GITHUB_SECRET)}`, "x-github-event": "check_suite", "x-github-delivery": "github-retry" }),
+    },
+  ];
+
+  function deliver(c: ReturnType<typeof retryableCases>[number], store: TaskStore, nonceCache: DeliveryNonceCache) {
+    const raw = JSON.stringify(c.payload);
+    return ingestSignal({
+      source: c.source,
+      store,
+      rawBody: Buffer.from(raw),
+      headers: Object.fromEntries(Object.entries(c.headers(raw)).map(([k, v]) => [k.toLowerCase(), v])),
+      body: c.payload,
+      nonceCache,
+    });
+  }
+
+  it("accepts a redelivery after task creation failed, for every provider", async () => {
+    for (const c of retryableCases()) {
+      const store = makeStore();
+      const createTask = store.createTask.bind(store);
+      let failNext = true;
+      store.createTask = (async (input: Parameters<TaskStore["createTask"]>[0]) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error("lock timeout");
+        }
+        return createTask(input);
+      }) as TaskStore["createTask"];
+      const nonceCache = new DeliveryNonceCache();
+
+      await expect(deliver(c, store, nonceCache)).rejects.toThrow("lock timeout");
+      const retry = await deliver(c, store, nonceCache);
+      expect({ provider: c.source.provider, status: retry.status }).toEqual({ provider: c.source.provider, status: 201 });
+      expect(store._tasks).toHaveLength(1);
+
+      const replay = await deliver(c, store, nonceCache);
+      expect({ provider: c.source.provider, status: replay.status }).toEqual({ provider: c.source.provider, status: 401 });
+      expect(store._tasks).toHaveLength(1);
+    }
+  });
+
+  it("accepts a redelivery after the persistent dedup lookup failed, for every provider", async () => {
+    for (const c of retryableCases()) {
+      const store = makeStore();
+      const listTasks = store.listTasks.bind(store);
+      let failNext = true;
+      store.listTasks = (async (...args: Parameters<TaskStore["listTasks"]>) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error("connection reset");
+        }
+        return listTasks(...args);
+      }) as TaskStore["listTasks"];
+      const nonceCache = new DeliveryNonceCache();
+
+      await expect(deliver(c, store, nonceCache)).rejects.toThrow("connection reset");
+      const retry = await deliver(c, store, nonceCache);
+      expect({ provider: c.source.provider, status: retry.status }).toEqual({ provider: c.source.provider, status: 201 });
+      expect(store._tasks).toHaveLength(1);
+    }
+  });
+
+  it("answers a concurrent duplicate as retryable and creates exactly one task", async () => {
+    const c = retryableCases()[0];
+    const store = makeStore();
+    const createTask = store.createTask.bind(store);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    store.createTask = (async (input: Parameters<TaskStore["createTask"]>[0]) => {
+      await gate;
+      return createTask(input);
+    }) as TaskStore["createTask"];
+    const nonceCache = new DeliveryNonceCache();
+
+    const first = deliver(c, store, nonceCache);
+    const concurrent = await deliver(c, store, nonceCache);
+    expect(concurrent.status).toBe(503);
+    expect(concurrent.retryAfterSeconds).toBeGreaterThan(0);
+
+    release();
+    expect((await first).status).toBe(201);
+    expect((await deliver(c, store, nonceCache)).status).toBe(401);
+    expect(store._tasks).toHaveLength(1);
+  });
+
+  it("keeps a failed concurrent winner's delivery retryable for the duplicate", async () => {
+    const c = retryableCases()[0];
+    const store = makeStore();
+    const createTask = store.createTask.bind(store);
+    let fail!: (err: Error) => void;
+    let entered!: () => void;
+    const reachedCreate = new Promise<void>((resolve) => { entered = resolve; });
+    let calls = 0;
+    store.createTask = (async (input: Parameters<TaskStore["createTask"]>[0]) => {
+      calls += 1;
+      if (calls === 1) {
+        await new Promise<void>((_resolve, reject) => { fail = reject; entered(); });
+      }
+      return createTask(input);
+    }) as TaskStore["createTask"];
+    const nonceCache = new DeliveryNonceCache();
+
+    const first = deliver(c, store, nonceCache);
+    expect((await deliver(c, store, nonceCache)).status).toBe(503);
+    await reachedCreate;
+    fail(new Error("deadlock"));
+    await expect(first).rejects.toThrow("deadlock");
+    expect((await deliver(c, store, nonceCache)).status).toBe(201);
+    expect(store._tasks).toHaveLength(1);
+  });
+
+  it("commits the nonce for an accepted recovery-only delivery", async () => {
+    const store = makeStore();
+    const nonceCache = new DeliveryNonceCache();
+    const green = githubPayload("check_suite", "success");
+    const first = await ingestSignal({ source: githubSource, store, ...githubContext(green, "check_suite", "github-green-retry"), nonceCache });
+    expect(first.status).toBe(200);
+    const replay = await ingestSignal({ source: githubSource, store, ...githubContext(green, "check_suite", "github-green-retry"), nonceCache });
+    expect(replay.status).toBe(401);
+    expect(store._tasks).toHaveLength(0);
   });
 });
