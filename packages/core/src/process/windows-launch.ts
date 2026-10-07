@@ -1,7 +1,6 @@
-import type { ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { posix, win32 } from "node:path";
-import { killProcessTreeByPid } from "./process-supervisor.js";
 
 /*
 FNXC:WindowsProcessLaunch 2026-10-07-18:02:
@@ -201,6 +200,124 @@ export function resolveShellFreeLaunch(command: string, args: readonly string[],
   throw new UnlaunchableCommandError(command, located, `${extension || "extensionless"} files need an interpreter shell`);
 }
 
+const TREE_KILL_SYNC_TIMEOUT_MS = 5_000;
+
+/*
+FNXC:ProcessLifecycle 2026-10-07-18:00:
+A killed supervised command must not leave descendants alive, and its caller's wait must stay bounded on every platform.
+Windows has no process groups and `shell: true` makes cmd.exe the direct child, so `child.kill` reached only cmd.exe while the real command kept running and held the stdout/stderr pipes, which kept `close` from ever firing.
+On win32 the tree is killed with `taskkill /T /F` (console processes ignore the non-forced close request, and Node's own win32 kill is already forced), and only while the root is still alive, because a dead root's pid can be reused by an unrelated process.
+*/
+export interface ProcessTreeKillLauncher {
+  spawn: typeof spawn;
+  spawnSync: typeof spawnSync;
+}
+
+// Resolved at call time so a partial `node:child_process` test mock cannot break this module at import.
+let treeKillLauncher: ProcessTreeKillLauncher | null = null;
+
+function currentTreeKillLauncher(): ProcessTreeKillLauncher {
+  return treeKillLauncher ?? { spawn, spawnSync };
+}
+
+function taskkillExecutable(): string {
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+  return systemRoot ? win32.join(systemRoot, "System32", "taskkill.exe") : "taskkill";
+}
+
+function windowsTreeKillArgs(pids: readonly number[]): string[] {
+  return [...pids.flatMap((pid) => ["/PID", String(pid)]), "/T", "/F"];
+}
+
+export interface KillProcessTreeOptions {
+  /** Block until the tree kill completes. Only for synchronous contexts such as `process.on("exit")`. */
+  sync?: boolean;
+  /** Called when the platform tree kill could not be launched or reported failure. */
+  onTreeKillFailed?: () => void;
+  /** Called exactly once after the tree kill finished, whatever its outcome (synchronously on POSIX and with `sync`). */
+  onSettled?: () => void;
+  /** Platform override for tests. */
+  platform?: NodeJS.Platform;
+  /** Launcher override for the async `taskkill` (tests and plugin seams). */
+  spawnImpl?: (command: string, args: string[], options: { shell: false; windowsHide: true; stdio: "ignore" }) => ChildProcess;
+}
+
+/**
+ * Terminate `pid` and every process it started.
+ *
+ * POSIX signals the process group `-pid` (the caller must have spawned the root `detached`) and falls
+ * back to the single pid. Windows runs `taskkill /PID <pid> /T /F`. The call never throws.
+ */
+/*
+FNXC:ProcessLifecycle 2026-10-07-18:00:
+This is the ONE process-tree termination implementation in core; `killProcessTree(child)` below and the process supervisor both delegate to it. Do not add a second taskkill path.
+It lives here, not in the supervisor, because this file is copied verbatim into the published CLI bundle and must import Node built-ins only.
+*/
+export function killProcessTreeByPid(
+  pid: number,
+  signal: NodeJS.Signals = "SIGTERM",
+  options: KillProcessTreeOptions = {},
+): void {
+  if ((options.platform ?? process.platform) !== "win32") {
+    try {
+      process.kill(-pid, signal);
+    } catch {
+      // Not a group leader, or the group is already gone.
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // Already gone.
+      }
+    }
+    options.onSettled?.();
+    return;
+  }
+  killWindowsProcessTrees([pid], options);
+}
+
+/** @internal Batch tree kill for the supervisor's parent-exit handler. */
+export function killWindowsProcessTrees(pids: readonly number[], options: KillProcessTreeOptions = {}): void {
+  let settled = false;
+  const settle = (failed: boolean) => {
+    if (settled) return;
+    settled = true;
+    if (failed) options.onTreeKillFailed?.();
+    options.onSettled?.();
+  };
+  if (pids.length === 0) {
+    settle(false);
+    return;
+  }
+  const args = windowsTreeKillArgs(pids);
+  if (options.sync) {
+    try {
+      const result = currentTreeKillLauncher().spawnSync(taskkillExecutable(), args, {
+        stdio: "ignore",
+        windowsHide: true,
+        timeout: TREE_KILL_SYNC_TIMEOUT_MS,
+      });
+      settle(Boolean(result.error) || result.status !== 0);
+    } catch {
+      settle(true);
+    }
+    return;
+  }
+  try {
+    const launch = options.spawnImpl ?? currentTreeKillLauncher().spawn;
+    const killer = launch(taskkillExecutable(), args, { shell: false, stdio: "ignore", windowsHide: true });
+    killer.once("error", () => settle(true));
+    killer.once("exit", (code) => settle(code !== 0));
+    killer.unref?.();
+  } catch {
+    settle(true);
+  }
+}
+
+/** Replace the launcher that runs `taskkill`, so tests can observe win32 tree kills on any host. */
+export function __setProcessTreeKillLauncherForTests(launcher: ProcessTreeKillLauncher | null): void {
+  treeKillLauncher = launcher;
+}
+
 export interface KillProcessTreeDeps {
   platform?: NodeJS.Platform;
   spawnImpl?: (command: string, args: string[], options: { shell: false; windowsHide: true; stdio: "ignore" }) => ChildProcess;
@@ -224,7 +341,7 @@ function directKill(child: ChildProcess): void {
  * `taskkill /T` must run before the root dies because it walks the tree from the root's PID.
  *
  * FNXC:ProcessLifecycle 2026-10-07-18:00:
- * A thin child-process wrapper over core's single tree kill (`killProcessTreeByPid`); it adds the already-exited no-op and keeps a direct SIGKILL off Windows.
+ * A thin child-process wrapper over core's single tree kill (`killProcessTreeByPid`, above); it adds the already-exited no-op and keeps a direct SIGKILL off Windows.
  */
 export function killProcessTree(child: ChildProcess, deps: KillProcessTreeDeps = {}): void {
   // `killed` means a signal was already delivered; repeat teardown (dispose, then exit-time sweep) is a no-op.

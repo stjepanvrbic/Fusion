@@ -8,12 +8,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   __getProcessSupervisorStateForTests,
   __resetProcessSupervisorForTests,
-  __setProcessTreeKillLauncherForTests,
   __terminateSupervisedChildrenForTests,
-  killProcessTreeByPid,
   releaseSupervisedChild,
   superviseSpawn,
 } from "../process/process-supervisor.js";
+import { __setProcessTreeKillLauncherForTests, killProcessTreeByPid } from "../process/windows-launch.js";
 
 const fixturePath = join(import.meta.dirname, "fixtures", "process-supervisor-child.mjs");
 

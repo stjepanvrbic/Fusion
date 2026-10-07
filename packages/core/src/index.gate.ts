@@ -1114,11 +1114,10 @@ export {
   hasProjectIdentity,
   PROJECT_IDENTITY_FILENAME,
 } from "./central/project-identity.js";
-export { ProcessSupervisor, superviseSpawn, killProcessTreeByPid } from "./process/process-supervisor.js";
-export { resolveShellFreeLaunch, withPlatformBaseEnvKeys, killProcessTree, UnlaunchableCommandError, WINDOWS_BASE_ENV_KEYS } from "./process/windows-launch.js";
-export type { ShellFreeLaunch, ShellFreeLaunchDeps, KillProcessTreeDeps } from "./process/windows-launch.js";
+export { ProcessSupervisor, superviseSpawn } from "./process/process-supervisor.js";
+export { resolveShellFreeLaunch, withPlatformBaseEnvKeys, killProcessTree, killProcessTreeByPid, UnlaunchableCommandError, WINDOWS_BASE_ENV_KEYS } from "./process/windows-launch.js";
+export type { ShellFreeLaunch, ShellFreeLaunchDeps, KillProcessTreeDeps, KillProcessTreeOptions } from "./process/windows-launch.js";
 export type {
-  KillProcessTreeOptions,
   SuperviseSpawnOptions,
   SupervisedChild,
   SupervisedExit,
