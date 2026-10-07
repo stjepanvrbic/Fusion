@@ -173,6 +173,31 @@ interface CachedSetupInfo {
 
 const DEFAULT_HOOK_TIMEOUT_MS = 5000;
 
+/** Prefix applied to every plugin tool name exposed to agent sessions. */
+const PLUGIN_TOOL_PREFIX = "plugin_";
+
+interface OwnedPluginTool {
+  pluginId: string;
+  tool: PluginToolDefinition;
+  exposedName: string;
+  /** Detached copy of the declared JSON Schema, validated as an object schema. */
+  parameters: Record<string, unknown>;
+}
+
+/**
+ * Return a detached copy of a plugin tool's declared parameter schema, or undefined when it cannot serve as a tool input schema.
+ * Tool input must be a JSON object, so the root must be a JSON Schema with `type: "object"`; a copy keeps a plugin from mutating the schema after conversion.
+ */
+function toPluginToolParameters(declared: unknown): Record<string, unknown> | undefined {
+  if (!declared || typeof declared !== "object" || Array.isArray(declared)) return undefined;
+  if ((declared as { type?: unknown }).type !== "object") return undefined;
+  try {
+    return structuredClone(declared) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
 export class PluginRunner {
   private readonly log = createLogger("plugin-runner");
   private cachedTools: CachedTools | null = null;
@@ -204,6 +229,10 @@ export class PluginRunner {
   private promptContributionsCacheVersion = 0;
   /** Map of pluginId → the registry trait ids it currently has registered. */
   private registeredPluginTraitIds = new Map<string, string[]>();
+  /** Map of pluginId → trait ids kept registered but degraded because a live card sat in a column using them when they were removed. */
+  private retainedDegradedTraitIds = new Map<string, string[]>();
+  /** In-flight live-dependents checks for removed traits. */
+  private pendingTraitRemovals = new Set<Promise<void>>();
   /** Map of pluginId → the workflow extension ids it currently has registered. */
   private registeredPluginWorkflowExtensionIds = new Map<string, string[]>();
   /** Map of pluginId → the step-parser registry ids it currently has registered
@@ -312,6 +341,9 @@ export class PluginRunner {
     // Stop all plugins
     await this.options.pluginLoader.stopAllPlugins();
 
+    // Settle trait removal checks so none reads the task store after shutdown returns.
+    await this.waitForPluginTraitRemovals();
+
     executorLog.log("PluginRunner shutdown complete");
   }
 
@@ -330,9 +362,8 @@ export class PluginRunner {
    */
   getPluginTools(): ToolDefinition[] {
     if (!this.cachedTools || this.cachedTools.version !== this.toolsCacheVersion) {
-      const pluginTools = this.options.pluginLoader.getPluginTools();
       this.cachedTools = {
-        tools: this.convertPluginTools(pluginTools),
+        tools: this.convertPluginTools(this.collectOwnedPluginTools()),
         version: this.toolsCacheVersion,
       };
     }
@@ -478,13 +509,15 @@ export class PluginRunner {
 
   /**
    * Register all currently-loaded plugins' trait contributions into the core
-   * TraitRegistry (plugin-namespaced ids). Re-runs on cache invalidation. Traits
-   * for plugins no longer present are dropped from the registry (degraded path
-   * is the force-disable route; a clean unload removes them).
+   * TraitRegistry (plugin-namespaced ids). Re-runs on cache invalidation.
+   *
+   * FNXC:PluginTraits 2026-10-07-19:36:
+   * Removing a trait (plugin disabled, uninstalled, or reloaded without it) must pass the live-dependents guard, whichever path removed it: dashboard, CLI and store events all end in this sync.
+   * Hooks of a removed trait stop at once. A definition still used by a column holding a live card stays registered and degraded, audited once as plugin:trait-degraded, so the card stays movable and workflow validation still knows the trait; one with no dependents is unregistered.
+   * Retained definitions are re-checked on every later sync and removed once their last live card leaves, and a re-enable re-arms their hooks.
    */
   syncPluginTraits(): void {
     const registry = getTraitRegistry();
-    const runner = this.traitHookRunner;
     const current = this.getPluginTraits();
 
     // Group contributions by plugin id.
@@ -495,37 +528,138 @@ export class PluginRunner {
       byPlugin.set(pluginId, list);
     }
 
-    // Drop traits for plugins no longer present.
-    for (const [pluginId, ids] of [...this.registeredPluginTraitIds.entries()]) {
-      if (!byPlugin.has(pluginId)) {
-        unregisterPluginTraits(registry, ids);
-        this.registeredPluginTraitIds.delete(pluginId);
-      }
+    const removedByPlugin = new Map<string, string[]>();
+    for (const [pluginId, ids] of this.registeredPluginTraitIds) {
+      if (!byPlugin.has(pluginId)) removedByPlugin.set(pluginId, ids);
     }
+    for (const pluginId of removedByPlugin.keys()) this.registeredPluginTraitIds.delete(pluginId);
 
-    if (!runner) {
-      // No runner yet: don't register hooks (they'd degrade to no-ops anyway).
-      // Definitions still register so the catalog/validation see them.
-      for (const [pluginId, contributions] of byPlugin) {
-        const ids = registerPluginTraits({
-          registry,
-          pluginId,
-          contributions,
-          runCustomNode: async () => ({ outcome: "success" as const }),
-        });
-        this.registeredPluginTraitIds.set(pluginId, ids);
-      }
-      return;
-    }
-
+    // Without a runner, definitions still register so the catalog/validation see
+    // them; hooks resolve to a success no-op until the executor wires a runner.
+    const runCustomNode: WorkflowCustomNodeRunner = this.traitHookRunner ?? (async () => ({ outcome: "success" as const }));
     for (const [pluginId, contributions] of byPlugin) {
+      const previous = this.registeredPluginTraitIds.get(pluginId) ?? [];
       try {
-        const ids = registerPluginTraits({ registry, pluginId, contributions, runCustomNode: runner });
+        const ids = registerPluginTraits({ registry, pluginId, contributions, runCustomNode });
         this.registeredPluginTraitIds.set(pluginId, ids);
+        const dropped = previous.filter((id) => !ids.includes(id));
+        if (dropped.length > 0) removedByPlugin.set(pluginId, dropped);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.log.warn(`Failed to register traits for plugin '${pluginId}': ${msg}`);
       }
+    }
+
+    for (const [pluginId, ids] of removedByPlugin) {
+      degradePluginTraits(registry, ids);
+      this.trackTraitRemoval(this.settleRemovedPluginTraits(pluginId, ids));
+    }
+
+    // Re-check definitions retained by an earlier removal; a re-registered id is live again.
+    for (const [pluginId, retained] of [...this.retainedDegradedTraitIds]) {
+      const live = new Set(this.registeredPluginTraitIds.get(pluginId) ?? []);
+      const stillRetained = retained.filter((id) => !live.has(id));
+      if (stillRetained.length === 0) {
+        this.retainedDegradedTraitIds.delete(pluginId);
+        continue;
+      }
+      this.retainedDegradedTraitIds.set(pluginId, stillRetained);
+      if (!removedByPlugin.has(pluginId)) {
+        this.trackTraitRemoval(this.settleRemovedPluginTraits(pluginId, stillRetained));
+      }
+    }
+  }
+
+  /** Resolves once every in-flight trait removal check has settled. */
+  async waitForPluginTraitRemovals(): Promise<void> {
+    while (this.pendingTraitRemovals.size > 0) {
+      await Promise.allSettled([...this.pendingTraitRemovals]);
+    }
+  }
+
+  private trackTraitRemoval(removal: Promise<void>): void {
+    const tracked: Promise<void> = removal.finally(() => {
+      this.pendingTraitRemovals.delete(tracked);
+    });
+    this.pendingTraitRemovals.add(tracked);
+  }
+
+  /**
+   * Decide the fate of removed, already degraded trait ids: unregister the ones no live card depends on and keep the rest degraded.
+   * Ids a re-enable registered while the check ran are left alone. A failed check keeps every definition degraded; a passive definition is harmless and the next sync retries.
+   */
+  private async settleRemovedPluginTraits(pluginId: string, ids: string[]): Promise<void> {
+    let dependents: PluginTraitDependent[];
+    try {
+      dependents = await findLivePluginTraitDependents({
+        store: this.options.taskStore,
+        resolveTaskWorkflowIr: (taskId) => this.resolveTaskWorkflowIr(taskId),
+        pluginTraitIds: ids,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.warn(`Live-dependents check failed for removed traits of plugin '${pluginId}'; keeping them degraded: ${msg}`);
+      this.updateRetainedTraitIds(pluginId, ids, []);
+      return;
+    }
+
+    const live = new Set(this.registeredPluginTraitIds.get(pluginId) ?? []);
+    const removed = ids.filter((id) => !live.has(id));
+    const occupied = new Set(dependents.flatMap((d) => d.traitIds));
+    const keep = removed.filter((id) => occupied.has(id));
+    const drop = removed.filter((id) => !occupied.has(id));
+
+    unregisterPluginTraits(getTraitRegistry(), drop);
+    const newlyRetained = this.updateRetainedTraitIds(pluginId, keep, drop);
+    if (newlyRetained.length > 0) {
+      const affected = dependents.filter((d) => d.traitIds.some((id) => newlyRetained.includes(id)));
+      this.log.warn(
+        `Plugin '${pluginId}' traits ${newlyRetained.join(", ")} stay registered as passive: ` +
+          `${affected.map((d) => `${d.taskId}@${d.column}`).join(", ")} still occupy columns using them`,
+      );
+      this.emitTraitDegradedAudit(pluginId, newlyRetained, affected, "unload-with-live-dependents");
+    }
+  }
+
+  /** Add `keep` to and remove `drop` from a plugin's retained set, ignoring live ids. Returns ids retained for the first time. */
+  private updateRetainedTraitIds(pluginId: string, keep: string[], drop: string[]): string[] {
+    const live = new Set(this.registeredPluginTraitIds.get(pluginId) ?? []);
+    const previous = new Set(this.retainedDegradedTraitIds.get(pluginId) ?? []);
+    const next = new Set([...previous].filter((id) => !drop.includes(id) && !live.has(id)));
+    const newlyRetained: string[] = [];
+    for (const id of keep) {
+      if (live.has(id)) continue;
+      if (!previous.has(id)) newlyRetained.push(id);
+      next.add(id);
+    }
+    if (next.size > 0) this.retainedDegradedTraitIds.set(pluginId, [...next]);
+    else this.retainedDegradedTraitIds.delete(pluginId);
+    return newlyRetained;
+  }
+
+  private emitTraitDegradedAudit(
+    pluginId: string,
+    degradedTraitIds: string[],
+    dependents: PluginTraitDependent[],
+    source: "force-disable" | "unload-with-live-dependents",
+  ): void {
+    try {
+      void emitBoundedRunAudit(this.options.taskStore, {
+        agentId: "system",
+        runId: `plugin-trait-degrade-${pluginId}-${Date.now()}`,
+        domain: "database",
+        mutationType: "plugin:trait-degraded",
+        target: pluginId,
+        metadata: {
+          pluginId,
+          degradedTraitIds,
+          affectedTasks: dependents.map((d) => d.taskId),
+          source,
+          note: "hooks now resolve to no-ops; cards remain movable",
+        },
+      }, { log: this.log });
+    } catch {
+      // Audit is best-effort; degradation already applied.
     }
   }
 
@@ -674,23 +808,7 @@ export class PluginRunner {
     }
     const degraded = degradePluginTraits(registry, ids);
     if (degraded.length > 0) {
-      try {
-        void emitBoundedRunAudit(this.options.taskStore, {
-          agentId: "system",
-          runId: `plugin-trait-degrade-${pluginId}-${Date.now()}`,
-          domain: "database",
-          mutationType: "plugin:trait-degraded",
-          target: pluginId,
-          metadata: {
-            pluginId,
-            degradedTraitIds: degraded,
-            affectedTasks: dependents.map((d) => d.taskId),
-            note: "hooks now resolve to no-ops; cards remain movable",
-          },
-        }, { log: this.log });
-      } catch {
-        // Audit is best-effort; degradation already applied.
-      }
+      this.emitTraitDegradedAudit(pluginId, degraded, dependents, "force-disable");
     }
     return { degraded, dependents };
   }
@@ -1162,30 +1280,55 @@ export class PluginRunner {
   // ── Tool Conversion ───────────────────────────────────────────────
 
   /**
-   * Convert PluginToolDefinition[] to ToolDefinition[] for the pi-coding-agent.
+   * Collect plugin tools with their owning plugin id, one entry per exposed name.
    *
-   * Plugin tools have this signature:
-   *   execute(params: Record<string, unknown>, ctx: PluginContext): Promise<PluginToolResult>
-   *
-   * Engine ToolDefinition has this signature:
-   *   execute(toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult>
-   *
-   * The conversion:
-   * 1. Prefixes the tool name with "plugin_"
-   * 2. Maps name/description directly (use name as label)
-   * 3. Wraps execute to extract params and call plugin's execute
-   * 4. Returns { content: result.content } format
+   * FNXC:PluginTools 2026-10-07-19:36:
+   * Ownership is carried from collection, never inferred by name: inferring it bound a second plugin's same-named tool to the first plugin's context (settings, identity, destructive-operation permission).
+   * Exposed names are unique per session because providers reject duplicate tool names. On a collision the plugin with the lowest id keeps the name, independent of load order, and the others are skipped with a warning naming both plugins.
    */
-  private convertPluginTools(pluginTools: PluginToolDefinition[]): ToolDefinition[] {
-    return pluginTools.map((pluginTool) => {
-      // Get the plugin context for this tool
-      const pluginId = this.getPluginIdForTool(pluginTool);
-      const plugin = pluginId ? this.options.pluginLoader.getPlugin(pluginId) : undefined;
+  private collectOwnedPluginTools(): OwnedPluginTool[] {
+    const plugins = [...this.options.pluginLoader.getLoadedPlugins()]
+      .sort((a, b) => (a.manifest.id < b.manifest.id ? -1 : a.manifest.id > b.manifest.id ? 1 : 0));
+    const owners = new Map<string, string>();
+    const owned: OwnedPluginTool[] = [];
+    for (const plugin of plugins) {
+      const pluginId = plugin.manifest.id;
+      for (const tool of plugin.tools ?? []) {
+        const exposedName = `${PLUGIN_TOOL_PREFIX}${tool.name}`;
+        const existingOwner = owners.get(exposedName);
+        if (existingOwner !== undefined) {
+          if (existingOwner !== pluginId) {
+            this.log.warn(
+              `Plugin tool '${exposedName}' from plugin '${pluginId}' is skipped: plugin '${existingOwner}' already exposes that name`,
+            );
+          } else {
+            this.log.warn(`Plugin '${pluginId}' declares tool '${exposedName}' more than once; only the first is exposed`);
+          }
+          continue;
+        }
+        const parameters = toPluginToolParameters(tool.parameters);
+        if (!parameters) {
+          this.log.warn(
+            `Plugin tool '${exposedName}' from plugin '${pluginId}' is skipped: parameters must be a JSON Schema object with type "object"`,
+          );
+          continue;
+        }
+        owners.set(exposedName, pluginId);
+        owned.push({ pluginId, tool, exposedName, parameters });
+      }
+    }
+    return owned;
+  }
 
-      // Store the timeout for use in the closure
-      const timeout = this.hookTimeoutMs;
-
-      // Create wrapper that extracts params and uses stored context
+  /**
+   * Convert owned plugin tools to the pi-coding-agent ToolDefinition shape.
+   *
+   * FNXC:PluginTools 2026-10-07-19:36:
+   * The agent-visible schema is the plugin's declared JSON Schema (pi-ai validates arguments against it and providers advertise its properties and required fields); it previously advertised Type.Any(), so required arguments never reached the model.
+   * Each call resolves the owner's currently loaded instance and its same-named tool, so a session that captured definitions before a reload runs the new module, and one that captured them before an unload gets "not available" instead of a torn-down module.
+   */
+  private convertPluginTools(ownedTools: OwnedPluginTool[]): ToolDefinition[] {
+    return ownedTools.map(({ pluginId, tool: declaredTool, exposedName, parameters }) => {
       const wrappedExecute = async (
         _toolCallId: string,
         params: Record<string, unknown>,
@@ -1193,24 +1336,25 @@ export class PluginRunner {
         _onUpdate: unknown | undefined,
         _ctx: unknown,
       ) => {
-        if (!plugin) {
+        const plugin = this.options.pluginLoader.getPlugin(pluginId);
+        const currentTool = plugin?.tools?.find((t) => t.name === declaredTool.name);
+        if (!plugin || !currentTool) {
           return {
-            content: [{ type: "text" as const, text: "Plugin not available" }],
+            content: [{ type: "text" as const, text: `Plugin tool ${exposedName} is not available: plugin '${pluginId}' is not loaded` }],
+            isError: true,
             details: {},
           };
         }
 
-        // Create context for this specific tool call
         const context = await this.createToolContext(plugin);
 
         try {
           const result = await this.withTimeout(
-            pluginTool.execute(params as Record<string, unknown>, context),
-            timeout,
-            `Tool ${pluginTool.name} execution timed out`,
+            currentTool.execute(params as Record<string, unknown>, context),
+            this.hookTimeoutMs,
+            `Tool ${declaredTool.name} execution timed out`,
           );
 
-          // Convert PluginToolResult to AgentToolResult
           return {
             content: result.content,
             isError: result.isError ?? false,
@@ -1225,32 +1369,14 @@ export class PluginRunner {
         }
       };
 
-      // Use Type.Any for plugin tool parameters since plugins use JSON Schema
-      // which is compatible with TypeBox's Any type
-      const anySchema = Type.Any();
-
       return {
-        name: `plugin_${pluginTool.name}`,
-        label: pluginTool.name,
-        description: pluginTool.description,
-        parameters: anySchema,
+        name: exposedName,
+        label: declaredTool.name,
+        description: declaredTool.description,
+        parameters: Type.Unsafe<Record<string, unknown>>(parameters),
         execute: wrappedExecute,
       };
     });
-  }
-
-  /**
-   * Get the plugin ID that owns a tool.
-   * We infer it from the loader's perspective - tools are stored per plugin.
-   */
-  private getPluginIdForTool(tool: PluginToolDefinition): string | undefined {
-    const loadedPlugins = this.options.pluginLoader.getLoadedPlugins();
-    for (const plugin of loadedPlugins) {
-      if (plugin.tools?.some((t) => t.name === tool.name)) {
-        return plugin.manifest.id;
-      }
-    }
-    return undefined;
   }
 
   /**

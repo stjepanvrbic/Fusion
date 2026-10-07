@@ -10,13 +10,14 @@ import { PluginRunner, type PluginRunnerOptions } from "../plugins/plugin-runner
 import { RENAMED_VOCAB, lifecycleIr } from "./_workflow-vocabulary-fixture.js";
 import {
   __resetWorkflowExtensionRegistryForTests,
+  getTraitRegistry,
   getWorkflowExtensionRegistry,
   workflowExtensionRegistryId,
   type PluginLoader,
   type PluginStore,
   type PluginInstallation,
 } from "@fusion/core";
-import type { FusionPlugin, PluginToolDefinition } from "@fusion/core";
+import type { FusionPlugin, PluginContext, PluginToolDefinition } from "@fusion/core";
 
 /*
 FNXC:PluginRunnerTests 2026-08-17-12:11:
@@ -320,7 +321,7 @@ describe("PluginRunner", () => {
           execute: vi.fn(),
         },
       ];
-      mockPluginLoader.getPluginTools.mockReturnValue(mockTools);
+      mockPluginLoader.getLoadedPlugins.mockReturnValue([createMockPlugin({ tools: mockTools })]);
       
       await pluginRunner.init();
       const tools1 = pluginRunner.getPluginTools();
@@ -339,7 +340,419 @@ describe("PluginRunner", () => {
       
       // Next call should rebuild cache
       const tools3 = pluginRunner.getPluginTools();
-      expect(mockPluginLoader.getPluginTools).toHaveBeenCalledTimes(2);
+      expect(tools3).not.toBe(tools1);
+      expect(tools3.map((t) => t.name)).toEqual(["plugin_test-tool"]);
+    });
+  });
+
+  /*
+  FNXC:PluginTools 2026-10-07-19:36:
+  Each exposed plugin tool carries its owning plugin from collection onward. The agent sees the declared JSON Schema unchanged, a call executes the owner's currently loaded instance with the owner's context, and a duplicate exposed name is never bound to another plugin's context.
+  */
+  describe("plugin tool conversion", () => {
+    const linearBrowseSchema = {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Optional text search." },
+        state: { type: "string", enum: ["active", "backlog", "all"] },
+        limit: { type: "number", minimum: 1, maximum: 100 },
+      },
+      required: [],
+    };
+    const linearImportSchema = {
+      type: "object",
+      properties: { issueId: { type: "string", description: "Linear issue id." } },
+      required: ["issueId"],
+    };
+    const pressUpdateSchema = {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        draft: { type: "object", additionalProperties: true },
+        tags: { type: "array", items: { type: "string" } },
+      },
+      required: ["id", "draft"],
+    };
+
+    type ToolExecute = (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
+
+    const toolPlugin = (
+      id: string,
+      tools: PluginToolDefinition[],
+      overrides: Partial<FusionPlugin> = {},
+    ): FusionPlugin => createMockPlugin({
+      manifest: { id, name: id, version: "1.0.0" },
+      tools,
+      ...overrides,
+    });
+
+    const tool = (
+      name: string,
+      parameters: Record<string, unknown>,
+      execute: PluginToolDefinition["execute"] = vi.fn(async () => ({ content: [{ type: "text" as const, text: name }] })),
+    ): PluginToolDefinition => ({ name, description: `${name} tool`, parameters, execute });
+
+    const loadPlugins = (plugins: FusionPlugin[]) => {
+      mockPluginLoader.getLoadedPlugins.mockImplementation(() => plugins);
+      mockPluginLoader.getPlugin.mockImplementation((id: string) => plugins.find((p) => p.manifest.id === id));
+      mockPluginLoader.getPluginTools.mockImplementation(() => plugins.flatMap((p) => p.tools ?? []));
+    };
+
+    const runTool = async (exposedName: string, params: Record<string, unknown> = {}) => {
+      const converted = pluginRunner.getPluginTools().find((t) => t.name === exposedName);
+      expect(converted, `tool ${exposedName} is exposed`).toBeDefined();
+      return (converted!.execute as unknown as ToolExecute)("call-1", params, undefined, undefined, undefined);
+    };
+
+    it("advertises the declared JSON Schema for every tool", async () => {
+      loadPlugins([
+        toolPlugin("linear", [tool("linear_browse", linearBrowseSchema), tool("linear_import", linearImportSchema)]),
+        toolPlugin("press", [tool("press_update", pressUpdateSchema)]),
+      ]);
+      await pluginRunner.init();
+
+      const byName = new Map(pluginRunner.getPluginTools().map((t) => [t.name, t]));
+      expect(byName.get("plugin_linear_browse")?.parameters).toEqual(linearBrowseSchema);
+      expect(byName.get("plugin_linear_import")?.parameters).toEqual(linearImportSchema);
+      expect(byName.get("plugin_press_update")?.parameters).toEqual(pressUpdateSchema);
+    });
+
+    it("validates arguments against the declared schema through pi-ai", async () => {
+      const { validateToolArguments } = await import("@earendil-works/pi-ai");
+      loadPlugins([
+        toolPlugin("linear", [tool("linear_browse", linearBrowseSchema), tool("linear_import", linearImportSchema)]),
+        toolPlugin("press", [tool("press_update", pressUpdateSchema)]),
+      ]);
+      await pluginRunner.init();
+      type ValidateArgs = Parameters<typeof validateToolArguments>;
+      const tools = pluginRunner.getPluginTools() as unknown as ValidateArgs[0][];
+      const check = (name: string, args: Record<string, unknown>) => validateToolArguments(
+        tools.find((t) => t.name === name)!,
+        { type: "toolCall", id: "c1", name, arguments: args } as unknown as ValidateArgs[1],
+      );
+
+      expect(() => check("plugin_linear_import", {})).toThrow(/issueId/);
+      expect(check("plugin_linear_import", { issueId: "ENG-1" })).toEqual({ issueId: "ENG-1" });
+      expect(() => check("plugin_linear_browse", { state: "bogus" })).toThrow();
+      expect(() => check("plugin_linear_browse", { limit: 500 })).toThrow();
+      expect(check("plugin_linear_browse", {})).toEqual({});
+      expect(() => check("plugin_press_update", { id: "x" })).toThrow(/draft/);
+      expect(() => check("plugin_press_update", { id: "x", draft: {}, tags: [{}] })).toThrow();
+      expect(check("plugin_press_update", { id: "x", draft: { a: 1 }, tags: ["t"] })).toEqual({ id: "x", draft: { a: 1 }, tags: ["t"] });
+    });
+
+    it("does not let a plugin mutate the advertised schema after conversion", async () => {
+      const schema = structuredClone(linearImportSchema);
+      loadPlugins([toolPlugin("linear", [tool("linear_import", schema)])]);
+      await pluginRunner.init();
+      const advertised = pluginRunner.getPluginTools()[0].parameters;
+      (schema.properties as Record<string, unknown>).injected = { type: "string" };
+      expect(advertised).toEqual(linearImportSchema);
+    });
+
+    it("excludes a tool whose schema is not an object schema and keeps the plugin's valid tools", async () => {
+      loadPlugins([
+        toolPlugin("linear", [
+          tool("bad_scalar", { type: "string" }),
+          tool("bad_missing", undefined as unknown as Record<string, unknown>),
+          tool("linear_import", linearImportSchema),
+        ]),
+      ]);
+      await pluginRunner.init();
+      expect(pluginRunner.getPluginTools().map((t) => t.name)).toEqual(["plugin_linear_import"]);
+      expect(pluginRunnerLogger.warn).toHaveBeenCalledWith(expect.stringContaining("bad_scalar"));
+      expect(pluginRunnerLogger.warn).toHaveBeenCalledWith(expect.stringContaining("bad_missing"));
+    });
+
+    it.each([
+      ["alpha loaded first", ["alpha", "beta"]],
+      ["beta loaded first", ["beta", "alpha"]],
+    ])("binds each tool to its owner's context with duplicate names (%s)", async (_label, order) => {
+      const contexts = new Map<string, { pluginId: string; settings: Record<string, unknown> }>();
+      const make = (id: string) => toolPlugin(
+        id,
+        [
+          tool("lookup", { type: "object", properties: {} }, vi.fn(async (_p, ctx) => {
+            contexts.set(`lookup:${id}`, { pluginId: ctx.pluginId, settings: ctx.settings });
+            return { content: [{ type: "text" as const, text: id }] };
+          })),
+          tool(`${id}_only`, { type: "object", properties: {} }, vi.fn(async (_p, ctx) => {
+            contexts.set(`${id}_only`, { pluginId: ctx.pluginId, settings: ctx.settings });
+            return { content: [{ type: "text" as const, text: id }] };
+          })),
+        ],
+      );
+      loadPlugins(order.map(make));
+      mockPluginStore.getPlugin.mockImplementation(async (id: string) => ({ id, settings: { owner: id } }));
+      await pluginRunner.init();
+
+      const names = pluginRunner.getPluginTools().map((t) => t.name);
+      expect(new Set(names).size).toBe(names.length);
+      expect(names.filter((n) => n === "plugin_lookup")).toHaveLength(1);
+
+      // The shared name resolves deterministically to the lowest plugin id regardless of load order.
+      const shared = await runTool("plugin_lookup");
+      expect(shared.content[0].text).toBe("alpha");
+      expect(contexts.get("lookup:alpha")).toEqual({ pluginId: "alpha", settings: { owner: "alpha" } });
+      expect(contexts.has("lookup:beta")).toBe(false);
+
+      await runTool("plugin_alpha_only");
+      await runTool("plugin_beta_only");
+      expect(contexts.get("alpha_only")).toEqual({ pluginId: "alpha", settings: { owner: "alpha" } });
+      expect(contexts.get("beta_only")).toEqual({ pluginId: "beta", settings: { owner: "beta" } });
+      expect(pluginRunnerLogger.warn).toHaveBeenCalledWith(expect.stringMatching(/plugin_lookup.*beta/));
+    });
+
+    it("gates each duplicate-name owner's TaskStore by its own manifest permissions", async () => {
+      const seen = new Map<string, PluginContext>();
+      const make = (id: string, destructive: boolean) => toolPlugin(
+        id,
+        [tool(`${id}_tool`, { type: "object", properties: {} }, vi.fn(async (_p, ctx) => {
+          seen.set(id, ctx);
+          return { content: [{ type: "text" as const, text: id }] };
+        }))],
+        { manifest: { id, name: id, version: "1.0.0", permissions: { destructiveTaskOps: destructive } } as FusionPlugin["manifest"] },
+      );
+      loadPlugins([make("safe", false), make("admin", true)]);
+      (mockTaskStore as unknown as { deleteTask: ReturnType<typeof vi.fn> }).deleteTask = vi.fn(async () => undefined);
+      await pluginRunner.init();
+
+      await runTool("plugin_safe_tool");
+      await runTool("plugin_admin_tool");
+      expect(seen.get("safe")?.pluginId).toBe("safe");
+      expect(seen.get("admin")?.pluginId).toBe("admin");
+      expect(() => (seen.get("safe")!.taskStore as unknown as { deleteTask: (id: string) => Promise<void> }).deleteTask("FN-1")).toThrow();
+      await expect((seen.get("admin")!.taskStore as unknown as { deleteTask: (id: string) => Promise<void> }).deleteTask("FN-1")).resolves.toBeUndefined();
+    });
+
+    it("executes the reloaded instance from a tool definition captured before reload", async () => {
+      const v1 = vi.fn(async () => ({ content: [{ type: "text" as const, text: "v1" }] }));
+      const v2 = vi.fn(async () => ({ content: [{ type: "text" as const, text: "v2" }] }));
+      let current = toolPlugin("reports", [tool("reports_get", linearImportSchema, v1)]);
+      mockPluginLoader.getLoadedPlugins.mockImplementation(() => [current]);
+      mockPluginLoader.getPlugin.mockImplementation((id: string) => (id === "reports" ? current : undefined));
+      await pluginRunner.init();
+      const captured = pluginRunner.getPluginTools()[0];
+
+      current = toolPlugin("reports", [tool("reports_get", linearImportSchema, v2)]);
+      const result = await (captured.execute as unknown as ToolExecute)("c", { issueId: "1" }, undefined, undefined, undefined);
+      expect(result.content[0].text).toBe("v2");
+      expect(v1).not.toHaveBeenCalled();
+    });
+
+    it("reports the tool unavailable after its plugin unloads instead of running the unloaded module", async () => {
+      const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }] }));
+      let loaded: FusionPlugin[] = [toolPlugin("reports", [tool("reports_get", linearImportSchema, execute)])];
+      mockPluginLoader.getLoadedPlugins.mockImplementation(() => loaded);
+      mockPluginLoader.getPlugin.mockImplementation((id: string) => loaded.find((p) => p.manifest.id === id));
+      await pluginRunner.init();
+      const captured = pluginRunner.getPluginTools()[0];
+
+      loaded = [];
+      const result = await (captured.execute as unknown as ToolExecute)("c", {}, undefined, undefined, undefined);
+      expect(execute).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/not available/i);
+    });
+  });
+
+  /*
+  FNXC:PluginTraits 2026-10-07-19:36:
+  Every trait removal (disable, uninstall, a reload that drops a trait) runs the live-dependents guard: hooks stop at once, a definition still used by a column holding a live card stays registered and degraded with an audit row, and one with no dependents is removed.
+  */
+  describe("plugin trait removal guard", () => {
+    const PLUGIN = "gatekeeper";
+    const GATE_ID = `plugin:${PLUGIN}:review-gate`;
+    const NOTE_ID = `plugin:${PLUGIN}:release-note`;
+    const gateTrait = {
+      traitId: "review-gate",
+      name: "Review Gate",
+      schemaVersion: 1 as const,
+      hooks: { gate: { mode: "prompt" as const, prompt: "Check the diff" } },
+    };
+    const noteTrait = {
+      traitId: "release-note",
+      name: "Release Note",
+      schemaVersion: 1 as const,
+      hooks: { onEnter: { mode: "prompt" as const, prompt: "Draft a note" } },
+    };
+
+    let traits: Array<{ pluginId: string; trait: typeof gateTrait | typeof noteTrait }>;
+    let tasks: Array<{ id: string; column: string }>;
+    let ir: unknown;
+
+    const loaderHandler = (event: string) =>
+      mockPluginLoader.on.mock.calls.find((call) => call[0] === event)?.[1] as (e: { pluginId: string }) => void;
+    const storeHandler = (event: string) =>
+      mockPluginStore.on.mock.calls.find((call) => call[0] === event)?.[1] as (p: { id: string }) => Promise<void>;
+    const auditRows = () => mockTaskStore.recordRunAuditEvent.mock.calls
+      .map((call) => call[0] as { mutationType: string; metadata: Record<string, unknown> })
+      .filter((row) => row.mutationType === "plugin:trait-degraded");
+    const hookState = (traitId: string, hook: "gate" | "onEnter") =>
+      getTraitRegistry().resolveTraitHook(traitId, hook);
+
+    // The shared registry also holds the built-in traits other suites resolve, so clean up by id rather than resetting it.
+    const removePluginTraits = () => {
+      getTraitRegistry().unregisterTrait(GATE_ID);
+      getTraitRegistry().unregisterTrait(NOTE_ID);
+    };
+
+    beforeEach(async () => {
+      removePluginTraits();
+      traits = [{ pluginId: PLUGIN, trait: gateTrait }, { pluginId: PLUGIN, trait: noteTrait }];
+      tasks = [];
+      // A renamed review lane: the guard keys on the column's traits, never on a lane id.
+      ir = { columns: [{ id: "checking", traits: [{ trait: GATE_ID }] }, { id: "shipped", traits: [] }] };
+      (mockPluginLoader as unknown as { getPluginTraits: () => unknown }).getPluginTraits = vi.fn(() => traits);
+      (mockTaskStore as unknown as { listTasks: () => Promise<unknown> }).listTasks = vi.fn(async () => tasks);
+      vi.spyOn(pluginRunner as unknown as { resolveTaskWorkflowIr: () => Promise<unknown> }, "resolveTaskWorkflowIr")
+        .mockImplementation(async () => ir);
+      pluginRunner.setTraitHookRunner(vi.fn(async () => ({ outcome: "success" as const })));
+      await pluginRunner.init();
+    });
+
+    afterEach(() => {
+      removePluginTraits();
+    });
+
+    const unloadPlugin = async (via: "loader-unload" | "store-disable" | "store-unregister") => {
+      if (via === "loader-unload") {
+        traits = [];
+        loaderHandler("plugin:unloaded")({ pluginId: PLUGIN });
+      } else {
+        // The loader removes the instance during stopPlugin and emits plugin:unloaded, as in production.
+        mockPluginLoader.stopPlugin.mockImplementationOnce(async () => {
+          traits = [];
+          loaderHandler("plugin:unloaded")({ pluginId: PLUGIN });
+        });
+        await storeHandler(via === "store-disable" ? "plugin:disabled" : "plugin:unregistered")({ id: PLUGIN });
+      }
+      await pluginRunner.waitForPluginTraitRemovals();
+    };
+
+    it("registers both traits with live hooks while the plugin is loaded", () => {
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+      expect(hookState(GATE_ID, "gate").warning).toBeUndefined();
+      expect(hookState(NOTE_ID, "onEnter").warning).toBeUndefined();
+    });
+
+    it.each(["loader-unload", "store-disable", "store-unregister"] as const)(
+      "keeps an occupied trait degraded and audited, and removes an unoccupied one (%s)",
+      async (via) => {
+        tasks = [{ id: "FN-1", column: "checking" }, { id: "FN-2", column: "shipped" }];
+        await unloadPlugin(via);
+
+        expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+        expect(hookState(GATE_ID, "gate").warning?.kind).toBe("missing-hook-impl");
+        expect(getTraitRegistry().has(NOTE_ID)).toBe(false);
+
+        const rows = auditRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].metadata).toMatchObject({
+          pluginId: PLUGIN,
+          degradedTraitIds: [GATE_ID],
+          affectedTasks: ["FN-1"],
+          source: "unload-with-live-dependents",
+        });
+      },
+    );
+
+    it("removes every trait definition when no live card depends on them", async () => {
+      tasks = [{ id: "FN-2", column: "shipped" }];
+      await unloadPlugin("store-disable");
+      expect(getTraitRegistry().has(GATE_ID)).toBe(false);
+      expect(getTraitRegistry().has(NOTE_ID)).toBe(false);
+      expect(auditRows()).toHaveLength(0);
+    });
+
+    it("stops hooks immediately, before the dependents check settles", async () => {
+      let releaseList!: () => void;
+      (mockTaskStore as unknown as { listTasks: () => Promise<unknown> }).listTasks = vi.fn(
+        () => new Promise((resolve) => { releaseList = () => resolve(tasks); }),
+      );
+      traits = [];
+      loaderHandler("plugin:unloaded")({ pluginId: PLUGIN });
+
+      expect(hookState(GATE_ID, "gate").warning?.kind).toBe("missing-hook-impl");
+      expect(hookState(NOTE_ID, "onEnter").warning?.kind).toBe("missing-hook-impl");
+      releaseList();
+      await pluginRunner.waitForPluginTraitRemovals();
+    });
+
+    it("keeps definitions degraded when the dependents check fails", async () => {
+      (mockTaskStore as unknown as { listTasks: () => Promise<unknown> }).listTasks = vi.fn(async () => {
+        throw new Error("store closed");
+      });
+      await unloadPlugin("loader-unload");
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+      expect(getTraitRegistry().has(NOTE_ID)).toBe(true);
+      expect(hookState(GATE_ID, "gate").warning?.kind).toBe("missing-hook-impl");
+    });
+
+    it("does not remove traits a re-enable registered while the check was in flight", async () => {
+      let releaseList!: () => void;
+      (mockTaskStore as unknown as { listTasks: () => Promise<unknown> }).listTasks = vi.fn(
+        () => new Promise((resolve) => { releaseList = () => resolve([]); }),
+      );
+      traits = [];
+      loaderHandler("plugin:unloaded")({ pluginId: PLUGIN });
+
+      traits = [{ pluginId: PLUGIN, trait: gateTrait }, { pluginId: PLUGIN, trait: noteTrait }];
+      loaderHandler("plugin:loaded")({ pluginId: PLUGIN });
+      releaseList();
+      await pluginRunner.waitForPluginTraitRemovals();
+
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+      expect(hookState(GATE_ID, "gate").warning).toBeUndefined();
+      expect(getTraitRegistry().has(NOTE_ID)).toBe(true);
+    });
+
+    it("re-arms hooks when a plugin whose traits were retained is enabled again", async () => {
+      tasks = [{ id: "FN-1", column: "checking" }];
+      await unloadPlugin("loader-unload");
+      expect(hookState(GATE_ID, "gate").warning?.kind).toBe("missing-hook-impl");
+
+      traits = [{ pluginId: PLUGIN, trait: gateTrait }];
+      loaderHandler("plugin:loaded")({ pluginId: PLUGIN });
+      await pluginRunner.waitForPluginTraitRemovals();
+      expect(hookState(GATE_ID, "gate").warning).toBeUndefined();
+    });
+
+    it("removes a retained degraded trait once its last live card leaves, without a second audit row", async () => {
+      tasks = [{ id: "FN-1", column: "checking" }];
+      await unloadPlugin("loader-unload");
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+
+      // Still occupied on the next lifecycle event: kept, not audited again.
+      loaderHandler("plugin:reloaded")({ pluginId: "other-plugin" });
+      await pluginRunner.waitForPluginTraitRemovals();
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+
+      tasks = [{ id: "FN-1", column: "shipped" }];
+      loaderHandler("plugin:reloaded")({ pluginId: "other-plugin" });
+      await pluginRunner.waitForPluginTraitRemovals();
+      expect(getTraitRegistry().has(GATE_ID)).toBe(false);
+      expect(auditRows()).toHaveLength(1);
+    });
+
+    it("guards a trait that a reload of the same plugin no longer contributes", async () => {
+      tasks = [{ id: "FN-1", column: "checking" }];
+      traits = [{ pluginId: PLUGIN, trait: noteTrait }];
+      loaderHandler("plugin:reloaded")({ pluginId: PLUGIN });
+      await pluginRunner.waitForPluginTraitRemovals();
+
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+      expect(hookState(GATE_ID, "gate").warning?.kind).toBe("missing-hook-impl");
+      expect(hookState(NOTE_ID, "onEnter").warning).toBeUndefined();
+      expect(auditRows()[0]?.metadata).toMatchObject({ degradedTraitIds: [GATE_ID], affectedTasks: ["FN-1"] });
+    });
+
+    it("keeps the explicit force-disable refusal and degradation", async () => {
+      tasks = [{ id: "FN-1", column: "checking" }];
+      await expect(pluginRunner.disablePluginTraits(PLUGIN)).rejects.toThrow(/FN-1@checking/);
+      const result = await pluginRunner.disablePluginTraits(PLUGIN, { force: true });
+      expect(result.degraded).toEqual(expect.arrayContaining([GATE_ID, NOTE_ID]));
+      expect(auditRows().at(-1)?.metadata).toMatchObject({ source: "force-disable", affectedTasks: ["FN-1"] });
     });
   });
 

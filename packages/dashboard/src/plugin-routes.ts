@@ -28,6 +28,7 @@ import type {
   PluginStore,
   PluginContext,
   PluginState,
+  PluginRouteMethod,
 } from "@fusion/core";
 import { resolvePluginEntryPath, validatePluginManifest } from "@fusion/core";
 import {
@@ -56,6 +57,12 @@ interface PluginRunner {
   uninstallPluginSetup?(pluginId: string): Promise<{ success: boolean; error?: string }>;
   getPluginSetupInfo?(): Array<{ pluginId: string; manifest: import("@fusion/core").PluginSetupManifest; hooks: import("@fusion/core").PluginSetupHooks }>;
   getPluginRoutes(): Array<{ pluginId: string; route: import("@fusion/core").PluginRouteDefinition }>;
+}
+
+/** The plugin authority for one request: the selected project's loader and TaskStore. */
+export interface ProjectPluginScope {
+  loader?: PluginLoader;
+  taskStore?: import("@fusion/core").TaskStore;
 }
 
 export interface RegistryManifestEntry {
@@ -317,6 +324,65 @@ async function readAndValidateManifest(
   return manifest as import("@fusion/core").PluginManifest;
 }
 
+// ── Reserved Management Paths ─────────────────────────────────────────
+
+/**
+ * Management routes served under `/api/plugins` ahead of plugin-defined routes, by createPluginRouter and registerPluginsAutomationRoutes.
+ * Paths are relative to `/plugins`; `:id` matches one path segment.
+ *
+ * FNXC:PluginRoutes 2026-10-07-19:36:
+ * A plugin route with the same method and a path these patterns fully cover can never run, because the management route answers first. Dispatch excludes it and warns instead of shadowing it silently.
+ * Keep this list equal to the mounted management routes; plugin-routes.routes.test.ts compares it with the live router stacks.
+ */
+export const RESERVED_PLUGIN_MANAGEMENT_ROUTES: ReadonlyArray<{ method: PluginRouteMethod; path: string }> = [
+  { method: "GET", path: "/" },
+  { method: "GET", path: "/registry" },
+  { method: "GET", path: "/ui-slots" },
+  { method: "GET", path: "/ui-contributions" },
+  { method: "GET", path: "/dashboard-views" },
+  { method: "GET", path: "/runtimes" },
+  { method: "GET", path: "/:id" },
+  { method: "GET", path: "/:id/settings" },
+  { method: "GET", path: "/:id/setup-status" },
+  { method: "POST", path: "/" },
+  { method: "POST", path: "/install" },
+  { method: "POST", path: "/:id/enable" },
+  { method: "POST", path: "/:id/disable" },
+  { method: "POST", path: "/:id/reload" },
+  { method: "POST", path: "/:id/rescan" },
+  { method: "POST", path: "/:id/setup/install" },
+  { method: "POST", path: "/:id/setup/uninstall" },
+  { method: "PUT", path: "/:id/settings" },
+  { method: "PATCH", path: "/:id" },
+  { method: "DELETE", path: "/:id" },
+];
+
+function pathSegments(path: string): string[] {
+  return path.split("/").filter((segment) => segment.length > 0);
+}
+
+/**
+ * Return the management route that shadows a plugin route, if any.
+ * Express matches paths case-insensitively and ignores a trailing slash. A plugin segment that is a parameter is only partly covered by a literal management segment, so such a route stays served.
+ */
+export function findReservedPluginRoute(
+  pluginId: string,
+  route: { method: string; path: string },
+): { method: PluginRouteMethod; path: string } | undefined {
+  const segments = [pluginId, ...pathSegments(route.path)].map((segment) => segment.toLowerCase());
+  const method = route.method.toUpperCase();
+  return RESERVED_PLUGIN_MANAGEMENT_ROUTES.find((reserved) => {
+    if (reserved.method !== method) return false;
+    const pattern = pathSegments(reserved.path);
+    if (pattern.length !== segments.length) return false;
+    return pattern.every((part, index) => {
+      if (part.startsWith(":")) return true;
+      const segment = segments[index];
+      return !segment.startsWith(":") && segment === part.toLowerCase();
+    });
+  });
+}
+
 // ── Router Factory ────────────────────────────────────────────────────
 
 /**
@@ -326,18 +392,23 @@ async function readAndValidateManifest(
  * @param pluginLoader - Plugin loader for lifecycle management
  * @param pluginRunner - Optional plugin runner for plugin-defined routes
  * @param defaultTaskStore - Task store used when a request carries no projectId
- * @param resolveProjectPluginLoader - Per-request project-scoped loader resolution
- *   (routes/context.ts getProjectPluginLoader); when absent, dispatch falls back to
- *   the host pluginLoader + pluginRunner route tables only.
+ * @param resolveProjectPluginScope - Per-request project scope (routes/context.ts
+ *   getProjectContext + getProjectPluginLoader). When wired, the scope's loader is the
+ *   only plugin-route authority and lifecycle routes stop through it; when absent,
+ *   dispatch uses the host pluginLoader + pluginRunner route tables.
  */
 export function createPluginRouter(
   pluginStore: PluginStore,
   pluginLoader: PluginLoader,
   pluginRunner?: PluginRunner,
   defaultTaskStore?: import("@fusion/core").TaskStore,
-  resolveProjectPluginLoader?: (req: Request) => Promise<PluginLoader | undefined>,
+  resolveProjectPluginScope?: (req: Request) => Promise<ProjectPluginScope | undefined>,
 ): Router {
   const router = Router();
+  const resolveScope = async (req: Request): Promise<ProjectPluginScope | undefined> =>
+    resolveProjectPluginScope ? await resolveProjectPluginScope(req) : undefined;
+  const scopePluginStore = (scope: ProjectPluginScope | undefined): PluginStore =>
+    (scope?.taskStore?.getPluginStore?.() as PluginStore | undefined) ?? pluginStore;
 
   // ── Management Routes ───────────────────────────────────────────
 
@@ -493,16 +564,18 @@ export function createPluginRouter(
    */
   router.post("/:id/disable", catchHandler(async (req: Request, res: Response) => {
     const id = req.params.id as string;
+    const scope = await resolveScope(req);
 
-    // Stop the plugin
+    /*
+    FNXC:PluginLoader 2026-10-07-19:36:
+    Mirror registerPluginsAutomationRoutes: persist the disable first, then stop through the request project's loader (the engine's when one runs), so the instance the project uses is the one removed.
+    */
+    const plugin = await scopePluginStore(scope).disablePlugin(id);
     try {
-      await pluginLoader.stopPlugin(id);
+      await (scope?.loader ?? pluginLoader).stopPlugin(id);
     } catch {
       // Ignore errors from stopping - plugin might not be loaded
     }
-
-    // Disable in store
-    const plugin = await pluginStore.disablePlugin(id);
     res.json(plugin);
   }));
 
@@ -636,16 +709,18 @@ export function createPluginRouter(
    */
   router.delete("/:id", catchHandler(async (req: Request, res: Response) => {
     const id = req.params.id as string;
+    const scope = await resolveScope(req);
 
-    // Stop the plugin (ignore errors)
+    /*
+    FNXC:PluginLoader 2026-10-07-19:36:
+    Mirror registerPluginsAutomationRoutes: unregister first, then stop through the request project's loader. The loader then resolves the instance from memory and unloads it in every loader sharing the lifecycle.
+    */
+    await scopePluginStore(scope).unregisterPlugin(id);
     try {
-      await pluginLoader.stopPlugin(id);
+      await (scope?.loader ?? pluginLoader).stopPlugin(id);
     } catch {
       // Ignore - plugin might not be loaded
     }
-
-    // Unregister the plugin
-    await pluginStore.unregisterPlugin(id);
 
     res.status(204).send();
   }));
@@ -720,29 +795,50 @@ export function createPluginRouter(
   until restart; (2) a plugin enabled only in a non-launch project NEVER got routes
   mounted because the snapshot came from the launch project's loader. Dispatch
   resolves the request's project-scoped loader (same routes/context.ts
-  getProjectPluginLoader cache the dashboard-views/enable endpoints use), unions in
-  the host loader + PluginRunner tables (project entries win, loader beats runner),
-  and executes each entry against the loader that owns its plugin instance. The
+  getProjectPluginLoader cache the dashboard-views/enable endpoints use), falls back
+  to the host loader + PluginRunner tables only when no project scope resolver is
+  wired (loader beats runner), and executes each entry against the loader that owns
+  its plugin instance. The
   matching sub-router is cached per resolved loader and rebuilt only when the route
   signature changes, so views and routes agree by construction.
   */
   type PluginRouteEntry = { pluginId: string; route: import("@fusion/core").PluginRouteDefinition };
   type DispatchEntry = PluginRouteEntry & { execLoader: PluginLoader };
 
-  const collectDispatchEntries = (resolvedLoader?: PluginLoader): Map<string, DispatchEntry> => {
+  /*
+  FNXC:PluginRoutes 2026-10-07-19:36:
+  When a project scope resolves, its loader is the only route authority: a plugin it has not loaded is disabled (or not yet loaded) in that project, and serving the host loader's or runner's copy ran another project's handler against this project's store.
+  The host loader plus runner union applies only when no scope resolver is wired (standalone routers).
+  A plugin route that a management route shadows is excluded with one warning per route instead of silently never running.
+  */
+  const warnedReservedRoutes = new Set<string>();
+  const collectDispatchEntries = (scope: ProjectPluginScope | undefined): Map<string, DispatchEntry> => {
     const byKey = new Map<string, DispatchEntry>();
-    // First writer wins: project-scoped loader, then host loader, then runner.
+    // First writer wins: host loader, then runner.
     const addPluginRoutes = (entries: PluginRouteEntry[] | undefined, execLoader: PluginLoader) => {
       if (!entries) return;
       for (const entry of entries) {
         const key = `${entry.pluginId}\0${entry.route.method}\0${entry.route.path}`;
-        if (!byKey.has(key)) {
-          byKey.set(key, { ...entry, execLoader });
+        if (byKey.has(key)) continue;
+        const reserved = findReservedPluginRoute(entry.pluginId, entry.route);
+        if (reserved) {
+          if (!warnedReservedRoutes.has(key)) {
+            warnedReservedRoutes.add(key);
+            severityAuditLog.warn(
+              `[plugin-routes] Plugin "${entry.pluginId}" route ${entry.route.method} ${entry.route.path} is not served: ` +
+                `it is shadowed by the reserved management route ${reserved.method} /plugins${reserved.path}`,
+            );
+          }
+          continue;
         }
+        byKey.set(key, { ...entry, execLoader });
       }
     };
-    if (resolvedLoader && resolvedLoader !== pluginLoader) {
-      addPluginRoutes((resolvedLoader as { getPluginRoutes?: () => PluginRouteEntry[] }).getPluginRoutes?.(), resolvedLoader);
+    if (scope) {
+      if (scope.loader) {
+        addPluginRoutes((scope.loader as { getPluginRoutes?: () => PluginRouteEntry[] }).getPluginRoutes?.(), scope.loader);
+      }
+      return byKey;
     }
     addPluginRoutes((pluginLoader as { getPluginRoutes?: () => PluginRouteEntry[] }).getPluginRoutes?.(), pluginLoader);
     if (pluginRunner && typeof pluginRunner.getPluginRoutes === "function") {
@@ -760,6 +856,9 @@ export function createPluginRouter(
     }
     return dispatchRouter;
   };
+
+  // The project scope the dispatch middleware resolved for a request, read by the route handler.
+  const requestScopes = new WeakMap<Request, ProjectPluginScope>();
 
   const registerPluginRoute = (
     targetRouter: Router,
@@ -783,7 +882,9 @@ export function createPluginRouter(
           ? (req.body as { projectId: string }).projectId.trim()
           : "";
       const projectId = queryProjectId || bodyProjectId || undefined;
-      const scopedStore = projectId ? await getOrCreateProjectStore(projectId) : null;
+      // The handler runs against the same project the route table came from.
+      const scope = requestScopes.get(req);
+      const scopedStore = scope?.taskStore ?? (projectId ? await getOrCreateProjectStore(projectId) : null);
       const taskStore = scopedStore ?? defaultTaskStore ?? ({} as import("@fusion/core").TaskStore);
 
       let settings: Record<string, unknown> = {};
@@ -871,26 +972,39 @@ export function createPluginRouter(
     }
   };
 
-  // Cache the compiled dispatch router per resolved loader; the signature encodes
-  // route identity AND owning loader so enabling a plugin later (route set grows)
-  // or a plugin migrating from host to project loader both trigger a rebuild.
+  /*
+  FNXC:PluginRoutes 2026-10-07-19:36:
+  A compiled dispatch router is cached per authority loader and rebuilt when the signature changes. The signature carries each route's handler identity: a reload that keeps a route's method and path installs a new handler, and a signature of keys alone kept serving the unloaded module's handler.
+  */
   const dispatchRouterCache = new WeakMap<PluginLoader, { signature: string; router: Router }>();
-  const dispatchSignature = (entries: Map<string, DispatchEntry>, resolvedLoader?: PluginLoader): string =>
+  const handlerIds = new WeakMap<object, number>();
+  let nextHandlerId = 0;
+  const handlerId = (handler: unknown): number => {
+    if (typeof handler !== "function") return -1;
+    let id = handlerIds.get(handler);
+    if (id === undefined) {
+      id = ++nextHandlerId;
+      handlerIds.set(handler, id);
+    }
+    return id;
+  };
+  const dispatchSignature = (entries: Map<string, DispatchEntry>): string =>
     [...entries.entries()]
-      .map(([key, entry]) => `${key}\0${entry.execLoader === resolvedLoader ? "p" : "h"}`)
+      .map(([key, entry]) => `${key}\0${handlerId(entry.route.handler)}`)
       .sort()
       .join("\n");
 
   router.use((req: Request, res: Response, next: import("express").NextFunction) => {
     void (async () => {
-      const resolvedLoader = resolveProjectPluginLoader ? await resolveProjectPluginLoader(req) : undefined;
-      const entries = collectDispatchEntries(resolvedLoader);
+      const scope = await resolveScope(req);
+      const entries = collectDispatchEntries(scope);
       if (entries.size === 0) {
         next();
         return;
       }
-      const signature = dispatchSignature(entries, resolvedLoader);
-      const cacheKey = resolvedLoader ?? pluginLoader;
+      if (scope) requestScopes.set(req, scope);
+      const signature = dispatchSignature(entries);
+      const cacheKey = scope?.loader ?? pluginLoader;
       let cached = dispatchRouterCache.get(cacheKey);
       if (!cached || cached.signature !== signature) {
         cached = { signature, router: buildDispatchRouter(entries) };

@@ -2083,10 +2083,13 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
         same getProjectPluginLoader cache the plugin management registrar uses — so a
         plugin enabled after boot, or enabled only in a non-launch project, serves its
         API routes the moment its dashboard view appears.
+
+        FNXC:PluginRoutes 2026-10-07-19:36:
+        The scope carries the project's TaskStore with its loader, so a plugin route runs against the store of the same project whose enablement admitted it, and that loader is the only route authority.
         */
         async (req) => {
           const { store: scopedStore, engine } = await routeContext.getProjectContext(req);
-          return routeContext.getProjectPluginLoader(scopedStore, engine);
+          return { loader: await routeContext.getProjectPluginLoader(scopedStore, engine), taskStore: scopedStore };
         },
       ),
     );
