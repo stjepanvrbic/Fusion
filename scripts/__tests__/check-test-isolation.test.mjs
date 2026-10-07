@@ -177,6 +177,40 @@ test("fails when protected .fusion existence changes after baseline", () => {
   });
 });
 
+/*
+FNXC:TestIsolation 2026-10-07-18:04:
+A workspace package never owns a `.fusion` directory. A test that passed `rootDir: process.cwd()` from a threads-pool lane created `packages/engine/.fusion/worktrees/...` in the checkout, and the next run treated that package as a protected repo root. A package-level `.fusion` that appears during a run must fail that run, across every workspace package parent.
+*/
+test("fails when a workspace package .fusion directory appears during the run", () => {
+  withFixture(({ cwd, home }) => {
+    for (const parent of ["packages/engine", "plugins/fusion-plugin-demo", "plugins/examples/fusion-plugin-sample"]) {
+      mkdirSync(path.join(cwd, parent), { recursive: true });
+    }
+    const before = runScript(["--before"], { cwd, home });
+    assert.equal(before.status, 0, before.stderr || before.stdout);
+    for (const parent of ["packages/engine", "plugins/fusion-plugin-demo", "plugins/examples/fusion-plugin-sample"]) {
+      mkdirSync(path.join(cwd, parent, ".fusion", "worktrees"), { recursive: true });
+    }
+    const after = runScript([], { cwd, home });
+    assert.equal(after.status, 1, after.stdout);
+    assert.match(after.stderr, /workspace package \.fusion/i);
+    for (const parent of ["packages/engine", "plugins/fusion-plugin-demo", "plugins/examples/fusion-plugin-sample"]) {
+      assert.ok(after.stderr.includes(path.join(parent, ".fusion")), `expected ${parent} in: ${after.stderr}`);
+    }
+  });
+});
+
+test("warns without failing for a workspace package .fusion directory that predates the run", () => {
+  withFixture(({ cwd, home }) => {
+    mkdirSync(path.join(cwd, "packages", "engine", ".fusion"), { recursive: true });
+    const before = runScript(["--before"], { cwd, home });
+    assert.equal(before.status, 0, before.stderr || before.stdout);
+    const after = runScript([], { cwd, home });
+    assert.equal(after.status, 0, after.stderr || after.stdout);
+    assert.match(after.stderr, /workspace package \.fusion/i);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // U3: --before-fast (cheap single-probe baseline). Detection must be preserved.
 // ---------------------------------------------------------------------------
