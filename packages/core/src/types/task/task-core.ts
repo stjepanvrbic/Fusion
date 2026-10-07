@@ -695,6 +695,8 @@ per six-hour window. A durable shared constant keeps the PostgreSQL claim and th
 engine's no-store fallback aligned across restarts.
 */
 export const WEDGE_RENOTIFY_COOLDOWN_MS = 6 * 60 * 60 * 1_000;
+/** An owed wedge delivery may be re-attempted for its episode once the previous attempt is this old. */
+export const WEDGE_DELIVERY_RETRY_LEASE_MS = 60 * 1_000;
 
 /*
 FNXC:TaskWedgeNotifications 2026-08-10-18:54:
@@ -747,6 +749,14 @@ export interface TaskWedgeNotificationState {
     escalationNotifiedAt?: string;
     escalationReason?: "budget-exhausted" | "auto-recovery-disabled";
   };
+  /*
+  FNXC:TaskWedgeNotifications 2026-10-07-20:54:
+  Allocating an episode is not delivering it. A new active episode is owed until a push provider or the mailbox confirms delivery; only that acknowledgement starts the per-reason cooldown in lastNotifiedAtByReason.
+  While owed, the same episode (same id, so the same mailbox idempotency key) may be re-claimed once deliveryAttemptAt is older than the retry lease, so a failed or timed-out delivery is retried instead of being remembered as sent.
+  Rows written before this field existed are treated as delivered.
+  */
+  deliveryOwed?: boolean;
+  deliveryAttemptAt?: string;
 }
 
 export type TaskRecommendationCategory = "improvement" | "feature" | "bug" | "other";

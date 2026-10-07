@@ -47,7 +47,7 @@ export type {
   MissionLineageSnapshot,
 } from "./tasks/symbol-lock-lineage-approval.js";
 export { AGENT_VALID_TRANSITIONS, DUPLICATE_OF_METADATA_KEY, REPORT_ATTACHMENT_SOURCE, assertNotWorkspaceTaskMerge, isWorkspaceTask, WorkspaceTaskMergeError, PLANNER_AGENT_ROLE} from "./types.js";
-export { WEDGE_RENOTIFY_COOLDOWN_MS, normalizeAgentRoles, MAX_TASK_MESSAGE_LENGTH } from "./types.js";
+export { WEDGE_DELIVERY_RETRY_LEASE_MS, WEDGE_RENOTIFY_COOLDOWN_MS, normalizeAgentRoles, MAX_TASK_MESSAGE_LENGTH } from "./types.js";
 export { MAX_TASK_STEP_REPORTS, MAX_TASK_STEP_REPORT_SUMMARY_CHARS, appendTaskStepReport } from "./workflows/task-step-reports.js";
 export {
   BUILTIN_WORKFLOW_AGENT_BUNDLE_CONFIG,

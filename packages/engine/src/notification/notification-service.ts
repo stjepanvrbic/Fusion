@@ -11,7 +11,7 @@ import type {
   Task,
 } from "@fusion/core";
 import type { LifecycleColumns, TaskMoveLanes, WorkflowIrResolverStore } from "@fusion/core";
-import { DASHBOARD_USER_ID, isTaskNotFoundError, MAX_TERMINAL_FAILURE_AUTO_RETRIES, NotificationDispatcher, resolveProjectColumnsForRoles, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, WEDGE_RENOTIFY_COOLDOWN_MS } from "@fusion/core";
+import { DASHBOARD_USER_ID, isTaskNotFoundError, MAX_TERMINAL_FAILURE_AUTO_RETRIES, NotificationDispatcher, resolveProjectColumnsForRoles, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, WEDGE_DELIVERY_RETRY_LEASE_MS, WEDGE_RENOTIFY_COOLDOWN_MS } from "@fusion/core";
 import { DEFAULT_NTFY_EVENTS, buildNtfyClickUrl, formatTaskIdentifier } from "../util/notifier.js";
 import { schedulerLog } from "../logger.js";
 import { NtfyNotificationProvider } from "./ntfy-provider.js";
@@ -41,6 +41,24 @@ function formatWedgeMailboxContent(task: Task, descriptor: TaskWedgeDescriptor, 
   ].join("\n");
 }
 type PendingWedgeCompletionResult = { outcome: PendingWedgeCompletionOutcome; reasonKey?: string; remainingMs?: number };
+
+/** Upper bound on waiting for a push provider to confirm a wedge alert; a slower provider counts as unconfirmed for this attempt. */
+const WEDGE_PUSH_CONFIRM_TIMEOUT_MS = 5_000;
+
+async function confirmWithin(delivery: Promise<boolean>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // A late rejection after the timeout must never escape.
+  void delivery.catch(() => undefined);
+  try {
+    const timedOut = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), Math.max(1, timeoutMs));
+      timer.unref?.();
+    });
+    return await Promise.race([delivery.then((confirmed) => confirmed, () => false), timedOut]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export interface NotificationServiceOptions {
   /** Project identifier for notification deep links */
@@ -74,6 +92,8 @@ interface NotificationServiceStore {
   claimTaskWedgeNotificationEpisode?(taskId: string, reasonKey: string | null): Promise<{ episodeId?: string; claimed: boolean }>;
   markTaskWedgeNotificationPending?(taskId: string, descriptor: { reasonKey: string; source: "auto" | "supplied"; reason: string; action: string; gate?: string }, options?: { staleAfterMs?: number }): Promise<{ since: string; armed: boolean; restamped: boolean }>;
   clearTaskWedgeNotificationPending?(taskId: string, reasonKey?: string): Promise<boolean>;
+  /** Records confirmed delivery of the active episode and starts its cooldown. */
+  acknowledgeTaskWedgeNotificationDelivery?(taskId: string, episodeId: string): Promise<boolean>;
   /** Optional so lightweight notification fakes retain their structural surface. */
   markTerminalFailureAutoRecoveryBudgetExhausted?(taskId: string, options: { maxAttempts: number }): Promise<"stamped" | "already-stamped" | "not-exhausted" | "no-budget">;
   /** Optional; self-healing's concrete store is the durable backstop when absent. */
@@ -784,12 +804,11 @@ export class NotificationService {
       // Bounded descriptor text is operator-facing provider content, never audit metadata.
       metadata: { wedgeReason: descriptor.reasonKey, reason: descriptor.reason, action: descriptor.action, ...(descriptor.gate ? { gate: descriptor.gate } : {}), notificationDedupeKey: `task-wedge:${episode}` },
     };
-    // Push and mailbox delivery are independently best-effort.
-    void this.dispatch("task-wedged", payload);
-    await deliverMailboxMessageOnce(this.options.messageStore, {
-      fromId: "system", fromType: "system", toId: DASHBOARD_USER_ID, toType: "user", type: "system",
-      content, metadata: { taskId: task.id, kind: "task-wedge", wedgeReason: descriptor.reasonKey, ...(descriptor.gate ? { gate: descriptor.gate } : {}) },
-    }, `task-wedge:${episode}`);
+    const delivered = await this.deliverWedgeEpisode({
+      task, descriptor, source, episodeId: episode, durable: Boolean(this.store.claimTaskWedgeNotificationEpisode), payload, content,
+      mailboxMetadata: { taskId: task.id, kind: "task-wedge", wedgeReason: descriptor.reasonKey, ...(descriptor.gate ? { gate: descriptor.gate } : {}) },
+    });
+    if (!delivered) return "unavailable";
     if (isAutoRecoveryEscalationDispatch && classification.action === "notify") {
       try {
         await this.store.markTerminalFailureAutoRecoveryEscalationDelivered?.(task.id, {
@@ -951,6 +970,16 @@ export class NotificationService {
       }
       const remainingMs = this.wedgeNotificationSettleMs - Math.max(0, age);
       if (remainingMs > 0) return { outcome: "held", reasonKey: descriptor.reasonKey, remainingMs };
+      /*
+      FNXC:TaskWedgeNotifications 2026-10-07-21:05:
+      An owed episode whose last delivery attempt is still inside the retry lease would decline the claim, and a declined claim clears this hold. Hold instead, so the owed delivery keeps its retry driver until the lease lapses.
+      */
+      const active = task.wedgeNotification;
+      const lastAttemptMs = Date.parse(active?.deliveryAttemptAt ?? "");
+      if (active?.status === "active" && active.reasonKey === descriptor.reasonKey && active.deliveryOwed === true && Number.isFinite(lastAttemptMs)) {
+        const leaseRemainingMs = WEDGE_DELIVERY_RETRY_LEASE_MS - (Date.now() - lastAttemptMs);
+        if (leaseRemainingMs > 0) return { outcome: "held", reasonKey: descriptor.reasonKey, remainingMs: leaseRemainingMs };
+      }
 
       const claim = this.store.claimTaskWedgeNotificationEpisode
         ? await this.store.claimTaskWedgeNotificationEpisode(taskId, descriptor.reasonKey)
@@ -961,14 +990,70 @@ export class NotificationService {
         return { outcome: "suppressed", reasonKey: descriptor.reasonKey };
       }
       const payload = this.createTaskPayload(task, "task-wedged", { wedgeReason: descriptor.reasonKey, reason: descriptor.reason, action: descriptor.action, ...(descriptor.gate ? { gate: descriptor.gate } : {}), notificationDedupeKey: `task-wedge:${claim.episodeId}` });
-      void this.dispatch("task-wedged", payload);
       const content = formatWedgeMailboxContent(task, descriptor, buildNtfyClickUrl({ dashboardHost: this.dashboardHost, projectId: this.options.projectId, taskId }));
-      await deliverMailboxMessageOnce(this.options.messageStore, { fromId: "system", fromType: "system", toId: DASHBOARD_USER_ID, toType: "user", type: "system", content, metadata: { taskId, kind: "task-wedge", wedgeReason: descriptor.reasonKey } }, `task-wedge:${claim.episodeId}`);
+      const delivered = await this.deliverWedgeEpisode({
+        task, descriptor, source, episodeId: claim.episodeId, durable: Boolean(this.store.claimTaskWedgeNotificationEpisode), payload, content,
+        mailboxMetadata: { taskId, kind: "task-wedge", wedgeReason: descriptor.reasonKey },
+      });
+      if (!delivered) return { outcome: "rearmed", reasonKey: descriptor.reasonKey, remainingMs: this.wedgeNotificationSettleMs };
       return { outcome: "delivered", reasonKey: descriptor.reasonKey };
     } catch (error) {
       schedulerLog.debug(`[notify] ${taskId} pending wedge completion failed: ${error instanceof Error ? error.message : String(error)}`);
       return { outcome: "unreadable" };
     }
+  }
+
+  /**
+   * FNXC:TaskWedgeNotifications 2026-10-07-20:56:
+   * A wedge episode counts as delivered only when a push provider or the mailbox confirms it. Then the store acknowledgement starts the cooldown.
+   * On failure nothing is remembered as sent: the durable episode stays owed and a deferred-delivery hold is re-armed so the pending-wedge sweep retries it with the same episode id, hence the same mailbox idempotency key (a late mailbox success cannot duplicate). A fallback in-memory claim is released.
+   * Retries touch only notification state, never task lifecycle.
+   */
+  private async deliverWedgeEpisode(input: {
+    task: Task;
+    descriptor: TaskWedgeDescriptor;
+    source: "auto" | "supplied";
+    episodeId: string;
+    durable: boolean;
+    payload: NotificationPayload;
+    content: string;
+    mailboxMetadata: MessageCreateInput["metadata"];
+  }): Promise<boolean> {
+    const { task, descriptor, source, episodeId } = input;
+    // Both channels start together and are independently best-effort; either confirmation is enough.
+    // A confirmed mailbox insert acknowledges at once, so a slow push provider only delays the attempt when the mailbox failed.
+    const pushConfirmation = confirmWithin(this.dispatchConfirmed("task-wedged", input.payload), WEDGE_PUSH_CONFIRM_TIMEOUT_MS);
+    const mailbox = await deliverMailboxMessageOnce(this.options.messageStore, {
+      fromId: "system", fromType: "system", toId: DASHBOARD_USER_ID, toType: "user", type: "system",
+      content: input.content, metadata: input.mailboxMetadata,
+    }, `task-wedge:${episodeId}`);
+    if (mailbox === "delivered" || await pushConfirmation) {
+      try {
+        await this.store.acknowledgeTaskWedgeNotificationDelivery?.(task.id, episodeId);
+      } catch (error) {
+        schedulerLog.debug(`[notify] ${task.id} could not acknowledge wedge delivery: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return true;
+    }
+    schedulerLog.warn(`[notify] ${task.id} wedge alert was not confirmed by any channel; delivery stays owed`);
+    if (!input.durable) {
+      this.releaseFallbackWedgeNotificationEpisode(task.id, descriptor.reasonKey);
+      return false;
+    }
+    if (this.wedgeNotificationSettleMs > 0 && typeof this.store.markTaskWedgeNotificationPending === "function") {
+      try {
+        const marked = await this.store.markTaskWedgeNotificationPending(task.id, { ...descriptor, source }, { staleAfterMs: 0 });
+        this.pendingWedgeNotifications.set(task.id, { ...this.pendingWedgeNotifications.get(task.id), descriptor, source, since: marked.since, task });
+      } catch (error) {
+        schedulerLog.debug(`[notify] ${task.id} could not re-arm owed wedge delivery: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return false;
+  }
+
+  private releaseFallbackWedgeNotificationEpisode(taskId: string, reasonKey: string): void {
+    if (this.activeWedgeReasons.get(taskId) === reasonKey) this.activeWedgeReasons.delete(taskId);
+    this.fallbackWedgeNotificationTimestamps.get(taskId)?.delete(reasonKey);
   }
 
   private claimFallbackWedgeNotificationEpisode(taskId: string, reasonKey: string, updatedAt: string): string | undefined {
