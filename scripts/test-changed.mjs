@@ -724,15 +724,30 @@ export function detectComparisonBase(baseBranch) {
   return null;
 }
 
+/*
+FNXC:VerificationSelection 2026-10-07-18:03:
+Change selection must cover the current working tree, not only commits: an operator who edits a file before committing must get that package typechecked/tested by `pnpm test` and verify:fast.
+Union the committed range with staged and unstaged changes (`git diff HEAD`) and untracked, non-ignored files.
+`--no-renames` lists both sides of a rename, and deletions stay listed so the package that lost a file is still selected.
+Any git read failure returns null, which callers already treat as "could not determine" rather than "nothing changed".
+*/
 export function changedFilesSince(baseSha) {
-  const diff = gitOutput(["diff", "--name-only", `${baseSha}...HEAD`]);
-  if (diff === null) {
+  const reads = [
+    ["diff", "--name-only", "--no-renames", "-z", `${baseSha}...HEAD`],
+    ["diff", "--name-only", "--no-renames", "-z", "HEAD"],
+    ["ls-files", "--others", "--exclude-standard", "-z"],
+  ].map((args) => gitOutput(args));
+  if (reads.some((output) => output === null)) {
     return null;
   }
-  if (!diff) {
-    return [];
+  const files = new Set();
+  for (const output of reads) {
+    for (const entry of output.split("\0")) {
+      const file = entry.trim().replaceAll("\\", "/");
+      if (file) files.add(file);
+    }
   }
-  return diff.split("\n").map((entry) => entry.trim()).filter(Boolean);
+  return [...files];
 }
 
 export function resolveAffectedPackages(changedFiles, packageNameByDir) {

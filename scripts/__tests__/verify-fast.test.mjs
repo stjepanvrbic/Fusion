@@ -13,7 +13,8 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   buildTypecheckStep,
@@ -444,3 +445,43 @@ test("runVerifyPlan reports the first failure in plan order and skips later batc
   assert.ok(!started.includes("boot-smoke"));
 });
 
+
+/*
+FNXC:VerificationSelection 2026-10-07-18:03:
+verify:fast must typecheck/build the package an operator edited before committing; with HEAD at the base the old committed-only diff planned no package checks.
+*/
+test("resolveAffectedForVerify selects a package edited in the working tree with HEAD at the base", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vf-worktree-"));
+  const git = (...args) => {
+    const r = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  try {
+    git("init", "-q");
+    git("config", "user.email", "t@t.t");
+    git("config", "user.name", "t");
+    writeFileSync(join(dir, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
+    mkdirSync(join(dir, ".changeset"), { recursive: true });
+    writeFileSync(join(dir, ".changeset", "config.json"), JSON.stringify({ baseBranch: "main" }));
+    for (const name of ["one", "two"]) {
+      mkdirSync(join(dir, "packages", name, "src"), { recursive: true });
+      writeFileSync(join(dir, "packages", name, "src", "index.ts"), "export const v = 1;\n");
+      writeFileSync(join(dir, "packages", name, "package.json"), JSON.stringify({ name: `@x/${name}`, version: "1.0.0" }));
+    }
+    git("add", "-A");
+    git("commit", "-q", "-m", "base");
+    git("branch", "-f", "main", "HEAD");
+    writeFileSync(join(dir, "packages", "two", "src", "index.ts"), "export const v = 2;\n");
+
+    const code = `
+      const mod = await import(${JSON.stringify(pathToFileURL(resolve(REPO_ROOT, "scripts/verify-fast.mjs")).href)});
+      const { packages } = mod.resolveAffectedForVerify();
+      console.log(JSON.stringify(packages));
+    `;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd: dir, encoding: "utf8", env: { ...process.env, FUSION_PROJECT_DIR: dir } });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout.trim().split("\n").pop()), ["@x/two"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
