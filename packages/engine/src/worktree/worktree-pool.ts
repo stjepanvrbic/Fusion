@@ -1,7 +1,7 @@
 import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, lstatSync, readdirSync, readFileSync, rmdirSync, realpathSync, rmSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { Settings, TaskStore, WorktrunkSettings, WorkspaceWorktreeContext } from "@fusion/core";
 import { worktreePoolLog } from "../logger.js";
@@ -16,8 +16,11 @@ import {
   removeWorktree as removeWorktreeViaBackend,
 } from "./worktree-backend.js";
 import { pruneWorktreeAdminEntries } from "./worktree-prune.js";
-import { resolveWorkflowIrForTask, columnsWithFlag } from "@fusion/core";
+import { resolveWorkflowIrForTask, columnsWithFlag, isStrictDescendantPath, WORKSPACE_GROUP_MARKER_FILENAME } from "@fusion/core";
 import { FINGERPRINT_FILE } from "./secrets-env-writer.js";
+import { activeSessionRegistry } from "../agents/active-session-registry.js";
+import { inspectCheckoutGitEntry } from "./remove-checkout.js";
+import { removeDirectoryWithRetry } from "./worktree-removal-retry.js";
 
 export {
   NativeWorktreeBackend,
@@ -736,9 +739,114 @@ function dotGitPointerIsDangling(dotGitPath: string): boolean {
   }
 }
 
+/*
+FNXC:WorktreeOrphanReap 2026-10-07-15:11:
+Minimum age before a `.git`-less folder counts as residue rather than a checkout `git worktree add` is
+still creating (the directory exists briefly before its `.git` file is written).
+*/
+export const ORPHAN_RESIDUE_MIN_AGE_MS = 15 * 60_000;
+
+export interface ReapOrphanWorktreesOptions {
+  /** Task rows prove a `.git`-less folder is unreferenced; without it residue is never reclaimed. */
+  store?: Pick<TaskStore, "listTasks">;
+  now?: () => number;
+}
+
+type OrphanDirEntry = { name: string; fullPath: string; scanRoot: string };
+
+function isRealDirectory(path: string): boolean {
+  try {
+    const stat = lstatSync(path);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+async function listReferencedWorktreePaths(store: Pick<TaskStore, "listTasks">): Promise<Set<string>> {
+  const tasks = await store.listTasks({ slim: true, includeArchived: true, includeDeleted: true });
+  const referenced = new Set<string>();
+  for (const task of tasks) {
+    if (task.worktree) referenced.add(canonicalizePath(task.worktree));
+    for (const entry of Object.values(task.workspaceWorktrees ?? {})) {
+      if (entry?.worktreePath) referenced.add(canonicalizePath(entry.worktreePath));
+    }
+  }
+  return referenced;
+}
+
+/*
+FNXC:WorktreeOrphanReap 2026-10-07-15:11:
+A removal that failed on a locked file (Windows) leaves a `.git`-less, unregistered folder; once callers
+clear their task pointer nothing referenced it and nothing reclaimed it, because ownership was proven only
+through git. Without `.git`, ownership and abandonment are proven instead by: a direct child of a
+worktrees root that is itself inside this project (a shared external root may hold another project's
+folders), no `.git` entry, not registered, no workspace marker, no secret material, no live session,
+older than ORPHAN_RESIDUE_MIN_AGE_MS, and no task row in any column — archived and soft-deleted rows
+included — naming it as its worktree or a workspace member path. Any unreadable proof fails closed.
+*/
+async function reapUnreferencedCheckoutResidue(
+  projectRoot: string,
+  candidates: OrphanDirEntry[],
+  registered: Set<string>,
+  settings: Pick<Settings, "worktreesDir" | "workspaceMode" | "secretsEnv"> | undefined,
+  options: ReapOrphanWorktreesOptions,
+): Promise<number> {
+  if (!options.store || candidates.length === 0) return 0;
+  let referenced: Set<string>;
+  try {
+    referenced = await listReferencedWorktreePaths(options.store);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    worktreePoolLog.warn(`reapOrphanWorktrees: skipping checkout residue — task references unavailable: ${msg}`);
+    return 0;
+  }
+  const canonicalProjectRoot = canonicalizePath(projectRoot);
+  const now = options.now?.() ?? Date.now();
+  let removed = 0;
+  for (const { name, fullPath, scanRoot } of candidates) {
+    const resolvedFull = resolve(fullPath);
+    const canonicalFull = canonicalizePath(resolvedFull);
+    if (!isStrictDescendantPath(canonicalProjectRoot, canonicalizePath(scanRoot))) continue;
+    if (!isInsideWorktreesDir(projectRoot, resolvedFull, settings)) continue;
+    if (registered.has(resolvedFull) || registered.has(canonicalFull) || referenced.has(canonicalFull)) continue;
+    if (activeSessionRegistry.isPathActive(resolvedFull) || activeSessionRegistry.isPathActive(canonicalFull)) continue;
+    if (existsSync(join(resolvedFull, WORKSPACE_GROUP_MARKER_FILENAME))) continue;
+    if (hasSensitiveWorktreeArtifacts(resolvedFull, settings?.secretsEnv?.filename)) {
+      worktreePoolLog.debug(`reapOrphanWorktrees: preserving residue ${name} (contains sensitive environment artifacts)`);
+      continue;
+    }
+    let ageMs: number;
+    try {
+      ageMs = now - lstatSync(resolvedFull).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (!(ageMs >= ORPHAN_RESIDUE_MIN_AGE_MS)) continue;
+    // Re-prove immediately before deletion: a `.git` written since the scan means a live checkout.
+    if (await inspectCheckoutGitEntry(resolvedFull) !== "absent") continue;
+
+    const removal = await removeDirectoryWithRetry({ path: resolvedFull, rm });
+    if (!removal.removed) {
+      worktreePoolLog.warn(`reapOrphanWorktrees: failed to remove checkout residue ${name} — ${removal.lastError ?? "unknown error"}`);
+      continue;
+    }
+    await pruneWorktreeAdminEntries({
+      rootDir: projectRoot,
+      reason: "pool-reap-checkout-residue",
+      target: resolvedFull,
+      logger: worktreePoolLog,
+    }).catch(() => undefined);
+    worktreePoolLog.log(`reapOrphanWorktrees: removed unreferenced checkout residue ${name}`);
+    removed++;
+  }
+  return removed;
+}
+
 export async function reapOrphanWorktrees(
   projectRoot: string,
   settings?: Pick<Settings, "worktreesDir" | "workspaceMode" | "secretsEnv">,
+  options: ReapOrphanWorktreesOptions = {},
 ): Promise<number> {
   if (settings?.workspaceMode) {
     worktreePoolLog.debug?.("Skipping workspace orphan reaping; recorded paths are reclaimed addressably.");
@@ -748,40 +856,38 @@ export async function reapOrphanWorktrees(
 
   // Read every currently valid root; failure in one root must not hide legacy
   // checkout residue in the other.
-  let entries: Array<{ name: string; fullPath: string }> = [];
+  let entries: OrphanDirEntry[] = [];
+  const residueCandidates: OrphanDirEntry[] = [];
   for (const worktreesDir of scanRoots) {
     if (!existsSync(worktreesDir)) continue;
     try {
-      entries.push(...readdirSync(worktreesDir, { withFileTypes: true })
-        .filter((e) => {
-          // Only real directories — never symlinks or internal worktree containers.
-          if (!e.isDirectory() || isWorktreeContainerDir(e.name) || !existsSync(join(worktreesDir, e.name, ".git"))) return false;
-          try {
-            return lstatSync(join(worktreesDir, e.name)).isDirectory() && !lstatSync(join(worktreesDir, e.name)).isSymbolicLink();
-          } catch {
-            return false;
-          }
-        })
-        .map((e) => ({ name: e.name, fullPath: join(worktreesDir, e.name) })));
+      for (const e of readdirSync(worktreesDir, { withFileTypes: true })) {
+        // Only real directories — never symlinks or internal worktree containers.
+        if (!e.isDirectory() || isWorktreeContainerDir(e.name)) continue;
+        const fullPath = join(worktreesDir, e.name);
+        const hasGitEntry = existsSync(join(fullPath, ".git"));
+        if (!isRealDirectory(fullPath)) continue;
+        (hasGitEntry ? entries : residueCandidates).push({ name: e.name, fullPath, scanRoot: worktreesDir });
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       worktreePoolLog.warn(`reapOrphanWorktrees: failed to read ${worktreesDir} — ${msg}`);
     }
   }
 
-  if (entries.length === 0) {
+  if (entries.length === 0 && residueCandidates.length === 0) {
     retireEmptyLegacyWorktreesRoot(projectRoot, settings);
     return 0;
   }
   entries = (await Promise.all(entries.map(async (entry) =>
     (await isReclaimableWorktreeCandidate(entry.fullPath, { rootDir: projectRoot })) ? entry : null,
-  ))).filter((entry): entry is { name: string; fullPath: string } => entry !== null);
-  if (entries.length === 0) return 0;
+  ))).filter((entry): entry is OrphanDirEntry => entry !== null);
+  if (entries.length === 0 && (residueCandidates.length === 0 || !options.store)) return 0;
 
   // Get the set of paths registered with git
   const registered = await getRegisteredWorktreePaths(projectRoot);
 
-  let removed = 0;
+  let removed = await reapUnreferencedCheckoutResidue(projectRoot, residueCandidates, registered, settings, options);
   for (const { name, fullPath } of entries) {
     const resolvedFull = resolve(fullPath);
 

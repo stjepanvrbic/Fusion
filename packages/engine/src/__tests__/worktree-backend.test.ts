@@ -357,17 +357,26 @@ describe("NativeWorktreeBackend", () => {
     execMock.mockRejectedValueOnce({ stderr: "error: failed to delete '/repo/.worktrees/fn-1': Directory not empty" });
     rmMock.mockRejectedValue(rmError as never);
 
-    await expect(
-      new NativeWorktreeBackend({ audit }).remove({
-        rootDir: "/repo",
-        worktreePath: "/repo/.worktrees/fn-1",
-      }),
-    ).rejects.toBe(rmError);
+    // FNXC:WorktreeCleanup 2026-10-07-15:11: fake timers drain the platform-specific retry budget without real waits.
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const removal = expect(
+        new NativeWorktreeBackend({ audit }).remove({
+          rootDir: "/repo",
+          worktreePath: "/repo/.worktrees/fn-1",
+        }),
+      ).rejects.toBe(rmError);
+      await vi.runAllTimersAsync();
+      await removal;
+    } finally {
+      vi.useRealTimers();
+    }
 
-    expect(rmMock).toHaveBeenCalledTimes(5);
+    const attempts = rmMock.mock.calls.length;
+    expect(attempts).toBeGreaterThan(1);
     expect(audit.git).toHaveBeenCalledWith(expect.objectContaining({
       type: "worktree:remove-fallback",
-      metadata: expect.objectContaining({ attempts: 5, residual: true, registrationRetained: true }),
+      metadata: expect.objectContaining({ attempts, residual: true, registrationRetained: true }),
     }));
     expect(pruneWorktreeAdminEntriesMock).not.toHaveBeenCalled();
   });

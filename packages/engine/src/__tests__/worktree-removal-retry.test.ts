@@ -1,9 +1,11 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  filesystemRetryPolicyFor,
   isBenignAbsentRemovalError,
   isRetryableRemovalError,
   removeDirectoryWithRetry,
+  retryTransientFilesystemOperation,
 } from "../worktree/worktree-removal-retry.js";
 
 function codedError(code: string, message = code): Error & { code: string } {
@@ -60,5 +62,84 @@ describe("removeDirectoryWithRetry", () => {
       expect(isBenignAbsentRemovalError(codedError(code))).toBe(false);
       expect(isRetryableRemovalError(codedError(code))).toBe(true);
     }
+  });
+});
+
+/*
+FNXC:WorktreeCleanup 2026-10-07-15:11:
+Windows can hold a deleted checkout's handles for seconds (antivirus, indexer, exiting agent children),
+so the former ~1s retry window left residue on every AI merge. Win32 now waits up to ~10s with
+exponential backoff while POSIX stays at its ~1s window; sleeps are injected or faked, never real.
+*/
+describe("removeDirectoryWithRetry platform budgets", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("keeps retrying EBUSY across the longer Windows budget and then succeeds", async () => {
+    const rm = vi.fn();
+    for (let i = 0; i < 7; i++) rm.mockRejectedValueOnce(codedError("EBUSY"));
+    rm.mockResolvedValueOnce(undefined);
+    const delays: number[] = [];
+
+    await expect(removeDirectoryWithRetry({ path: "/clean-room", rm, sleep: (ms) => { delays.push(ms); }, platform: "win32", chmod: vi.fn() }))
+      .resolves.toMatchObject({ removed: true, attempts: 8 });
+    expect(delays).toEqual([100, 200, 400, 800, 1600, 2000, 2000]);
+  });
+
+  it("exhausts a bounded Windows budget on persistent ENOTEMPTY and reports the residue", async () => {
+    const rm = vi.fn().mockRejectedValue(codedError("ENOTEMPTY", "Directory not empty"));
+    const delays: number[] = [];
+
+    const result = await removeDirectoryWithRetry({ path: "/clean-room", rm, sleep: (ms) => { delays.push(ms); }, platform: "win32" });
+
+    expect(result).toMatchObject({ removed: false, lastCode: "ENOTEMPTY", attempts: rm.mock.calls.length });
+    const waited = delays.reduce((sum, ms) => sum + ms, 0);
+    expect(waited).toBeLessThanOrEqual(filesystemRetryPolicyFor("win32").budgetMs);
+    expect(waited).toBeGreaterThan(filesystemRetryPolicyFor("linux").budgetMs * 5);
+  });
+
+  it("keeps the POSIX window short", async () => {
+    const rm = vi.fn().mockRejectedValue(codedError("EBUSY"));
+    const delays: number[] = [];
+
+    await expect(removeDirectoryWithRetry({ path: "/clean-room", rm, sleep: (ms) => { delays.push(ms); }, platform: "linux" }))
+      .resolves.toMatchObject({ removed: false, attempts: 5 });
+    expect(delays.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(1_100);
+  });
+
+  it("waits on timers rather than spinning when no sleep is injected", async () => {
+    vi.useFakeTimers();
+    const rm = vi.fn()
+      .mockRejectedValueOnce(codedError("EBUSY"))
+      .mockRejectedValueOnce(codedError("EBUSY"))
+      .mockResolvedValueOnce(undefined);
+    let settled = false;
+    const pending = removeDirectoryWithRetry({ path: "/clean-room", rm, platform: "win32", chmod: vi.fn() }).finally(() => { settled = true; });
+
+    await vi.advanceTimersByTimeAsync(99);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(201);
+    await expect(pending).resolves.toMatchObject({ removed: true, attempts: 3 });
+  });
+});
+
+describe("retryTransientFilesystemOperation", () => {
+  it("retries only classified errors and returns the final value", async () => {
+    const operation = vi.fn()
+      .mockRejectedValueOnce(codedError("EPERM"))
+      .mockResolvedValueOnce("renamed");
+
+    await expect(retryTransientFilesystemOperation({ operation, isRetryable: isRetryableRemovalError, sleep: vi.fn(), platform: "win32" }))
+      .resolves.toEqual({ ok: true, value: "renamed", attempts: 2 });
+  });
+
+  it("stops immediately on a non-retryable error", async () => {
+    const exdev = codedError("EXDEV");
+    const operation = vi.fn().mockRejectedValue(exdev);
+
+    await expect(retryTransientFilesystemOperation({ operation, isRetryable: isRetryableRemovalError, sleep: vi.fn(), platform: "win32" }))
+      .resolves.toEqual({ ok: false, error: exdev, attempts: 1 });
+    expect(operation).toHaveBeenCalledTimes(1);
   });
 });

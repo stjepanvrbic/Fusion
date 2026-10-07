@@ -95,6 +95,7 @@ import {
   type MergeWriteFence,
 } from "./merge-write-fence.js";
 import { createResolvedAgentSession, resolveMergerSessionModel, resolveMergerThinkingLevel, resolveMergerFallbackThinkingLevel, resolveValidatorThinkingLevel } from "../agents/agent-session-helpers.js";
+import { disposeAgentSessionBounded } from "../agents/dispose-agent-session.js";
 import { promptWithFallback } from "../pi.js";
 import { AgentLogger } from "../agents/agent-logger.js";
 import { attachAgentUsageTelemetry, emitAgentSessionStart } from "../agents/agent-usage-telemetry.js";
@@ -575,7 +576,8 @@ function makeMutatingAgent(store: TaskStore, settings: Settings, taskId: string,
       await accumulateSessionTokenUsage(store, taskId, session);
     } finally {
       await logger.flush();
-      session.dispose();
+      /* FNXC:AiMerge 2026-10-07-15:11: await (bounded) disposal so clean-room cleanup never races the agent's exiting child processes. */
+      await disposeAgentSessionBounded(session);
     }
   };
 }
@@ -648,11 +650,29 @@ function makeReviewAgent(store: TaskStore, settings: Settings, taskId: string, o
       await accumulateSessionTokenUsage(store, taskId, session);
     } finally {
       await logger.flush();
-      session.dispose();
+      /* FNXC:AiMerge 2026-10-07-15:11: await (bounded) disposal so clean-room cleanup never races the reviewer's exiting child processes. */
+      await disposeAgentSessionBounded(session);
     }
     return captured;
   };
 }
+
+/*
+FNXC:AiMerge 2026-10-07-15:11:
+Clean-room cleanup runs in a finally after the merge outcome is decided. A throwing cleanup (audit sink,
+unexpected git error) used to replace a landed result with an exception; the outcome must stay
+independent of cleanup, so failures are logged and residue is left to the stale clean-room sweeps.
+*/
+async function cleanupAiMergeWorktreeNonFatal(taskId: string, input: Parameters<typeof cleanupAiMergeWorktree>[0]): Promise<void> {
+  try {
+    await cleanupAiMergeWorktree(input);
+  } catch (error: unknown) {
+    aiMergeLog.warn(`${taskId}: AI merge clean-room cleanup failed for ${input.mergeRoot}: ${getErrorMessage(error)}`);
+  }
+}
+
+/** Test seam: the session-owning agent factories (disposal ordering is asserted against them). */
+export const __test__ = { makeMutatingAgent, makeReviewAgent };
 
 // ---------------------------------------------------------------------------
 // Local checkout sync
@@ -1352,7 +1372,7 @@ export async function landOneRepo(
         activeSessionRegistry.unregisterPath(registeredPath);
       }
       if (mergeRoot) {
-        await cleanupAiMergeWorktree({ taskId, mergeRoot, projectRootDir: repoRootDir, worktreeAdded, audit, log });
+        await cleanupAiMergeWorktreeNonFatal(taskId, { taskId, mergeRoot, projectRootDir: repoRootDir, worktreeAdded, audit, log });
       }
     }
   }
@@ -3879,7 +3899,7 @@ export async function pushAfterMergeToRemote(input: {
       activeSessionRegistry.unregisterPath(registeredPath);
     }
     if (pushRoot) {
-      await cleanupAiMergeWorktree({ taskId, mergeRoot: pushRoot, projectRootDir, worktreeAdded, audit, log });
+      await cleanupAiMergeWorktreeNonFatal(taskId, { taskId, mergeRoot: pushRoot, projectRootDir, worktreeAdded, audit, log });
     }
   }
 }

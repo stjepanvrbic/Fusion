@@ -395,15 +395,33 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
     fsState.rmFailuresRemaining = -1;
     const { manager, audits } = makeManager();
 
-    await expect(sweep(manager)).resolves.toBe(1);
+    /*
+    FNXC:WorktreeCleanup 2026-10-07-15:11:
+    The bounded filesystem retry's budget is platform-specific (~10s on win32, ~1s on POSIX); fake
+    timers drain it without real waits and the audit must report the attempts actually made.
+    */
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      let settled = false;
+      const swept = sweep(manager).finally(() => { settled = true; });
+      // Win32 EACCES retries restore attributes with real async fs calls between backoff timers.
+      while (!settled) {
+        await vi.advanceTimersByTimeAsync(2_000);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      await expect(swept).resolves.toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
 
+    const attempts = fsState.rmCalls.filter((path) => path === canonicalFailing).length;
+    expect(attempts).toBeGreaterThan(1);
     expect(existsSync(failing)).toBe(true);
     expect(existsSync(succeeding)).toBe(false);
     expect(sweepAudits(audits)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ metadata: expect.objectContaining({ path: canonicalFailing, success: false, reason: "fs-rm-failed", error: expect.stringContaining("simulated tempdir rm failure"), attempts: 5, residual: true, registrationRetained: true }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ path: canonicalFailing, success: false, reason: "fs-rm-failed", error: expect.stringContaining("simulated tempdir rm failure"), attempts, residual: true, registrationRetained: true }) }),
       expect.objectContaining({ metadata: expect.objectContaining({ path: expect.stringContaining("succeeding"), success: true, reason: "stale" }) }),
     ]));
-    expect(fsState.rmCalls.filter((path) => path === canonicalFailing)).toHaveLength(5);
     expect(childState.execCalls.filter((command) => command === "git worktree prune")).toHaveLength(2);
   });
 

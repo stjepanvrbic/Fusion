@@ -68,6 +68,8 @@ vi.mock("node:fs", async () => {
 
 const tracked = new Set<string>();
 const RM = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as const;
+/* FNXC:WorktreeCleanup 2026-10-07-15:11: the bounded filesystem retry's backoff is injected so no test waits in real time. */
+const noRetrySleep = () => undefined;
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -118,6 +120,7 @@ async function cleanup(input: Partial<Parameters<typeof cleanupAiMergeWorktree>[
     log: input.log ?? vi.fn(async (message: string) => { logs.push(message); }),
     gitRunner: input.gitRunner ?? vi.fn(async () => ""),
     rmRunner: input.rmRunner ?? rm,
+    retrySleep: input.retrySleep ?? noRetrySleep,
   });
   return { mergeRoot, events, logs };
 }
@@ -404,11 +407,13 @@ describe("AI merge temp worktree cleanup", () => {
 
     const { mergeRoot, events } = await cleanup({ gitRunner, rmRunner });
 
-    expect(rmRunner).toHaveBeenCalledTimes(realpathSync(mergeRoot) === mergeRoot ? 5 : 10);
+    // FNXC:WorktreeCleanup 2026-10-07-15:11: the attempt count follows the host platform's bounded retry budget.
+    const attemptsPerTarget = vi.mocked(rmRunner).mock.calls.length / (realpathSync(mergeRoot) === mergeRoot ? 1 : 2);
+    expect(attemptsPerTarget).toBeGreaterThan(1);
     expect(existsSync(mergeRoot)).toBe(true);
     expect(gitRunner.mock.calls.filter(([args]) => args[1] === "prune")).toHaveLength(1);
     expect(events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ metadata: expect.objectContaining({ phase: "fs-rm", success: false, attempts: 5, residual: true, registrationRetained: true, code: "EBUSY" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ phase: "fs-rm", success: false, attempts: attemptsPerTarget, residual: true, registrationRetained: true, code: "EBUSY" }) }),
     ]));
   });
 
@@ -469,7 +474,7 @@ describe("AI merge temp worktree cleanup", () => {
     fsState.rmFailuresRemaining = 1;
     const { audit, events } = makeAudit();
 
-    await expect(pruneExistingAiMergeWorktrees("FN-9169", projectRoot, audit, vi.fn(async () => undefined))).resolves.toBe(1);
+    await expect(pruneExistingAiMergeWorktrees("FN-9169", projectRoot, audit, vi.fn(async () => undefined), undefined, { retrySleep: noRetrySleep })).resolves.toBe(1);
 
     expect(fsState.rmCalls.filter((path) => path === canonical)).toHaveLength(2);
     expect(existsSync(stale)).toBe(false);
@@ -507,15 +512,17 @@ describe("AI merge temp worktree cleanup", () => {
     makeAge(stale, MIN_TEMP_WORKTREE_REAP_AGE_MS + 1_000);
     const canonical = realpathSync(stale);
     fsState.rmFailurePath = canonical;
-    fsState.rmFailuresRemaining = 5;
+    fsState.rmFailuresRemaining = Number.POSITIVE_INFINITY;
     const { audit, events } = makeAudit();
 
-    await expect(pruneExistingAiMergeWorktrees("FN-9169", projectRoot, audit, vi.fn(async () => undefined))).resolves.toBe(0);
+    await expect(pruneExistingAiMergeWorktrees("FN-9169", projectRoot, audit, vi.fn(async () => undefined), undefined, { retrySleep: noRetrySleep })).resolves.toBe(0);
 
+    // FNXC:WorktreeCleanup 2026-10-07-15:11: the attempt count follows the host platform's bounded retry budget.
+    const attempts = fsState.rmCalls.filter((path) => path === canonical).length;
     expect(existsSync(stale)).toBe(true);
-    expect(fsState.rmCalls.filter((path) => path === canonical)).toHaveLength(5);
+    expect(attempts).toBeGreaterThan(1);
     expect(events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ metadata: expect.objectContaining({ phase: "pre-merge-prune", success: false, attempts: 5, residual: true, registrationRetained: true, code: "EBUSY" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ phase: "pre-merge-prune", success: false, attempts, residual: true, registrationRetained: true, code: "EBUSY" }) }),
     ]));
   });
 

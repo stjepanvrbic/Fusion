@@ -59,9 +59,17 @@ import {
   type DependencyCommandResult,
 } from "./worktree-dependency-install.js";
 import { getConfiguredWorktreeInitCommand } from "./dependency-bootstrap-inference.js";
+import { removeDirectoryWithRetry, retryTransientFilesystemOperation } from "./worktree-removal-retry.js";
+import { inspectCheckoutGitEntry, recordCheckoutRemovalPartial } from "./remove-checkout.js";
 
 const execAsync = promisify(exec);
 const PRESERVED_ORPHAN_RETENTION_COUNT = 10;
+/** Errno codes a lingering handle produces on a rename-aside; EXDEV is deliberately excluded. */
+const TRANSIENT_RENAME_ASIDE_CODES = new Set(["EPERM", "EACCES", "EBUSY", "ENOTEMPTY"]);
+
+function isTransientRenameAsideError(error: unknown): boolean {
+  return TRANSIENT_RENAME_ASIDE_CODES.has((error as NodeJS.ErrnoException | undefined)?.code ?? "");
+}
 const PRESERVED_ORPHAN_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 /**
@@ -96,6 +104,8 @@ export interface AcquireTaskWorktreeOptions {
   backend?: WorktreeBackend;
   /** Test seam for filesystem-device recovery behavior. */
   renameWorktreeDirectory?: typeof rename;
+  /** Test seam for the bounded filesystem retry's backoff (rename-aside and residue removal). */
+  filesystemRetrySleep?: (ms: number) => void | Promise<void>;
   /** Execution callers opt in; planning, review, and merge reuse remain unchanged. */
   refreshStaleBase?: boolean;
   /*
@@ -404,6 +414,51 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
     }
   };
   const renameWorktreeDirectory = opts.renameWorktreeDirectory ?? rename;
+  /*
+  FNXC:TaskPinnedWorktrees 2026-10-07-15:11:
+  A broken pinned folder is usually the residue of a removal that failed on a locked file, and on
+  Windows that lock can outlive the failure by seconds. The preserve-aside rename used to rethrow the
+  first EPERM/EACCES/EBUSY/ENOTEMPTY, so the KB-003 post-merge re-acquire failed forever with
+  `post-merge-checkout-unavailable`. Rename now shares the bounded filesystem backoff (EXDEV is never
+  retried; it keeps its cross-device fallback). If preservation still fails, a folder that is
+  filesystem-proven residue (`.git` absent or a dangling `gitdir:` pointer) is deleted so recreation can
+  proceed; anything else (a live link, an independent repository, an unreadable `.git`) keeps the error.
+  */
+  const renameAsideWithRetry = async (from: string, to: string): Promise<void> => {
+    const result = await retryTransientFilesystemOperation({
+      operation: () => renameWorktreeDirectory(from, to),
+      isRetryable: isTransientRenameAsideError,
+      sleep: opts.filesystemRetrySleep,
+    });
+    if (!result.ok) throw result.error;
+  };
+  const deleteUnpreservableResidue = async (
+    residuePath: string,
+    classification: string,
+    source: string,
+    preserveError: unknown,
+  ): Promise<boolean> => {
+    if (!isTransientRenameAsideError(preserveError)) return false;
+    const state = await inspectCheckoutGitEntry(residuePath);
+    if (state !== "absent" && state !== "dangling") return false;
+    const removal = await removeDirectoryWithRetry({ path: residuePath, rm, sleep: opts.filesystemRetrySleep });
+    await recordCheckoutRemovalPartial(audit, residuePath, {
+      taskId: task.id, source, classification, phase: "pre-existing", residual: !removal.removed,
+    });
+    if (!removal.removed) return false;
+    const code = (preserveError as NodeJS.ErrnoException).code ?? "unknown";
+    try {
+      await store.logEntry(
+        task.id,
+        `Deleted unusable task-pinned residue ${residuePath} (${classification}) because it could not be preserved aside`,
+        `${code}: ${formatError(preserveError).message}`,
+        runContext,
+      );
+    } catch (error) {
+      logger?.warn(`${task.id}: failed to log deleted residue ${residuePath}: ${formatError(error).message}`);
+    }
+    return true;
+  };
   const refreshExistingWorktree = async (
     path: string,
     backendKind: WorktreeBackend["kind"],
@@ -1087,51 +1142,60 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
               throw new Error(`Task-pinned worktree ${pinnedPath} became active during orphan recovery`);
             }
             let preservedPath = join(actualRecoveryRoot, `${task.id.toLowerCase()}-${randomUUID()}`);
+            let preserved = true;
             try {
-              await renameWorktreeDirectory(pinnedPath, preservedPath);
-            } catch (renameError) {
-              if ((renameError as NodeJS.ErrnoException).code !== "EXDEV") throw renameError;
+              try {
+                await renameAsideWithRetry(pinnedPath, preservedPath);
+              } catch (renameError) {
+                if ((renameError as NodeJS.ErrnoException).code !== "EXDEV") throw renameError;
+                /*
+                 * FNXC:TaskPinnedWorktrees 2026-08-09-03:20:
+                 * Configured worktrees may live on another filesystem. Preserve atomically beside the
+                 * configured worktree root instead of weakening recovery to recursive copy-and-delete.
+                 */
+                const canonicalWorktreesRoot = await realpath(resolveWorktreesDir(rootDir, settings, workspaceContext));
+                const localRecoveryRoot = await ensureContainedDirectory(canonicalWorktreesRoot, WORKTREE_RECOVERY_DIRNAME);
+                const localRecoveryWorktrees = await ensureContainedDirectory(localRecoveryRoot, "worktrees");
+                actualRecoveryRoot = localRecoveryWorktrees;
+                preservedPath = join(localRecoveryWorktrees, `${task.id.toLowerCase()}-${randomUUID()}`);
+                await renameAsideWithRetry(pinnedPath, preservedPath);
+              }
+            } catch (preserveError) {
+              const residueClassification = classification.ok ? "unknown" : classification.classification;
+              if (!await deleteUnpreservableResidue(pinnedPath, residueClassification, "pinned-acquire", preserveError)) throw preserveError;
+              preserved = false;
+            }
+            if (preserved) {
               /*
-               * FNXC:TaskPinnedWorktrees 2026-08-09-03:20:
-               * Configured worktrees may live on another filesystem. Preserve atomically beside the
-               * configured worktree root instead of weakening recovery to recursive copy-and-delete.
+               * FNXC:TaskPinnedWorktrees 2026-08-10-01:12:
+               * Once rename has preserved the orphan, audit, task-log, and retention work are independent best-effort observability/housekeeping. Their failures must not strand the pinned path or block recreation, and warnings must retain the concrete formatted failure message.
                */
-              const canonicalWorktreesRoot = await realpath(resolveWorktreesDir(rootDir, settings, workspaceContext));
-              const localRecoveryRoot = await ensureContainedDirectory(canonicalWorktreesRoot, WORKTREE_RECOVERY_DIRNAME);
-              const localRecoveryWorktrees = await ensureContainedDirectory(localRecoveryRoot, "worktrees");
-              actualRecoveryRoot = localRecoveryWorktrees;
-              preservedPath = join(localRecoveryWorktrees, `${task.id.toLowerCase()}-${randomUUID()}`);
-              await renameWorktreeDirectory(pinnedPath, preservedPath);
+              try {
+                await audit?.filesystem({
+                  type: "file:write",
+                  target: preservedPath,
+                  metadata: {
+                    taskId: task.id,
+                    classification: classification.classification,
+                    reason: "task-pinned-orphan-preserved",
+                    sourcePath: pinnedPath,
+                  },
+                });
+              } catch (error) {
+                logger?.warn(`${task.id}: failed to audit preserved orphan ${preservedPath}: ${formatError(error).message}`);
+              }
+              try {
+                await store.logEntry(
+                  task.id,
+                  `Preserved orphaned task-pinned directory ${pinnedPath} before recreation`,
+                  preservedPath,
+                  runContext,
+                );
+              } catch (error) {
+                logger?.warn(`${task.id}: failed to log preserved orphan ${preservedPath}: ${formatError(error).message}`);
+              }
+              await prunePreservedOrphanDirectories(actualRecoveryRoot, logger);
             }
-            /*
-             * FNXC:TaskPinnedWorktrees 2026-08-10-01:12:
-             * Once rename has preserved the orphan, audit, task-log, and retention work are independent best-effort observability/housekeeping. Their failures must not strand the pinned path or block recreation, and warnings must retain the concrete formatted failure message.
-             */
-            try {
-              await audit?.filesystem({
-                type: "file:write",
-                target: preservedPath,
-                metadata: {
-                  taskId: task.id,
-                  classification: classification.classification,
-                  reason: "task-pinned-orphan-preserved",
-                  sourcePath: pinnedPath,
-                },
-              });
-            } catch (error) {
-              logger?.warn(`${task.id}: failed to audit preserved orphan ${preservedPath}: ${formatError(error).message}`);
-            }
-            try {
-              await store.logEntry(
-                task.id,
-                `Preserved orphaned task-pinned directory ${pinnedPath} before recreation`,
-                preservedPath,
-                runContext,
-              );
-            } catch (error) {
-              logger?.warn(`${task.id}: failed to log preserved orphan ${preservedPath}: ${formatError(error).message}`);
-            }
-            await prunePreservedOrphanDirectories(actualRecoveryRoot, logger);
           } else {
             await removeWorktree({
               rootDir,
@@ -1213,18 +1277,26 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
       const recoveryRoot = await ensureContainedDirectory(canonicalWorktreesRoot, WORKTREE_RECOVERY_DIRNAME);
       const recoveryWorktrees = await ensureContainedDirectory(recoveryRoot, "worktrees");
       const preservedPath = join(recoveryWorktrees, `${task.id.toLowerCase()}-${randomUUID()}`);
-      await renameWorktreeDirectory(worktreePath, preservedPath);
+      let preserved = true;
       try {
-        await store.logEntry(
-          task.id,
-          `Preserved unusable workspace checkout ${worktreePath} (${forcedClassification.classification}) before recreation`,
-          preservedPath,
-          runContext,
-        );
-      } catch (error) {
-        logger?.warn(`${task.id}: failed to log preserved workspace checkout ${preservedPath}: ${formatError(error).message}`);
+        await renameAsideWithRetry(worktreePath, preservedPath);
+      } catch (preserveError) {
+        if (!await deleteUnpreservableResidue(worktreePath, forcedClassification.classification, "workspace-acquire", preserveError)) throw preserveError;
+        preserved = false;
       }
-      await prunePreservedOrphanDirectories(recoveryWorktrees, logger);
+      if (preserved) {
+        try {
+          await store.logEntry(
+            task.id,
+            `Preserved unusable workspace checkout ${worktreePath} (${forcedClassification.classification}) before recreation`,
+            preservedPath,
+            runContext,
+          );
+        } catch (error) {
+          logger?.warn(`${task.id}: failed to log preserved workspace checkout ${preservedPath}: ${formatError(error).message}`);
+        }
+        await prunePreservedOrphanDirectories(recoveryWorktrees, logger);
+      }
       isResume = false;
     }
   }

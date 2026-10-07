@@ -99,6 +99,8 @@ export async function pruneExistingAiMergeWorktrees(
   audit: RunAuditor,
   log: (message: string) => Promise<void>,
   settings?: Settings,
+  /** Test seam for the bounded filesystem retry's backoff. */
+  options: { retrySleep?: (ms: number) => void | Promise<void> } = {},
 ): Promise<number> {
   const prefix = `fusion-ai-merge-${taskId.toLowerCase()}-`;
   const tempRoots = getAiMergeTempSearchRoots(projectRootDir, settings);
@@ -174,7 +176,8 @@ export async function pruneExistingAiMergeWorktrees(
       cleanupAttempted = true;
       const removal = await removeDirectoryWithRetry({
         path: canonicalPath,
-        rm: (path, options) => rmSync(path, options),
+        rm: (path, rmOptions) => rmSync(path, rmOptions),
+        sleep: options.retrySleep,
         log: (message) => void log(`AI merge pre-merge prune: ${message}`),
       });
       if (removal.removed) {
@@ -209,6 +212,8 @@ export async function cleanupAiMergeWorktree(input: {
   log: (message: string) => Promise<void>;
   gitRunner?: typeof git;
   rmRunner?: typeof rm;
+  /** Test seam for the bounded filesystem retry's backoff. */
+  retrySleep?: (ms: number) => void | Promise<void>;
 }): Promise<void> {
   const { taskId, mergeRoot, projectRootDir, worktreeAdded, audit, log, gitRunner = git, rmRunner = rm } = input;
   let canonicalRoot = mergeRoot;
@@ -266,6 +271,7 @@ export async function cleanupAiMergeWorktree(input: {
     const removal = await removeDirectoryWithRetry({
       path: target,
       rm: rmRunner,
+      sleep: input.retrySleep,
       log: (message) => void log(`AI merge cleanup: ${message}`),
     });
     if (removal.removed) {

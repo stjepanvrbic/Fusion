@@ -477,6 +477,93 @@ describe("acquireTaskWorktree", () => {
     expect(renameWorktreeDirectory).toHaveBeenCalledTimes(2);
   });
 
+  /*
+  FNXC:TaskPinnedWorktrees 2026-10-07-15:11:
+  On Windows a just-failed removal can leave a lingering handle on the broken pinned folder, so the
+  preserve-aside rename fails with EPERM/EBUSY and the KB-003 re-acquire failed forever. The rename now
+  retries with the bounded filesystem backoff; if it still fails and the folder is filesystem-proven
+  residue (no live `.git` link, no independent repository) it is deleted instead, otherwise the error stands.
+  */
+  it("retries a transient EBUSY preserve-aside rename before recreating", async () => {
+    const rootDir = makeRepo();
+    const pinnedPath = join(rootDir, ".worktrees", "fn-1");
+    mkdirSync(join(pinnedPath, ".build"), { recursive: true });
+    writeFileSync(join(pinnedPath, ".build", "cache"), "stale\n", "utf-8");
+    vi.mocked(classifyTaskWorktree).mockResolvedValueOnce({ ok: false, classification: "incomplete", reason: "missing .git metadata" });
+    const actualFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    const busy = Object.assign(new Error("resource busy or locked"), { code: "EBUSY" });
+    const renameWorktreeDirectory = vi.fn()
+      .mockRejectedValueOnce(busy)
+      .mockRejectedValueOnce(busy)
+      .mockImplementationOnce(actualFs.rename);
+    const filesystemRetrySleep = vi.fn();
+
+    const result = await acquireTaskWorktree({
+      task: { ...task, worktree: pinnedPath, branch: "fusion/fn-1" },
+      rootDir,
+      store,
+      settings: { worktreeNaming: "task-id", recycleWorktrees: false },
+      renameWorktreeDirectory,
+      filesystemRetrySleep,
+    });
+
+    const recoveryRoot = join(rootDir, ".fusion", "recovery", "worktrees");
+    expect(result).toMatchObject({ worktreePath: pinnedPath, source: "fresh" });
+    expect(renameWorktreeDirectory).toHaveBeenCalledTimes(3);
+    expect(filesystemRetrySleep).toHaveBeenCalledTimes(2);
+    expect(readFileSync(join(recoveryRoot, readdirSync(recoveryRoot)[0], ".build", "cache"), "utf-8")).toBe("stale\n");
+  });
+
+  it("deletes proven pinned residue when the preserve-aside rename keeps failing", async () => {
+    const rootDir = makeRepo();
+    const pinnedPath = join(rootDir, ".worktrees", "fn-1");
+    mkdirSync(join(pinnedPath, "locked"), { recursive: true });
+    writeFileSync(join(pinnedPath, "locked", "file.txt"), "stale\n", "utf-8");
+    vi.mocked(classifyTaskWorktree).mockResolvedValueOnce({ ok: false, classification: "incomplete", reason: "missing .git metadata" });
+    const renameWorktreeDirectory = vi.fn().mockRejectedValue(Object.assign(new Error("operation not permitted"), { code: "EPERM" }));
+
+    const result = await acquireTaskWorktree({
+      task: { ...task, worktree: pinnedPath, branch: "fusion/fn-1" },
+      rootDir,
+      store,
+      settings: { worktreeNaming: "task-id", recycleWorktrees: false },
+      renameWorktreeDirectory,
+      filesystemRetrySleep: vi.fn(),
+    });
+
+    expect(result).toMatchObject({ worktreePath: pinnedPath, source: "fresh" });
+    expect(renameWorktreeDirectory.mock.calls.length).toBeGreaterThan(1);
+    expect(existsSync(join(pinnedPath, "locked", "file.txt"))).toBe(false);
+    expect(existsSync(join(pinnedPath, ".git"))).toBe(true);
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "FN-1",
+      expect.stringContaining("Deleted unusable task-pinned residue"),
+      expect.stringContaining("EPERM"),
+      undefined,
+    );
+  });
+
+  it("keeps the rename failure when the pinned folder is not proven residue", async () => {
+    const rootDir = makeRepo();
+    const pinnedPath = join(rootDir, ".worktrees", "fn-1");
+    mkdirSync(join(pinnedPath, ".git"), { recursive: true });
+    writeFileSync(join(pinnedPath, "work.txt"), "independent repository\n", "utf-8");
+    vi.mocked(classifyTaskWorktree).mockResolvedValueOnce({ ok: false, classification: "unregistered", reason: "not registered in git worktree list" });
+    const denied = Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    const renameWorktreeDirectory = vi.fn().mockRejectedValue(denied);
+
+    await expect(acquireTaskWorktree({
+      task: { ...task, worktree: pinnedPath, branch: "fusion/fn-1" },
+      rootDir,
+      store,
+      settings: { worktreeNaming: "task-id", recycleWorktrees: false },
+      renameWorktreeDirectory,
+      filesystemRetrySleep: vi.fn(),
+    })).rejects.toBe(denied);
+
+    expect(readFileSync(join(pinnedPath, "work.txt"), "utf-8")).toBe("independent repository\n");
+  });
+
   it("retains only the newest ten generated orphan directories in the primary recovery root", async () => {
     const rootDir = makeRepo();
     const pinnedPath = join(rootDir, ".worktrees", "fn-1");

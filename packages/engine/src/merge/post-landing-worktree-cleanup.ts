@@ -1,5 +1,4 @@
 import { existsSync, rmdirSync } from "node:fs";
-import { rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { isLegacyWorkspaceWorktreeLayout, isStrictDescendantPath, resolveWorkspaceTaskWorktreeDir, type Settings, type Task, type TaskStore } from "@fusion/core";
 import type { RunAuditor } from "../util/run-audit.js";
@@ -11,8 +10,16 @@ import {
 import type { MergeWriteFence } from "./merge-write-fence.js";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
 import { canonicalizePath, classifyTaskWorktree, type TaskWorktreeClassificationResult } from "../worktree/worktree-pool.js";
-import { removeDirectoryWithRetry } from "../worktree/worktree-removal-retry.js";
-import { pruneWorktreeAdminEntries } from "../worktree/worktree-prune.js";
+import {
+  isCheckoutResidue,
+  pruneCheckoutAdminBestEffort,
+  recordCheckoutRemovalPartial,
+  settleFailedCheckoutRemoval,
+  type CheckoutResidueClassification,
+  type CheckoutResidueRemover,
+  type CheckoutStateProbe,
+  type FailedCheckoutRemovalSettlement,
+} from "../worktree/remove-checkout.js";
 
 /**
  * FNXC:WorktreeCleanup 2026-10-07-05:29:
@@ -33,10 +40,10 @@ export type LandedWorktreeCleanupOutcome =
 type LandedWorktreeCleanupStore = Pick<TaskStore, "updateTask" | "logEntry"> & Partial<Pick<TaskStore, "getSettings">>;
 
 /** Classifies a recorded checkout; defaults to the canonical `classifyTaskWorktree`. */
-export type LandedWorktreeStateProbe = (rootDir: string, worktreePath: string) => Promise<TaskWorktreeClassificationResult>;
+export type LandedWorktreeStateProbe = CheckoutStateProbe;
 
 /** Deletes residual files git left behind; defaults to the bounded `removeDirectoryWithRetry`. */
-export type LandedWorktreeResidualRemover = (worktreePath: string) => Promise<{ removed: boolean }>;
+export type LandedWorktreeResidualRemover = CheckoutResidueRemover;
 
 export interface CleanupLandedTaskWorktreeInput {
   store: LandedWorktreeCleanupStore;
@@ -119,10 +126,6 @@ function isPreservationRefusal(error: unknown): boolean {
   return message.startsWith("preserving ");
 }
 
-function isUnusableResidue(state: TaskWorktreeClassificationResult): state is { ok: false; classification: "incomplete" | "unregistered"; reason: string } {
-  return !state.ok && (state.classification === "incomplete" || state.classification === "unregistered");
-}
-
 async function probeState(
   probe: LandedWorktreeStateProbe,
   rootDir: string,
@@ -135,25 +138,7 @@ async function probeState(
   }
 }
 
-async function pruneBestEffort(rootDir: string, worktreePath: string, audit: RunAuditor | undefined): Promise<void> {
-  try {
-    await pruneWorktreeAdminEntries({ rootDir, auditor: audit, reason: "post-landing-partial-removal", target: worktreePath });
-  } catch {
-    // Pruning stale administration is housekeeping; it never decides the cleanup outcome.
-  }
-}
-
-async function recordPartialRemovalAudit(
-  audit: RunAuditor | undefined,
-  worktreePath: string,
-  metadata: { taskId: string; source: string; classification: string; phase: "pre-existing" | "during-removal"; residual: boolean },
-): Promise<void> {
-  try {
-    await audit?.git({ type: "worktree:removal-partial", target: worktreePath, metadata });
-  } catch {
-    // Audit persistence must not change worktree cleanup outcomes.
-  }
-}
+const POST_LANDING_PRUNE_REASON = "post-landing-partial-removal";
 
 /*
 FNXC:WorktreeCleanup 2026-10-07-13:33:
@@ -191,9 +176,6 @@ async function recordActiveSessionRefusalAudit(
   }
 }
 
-const defaultResidualRemover: LandedWorktreeResidualRemover = (worktreePath) =>
-  removeDirectoryWithRetry({ path: worktreePath, rm });
-
 type UnusablePathOutcome =
   | { kind: "settled"; outcome: "removed" | "partially-removed" | "residual-unusable" | "nothing-to-remove"; removed: boolean }
   | { kind: "preserved"; outcome: Extract<LandedWorktreeCleanupOutcome, "preserved-deliverable" | "preserved-unverifiable" | "preserved-active-session">; reason: string };
@@ -227,9 +209,9 @@ async function cleanupLandedWorktreePath(params: {
     if (before.classification === "missing") {
       return { kind: "settled", outcome: "nothing-to-remove", removed: false };
     }
-    if (isUnusableResidue(before)) {
-      await pruneBestEffort(rootDir, worktreePath, input.audit);
-      await recordPartialRemovalAudit(input.audit, worktreePath, {
+    if (isCheckoutResidue(before)) {
+      await pruneCheckoutAdminBestEffort(rootDir, worktreePath, input.audit, POST_LANDING_PRUNE_REASON);
+      await recordCheckoutRemovalPartial(input.audit, worktreePath, {
         taskId, source: input.source, classification: before.classification, phase: "pre-existing", residual: true,
       });
       await recordCleanupMessage(
@@ -245,6 +227,42 @@ async function cleanupLandedWorktreePath(params: {
     return preserved;
   }
 
+  const recordPartialRemoval = async (
+    classification: CheckoutResidueClassification,
+    residualRemoved: boolean,
+    failureSummary: string,
+  ): Promise<UnusablePathOutcome> => {
+    await recordCleanupMessage(
+      logInput,
+      "Post-landing worktree cleanup partially removed",
+      `Post-landing worktree cleanup partially removed ${worktreePath} (${classification}): git unregistered the checkout but ${failureSummary}; residual files ${residualRemoved ? "deleted" : "remain"}`,
+    );
+    return residualRemoved
+      ? { kind: "settled", outcome: "removed", removed: true }
+      : { kind: "settled", outcome: "partially-removed", removed: false };
+  };
+
+  const recordSettlement = async (
+    settlement: FailedCheckoutRemovalSettlement,
+    failureSummary: string,
+  ): Promise<UnusablePathOutcome | undefined> => {
+    switch (settlement.outcome) {
+      case "removed":
+        return { kind: "settled", outcome: "removed", removed: true };
+      case "partially-removed":
+        return recordPartialRemoval(settlement.classification, settlement.residualRemoved, failureSummary);
+      case "residual-unusable":
+        await recordCleanupMessage(
+          logInput,
+          "Post-landing worktree cleanup found an unusable checkout",
+          `Post-landing worktree cleanup found ${worktreePath} unusable (${settlement.classification}) after ${failureSummary}; cleared the task worktree pointer and left the residue for orphan recovery`,
+        );
+        return { kind: "settled", outcome: "residual-unusable", removed: false };
+      case "unresolved":
+        return undefined;
+    }
+  };
+
   let removal: Awaited<ReturnType<typeof removeWorktree>>;
   try {
     input.fence?.assertOwned("finalization");
@@ -256,42 +274,28 @@ async function cleanupLandedWorktreePath(params: {
       audit: input.audit,
       reason: RemovalReason.CompletionLandedCleanup,
       postLandingProof: { landedSha: input.landedSha, source: input.source },
+      removeCheckoutResidue: input.removeResidualDirectory,
     });
   } catch (error) {
-    const after = isPreservationRefusal(error) ? undefined : await probeState(probe, rootDir, worktreePath);
-    if (after && !after.ok && after.classification === "missing") {
-      await pruneBestEffort(rootDir, worktreePath, input.audit);
-      return { kind: "settled", outcome: "removed", removed: true };
-    }
-    if (after && isUnusableResidue(after) && before?.ok === true) {
-      const residual = await (input.removeResidualDirectory ?? defaultResidualRemover)(worktreePath)
-        .catch(() => ({ removed: false }));
-      const residualGone = residual.removed;
-      await pruneBestEffort(rootDir, worktreePath, input.audit);
-      await recordPartialRemovalAudit(input.audit, worktreePath, {
-        taskId, source: input.source, classification: after.classification, phase: "during-removal", residual: !residualGone,
-      });
-      await recordCleanupMessage(
-        logInput,
-        "Post-landing worktree cleanup partially removed",
-        `Post-landing worktree cleanup partially removed ${worktreePath}: git unregistered the checkout but ${errorSummary(error)}; residual files ${residualGone ? "deleted" : "remain"}`,
-      );
-      return residualGone
-        ? { kind: "settled", outcome: "removed", removed: true }
-        : { kind: "settled", outcome: "partially-removed", removed: false };
-    }
-    if (after && isUnusableResidue(after)) {
-      // The pre-probe could not prove the checkout usable, so its residue is never deleted here.
-      await pruneBestEffort(rootDir, worktreePath, input.audit);
-      await recordPartialRemovalAudit(input.audit, worktreePath, {
-        taskId, source: input.source, classification: after.classification, phase: "during-removal", residual: true,
-      });
-      await recordCleanupMessage(
-        logInput,
-        "Post-landing worktree cleanup found an unusable checkout",
-        `Post-landing worktree cleanup found ${worktreePath} unusable (${after.classification}) after ${errorSummary(error)}; cleared the task worktree pointer and left the residue for orphan recovery`,
-      );
-      return { kind: "settled", outcome: "residual-unusable", removed: false };
+    /*
+    FNXC:WorktreeCleanup 2026-10-07-15:11:
+    removeWorktree now settles a proven partial removal itself; this re-probe covers what it cannot
+    prove alone (a pre-probe that failed, or a classifier-only verdict) through the same shared seam,
+    so post-landing and defensive removal share one set of residue rules.
+    */
+    if (!isPreservationRefusal(error)) {
+      const settled = await recordSettlement(await settleFailedCheckoutRemoval({
+        rootDir,
+        worktreePath,
+        usableBefore: before?.ok === true,
+        taskId,
+        source: input.source,
+        pruneReason: POST_LANDING_PRUNE_REASON,
+        audit: input.audit,
+        probe,
+        removeResidue: input.removeResidualDirectory,
+      }), errorSummary(error));
+      if (settled) return settled;
     }
     const preserved = preservedOutcomeFor(error);
     await recordPreservedOutcome(logInput, worktreePath, preserved);
@@ -300,6 +304,9 @@ async function cleanupLandedWorktreePath(params: {
       outcome: preserved.outcome as Extract<LandedWorktreeCleanupOutcome, "preserved-deliverable" | "preserved-unverifiable" | "preserved-active-session">,
       reason: preserved.preservedReason ?? "deliverable",
     };
+  }
+  if (removal.classification === "partially-removed") {
+    return recordPartialRemoval(removal.checkoutState, removal.residualRemoved, removal.failureSummary);
   }
   return removal.removed
     ? { kind: "settled", outcome: "removed", removed: true }

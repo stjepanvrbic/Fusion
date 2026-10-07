@@ -43,3 +43,14 @@ KB-001 landed, but the card stayed In Review forever. Every `post-merge-verifica
 - Never treat a non-zero `git worktree remove` as all-or-nothing. Re-probe with `classifyTaskWorktree` before reporting what happened.
 - `existsSync` is not a liveness check for a worktree; use the shared classifier.
 - Symptom coverage lives in `packages/engine/src/__tests__/post-merge-gate-unusable-worktree.test.ts` and `post-landing-worktree-partial-removal.test.ts`.
+
+## Follow-up: every defensive removal path
+
+KB-003 fixed only post-landing cleanup. The same half-deleted state was reachable from every other defensive removal (self-healing reclaim, pool prune, step-session cleanup, merger cleanup, pre-execution release), which kept their task pointer to the broken folder.
+
+- `packages/engine/src/worktree/remove-checkout.ts` is the shared seam. `settleFailedCheckoutRemoval` decides what a failed removal left behind, using only async filesystem reads: `.git` absent or a dangling `gitdir:` pointer is residue; a live link, a `.git` directory, or an unreadable `.git` is never deleted.
+- Defensive `removeWorktree` settles a git failure through that seam when the checkout carried `.git` and passed the content probe before removal. A proven partial removal returns `{ removed: true, classification: "partially-removed" }`, so existing callers clear their pointer, and emits `worktree:removal-partial`. A checkout that is still usable after the failure keeps the original throw.
+- `removeDirectoryWithRetry` waits up to ~10s with exponential backoff on win32 (POSIX stays ~1s). The pinned preserve-aside rename uses the same backoff and, if it still fails, deletes filesystem-proven residue instead of failing acquisition forever.
+- AI merge awaits bounded agent-session disposal before removing its clean room, and clean-room cleanup failures no longer replace a landed outcome.
+- The startup orphan reaper reclaims `.git`-less residue only under a worktrees root inside the project, unregistered, older than 15 minutes, without secret material or a live session, and referenced by no task row (archived and soft-deleted included).
+- Coverage: `worktree-defensive-partial-removal.test.ts`, `worktree-removal-retry.test.ts`, `worktree-acquisition.test.ts` (rename-aside), `merger-ai-session-dispose-order.test.ts`, `dispose-agent-session.test.ts`, `worktree-orphan-residue-reap.test.ts`.

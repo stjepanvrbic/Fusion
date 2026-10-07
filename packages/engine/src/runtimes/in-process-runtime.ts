@@ -1326,7 +1326,8 @@ export class InProcessRuntime
       const { reapOrphanWorktrees } = await import("../worktree/worktree-pool.js");
       const settings = await this.taskStore.getSettings();
       try {
-        const reaped = await reapOrphanWorktrees(this.config.workingDirectory, settings);
+        // FNXC:WorktreeOrphanReap 2026-10-07-15:11: the task store lets the reaper prove `.git`-less residue is unreferenced.
+        const reaped = await reapOrphanWorktrees(this.config.workingDirectory, settings, { store: this.taskStore });
         if (reaped > 0) {
           runtimeLog.log(`Reaped ${reaped} half-initialized orphan worktree(s) on startup`);
         }

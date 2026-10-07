@@ -18,6 +18,7 @@ import { formatError } from "../logger.js";
 import { installTaskWorktreeIdentityGuard } from "./worktree-hooks.js";
 import { pruneWorktreeAdminEntries } from "./worktree-prune.js";
 import { isRetryableRemovalError, removeDirectoryWithRetry } from "./worktree-removal-retry.js";
+import { settleFailedCheckoutRemoval, type CheckoutResidueClassification, type CheckoutResidueRemover } from "./remove-checkout.js";
 import {
   StaleWorktreeIndexLockError,
   classifyStaleLock,
@@ -35,6 +36,20 @@ const MAX_BUFFER = 10 * 1024 * 1024;
 
 export type WorktreeRemoveOutcome =
   | { removed: true; classification: "removed" }
+  /*
+  FNXC:WorktreeCleanup 2026-10-07-15:11:
+  A defensive removal whose git call failed after crossing the deletion boundary (Windows lock: the
+  folder is left `.git`-less or with a dangling pointer). The checkout is no longer usable, so callers
+  treat this exactly like a removal and clear their task pointer; `residualRemoved` reports whether the
+  residue was finished off, and orphan reaping reclaims any that remains.
+  */
+  | {
+      removed: true;
+      classification: "partially-removed";
+      checkoutState: CheckoutResidueClassification;
+      residualRemoved: boolean;
+      failureSummary: string;
+    }
   | {
       removed: false;
       harmless: true;
@@ -1278,6 +1293,13 @@ async function assertCleanForDefensiveRemoval(rootDir: string, worktreePath: str
   };
 }
 
+/** Last non-empty line of a git failure (git prints its fatal reason last), bounded for task logs. */
+function summarizeRemovalFailure(error: unknown): string {
+  const detail = getErrorMessageWithStderr(error);
+  const firstLine = detail.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop() ?? detail;
+  return firstLine.length > 300 ? `${firstLine.slice(0, 300)}…` : firstLine;
+}
+
 /**
  * FNXC:WorkspaceWorktree 2026-08-20-07:08:
  * Force removal is reserved for explicit executor teardown paths and workspace-acquisition rollback
@@ -1298,6 +1320,8 @@ export async function removeWorktree(input: {
   liveOwnerProbe?: LiveBindingProbe;
   processActiveProbe?: ProcessActiveProbe;
   reconcileMinIdleMs?: number;
+  /** Deletes residue after a proven partial defensive removal; defaults to the bounded retrying remover. */
+  removeCheckoutResidue?: CheckoutResidueRemover;
 }): Promise<WorktreeRemoveOutcome> {
   const logger = {
     log: (_message: string): void => {},
@@ -1434,6 +1458,42 @@ export async function removeWorktree(input: {
     });
   }
 
+  /*
+  FNXC:WorktreeCleanup 2026-10-07-15:11:
+  Defensive removals pass `force:false`, so git's failure used to propagate and every caller kept its
+  task pointer to whatever git left behind. On Windows a locked file makes `git worktree remove` exit
+  non-zero after it already deleted `.git` and the admin entry, so that pointer named a half-deleted
+  folder forever. A failure is now settled through the shared remove-checkout seam: only a checkout this
+  call proved usable (it carried `.git` and passed the content probe) and that is now filesystem-proven
+  residue is finished off and reported as a removal. A checkout that is still usable after the failure
+  (dirty, locked, foreign) keeps today's throw, so the defensive refusal semantics never weaken.
+  */
+  const usableBeforeRemoval = requiresCleanWorktree && existsSync(resolve(input.worktreePath, ".git"));
+  const settleFailure = async (error: unknown): Promise<WorktreeRemoveOutcome | null> => {
+    if (!usableBeforeRemoval) return null;
+    const settlement = await settleFailedCheckoutRemoval({
+      rootDir: input.rootDir,
+      worktreePath: input.worktreePath,
+      usableBefore: true,
+      taskId: input.taskId,
+      source: input.postLandingProof?.source ?? input.reason,
+      pruneReason: input.postLandingProof ? "post-landing-partial-removal" : "defensive-partial-removal",
+      audit: input.audit,
+      removeResidue: input.removeCheckoutResidue,
+    });
+    if (settlement.outcome !== "removed" && settlement.outcome !== "partially-removed") return null;
+    await recordIgnoredOnlyDiscard();
+    await recordRegenerableDiscard();
+    if (settlement.outcome === "removed") return { removed: true, classification: "removed" };
+    return {
+      removed: true,
+      classification: "partially-removed",
+      checkoutState: settlement.classification,
+      residualRemoved: settlement.residualRemoved,
+      failureSummary: summarizeRemovalFailure(error),
+    };
+  };
+
   const backend = resolveWorktreeBackend(input.settings, { logger, audit: input.audit });
   const removeInput: WorktreeRemoveInput = {
     rootDir: input.rootDir,
@@ -1463,6 +1523,8 @@ export async function removeWorktree(input: {
     if (classified) return classified;
 
     if (!(error instanceof WorktrunkOperationError) || input.settings.worktrunk?.onFailure !== "fallback-native") {
+      const settled = await settleFailure(error);
+      if (settled) return settled;
       throw error;
     }
 
@@ -1488,6 +1550,8 @@ export async function removeWorktree(input: {
     } catch (nativeError) {
       const classified = await classifyHarmlessMergeRemoveFailure(input, nativeError);
       if (classified) return classified;
+      const settled = await settleFailure(nativeError);
+      if (settled) return settled;
       throw nativeError;
     }
   }

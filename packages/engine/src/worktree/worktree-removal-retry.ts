@@ -63,9 +63,88 @@ async function clearReadOnlyAttributes(
   }
 }
 
+/*
+FNXC:WorktreeCleanup 2026-10-07-15:11:
+Windows keeps handles to a just-deleted checkout open for seconds (antivirus and indexer scans, exiting
+agent child processes), so the former ~1s linear retry window ended before they drained and every AI
+merge clean room logged "Directory not empty". Win32 now uses exponential backoff bounded by a ~10s
+total wait; POSIX keeps its ~1s window because its unlink semantics do not wait on open handles. The
+budget counts planned sleeps rather than wall-clock time so injected sleeps keep tests deterministic.
+*/
+export type FilesystemRetryPolicy = {
+  /** Upper bound on operation attempts, including the first. */
+  maxAttempts: number;
+  /** First retry delay; each later delay doubles up to `maxDelayMs`. */
+  baseDelayMs: number;
+  maxDelayMs: number;
+  /** Total planned sleep across all retries. */
+  budgetMs: number;
+};
+
+export const WIN32_FILESYSTEM_RETRY_POLICY: Readonly<FilesystemRetryPolicy> = Object.freeze({
+  maxAttempts: 12,
+  baseDelayMs: 100,
+  maxDelayMs: 2_000,
+  budgetMs: 10_000,
+});
+
+export const POSIX_FILESYSTEM_RETRY_POLICY: Readonly<FilesystemRetryPolicy> = Object.freeze({
+  maxAttempts: 5,
+  baseDelayMs: 100,
+  maxDelayMs: 400,
+  budgetMs: 1_100,
+});
+
+export function filesystemRetryPolicyFor(platform: NodeJS.Platform | string = process.platform): FilesystemRetryPolicy {
+  return { ...(platform === "win32" ? WIN32_FILESYSTEM_RETRY_POLICY : POSIX_FILESYSTEM_RETRY_POLICY) };
+}
+
+/** Delay before the next attempt, or undefined once the attempt or wait budget is spent. */
+function nextRetryDelayMs(policy: FilesystemRetryPolicy, completedAttempts: number, waitedMs: number): number | undefined {
+  if (completedAttempts >= policy.maxAttempts) return undefined;
+  const delay = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (completedAttempts - 1));
+  return waitedMs + delay > policy.budgetMs ? undefined : delay;
+}
+
+const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export type TransientFilesystemRetryResult<T> =
+  | { ok: true; value: T; attempts: number }
+  | { ok: false; error: unknown; attempts: number };
+
+/**
+ * Bounded retry for one filesystem operation that can fail while external handles drain. Only errors the
+ * caller classifies as transient are retried; every other failure is returned after one attempt.
+ */
+export async function retryTransientFilesystemOperation<T>(input: {
+  operation: (attempt: number) => Promise<T>;
+  isRetryable: (error: unknown) => boolean;
+  policy?: FilesystemRetryPolicy;
+  platform?: NodeJS.Platform | string;
+  sleep?: (ms: number) => void | Promise<void>;
+  beforeRetry?: (error: unknown, attempt: number, delayMs: number) => void | Promise<void>;
+}): Promise<TransientFilesystemRetryResult<T>> {
+  const policy = input.policy ?? filesystemRetryPolicyFor(input.platform);
+  const sleep = input.sleep ?? defaultSleep;
+  let waitedMs = 0;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return { ok: true, value: await input.operation(attempt), attempts: attempt };
+    } catch (error) {
+      const delay = input.isRetryable(error) ? nextRetryDelayMs(policy, attempt, waitedMs) : undefined;
+      if (delay === undefined) return { ok: false, error, attempts: attempt };
+      await input.beforeRetry?.(error, attempt, delay);
+      await sleep(delay);
+      waitedMs += delay;
+    }
+  }
+}
+
 export async function removeDirectoryWithRetry(input: {
   path: string;
+  /** Explicit attempt cap; replaces the platform wait budget. */
   attempts?: number;
+  /** Explicit first retry delay. */
   backoffMs?: number;
   rm: (path: string, options: RemovalOptions) => void | Promise<void>;
   chmod?: (path: string, mode: number) => void | Promise<void>;
@@ -73,38 +152,50 @@ export async function removeDirectoryWithRetry(input: {
   platform?: NodeJS.Platform | string;
   log?: (message: string) => void;
 }): Promise<DirectoryRemovalResult> {
-  const attempts = Math.max(1, Math.trunc(input.attempts ?? 5));
-  const backoffMs = Math.max(0, Math.trunc(input.backoffMs ?? 100));
   const platform = input.platform ?? process.platform;
-  const sleep = input.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const policy = filesystemRetryPolicyFor(platform);
+  if (input.attempts !== undefined) {
+    policy.maxAttempts = Math.max(1, Math.trunc(input.attempts));
+    policy.budgetMs = Number.POSITIVE_INFINITY;
+  }
+  if (input.backoffMs !== undefined) {
+    policy.baseDelayMs = Math.max(0, Math.trunc(input.backoffMs));
+    policy.maxDelayMs = Math.max(policy.maxDelayMs, policy.baseDelayMs);
+  }
   const chmod = input.chmod ?? chmodAsync;
-  let lastError: unknown;
+  let benignAbsent: unknown;
 
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    try {
-      await input.rm(input.path, { recursive: true, force: true });
-      return { removed: true, attempts: attempt, benignAbsent: false };
-    } catch (error) {
-      if (isBenignAbsentRemovalError(error)) {
-        return { removed: true, attempts: attempt, benignAbsent: true, lastCode: errorCode(error), lastError: errorDescription(error) };
+  const result = await retryTransientFilesystemOperation({
+    policy,
+    sleep: input.sleep,
+    isRetryable: isRetryableRemovalError,
+    operation: async () => {
+      try {
+        await input.rm(input.path, { recursive: true, force: true });
+      } catch (error) {
+        if (!isBenignAbsentRemovalError(error)) throw error;
+        benignAbsent = error;
       }
-      lastError = error;
-      if (!isRetryableRemovalError(error) || attempt === attempts) break;
+    },
+    beforeRetry: async (error, attempt) => {
       if (platform === "win32" && (errorCode(error) === "EPERM" || errorCode(error) === "EACCES")) {
         await clearReadOnlyAttributes(input.path, chmod);
       }
-      const delay = backoffMs * attempt;
-      input.log?.(`retrying removal of ${input.path} after ${errorCode(error) ?? "unknown"} (${attempt}/${attempts})`);
-      await sleep(delay);
-    }
-  }
+      input.log?.(`retrying removal of ${input.path} after ${errorCode(error) ?? "unknown"} (attempt ${attempt})`);
+    },
+  });
 
+  if (result.ok) {
+    return benignAbsent === undefined
+      ? { removed: true, attempts: result.attempts, benignAbsent: false }
+      : { removed: true, attempts: result.attempts, benignAbsent: true, lastCode: errorCode(benignAbsent), lastError: errorDescription(benignAbsent) };
+  }
   return {
     removed: false,
-    attempts,
+    attempts: result.attempts,
     benignAbsent: false,
-    lastCode: errorCode(lastError),
-    lastError: lastError === undefined ? undefined : errorDescription(lastError),
-    lastFailure: lastError,
+    lastCode: errorCode(result.error),
+    lastError: errorDescription(result.error),
+    lastFailure: result.error,
   };
 }
