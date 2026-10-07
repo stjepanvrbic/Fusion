@@ -740,3 +740,77 @@ describe("HeartbeatTriggerScheduler to HeartbeatMonitor recovery boundary", () =
     }
   });
 });
+
+/*
+FNXC:HeartbeatRecovery 2026-10-07-18:55:
+A repeating model-unavailable failure (missing provider key, unknown model) must become operator-visible within the retry budget for every trigger source.
+Each failure parks the agent with the model-unavailable pause reason and keeps lastError; only real successful work resets the shared budget.
+*/
+describe("model-unavailable failures are bounded for every trigger source", () => {
+  const NO_KEY = "No API key for provider: anthropic";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedCreateFnAgent.mockReset();
+  });
+
+  it.each([
+    ["timer", "session creation"],
+    ["assignment", "session creation"],
+    ["on_demand", "session creation"],
+    ["timer", "prompt"],
+  ] as const)("%s %s failures park and exhaust the shared budget instead of looping as healthy", async (source, failurePoint) => {
+    if (failurePoint === "session creation") {
+      mockedCreateFnAgent.mockRejectedValue(new Error(NO_KEY));
+    } else {
+      mockedCreateFnAgent.mockImplementation(async () => createSession(async () => { throw new Error(NO_KEY); }) as never);
+    }
+    const store = createAgentStore(baseAgent({ state: "active", lastError: undefined }));
+    const taskStore = createNoTaskStore();
+    const monitor = new HeartbeatMonitor({ store, taskStore, rootDir: process.cwd() });
+
+    const first = await monitor.executeHeartbeat({ agentId: store.agent.id, source });
+    expect(first.resultJson).toMatchObject({ reason: "heartbeat_model_unavailable", source, actionRequired: true });
+    expect(store.agent.state).toBe("paused");
+    expect(store.agent.pauseReason).toBe(HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON);
+    expect(store.agent.lastError).toContain(NO_KEY);
+
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      await monitor.executeHeartbeat({ agentId: store.agent.id, source });
+      expect(readHeartbeatErrorRetryCount(store.agent)).toBe(attempt);
+      expect(store.agent.state).toBe("paused");
+      expect(store.agent.lastError).toContain(NO_KEY);
+    }
+
+    const sessionAttempts = mockedCreateFnAgent.mock.calls.length;
+    const exhausted = await monitor.executeHeartbeat({ agentId: store.agent.id, source });
+
+    expect(mockedCreateFnAgent.mock.calls.length).toBe(sessionAttempts);
+    expect(exhausted.resultJson).toMatchObject({ reason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON, attempts: 5, limit: 5 });
+    expect(store.agent.state).toBe("paused");
+    expect(store.agent.pauseReason).toBe(HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON);
+    expect(store.agent.lastError).toContain(NO_KEY);
+    expect(taskStore.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "agent:error-retry-exhausted" }));
+  });
+
+  it("resets the budget only after a later run does real successful work", async () => {
+    mockedCreateFnAgent
+      .mockRejectedValueOnce(new Error(NO_KEY))
+      .mockRejectedValueOnce(new Error(NO_KEY))
+      .mockResolvedValueOnce(createSession(async () => undefined) as never);
+    const store = createAgentStore(baseAgent({ state: "active", lastError: undefined }));
+    const monitor = new HeartbeatMonitor({ store, taskStore: createNoTaskStore(), rootDir: process.cwd() });
+
+    await monitor.executeHeartbeat({ agentId: store.agent.id, source: "timer" });
+    await monitor.executeHeartbeat({ agentId: store.agent.id, source: "timer" });
+    expect(readHeartbeatErrorRetryCount(store.agent)).toBe(1);
+    expect(store.agent.state).toBe("paused");
+
+    await monitor.executeHeartbeat({ agentId: store.agent.id, source: "timer" });
+
+    expect(store.agent.state).toBe("active");
+    expect(store.agent.pauseReason).toBeUndefined();
+    expect(store.agent.lastError).toBeUndefined();
+    expect(readHeartbeatErrorRetryCount(store.agent)).toBe(0);
+  });
+});

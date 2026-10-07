@@ -4379,26 +4379,11 @@ describe("executeHeartbeat", () => {
       expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "paused");
     });
 
-    it("fails soft on timer heartbeat when model provider credentials are unavailable", async () => {
-      const store = createStoreWithAgentForExec();
-      mockedCreateFnAgent.mockRejectedValue(new Error("No API key for provider: anthropic"));
-
-      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
-
-      const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer" });
-
-      expect(result.status).toBe("completed");
-      expect(result.resultJson).toMatchObject({
-        reason: "heartbeat_model_unavailable",
-        source: "timer",
-        detail: expect.stringContaining("No API key for provider: anthropic"),
-      });
-      expect(result.stderrExcerpt).toContain("No API key for provider: anthropic");
-      expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "active");
-      expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "error");
-    });
-
-    it.each(["on_demand", "assignment"] as const)("pauses on %s heartbeat when model provider credentials are unavailable", async (source) => {
+    /*
+    FNXC:HeartbeatRecovery 2026-10-07-18:55:
+    Timer runs share the parked model-unavailable outcome; completing them as healthy reset the recovery budget and hid the cause.
+    */
+    it.each(["timer", "on_demand", "assignment"] as const)("pauses on %s heartbeat when model provider credentials are unavailable", async (source) => {
       const store = createStoreWithAgentForExec();
       mockedCreateFnAgent.mockRejectedValue(new Error("No API key for provider: anthropic"));
 
@@ -4422,50 +4407,24 @@ describe("executeHeartbeat", () => {
       expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "error");
     });
 
-    it("keeps timer-triggered credential failures in recoverable state across consecutive wakeups", async () => {
+    it.each(["timer", "assignment"] as const)("keeps %s credential failures recoverable on consecutive wakeups", async (source) => {
       const store = createStoreWithAgentForExec();
       mockedCreateFnAgent.mockRejectedValue(new Error("No API key for provider: anthropic"));
 
       const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
 
-      const first = await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer" });
-      const second = await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer" });
+      const first = await monitor.executeHeartbeat({ agentId: "agent-001", source });
+      const second = await monitor.executeHeartbeat({ agentId: "agent-001", source });
 
       for (const run of [first, second]) {
         expect(run.status).toBe("completed");
         expect(run.resultJson).toMatchObject({
           reason: "heartbeat_model_unavailable",
-          source: "timer",
-          detail: expect.stringContaining("No API key for provider: anthropic"),
+          source,
+          actionRequired: true,
         });
-        expect(run.stderrExcerpt).toContain("No API key for provider: anthropic");
       }
-
-      expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "active");
-      expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "error");
-    });
-
-    it("keeps non-timer credential failures recoverable on consecutive wakeups", async () => {
-      const store = createStoreWithAgentForExec();
-      mockedCreateFnAgent.mockRejectedValue(new Error("No API key for provider: anthropic"));
-
-      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
-
-      const first = await monitor.executeHeartbeat({ agentId: "agent-001", source: "assignment" });
-      const second = await monitor.executeHeartbeat({ agentId: "agent-001", source: "assignment" });
-
-      expect(first.status).toBe("completed");
-      expect(first.resultJson).toMatchObject({
-        reason: "heartbeat_model_unavailable",
-        source: "assignment",
-        actionRequired: true,
-      });
-      expect(second.status).toBe("completed");
-      expect(second.resultJson).toMatchObject({
-        reason: "heartbeat_model_unavailable",
-        source: "assignment",
-        actionRequired: true,
-      });
+      expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "active");
       expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "error");
     });
 

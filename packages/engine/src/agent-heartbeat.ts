@@ -119,6 +119,22 @@ A heartbeat worktree-acquisition failure is worktree recovery, which lifecycle c
 The card is never moved: the former requeue through the rebound target moved WIP and review cards backward and, on a board with no hold lane, into intake.
 These lanes decide, against the live row, whether recovery may write at all: never on a terminal card, never over a user or approval pause, and never on a review card owned by a human merge (autoMerge:false).
 */
+/** Classifies provider-credential and model-registry misses that need operator configuration. */
+function isHeartbeatModelUnavailableError(errorMessage: string): boolean {
+  const normalized = errorMessage.toLowerCase();
+  return normalized.includes("no api key for provider")
+    || normalized.includes("configured primary model")
+    || normalized.includes("was not found in the pi model registry");
+}
+
+function buildHeartbeatModelUnavailableDetail(errorMessage: string): string {
+  const provider = /no api key for provider:\s*([^\s)]+)/i.exec(errorMessage)?.[1]
+    ?? /configured primary model\s+([^/\s]+)\//i.exec(errorMessage)?.[1];
+  return provider
+    ? `${errorMessage}. Configure credentials for provider "${provider}" in settings, then resume the agent.`
+    : `${errorMessage}. Configure valid provider credentials in settings, then resume the agent.`;
+}
+
 interface HeartbeatAcquisitionLanes {
   terminal: ReadonlySet<string>;
   review: ReadonlySet<string>;
@@ -1819,6 +1835,40 @@ export class HeartbeatMonitor {
   }
 
   /**
+   * FNXC:HeartbeatRecovery 2026-10-07-18:55:
+   * One outcome for a model-unavailable failure from every trigger source and failure point (session creation or prompt).
+   * The run completes without the success state transition, and the agent parks with the model-unavailable pause reason and an actionable lastError.
+   * The timer branch used to complete as healthy, which cleared lastError and reset the shared recovery budget, so a missing provider key looped every interval forever with no operator signal.
+   * The run-entry recovery gate re-admits the park under the shared budget and keeps it parked once the budget is exhausted.
+   */
+  private async completeRunAsModelUnavailable(
+    agentId: string,
+    runId: string,
+    source: HeartbeatInvocationSource,
+    errorDetail: string,
+    stdoutExcerpt?: string,
+  ): Promise<void> {
+    const detail = buildHeartbeatModelUnavailableDetail(errorDetail);
+    await this.completeRun(agentId, runId, {
+      status: "completed",
+      resultJson: {
+        reason: "heartbeat_model_unavailable",
+        source,
+        detail,
+        actionRequired: true,
+      },
+      stderrExcerpt: detail,
+      ...(stdoutExcerpt ? { stdoutExcerpt } : {}),
+      skipStateTransition: true,
+    });
+    await this.store.updateAgentState(agentId, "paused");
+    await this.store.updateAgent(agentId, {
+      pauseReason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON,
+      lastError: detail,
+    });
+  }
+
+  /**
    * Stop an active heartbeat run for an agent.
    *
    * If an in-memory tracked session exists, dispose it and complete the run as terminated.
@@ -2982,60 +3032,8 @@ export class HeartbeatMonitor {
           attachAgentUsageTelemetry(agentLogger, { store: taskStore, agentId, taskId, nodeId: taskDetail?.effectiveNodeId ?? taskDetail?.nodeId ?? null, lane: "heartbeat" });
         }
 
-        const isModelUnavailableError = (errorMessage: string): boolean => {
-          const normalized = errorMessage.toLowerCase();
-          return normalized.includes("no api key for provider")
-            || normalized.includes("configured primary model")
-            || normalized.includes("was not found in the pi model registry");
-        };
-
-        const extractUnavailableProvider = (errorMessage: string): string | undefined => {
-          const providerMatch = /no api key for provider:\s*([^\s)]+)/i.exec(errorMessage);
-          if (providerMatch?.[1]) return providerMatch[1];
-          const modelMatch = /configured primary model\s+([^/\s]+)\//i.exec(errorMessage);
-          if (modelMatch?.[1]) return modelMatch[1];
-          return undefined;
-        };
-
-        const completeAsModelUnavailable = async (errorMessage: string): Promise<void> => {
-          const provider = extractUnavailableProvider(errorMessage);
-          const detail = provider
-            ? `${errorMessage}. Configure credentials for provider "${provider}" in settings, then resume the agent.`
-            : `${errorMessage}. Configure valid provider credentials in settings, then resume the agent.`;
-
-          if (source === "timer") {
-            await this.completeRun(agentId, run.id, {
-              status: "completed",
-              resultJson: {
-                reason: "heartbeat_model_unavailable",
-                source,
-                detail,
-              },
-              stderrExcerpt: detail,
-              stdoutExcerpt: stdoutExcerpt || undefined,
-            });
-            return;
-          }
-
-          await this.completeRun(agentId, run.id, {
-            status: "completed",
-            resultJson: {
-              reason: "heartbeat_model_unavailable",
-              source,
-              detail,
-              actionRequired: true,
-            },
-            stderrExcerpt: detail,
-            stdoutExcerpt: stdoutExcerpt || undefined,
-            skipStateTransition: true,
-          });
-
-          await this.store.updateAgentState(agentId, "paused");
-          await this.store.updateAgent(agentId, {
-            pauseReason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON,
-            lastError: detail,
-          });
-        };
+        const completeAsModelUnavailable = (errorMessage: string): Promise<void> =>
+          this.completeRunAsModelUnavailable(agentId, run.id, source, errorMessage, stdoutExcerpt || undefined);
 
         if (!heartbeatModelSettings) {
           try {
@@ -3928,7 +3926,7 @@ export class HeartbeatMonitor {
           heartbeatLog.error(`Heartbeat execution failed for ${agentId}: ${errorDetail}`);
           await flushAgentLogger();
 
-          if (isModelUnavailableError(errorDetail)) {
+          if (isHeartbeatModelUnavailableError(errorDetail)) {
             await completeAsModelUnavailable(errorDetail);
           } else {
             await this.completeRun(agentId, run.id, {
@@ -3960,51 +3958,12 @@ export class HeartbeatMonitor {
         heartbeatLog.error(`Heartbeat execution error for ${agentId}: ${errorDetail}`);
         await flushAgentLogger();
 
-        const normalizedError = errorDetail.toLowerCase();
-        const isModelUnavailable = normalizedError.includes("no api key for provider")
-          || normalizedError.includes("configured primary model")
-          || normalizedError.includes("was not found in the pi model registry");
-
         // Attempt to complete the run if it's still active.
         // If completeRun also fails, fall back to a direct DB update to ensure
         // the run is not permanently stuck in "active" state.
         try {
-          if (isModelUnavailable) {
-            const providerMatch = /no api key for provider:\s*([^\s)]+)/i.exec(errorDetail);
-            const modelMatch = /configured primary model\s+([^/\s]+)\//i.exec(errorDetail);
-            const provider = providerMatch?.[1] ?? modelMatch?.[1];
-            const detail = provider
-              ? `${errorDetail}. Configure credentials for provider "${provider}" in settings, then resume the agent.`
-              : `${errorDetail}. Configure valid provider credentials in settings, then resume the agent.`;
-
-            if (source === "timer") {
-              await this.completeRun(agentId, run.id, {
-                status: "completed",
-                resultJson: {
-                  reason: "heartbeat_model_unavailable",
-                  source,
-                  detail,
-                },
-                stderrExcerpt: detail,
-              });
-            } else {
-              await this.completeRun(agentId, run.id, {
-                status: "completed",
-                resultJson: {
-                  reason: "heartbeat_model_unavailable",
-                  source,
-                  detail,
-                  actionRequired: true,
-                },
-                stderrExcerpt: detail,
-                skipStateTransition: true,
-              });
-              await this.store.updateAgentState(agentId, "paused");
-              await this.store.updateAgent(agentId, {
-                pauseReason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON,
-                lastError: detail,
-              });
-            }
+          if (isHeartbeatModelUnavailableError(errorDetail)) {
+            await this.completeRunAsModelUnavailable(agentId, run.id, source, errorDetail);
           } else {
             await this.completeRun(agentId, run.id, {
               status: "failed",

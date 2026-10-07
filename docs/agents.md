@@ -386,7 +386,7 @@ Model-less durable-agent heartbeats use the same role-lane chain. Calling the lo
 Task-scoped heartbeat runs for durable agents execute inside the task's git worktree (same as ephemeral task execution), while no-task heartbeat runs continue to execute from the project root.
 Heartbeat and executor system prompts share the same active-goal context injector (`buildGoalContextSection`), so both lanes receive identical goal preambles when active goals exist.
 
-If a heartbeat cannot create/run a session due to unavailable provider credentials or missing provider registration, Fusion records `resultJson.reason = "heartbeat_model_unavailable"` with actionable diagnostics in `resultJson.detail`/`stderrExcerpt`.
+If a heartbeat cannot create/run a session due to unavailable provider credentials or missing provider registration, Fusion records `resultJson.reason = "heartbeat_model_unavailable"` with actionable diagnostics in `resultJson.detail`/`stderrExcerpt`, and parks the agent with `pauseReason="heartbeat-model-unavailable"` and `lastError` set. This applies to every trigger source, timer included, so a repeating configuration failure becomes visible and bounded rather than looping as healthy.
 
 ### Durable-agent transient error auto-recovery
 
