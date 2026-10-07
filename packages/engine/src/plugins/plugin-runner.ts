@@ -229,6 +229,10 @@ export class PluginRunner {
   private promptContributionsCacheVersion = 0;
   /** Map of pluginId → the registry trait ids it currently has registered. */
   private registeredPluginTraitIds = new Map<string, string[]>();
+  /** Map of pluginId → trait ids kept registered but degraded because a live card sat in a column using them when they were removed. */
+  private retainedDegradedTraitIds = new Map<string, string[]>();
+  /** In-flight live-dependents checks for removed traits. */
+  private pendingTraitRemovals = new Set<Promise<void>>();
   /** Map of pluginId → the workflow extension ids it currently has registered. */
   private registeredPluginWorkflowExtensionIds = new Map<string, string[]>();
   /** Map of pluginId → the step-parser registry ids it currently has registered
@@ -336,6 +340,9 @@ export class PluginRunner {
 
     // Stop all plugins
     await this.options.pluginLoader.stopAllPlugins();
+
+    // Settle trait removal checks so none reads the task store after shutdown returns.
+    await this.waitForPluginTraitRemovals();
 
     executorLog.log("PluginRunner shutdown complete");
   }
@@ -502,13 +509,15 @@ export class PluginRunner {
 
   /**
    * Register all currently-loaded plugins' trait contributions into the core
-   * TraitRegistry (plugin-namespaced ids). Re-runs on cache invalidation. Traits
-   * for plugins no longer present are dropped from the registry (degraded path
-   * is the force-disable route; a clean unload removes them).
+   * TraitRegistry (plugin-namespaced ids). Re-runs on cache invalidation.
+   *
+   * FNXC:PluginTraits 2026-10-07-19:36:
+   * Removing a trait (plugin disabled, uninstalled, or reloaded without it) must pass the live-dependents guard, whichever path removed it: dashboard, CLI and store events all end in this sync.
+   * Hooks of a removed trait stop at once. A definition still used by a column holding a live card stays registered and degraded, audited once as plugin:trait-degraded, so the card stays movable and workflow validation still knows the trait; one with no dependents is unregistered.
+   * Retained definitions are re-checked on every later sync and removed once their last live card leaves, and a re-enable re-arms their hooks.
    */
   syncPluginTraits(): void {
     const registry = getTraitRegistry();
-    const runner = this.traitHookRunner;
     const current = this.getPluginTraits();
 
     // Group contributions by plugin id.
@@ -519,37 +528,138 @@ export class PluginRunner {
       byPlugin.set(pluginId, list);
     }
 
-    // Drop traits for plugins no longer present.
-    for (const [pluginId, ids] of [...this.registeredPluginTraitIds.entries()]) {
-      if (!byPlugin.has(pluginId)) {
-        unregisterPluginTraits(registry, ids);
-        this.registeredPluginTraitIds.delete(pluginId);
-      }
+    const removedByPlugin = new Map<string, string[]>();
+    for (const [pluginId, ids] of this.registeredPluginTraitIds) {
+      if (!byPlugin.has(pluginId)) removedByPlugin.set(pluginId, ids);
     }
+    for (const pluginId of removedByPlugin.keys()) this.registeredPluginTraitIds.delete(pluginId);
 
-    if (!runner) {
-      // No runner yet: don't register hooks (they'd degrade to no-ops anyway).
-      // Definitions still register so the catalog/validation see them.
-      for (const [pluginId, contributions] of byPlugin) {
-        const ids = registerPluginTraits({
-          registry,
-          pluginId,
-          contributions,
-          runCustomNode: async () => ({ outcome: "success" as const }),
-        });
-        this.registeredPluginTraitIds.set(pluginId, ids);
-      }
-      return;
-    }
-
+    // Without a runner, definitions still register so the catalog/validation see
+    // them; hooks resolve to a success no-op until the executor wires a runner.
+    const runCustomNode: WorkflowCustomNodeRunner = this.traitHookRunner ?? (async () => ({ outcome: "success" as const }));
     for (const [pluginId, contributions] of byPlugin) {
+      const previous = this.registeredPluginTraitIds.get(pluginId) ?? [];
       try {
-        const ids = registerPluginTraits({ registry, pluginId, contributions, runCustomNode: runner });
+        const ids = registerPluginTraits({ registry, pluginId, contributions, runCustomNode });
         this.registeredPluginTraitIds.set(pluginId, ids);
+        const dropped = previous.filter((id) => !ids.includes(id));
+        if (dropped.length > 0) removedByPlugin.set(pluginId, dropped);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.log.warn(`Failed to register traits for plugin '${pluginId}': ${msg}`);
       }
+    }
+
+    for (const [pluginId, ids] of removedByPlugin) {
+      degradePluginTraits(registry, ids);
+      this.trackTraitRemoval(this.settleRemovedPluginTraits(pluginId, ids));
+    }
+
+    // Re-check definitions retained by an earlier removal; a re-registered id is live again.
+    for (const [pluginId, retained] of [...this.retainedDegradedTraitIds]) {
+      const live = new Set(this.registeredPluginTraitIds.get(pluginId) ?? []);
+      const stillRetained = retained.filter((id) => !live.has(id));
+      if (stillRetained.length === 0) {
+        this.retainedDegradedTraitIds.delete(pluginId);
+        continue;
+      }
+      this.retainedDegradedTraitIds.set(pluginId, stillRetained);
+      if (!removedByPlugin.has(pluginId)) {
+        this.trackTraitRemoval(this.settleRemovedPluginTraits(pluginId, stillRetained));
+      }
+    }
+  }
+
+  /** Resolves once every in-flight trait removal check has settled. */
+  async waitForPluginTraitRemovals(): Promise<void> {
+    while (this.pendingTraitRemovals.size > 0) {
+      await Promise.allSettled([...this.pendingTraitRemovals]);
+    }
+  }
+
+  private trackTraitRemoval(removal: Promise<void>): void {
+    const tracked: Promise<void> = removal.finally(() => {
+      this.pendingTraitRemovals.delete(tracked);
+    });
+    this.pendingTraitRemovals.add(tracked);
+  }
+
+  /**
+   * Decide the fate of removed, already degraded trait ids: unregister the ones no live card depends on and keep the rest degraded.
+   * Ids a re-enable registered while the check ran are left alone. A failed check keeps every definition degraded; a passive definition is harmless and the next sync retries.
+   */
+  private async settleRemovedPluginTraits(pluginId: string, ids: string[]): Promise<void> {
+    let dependents: PluginTraitDependent[];
+    try {
+      dependents = await findLivePluginTraitDependents({
+        store: this.options.taskStore,
+        resolveTaskWorkflowIr: (taskId) => this.resolveTaskWorkflowIr(taskId),
+        pluginTraitIds: ids,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.warn(`Live-dependents check failed for removed traits of plugin '${pluginId}'; keeping them degraded: ${msg}`);
+      this.updateRetainedTraitIds(pluginId, ids, []);
+      return;
+    }
+
+    const live = new Set(this.registeredPluginTraitIds.get(pluginId) ?? []);
+    const removed = ids.filter((id) => !live.has(id));
+    const occupied = new Set(dependents.flatMap((d) => d.traitIds));
+    const keep = removed.filter((id) => occupied.has(id));
+    const drop = removed.filter((id) => !occupied.has(id));
+
+    unregisterPluginTraits(getTraitRegistry(), drop);
+    const newlyRetained = this.updateRetainedTraitIds(pluginId, keep, drop);
+    if (newlyRetained.length > 0) {
+      const affected = dependents.filter((d) => d.traitIds.some((id) => newlyRetained.includes(id)));
+      this.log.warn(
+        `Plugin '${pluginId}' traits ${newlyRetained.join(", ")} stay registered as passive: ` +
+          `${affected.map((d) => `${d.taskId}@${d.column}`).join(", ")} still occupy columns using them`,
+      );
+      this.emitTraitDegradedAudit(pluginId, newlyRetained, affected, "unload-with-live-dependents");
+    }
+  }
+
+  /** Add `keep` to and remove `drop` from a plugin's retained set, ignoring live ids. Returns ids retained for the first time. */
+  private updateRetainedTraitIds(pluginId: string, keep: string[], drop: string[]): string[] {
+    const live = new Set(this.registeredPluginTraitIds.get(pluginId) ?? []);
+    const previous = new Set(this.retainedDegradedTraitIds.get(pluginId) ?? []);
+    const next = new Set([...previous].filter((id) => !drop.includes(id) && !live.has(id)));
+    const newlyRetained: string[] = [];
+    for (const id of keep) {
+      if (live.has(id)) continue;
+      if (!previous.has(id)) newlyRetained.push(id);
+      next.add(id);
+    }
+    if (next.size > 0) this.retainedDegradedTraitIds.set(pluginId, [...next]);
+    else this.retainedDegradedTraitIds.delete(pluginId);
+    return newlyRetained;
+  }
+
+  private emitTraitDegradedAudit(
+    pluginId: string,
+    degradedTraitIds: string[],
+    dependents: PluginTraitDependent[],
+    source: "force-disable" | "unload-with-live-dependents",
+  ): void {
+    try {
+      void emitBoundedRunAudit(this.options.taskStore, {
+        agentId: "system",
+        runId: `plugin-trait-degrade-${pluginId}-${Date.now()}`,
+        domain: "database",
+        mutationType: "plugin:trait-degraded",
+        target: pluginId,
+        metadata: {
+          pluginId,
+          degradedTraitIds,
+          affectedTasks: dependents.map((d) => d.taskId),
+          source,
+          note: "hooks now resolve to no-ops; cards remain movable",
+        },
+      }, { log: this.log });
+    } catch {
+      // Audit is best-effort; degradation already applied.
     }
   }
 
@@ -698,23 +808,7 @@ export class PluginRunner {
     }
     const degraded = degradePluginTraits(registry, ids);
     if (degraded.length > 0) {
-      try {
-        void emitBoundedRunAudit(this.options.taskStore, {
-          agentId: "system",
-          runId: `plugin-trait-degrade-${pluginId}-${Date.now()}`,
-          domain: "database",
-          mutationType: "plugin:trait-degraded",
-          target: pluginId,
-          metadata: {
-            pluginId,
-            degradedTraitIds: degraded,
-            affectedTasks: dependents.map((d) => d.taskId),
-            note: "hooks now resolve to no-ops; cards remain movable",
-          },
-        }, { log: this.log });
-      } catch {
-        // Audit is best-effort; degradation already applied.
-      }
+      this.emitTraitDegradedAudit(pluginId, degraded, dependents, "force-disable");
     }
     return { degraded, dependents };
   }

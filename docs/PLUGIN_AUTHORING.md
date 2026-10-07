@@ -1805,14 +1805,18 @@ contribution with `validatePluginTraitContribution(...)` from
 
 ### Disabling a plugin with live dependents
 
-If a card is currently sitting in a column that uses one of your plugin's
-traits, disabling/uninstalling the plugin is **blocked** with a typed error
-listing the dependent tasks (mirroring the built-in-workflow deletion block).
+Disabling or uninstalling a plugin, or reloading it without one of its traits,
+stops that trait's hooks immediately. If a card is sitting in a column that uses
+the trait, the trait stays registered as **passive**: its hooks resolve to a no-op
+plus an audit warning, one `plugin:trait-degraded` audit event lists the dependent
+tasks, and the cards remain fully movable. A degraded gate column never blocks a
+card. The passive trait is removed once no live card sits in a column using it,
+and enabling the plugin again restores its hooks. A trait with no dependents is
+removed at once.
 
-A **force** path degrades the affected columns to **passive**: the trait's hooks
-become no-ops (the registry resolves them to a no-op plus an audit warning), a
-single audit event is emitted, and the cards remain fully movable. A degraded
-gate column never blocks a card.
+The engine's `PluginRunner.disablePluginTraits(pluginId)` refuses with a typed
+error listing the dependent tasks, and `{ force: true }` applies the same passive
+degradation explicitly.
 
 ## 16.6. Contributing Workflow Extensions
 

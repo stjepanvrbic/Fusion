@@ -10,6 +10,7 @@ import { PluginRunner, type PluginRunnerOptions } from "../plugins/plugin-runner
 import { RENAMED_VOCAB, lifecycleIr } from "./_workflow-vocabulary-fixture.js";
 import {
   __resetWorkflowExtensionRegistryForTests,
+  getTraitRegistry,
   getWorkflowExtensionRegistry,
   workflowExtensionRegistryId,
   type PluginLoader,
@@ -552,6 +553,206 @@ describe("PluginRunner", () => {
       expect(execute).not.toHaveBeenCalled();
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toMatch(/not available/i);
+    });
+  });
+
+  /*
+  FNXC:PluginTraits 2026-10-07-19:36:
+  Every trait removal (disable, uninstall, a reload that drops a trait) runs the live-dependents guard: hooks stop at once, a definition still used by a column holding a live card stays registered and degraded with an audit row, and one with no dependents is removed.
+  */
+  describe("plugin trait removal guard", () => {
+    const PLUGIN = "gatekeeper";
+    const GATE_ID = `plugin:${PLUGIN}:review-gate`;
+    const NOTE_ID = `plugin:${PLUGIN}:release-note`;
+    const gateTrait = {
+      traitId: "review-gate",
+      name: "Review Gate",
+      schemaVersion: 1 as const,
+      hooks: { gate: { mode: "prompt" as const, prompt: "Check the diff" } },
+    };
+    const noteTrait = {
+      traitId: "release-note",
+      name: "Release Note",
+      schemaVersion: 1 as const,
+      hooks: { onEnter: { mode: "prompt" as const, prompt: "Draft a note" } },
+    };
+
+    let traits: Array<{ pluginId: string; trait: typeof gateTrait | typeof noteTrait }>;
+    let tasks: Array<{ id: string; column: string }>;
+    let ir: unknown;
+
+    const loaderHandler = (event: string) =>
+      mockPluginLoader.on.mock.calls.find((call) => call[0] === event)?.[1] as (e: { pluginId: string }) => void;
+    const storeHandler = (event: string) =>
+      mockPluginStore.on.mock.calls.find((call) => call[0] === event)?.[1] as (p: { id: string }) => Promise<void>;
+    const auditRows = () => mockTaskStore.recordRunAuditEvent.mock.calls
+      .map((call) => call[0] as { mutationType: string; metadata: Record<string, unknown> })
+      .filter((row) => row.mutationType === "plugin:trait-degraded");
+    const hookState = (traitId: string, hook: "gate" | "onEnter") =>
+      getTraitRegistry().resolveTraitHook(traitId, hook);
+
+    // The shared registry also holds the built-in traits other suites resolve, so clean up by id rather than resetting it.
+    const removePluginTraits = () => {
+      getTraitRegistry().unregisterTrait(GATE_ID);
+      getTraitRegistry().unregisterTrait(NOTE_ID);
+    };
+
+    beforeEach(async () => {
+      removePluginTraits();
+      traits = [{ pluginId: PLUGIN, trait: gateTrait }, { pluginId: PLUGIN, trait: noteTrait }];
+      tasks = [];
+      // A renamed review lane: the guard keys on the column's traits, never on a lane id.
+      ir = { columns: [{ id: "checking", traits: [{ trait: GATE_ID }] }, { id: "shipped", traits: [] }] };
+      (mockPluginLoader as unknown as { getPluginTraits: () => unknown }).getPluginTraits = vi.fn(() => traits);
+      (mockTaskStore as unknown as { listTasks: () => Promise<unknown> }).listTasks = vi.fn(async () => tasks);
+      vi.spyOn(pluginRunner as unknown as { resolveTaskWorkflowIr: () => Promise<unknown> }, "resolveTaskWorkflowIr")
+        .mockImplementation(async () => ir);
+      pluginRunner.setTraitHookRunner(vi.fn(async () => ({ outcome: "success" as const })));
+      await pluginRunner.init();
+    });
+
+    afterEach(() => {
+      removePluginTraits();
+    });
+
+    const unloadPlugin = async (via: "loader-unload" | "store-disable" | "store-unregister") => {
+      if (via === "loader-unload") {
+        traits = [];
+        loaderHandler("plugin:unloaded")({ pluginId: PLUGIN });
+      } else {
+        // The loader removes the instance during stopPlugin and emits plugin:unloaded, as in production.
+        mockPluginLoader.stopPlugin.mockImplementationOnce(async () => {
+          traits = [];
+          loaderHandler("plugin:unloaded")({ pluginId: PLUGIN });
+        });
+        await storeHandler(via === "store-disable" ? "plugin:disabled" : "plugin:unregistered")({ id: PLUGIN });
+      }
+      await pluginRunner.waitForPluginTraitRemovals();
+    };
+
+    it("registers both traits with live hooks while the plugin is loaded", () => {
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+      expect(hookState(GATE_ID, "gate").warning).toBeUndefined();
+      expect(hookState(NOTE_ID, "onEnter").warning).toBeUndefined();
+    });
+
+    it.each(["loader-unload", "store-disable", "store-unregister"] as const)(
+      "keeps an occupied trait degraded and audited, and removes an unoccupied one (%s)",
+      async (via) => {
+        tasks = [{ id: "FN-1", column: "checking" }, { id: "FN-2", column: "shipped" }];
+        await unloadPlugin(via);
+
+        expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+        expect(hookState(GATE_ID, "gate").warning?.kind).toBe("missing-hook-impl");
+        expect(getTraitRegistry().has(NOTE_ID)).toBe(false);
+
+        const rows = auditRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].metadata).toMatchObject({
+          pluginId: PLUGIN,
+          degradedTraitIds: [GATE_ID],
+          affectedTasks: ["FN-1"],
+          source: "unload-with-live-dependents",
+        });
+      },
+    );
+
+    it("removes every trait definition when no live card depends on them", async () => {
+      tasks = [{ id: "FN-2", column: "shipped" }];
+      await unloadPlugin("store-disable");
+      expect(getTraitRegistry().has(GATE_ID)).toBe(false);
+      expect(getTraitRegistry().has(NOTE_ID)).toBe(false);
+      expect(auditRows()).toHaveLength(0);
+    });
+
+    it("stops hooks immediately, before the dependents check settles", async () => {
+      let releaseList!: () => void;
+      (mockTaskStore as unknown as { listTasks: () => Promise<unknown> }).listTasks = vi.fn(
+        () => new Promise((resolve) => { releaseList = () => resolve(tasks); }),
+      );
+      traits = [];
+      loaderHandler("plugin:unloaded")({ pluginId: PLUGIN });
+
+      expect(hookState(GATE_ID, "gate").warning?.kind).toBe("missing-hook-impl");
+      expect(hookState(NOTE_ID, "onEnter").warning?.kind).toBe("missing-hook-impl");
+      releaseList();
+      await pluginRunner.waitForPluginTraitRemovals();
+    });
+
+    it("keeps definitions degraded when the dependents check fails", async () => {
+      (mockTaskStore as unknown as { listTasks: () => Promise<unknown> }).listTasks = vi.fn(async () => {
+        throw new Error("store closed");
+      });
+      await unloadPlugin("loader-unload");
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+      expect(getTraitRegistry().has(NOTE_ID)).toBe(true);
+      expect(hookState(GATE_ID, "gate").warning?.kind).toBe("missing-hook-impl");
+    });
+
+    it("does not remove traits a re-enable registered while the check was in flight", async () => {
+      let releaseList!: () => void;
+      (mockTaskStore as unknown as { listTasks: () => Promise<unknown> }).listTasks = vi.fn(
+        () => new Promise((resolve) => { releaseList = () => resolve([]); }),
+      );
+      traits = [];
+      loaderHandler("plugin:unloaded")({ pluginId: PLUGIN });
+
+      traits = [{ pluginId: PLUGIN, trait: gateTrait }, { pluginId: PLUGIN, trait: noteTrait }];
+      loaderHandler("plugin:loaded")({ pluginId: PLUGIN });
+      releaseList();
+      await pluginRunner.waitForPluginTraitRemovals();
+
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+      expect(hookState(GATE_ID, "gate").warning).toBeUndefined();
+      expect(getTraitRegistry().has(NOTE_ID)).toBe(true);
+    });
+
+    it("re-arms hooks when a plugin whose traits were retained is enabled again", async () => {
+      tasks = [{ id: "FN-1", column: "checking" }];
+      await unloadPlugin("loader-unload");
+      expect(hookState(GATE_ID, "gate").warning?.kind).toBe("missing-hook-impl");
+
+      traits = [{ pluginId: PLUGIN, trait: gateTrait }];
+      loaderHandler("plugin:loaded")({ pluginId: PLUGIN });
+      await pluginRunner.waitForPluginTraitRemovals();
+      expect(hookState(GATE_ID, "gate").warning).toBeUndefined();
+    });
+
+    it("removes a retained degraded trait once its last live card leaves, without a second audit row", async () => {
+      tasks = [{ id: "FN-1", column: "checking" }];
+      await unloadPlugin("loader-unload");
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+
+      // Still occupied on the next lifecycle event: kept, not audited again.
+      loaderHandler("plugin:reloaded")({ pluginId: "other-plugin" });
+      await pluginRunner.waitForPluginTraitRemovals();
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+
+      tasks = [{ id: "FN-1", column: "shipped" }];
+      loaderHandler("plugin:reloaded")({ pluginId: "other-plugin" });
+      await pluginRunner.waitForPluginTraitRemovals();
+      expect(getTraitRegistry().has(GATE_ID)).toBe(false);
+      expect(auditRows()).toHaveLength(1);
+    });
+
+    it("guards a trait that a reload of the same plugin no longer contributes", async () => {
+      tasks = [{ id: "FN-1", column: "checking" }];
+      traits = [{ pluginId: PLUGIN, trait: noteTrait }];
+      loaderHandler("plugin:reloaded")({ pluginId: PLUGIN });
+      await pluginRunner.waitForPluginTraitRemovals();
+
+      expect(getTraitRegistry().has(GATE_ID)).toBe(true);
+      expect(hookState(GATE_ID, "gate").warning?.kind).toBe("missing-hook-impl");
+      expect(hookState(NOTE_ID, "onEnter").warning).toBeUndefined();
+      expect(auditRows()[0]?.metadata).toMatchObject({ degradedTraitIds: [GATE_ID], affectedTasks: ["FN-1"] });
+    });
+
+    it("keeps the explicit force-disable refusal and degradation", async () => {
+      tasks = [{ id: "FN-1", column: "checking" }];
+      await expect(pluginRunner.disablePluginTraits(PLUGIN)).rejects.toThrow(/FN-1@checking/);
+      const result = await pluginRunner.disablePluginTraits(PLUGIN, { force: true });
+      expect(result.degraded).toEqual(expect.arrayContaining([GATE_ID, NOTE_ID]));
+      expect(auditRows().at(-1)?.metadata).toMatchObject({ source: "force-disable", affectedTasks: ["FN-1"] });
     });
   });
 

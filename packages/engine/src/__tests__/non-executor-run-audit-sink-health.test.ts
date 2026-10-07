@@ -34,7 +34,7 @@ import { aiMergeTask } from "../merger.js";
 import { recordBranchGroupPrSyncFailureAudit, runAiMerge } from "../merge/merger-ai.js";
 import { createMergeAbortedError } from "../merge/merge-write-fence.js";
 import { PluginRunner } from "../plugins/plugin-runner.js";
-import { getWorkflowExtensionRegistry, workflowExtensionRegistryId } from "@fusion/core";
+import { getTraitRegistry, getWorkflowExtensionRegistry, workflowExtensionRegistryId } from "@fusion/core";
 import { RUN_AUDIT_EMIT_TIMEOUT_MS } from "../util/emit-bounded-run-audit.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -321,6 +321,35 @@ describe("FN-9175 non-executor audit sink health", () => {
         await expect(settleBounded(sink, () => runner.disablePluginWorkflowExtensions(pluginId, { force: true }))).resolves.toEqual({ degraded: [registryId], dependents: [] });
       } finally {
         getWorkflowExtensionRegistry().unregister(registryId);
+      }
+    });
+  });
+
+  describe("plugins/plugin-runner.ts trait removal with live dependents", () => {
+    it.each(hostileModes)("keeps the occupied trait degraded with a %s audit sink", async (mode) => {
+      const sink = sinkFor(mode);
+      const pluginId = `sink-health-trait-${mode}`;
+      const traitRegistryId = `plugin:${pluginId}:review-gate`;
+      let traits = [{ pluginId, trait: { traitId: "review-gate", name: "Review gate", schemaVersion: 1, hooks: { gate: { mode: "prompt", prompt: "check" } } } }];
+      const loader = { getPluginTraits: vi.fn(() => traits) };
+      const taskStore = { ...sink.host, listTasks: vi.fn(async () => [{ id: "FN-9175", column: "checking" }]) };
+      const runner = new PluginRunner({ pluginLoader: loader as any, pluginStore: {} as any, taskStore: taskStore as any, rootDir: "/tmp/fn-9175" });
+      vi.spyOn(runner as unknown as { resolveTaskWorkflowIr: () => Promise<unknown> }, "resolveTaskWorkflowIr")
+        .mockResolvedValue({ columns: [{ id: "checking", traits: [{ trait: traitRegistryId }] }] });
+      runner.syncPluginTraits();
+      try {
+        traits = [];
+        await expect(settleBounded(sink, async () => {
+          (runner as unknown as { invalidateTraitsCache: () => void }).invalidateTraitsCache();
+          await runner.waitForPluginTraitRemovals();
+          return getTraitRegistry().resolveTraitHook(traitRegistryId, "gate").warning?.kind;
+        })).resolves.toBe("missing-hook-impl");
+        expect(getTraitRegistry().has(traitRegistryId)).toBe(true);
+        if (sink.recordRunAuditEvent) {
+          expect(sink.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "plugin:trait-degraded" }));
+        }
+      } finally {
+        getTraitRegistry().unregisterTrait(traitRegistryId);
       }
     });
   });
