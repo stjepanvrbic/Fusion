@@ -367,7 +367,7 @@ async function recoverApprovedPreexistingAiMergeWorktree(
   integrationBranch: string,
   ctx: LandRepoContext,
 ): Promise<LandOneRepoResult | null> {
-  const { taskId, settings, store, audit, log, allowDirtyLocalCheckoutSync, stashResolveAgent, signal } = ctx;
+  const { taskId, settings, store, audit, log, signal } = ctx;
   throwIfAborted(signal, taskId);
   const task = await store.getTask(taskId).catch(() => undefined);
   const state = task?.aiMergeReviewReconciliation;
@@ -1131,7 +1131,7 @@ export async function landOneRepo(
 ): Promise<LandOneRepoResult> {
   const {
     taskId, settings, audit, log: baseLog, setStatus, maxPasses,
-    mergeAgent, reviewAgent, stashResolveAgent,
+    mergeAgent, reviewAgent,
     includeTaskId, trailers, taskTitle, signal, store,
   } = ctx;
   /*
