@@ -379,7 +379,7 @@ Entries 22 and 23 record same-day second sightings on the fork's Full Suite. Bot
 - **File:** `packages/dashboard/app/components/__tests__/PlanningModeModal.planning-flow.test.tsx`
 - **Exact test:** `PlanningModeModal sequential flow > silently reconciles duplicate-response generation conflicts on $viewport with $label`
 - **Observed tree/SHA:** fork Full Suite run [37648267708](https://github.com/stjepanvrbic/Fusion/actions/runs/37648267708) at `1359c449cd`, job `112884602084`, lane `dashboard-app-quality-backfill --shard=3/4`.
-- **Observed frequency:** 1 failed / 6008 passed in that lane; the concrete row was `'desktop'` with `'a durable next question'`.
+- **Observed frequency:** 1 failed / 6008 passed in that lane; the concrete row was `'desktop'` with `'a durable next question'`. The next fork Full Suite run, [37660774452](https://github.com/stjepanvrbic/Fusion/actions/runs/37660774452) at `2cd182201`, passed it.
 
 The failure was `expect(element).toBeEnabled()` on the primary planning action (`.planning-actions-primary` stayed `disabled`) inside a `waitFor` at `PlanningModeModal.planning-flow.test.tsx:81`. Entry 8 closed this exact case on 2026-08-16 as a product race fixed by FN-9116, and the lane-sharding entry below recorded two more moving-case sightings in the same file at `c82e420ba0`. A re-sighting after a claimed structural fix is an ordinary on-sight quarantine.
 
@@ -391,7 +391,7 @@ This is the file's third register history after entries 4, 5 and 8, so the AGENT
 - **File:** `packages/dashboard/src/__tests__/planning-browser-e2e.test.ts`
 - **Exact test:** `Planning Mode browser E2E` suite `beforeAll` hook and every case that depends on its shared browser.
 - **Observed trees/SHAs:** fork Full Suite runs [37648267708](https://github.com/stjepanvrbic/Fusion/actions/runs/37648267708) at `1359c449cd` (job `112884602255`) and [37652972793](https://github.com/stjepanvrbic/Fusion/actions/runs/37652972793) at `595b2f5fad` (job `112900802405`), lane `dashboard-api-quality-backfill --shard=1/2`.
-- **Observed frequency:** 2 of the last 13 fork Full Suite runs.
+- **Observed frequency:** 2 of the last 13 fork Full Suite runs; the following run, [37660774452](https://github.com/stjepanvrbic/Fusion/actions/runs/37660774452) at `2cd182201`, passed the file.
 
 | run | result |
 |---|---|

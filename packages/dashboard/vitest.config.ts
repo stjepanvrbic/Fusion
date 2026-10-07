@@ -363,30 +363,27 @@ roughly 300-second stall. Its paired ledger entry is removed in the same commit;
 */
 /*
 FNXC:DashboardTestQuarantine 2026-10-07-18:04:
-The quarantine list lives in a literal `exclude:` array because scripts/check-quarantine-ledger.mjs proves ledger and Vitest lockstep by reading concrete strings in `exclude:` arrays, and every project spreads this list into its own exclude.
+Every project spreads this named list into its own exclude; scripts/check-quarantine-ledger.mjs reads the `quarantinedDashboardTests` declaration to prove ledger and Vitest lockstep.
 PlanningModeModal.planning-flow and planning-browser-e2e are quarantined on second sightings with ledger rows in scripts/lib/test-quarantine.json; delete each file after its 14-day deadline unless a root-cause rescue lands. No timeout, retry, or assertion change is allowed as a rescue.
 */
-const dashboardQuarantine = {
-  exclude: [
-    "app/components/__tests__/PlanningModeModal.planning-flow.test.tsx",
-    "src/__tests__/planning-browser-e2e.test.ts",
-    /*
-    FNXC:DashboardTestQuarantine 2026-07-17-16:50:
-    FN-8245 re-admits all three UI files with their ledger rows removed in lockstep.
-    QuickEntryBox restores focus from its resolved submit path while isolated jsdom
-    globals prevent cross-file focus leakage; PlanningModeModal stream doubles use
-    deterministic microtasks instead of wall-clock timers; and the oversight menu
-    focuses its first button after the opening frame, never the native select.
-    */
-    /*
-    FNXC:DashboardTests 2026-07-17-22:10:
-    FN-8240 verified the 18 VAL-REMOVAL-005 dashboard API tests on their PG-backed
-    async-store or applicable mock/non-store contracts. Remove their ledger/exclude
-    pairs so dashboard-api-quality-backfill collects the restored coverage.
-    */
-  ],
-};
-const quarantinedDashboardTests: string[] = dashboardQuarantine.exclude;
+const quarantinedDashboardTests: string[] = [
+  "app/components/__tests__/PlanningModeModal.planning-flow.test.tsx",
+  "src/__tests__/planning-browser-e2e.test.ts",
+  /*
+  FNXC:DashboardTestQuarantine 2026-07-17-16:50:
+  FN-8245 re-admits all three UI files with their ledger rows removed in lockstep.
+  QuickEntryBox restores focus from its resolved submit path while isolated jsdom
+  globals prevent cross-file focus leakage; PlanningModeModal stream doubles use
+  deterministic microtasks instead of wall-clock timers; and the oversight menu
+  focuses its first button after the opening frame, never the native select.
+  */
+  /*
+  FNXC:DashboardTests 2026-07-17-22:10:
+  FN-8240 verified the 18 VAL-REMOVAL-005 dashboard API tests on their PG-backed
+  async-store or applicable mock/non-store contracts. Remove their ledger/exclude
+  pairs so dashboard-api-quality-backfill collects the restored coverage.
+  */
+];
 
 /*
 FNXC:DashboardTests 2026-08-13-17:10:
