@@ -158,7 +158,8 @@ describe("reliability interactions: in-review stall deadlock disposition", () =>
       target: "FN-6113-TERMINAL",
       metadata: expect.objectContaining({
         code: "non-retryable-provider-error",
-        reason: "Terminal provider error: HTTP 400 invalid_request_error: model gpt-5.3-codex is not supported",
+        // Raw provider error prose stays in the task log; run-audit keeps the fixed code only.
+        redactedFields: expect.arrayContaining(["reason"]),
         branch: "fusion/fn-6113-terminal",
         worktree: "/tmp/fn-6113-terminal",
       }),
