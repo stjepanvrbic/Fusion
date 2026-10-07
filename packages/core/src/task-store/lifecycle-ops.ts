@@ -90,7 +90,34 @@ export async function initImpl(store: TaskStore): Promise<void> {
     // Lifecycle listeners are backend-agnostic: recordActivity() routes their
     // best-effort writes through the injected PostgreSQL data layer.
     store.setupActivityLogListeners();
+    await emitStoreOpenProvenance(store);
     return;
+}
+
+/**
+ * Stamp which process opened this store.
+ *
+ * FNXC:RunAudit 2026-10-07-20:33:
+ * Every TaskStore.init() records one `store:open` run-audit row so shared-database mutations can be attributed to the process that opened the store (the FN-7910 writer was unidentifiable without it); the SQLite-cutover cleanup deleted the emitter.
+ * Metadata is ids/paths only: pid, parent pid, executable, entry script, cwd and node version.
+ * Emission goes through the core bounded seam, so an absent, throwing, rejecting or hanging sink can never prevent or fail the store open.
+ */
+async function emitStoreOpenProvenance(store: TaskStore): Promise<void> {
+    await emitBoundedRunAudit(store, {
+      agentId: "store",
+      runId: `store-open-${process.pid}-${Date.now()}`,
+      domain: "database",
+      mutationType: "store:open",
+      target: store.rootDir,
+      metadata: {
+        pid: process.pid,
+        ppid: process.ppid,
+        execPath: process.execPath,
+        entry: process.argv[1] ?? null,
+        cwd: process.cwd(),
+        nodeVersion: process.version,
+      },
+    });
 }
 
 /*
