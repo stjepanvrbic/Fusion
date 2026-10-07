@@ -1259,7 +1259,7 @@ Heartbeat sessions for durable agents use this order:
 6. Assigned durable agent runtime model (`runtimeConfig.model` or `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) when both provider and model ID are set and no execution/default pair is configured
 7. Automatic provider/model resolution
 
-On timer-triggered runs, unrecoverable missing-provider credential/registry failures complete as `heartbeat_model_unavailable` instead of permanently setting the durable agent to `state=error`.
+On every heartbeat trigger (timer, assignment, on-demand), missing-provider credential/registry failures complete as `heartbeat_model_unavailable` and park the durable agent with `pauseReason="heartbeat-model-unavailable"` and an actionable `lastError`, instead of setting `state=error`. The park is retried under the shared heartbeat error-recovery budget and stays parked once that budget is exhausted.
 
 ### Reviewer model
 

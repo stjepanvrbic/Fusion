@@ -8,7 +8,7 @@ THE FAILURE: on a board whose lanes are renamed, both filters match nothing, so 
 is told there is none — with its own assigned tasks sitting right there in the list it just fetched. No
 error, no log line. The agent simply idles.
 
-`agent-heartbeat-worktree-renamed-hold.test.ts` covers the requeue TARGET on a renamed board; nothing
+`agent-heartbeat-worktree-renamed-hold.test.ts` covers acquisition-failure containment on a renamed board; nothing
 covered the dispatcher's SELECTION filters, which is why this file exists rather than a case added there.
 
 WHY THE IMPL DIRECTLY. The existing `selectNextTaskForAgent` coverage in

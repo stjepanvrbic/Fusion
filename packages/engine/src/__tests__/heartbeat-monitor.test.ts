@@ -606,14 +606,25 @@ describe("recordHeartbeat", () => {
     vi.useRealTimers();
   });
 
-  it("records ok heartbeat to store", () => {
+  /*
+  FNXC:AgentHeartbeat 2026-10-07-18:24:
+  recordHeartbeat runs on every session event, so it persists an "ok" heartbeat at most once per 30s while in-memory lastSeen updates on every call.
+  */
+  it("persists ok heartbeats to the store at a bounded cadence", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const session = createMockSession();
     monitor.trackAgent("agent-001", session, "run-001");
     monitor.recordHeartbeat("agent-001");
 
-    // Should have been called twice: once on track, once on heartbeat
+    // Track records the initial heartbeat; an immediate activity refresh is in-memory only.
+    expect(store.recordHeartbeat).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(Date.now() + 30_000);
+    monitor.recordHeartbeat("agent-001");
     expect(store.recordHeartbeat).toHaveBeenCalledTimes(2);
     expect(store.recordHeartbeat).toHaveBeenLastCalledWith("agent-001", "ok", "run-001");
+
+    vi.useRealTimers();
   });
 
   it("triggers onRecovered callback after missed heartbeat", () => {

@@ -17,7 +17,7 @@
  * - onTerminated: Called when a heartbeat run is terminated
  */
 
-import { DEFAULT_PROVIDER_INSTANCE_ID, type AgentStore, type AgentHeartbeatRun, type HeartbeatInvocationSource, type AgentHeartbeatConfig, type AgentBudgetStatus, type Message, type MessageStore, type TaskStore, type TaskDetail, type AgentRole, type Agent, type InboxTask, type RunMutationContext, type Settings, type AgentConfigRevision, type ReflectionStore, type ChatStore, type ChatRoom, type ChatRoomMessage, type AgentMemoryInclusionMode } from "@fusion/core";
+import { DEFAULT_PROVIDER_INSTANCE_ID, type AgentStore, type AgentHeartbeatRun, type HeartbeatInvocationSource, type AgentHeartbeatConfig, type AgentBudgetStatus, type Message, type MessageStore, type TaskStore, type TaskDetail, type Task, type AgentRole, type Agent, type InboxTask, type RunMutationContext, type Settings, type AgentConfigRevision, type ReflectionStore, type ChatStore, type ChatRoom, type ChatRoomMessage, type AgentMemoryInclusionMode } from "@fusion/core";
 import { AutoClaimSnapshotManager, resolveFreshAutoClaimCandidates, type AutoClaimCandidate } from "./scheduling/auto-claim-snapshot.js";
 import {
   ApprovalRequestStore,
@@ -37,7 +37,8 @@ import {
   resolveEffectiveSettingsById,
   resolveEffectivePlannerHeartbeatPatrolEnabled,
   resolveEffectiveMemoryConsolidationEnabled,
-  resolveReboundTarget,
+  resolveReviewColumns,
+  resolveTerminalColumns,
   resolveWorkflowIrForTask,
   columnsWithFlag,
   resolveTaskLifecycleColumns,
@@ -113,27 +114,72 @@ import { evaluateParkedAgentTaskLink, isParkedTaskColumn, type AgentTaskLinkExec
 import { MemoryConsolidationError, MemoryConsolidationService, resolveMemoryConsolidationPorts } from "./memory/index.js";
 
 /*
-FNXC:WorkflowLifecycleColumns 2026-07-28-09:25 (U11 conversion):
-Where a worktree-acquisition failure requeues the card. KTD-10 ordering via
-`resolveReboundTarget` (hold -> intake -> first column) — the same helper
-self-healing and mesh-lease-manager use for "requeue a recovered card", so the
-recovery paths cannot drift apart.
-
-This matters beyond renamed workflows: U11 DELETES the `todo` column from the
-builtin workflows, after which the old literal would requeue every
-acquisition-failed card into a column that no longer exists.
-
-Fail-soft to the legacy id: a requeue must not be abandoned because a workflow
-lookup failed, or the card is left holding a worktree it could not acquire.
+FNXC:WorktreeAcquisition 2026-10-07-18:02:
+A heartbeat worktree-acquisition failure is worktree recovery, which lifecycle containment (FN-207/FN-217) keeps in the card's current lifecycle role.
+The card is never moved: the former requeue through the rebound target moved WIP and review cards backward and, on a board with no hold lane, into intake.
+These lanes decide, against the live row, whether recovery may write at all: never on a terminal card, never over a user or approval pause, and never on a review card owned by a human merge (autoMerge:false).
 */
-async function resolveHeartbeatReboundColumn(taskStore: TaskStore, taskId: string): Promise<string> {
+/*
+FNXC:AgentHeartbeat 2026-10-07-18:24:
+Heartbeat run ids that a live session in this process still owns, from startRun until its serialized run settles.
+HeartbeatMonitor and HeartbeatTriggerScheduler are constructed independently at each runtime wiring site with no reference to each other, so the run id is the shared identity.
+The scheduler's persisted-row reapers key on lastHeartbeatAt, which a long silent tool call can let go stale; a run listed here is owned and supervised by the monitor's own missed-heartbeat check, so it is never reaped as orphaned.
+*/
+const inProcessLiveHeartbeatRunIds = new Set<string>();
+
+/** True while a session in this process still owns the heartbeat run. */
+export function isHeartbeatRunLiveInProcess(runId: string): boolean {
+  return inProcessLiveHeartbeatRunIds.has(runId);
+}
+
+/** Minimum gap between persisted liveness writes driven by session activity. */
+const HEARTBEAT_ACTIVITY_PERSIST_INTERVAL_MS = 30_000;
+
+/** Classifies provider-credential and model-registry misses that need operator configuration. */
+function isHeartbeatModelUnavailableError(errorMessage: string): boolean {
+  const normalized = errorMessage.toLowerCase();
+  return normalized.includes("no api key for provider")
+    || normalized.includes("configured primary model")
+    || normalized.includes("was not found in the pi model registry");
+}
+
+function buildHeartbeatModelUnavailableDetail(errorMessage: string): string {
+  const provider = /no api key for provider:\s*([^\s)]+)/i.exec(errorMessage)?.[1]
+    ?? /configured primary model\s+([^/\s]+)\//i.exec(errorMessage)?.[1];
+  return provider
+    ? `${errorMessage}. Configure credentials for provider "${provider}" in settings, then resume the agent.`
+    : `${errorMessage}. Configure valid provider credentials in settings, then resume the agent.`;
+}
+
+interface HeartbeatAcquisitionLanes {
+  terminal: ReadonlySet<string>;
+  review: ReadonlySet<string>;
+}
+
+type HeartbeatAcquisitionRecoveryHold = "terminal" | "user-paused" | "approval-blocked" | "human-review";
+
+async function resolveHeartbeatAcquisitionLanes(taskStore: TaskStore, taskId: string): Promise<HeartbeatAcquisitionLanes | undefined> {
   try {
-    return resolveReboundTarget(await resolveWorkflowIrForTask(taskStore, taskId)) ?? "todo";
+    const ir = await resolveWorkflowIrForTask(taskStore, taskId);
+    return { terminal: new Set(resolveTerminalColumns(ir)), review: new Set(resolveReviewColumns(ir)) };
   } catch {
-    return "todo";
+    return undefined;
   }
 }
+
+function resolveHeartbeatAcquisitionRecoveryHold(
+  task: Task,
+  lanes: HeartbeatAcquisitionLanes,
+  settings: Settings | undefined,
+): HeartbeatAcquisitionRecoveryHold | undefined {
+  if (lanes.terminal.has(task.column)) return "terminal";
+  const humanControl = evaluateOverseerHumanControl(task, settings ?? null);
+  if (humanControl.reason === "approval-blocked" || humanControl.reason === "user-paused") return humanControl.reason;
+  if (humanControl.reason === "auto-merge-off-human-review" && lanes.review.has(task.column)) return "human-review";
+  return undefined;
+}
 import { classifyReportHealth } from "./reports-health.js";
+import { evaluateOverseerHumanControl } from "./overseer/overseer-human-control-policy.js";
 import { accumulateSessionTokenUsage, captureSessionTokenBaseline } from "./execution/session-token-usage.js";
 
 const promptSizeLog = createLogger("prompt-size");
@@ -342,6 +388,8 @@ interface TrackedAgent {
   abortController?: AbortController;
   runId: string;
   lastSeen: number; // timestamp from Date.now()
+  /** Last time session activity was persisted as an "ok" heartbeat (Date.now()). */
+  lastPersistedAt: number;
   missedHeartbeatReported: boolean;
   /** Session ID before this execution started */
   sessionIdBefore?: string;
@@ -762,6 +810,8 @@ export class HeartbeatMonitor {
 
   private trackedAgents: Map<string, TrackedAgent> = new Map();
   private agentStartLocks: Map<string, Promise<unknown>> = new Map();
+  /** Run id each agent's current serialized executeHeartbeat owns (mirrored in inProcessLiveHeartbeatRunIds). */
+  private liveRunIdByAgent: Map<string, string> = new Map();
   private pollInterval: NodeJS.Timeout | null = null;
   private isRunning = false;
   /**
@@ -1342,7 +1392,8 @@ export class HeartbeatMonitor {
         }
         if (!reason && !activeRun) {
           reason = "no active run";
-        } else if (!reason && activeRun && !this.trackedAgents.has(agent.id)) {
+        } else if (!reason && activeRun && !this.trackedAgents.has(agent.id) && !isHeartbeatRunLiveInProcess(activeRun.id)) {
+          // FNXC:AgentHeartbeat 2026-10-07-18:24: a run still in its pre-session phase (for example worktree acquisition) is live but not yet tracked.
           const timeoutMs = this.resolveAgentConfig(agent.id).heartbeatTimeoutMs;
           const heartbeatAgeMs = getHeartbeatAgeMs(agent, now);
           // NOTE(FN-4278): this stale gate intentionally uses a per-run work-budget
@@ -1438,12 +1489,14 @@ export class HeartbeatMonitor {
     sessionIdBefore?: string,
     abortController?: AbortController,
   ): void {
+    const now = Date.now();
     const tracked: TrackedAgent = {
       agentId,
       session,
       abortController,
       runId,
-      lastSeen: Date.now(),
+      lastSeen: now,
+      lastPersistedAt: now,
       missedHeartbeatReported: false,
       sessionIdBefore,
     };
@@ -1460,30 +1513,46 @@ export class HeartbeatMonitor {
    * @param fn - Function to execute with the lock
    */
   async withAgentStartLock<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
+    /*
+    FNXC:AgentHeartbeat 2026-10-07-17:49:
+    A rejected run must never affect the next run's admission. The stored queue tail is rejection-neutral, so a predecessor's failure is seen only by its own caller and the successor still runs after it settles.
+    The tail entry is deleted when the operation that set it settles while still being the current tail, so the map cannot grow or retain a settled promise.
+    */
     const existing = this.agentStartLocks.get(agentId) ?? Promise.resolve();
-    const operation = existing.then(
-      async () => {
-        try {
-          return await fn();
-        } finally {
-          // Clean up accumulated run state for this agent at end of each serialized run.
-          // This guarantees cleanup even when the run path throws without calling completeRun
-          // (e.g., execution error before completeRun is reached, or completeRun itself throws).
-          // Because withAgentStartLock serializes runs per agent, the finally runs after each
-          // run completes but before the next concurrent call's callback starts.
-          this.clearRunState(agentId);
-        }
-      },
-      async (err) => {
-        try {
-          throw err;
-        } finally {
-          this.clearRunState(agentId);
-        }
-      },
-    );
-    this.agentStartLocks.set(agentId, operation);
-    return operation as Promise<T>;
+    const operation = existing.then(async () => {
+      try {
+        return await fn();
+      } finally {
+        // Clean up accumulated run state for this agent at end of each serialized run.
+        // This guarantees cleanup even when the run path throws without calling completeRun
+        // (e.g., execution error before completeRun is reached, or completeRun itself throws).
+        // Because withAgentStartLock serializes runs per agent, the finally runs after each
+        // run completes but before the next concurrent call's callback starts.
+        this.clearRunState(agentId);
+        this.releaseLiveRun(agentId);
+      }
+    });
+    const tail: Promise<void> = operation.then(() => undefined, () => undefined);
+    this.agentStartLocks.set(agentId, tail);
+    void tail.then(() => {
+      if (this.agentStartLocks.get(agentId) === tail) {
+        this.agentStartLocks.delete(agentId);
+      }
+    });
+    return operation;
+  }
+
+  private markRunLive(agentId: string, runId: string): void {
+    this.releaseLiveRun(agentId);
+    this.liveRunIdByAgent.set(agentId, runId);
+    inProcessLiveHeartbeatRunIds.add(runId);
+  }
+
+  private releaseLiveRun(agentId: string): void {
+    const runId = this.liveRunIdByAgent.get(agentId);
+    if (runId === undefined) return;
+    this.liveRunIdByAgent.delete(agentId);
+    inProcessLiveHeartbeatRunIds.delete(runId);
   }
 
   /**
@@ -1803,6 +1872,40 @@ export class HeartbeatMonitor {
   }
 
   /**
+   * FNXC:HeartbeatRecovery 2026-10-07-18:15:
+   * One outcome for a model-unavailable failure from every trigger source and failure point (session creation or prompt).
+   * The run completes without the success state transition, and the agent parks with the model-unavailable pause reason and an actionable lastError.
+   * The timer branch used to complete as healthy, which cleared lastError and reset the shared recovery budget, so a missing provider key looped every interval forever with no operator signal.
+   * The run-entry recovery gate re-admits the park under the shared budget and keeps it parked once the budget is exhausted.
+   */
+  private async completeRunAsModelUnavailable(
+    agentId: string,
+    runId: string,
+    source: HeartbeatInvocationSource,
+    errorDetail: string,
+    stdoutExcerpt?: string,
+  ): Promise<void> {
+    const detail = buildHeartbeatModelUnavailableDetail(errorDetail);
+    await this.completeRun(agentId, runId, {
+      status: "completed",
+      resultJson: {
+        reason: "heartbeat_model_unavailable",
+        source,
+        detail,
+        actionRequired: true,
+      },
+      stderrExcerpt: detail,
+      ...(stdoutExcerpt ? { stdoutExcerpt } : {}),
+      skipStateTransition: true,
+    });
+    await this.store.updateAgentState(agentId, "paused");
+    await this.store.updateAgent(agentId, {
+      pauseReason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON,
+      lastError: detail,
+    });
+  }
+
+  /**
    * Stop an active heartbeat run for an agent.
    *
    * If an in-memory tracked session exists, dispose it and complete the run as terminated.
@@ -1985,15 +2088,35 @@ export class HeartbeatMonitor {
     const tracked = this.trackedAgents.get(agentId);
     if (!tracked) return;
 
-    tracked.lastSeen = Date.now();
+    /*
+    FNXC:AgentHeartbeat 2026-10-07-18:24:
+    Called from every session activity callback, so in-memory liveness is exact while persisted liveness is written at most once per HEARTBEAT_ACTIVITY_PERSIST_INTERVAL_MS.
+    The persisted "ok" write advances lastHeartbeatAt, which keeps another process's view of a live run fresh.
+    */
+    const now = Date.now();
+    tracked.lastSeen = now;
 
     // If recovering from a missed heartbeat
     if (tracked.missedHeartbeatReported) {
       tracked.missedHeartbeatReported = false;
-      void this.store.recordHeartbeat(agentId, "recovered", tracked.runId);
+      this.persistHeartbeatEvent(agentId, "recovered", tracked.runId);
       this.onRecovered?.(agentId);
-    } else {
-      void this.store.recordHeartbeat(agentId, "ok", tracked.runId);
+    }
+    if (now - tracked.lastPersistedAt >= HEARTBEAT_ACTIVITY_PERSIST_INTERVAL_MS) {
+      tracked.lastPersistedAt = now;
+      this.persistHeartbeatEvent(agentId, "ok", tracked.runId);
+    }
+  }
+
+  /** Best-effort liveness write: a failed write must never break the session callback that triggered it. */
+  private persistHeartbeatEvent(agentId: string, status: "ok" | "recovered", runId: string): void {
+    const warn = (err: unknown) => {
+      heartbeatLog.warn(`recordHeartbeat(${status}) failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+    };
+    try {
+      void Promise.resolve(this.store.recordHeartbeat(agentId, status, runId)).catch(warn);
+    } catch (err) {
+      warn(err);
     }
   }
 
@@ -2177,6 +2300,8 @@ export class HeartbeatMonitor {
         triggerDetail,
         contextSnapshot: Object.keys(runContextSnapshot).length > 0 ? runContextSnapshot : undefined,
       });
+      // FNXC:AgentHeartbeat 2026-10-07-18:24: owned by this serialized run until the start lock settles, covering pre-session work such as worktree acquisition.
+      this.markRunLive(agentId, run.id);
 
       // Build run context for mutation correlation
       const runContext: RunMutationContext = {
@@ -2966,60 +3091,8 @@ export class HeartbeatMonitor {
           attachAgentUsageTelemetry(agentLogger, { store: taskStore, agentId, taskId, nodeId: taskDetail?.effectiveNodeId ?? taskDetail?.nodeId ?? null, lane: "heartbeat" });
         }
 
-        const isModelUnavailableError = (errorMessage: string): boolean => {
-          const normalized = errorMessage.toLowerCase();
-          return normalized.includes("no api key for provider")
-            || normalized.includes("configured primary model")
-            || normalized.includes("was not found in the pi model registry");
-        };
-
-        const extractUnavailableProvider = (errorMessage: string): string | undefined => {
-          const providerMatch = /no api key for provider:\s*([^\s)]+)/i.exec(errorMessage);
-          if (providerMatch?.[1]) return providerMatch[1];
-          const modelMatch = /configured primary model\s+([^/\s]+)\//i.exec(errorMessage);
-          if (modelMatch?.[1]) return modelMatch[1];
-          return undefined;
-        };
-
-        const completeAsModelUnavailable = async (errorMessage: string): Promise<void> => {
-          const provider = extractUnavailableProvider(errorMessage);
-          const detail = provider
-            ? `${errorMessage}. Configure credentials for provider "${provider}" in settings, then resume the agent.`
-            : `${errorMessage}. Configure valid provider credentials in settings, then resume the agent.`;
-
-          if (source === "timer") {
-            await this.completeRun(agentId, run.id, {
-              status: "completed",
-              resultJson: {
-                reason: "heartbeat_model_unavailable",
-                source,
-                detail,
-              },
-              stderrExcerpt: detail,
-              stdoutExcerpt: stdoutExcerpt || undefined,
-            });
-            return;
-          }
-
-          await this.completeRun(agentId, run.id, {
-            status: "completed",
-            resultJson: {
-              reason: "heartbeat_model_unavailable",
-              source,
-              detail,
-              actionRequired: true,
-            },
-            stderrExcerpt: detail,
-            stdoutExcerpt: stdoutExcerpt || undefined,
-            skipStateTransition: true,
-          });
-
-          await this.store.updateAgentState(agentId, "paused");
-          await this.store.updateAgent(agentId, {
-            pauseReason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON,
-            lastError: detail,
-          });
-        };
+        const completeAsModelUnavailable = (errorMessage: string): Promise<void> =>
+          this.completeRunAsModelUnavailable(agentId, run.id, source, errorMessage, stdoutExcerpt || undefined);
 
         if (!heartbeatModelSettings) {
           try {
@@ -3072,6 +3145,7 @@ export class HeartbeatMonitor {
               ? worktreeErr.refresh.kind
               : undefined;
             heartbeatLog.warn(`Heartbeat worktree acquisition failed for ${agentId}: ${detail}`);
+            const acquisitionLanes = await resolveHeartbeatAcquisitionLanes(taskStore, taskDetail.id);
 
             /*
              * FNXC:WorktreeBaseRefresh 2026-08-01-16:33:
@@ -3079,18 +3153,19 @@ export class HeartbeatMonitor {
              * broken acquisition. Their typed outcome remains in task/run records and is retried
              * only on a later heartbeat after git state can change; never consume the generic
              * three-strike acquisition budget or replace the reason with terminal failure.
+             *
+             * FNXC:WorktreeAcquisition 2026-10-07-18:02:
+             * The refusal parks the card where it is; it records only the task-log reason.
              */
             if (refreshKind) {
-              if (!(await isTaskInTerminalLane(taskStore, taskDetail))) {
+              const isTerminal = acquisitionLanes
+                ? acquisitionLanes.terminal.has(taskDetail.column)
+                : await isTaskInTerminalLane(taskStore, taskDetail);
+              if (!isTerminal) {
                 await taskStore.logEntry(
                   taskDetail.id,
                   `Worktree base refresh blocked heartbeat execution (${refreshKind})`,
                   detail,
-                );
-                await taskStore.moveTask(
-                  taskDetail.id,
-                  await resolveHeartbeatReboundColumn(taskStore, taskDetail.id),
-                  { preserveProgress: true },
                 );
               }
               await this.completeRun(agentId, run.id, {
@@ -3107,44 +3182,40 @@ export class HeartbeatMonitor {
              * Bound consecutive cross-heartbeat acquisition failures for this task
              * (see MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES doc comment). On cap
              * exhaustion, terminally fail the task (matching the executor's
-             * `status: "failed"` convention) instead of requeuing to "todo" again,
-             * and surface the exhaustion via onTaskAcquisitionExhausted so the
-             * owning runtime can record the failure in CentralCore stats (FN-7721).
+             * `status: "failed"` convention) instead of retrying again, and surface
+             * the exhaustion via onTaskAcquisitionExhausted so the owning runtime
+             * can record the failure in CentralCore stats (FN-7721).
+             *
+             * FNXC:WorktreeAcquisition 2026-10-07-18:02:
+             * The counter and the terminal park are one atomic write decided against the live row, and neither moves the card.
+             * A pause or human-merge ownership that lands while acquisition is failing wins: recovery writes nothing and the exhaustion callback does not fire.
+             * Unresolvable lanes also write nothing, because a terminal or human-owned card cannot be ruled out.
              */
-            const priorAttempts = taskDetail.recoveryRetryCount ?? 0;
-            const attemptsSoFar = priorAttempts + 1;
-            const retryCapExhausted = attemptsSoFar >= MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES;
-
-            if (!(await isTaskInTerminalLane(taskStore, taskDetail))) {
-              if (retryCapExhausted) {
-                const exhaustionMessage = `Worktree acquisition failed after ${MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES} heartbeat attempts for branch "${taskDetail.branch ?? `fusion/${taskDetail.id.toLowerCase()}`}": ${detail}`;
-                await taskStore.updateTask(taskDetail.id, {
-                  status: "failed",
-                  error: exhaustionMessage,
-                  recoveryRetryCount: null,
-                });
-                await taskStore.logEntry(taskDetail.id, `Worktree acquisition retry cap reached (${MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES} attempts); task marked failed`, exhaustionMessage);
-                /*
-                 * FNXC:WorktreeAcquisition 2026-07-09-00:00:
-                 * `moveTask(..., "todo", ...)` reopen-to-todo semantics clear
-                 * task.status/task.error back to undefined unless `preserveStatus`
-                 * is passed (see store.ts isReopenToTodoOrTriage clause and
-                 * move-task-preserve-status.test.ts) — without this flag the
-                 * `status: "failed"` just written above would be silently wiped,
-                 * leaving the task looking like a normal todo task that gets
-                 * reassigned and retried from scratch, defeating the terminal-
-                 * failure intent of this fix (FN-7721).
-                 */
-                await taskStore.moveTask(taskDetail.id, await resolveHeartbeatReboundColumn(taskStore, taskDetail.id), { preserveProgress: true, preserveStatus: true });
-                this.onTaskAcquisitionExhausted?.(taskDetail.id, exhaustionMessage);
-              } else {
-                await taskStore.updateTask(taskDetail.id, { recoveryRetryCount: attemptsSoFar });
-                await taskStore.moveTask(taskDetail.id, await resolveHeartbeatReboundColumn(taskStore, taskDetail.id), { preserveProgress: true });
-              }
+            const branchLabel = taskDetail.branch ?? `fusion/${taskDetail.id.toLowerCase()}`;
+            let attemptsSoFar = (taskDetail.recoveryRetryCount ?? 0) + 1;
+            let retryCapExhausted = attemptsSoFar >= MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES;
+            let recoveryHold: HeartbeatAcquisitionRecoveryHold | "lanes-unresolved" | undefined = acquisitionLanes ? undefined : "lanes-unresolved";
+            let exhaustionMessage: string | undefined;
+            if (acquisitionLanes) {
+              await taskStore.updateTaskAtomic(taskDetail.id, (current) => {
+                recoveryHold = resolveHeartbeatAcquisitionRecoveryHold(current, acquisitionLanes, heartbeatModelSettings);
+                if (recoveryHold) return null;
+                attemptsSoFar = (current.recoveryRetryCount ?? 0) + 1;
+                retryCapExhausted = attemptsSoFar >= MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES;
+                if (!retryCapExhausted) return { recoveryRetryCount: attemptsSoFar };
+                exhaustionMessage = `Worktree acquisition failed after ${MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES} heartbeat attempts for branch "${branchLabel}": ${detail}`;
+                return { status: "failed", error: exhaustionMessage, recoveryRetryCount: null };
+              });
+            }
+            if (exhaustionMessage) {
+              await taskStore.logEntry(taskDetail.id, `Worktree acquisition retry cap reached (${MAX_HEARTBEAT_WORKTREE_ACQUISITION_RETRIES} attempts); task marked failed`, exhaustionMessage);
+              this.onTaskAcquisitionExhausted?.(taskDetail.id, exhaustionMessage);
+            } else if (recoveryHold) {
+              heartbeatLog.log(`Heartbeat worktree acquisition recovery for ${taskDetail.id} wrote nothing (hold=${recoveryHold})`);
             }
             await this.completeRun(agentId, run.id, {
               status: "completed",
-              resultJson: { reason: "worktree_acquisition_failed", detail, attempt: attemptsSoFar, retryCapExhausted },
+              resultJson: { reason: "worktree_acquisition_failed", detail, attempt: attemptsSoFar, retryCapExhausted, ...(recoveryHold ? { recoveryHold } : {}) },
               stderrExcerpt: detail,
               skipStateTransition: true,
             });
@@ -3222,20 +3293,29 @@ export class HeartbeatMonitor {
           runAuditor: audit,
           settings: heartbeatModelSettings,
           mcpServers: heartbeatMcp.servers,
+          /*
+          FNXC:AgentHeartbeat 2026-10-07-18:24:
+          Every session event is proof the run is progressing, so each one refreshes liveness through recordHeartbeat.
+          Without it lastSeen and lastHeartbeatAt froze at run start, and any session longer than the timeout was reported missed, killed and re-dispatched.
+          */
           onText: (delta) => {
             outputLength += delta.length;
             appendStdoutExcerpt(delta);
             agentLogger?.onText(delta);
+            this.recordHeartbeat(agentId);
           },
           onThinking: (delta) => {
             agentLogger?.onThinking(delta);
+            this.recordHeartbeat(agentId);
           },
           onToolStart: (name, args) => {
             agentLogger?.onToolStart(name, args);
+            this.recordHeartbeat(agentId);
           },
           onToolEnd: (name, isError, result) => {
             toolCallCount++;
             agentLogger?.onToolEnd(name, isError, result);
+            this.recordHeartbeat(agentId);
           },
           // FNXC:PluginSkills 2026-07-12-00:00: Heartbeat sessions forward plugin skill body dirs with waking-agent requested names so durable agents can use plugin-provided guidance.
           ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
@@ -3793,10 +3873,10 @@ export class HeartbeatMonitor {
                   fallbackModelId: heartbeatSessionModels.fallbackModelId,
                   fallbackThinkingLevel: resolveExecutorFallbackThinkingLevel(undefined, heartbeatModelSettings), runAuditor: audit, settings: heartbeatModelSettings,
                   mcpServers: heartbeatMcp.servers,
-                  onText: (delta) => { outputLength += delta.length; appendStdoutExcerpt(delta); agentLogger?.onText(delta); },
-                  onThinking: (delta) => agentLogger?.onThinking(delta),
-                  onToolStart: (name, args) => agentLogger?.onToolStart(name, args),
-                  onToolEnd: (name, isError, result) => { toolCallCount++; agentLogger?.onToolEnd(name, isError, result); },
+                  onText: (delta) => { outputLength += delta.length; appendStdoutExcerpt(delta); agentLogger?.onText(delta); this.recordHeartbeat(agentId); },
+                  onThinking: (delta) => { agentLogger?.onThinking(delta); this.recordHeartbeat(agentId); },
+                  onToolStart: (name, args) => { agentLogger?.onToolStart(name, args); this.recordHeartbeat(agentId); },
+                  onToolEnd: (name, isError, result) => { toolCallCount++; agentLogger?.onToolEnd(name, isError, result); this.recordHeartbeat(agentId); },
                   ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
                   ...(skillContext.additionalSkillPaths.length > 0 ? { additionalSkillPaths: skillContext.additionalSkillPaths } : {}),
                   actionGateContext: this.buildActionGateContext(agent, taskId, run.id, heartbeatModelSettings?.defaultAgentPermissionPolicy),
@@ -3863,12 +3943,19 @@ export class HeartbeatMonitor {
 
           await flushAgentLogger();
 
-          // Mark messages as read after successful processing (only if messages were included in prompt)
+          /*
+          FNXC:AgentMailbox 2026-10-07-18:05:
+          Acknowledge only the messages this run rendered into its prompt, by id, after successful processing.
+          A bulk inbox acknowledgement also consumed unread mail beyond the prompt limit and mail that arrived mid-session, so no later heartbeat or unread-only read could surface it.
+          One failed acknowledgement (for example a message deleted mid-run) must not block the others.
+          */
           if (pendingMessages.length > 0 && this.messageStore) {
-            try {
-              await this.messageStore.markAllAsRead(agentId, "agent");
-            } catch (markReadErr) {
-              heartbeatLog.warn(`Failed to mark messages as read for ${agentId}: ${markReadErr instanceof Error ? markReadErr.message : String(markReadErr)}`);
+            for (const delivered of pendingMessages) {
+              try {
+                await this.messageStore.markAsRead(delivered.id);
+              } catch (markReadErr) {
+                heartbeatLog.warn(`Failed to mark message ${delivered.id} as read for ${agentId}: ${markReadErr instanceof Error ? markReadErr.message : String(markReadErr)}`);
+              }
             }
           }
 
@@ -3907,7 +3994,7 @@ export class HeartbeatMonitor {
           heartbeatLog.error(`Heartbeat execution failed for ${agentId}: ${errorDetail}`);
           await flushAgentLogger();
 
-          if (isModelUnavailableError(errorDetail)) {
+          if (isHeartbeatModelUnavailableError(errorDetail)) {
             await completeAsModelUnavailable(errorDetail);
           } else {
             await this.completeRun(agentId, run.id, {
@@ -3939,51 +4026,12 @@ export class HeartbeatMonitor {
         heartbeatLog.error(`Heartbeat execution error for ${agentId}: ${errorDetail}`);
         await flushAgentLogger();
 
-        const normalizedError = errorDetail.toLowerCase();
-        const isModelUnavailable = normalizedError.includes("no api key for provider")
-          || normalizedError.includes("configured primary model")
-          || normalizedError.includes("was not found in the pi model registry");
-
         // Attempt to complete the run if it's still active.
         // If completeRun also fails, fall back to a direct DB update to ensure
         // the run is not permanently stuck in "active" state.
         try {
-          if (isModelUnavailable) {
-            const providerMatch = /no api key for provider:\s*([^\s)]+)/i.exec(errorDetail);
-            const modelMatch = /configured primary model\s+([^/\s]+)\//i.exec(errorDetail);
-            const provider = providerMatch?.[1] ?? modelMatch?.[1];
-            const detail = provider
-              ? `${errorDetail}. Configure credentials for provider "${provider}" in settings, then resume the agent.`
-              : `${errorDetail}. Configure valid provider credentials in settings, then resume the agent.`;
-
-            if (source === "timer") {
-              await this.completeRun(agentId, run.id, {
-                status: "completed",
-                resultJson: {
-                  reason: "heartbeat_model_unavailable",
-                  source,
-                  detail,
-                },
-                stderrExcerpt: detail,
-              });
-            } else {
-              await this.completeRun(agentId, run.id, {
-                status: "completed",
-                resultJson: {
-                  reason: "heartbeat_model_unavailable",
-                  source,
-                  detail,
-                  actionRequired: true,
-                },
-                stderrExcerpt: detail,
-                skipStateTransition: true,
-              });
-              await this.store.updateAgentState(agentId, "paused");
-              await this.store.updateAgent(agentId, {
-                pauseReason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON,
-                lastError: detail,
-              });
-            }
+          if (isHeartbeatModelUnavailableError(errorDetail)) {
+            await this.completeRunAsModelUnavailable(agentId, run.id, source, errorDetail);
           } else {
             await this.completeRun(agentId, run.id, {
               status: "failed",
@@ -4707,6 +4755,13 @@ export class HeartbeatTriggerScheduler {
   private timerArmSeq = 0;
   private currentTimerArm: Map<string, number> = new Map();
   private running = false;
+  /*
+   * FNXC:AgentHeartbeat 2026-10-07-18:19:
+   * stop() advances this generation so asynchronous work already in flight cannot act afterward.
+   * Every async path (multiplier re-arm, lifecycle refresh, timer audit, timer tick, assignment wake, deferred-assignment drain) captures the generation before its first await and re-checks it after each await and immediately before it registers a timer or dispatches a heartbeat.
+   * start() does not advance it, so a registration made before start keeps its multiplier refresh.
+   */
+  private lifecycleGeneration = 0;
   private assignedListener: ((agent: import("@fusion/core").Agent, taskId: string) => void) | null = null;
   private createdListener: ((agent: import("@fusion/core").Agent) => void) | null = null;
   private updatedListener: ((agent: import("@fusion/core").Agent) => void) | null = null;
@@ -4834,6 +4889,7 @@ export class HeartbeatTriggerScheduler {
   stop(): void {
     if (!this.running) return;
     this.running = false;
+    this.lifecycleGeneration += 1;
 
     // Unwatch assignments
     this.unwatchAssignments();
@@ -4875,6 +4931,11 @@ export class HeartbeatTriggerScheduler {
    */
   isActive(): boolean {
     return this.running;
+  }
+
+  /** True while the scheduler runs in the same lifecycle generation that `generation` was captured in. */
+  private isLiveGeneration(generation: number): boolean {
+    return this.running && this.lifecycleGeneration === generation;
   }
 
   /** Default heartbeat interval when not explicitly configured (3600 seconds / 1 hour) */
@@ -4921,7 +4982,7 @@ export class HeartbeatTriggerScheduler {
 
     // If project settings are available, refresh registration with the current multiplier.
     if (this.taskStore && typeof (this.taskStore as { getSettings?: () => Promise<Settings> }).getSettings === "function") {
-      void this.applyProjectMultiplierRegistration(agentId, intervalMs, usingDefaultInterval, registrationEpoch, lastHeartbeatAt);
+      void this.applyProjectMultiplierRegistration(agentId, intervalMs, usingDefaultInterval, registrationEpoch, lastHeartbeatAt, this.lifecycleGeneration);
     }
   }
 
@@ -4931,6 +4992,7 @@ export class HeartbeatTriggerScheduler {
     usingDefaultInterval: boolean,
     expectedEpoch: number,
     lastHeartbeatAt: string | null,
+    expectedGeneration: number,
   ): Promise<void> {
     let multiplier = 1;
 
@@ -4946,8 +5008,8 @@ export class HeartbeatTriggerScheduler {
 
     this.lastKnownHeartbeatMultiplier = multiplier;
 
-    // Guard against stale async completions after subsequent register/unregister calls.
-    if (this.registrationEpochs.get(agentId) !== expectedEpoch) {
+    // Guard against stale async completions after subsequent register/unregister calls or a stop().
+    if (this.registrationEpochs.get(agentId) !== expectedEpoch || this.lifecycleGeneration !== expectedGeneration) {
       return;
     }
 
@@ -5140,6 +5202,7 @@ export class HeartbeatTriggerScheduler {
 
     this.assignedListener = async (agent, taskId) => {
       if (!this.running) return;
+      const generation = this.lifecycleGeneration;
 
       try {
         if (!isHeartbeatManaged(agent)) {
@@ -5162,6 +5225,7 @@ export class HeartbeatTriggerScheduler {
         // assignment for completion-driven re-fire so it is not stranded by
         // long/idle-skipped timer intervals.
         const activeRun = await this.store.getActiveHeartbeatRun(agent.id);
+        if (!this.isLiveGeneration(generation)) return;
         if (activeRun) {
           this.pendingAssignments.set(agent.id, { taskId });
           heartbeatLog.debug(`Assignment trigger skipped for ${agent.id} (active run)`);
@@ -5215,6 +5279,8 @@ export class HeartbeatTriggerScheduler {
           }
         }
 
+        // FNXC:AgentHeartbeat 2026-10-07-18:19: an assignment wake that crossed a stop() must not dispatch.
+        if (!this.isLiveGeneration(generation)) return;
         heartbeatLog.log(`Assignment trigger for ${agent.id} (task: ${taskId})`);
         await this.callback(agent.id, "assignment", {
           taskId,
@@ -5250,9 +5316,11 @@ export class HeartbeatTriggerScheduler {
     if (!pending) {
       return;
     }
+    const generation = this.lifecycleGeneration;
 
     try {
       const agent = await this.store.getAgent(agentId);
+      if (!this.isLiveGeneration(generation)) return;
       if (!agent) {
         this.pendingAssignments.delete(agentId);
         heartbeatLog.log(`Deferred assignment cleared for ${agentId} (agent missing)`);
@@ -5313,6 +5381,8 @@ export class HeartbeatTriggerScheduler {
         heartbeatLog.warn(`Deferred assignment budget check failed for ${agentId}: ${budgetErr instanceof Error ? budgetErr.message : String(budgetErr)} — proceeding without budget check`);
       }
 
+      // FNXC:AgentHeartbeat 2026-10-07-18:19: a drain that crossed a stop() keeps its pending entry and does not dispatch.
+      if (!this.isLiveGeneration(generation)) return;
       this.pendingAssignments.delete(agentId);
       heartbeatLog.log(`Deferred assignment re-fired for ${agentId} (task: ${pending.taskId})`);
       await this.callback(agentId, "assignment", {
@@ -5405,7 +5475,9 @@ export class HeartbeatTriggerScheduler {
   }
 
   private async syncTimerForAgentFromStore(agentId: string, reason: string): Promise<void> {
+    const generation = this.lifecycleGeneration;
     const agent = await this.store.getAgent(agentId);
+    if (this.lifecycleGeneration !== generation) return;
     if (!agent) {
       this.unregisterAgent(agentId);
       return;
@@ -5532,6 +5604,14 @@ export class HeartbeatTriggerScheduler {
 
     const thresholdMs = this.getActiveRunStaleThresholdMs(agent, staleMultiplier);
     const elapsedMs = getHeartbeatAgeMs(agent);
+    /*
+    FNXC:AgentHeartbeat 2026-10-07-18:24:
+    A run that a live session in this process owns is not orphaned, however stale lastHeartbeatAt looks; the monitor's missed-heartbeat check supervises it.
+    Reaping it let the tick and audit dispatch a second heartbeat that queued behind the live run, so one wake burned several model sessions back-to-back.
+    */
+    if (isHeartbeatRunLiveInProcess(activeRun.id)) {
+      return { reaped: false, elapsedMs, thresholdMs };
+    }
     if (!Number.isFinite(elapsedMs) || elapsedMs <= thresholdMs) {
       return { reaped: false, elapsedMs, thresholdMs };
     }
@@ -5586,12 +5666,14 @@ export class HeartbeatTriggerScheduler {
 
   async auditTimerRegistrations(reason: "start" | "interval" = "interval"): Promise<void> {
     if (!this.running) return;
+    const generation = this.lifecycleGeneration;
     this.lastAuditRanAtMs = Date.now();
 
     try {
       const settings = this.taskStore && typeof this.taskStore.getSettings === "function"
         ? await this.taskStore.getSettings()
         : null;
+      if (!this.isLiveGeneration(generation)) return;
       const staleMultiplier = this.resolveRepairStaleMultiplier(settings);
       this.lastKnownHeartbeatMultiplier = HeartbeatTriggerScheduler.resolveHeartbeatMultiplier(settings?.heartbeatMultiplier);
       this.updateErrorRecoveryLimit(settings);
@@ -5599,6 +5681,8 @@ export class HeartbeatTriggerScheduler {
       let rearmedCount = 0;
       let zombieRearmedCount = 0;
       for (const agent of agents) {
+        // FNXC:AgentHeartbeat 2026-10-07-18:19: a stop() during any await of this pass ends the pass before it re-arms or unregisters anything.
+        if (!this.isLiveGeneration(generation)) return;
         /*
          * FNXC:AgentHeartbeat 2026-07-09-00:00:
          * FN-7718 — CLI-driven `fn agent stop`/`start` mutate the agent row from
@@ -5688,6 +5772,7 @@ export class HeartbeatTriggerScheduler {
         const isZombieRearm = hasTimerEntry && staleAtRepair;
 
         const activeRun = await this.store.getActiveHeartbeatRun(agent.id);
+        if (!this.isLiveGeneration(generation)) return;
         const activeRunId = activeRun?.id ?? null;
         let reapedActiveRun = false;
         let activeRunElapsedMs = Number.NaN;
@@ -5699,6 +5784,7 @@ export class HeartbeatTriggerScheduler {
             continue;
           }
           const reapResult = await this.maybeReapStaleActiveRun(agent, activeRun, "audit", staleMultiplier);
+          if (!this.isLiveGeneration(generation)) return;
           reapedActiveRun = reapResult.reaped;
           activeRunElapsedMs = reapResult.elapsedMs;
           activeRunThresholdMs = reapResult.thresholdMs;
@@ -5821,8 +5907,18 @@ export class HeartbeatTriggerScheduler {
      */
     this.lastTimerFireAtMs.set(agentId, Date.now());
 
+    /*
+     * FNXC:AgentHeartbeat 2026-10-07-18:19:
+     * The entry guards above run before any await; a stop, restart, or re-arm can land during the reads below.
+     * Re-check the lifecycle generation, running state, and arm identity after every await and immediately before dispatch.
+     */
+    const generation = this.lifecycleGeneration;
+    const superseded = (): boolean => !this.isLiveGeneration(generation)
+      || (armId !== undefined && this.currentTimerArm.get(agentId) !== armId);
+
     try {
       const agent = await this.store.getAgent(agentId);
+      if (superseded()) return;
       /*
       FNXC:EngineDiagnostics 2026-07-26-08:17:
       Timer skip reasons (pause, idle, active run, ineligible state) fire on every interval for every registered agent. That is steady-state gating, not a lifecycle event — demote to debug (FUSION_DEBUG=heartbeat). Keep reap/re-arm and actual executeHeartbeat start/complete on log/warn.
@@ -5832,16 +5928,16 @@ export class HeartbeatTriggerScheduler {
         this.unregisterAgent(agentId);
         return;
       }
-      if (!isHeartbeatManaged(agent) || (agent.state !== "error" && !isTickableState(agent.state))) {
-        heartbeatLog.debug(`Timer tick skipped for ${agentId} (state=${agent.state})`);
-        this.unregisterAgent(agentId);
-        return;
-      }
-
+      /*
+      FNXC:HeartbeatRecovery 2026-10-07-18:12:
+      Dispatch uses the same isTimerEligibleAgent decision as registration, with the live recovery limit.
+      A separate state check here admitted only tickable or error agents, so it unregistered the under-budget heartbeat-model-unavailable parks that registration deliberately arms.
+      */
       const settings = this.taskStore ? await this.taskStore.getSettings() : null;
-      const errorRecoveryLimit = this.updateErrorRecoveryLimit(settings);
-      if (agent.state === "error" && !isErrorRecoveryEligible(agent, errorRecoveryLimit)) {
-        heartbeatLog.debug(`Timer tick skipped for ${agentId} (state=${agent.state}, error recovery ineligible)`);
+      if (superseded()) return;
+      this.updateErrorRecoveryLimit(settings);
+      if (!this.isTimerEligibleAgent(agent)) {
+        heartbeatLog.debug(`Timer tick skipped for ${agentId} (state=${agent.state})`);
         this.unregisterAgent(agentId);
         return;
       }
@@ -5885,9 +5981,11 @@ export class HeartbeatTriggerScheduler {
 
       // Check for active runs
       const activeRun = await this.store.getActiveHeartbeatRun(agentId);
+      if (superseded()) return;
       if (activeRun) {
         const staleMultiplier = this.resolveRepairStaleMultiplier(settings);
         const reapResult = await this.maybeReapStaleActiveRun(agent, activeRun, "timer", staleMultiplier);
+        if (superseded()) return;
         if (!reapResult.reaped) {
           heartbeatLog.debug(`Timer tick skipped for ${agentId} (active run)`);
           return;
@@ -5902,6 +6000,7 @@ export class HeartbeatTriggerScheduler {
       // can create explicit run records with budget_exhausted/budget_threshold_exceeded reasons.
       // This makes timer budget skips observable rather than silent drops.
 
+      if (superseded()) return;
       await this.callback(agentId, "timer", {
         wakeReason: "timer",
         triggerDetail: "scheduled",
