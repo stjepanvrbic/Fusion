@@ -3,6 +3,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(currentFilePath), "..");
@@ -188,7 +189,7 @@ export async function main(argv = process.argv.slice(2), { rootDir = repoRoot, s
   return 0;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   /*
   FNXC:TestFeedbackVelocity 2026-06-17-18:30:
   The CEO mandate requires a weekly #leads-visible baseline for test signal-per-second, not more coverage. Keep this script stdlib-only so any engineer or scheduled job can refresh gate time, pnpm-test time, slowest files, and quarantine count without booting Fusion services.

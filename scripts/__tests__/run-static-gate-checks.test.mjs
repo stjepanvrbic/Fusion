@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   extractLeadingStaticGateChecks,
@@ -30,6 +32,8 @@ const EXPECTED_GATE_CHECKS = [
   check("pi-versions-pinned"),
   check("workspace-package-graph"),
   check("no-test-timeout-appeasement"),
+  /* FNXC:TestInfrastructure 2026-10-07-18:03: the comment-assertion checker joined test:gate:static without this mirror; production was right and the mirror was stale. */
+  check("no-comment-assertions-in-tests"),
   check("changeset-format"),
   check("mock-completeness"),
   check("inert-sync-lane-conversions"),
@@ -105,6 +109,53 @@ test("runStaticGateChecks reports every violating fixture validator before faili
       "[static-gate] validator failed: scripts/check-first-violation.mjs (exit 1)",
       "[static-gate] validator failed: scripts/check-second-violation.mjs (exit 2)",
     ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/*
+FNXC:WindowsEntryGuard 2026-10-07-18:03:
+Running the runner as a real entry point must execute every validator and fail closed, on Windows paths and paths with spaces.
+The fixture copies the runner beside its own package.json because the runner derives the repository root from its own location.
+*/
+function createEntrypointFixture(checks) {
+  const root = mkdtempSync(join(tmpdir(), "static gate entry "));
+  const scriptsDir = join(root, "scripts");
+  mkdirSync(join(scriptsDir, "lib"), { recursive: true });
+  const realScripts = dirname(dirname(fileURLToPath(import.meta.url)));
+  copyFileSync(join(realScripts, "run-static-gate-checks.mjs"), join(scriptsDir, "run-static-gate-checks.mjs"));
+  copyFileSync(join(realScripts, "lib", "is-entry-point.mjs"), join(scriptsDir, "lib", "is-entry-point.mjs"));
+  for (const [name, source] of Object.entries(checks)) writeFixtureCheck(root, name, source);
+  const gate = Object.keys(checks).map((name) => `node scripts/${name}.mjs`).join(" && ");
+  writeFileSync(join(root, "package.json"), JSON.stringify({ scripts: { "test:gate:static": gate } }));
+  return root;
+}
+
+function runEntrypoint(root) {
+  return spawnSync(process.execPath, [join(root, "scripts", "run-static-gate-checks.mjs")], { cwd: root, encoding: "utf8" });
+}
+
+test("direct entrypoint invocation runs every validator and reports success", () => {
+  const root = createEntrypointFixture({ "check-alpha": 'console.log("alpha ran");', "check-beta": 'console.log("beta ran");' });
+  try {
+    const result = runEntrypoint(root);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /alpha ran/);
+    assert.match(result.stdout, /beta ran/);
+    assert.match(result.stdout, /\[static-gate\] 2 validators passed/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("direct entrypoint invocation fails closed on a violating validator", () => {
+  const root = createEntrypointFixture({ "check-clean": "process.exit(0);", "check-broken": 'console.error("violation"); process.exit(3);' });
+  try {
+    const result = runEntrypoint(root);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /validator failed: scripts\/check-broken\.mjs \(exit 3\)/);
+    assert.doesNotMatch(result.stdout, /validators passed/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

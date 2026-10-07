@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { openBackend } from "./lib/backend-db.mjs";
 import process from "node:process";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 export const TASK_ID = "FN-3909";
 export const SOURCE_TASK_ID = "FN-4194";
@@ -175,7 +176,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

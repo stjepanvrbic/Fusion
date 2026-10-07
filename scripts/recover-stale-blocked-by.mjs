@@ -12,6 +12,7 @@ import path from "node:path";
 import process from "node:process";
 import { execSync } from "node:child_process";
 import { openBackend, rowsOf } from "./lib/backend-db.mjs";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 function parseArgs(argv) {
   const flags = new Set(argv.slice(2));
@@ -214,7 +215,7 @@ function printFindings(findings, dryRun, unknownLanes = []) {
   console.log(`Repairs: ${changed.length}`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   const { dryRun } = parseArgs(process.argv);
   const projectRoot = resolveProjectRoot();
   const tasksDir = path.join(projectRoot, ".fusion", "tasks");

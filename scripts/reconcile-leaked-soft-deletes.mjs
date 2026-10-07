@@ -10,6 +10,7 @@ run-audit event per repaired row.
 */
 import process from "node:process";
 import { openBackend, rowsOf } from "./lib/backend-db.mjs";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 export function parseArgs(argv = process.argv.slice(2)) {
   const args = [...argv];
@@ -163,7 +164,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

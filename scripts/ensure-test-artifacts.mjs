@@ -9,6 +9,7 @@ import {
   fusionCacheDir,
   readJsonCache,
 } from "./lib/content-hash.mjs";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 export const REQUIRED_BUILD_PACKAGES = [
   {
@@ -539,7 +540,7 @@ export function seedArtifactCache(rootDir = process.cwd(), existsFn = existsSync
   return present.map((pkg) => pkg.name);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   const argv = process.argv.slice(2);
   if (argv.includes("--print-source-hash")) {
     const hash = computeCombinedSourceHash();

@@ -11,6 +11,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { openBackend, rowsOf } from "./lib/backend-db.mjs";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 function runGit(projectRoot, args, { allowFailure = false } = {}) {
   try {
@@ -246,7 +247,7 @@ function renderSummary(report) {
   return lines.join("\n");
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   const options = parseArgs(process.argv.slice(2));
   const report = await auditBranchCrossContamination({ projectRoot: options.projectRoot });
   const json = JSON.stringify(report, null, 2);
