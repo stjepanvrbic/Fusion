@@ -164,6 +164,81 @@ describe("createAuthMiddleware", () => {
   });
 });
 
+/*
+FNXC:DaemonAuth 2026-10-07-19:55:
+Provider-signed webhook ingress (signal connectors, GitHub App, routine webhooks, monitor ingestion) cannot carry the daemon bearer token, so it bypasses the daemon gate and relies on each route's mandatory signature or ingest-secret check.
+The bypass is method- and path-exact: every neighbouring management route stays gated, and gating is case-insensitive because Express routing is.
+*/
+describe("createAuthMiddleware — self-authenticating webhook ingress", () => {
+  const token = "fn_abc123def456789";
+
+  function run(method: string, path: string) {
+    const req = { method, path, headers: {} } as unknown as Request;
+    const res = {
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+    } as unknown as Response;
+    const next = vi.fn();
+    createAuthMiddleware(token)(req, res, next);
+    return { passed: next.mock.calls.length === 1, status: (res.status as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0], verified: hasVerifiedDaemonRequest(req) };
+  }
+
+  const exempt: Array<[string, string]> = [
+    ["POST", "/api/signals/webhook"],
+    ["POST", "/api/signals/sentry"],
+    ["POST", "/api/signals/datadog"],
+    ["POST", "/api/signals/pagerduty"],
+    ["POST", "/api/signals/gitlab"],
+    ["POST", "/api/signals/github"],
+    ["POST", "/api/signals/github/"],
+    ["POST", "/api/github/webhooks"],
+    ["POST", "/api/github/webhooks/"],
+    ["POST", "/api/routines/routine-1/webhook"],
+    ["POST", "/api/routines/routine-1/webhook/"],
+    ["POST", "/api/monitor/incidents"],
+    ["POST", "/api/monitor/deployments"],
+    ["POST", "/API/Signals/webhook"],
+  ];
+
+  it.each(exempt)("passes %s %s through without a bearer token and without marking it verified", (method, path) => {
+    expect(run(method, path)).toEqual({ passed: true, status: undefined, verified: false });
+  });
+
+  const protectedNeighbours: Array<[string, string]> = [
+    ["GET", "/api/signals/webhook"],
+    ["POST", "/api/signals"],
+    ["POST", "/api/signals/webhook/extra"],
+    ["GET", "/api/signals/status"],
+    ["GET", "/api/github/webhooks"],
+    ["POST", "/api/github/webhooks/extra"],
+    ["POST", "/api/github/prs"],
+    ["POST", "/api/routines/routine-1/run"],
+    ["POST", "/api/routines/routine-1/trigger"],
+    ["PATCH", "/api/routines/routine-1/webhook"],
+    ["POST", "/api/routines/webhook"],
+    ["GET", "/api/monitor/metrics"],
+    ["GET", "/api/monitor/incidents"],
+    ["POST", "/api/monitor/other"],
+    ["GET", "/api/tasks"],
+  ];
+
+  it.each(protectedNeighbours)("still rejects %s %s without a bearer token", (method, path) => {
+    expect(run(method, path)).toEqual({ passed: false, status: 401, verified: false });
+  });
+
+  it.each([["GET", "/API/tasks"], ["GET", "/Api/settings"], ["POST", "/API/MONITOR/METRICS"], ["GET", "/API"]])(
+    "gates %s %s case-insensitively, matching Express routing",
+    (method, path) => {
+      expect(run(method, path)).toEqual({ passed: false, status: 401, verified: false });
+    },
+  );
+
+  it("still exempts liveness and CLI-agent hooks regardless of case", () => {
+    expect(run("GET", "/API/health").passed).toBe(true);
+    expect(run("POST", "/Api/cli-agent/hooks").passed).toBe(true);
+  });
+});
+
 describe("isDaemonAuthActive", () => {
   const originalEnv = process.env.FUSION_DAEMON_TOKEN;
 

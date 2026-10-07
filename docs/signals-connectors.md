@@ -21,7 +21,8 @@ Supported providers are `webhook`, `github`, `gitlab`, `sentry`, `datadog`, and 
 - Secrets are environment variables; do not commit them to source control.
 - HMAC verification uses the raw request body and constant-time comparison where the provider supplies an HMAC signature. GitHub uses `X-Hub-Signature-256`; GitLab secret-token verification compares `X-Gitlab-Token` to `FUSION_SIGNAL_GITLAB_SECRET` with constant-time comparison.
 - Requests are capped at about 1 MB.
-- Replay protection rejects stale timestamps where the provider supplies one and rejects repeated delivery ids within the replay window.
+- Replay protection rejects stale timestamps where the provider supplies one and rejects repeated delivery ids within the replay window. A delivery id is only consumed once Fusion has accepted the delivery: if the dedup lookup or task creation fails, the provider's redelivery is processed normally. A duplicate that arrives while the original is still being processed gets `503` with `Retry-After`.
+- Daemon mode (`fn daemon` or `FUSION_DAEMON_TOKEN`): `POST /api/signals/:provider` bypasses the dashboard bearer token, because a provider cannot send it. The connector's own signature or secret-token check is the authentication for that route. Never put the daemon token in a provider's webhook URL. The same applies to `POST /api/github/webhooks`, `POST /api/routines/:id/webhook`, and the monitor ingestion routes `POST /api/monitor/incidents` and `POST /api/monitor/deployments`. Every other route, including signal status and management routes, still requires the daemon token.
 - Normalized `title`, `body`, `groupingKey`, `link`, and `meta` fields are capped by `signal-source.ts` before storage.
 - Signal `link` values are SSRF-untrusted. Fusion stores safe external URLs as data for the UI and never fetches connector links server-side.
 - `meta` is stored as JSON data only and must not be rendered as raw HTML.
