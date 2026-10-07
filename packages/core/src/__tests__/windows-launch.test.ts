@@ -1,4 +1,6 @@
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -222,5 +224,21 @@ describe("killProcessTree", () => {
     Object.assign(alreadyKilled, { killed: true });
     killProcessTree(alreadyKilled, { platform: "linux", spawnImpl });
     expect(alreadyKilled.kill).not.toHaveBeenCalled();
+  });
+});
+
+/*
+FNXC:ProcessLifecycle 2026-10-07-18:00:
+windows-launch.ts is copied verbatim into the published CLI bundle (dist/pi-claude-cli), so it may import Node built-ins only.
+This is a code-construct guard: a relative or package import here breaks the shipped bundle.
+*/
+describe("windows-launch module boundary", () => {
+  it("imports only node: built-ins", () => {
+    const source = readFileSync(join(import.meta.dirname, "..", "process", "windows-launch.ts"), "utf8");
+    const specifiers = [...source.matchAll(/^\s*(?:import|export)\b[^'"]*?\bfrom\s+["']([^"']+)["']/gm)].map((match) => match[1]);
+    const dynamic = [...source.matchAll(/\bimport\(\s*["']([^"']+)["']\s*\)|\brequire\(\s*["']([^"']+)["']\s*\)/g)].map((match) => match[1] ?? match[2]);
+
+    expect(specifiers.length).toBeGreaterThan(0);
+    expect([...specifiers, ...dynamic].filter((specifier) => !specifier.startsWith("node:"))).toEqual([]);
   });
 });
