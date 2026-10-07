@@ -1251,16 +1251,23 @@ test("applyCacheToPlan: a changed (non-cached) package keeps the run active (no 
   assert.deepEqual(activePackages, ["@fusion/core"]);
 });
 
+/*
+FNXC:TestIsolation 2026-10-07-18:04:
+Prune tests scan a private root, never the shared OS temp dir. Scanning the shared dir made them fail while other sessions' Vitest roots were live, and the pid-liveness stub let them delete those sessions' roots.
+*/
+const pruneScanRoot = mkdtempSync(path.join(tmpdir(), "fusion-prune-scan-"));
+test.after(() => rmSync(pruneScanRoot, { recursive: true, force: true }));
+
 test("pruneFusionTestHomes: bounded — removes at most maxEntries per call", () => {
   const created = [];
   try {
     for (let i = 0; i < 5; i++) {
-      const dir = path.join(tmpdir(), `fusion-test-home-root-prune-budget-${process.pid}-${i}`);
+      const dir = path.join(pruneScanRoot, `fusion-test-home-root-prune-budget-${process.pid}-${i}`);
       mkdirSync(dir, { recursive: true });
       created.push(dir);
     }
     // Cap at 2 → at least 3 of ours survive this call.
-    pruneFusionTestHomes(2);
+    pruneFusionTestHomes(2, { tempRoot: pruneScanRoot });
     const survivors = created.filter((dir) => existsSync(dir));
     assert.ok(survivors.length >= 3, `expected >=3 survivors with cap=2, got ${survivors.length}`);
   } finally {
@@ -1272,12 +1279,12 @@ test("pruneFusionTestWorkers: bounded — removes at most maxEntries per call", 
   const created = [];
   try {
     for (let i = 0; i < 5; i++) {
-      const dir = path.join(tmpdir(), `fusion-test-workers-prune-budget-${process.pid}-${i}`);
+      const dir = path.join(pruneScanRoot, `fusion-test-workers-prune-budget-${process.pid}-${i}`);
       mkdirSync(dir, { recursive: true });
       created.push(dir);
     }
     // Cap at 2 → at least 3 of ours survive this call.
-    pruneFusionTestWorkers(2);
+    pruneFusionTestWorkers(2, { tempRoot: pruneScanRoot });
     const survivors = created.filter((dir) => existsSync(dir));
     assert.ok(survivors.length >= 3, `expected >=3 survivors with cap=2, got ${survivors.length}`);
   } finally {
@@ -1286,7 +1293,7 @@ test("pruneFusionTestWorkers: bounded — removes at most maxEntries per call", 
 });
 
 function createNonEmptyPruneRoot(prefix, label) {
-  const root = mkdtempSync(path.join(tmpdir(), `${prefix}${label}-${process.pid}-`));
+  const root = mkdtempSync(path.join(pruneScanRoot, `${prefix}${label}-${process.pid}-`));
   const childDir = path.join(root, `w-${process.pid}-busy`);
   mkdirSync(childDir, { recursive: true });
   writeFileSync(path.join(childDir, "busy.txt"), "busy\n");
@@ -1317,7 +1324,7 @@ function withTransientPruneFailure(root, pruneFn) {
   });
 
   try {
-    const warnings = capturePruneWarnings(() => pruneFn(64, { retries: 3, delayMs: 0 }));
+    const warnings = capturePruneWarnings(() => pruneFn(64, { retries: 3, delayMs: 0, tempRoot: pruneScanRoot }));
     assert.equal(existsSync(root), false);
     assert.equal(calls, 2);
     assert.deepEqual(warnings, []);
@@ -1339,7 +1346,7 @@ function withPersistentPruneFailure(root, pruneFn) {
   });
 
   try {
-    const warnings = capturePruneWarnings(() => pruneFn(1024, { retries: 3, delayMs: 0 }));
+    const warnings = capturePruneWarnings(() => pruneFn(1024, { retries: 3, delayMs: 0, tempRoot: pruneScanRoot }));
     assert.equal(existsSync(root), true);
     assert.equal(calls, 3);
     assert.equal(warnings.length, 1);
@@ -1355,7 +1362,7 @@ test("pruneFusionTestWorkers: skips active per-invocation worker roots", () => {
   const root = createNonEmptyPruneRoot("fusion-test-workers-", "active");
   try {
     writeFileSync(path.join(root, ".fusion-test-worker-root-owner"), `${process.pid}\n`);
-    pruneFusionTestWorkers(1024);
+    pruneFusionTestWorkers(1024, { tempRoot: pruneScanRoot });
     assert.equal(existsSync(root), true, "active worker root must not be pruned");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1363,11 +1370,11 @@ test("pruneFusionTestWorkers: skips active per-invocation worker roots", () => {
 });
 
 test("pruneFusionTestWorkers: skips markerless roots with live redirect sinks", () => {
-  const root = mkdtempSync(path.join(tmpdir(), `fusion-test-workers-active-redir-${process.pid}-`));
+  const root = mkdtempSync(path.join(pruneScanRoot, `fusion-test-workers-active-redir-${process.pid}-`));
   try {
     mkdirSync(path.join(root, `redir-${process.pid}`), { recursive: true });
     writeFileSync(path.join(root, `redir-${process.pid}`, "payload.txt"), "active\n");
-    pruneFusionTestWorkers(1024);
+    pruneFusionTestWorkers(1024, { tempRoot: pruneScanRoot });
     assert.equal(existsSync(root), true, "live redir-pid root must not be pruned");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1389,11 +1396,11 @@ function withAlivePid(pid, fn) {
 }
 
 test("pruneFusionTestWorkers: prunes owner-marker roots when pid liveness is stale", () => {
-  const root = mkdtempSync(path.join(tmpdir(), `fusion-test-workers-stale-owner-${process.pid}-`));
+  const root = mkdtempSync(path.join(pruneScanRoot, `fusion-test-workers-stale-owner-${process.pid}-`));
   const recycledPid = 424_242;
   try {
     writeFileSync(path.join(root, ".fusion-test-worker-root-owner"), `${recycledPid}\nrunToken=prior-run\n`);
-    withAlivePid(recycledPid, () => pruneFusionTestWorkers(1024));
+    withAlivePid(recycledPid, () => pruneFusionTestWorkers(1024, { tempRoot: pruneScanRoot }));
     assert.equal(existsSync(root), false, "stale pid reuse must not preserve an orphaned worker root");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1401,14 +1408,14 @@ test("pruneFusionTestWorkers: prunes owner-marker roots when pid liveness is sta
 });
 
 test("pruneFusionTestWorkers: preserves same-run owner-marker roots with live pids", () => {
-  const root = mkdtempSync(path.join(tmpdir(), `fusion-test-workers-current-owner-${process.pid}-`));
+  const root = mkdtempSync(path.join(pruneScanRoot, `fusion-test-workers-current-owner-${process.pid}-`));
   const ownerPid = 515_151;
   try {
     writeFileSync(
       path.join(root, ".fusion-test-worker-root-owner"),
       `${ownerPid}\nrunToken=${process.env.FUSION_TEST_RUN_TOKEN}\n`,
     );
-    withAlivePid(ownerPid, () => pruneFusionTestWorkers(1024));
+    withAlivePid(ownerPid, () => pruneFusionTestWorkers(1024, { tempRoot: pruneScanRoot }));
     assert.equal(existsSync(root), true, "current-run live worker root must not be pruned");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1416,7 +1423,7 @@ test("pruneFusionTestWorkers: preserves same-run owner-marker roots with live pi
 });
 
 test("pruneFusionTestWorkers: prunes old markerless redir roots when pid liveness is stale", () => {
-  const root = mkdtempSync(path.join(tmpdir(), `fusion-test-workers-stale-redir-${process.pid}-`));
+  const root = mkdtempSync(path.join(pruneScanRoot, `fusion-test-workers-stale-redir-${process.pid}-`));
   const recycledPid = 626_262;
   try {
     const redir = path.join(root, `redir-${recycledPid}`);
@@ -1424,7 +1431,7 @@ test("pruneFusionTestWorkers: prunes old markerless redir roots when pid livenes
     writeFileSync(path.join(redir, "payload.txt"), "stale\n");
     setOldMtime(redir);
     setOldMtime(root);
-    withAlivePid(recycledPid, () => pruneFusionTestWorkers(1024));
+    withAlivePid(recycledPid, () => pruneFusionTestWorkers(1024, { tempRoot: pruneScanRoot }));
     assert.equal(existsSync(root), false, "old markerless redir root must be pruned despite pid reuse");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1432,11 +1439,11 @@ test("pruneFusionTestWorkers: prunes old markerless redir roots when pid livenes
 });
 
 test("pruneFusionTestWorkers: removes SIGKILL-style orphan roots and leaves foreign prefixes alone", () => {
-  const root = mkdtempSync(path.join(tmpdir(), `fusion-test-workers-sigkill-orphan-${process.pid}-`));
-  const foreign = mkdtempSync(path.join(tmpdir(), `not-fusion-test-workers-${process.pid}-`));
+  const root = mkdtempSync(path.join(pruneScanRoot, `fusion-test-workers-sigkill-orphan-${process.pid}-`));
+  const foreign = mkdtempSync(path.join(pruneScanRoot, `not-fusion-test-workers-${process.pid}-`));
   try {
     mkdirSync(path.join(root, `w-${process.pid}-orphan`), { recursive: true });
-    pruneFusionTestWorkers(1024);
+    pruneFusionTestWorkers(1024, { tempRoot: pruneScanRoot });
     assert.equal(existsSync(root), false, "orphaned worker root should be pruned");
     assert.equal(existsSync(foreign), true, "foreign prefixes must not be touched");
   } finally {
@@ -1477,7 +1484,7 @@ function withEnoentPruneSuccess(root, pruneFn) {
   });
 
   try {
-    const warnings = capturePruneWarnings(() => pruneFn(1024, { retries: 3, delayMs: 0 }));
+    const warnings = capturePruneWarnings(() => pruneFn(1024, { retries: 3, delayMs: 0, tempRoot: pruneScanRoot }));
     assert.equal(existsSync(root), false);
     assert.equal(calls, 1);
     assert.deepEqual(warnings, []);
@@ -1944,12 +1951,12 @@ test("applyCacheToPlan: genuinely unchanged dependent still hits cache (fast pat
 });
 
 test("pruneFusionTestHomes: only targets the fusion-test-home-root- prefix", () => {
-  const ours = path.join(tmpdir(), `fusion-test-home-root-prune-prefix-${process.pid}`);
-  const foreign = path.join(tmpdir(), `not-ours-prune-prefix-${process.pid}`);
+  const ours = path.join(pruneScanRoot, `fusion-test-home-root-prune-prefix-${process.pid}`);
+  const foreign = path.join(pruneScanRoot, `not-ours-prune-prefix-${process.pid}`);
   mkdirSync(ours, { recursive: true });
   mkdirSync(foreign, { recursive: true });
   try {
-    pruneFusionTestHomes();
+    pruneFusionTestHomes(undefined, { tempRoot: pruneScanRoot });
     assert.equal(existsSync(ours), false, "our prefixed dir should be pruned");
     assert.equal(existsSync(foreign), true, "foreign dir must be left untouched");
   } finally {
@@ -1959,12 +1966,12 @@ test("pruneFusionTestHomes: only targets the fusion-test-home-root- prefix", () 
 });
 
 test("pruneFusionTestWorkers: only targets the fusion-test-workers- prefix", () => {
-  const ours = path.join(tmpdir(), `fusion-test-workers-prune-prefix-${process.pid}`);
-  const foreign = path.join(tmpdir(), `not-ours-workers-prune-prefix-${process.pid}`);
+  const ours = path.join(pruneScanRoot, `fusion-test-workers-prune-prefix-${process.pid}`);
+  const foreign = path.join(pruneScanRoot, `not-ours-workers-prune-prefix-${process.pid}`);
   mkdirSync(ours, { recursive: true });
   mkdirSync(foreign, { recursive: true });
   try {
-    pruneFusionTestWorkers();
+    pruneFusionTestWorkers(undefined, { tempRoot: pruneScanRoot });
     assert.equal(existsSync(ours), false, "orphaned worker root should be pruned");
     assert.equal(existsSync(foreign), true, "foreign dir must be left untouched");
   } finally {

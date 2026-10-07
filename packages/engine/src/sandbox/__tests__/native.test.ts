@@ -21,7 +21,8 @@ describe("NativeSandboxBackend", () => {
 
   it("returns stdout on success", async () => {
     const backend = new NativeSandboxBackend();
-    const result = await backend.run("node -e 'process.stdout.write(\"ok\")'", {
+    // FNXC:TestInfraWindows 2026-10-07-18:04: the backend runs commands through the platform shell, so scripts use double outer quotes that sh and cmd.exe both parse.
+    const result = await backend.run("node -e \"process.stdout.write('ok')\"", {
       cwd: cwd(),
       timeoutMs: 5_000,
       maxBuffer: 1024 * 1024,
@@ -36,7 +37,7 @@ describe("NativeSandboxBackend", () => {
 
   it("maps timeout failures", async () => {
     const backend = new NativeSandboxBackend();
-    const result = await backend.run("node -e 'setTimeout(() => {}, 1000)'", {
+    const result = await backend.run("node -e \"setTimeout(() => {}, 1000)\"", {
       cwd: cwd(),
       timeoutMs: 50,
       maxBuffer: 1024 * 1024,
@@ -111,7 +112,7 @@ setInterval(() => {}, 1000);
 
   it("maps non-zero exits", async () => {
     const backend = new NativeSandboxBackend();
-    const result = await backend.run("node -e 'process.stderr.write(\"fail\"); process.exit(7)'", {
+    const result = await backend.run("node -e \"process.stderr.write('fail'); process.exit(7)\"", {
       cwd: cwd(),
       timeoutMs: 5_000,
       maxBuffer: 1024 * 1024,
@@ -125,7 +126,7 @@ setInterval(() => {}, 1000);
 
   it("maps maxBuffer failures", async () => {
     const backend = new NativeSandboxBackend();
-    const result = await backend.run("node -e 'process.stdout.write(\"x\".repeat(5000))'", {
+    const result = await backend.run("node -e \"process.stdout.write('x'.repeat(5000))\"", {
       cwd: cwd(),
       timeoutMs: 5_000,
       maxBuffer: 512,

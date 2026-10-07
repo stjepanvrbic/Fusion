@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
+import { gitFixtureSync } from "../../../core/src/__test-utils__/git-fixture";
 import { commitOrAmendMergeWithFixes } from "../merger.js";
 import { DEFAULT_SETTINGS } from "@fusion/core";
 
@@ -70,7 +71,8 @@ describe("commitOrAmendMergeWithFixes ancestor/equivalent-content short-circuit"
     git(dir, "git checkout -b task");
     writeFileSync(join(dir, "foo.txt"), "from task\n");
     git(dir, "git add foo.txt");
-    git(dir, 'git commit -m "feat: task commit\n\nFusion-Task-Id: FN-TEST"');
+    // FNXC:TestInfraWindows 2026-10-07-18:04: multi-line commit messages go through argv; cmd.exe ends a command string at the first LF and drops the trailer.
+    gitFixtureSync(dir, ["commit", "-m", "feat: task commit\n\nFusion-Task-Id: FN-TEST"]);
     const taskTip = git(dir, "git rev-parse HEAD");
 
     git(dir, "git checkout main");
@@ -86,14 +88,14 @@ describe("commitOrAmendMergeWithFixes ancestor/equivalent-content short-circuit"
     git(dir, "git checkout -b task");
     writeFileSync(join(dir, "foo.txt"), "from task\n");
     git(dir, "git add foo.txt");
-    git(dir, 'git commit -m "feat: task commit\n\nFusion-Task-Id: FN-TEST"');
+    gitFixtureSync(dir, ["commit", "-m", "feat: task commit\n\nFusion-Task-Id: FN-TEST"]);
     const taskTip = git(dir, "git rev-parse HEAD");
 
     git(dir, "git checkout main");
     git(dir, `git merge --ff-only ${taskTip}`);
     writeFileSync(join(dir, "other.txt"), "other\n");
     git(dir, "git add other.txt");
-    git(dir, 'git commit -m "feat: other commit\n\nFusion-Task-Id: FN-OTHER"');
+    gitFixtureSync(dir, ["commit", "-m", "feat: other commit\n\nFusion-Task-Id: FN-OTHER"]);
     const preAttemptHeadSha = git(dir, "git rev-parse HEAD");
 
     const result = await runFinalize(dir, "FN-TEST", "task", preAttemptHeadSha);
@@ -105,12 +107,12 @@ describe("commitOrAmendMergeWithFixes ancestor/equivalent-content short-circuit"
     git(dir, "git checkout -b task");
     writeFileSync(join(dir, "foo.txt"), "same-content\n");
     git(dir, "git add foo.txt");
-    git(dir, 'git commit -m "feat: task commit\n\nFusion-Task-Id: FN-3846"');
+    gitFixtureSync(dir, ["commit", "-m", "feat: task commit\n\nFusion-Task-Id: FN-3846"]);
 
     git(dir, "git checkout main");
     writeFileSync(join(dir, "foo.txt"), "same-content\n");
     git(dir, "git add foo.txt");
-    git(dir, 'git commit -m "feat: same content other sha\n\nFusion-Task-Id: FN-OTHER"');
+    gitFixtureSync(dir, ["commit", "-m", "feat: same content other sha\n\nFusion-Task-Id: FN-OTHER"]);
     const preAttemptHeadSha = git(dir, "git rev-parse HEAD");
 
     const result = await runFinalize(dir, "FN-3846", "task", preAttemptHeadSha);
@@ -121,7 +123,7 @@ describe("commitOrAmendMergeWithFixes ancestor/equivalent-content short-circuit"
   it("still refuses real phantom finalize when no current-task branch content exists", async () => {
     writeFileSync(join(dir, "other.txt"), "other\n");
     git(dir, "git add other.txt");
-    git(dir, 'git commit -m "feat: unrelated\n\nFusion-Task-Id: FN-OTHER"');
+    gitFixtureSync(dir, ["commit", "-m", "feat: unrelated\n\nFusion-Task-Id: FN-OTHER"]);
     const preAttemptHeadSha = git(dir, "git rev-parse HEAD");
 
     const result = await runFinalize(dir, "FN-TEST", "task", preAttemptHeadSha);

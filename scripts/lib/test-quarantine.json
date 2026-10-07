@@ -15,6 +15,16 @@
       "file": "packages/engine/src/__tests__/executor-prompt.test.ts",
       "reason": "Second sightings: https://github.com/Runfusion/Fusion/actions/runs/33034719148 (5769d5cd610e8830be24c4ede6eb79b38d2143c1) and https://github.com/Runfusion/Fusion/actions/runs/37339500295 (1a648d35d3987a6722b221e37df3084f75df6f0d); TaskExecutor pause-resume agent-creation count was zero only in shard/multi-file execution.",
       "quarantinedAt": "2026-10-05"
+    },
+    {
+      "file": "packages/dashboard/app/components/__tests__/PlanningModeModal.planning-flow.test.tsx",
+      "reason": "Re-sighted after FN-9116 closed register entry 8: https://github.com/stjepanvrbic/Fusion/actions/runs/37648267708 (1359c449cd, desktop duplicate-response reconciliation, Proceed stayed disabled) after two moving-case lane-runner sightings at c82e420ba0; register entry 22.",
+      "quarantinedAt": "2026-10-07"
+    },
+    {
+      "file": "packages/dashboard/src/__tests__/planning-browser-e2e.test.ts",
+      "reason": "Second sighting: https://github.com/stjepanvrbic/Fusion/actions/runs/37648267708 (1359c449cd, beforeAll Chromium launch exceeded 30s) and https://github.com/stjepanvrbic/Fusion/actions/runs/37652972793 (595b2f5fad, browser closed before first navigation); register entry 23.",
+      "quarantinedAt": "2026-10-07"
     }
   ]
 }

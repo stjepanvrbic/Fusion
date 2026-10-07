@@ -106,6 +106,31 @@ function listProtectedFusionDirs() {
   return [...dirs];
 }
 
+/*
+FNXC:TestIsolation 2026-10-07-18:04:
+A workspace package never owns a `.fusion` directory. Threads-pool lanes keep `process.cwd()` at the package, so a test passing it as a project root writes `packages/<pkg>/.fusion/...` into the checkout; the directory is gitignored and the next run treats the package as a protected repo root.
+One bounded readdir per workspace package parent finds them. A directory that appears during the run fails it; one that predates the baseline only warns, so a later run is not blamed for an earlier leak.
+*/
+const WORKSPACE_PACKAGE_PARENTS = ["packages", "plugins", join("plugins", "examples")];
+
+function listWorkspacePackageFusionDirs(rootDir = process.cwd()) {
+  const found = [];
+  for (const parent of WORKSPACE_PACKAGE_PARENTS) {
+    let entries;
+    try {
+      entries = readdirSync(join(rootDir, parent), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const relative = join(parent, entry.name, ".fusion");
+      if (existsSync(join(rootDir, relative))) found.push(relative);
+    }
+  }
+  return found.sort();
+}
+
 // Paths inside a protected .fusion root that a concurrently-running fusion app
 // is expected to mutate. Tests still must not write to these — the filter only
 // suppresses noise from a live app sharing the same HOME during local dev.
@@ -245,6 +270,7 @@ function recordBaselineFast() {
     tmpNames: snapshotTmp().map((e) => e.name),
     protectedFusion: latestProtected,
     unstableProtectedDirs: [...unstableProtectedDirs],
+    packageFusionDirs: listWorkspacePackageFusionDirs(),
   };
   writeFileSync(BASELINE_FILE, JSON.stringify(payload));
   console.log(`[test-isolation] Baseline recorded (fast): ${payload.tmpNames.length} temp dir(s), ${payload.protectedFusion.length} protected .fusion root(s).`);
@@ -287,6 +313,7 @@ function recordBaseline() {
     tmpNames: snapshotTmp().map((e) => e.name),
     protectedFusion: latestProtected,
     unstableProtectedDirs,
+    packageFusionDirs: listWorkspacePackageFusionDirs(),
   };
   writeFileSync(BASELINE_FILE, JSON.stringify(payload));
   console.log(`[test-isolation] Baseline recorded: ${payload.tmpNames.length} temp dir(s), ${payload.protectedFusion.length} protected .fusion root(s).`);
@@ -405,12 +432,21 @@ function checkAgainstBaseline() {
     }
   }
 
+  const baselinePackageFusionDirs = new Set(baseline.packageFusionDirs ?? []);
+  const currentPackageFusionDirs = listWorkspacePackageFusionDirs();
+  const packageFusionLeaks = currentPackageFusionDirs.filter((dir) => !baselinePackageFusionDirs.has(dir));
+  const stalePackageFusionDirs = currentPackageFusionDirs.filter((dir) => baselinePackageFusionDirs.has(dir));
+  if (stalePackageFusionDirs.length > 0) {
+    console.warn(`[test-isolation] WARN: ${stalePackageFusionDirs.length} workspace package .fusion director${stalePackageFusionDirs.length === 1 ? "y predates" : "ies predate"} this run; delete them, they break later runs:`);
+    for (const dir of stalePackageFusionDirs) console.warn(`  ${dir}`);
+  }
+
   if (skippedUnknownDirs.length > 0) {
     console.warn(`[test-isolation] WARN: ${skippedUnknownDirs.length} protected dir(s) absent from baseline (was \`--before\` run from a different cwd?):`);
     for (const dir of skippedUnknownDirs) console.warn(`  ${dir}`);
   }
 
-  if (leaks.length === 0 && protectedViolations.length === 0) {
+  if (leaks.length === 0 && protectedViolations.length === 0 && packageFusionLeaks.length === 0) {
     console.log("[test-isolation] No temp leaks or live .fusion mutations detected.");
     process.exit(0);
   }
@@ -425,6 +461,12 @@ function checkAgainstBaseline() {
     console.error("[test-isolation] FAIL: protected live .fusion data changed during tests:");
     for (const dir of protectedViolations) console.error(`  ${dir}`);
     console.error("Tests must use temp HOME / temp workspaces and never write repo or user .fusion data.");
+  }
+
+  if (packageFusionLeaks.length > 0) {
+    console.error("[test-isolation] FAIL: workspace package .fusion directories appeared during tests:");
+    for (const dir of packageFusionLeaks) console.error(`  ${dir}`);
+    console.error("Tests must pass a temp project root, never process.cwd(), to code that writes .fusion state.");
   }
 
   process.exit(1);

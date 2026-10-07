@@ -361,7 +361,14 @@ FN-8900 resolves the Kimi K3 quarantine before its 2026-08-15 ratchet deadline. 
 uses pi-ai's real bundled catalog behind a no-refresh registry seam, after live refresh reproduced a
 roughly 300-second stall. Its paired ledger entry is removed in the same commit; no timeout or retry changed.
 */
+/*
+FNXC:DashboardTestQuarantine 2026-10-07-18:04:
+Every project spreads this named list into its own exclude; scripts/check-quarantine-ledger.mjs reads the `quarantinedDashboardTests` declaration to prove ledger and Vitest lockstep.
+PlanningModeModal.planning-flow and planning-browser-e2e are quarantined on second sightings with ledger rows in scripts/lib/test-quarantine.json; delete each file after its 14-day deadline unless a root-cause rescue lands. No timeout, retry, or assertion change is allowed as a rescue.
+*/
 const quarantinedDashboardTests: string[] = [
+  "app/components/__tests__/PlanningModeModal.planning-flow.test.tsx",
+  "src/__tests__/planning-browser-e2e.test.ts",
   /*
   FNXC:DashboardTestQuarantine 2026-07-17-16:50:
   FN-8245 re-admits all three UI files with their ledger rows removed in lockstep.

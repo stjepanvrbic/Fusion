@@ -6,7 +6,7 @@ This guide consolidates the detailed testing guidance moved from `AGENTS.md`.
 
 ## The merge gate
 
-CI blocks PRs on exactly four checks (`.github/workflows/pr-checks.yml`): **Lint, Typecheck, Build, Gate**. The Gate job runs the boot smoke (`scripts/boot-smoke.mjs`: independent CLI `--help` and real `fn init` preflights run concurrently, the latter proving a durable `.fusion/project.json` marker, then a real `fn serve` answers `GET /api/health`, all against one isolated home) and `pnpm test:gate`: 15 static policy validators, 21 curated `engine-core` files, two PostgreSQL canaries, four core unit files, then the CI-shape test.
+CI blocks PRs on exactly four checks (`.github/workflows/pr-checks.yml`): **Lint, Typecheck, Build, Gate**. The Gate job runs the boot smoke (`scripts/boot-smoke.mjs`: independent CLI `--help` and real `fn init` preflights run concurrently, the latter proving a durable `.fusion/project.json` marker, then a real `fn serve` answers `GET /api/health`, all against one isolated home) and `pnpm test:gate`: 16 static policy validators, 21 curated `engine-core` files, two PostgreSQL canaries, four core unit files, then the CI-shape test.
 
 Set `BOOT_SMOKE_TIMINGS=1` when invoking `pnpm smoke:boot` to print per-attempt help, init, health, and SIGTERM phase timings for diagnosis; the flag is off by default so normal gate output stays concise. Everything else — the 4-way shards, the engine slow tier, the dashboard inventory guard — runs NON-BLOCKING in `.github/workflows/full-suite.yml` on push to main.
 
@@ -1017,6 +1017,10 @@ drift** that the content hash cannot see — toolchain/Node upgrades, OS or nati
 dependency changes, and other host-level shifts that can change test outcomes
 without changing any hashed file. Seven days bounds that blind spot while keeping
 the cache useful across a normal work week.
+
+## No live provider credentials in test workers
+
+The shared Vitest setup removes provider credentials from every worker before any test runs: every `*_API_KEY`/`API_KEY_*` variable plus the provider token and cloud-credential names pi-ai resolves. A test that reaches a model session must mock the session seam, for example `reviewStep`, instead of relying on whatever keys the operator's shell exports. A deliberate live-provider run sets `FUSION_TEST_ALLOW_LIVE_PROVIDER_CREDENTIALS=1`. The same setup also drops `DATABASE_URL`.
 
 ## Engine test helper convention
 

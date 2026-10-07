@@ -491,6 +491,42 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     expect(ratchet?.["continue-on-error"]).not.toBe(true);
   });
 
+  /*
+  FNXC:CI 2026-10-07-18:04:
+  Windows is the operator's primary platform, yet every test job ran on ubuntu-latest, so POSIX-only fixtures and separator assumptions landed unseen.
+  Every first-class platform needs at least one CI test signal: a non-blocking windows-latest job runs the merge gate plus the core and engine unit lanes against the image's preinstalled PostgreSQL.
+  */
+  it("gives Windows a non-blocking test signal: gate, core and engine lanes", () => {
+    const windowsJobs = Object.entries(workflow.jobs ?? {}).filter(([, job]: [string, any]) =>
+      String(job?.["runs-on"] ?? "").startsWith("windows"));
+    expect(windowsJobs.map(([name]) => name)).toEqual(["test-windows"]);
+    const job: any = windowsJobs[0]?.[1];
+    const runs: string[] = (job?.steps ?? []).map((step: any) => String(step.run ?? ""));
+    const indexOf = (needle: string) => runs.findIndex((run) => run.includes(needle));
+
+    expect(job?.env?.FUSION_PG_TEST_URL_BASE).toBe("postgresql://postgres:root@localhost:5432");
+    expect(indexOf("Start-Service")).toBeGreaterThanOrEqual(0);
+    expect(indexOf("pnpm config set script-shell")).toBeGreaterThanOrEqual(0);
+    const build = indexOf("pnpm build");
+    expect(build).toBeGreaterThan(indexOf("pnpm config set script-shell"));
+    for (const lane of ["pnpm test:gate", "pnpm --filter @fusion/core test", "pnpm --filter @fusion/engine test"]) {
+      expect(indexOf(lane)).toBeGreaterThan(build);
+      expect(indexOf(lane)).toBeGreaterThan(indexOf("Start-Service"));
+    }
+  });
+
+  /*
+  FNXC:CI 2026-10-07-18:04:
+  The scripts/__tests__ node:test suite pins every gate validator, the release harness and Dockerfile manifests, yet no workflow ran it, so it rotted unseen.
+  Every committed test suite must run in at least one CI lane.
+  */
+  it("runs the scripts node:test suite", () => {
+    const steps = workflow.jobs?.["test-scripts"]?.steps ?? [];
+    expect(workflow.jobs?.["test-scripts"]?.["runs-on"]).toBe("ubuntu-latest");
+    expect(steps.some((step: any) => step.uses === "./.github/actions/setup-node-pnpm")).toBe(true);
+    expect(steps.some((step: any) => step.run === "pnpm test:scripts")).toBe(true);
+  });
+
   it("carries the demoted tier: 4-way shards, engine slow, inventory guard", () => {
     expect(workflow.jobs?.["test-shards"]?.strategy?.matrix?.shard).toEqual([1, 2, 3, 4]);
     expect(content).toContain("pnpm test:ci:shard --shard ${{ matrix.shard }} --total 4");

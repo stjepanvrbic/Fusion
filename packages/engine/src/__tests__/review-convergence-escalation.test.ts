@@ -1,5 +1,21 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { routeReviewConvergenceLadder, type ReviewConvergenceStop } from "../executor/review-convergence-ladder.js";
+
+/*
+FNXC:ReviewConvergence 2026-10-07-18:04:
+The arbitration rung calls reviewStep, which opened a real paid reviewer session whenever provider credentials were present and timed out cases (d) to (g).
+Those cases pin the ladder's release when arbitration produces no ruling, so the reviewer seam deterministically yields none.
+*/
+const reviewStepMock = vi.hoisted(() => vi.fn());
+vi.mock("../execution/reviewer.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../execution/reviewer.js")>()),
+  reviewStep: reviewStepMock,
+}));
+
+beforeEach(() => {
+  reviewStepMock.mockReset();
+  reviewStepMock.mockRejectedValue(new Error("no arbitration reviewer in tests"));
+});
 
 function task(overrides: Record<string, unknown> = {}) {
   return {
@@ -140,6 +156,7 @@ describe("FN-224 frozen review escalation candidate chain", () => {
 
     expect(subject.atomicPatches[0]).toMatchObject({ reviewConvergenceStage: 2, reviewConvergenceEscalationCount: 1 });
     expect(subject.sendTaskBackForFix).not.toHaveBeenCalled();
+    expect(reviewStepMock).toHaveBeenCalledOnce();
   });
 
   it("(g) rejects a candidate equal to the effective execution model when the task has no persisted pair", async () => {

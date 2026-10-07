@@ -1,13 +1,14 @@
 import { exec, execSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { prepareWorkspaceRevertPrBranches } from "../execution/task-revert.js";
-import type { Task } from "@fusion/core";
+import { bindPosixShell, type Task } from "@fusion/core";
 
-const realExecAsync = promisify(exec);
+// FNXC:TestInfraWindows 2026-10-07-18:04: the interposed exec must keep production's POSIX-shell binding, or Windows runs the product's quoted commands under cmd.exe.
+const realExecAsync = bindPosixShell(promisify(exec));
 
 const hasGit = spawnSync("git", ["--version"], { stdio: "pipe" }).status === 0;
 const describeIfGit = hasGit ? describe : describe.skip;
@@ -52,7 +53,8 @@ describeIfGit("prepareWorkspaceRevertPrBranches real-git scenarios", { timeout: 
 
   function subRepoFixture(workspaceRoot: string, repoRel: string, initialFile: string, initialContent: string): string {
     const repoRootDir = join(workspaceRoot, repoRel);
-    git(workspaceRoot, `mkdir -p ${repoRel}`);
+    // FNXC:TestInfraWindows 2026-10-07-18:04: create the directory in-process; cmd.exe `mkdir` rejects POSIX `-p`.
+    mkdirSync(repoRootDir, { recursive: true });
     git(repoRootDir, "git init -b main");
     git(repoRootDir, 'git config user.email "test@example.com"');
     git(repoRootDir, 'git config user.name "Test User"');
