@@ -54,7 +54,7 @@ import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
 import {getActivityLog as getActivityLogAsync} from "../task-store/async/async-audit.js";
 import {insertArtifactRow as insertArtifactRowAsync} from "../task-store/async/async-comments-attachments.js";
 import {appendConfigurationRevision, createConfigurationRevision, getConfigurationRevision, rollbackConfiguration} from "../async-stores/async-configuration-revision-store.js";
-import {readProjectConfig, readProjectConfigForUpdate, writeProjectConfig} from "./async/async-settings.js";
+import {readProjectConfigForUpdate, writeProjectConfig} from "./async/async-settings.js";
 import {publishSettingsUpdated} from "./settings-ops.js";
 import {loadWorkspaceConfig} from "../git/git-repository.js";
 import { mergeRestoredProjectSettings } from "../config/settings-schema.js";
