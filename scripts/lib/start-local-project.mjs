@@ -1,5 +1,5 @@
 import { existsSync, statSync } from "node:fs";
-import { basename, extname, join, resolve } from "node:path";
+import path, { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 /*
@@ -8,6 +8,9 @@ FNXC:ProcessLifecycle 2026-10-07-18:00:
 `spawnSync("pnpm.cmd")` without a shell fails with EINVAL, and adding `shell: true` to an argument array lets cmd.exe re-parse the arguments.
 Prefer pnpm's own entry (`npm_execpath`) run through `process.execPath`; otherwise resolve pnpm through PATH and PATHEXT and launch a `.cmd` shim through `cmd.exe /d /s /c` with escaped arguments.
 The cmd.exe fallback is the opt-in path for fixed, trusted argument lists only: start-local passes internal arguments (install flags, a sanitized project name, a temp-file path) and never user, agent or plugin text. Everything in core launches shell-free through resolveShellFreeLaunch instead; this plain script cannot import it.
+
+FNXC:ProcessLifecycle 2026-10-07-23:12:
+Paths are joined and split with the target platform's path rules, not the host's: a Windows PATH entry joined by posix `join` produced `C:\...\npm/pnpm.cmd`, so the injected-platform tests (and any Windows decision computed on Linux) silently fell back to a bare `pnpm`.
 */
 const CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
 
@@ -30,7 +33,7 @@ function resolveOnWindowsPath(command, env, isFile) {
   const extensions = (envValue(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").map((ext) => ext.trim().toLowerCase()).filter(Boolean);
   for (const dir of (envValue(env, "PATH") ?? "").split(";").map((entry) => entry.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean)) {
     for (const ext of extensions) {
-      const candidate = join(dir, `${command}${ext}`);
+      const candidate = path.win32.join(dir, `${command}${ext}`);
       if (isFile(candidate)) return candidate;
     }
   }
@@ -41,15 +44,16 @@ function resolveOnWindowsPath(command, env, isFile) {
  * Decide how to launch pnpm without a shell: `{ kind: "node" | "native" | "cmd-shim", command, prefixArgs }`.
  */
 export function resolvePnpmLauncher({ platform = process.platform, env = process.env, execPath = process.execPath, isFile = defaultIsFile } = {}) {
+  const paths = platform === "win32" ? path.win32 : path.posix;
   const execpath = env.npm_execpath;
-  if (execpath && /pnpm/i.test(basename(execpath)) && isFile(execpath)) {
+  if (execpath && /pnpm/i.test(paths.basename(execpath)) && isFile(execpath)) {
     if (/\.[cm]?js$/i.test(execpath)) return { kind: "node", command: execPath, prefixArgs: [execpath] };
     return { kind: "native", command: execpath, prefixArgs: [] };
   }
   if (platform !== "win32") return { kind: "native", command: "pnpm", prefixArgs: [] };
   const resolved = resolveOnWindowsPath("pnpm", env, isFile);
   if (!resolved) return { kind: "native", command: "pnpm", prefixArgs: [] };
-  const ext = extname(resolved).toLowerCase();
+  const ext = path.win32.extname(resolved).toLowerCase();
   if (ext === ".cmd" || ext === ".bat") return { kind: "cmd-shim", command: resolved, prefixArgs: [] };
   return { kind: "native", command: resolved, prefixArgs: [] };
 }
