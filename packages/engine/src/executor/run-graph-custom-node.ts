@@ -633,6 +633,24 @@ export async function runGraphCustomNode(
         );
         executionTarget = await deps.ensureGraphCustomNodeWorktree(executionTarget, settings, node.id);
       }
+      /*
+      FNXC:PostMergeRecovery 2026-10-07-19:40:
+      A landed workspace task carries one landed SHA per repository. Every configured repository checkout must contain
+      its own landed SHA before a post-merge reviewer starts, on every attempt, or the gate fails closed.
+      */
+      if (isLandedPostMergeNode) {
+        for (const [repository, landedSha] of Object.entries(executionTarget.mergeDetails?.workspaceLandedShas ?? {})) {
+          const path = executionTarget.workspaceWorktrees?.[repository]?.worktreePath;
+          if (typeof path === "string" && await checkoutContainsCommit(path, landedSha)) continue;
+          await deps.store.logEntry(
+            live.id,
+            `Workflow node '${node.id}' workspace checkout '${repository}' does not contain landed commit ${landedSha}; the gate will be rechecked later`,
+            path,
+            deps.getRunContextFor(live.id),
+          );
+          return { outcome: "failure", value: "post-merge-checkout-missing-landed-commit" };
+        }
+      }
     } else if (!workspaceConfig && isLandedPostMergeNode) {
       /*
       FNXC:PostMergeRecovery 2026-10-07-05:58:
@@ -657,16 +675,24 @@ export async function runGraphCustomNode(
         if (!executionTarget?.worktree) {
           return { outcome: "failure", value: "post-merge-checkout-unavailable" };
         }
-        const landedCommit = executionTarget.mergeDetails?.commitSha;
-        if (landedCommit && !await checkoutContainsCommit(executionTarget.worktree, landedCommit)) {
-          await deps.store.logEntry(
-            live.id,
-            `Workflow node '${node.id}' re-acquired ${executionTarget.worktree}, but it does not contain landed commit ${landedCommit}; the gate will be rechecked later`,
-            undefined,
-            deps.getRunContextFor(live.id),
-          );
-          return { outcome: "failure", value: "post-merge-checkout-missing-landed-commit" };
-        }
+      }
+      /*
+      FNXC:PostMergeRecovery 2026-10-07-19:40:
+      Landed-commit containment is an admission invariant for EVERY landed post-merge execution, including a reused
+      healthy checkout and a retry after an earlier attempt persisted a rejected checkout. It used to run only right after
+      re-acquisition, so the second attempt saw a healthy pointer and verified a tree without the landing.
+      A healthy recorded checkout without the landed commit (a retained or preserved task checkout after a squash) is
+      refused, never silently replaced, because preservation keeps it for its uncommitted content.
+      */
+      const landedCommit = executionTarget.mergeDetails?.commitSha;
+      if (landedCommit && executionTarget.worktree && !await checkoutContainsCommit(executionTarget.worktree, landedCommit)) {
+        await deps.store.logEntry(
+          live.id,
+          `Workflow node '${node.id}' checkout ${executionTarget.worktree} does not contain landed commit ${landedCommit}; the gate will be rechecked later`,
+          undefined,
+          deps.getRunContextFor(live.id),
+        );
+        return { outcome: "failure", value: "post-merge-checkout-missing-landed-commit" };
       }
     } else if (!workspaceConfig) {
       const recordedWorktreeMissing = Boolean(executionTarget.worktree) && !existsSync(executionTarget.worktree!);

@@ -9,7 +9,7 @@ is stubbed), and proves the gate produces a verdict and the card finalizes witho
 All filesystem operations are portable so the simulated states run on Windows and POSIX.
 */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -238,11 +238,15 @@ describe("post-merge gate after a half-deleted task worktree (KB-003, real git)"
     expect(sessions).toHaveLength(1);
     expect(fixture.task.worktree).toBeTruthy();
     expect(await classifyTaskWorktree(root, fixture.task.worktree as string)).toEqual({ ok: true });
+    /*
+    FNXC:PostMergeRecovery 2026-10-07-19:40:
+    A landed task's fresh checkout is a separate detached checkout, so the broken residue at the old recorded path is
+    left in place untouched for the operator instead of being renamed into recovery by branch acquisition.
+    */
+    expect(fixture.task.worktree).not.toBe(worktree);
+    expect(git(fixture.task.worktree as string, ["branch", "--show-current"])).toBe("");
     if (state !== "absent") {
-      const recoveryRoot = join(root, ".fusion", "recovery", "worktrees");
-      expect(existsSync(recoveryRoot)).toBe(true);
-      expect(readdirSync(recoveryRoot).some((name) => name.startsWith("fn-x-"))).toBe(true);
-      expect(existsSync(join(worktree, ".git"))).toBe(true);
+      expect(existsSync(join(worktree, "feature.txt"))).toBe(true);
     }
     expect(fixture.logs.some((line) => line.includes("acquiring a fresh checkout at the integration branch"))).toBe(true);
   });
@@ -274,6 +278,85 @@ describe("post-merge gate after a half-deleted task worktree (KB-003, real git)"
 
     expect(result).toEqual({ outcome: "failure", value: "post-merge-checkout-missing-landed-commit" });
     expect(onSession).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:PostMergeRecovery 2026-10-07-19:40:
+  Landed-commit containment is an admission invariant for every landed post-merge execution, not a one-time check
+  after re-acquisition: a rejected checkout persisted by the first attempt must not admit the reviewer on a retry,
+  and neither may a healthy recorded checkout that lacks the landed commit.
+  */
+  it("keeps refusing a checkout without the landed commit on retry and after rebuilding the executor", async () => {
+    const { root, worktree } = landedTask("incomplete");
+    git(root, ["checkout", "-q", "-b", "side"]);
+    writeFileSync(join(root, "side.txt"), "side\n");
+    git(root, ["add", "side.txt"]);
+    git(root, ["commit", "-q", "-m", "side"]);
+    const foreignSha = git(root, ["rev-parse", "HEAD"]);
+    git(root, ["checkout", "-q", "main"]);
+    const fixture = createStore(landedTaskRecord(worktree, foreignSha));
+    const onSession = vi.fn(async () => undefined);
+    const getLive = () => (fixture.store as unknown as { getTask: () => Promise<TaskDetail> }).getTask();
+
+    for (const deps of [buildDeps(root, fixture.store, onSession), buildDeps(root, fixture.store, onSession), buildDeps(root, fixture.store, onSession)]) {
+      const result = await runGraphCustomNode(deps, POST_MERGE_NODE as never, await getLive(), {} as Settings, undefined, POST_MERGE_CONTEXT);
+      expect(result).toEqual({ outcome: "failure", value: "post-merge-checkout-missing-landed-commit" });
+    }
+    expect(onSession).not.toHaveBeenCalled();
+  });
+
+  it("refuses a healthy recorded checkout that does not contain the squash-landed commit", async () => {
+    const { root, worktree } = landedTask("healthy");
+    // Main receives a squash commit the retained task checkout never sees.
+    writeFileSync(join(root, "squashed.txt"), "squashed\n");
+    git(root, ["add", "squashed.txt"]);
+    git(root, ["commit", "-q", "-m", "feat(FN-X): squash"]);
+    const squashSha = git(root, ["rev-parse", "HEAD"]);
+    const fixture = createStore(landedTaskRecord(worktree, squashSha));
+    const onSession = vi.fn(async () => undefined);
+    const live = await (fixture.store as unknown as { getTask: () => Promise<TaskDetail> }).getTask();
+
+    const result = await runGraphCustomNode(buildDeps(root, fixture.store, onSession), POST_MERGE_NODE as never, live, {} as Settings, undefined, POST_MERGE_CONTEXT);
+
+    expect(result).toEqual({ outcome: "failure", value: "post-merge-checkout-missing-landed-commit" });
+    expect(onSession).not.toHaveBeenCalled();
+    expect(fixture.task.worktree).toBe(worktree);
+  });
+
+  it("verifies on a checkout containing the squash commit even when the pre-squash task branch survives", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fusion-kb003-squash-")));
+    tracked.push(root);
+    git(root, ["init", "-q", "-b", "main"]);
+    writeFileSync(join(root, "base.txt"), "base\n");
+    writeFileSync(join(root, ".gitignore"), "node_modules/\n.fusion/\n");
+    git(root, ["add", "-A"]);
+    git(root, ["commit", "-q", "-m", "base"]);
+    git(root, ["branch", "fusion/fn-x"]);
+    git(root, ["checkout", "-q", "fusion/fn-x"]);
+    for (const name of ["one", "two"]) {
+      writeFileSync(join(root, `${name}.txt`), `${name}\n`);
+      git(root, ["add", `${name}.txt`]);
+      git(root, ["commit", "-q", "-m", `feat: ${name}`, "-m", "Fusion-Task-Id: FN-X"]);
+    }
+    git(root, ["checkout", "-q", "main"]);
+    git(root, ["merge", "-q", "--squash", "fusion/fn-x"]);
+    git(root, ["commit", "-q", "-m", "feat(FN-X): squash", "-m", "Fusion-Task-Id: FN-X"]);
+    const squashSha = git(root, ["rev-parse", "HEAD"]);
+    const fixture = createStore(landedTaskRecord(undefined, squashSha));
+    const sessions: string[] = [];
+    const deps = buildDeps(root, fixture.store, async (cwd) => {
+      await assertValidWorktreeSession(cwd, root);
+      expect(isAncestor(cwd, squashSha)).toBe(true);
+      sessions.push(cwd);
+    });
+    const live = await (fixture.store as unknown as { getTask: () => Promise<TaskDetail> }).getTask();
+
+    const result = await runGraphCustomNode(deps, POST_MERGE_NODE as never, live, {} as Settings, undefined, POST_MERGE_CONTEXT);
+
+    expect(result).toMatchObject({ outcome: "success", value: "APPROVE" });
+    expect(sessions).toHaveLength(1);
+    expect(isAncestor(fixture.task.worktree as string, squashSha)).toBe(true);
+    expect(git(root, ["rev-parse", "fusion/fn-x"])).not.toBe(squashSha);
   });
 
   it("finalizes the card to done once the approved post-merge result is recorded, without manual git repair", async () => {

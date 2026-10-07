@@ -8,14 +8,23 @@
  * FNXC:EngineDiagnostics 2026-08-03-05:54:
  * Per-node worktree acquisition is expected graph plumbing once the task has a worktree.
  */
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { promisify } from "node:util";
 import type { Settings, Task, TaskDetail, TaskStore } from "@fusion/core";
 import { type RunCommandResult, type WorkspaceConfig } from "@fusion/core";
 import { executorLog } from "../logger.js";
+import { resolveIntegrationBranch } from "../merge/integration-branch.js";
+import { resolveTaskWorktreePath } from "../worktree/worktree-paths.js";
+import { ensureWorktreeDependencies } from "../worktree/worktree-dependency-install.js";
 import { generateSyntheticRunId, createRunAuditor, type EngineRunContext, type RunAuditor } from "../util/run-audit.js";
 import { acquireTaskWorktree, acquireWorkspaceTaskWorktrees } from "../worktree/worktree-acquisition.js";
 import { captureBaseCommitSha } from "./worktree-git-refs.js";
 import { createConfiguredCommandAbortError } from "./task-predicates.js";
 import { resolveWorkspaceConfigOnce } from "./workspace-config-resolver.js";
+
+const execFileAsync = promisify(execFile);
 
 export type EnsureGraphCustomNodeWorktreeDeps = {
   store: TaskStore;
@@ -45,6 +54,62 @@ export type EnsureGraphCustomNodeWorktreeDeps = {
   registerConfiguredCommandController: (taskId: string, controller: AbortController) => void;
   unregisterConfiguredCommandController: (taskId: string, controller: AbortController) => void;
 };
+
+/**
+ * FNXC:PostMergeRecovery 2026-10-07-19:40:
+ * After landing, a fresh single-repository checkout must be a tree that contains the landed commit.
+ * Normal acquisition derives the task branch, and a pre-squash task branch that survived landing either gets attached
+ * at its old tip (which never contains a squash commit) or refused as "stranded", so every post-merge recheck failed
+ * the same way forever. A landed task therefore gets a detached checkout of the tip of the branch it landed on, at the
+ * Fusion-owned `<task>-landed` path, independent of the task branch, which is never created, moved, or attached.
+ * The caller's containment admission check still decides: a record whose commit never reached that branch fails closed.
+ * Residue at the old recorded path is left in place untouched; residue at the `-landed` path is Fusion's own read-only
+ * gate checkout and is replaced. Dependency readiness is best effort, as in fresh acquisition.
+ */
+async function acquireLandedCommitCheckout(
+  deps: EnsureGraphCustomNodeWorktreeDeps,
+  task: TaskDetail,
+  settings: Settings,
+  nodeId: string,
+  landedSha: string,
+  audit: RunAuditor,
+): Promise<TaskDetail> {
+  const git = async (args: string[]) => (await execFileAsync("git", args, { cwd: deps.rootDir, timeout: 120_000, windowsHide: true })).stdout.trim();
+  const landedBranch = task.mergeDetails?.mergeTargetBranch || await resolveIntegrationBranch(deps.rootDir, settings);
+  const tipSha = await git(["rev-parse", "--verify", `refs/heads/${landedBranch}^{commit}`]);
+  const worktreePath = resolveTaskWorktreePath(deps.rootDir, settings, `${task.id.toLowerCase()}-landed`);
+  await deps.store.logEntry(
+    task.id,
+    `Workflow node '${nodeId}' acquiring a detached checkout of ${landedBranch} at ${tipSha.slice(0, 12)} for landed commit ${landedSha.slice(0, 12)}`,
+    worktreePath,
+    deps.getRunContextFor(task.id),
+  );
+  if (existsSync(worktreePath)) {
+    await git(["worktree", "remove", "--force", worktreePath]).catch(() => undefined);
+    await rm(worktreePath, { recursive: true, force: true });
+  }
+  await git(["worktree", "prune"]);
+  await git(["worktree", "add", "--detach", worktreePath, tipSha]);
+  await deps.store.updateTask(task.id, { worktree: worktreePath });
+  deps.addActiveWorktree(task.id, worktreePath);
+  try {
+    await ensureWorktreeDependencies({
+      worktreePath,
+      settings,
+      taskId: task.id,
+      store: deps.store,
+      runContext: deps.getRunContextFor(task.id),
+      runConfiguredCommand: (command, cwd, timeoutMs, env) => deps.runConfiguredCommand(command, cwd, timeoutMs, env, audit),
+      taskEnv: process.env,
+      logger: executorLog,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    await deps.store.logEntry(task.id, "Worktree dependency readiness could not be determined", error instanceof Error ? error.message : String(error), deps.getRunContextFor(task.id));
+  }
+  deps.onStart?.(task, worktreePath);
+  return await deps.store.getTask(task.id);
+}
 
 export async function ensureGraphCustomNodeWorktree(
   deps: EnsureGraphCustomNodeWorktreeDeps,
@@ -109,6 +174,11 @@ export async function ensureGraphCustomNodeWorktree(
       deps.onStart?.(workspace.task, workspace.taskWorktreeDir);
       executorLog.debug(`${task.id}: workflow node '${nodeId}' using workspace task directory ${workspace.taskWorktreeDir}`);
       return { ...task, ...workspace.task } as TaskDetail;
+    }
+
+    const landedSha = task.mergeDetails?.mergeConfirmed === true ? task.mergeDetails.commitSha : undefined;
+    if (!task.worktree && landedSha && /^[a-f0-9]{40,64}$/i.test(landedSha)) {
+      return await acquireLandedCommitCheckout(deps, task, settings, nodeId, landedSha, audit);
     }
 
     await deps.store.logEntry(
