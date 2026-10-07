@@ -1264,7 +1264,12 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
     const pluginLoader = await getProjectPluginLoader(scopedStore, engine);
     const id = req.params.id as string;
 
-    // Stop the plugin if loader is available
+    /*
+    FNXC:PluginLoader 2026-10-07-18:01:
+    Persist the disable before stopping. The loader stops a disabled plugin process-wide, so the instance goes away even when another loader (host vs engine) owns it.
+    */
+    const plugin = await pluginStore.disablePlugin(id);
+
     if (pluginLoader) {
       try {
         await pluginLoader.stopPlugin(id);
@@ -1273,7 +1278,6 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
       }
     }
 
-    const plugin = await pluginStore.disablePlugin(id);
     res.json(plugin);
   });
 
@@ -1288,22 +1292,25 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
     const pluginLoader = await getProjectPluginLoader(scopedStore, engine);
     const id = req.params.id as string;
 
-    let plugin: import("@fusion/core").PluginInstallation;
     try {
-      plugin = await pluginStore.getPlugin(id);
+      await pluginStore.getPlugin(id);
     } catch (err: unknown) {
-      if (err instanceof Error && (err instanceof Error ? err.message : String(err)).includes("not found")) {
+      if (err instanceof Error && err.message.includes("not found")) {
         throw notFound(`Plugin "${id}" not found`);
       }
       throw internalError(err instanceof Error ? err.message : "Unknown error");
     }
 
-    if (plugin.state !== "started") {
-      throw badRequest("Plugin is not currently loaded. Use enable instead.");
-    }
-
     if (!pluginLoader) {
       throw internalError("Plugin loader not available");
+    }
+
+    /*
+    FNXC:PluginLoader 2026-10-07-18:01:
+    Reload acts on what the loader holds, not on the persisted state. A loaded plugin whose row says "error" (an old hook failure) must be reloadable; telling the operator to "enable" it did nothing.
+    */
+    if (!pluginLoader.isPluginLoaded(id)) {
+      throw badRequest("Plugin is not currently loaded. Use enable instead.");
     }
 
     try {
@@ -1364,8 +1371,12 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
       throw internalError("Plugin loader not available");
     }
 
+    /*
+    FNXC:PluginSecurityScan 2026-10-07-18:01:
+    Rescan reloads a plugin the loader holds and loads an enabled one it does not; both run the loader's pre-import scan gate. Branch on the loader map, not persisted state, so an errored-but-loaded plugin is rescanned rather than skipped.
+    */
     try {
-      if (plugin.state === "started") {
+      if (pluginLoader.isPluginLoaded(id)) {
         await pluginLoader.reloadPlugin(id);
       } else if (plugin.enabled) {
         await pluginLoader.loadPlugin(id);
@@ -1551,20 +1562,25 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
    * Query: { projectId?: string }
    */
   router.delete("/plugins/:id", async (req: Request, res: Response) => {
-    const { store: scopedStore } = await getProjectContext(req);
+    const { store: scopedStore, engine } = await getProjectContext(req);
     const pluginStore = scopedStore.getPluginStore();
+    const pluginLoader = await getProjectPluginLoader(scopedStore, engine);
     const id = req.params.id as string;
 
-    // Stop the plugin if loader is available
-    if (options?.pluginLoader) {
+    /*
+    FNXC:PluginLoader 2026-10-07-18:01:
+    After uninstall returns, no loader in the process may hold the plugin. Stop through the project's loader (the engine's when one runs), not the host loader, and stop after the record is deleted: the loader then resolves the instance from memory and unloads it in every loader sharing the lifecycle.
+    */
+    await pluginStore.unregisterPlugin(id);
+
+    if (pluginLoader) {
       try {
-        await options.pluginLoader.stopPlugin(id);
+        await pluginLoader.stopPlugin(id);
       } catch {
         // Ignore - plugin might not be loaded
       }
     }
 
-    await pluginStore.unregisterPlugin(id);
     res.status(204).send();
   });
 
