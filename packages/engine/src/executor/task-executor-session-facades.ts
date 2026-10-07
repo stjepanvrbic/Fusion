@@ -149,7 +149,7 @@ export abstract class TaskExecutorSessionFacades extends TaskExecutorWorktreePur
   protected async listWipLaneTasks(): ReturnType<typeof impl.listWipLaneTasksImpl> { return impl.listWipLaneTasksImpl(this.store); }
   async resumeTaskForAgent(agentId: string): Promise<void> { return impl.resumeTaskForAgentImpl(bags.buildResumeTaskForAgentDeps(this), agentId); }
   protected async taskEffectiveAgentMatches(task: import("@fusion/core").Task, agentId: string): ReturnType<typeof impl.taskEffectiveAgentMatchesImpl> { return impl.taskEffectiveAgentMatchesImpl(this.store, task, agentId); }
-  async resumeOrphaned(): Promise<void> { return impl.resumeOrphanedImpl(bags.buildResumeOrphanedDeps(this)); }
+  async resumeOrphaned(options?: Parameters<typeof impl.resumeOrphanedImpl>[1]): Promise<void> { return impl.resumeOrphanedImpl(bags.buildResumeOrphanedDeps(this), options); }
   protected async resolveInstructionsForRole(role: string, settings?: import("@fusion/core").Settings): ReturnType<typeof impl.resolveInstructionsForRoleImpl> { return impl.resolveInstructionsForRoleImpl(bags.buildResolveInstructionsForRoleDeps(this), role, settings); }
   markStuckAborted(...args: FacadeRestArgs<typeof impl.markStuckAbortedImpl>): ReturnType<typeof impl.markStuckAbortedImpl> { return impl.markStuckAbortedImpl(bags.buildMarkStuckAbortedDeps(this), ...args); }
   async handleLoopDetected(...args: FacadeRestArgs<typeof impl.handleLoopDetectedImpl>): ReturnType<typeof impl.handleLoopDetectedImpl> { return impl.handleLoopDetectedImpl(bags.buildHandleLoopDetectedDeps(this), ...args); }

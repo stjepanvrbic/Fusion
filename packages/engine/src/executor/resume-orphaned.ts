@@ -43,7 +43,16 @@ export type ResumeOrphanedDeps = {
   now?: () => number;
 };
 
-export async function resumeOrphaned(deps: ResumeOrphanedDeps): Promise<void> {
+/**
+ * FNXC:RecoveryOwnership 2026-10-07-18:04:
+ * `bootSnapshot` (task id -> columnMovedAt at boot) limits restart recovery to cards that were
+ * orphaned by the restart. Startup sweeps now run before orphan resumption, so a card moved into
+ * WIP after boot (by dispatch or an operator) already has an owner and must not be resumed again.
+ */
+export async function resumeOrphaned(
+  deps: ResumeOrphanedDeps,
+  options: { bootSnapshot?: ReadonlyMap<string, string | null> } = {},
+): Promise<void> {
   const settings = await deps.store.getSettings();
   if (settings.globalPause || settings.enginePaused) {
     executorLog.log(
@@ -56,8 +65,10 @@ export async function resumeOrphaned(deps: ResumeOrphanedDeps): Promise<void> {
 
   const wipColumns = await resolveProjectColumnsForRoles(deps.store, ["countsTowardWip"]);
   const tasks = await deps.listWipLaneTasks();
+  const bootSnapshot = options.bootSnapshot;
   const inProgress = tasks.filter(
-    (t) => wipColumns.has(t.column) && !t.deletedAt && !deps.executing.has(t.id) && !t.paused,
+    (t) => wipColumns.has(t.column) && !t.deletedAt && !deps.executing.has(t.id) && !t.paused
+      && (!bootSnapshot || (bootSnapshot.has(t.id) && bootSnapshot.get(t.id) === (t.columnMovedAt ?? null))),
   );
 
   if (inProgress.length === 0) return;
