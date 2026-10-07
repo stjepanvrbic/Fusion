@@ -213,3 +213,35 @@ test("--json output includes lockstep violations", () => {
     assert.deepEqual(JSON.parse(stdout.text).lockstep, []);
   } finally { rmSync(rootDir, { recursive: true, force: true }); }
 });
+
+/*
+FNXC:QuarantineLockstep 2026-10-07-19:10:
+Any package's named static quarantine list (the dashboard spreads `quarantinedDashboardTests` into every project) must be held in lockstep with the ledger in both directions.
+*/
+const DASHBOARD_CONFIG = (list) => `const quarantinedDashboardTests: string[] = [${list}]; export default { test: { projects: [{ test: { exclude: quarantinedDashboardTests } }, { test: { exclude: quarantinedDashboardTests } }] } };`;
+
+test("dashboard static quarantine list stays in lockstep with its ledger row", () => {
+  const rootDir = tempRoot();
+  try {
+    const file = "packages/dashboard/app/components/__tests__/flaky.test.tsx";
+    writeFile(rootDir, file);
+    writeConfig(rootDir, "dashboard", DASHBOARD_CONFIG('"app/components/__tests__/flaky.test.tsx"'));
+    const ledgerPath = writeLedger(rootDir, { entries: [healthyEntry(file)] });
+    assert.deepEqual(findLockstepViolations({ rootDir, ledger: readLedger(ledgerPath) }), []);
+  } finally { rmSync(rootDir, { recursive: true, force: true }); }
+});
+
+test("dashboard ledger row missing from its static list is missing-exclude, and an unledgered list entry is orphan-exclude", () => {
+  const rootDir = tempRoot();
+  try {
+    const file = "packages/dashboard/app/components/__tests__/flaky.test.tsx";
+    writeFile(rootDir, file);
+    writeConfig(rootDir, "dashboard", DASHBOARD_CONFIG(""));
+    let ledgerPath = writeLedger(rootDir, { entries: [healthyEntry(file)] });
+    assert.deepEqual(findLockstepViolations({ rootDir, ledger: readLedger(ledgerPath) }).map((row) => row.kind), ["missing-exclude"]);
+
+    writeConfig(rootDir, "dashboard", DASHBOARD_CONFIG('"app/components/__tests__/flaky.test.tsx"'));
+    ledgerPath = writeLedger(rootDir, { entries: [] });
+    assert.deepEqual(findLockstepViolations({ rootDir, ledger: readLedger(ledgerPath) }).map((row) => row.kind), ["orphan-exclude"]);
+  } finally { rmSync(rootDir, { recursive: true, force: true }); }
+});
