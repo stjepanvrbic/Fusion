@@ -1,8 +1,9 @@
 name: Full Suite (non-blocking)
 
 # The demoted test tier (docs/plans/2026-06-04-001-refactor-fast-trusted-test-gate-plan.md).
-# Runs the full sharded suite, the engine slow tier, and the dashboard
-# inventory guard on every push to main — post-merge signal only. These jobs
+# Runs the full sharded suite, the engine slow tier, the dashboard inventory
+# guard, the scripts node:test suite, and the Windows gate/core/engine lanes
+# on every push to main — post-merge signal only. These jobs
 # are NON-BLOCKING by design: they never run on PRs and must never be added
 # to branch-protection required checks. A red run here is information, not a
 # merge stopper; see docs/testing.md for the quarantine ratchet that keeps
@@ -298,6 +299,83 @@ jobs:
 
       - name: Run engine-slow with non-empty-execution assertion
         run: node scripts/assert-engine-slow-nonempty.mjs
+
+  # FNXC:CI 2026-10-07-18:04:
+  # The scripts/__tests__ node:test suite pins the gate validators, release harness and
+  # Dockerfile manifests, but no workflow ran it and it rotted unseen. Every committed
+  # test suite must run in at least one CI lane; promote this into the Lint job once green.
+  test-scripts:
+    name: Scripts node:test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Run scripts node:test suite
+        run: pnpm test:scripts
+
+  # FNXC:CI 2026-10-07-18:04:
+  # Windows is the operator's primary platform, yet every other test job runs on
+  # ubuntu-latest, so POSIX-only fixtures and path-separator assumptions land unseen.
+  # This non-blocking job gives Windows a test signal: the merge gate plus the core and
+  # engine unit lanes. Windows runners have no service containers, so it starts the image's
+  # preinstalled PostgreSQL service (user postgres, password root). Package scripts use
+  # POSIX syntax, so pnpm routes them through Git Bash as on the operator's machine.
+  # Promote to blocking once green.
+  test-windows:
+    name: Windows tests
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:root@localhost:5432"
+      PGPASSWORD: "root"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Start preinstalled PostgreSQL
+        shell: pwsh
+        run: |
+          $service = Get-Service -Name "postgresql*" | Select-Object -First 1
+          Set-Service -InputObject $service -StartupType Manual
+          Start-Service -InputObject $service
+          & "$env:PGBIN\pg_isready.exe" -h localhost -p 5432 -U postgres -t 60
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Route package scripts through Git Bash
+        shell: bash
+        run: pnpm config set script-shell "C:\\Program Files\\Git\\bin\\bash.exe"
+
+      - name: Build workspace artifacts
+        shell: bash
+        env:
+          FUSION_CLI_FULL_PACKAGE: "0"
+        run: pnpm build
+
+      - name: Merge gate suite
+        shell: bash
+        run: pnpm test:gate
+
+      - name: Core unit lane
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: pnpm --filter @fusion/core test
+
+      - name: Engine unit lane
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: pnpm --filter @fusion/engine test
 
   # FNXC:PipelineSmoke 2026-08-23-14:52:
   # FN-182 runs the deterministic full-pipeline composition only after merge.
