@@ -146,7 +146,8 @@ export function resolveLegacyStatusAdoption(
   return (
     LEGACY_STATUS_ADOPTION[status] ?? {
       kind: "park-paused",
-      note: `unmappable legacy status '${status}'`,
+      // FNXC:LegacyAdoption 2026-10-07-20:48: the note feeds run-audit metadata, so it is a fixed outcome; the unknown status stays visible on the parked row's status and pausedReason.
+      note: "unmappable legacy status",
     }
   );
 }

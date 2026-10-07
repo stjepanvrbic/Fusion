@@ -66,7 +66,7 @@ const RUN_AUDIT_ERROR_KEYS: ReadonlySet<string> = new Set(["error", "errorMessag
 const RUN_AUDIT_FIXED_TOKEN_KEYS: ReadonlySet<string> = new Set(["reason"]);
 const RUN_AUDIT_FIXED_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/;
 /** Words, ids and durations only: quotes, colons, slashes, `@` and `=` mark embedded error text, paths, URLs or credentials. */
-const RUN_AUDIT_FIXED_VOCABULARY = /^[A-Za-z0-9][A-Za-z0-9 _.,()-]{0,119}$/;
+const RUN_AUDIT_FIXED_VOCABULARY = /^[A-Za-z0-9][A-Za-z0-9 _.,()+&—-]{0,119}$/;
 const RUN_AUDIT_MAX_DEPTH = 8;
 const ERRNO_CANDIDATE = /\bE[A-Z][A-Z0-9]{1,15}\b/g;
 

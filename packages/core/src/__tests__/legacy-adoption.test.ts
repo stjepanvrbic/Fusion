@@ -181,7 +181,8 @@ describe("resolveLegacyStatusAdoption — every legacy (status) resumes owned", 
   it("an UNMAPPABLE (unknown) status parks paused for a human — never silently frozen", () => {
     const action = resolveLegacyStatusAdoption("some-future-status-xyz");
     expect(action?.kind).toBe("park-paused");
-    expect(action?.note).toContain("some-future-status-xyz");
+    // The note is a fixed audit outcome; the status itself stays on the parked row.
+    expect(action?.note).toBe("unmappable legacy status");
   });
 });
 
@@ -239,6 +240,8 @@ describe("planLegacyAdoption (U9b consumers)", () => {
     expect(plan.action).toBe("park-paused");
     expect(plan.patch?.paused).toBe(true);
     expect(plan.patch?.pausedReason).toContain("some-status-from-the-future");
+    // The audited reason is a fixed outcome; the open-ended status never enters it.
+    expect(plan.reason).toBe("unmappable legacy status");
     // The status is deliberately NOT cleared — a human needs to see what the row carried.
     expect(plan.patch?.status).toBeUndefined();
     expect(plan.auditType).toBe("task:reconcile-legacy-adoption-unmappable");
@@ -421,18 +424,17 @@ function makeFakeStore(
         db: {
           execute: async (q: unknown) => {
             const text = sqlText(q);
-            // FNXC:LegacyAdoption 2026-07-21-17:30: write path calls the SECURITY DEFINER
-            // helper (SELECT public.fusion_mark_legacy_adoption_drained()); the read path is
-            // SELECT version FROM … WHERE version = ….
-            if (text.includes("fusion_mark_legacy_adoption_drained")) {
+            // FNXC:LegacyAdoption 2026-10-07-21:10: the marker is the store's own
+            // project.__meta row — an INSERT … ON CONFLICT upsert, read with SELECT value.
+            if (text.includes("INSERT INTO project.__meta")) {
               if (opts?.markerWriteThrows) throw opts.markerError ?? new Error("marker write boom");
               markerWrites.push(text);
               markerPresent = true;
               return [];
             }
-            if (text.includes("SELECT") && text.includes("version")) {
+            if (text.includes("SELECT value FROM project.__meta")) {
               if (opts?.markerReadThrows) throw opts.markerError ?? new Error("marker read boom");
-              return markerPresent ? [{ version: "legacy-adoption-drained" }] : [];
+              return markerPresent ? [{ value: "2026-07-19T00:00:00.000Z" }] : [];
             }
             return [];
           },
@@ -492,7 +494,7 @@ sweep when it is absent or unreadable, write the marker only after a fully-clean
 and withhold it on any cycle that produced a mutating plan.
 */
 describe("adoptLegacyTaskRowsOnOpen — drained-marker completion short-circuit", () => {
-  it("writes the non-numeric marker after a clean drain (no mutating plan)", async () => {
+  it("writes the project's drained marker after a clean drain (no mutating plan)", async () => {
     const rows = [
       { id: "task-1", status: "done" },                                    // preserve gate → skip
       { id: "task-2", status: "plan-review-unavailable", legacyAdoptedAt: "2026-07-19" }, // already adopted → skip
@@ -503,9 +505,9 @@ describe("adoptLegacyTaskRowsOnOpen — drained-marker completion short-circuit"
     expect(await adoptLegacyTaskRowsOnOpen(store)).toBe(0);
     // The sweep still ran (marker was absent) …
     expect(listCalls.length).toBe(1);
-    // … and a clean drain recorded the durable marker exactly once via the SECURITY DEFINER helper.
+    // … and a clean drain recorded the store's per-project marker exactly once.
     expect(markerWrites.length).toBe(1);
-    expect(markerWrites[0]).toContain("fusion_mark_legacy_adoption_drained");
+    expect(markerWrites[0]).toContain("project.__meta");
   });
 
   it("skips the sweep entirely when the marker is present", async () => {
@@ -551,8 +553,8 @@ describe("adoptLegacyTaskRowsOnOpen — drained-marker completion short-circuit"
   });
 
   it("reports a permanent marker privilege failure once per SQLSTATE class", async () => {
-    const cause = Object.assign(new Error("permission denied for table fusion_schema_migrations"), {code: "42501"});
-    const markerError = new Error("Failed query: SELECT version FROM public.fusion_schema_migrations", {cause});
+    const cause = Object.assign(new Error("permission denied for table __meta"), {code: "42501"});
+    const markerError = new Error("Failed query: SELECT value FROM project.__meta", {cause});
     const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
       const {store} = makeFakeStore([{id: "task-1", status: "done"}], {
@@ -573,7 +575,7 @@ describe("adoptLegacyTaskRowsOnOpen — drained-marker completion short-circuit"
         operation: "read",
         sqlstate: "42501",
         sqlstateClass: "42",
-        hint: expect.stringContaining("schema baseline 0032+"),
+        hint: expect.stringContaining("project.__meta"),
       });
     } finally {
       stderr.mockRestore();

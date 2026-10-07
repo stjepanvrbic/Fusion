@@ -97,6 +97,9 @@ describe("run-audit metadata hygiene", () => {
     expect(sanitizeRunAuditMetadata({ reason: "parked in-review task FN-12 without live execution proof" })).toEqual({
       reason: "parked in-review task FN-12 without live execution proof",
     });
+    expect(sanitizeRunAuditMetadata({ reason: "transient cancel — clear on restart + reviewLevel backfill" })).toEqual({
+      reason: "transient cancel — clear on restart + reviewLevel backfill",
+    });
     expect(sanitizeRunAuditMetadata({
       reason: "task is marked 'failed': Failed to create worktree after 3 attempts: Branch fusion/fn-9999 conflict",
     })).toEqual({ redactedFields: ["reason"] });

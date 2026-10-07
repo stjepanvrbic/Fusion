@@ -11,11 +11,6 @@ import { emitBoundedRunAudit } from "../run-audit/emit-bounded-run-audit.js";
 import {TaskStore, storeLog, RECONCILE_ORPHAN_TASK_DIR_MAX_AGE_MS, WORKFLOW_COMPILED_STEP_TEMPLATE_PREFIX} from "../store.js";
 import {planLegacyAdoption} from "../db/legacy-adoption.js";
 import {and, eq, sql} from "drizzle-orm";
-import {
-  MIGRATION_BOOKKEEPING_TABLE,
-  LEGACY_ADOPTION_DRAINED_MARKER,
-  LEGACY_ADOPTION_DRAINED_MARKER_FUNCTION,
-} from "../postgres/schema-applier.js";
 import {mkdir, readdir, readFile, stat} from "node:fs/promises";
 import {join} from "node:path";
 import {existsSync, type Dirent} from "node:fs";
@@ -35,7 +30,7 @@ import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {reconcileTaskIdStateAsync} from "../task-store/async/async-allocator.js";
 import {ACTIVE_TASK_FILTER, insertTaskRowInTransaction, isTaskIdConflictError as isPgTaskIdConflictError, readTaskRow} from "./async/async-persistence.js";
 import {resolveWorkflowIrForTask} from "../workflows/workflow-ir-resolver.js";
-import {recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
+import {projectOwnershipPartition, recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
 import {diffSettingsForActivity, formatSettingsActivity} from "./settings-activity.js";
 import {LIFECYCLE_ROLE_RANK} from "../workflows/workflow-lifecycle-direction.js";
@@ -149,10 +144,9 @@ FNXC:LegacyAdoption 2026-07-19-14:30 (PR #2341 review):
 Completion short-circuit. Without one, the full active-census scan runs on EVERY store open
 forever — a permanent startup cost scaling with total task count, not the shrinking legacy
 backlog. After a full drain in which NO row produced a mutating adoption plan, a durable
-NON-NUMERIC marker row (LEGACY_ADOPTION_DRAINED_MARKER) is recorded in the
-fusion_schema_migrations bookkeeping table (INSERT ... ON CONFLICT DO NOTHING) and checked
-before sweeping on later opens. Non-numeric is deliberate: assertBinaryNotOlderThanDatabase
-ignores unparseable version identifiers by design (coupling documented at both sites).
+marker is recorded and checked before sweeping on later opens. The marker is now the
+per-project `project.__meta` LEGACY_ADOPTION_DRAINED_META_KEY row (see that constant); the
+original database-wide fusion_schema_migrations row is no longer read.
 Safety rules:
 - Any mutating plan during a sweep (including one withheld only by userPaused) withholds
   the marker that cycle — rows may still be arriving from an old binary (unlikely under the
@@ -160,7 +154,7 @@ Safety rules:
   after the operator unpauses.
 - A failed marker READ falls back to sweeping (fail-open toward correctness); a failed
   marker WRITE is warned and swallowed (the next clean drain retries).
-- SQLite (non-backend) mode has no bookkeeping table → no marker, sweep always runs.
+- A store without a PostgreSQL data layer has no marker storage → the sweep always runs.
 */
 /*
 FNXC:LegacyAdoption 2026-07-22-10:30:
@@ -215,7 +209,7 @@ function reportLegacyAdoptionMarkerFailure(operation: "read" | "write", error: u
       sqlstate,
       sqlstateClass,
       error: describeStoreOpenDbError(error),
-      hint: "Apply schema baseline 0032+ and verify fusion_runtime has public schema USAGE, bookkeeping SELECT, and marker-helper EXECUTE.",
+      hint: "Verify fusion_runtime can SELECT and INSERT/UPDATE its own project.__meta rows.",
     });
     return;
   }
@@ -225,12 +219,23 @@ function reportLegacyAdoptionMarkerFailure(operation: "read" | "write", error: u
   });
 }
 
+/**
+ * `project.__meta` key recording that this project's adoption census drained clean.
+ *
+ * FNXC:LegacyAdoption 2026-10-07-20:46:
+ * Adoption scans only the store's bound project, so its completion marker must be scoped to that same partition.
+ * The former single database-wide `legacy-adoption-drained` bookkeeping row let one clean project certify projects it never inspected, so their legacy rows were never adopted on open.
+ * The marker lives in the per-project `__meta` table (the partition `projectOwnershipPartition` resolves, the same one project identity uses), which the runtime role can already read and write and which backup restore carries with the project's rows.
+ * An unbound store scans every project, so its marker is the unscoped partition's and certifies nothing for a bound project. The legacy bookkeeping row and its 0032 helper are left in place but never read, so older binaries keep working.
+ */
+export const LEGACY_ADOPTION_DRAINED_META_KEY = "legacyAdoptionDrainedAt";
+
 async function hasLegacyAdoptionDrainedMarker(store: TaskStore): Promise<boolean> {
-  const db = store.asyncLayer?.db;
-  if (!db) return false;
+  const layer = store.asyncLayer;
+  if (!layer?.db) return false;
   try {
-    const rows = (await db.execute(
-      sql`SELECT version FROM public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} WHERE version = ${LEGACY_ADOPTION_DRAINED_MARKER}`,
+    const rows = (await layer.db.execute(
+      sql`SELECT value FROM project.__meta WHERE project_id = ${projectOwnershipPartition(layer.projectId)} AND key = ${LEGACY_ADOPTION_DRAINED_META_KEY}`,
     )) as unknown as unknown[];
     return rows.length > 0;
   } catch (error) {
@@ -240,17 +245,13 @@ async function hasLegacyAdoptionDrainedMarker(store: TaskStore): Promise<boolean
   }
 }
 
-async function writeLegacyAdoptionDrainedMarker(store: TaskStore): Promise<void> {
-  const db = store.asyncLayer?.db;
-  if (!db) return;
+async function writeLegacyAdoptionDrainedMarker(store: TaskStore, drainedAt: string): Promise<void> {
+  const layer = store.asyncLayer;
+  if (!layer?.db) return;
   try {
-    /*
-    FNXC:LegacyAdoption 2026-07-21-17:30:
-    Call the SECURITY DEFINER helper (migration 0032) instead of a raw INSERT.
-    fusion_runtime has EXECUTE on the function but not unrestricted INSERT on
-    fusion_schema_migrations, so it cannot stamp arbitrary migration versions.
-    */
-    await db.execute(sql`SELECT public.${sql.identifier(LEGACY_ADOPTION_DRAINED_MARKER_FUNCTION)}()`);
+    await layer.db.execute(
+      sql`INSERT INTO project.__meta (project_id, key, value) VALUES (${projectOwnershipPartition(layer.projectId)}, ${LEGACY_ADOPTION_DRAINED_META_KEY}, ${drainedAt}) ON CONFLICT (project_id, key) DO UPDATE SET value = EXCLUDED.value`,
+    );
   } catch (error) {
     // Non-fatal: the next fully-clean drain writes it again.
     reportLegacyAdoptionMarkerFailure("write", error);
@@ -302,7 +303,7 @@ export async function adoptLegacyTaskRowsOnOpen(store: TaskStore): Promise<numbe
       storeLog.log?.(`Legacy adoption adopted ${adopted} pre-cutover row(s) at store open`);
     }
     if (!mutationPlanned) {
-      await writeLegacyAdoptionDrainedMarker(store);
+      await writeLegacyAdoptionDrainedMarker(store, now);
     }
     return adopted;
   } catch (error) {
