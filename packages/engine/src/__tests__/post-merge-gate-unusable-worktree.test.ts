@@ -305,22 +305,57 @@ describe("post-merge gate after a half-deleted task worktree (KB-003, real git)"
     expect(onSession).not.toHaveBeenCalled();
   });
 
-  it("refuses a healthy recorded checkout that does not contain the squash-landed commit", async () => {
+  /*
+  FNXC:PostMergeRecovery 2026-10-07-22:10:
+  A healthy recorded checkout that lacks the landed commit is recovered automatically before anything parks: a clean
+  checkout is detached in place at the landed branch tip and the gate runs there. Only a checkout with uncommitted
+  changes is unsafe to move; it parks as a recoverable gate failure that the recheck ladder resumes once it is clean.
+  */
+  function squashLandedOverHealthyCheckout() {
     const { root, worktree } = landedTask("healthy");
     // Main receives a squash commit the retained task checkout never sees.
     writeFileSync(join(root, "squashed.txt"), "squashed\n");
     git(root, ["add", "squashed.txt"]);
     git(root, ["commit", "-q", "-m", "feat(FN-X): squash"]);
     const squashSha = git(root, ["rev-parse", "HEAD"]);
-    const fixture = createStore(landedTaskRecord(worktree, squashSha));
-    const onSession = vi.fn(async () => undefined);
+    return { root, worktree, squashSha, fixture: createStore(landedTaskRecord(worktree, squashSha)) };
+  }
+
+  it("recovers a clean healthy checkout without the landed commit by detaching it at the landed tip, then verifies", async () => {
+    const { root, worktree, squashSha, fixture } = squashLandedOverHealthyCheckout();
+    const branchTip = git(root, ["rev-parse", "fusion/fn-x"]);
+    const sessions: string[] = [];
+    const deps = buildDeps(root, fixture.store, async (cwd) => {
+      expect(isAncestor(cwd, squashSha)).toBe(true);
+      sessions.push(cwd);
+    });
     const live = await (fixture.store as unknown as { getTask: () => Promise<TaskDetail> }).getTask();
 
-    const result = await runGraphCustomNode(buildDeps(root, fixture.store, onSession), POST_MERGE_NODE as never, live, {} as Settings, undefined, POST_MERGE_CONTEXT);
+    const result = await runGraphCustomNode(deps, POST_MERGE_NODE as never, live, {} as Settings, undefined, POST_MERGE_CONTEXT);
 
-    expect(result).toEqual({ outcome: "failure", value: "post-merge-checkout-missing-landed-commit" });
-    expect(onSession).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ outcome: "success", value: "APPROVE" });
+    expect(sessions).toEqual([worktree]);
     expect(fixture.task.worktree).toBe(worktree);
+    expect(git(root, ["rev-parse", "fusion/fn-x"])).toBe(branchTip);
+  });
+
+  it("parks a dirty checkout without the landed commit with an operator reason, and resumes once it is clean", async () => {
+    const { root, worktree, squashSha, fixture } = squashLandedOverHealthyCheckout();
+    writeFileSync(join(worktree, "feature.txt"), "uncommitted edit\n");
+    const onSession = vi.fn(async (cwd: string) => { expect(isAncestor(cwd, squashSha)).toBe(true); });
+    const getLive = () => (fixture.store as unknown as { getTask: () => Promise<TaskDetail> }).getTask();
+
+    const parked = await runGraphCustomNode(buildDeps(root, fixture.store, onSession), POST_MERGE_NODE as never, await getLive(), {} as Settings, undefined, POST_MERGE_CONTEXT);
+
+    expect(parked).toEqual({ outcome: "failure", value: "post-merge-checkout-missing-landed-commit" });
+    expect(onSession).not.toHaveBeenCalled();
+    expect(fixture.logs.some((line) => line.includes("has uncommitted changes") && line.includes(worktree))).toBe(true);
+    expect(git(worktree, ["status", "--porcelain"])).toContain("feature.txt");
+
+    git(worktree, ["checkout", "--", "feature.txt"]);
+    const resumed = await runGraphCustomNode(buildDeps(root, fixture.store, onSession), POST_MERGE_NODE as never, await getLive(), {} as Settings, undefined, POST_MERGE_CONTEXT);
+    expect(resumed).toMatchObject({ outcome: "success", value: "APPROVE" });
+    expect(onSession).toHaveBeenCalledOnce();
   });
 
   it("verifies on a checkout containing the squash commit even when the pre-squash task branch survives", async () => {

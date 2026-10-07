@@ -5508,7 +5508,7 @@
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 415,
+      "lineHint": 446,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5523,12 +5523,12 @@
     },
     {
       "callSiteId": "packages/engine/src/executor/run-graph-custom-node.ts::runGraphCustomNode::store.logEntry::#10",
-      "callSiteFingerprint": "deps.store.logEntry(workspaceReviewTarget.id,`Workspace Code Review approval unavailable for ${workspaceReviewTarget.id}: ${repositories.join(\", \")}`,`Durable workspace review evidence was not published: ${reason}`,deps.getRunContextFor(workspaceReviewTarget.id))",
+      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow node '${node.id}': agent '${cfg.agentId}' not found — using default model`,undefined,deps.getRunContextFor(live.id))",
       "file": "packages/engine/src/executor/run-graph-custom-node.ts",
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 10,
-      "lineHint": 1139,
+      "lineHint": 918,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5543,12 +5543,12 @@
     },
     {
       "callSiteId": "packages/engine/src/executor/run-graph-custom-node.ts::runGraphCustomNode::store.logEntry::#11",
-      "callSiteFingerprint": "deps.store.logEntry(live.id,`[pre-merge] ${diagnostic}`,undefined,deps.getRunContextFor(live.id))",
+      "callSiteFingerprint": "deps.store.logEntry(workspaceReviewTarget.id,`Workspace Code Review approval unavailable for ${workspaceReviewTarget.id}: ${repositories.join(\", \")}`,`Durable workspace review evidence was not published: ${reason}`,deps.getRunContextFor(workspaceReviewTarget.id))",
       "file": "packages/engine/src/executor/run-graph-custom-node.ts",
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 11,
-      "lineHint": 1197,
+      "lineHint": 1186,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5563,12 +5563,32 @@
     },
     {
       "callSiteId": "packages/engine/src/executor/run-graph-custom-node.ts::runGraphCustomNode::store.logEntry::#12",
-      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow step '${node.id}' is waiting for your input: ${awaitQuestion}`,undefined,deps.getRunContextFor(live.id))",
+      "callSiteFingerprint": "deps.store.logEntry(live.id,`[pre-merge] ${diagnostic}`,undefined,deps.getRunContextFor(live.id))",
       "file": "packages/engine/src/executor/run-graph-custom-node.ts",
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 12,
-      "lineHint": 1235,
+      "lineHint": 1244,
+      "owningEntryPoint": "indeterminate",
+      "reachableDataStates": [
+        "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
+      ],
+      "axis1": "out-of-frontier",
+      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo; this scanned closure call belongs to another engine caller.",
+      "axis2Provisional": "out-of-frontier",
+      "axis2Final": "out-of-frontier",
+      "observedInSuite": "out-of-frontier",
+      "executionProof": "none:out-of-frontier",
+      "followUpTaskId": "none:out-of-frontier"
+    },
+    {
+      "callSiteId": "packages/engine/src/executor/run-graph-custom-node.ts::runGraphCustomNode::store.logEntry::#13",
+      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow step '${node.id}' is waiting for your input: ${awaitQuestion}`,undefined,deps.getRunContextFor(live.id))",
+      "file": "packages/engine/src/executor/run-graph-custom-node.ts",
+      "enclosingSymbolPath": "runGraphCustomNode",
+      "writer": "store.logEntry",
+      "ordinal": 13,
+      "lineHint": 1282,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5588,7 +5608,7 @@
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 2,
-      "lineHint": 475,
+      "lineHint": 506,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5608,7 +5628,7 @@
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 3,
-      "lineHint": 542,
+      "lineHint": 573,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5628,7 +5648,7 @@
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 4,
-      "lineHint": 628,
+      "lineHint": 659,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5648,7 +5668,7 @@
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 5,
-      "lineHint": 645,
+      "lineHint": 676,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5663,12 +5683,12 @@
     },
     {
       "callSiteId": "packages/engine/src/executor/run-graph-custom-node.ts::runGraphCustomNode::store.logEntry::#6",
-      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow node '${node.id}' checkout ${executionTarget.worktree} does not contain landed commit ${landedCommit}; the gat,undefined,deps.getRunContextFor(live.id))",
+      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow node '${node.id}' detached ${checkoutPath} at the tip of ${landedBranch}, which contains landed commit ${lande,undefined,deps.getRunContextFor(live.id))",
       "file": "packages/engine/src/executor/run-graph-custom-node.ts",
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 6,
-      "lineHint": 689,
+      "lineHint": 727,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5683,12 +5703,12 @@
     },
     {
       "callSiteId": "packages/engine/src/executor/run-graph-custom-node.ts::runGraphCustomNode::store.logEntry::#7",
-      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow node '${node.id}' did not run: workspace repository context is unresolved`,repositoryContext.output,deps.getRunContextFor(live.id))",
+      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow node '${node.id}' checkout ${checkoutPath} does not contain landed commit ${landedCommit} and could not be mov,undefined,deps.getRunContextFor(live.id))",
       "file": "packages/engine/src/executor/run-graph-custom-node.ts",
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 7,
-      "lineHint": 750,
+      "lineHint": 735,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5703,12 +5723,12 @@
     },
     {
       "callSiteId": "packages/engine/src/executor/run-graph-custom-node.ts::runGraphCustomNode::store.logEntry::#8",
-      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow node '${node.id}': column agent '${columnAgentId}' (${columnAgentMode}) not applied — raw CLI execution runs n,undefined,deps.getRunContextFor(live.id))",
+      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow node '${node.id}' did not run: workspace repository context is unresolved`,repositoryContext.output,deps.getRunContextFor(live.id))",
       "file": "packages/engine/src/executor/run-graph-custom-node.ts",
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 8,
-      "lineHint": 831,
+      "lineHint": 797,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5723,12 +5743,12 @@
     },
     {
       "callSiteId": "packages/engine/src/executor/run-graph-custom-node.ts::runGraphCustomNode::store.logEntry::#9",
-      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow node '${node.id}': agent '${cfg.agentId}' not found — using default model`,undefined,deps.getRunContextFor(live.id))",
+      "callSiteFingerprint": "deps.store.logEntry(live.id,`Workflow node '${node.id}': column agent '${columnAgentId}' (${columnAgentMode}) not applied — raw CLI execution runs n,undefined,deps.getRunContextFor(live.id))",
       "file": "packages/engine/src/executor/run-graph-custom-node.ts",
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.logEntry",
       "ordinal": 9,
-      "lineHint": 871,
+      "lineHint": 878,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5748,7 +5768,7 @@
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.updateTask",
       "ordinal": 1,
-      "lineHint": 411,
+      "lineHint": 442,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5768,7 +5788,7 @@
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.updateTask",
       "ordinal": 2,
-      "lineHint": 414,
+      "lineHint": 445,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5788,7 +5808,7 @@
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.updateTask",
       "ordinal": 3,
-      "lineHint": 916,
+      "lineHint": 963,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5808,7 +5828,7 @@
       "enclosingSymbolPath": "runGraphCustomNode",
       "writer": "store.updateTask",
       "ordinal": 4,
-      "lineHint": 1241,
+      "lineHint": 1288,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5828,7 +5848,7 @@
       "enclosingSymbolPath": "runGraphCustomNode>reacquireLandedPostMergeCheckout",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 579,
+      "lineHint": 610,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5848,7 +5868,7 @@
       "enclosingSymbolPath": "runGraphCustomNode>reacquireLandedPostMergeCheckout",
       "writer": "store.logEntry",
       "ordinal": 2,
-      "lineHint": 589,
+      "lineHint": 620,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
