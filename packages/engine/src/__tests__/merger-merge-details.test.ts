@@ -411,7 +411,7 @@ describe("aiMergeTask — includeTaskIdInCommit setting", () => {
     // includeTaskIdInCommit=false. The summary portion is derived from the
     // step commit log or AI subject, so we don't pin its exact text — just
     // assert the prefix shape.
-    expect(String(commitCall![0])).toMatch(/git commit -m "feat: \S/);
+    expect(String(commitCall![0])).toMatch(/^git commit -m feat: \S/);
     expect(String(commitCall![0])).not.toContain("feat(KB-050)");
     expect(String(commitCall![0])).not.toContain("feat(FN-050)");
   });

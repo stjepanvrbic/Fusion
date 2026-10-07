@@ -142,10 +142,9 @@ describe("resolveSafeCommitBody", () => {
 });
 
 describe("buildDeterministicMergeMessage", () => {
-  const decodeArg = (arg: string) => arg.replace(/^-m\s+"/, "").replace(/"$/, "").replace(/\\(["\\$`])/g, "$1");
 
   it("preserves AI body bullets in canonical merge body", async () => {
-    const { bodyArg } = await buildDeterministicMergeMessage({
+    const { body: rawBody } = await buildDeterministicMergeMessage({
       taskId: "FN-1",
       branch: "fusion/FN-1",
       commitLog: "- feat: one",
@@ -155,14 +154,14 @@ describe("buildDeterministicMergeMessage", () => {
       aiBody: "- bullet one\n- bullet two",
       aiSubject: "tighten canonical merge message",
     });
-    const body = decodeArg(bodyArg);
+    const body = rawBody;
     expect(body).toContain("- bullet one\n- bullet two");
     expect(body).toContain("Files changed:\n1 file changed");
   });
 
   it("falls back deterministically when aiBody is null/empty", async () => {
     for (const aiBody of [undefined, null, "   "] as const) {
-      const { bodyArg } = await buildDeterministicMergeMessage({
+      const { body: rawBody } = await buildDeterministicMergeMessage({
         taskId: "FN-3",
         branch: "fusion/FN-3",
         commitLog: "- feat: one",
@@ -172,7 +171,7 @@ describe("buildDeterministicMergeMessage", () => {
         aiBody,
         aiSubject: "subject",
       });
-      expect(decodeArg(bodyArg)).toBe("Narrative summary.\n\nFiles changed:\n1 file changed");
+      expect(rawBody).toBe("Narrative summary.\n\nFiles changed:\n1 file changed");
     }
   });
 
@@ -187,7 +186,7 @@ describe("buildDeterministicMergeMessage", () => {
       aiBody: "- bullet",
       aiSubject: "custom subject",
     });
-    expect(withSubject.subjectArg).toContain("feat(FN-1): custom subject");
+    expect(withSubject.subject).toBe("feat(FN-1): custom subject");
 
     const fallbackSubject = await buildDeterministicMergeMessage({
       taskId: "FN-2",
@@ -199,6 +198,6 @@ describe("buildDeterministicMergeMessage", () => {
       aiBody: "- bullet",
       aiSubject: null,
     });
-    expect(fallbackSubject.subjectArg).toContain("feat: merge fusion/FN-2");
+    expect(fallbackSubject.subject).toBe("feat: merge fusion/FN-2");
   });
 });
