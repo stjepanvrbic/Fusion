@@ -14,6 +14,7 @@
  *    streamEnded guard, abort via SIGKILL, process registry
  */
 
+
 import { createInterface } from "node:readline";
 import {
   AssistantMessageEventStream,
@@ -37,13 +38,16 @@ import {
   captureStderr,
   forceKillProcess,
   registerProcess,
-  cleanupSystemPromptFile,
+  createSystemPromptFile,
   buildClaudeSpawnArgs,
+  type SystemPromptFile,
 } from "./process-manager.js";
 import { parseLine } from "./stream-parser.js";
 import { createEventBridge } from "./event-bridge.js";
 import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
+import { pushTurnFailure, type TurnFailureReason } from "./turn-failure.js";
+import type { ClaudeResultMessage } from "./types.js";
 /**
  * Inactivity safety net for the Claude CLI subprocess.
  *
@@ -61,6 +65,10 @@ import { isPiKnownClaudeTool } from "./tool-mapping.js";
  * arrives (e.g. someone embeds pi-claude-cli without a stuck detector).
  */
 const INACTIVITY_TIMEOUT_MS = 30 * 60_000;
+/** How long a turn whose output ended without a result waits for the exit code and stderr before reporting the failure without them. */
+const EXIT_REPORT_GRACE_MS = 1_000;
+const ABORTED_MESSAGE = "Claude CLI request was aborted";
+
 function isDebugStreamEnabled(): boolean {
   return process.env.PI_CLAUDE_CLI_DEBUG === "1";
 }
@@ -68,6 +76,20 @@ function isDebugStreamEnabled(): boolean {
 function debugLog(message: string): void {
   if (!isDebugStreamEnabled()) return;
   console.error(`[pi-claude-cli] ${message}`);
+}
+
+/**
+ * The failure a result message reports, or undefined for a completed turn.
+ * Only `subtype: "success"` without `is_error` completed; see {@link ClaudeResultMessage}.
+ */
+function describeResultFailure(msg: ClaudeResultMessage): string | undefined {
+  if (msg.subtype === "success" && msg.is_error !== true) return undefined;
+  const detail =
+    msg.errors?.filter((entry) => typeof entry === "string" && entry.length > 0).join("; ") ||
+    msg.result ||
+    msg.error ||
+    "no error detail";
+  return `Claude CLI result ${msg.subtype}${msg.is_error ? " (is_error)" : ""}: ${detail}`;
 }
 
 /** Extended stream options: pi's SimpleStreamOptions plus optional cwd and mcpConfigPath */
@@ -84,9 +106,10 @@ type StreamViaCLiOptions = SimpleStreamOptions & {
  * at message_stop, if any built-in or custom-tools MCP tool was seen, kills
  * the subprocess before Claude CLI can auto-execute the tools.
  *
- * Hardened with: inactivity timeout (180s), subprocess exit handler with stderr
- * surfacing, streamEnded guard against double errors, abort via SIGKILL, and
- * process registry integration for teardown cleanup.
+ * FNXC:ClaudeCliProvider 2026-10-07-19:34:
+ * Every turn settles the stream exactly once: `done` only for a completed turn (a success result, or a break-early tool call), `error` with `stopReason` `error` for a failed one, and `error` with `stopReason` `aborted` for a cancelled one.
+ * A failure result, a non-zero or signal exit, output that ends without a result, the inactivity timeout, a spawn failure and a thrown setup step are all failures.
+ * A signal that is already aborted settles the turn without spawning; an abort after spawn kills the CLI and settles immediately rather than waiting for its output to end.
  *
  * @param model - The model to use (from pi's model catalog)
  * @param context - The conversation context with messages and system prompt
@@ -101,12 +124,28 @@ export function streamViaCli(
   // @ts-expect-error — tsc can't verify AssistantMessageEventStream is a value
   // through pi-ai's `export *` re-export chain. The class constructor exists at runtime.
   const stream = new AssistantMessageEventStream();
+  const bridge = createEventBridge(stream, model);
+
+  // First terminal path wins; later ones are no-ops.
+  let streamEnded = false;
+  function endStreamWithFailure(reason: TurnFailureReason, errMsg: string) {
+    if (streamEnded) return;
+    streamEnded = true;
+    pushTurnFailure(stream, bridge.getOutput(), reason, errMsg);
+  }
 
   (async () => {
     let proc: ReturnType<typeof spawnClaude> | undefined;
+    let promptFile: SystemPromptFile | undefined;
     let abortHandler: (() => void) | undefined;
+    let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
 
     try {
+      if (options?.signal?.aborted) {
+        endStreamWithFailure("aborted", ABORTED_MESSAGE);
+        return;
+      }
+
       const cwd = options?.cwd ?? process.cwd();
 
       // Resume if pi provides a session ID AND this isn't the first turn.
@@ -133,120 +172,92 @@ export function streamViaCli(
         options?.thinkingBudgets,
       );
 
-      const spawnOptions = {
-        cwd,
-        signal: options?.signal,
+      const sessionOptions = {
         effort,
         mcpConfigPath: options?.mcpConfigPath,
         resumeSessionId,
         newSessionId: !resumeSessionId ? options?.sessionId : undefined,
       };
 
-      // Spawn subprocess
-      proc = spawnClaude(model.id, systemPrompt || undefined, spawnOptions);
-      const getStderr = captureStderr(proc);
+      if (systemPrompt) promptFile = createSystemPromptFile(systemPrompt);
+      proc = spawnClaude(model.id, promptFile?.path, { cwd, ...sessionOptions });
+      const spawned = proc;
+      // The CLI reads its prompt file at startup; the file belongs to this process and goes away with it.
+      const ownedPromptFile = promptFile;
+      if (ownedPromptFile) {
+        spawned.once("close", () => ownedPromptFile.cleanup());
+        spawned.once("error", () => ownedPromptFile.cleanup());
+      }
+      const getStderr = captureStderr(spawned);
 
       // Register in global process registry for teardown cleanup
-      registerProcess(proc);
-      const spawnArgs = buildClaudeSpawnArgs(model.id, undefined, {
-        effort,
-        mcpConfigPath: options?.mcpConfigPath,
-        resumeSessionId,
-        newSessionId: !resumeSessionId ? options?.sessionId : undefined,
-      });
+      registerProcess(spawned);
       debugLog(
-        `spawned claude subprocess pid=${proc.pid ?? "unknown"} args=${JSON.stringify(spawnArgs)}`,
+        `spawned claude subprocess pid=${spawned.pid ?? "unknown"} args=${JSON.stringify(buildClaudeSpawnArgs(model.id, promptFile?.path, sessionOptions))}`,
       );
-
-      // Write user message to subprocess stdin
-      writeUserMessage(proc, prompt);
-      debugLog("user message written to stdin, stdin.end() called");
-
-      // Create event bridge (before endStreamWithError so bridge is in scope)
-      const bridge = createEventBridge(stream, model);
-
-      // Guard against double stream.end() and double error events.
-      // First error path wins; subsequent ones are no-ops.
-      let streamEnded = false;
-
-      /**
-       * End the stream with an error, using a "done" event instead of "error".
-       *
-       * Why "done" not "error": AssistantMessageEventStream.extractResult()
-       * returns event.error (a string) for error events, but agent-loop.js
-       * then calls message.content.filter() on the result, crashing because
-       * a string has no .content property. By pushing "done" with a valid
-       * AssistantMessage (content:[]), pi gets a well-formed object.
-       */
-      function endStreamWithError(errMsg: string) {
-        if (streamEnded || broken) return;
-        streamEnded = true;
-        const output = bridge.getOutput();
-        const errorMessage = {
-          ...output,
-          content: output.content?.length
-            ? output.content
-            : [{ type: "text" as const, text: `Error: ${errMsg}` }],
-          stopReason: "stop" as const,
-        };
-        stream.push({
-          type: "done",
-          reason: "stop",
-          message: errorMessage,
-        });
-        stream.end();
-      }
-
-      // Inactivity timeout: kill subprocess if no stdout for INACTIVITY_TIMEOUT_MS
-      let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
-
-      function resetInactivityTimer() {
-        if (inactivityTimer !== undefined) clearTimeout(inactivityTimer);
-        inactivityTimer = setTimeout(() => {
-          forceKillProcess(proc!);
-          endStreamWithError(
-            `Claude CLI subprocess timed out: no output for ${INACTIVITY_TIMEOUT_MS / 1000} seconds`,
-          );
-        }, INACTIVITY_TIMEOUT_MS);
-      }
-
-      // Set up abort signal handler -- uses SIGKILL for immediate force-kill
-      if (options?.signal) {
-        abortHandler = () => {
-          if (proc) {
-            forceKillProcess(proc);
-          }
-        };
-
-        if (options.signal.aborted) {
-          abortHandler();
-          return;
-        }
-        options.signal.addEventListener("abort", abortHandler, { once: true });
-      }
 
       // Track tool_use blocks for break-early decision at message_stop
       let sawBuiltInOrCustomTool = false;
       let firstLineReceived = false;
+      let resultReceived = false;
       // Guard against buffered readline lines firing after rl.close()
       let broken = false;
 
       // Set up readline for line-by-line NDJSON parsing
       const rl = createInterface({
-        input: proc.stdout!,
+        input: spawned.stdout!,
         crlfDelay: Infinity,
         terminal: false,
       });
+      const outputClosed = new Promise<void>((resolve) => {
+        rl.on("close", resolve);
+      });
+      let exitInfo = undefined as { code: number | null; signal: string | null } | undefined;
+      const exited = new Promise<void>((resolve) => {
+        spawned.once("close", (code: number | null, signal: string | null) => {
+          exitInfo = { code, signal };
+          resolve();
+        });
+        spawned.once("error", () => resolve());
+      });
 
-      // Handle process error -- use endStreamWithError for guard
-      proc.on("error", (err: Error) => {
+      // Abort: force-kill the CLI and settle now; its output may never end on its own.
+      if (options?.signal) {
+        abortHandler = () => {
+          clearTimeout(inactivityTimer);
+          forceKillProcess(spawned);
+          endStreamWithFailure("aborted", ABORTED_MESSAGE);
+          rl.close();
+        };
+        options.signal.addEventListener("abort", abortHandler, { once: true });
+        // An abort that landed during setup never fires a listener added afterwards.
+        if (options.signal.aborted) abortHandler();
+      }
+
+      // Inactivity timeout: kill subprocess if no stdout for INACTIVITY_TIMEOUT_MS
+      function resetInactivityTimer() {
+        if (inactivityTimer !== undefined) clearTimeout(inactivityTimer);
+        inactivityTimer = setTimeout(() => {
+          forceKillProcess(spawned);
+          endStreamWithFailure(
+            "error",
+            `Claude CLI subprocess timed out: no output for ${INACTIVITY_TIMEOUT_MS / 1000} seconds`,
+          );
+          rl.close();
+        }, INACTIVITY_TIMEOUT_MS);
+      }
+
+      // Handle process error (e.g. spawn ENOENT)
+      spawned.on("error", (err: Error) => {
         if (broken) return; // Break-early killed the process intentionally
-        const stderr = getStderr();
-        endStreamWithError(stderr || err.message);
+        clearTimeout(inactivityTimer);
+        const stderr = getStderr().trim();
+        endStreamWithFailure("error", stderr || err.message);
+        rl.close();
       });
 
       // Handle subprocess close -- surface crashes with stderr and exit code
-      proc.on("close", (code: number | null, _signal: string | null) => {
+      spawned.on("close", (code: number | null, _signal: string | null) => {
         clearTimeout(inactivityTimer);
         debugLog(`subprocess closed: code=${code} signal=${_signal}`);
         if (broken) return; // Break-early kill, expected
@@ -264,12 +275,9 @@ export function streamViaCli(
           const message = stderr
             ? `Claude CLI exited with code ${code}: ${stderr}`
             : `Claude CLI exited unexpectedly with code ${code}`;
-          endStreamWithError(message);
+          endStreamWithFailure("error", message);
         }
       });
-
-      // Start inactivity timer after writing user message
-      resetInactivityTimer();
 
       // Process NDJSON lines from stdout using event-based callback
       // NOTE: Using 'line' event instead of `for await` because the async
@@ -279,7 +287,7 @@ export function streamViaCli(
           firstLineReceived = true;
           debugLog("first stdout line received from Claude CLI");
         }
-        if (broken) return; // Guard: ignore buffered lines after break-early
+        if (broken || streamEnded) return; // Guard: ignore buffered lines after break-early or settlement
 
         // Reset inactivity timer on each line of output
         resetInactivityTimer();
@@ -326,93 +334,100 @@ export function streamViaCli(
             broken = true; // Set guard BEFORE rl.close() to prevent buffered lines
             clearTimeout(inactivityTimer);
             // Pi will execute these tools. Kill subprocess to prevent CLI from executing them.
-            forceKillProcess(proc!);
+            forceKillProcess(spawned);
             rl.close();
-            return; // Don't process further -- done event already pushed by event bridge
+            return; // Done event pushed after readline closes
           }
         } else if (msg.type === "control_request") {
           debugLog(
             `unexpected control_request received (stdin already closed): ${msg.request_id}`,
           );
         } else if (msg.type === "result") {
-          if (msg.subtype === "error") {
-            endStreamWithError(msg.error ?? "Unknown error from Claude CLI");
-          }
-          // For both success and error: clean up the subprocess
+          resultReceived = true;
+          const failure = describeResultFailure(msg);
+          if (failure) endStreamWithFailure("error", failure);
           clearTimeout(inactivityTimer);
-          cleanupProcess(proc!);
+          cleanupProcess(spawned);
           rl.close();
         }
       });
 
-      // Wait for readline to close (result received or process ended)
-      await new Promise<void>((resolve) => {
-        rl.on("close", resolve);
-      });
+      // Start inactivity timer before writing so a CLI that never answers is still bounded
+      resetInactivityTimer();
+
+      // Write user message to subprocess stdin
+      writeUserMessage(spawned, prompt);
+      debugLog("user message written to stdin, stdin.end() called");
+
+      // Wait for readline to close (result received, process ended, or turn settled)
+      await outputClosed;
+
+      if (streamEnded) return;
+
+      if (!broken && !resultReceived) {
+        // Output ended without a result: the turn did not complete. Wait briefly for the exit code and stderr so the failure says why.
+        await Promise.race([
+          exited,
+          new Promise<void>((resolve) => setTimeout(resolve, EXIT_REPORT_GRACE_MS)),
+        ]);
+        const stderr = getStderr().trim();
+        const exitDetail = exitInfo?.signal
+          ? `terminated by ${exitInfo.signal}`
+          : exitInfo
+            ? `exited with code ${exitInfo.code}`
+            : "output ended";
+        endStreamWithFailure(
+          "error",
+          `Claude CLI ${exitDetail} without a result${stderr ? `: ${stderr}` : ""}`,
+        );
+        return;
+      }
 
       // Push done event after readline closes (async). Pushing synchronously
       // inside handleMessageStop prevents pi from executing tools.
-      // Guard with streamEnded to avoid pushing done after an error was already pushed.
-      if (!streamEnded) {
-        const output = bridge.getOutput();
-        const contentEvents = output.content || [];
+      const output = bridge.getOutput();
+      const contentEvents = output.content || [];
 
-        if (contentEvents.length === 0) {
-          console.warn(
-            `[pi-claude-cli] Claude CLI closed without content events (model=${model.id}, sessionId=${options?.sessionId ?? "none"})`,
-          );
-        }
-
-        // If stopReason is toolUse but there are no pi-known tool calls in content,
-        // it means only user MCP tools were called (filtered by event bridge).
-        // Override to "stop" so pi doesn't try to execute non-existent tools.
-        const piToolCalls = (output.content || []).filter(
-          (c: TextContent | ThinkingContent | ToolCall) => c.type === "toolCall",
+      if (contentEvents.length === 0) {
+        console.warn(
+          `[pi-claude-cli] Claude CLI closed without content events (model=${model.id}, sessionId=${options?.sessionId ?? "none"})`,
         );
-        const effectiveReason =
-          output.stopReason === "toolUse" && piToolCalls.length === 0
-            ? "stop"
-            : output.stopReason;
-
-        streamEnded = true;
-        stream.push({
-          type: "done",
-          reason:
-            effectiveReason === "toolUse"
-              ? "toolUse"
-              : effectiveReason === "length"
-                ? "length"
-                : "stop",
-          message: { ...output, stopReason: effectiveReason },
-        });
-        stream.end();
       }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      // Push a "done" event with a text error so pi gets a valid AssistantMessage.
-      // Pushing type:"error" would require an AssistantMessage in the error field,
-      // but we don't have a full AssistantMessage here.
+
+      // If stopReason is toolUse but there are no pi-known tool calls in content,
+      // it means only user MCP tools were called (filtered by event bridge).
+      // Override to "stop" so pi doesn't try to execute non-existent tools.
+      const piToolCalls = (output.content || []).filter(
+        (c: TextContent | ThinkingContent | ToolCall) => c.type === "toolCall",
+      );
+      const effectiveReason =
+        output.stopReason === "toolUse" && piToolCalls.length === 0
+          ? "stop"
+          : output.stopReason;
+
+      streamEnded = true;
       stream.push({
         type: "done",
-        reason: "stop",
-        message: {
-          role: "assistant" as const,
-          content: [{ type: "text" as const, text: `Error: ${errMsg}` }],
-          api: "pi-claude-cli",
-          provider: model.provider,
-          model: model.id,
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-          stopReason: "stop" as const,
-          timestamp: Date.now(),
-        },
+        reason:
+          effectiveReason === "toolUse"
+            ? "toolUse"
+            : effectiveReason === "length"
+              ? "length"
+              : "stop",
+        message: { ...output, stopReason: effectiveReason },
       });
       stream.end();
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (proc) forceKillProcess(proc);
+      endStreamWithFailure(options?.signal?.aborted ? "aborted" : "error", errMsg);
     } finally {
-      // Clean up abort listener
+      clearTimeout(inactivityTimer);
       if (options?.signal && abortHandler) {
         options.signal.removeEventListener("abort", abortHandler);
       }
-      cleanupSystemPromptFile();
+      // A prompt file whose process never started has no close event to remove it.
+      if (!proc) promptFile?.cleanup();
     }
   })();
 

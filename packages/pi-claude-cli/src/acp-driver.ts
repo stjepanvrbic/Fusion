@@ -49,6 +49,7 @@ import { buildPrompt, buildResumePrompt, buildSystemPrompt, type PiContext } fro
 import { createEventBridge } from "./event-bridge.js";
 import { registerProcess, captureStderr } from "./process-manager.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
+import { pushTurnFailure, type TurnFailureReason } from "./turn-failure.js";
 import type { ClaudeApiEvent } from "./types.js";
 
 /** A stdio MCP server forwarded on `session/new` (schema-only — never executed here). */
@@ -357,20 +358,11 @@ export function streamViaAcp(
       endTurn(false); // clean turn → keep a cached connection warm for next turn
     };
 
-    const failWith = (msg: string) => {
+    // A failed or aborted ACP turn ends with the shared failure event, never a completed `stop`.
+    const failWith = (msg: string, reason: TurnFailureReason = "error") => {
       if (ended) return;
       ended = true;
-      const output = bridge.getOutput();
-      stream.push({
-        type: "done",
-        reason: "stop",
-        message: {
-          ...output,
-          content: output.content?.length ? output.content : [{ type: "text" as const, text: `Error: ${msg}` }],
-          stopReason: "stop" as const,
-        },
-      });
-      stream.end();
+      pushTurnFailure(stream, bridge.getOutput(), reason, msg);
       endTurn(true); // failed turn → destroy the connection (never reuse a broken one)
     };
 
@@ -463,6 +455,11 @@ export function streamViaAcp(
     };
 
     try {
+      // An already-aborted signal never fires its listener: settle before touching a warm connection or spawning.
+      if (options.signal?.aborted) {
+        failWith("Claude ACP request was aborted", "aborted");
+        return;
+      }
       const withTimeout = <T>(p: Promise<T>, label: string) =>
         Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`ACP ${label} timeout`)), INITIALIZE_TIMEOUT_MS))]);
 
@@ -494,7 +491,7 @@ export function streamViaAcp(
         warm.router.onPermission = handlePermission;
         warm.router.fail = failWith; // a warm-child death now fails THIS turn fast
         child = warm.child;
-        onAbort = () => failWith("aborted");
+        onAbort = () => failWith("Claude ACP request was aborted", "aborted");
         if (options.signal) options.signal.addEventListener("abort", onAbort, { once: true });
         armInactivity();
 
@@ -526,7 +523,7 @@ export function streamViaAcp(
         if (reuseKey && cacheEntry) evictCachedAcpConn(reuseKey, cacheEntry); // a dead child can never be reused
         fail?.(msg); // fail the owning turn (no-op if idle / already ended)
       });
-      onAbort = () => failWith("aborted");
+      onAbort = () => failWith("Claude ACP request was aborted", "aborted");
       if (options.signal) options.signal.addEventListener("abort", onAbort, { once: true });
       armInactivity();
 
@@ -577,7 +574,7 @@ export function streamViaAcp(
       emitUsage(res);
       if (!sawToolCall) finish("stop");
     } catch (err) {
-      failWith(err instanceof Error ? err.message : String(err));
+      failWith(err instanceof Error ? err.message : String(err), options.signal?.aborted ? "aborted" : "error");
     }
   })();
 

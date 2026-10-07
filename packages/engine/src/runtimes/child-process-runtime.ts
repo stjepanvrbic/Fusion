@@ -2,9 +2,10 @@ import { EventEmitter } from "node:events";
 import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import type {
-  TaskStore,
-  CentralCore,
+import {
+  killProcessTree,
+  type TaskStore,
+  type CentralCore,
 } from "@fusion/core";
 import type { Scheduler } from "../scheduler.js";
 import type {
@@ -112,6 +113,24 @@ class HealthMonitor {
   }
 }
 
+/** Grace a retiring child gets to exit after the polite signal before it is force-killed. */
+const CHILD_SIGKILL_GRACE_MS = 5_000;
+/** How long to wait for the exit event after a force kill before giving up on observing it. */
+const CHILD_EXIT_AFTER_SIGKILL_MS = 5_000;
+
+/** One forked child and the IPC host bound to it. */
+interface ChildGeneration {
+  readonly id: number;
+  readonly child: ChildProcess;
+  readonly ipcHost: IpcHost;
+  /** Set once the generation's failure was reported or it was retired; later exit/disconnect/heartbeat signals from it are ignored. */
+  settled: boolean;
+}
+
+function hasExited(child: ChildProcess): boolean {
+  return child.exitCode != null || child.signalCode != null;
+}
+
 /**
  * ChildProcessRuntime runs a project in an isolated child process.
  *
@@ -126,11 +145,12 @@ class HealthMonitor {
  * - Graceful shutdown with configurable timeout
  * - Event forwarding from child process to host listeners
  *
- * Timer/generation safety pattern:
- * - Every delayed callback (SIGKILL fallback, restart backoff) is tracked in a field.
- * - Timers are cleared during shutdown and before replacement to avoid stacked callbacks.
- * - Each spawned child increments a monotonic generation counter captured by callbacks.
- *   If a callback's captured generation no longer matches, it bails as stale.
+ * FNXC:ChildProcessRuntime 2026-10-07-20:07:
+ * At most one live child per runtime, and stop() leaves none.
+ * Each fork is a generation that reports at most one failure: a crash fires both `exit` and IPC `disconnect`, and missed heartbeats keep firing, but they cost one restart attempt, not several.
+ * A child is retired before its replacement starts or stop() returns: its listeners stop forwarding, it gets SIGTERM (a process-tree kill on Windows), and a SIGKILL bound to that child, not to a mutable field, if it ignores the signal. Termination is judged by its exit, not by `child.killed`, which only means a signal was sent.
+ * A child whose START_RUNTIME fails is killed rather than left running, and its piped stdout/stderr are drained into the runtime log so a chatty worker cannot block on a full pipe.
+ * Spawning through `superviseSpawn` is deferred: its default lifetime cap would kill a long-lived runtime child, and the worker exits on its own when the host's IPC channel closes.
  *
  * @example
  * ```typescript
@@ -156,18 +176,18 @@ export class ChildProcessRuntime
   implements ProjectRuntime
 {
   private status: RuntimeStatus = "stopped";
-  private child: ChildProcess | null = null;
-  private ipcHost: IpcHost | null = null;
+  private current: ChildGeneration | null = null;
   private healthMonitor: HealthMonitor;
   /**
    * Monotonic child-process generation.
    *
-   * Incremented before every spawn so delayed callbacks can invalidate themselves
+   * Incremented before every spawn so delayed restart callbacks can invalidate themselves
    * if they were scheduled against an older process generation.
    */
   private generation = 0;
-  private sigkillTimer: ReturnType<typeof setTimeout> | null = null;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Terminations of retired children still waiting for their exit. */
+  private readonly terminations = new Set<Promise<void>>();
   private lastMetrics: RuntimeMetrics = {
     inFlightTasks: 0,
     activeAgents: 0,
@@ -188,7 +208,9 @@ export class ChildProcessRuntime
     // Initialize health monitor
     this.healthMonitor = new HealthMonitor(
       async () => this.checkHealth(),
-      () => this.handleUnhealthy(),
+      () => {
+        if (this.current) this.reportFailure(this.current, "missed heartbeats");
+      },
       { intervalMs: 5000, maxMissedHeartbeats: 3, maxRestartAttempts: 3 }
     );
 
@@ -229,7 +251,7 @@ export class ChildProcessRuntime
   }
 
   /**
-   * Spawn the child process and set up IPC.
+   * Spawn the child process and set up IPC. A child whose START_RUNTIME fails is retired before the error propagates.
    */
   private async spawnChild(): Promise<void> {
     // Determine worker entry point
@@ -240,28 +262,49 @@ export class ChildProcessRuntime
     runtimeLog.log(`Forking child process: ${workerPath}`);
 
     // Fork child process
-    this.child = fork(workerPath, [], {
+    const child = fork(workerPath, [], {
       silent: true, // Pipe stdout/stderr
       execArgv: [], // Don't inherit exec arguments
     });
+    const gen: ChildGeneration = {
+      id: this.generation,
+      child,
+      ipcHost: new IpcHost(child, { commandTimeoutMs: 10000 }),
+      settled: false,
+    };
+    this.current = gen;
 
-    // Set up IPC host
-    this.ipcHost = new IpcHost(this.child, { commandTimeoutMs: 10000 });
+    this.drainOutput(child);
+    this.setupEventForwarding(gen);
 
-    // Set up event forwarding
-    this.setupEventForwarding();
+    child.on("exit", (code, signal) => {
+      runtimeLog.warn(`Child process exited (code: ${code}, signal: ${signal})`);
+      this.reportFailure(gen, `exit (code: ${code}, signal: ${signal})`);
+    });
 
     // Send START_RUNTIME command
     runtimeLog.log("Sending START_RUNTIME command to child");
-    await this.ipcHost.sendCommand(START_RUNTIME, { config: this.config });
+    try {
+      await gen.ipcHost.sendCommand(START_RUNTIME, { config: this.config });
+    } catch (error) {
+      await this.retire(gen);
+      throw error;
+    }
 
     // Start health monitoring
     this.healthMonitor.start();
+  }
 
-    // Handle child process exit
-    this.child.on("exit", (code, signal) => {
-      runtimeLog.warn(`Child process exited (code: ${code}, signal: ${signal})`);
-      this.handleChildExit(code, signal);
+  /** Forward the child's piped output to the log; an unread pipe fills and blocks the worker's writes. */
+  private drainOutput(child: ChildProcess): void {
+    const prefix = `[child ${this.config.projectId}]`;
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      const text = String(chunk).trimEnd();
+      if (text) runtimeLog.log(`${prefix} ${text}`);
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      const text = String(chunk).trimEnd();
+      if (text) runtimeLog.warn(`${prefix} ${text}`);
     });
   }
 
@@ -280,30 +323,30 @@ export class ChildProcessRuntime
   }
 
   /**
-   * Set up event forwarding from IPC host to runtime listeners.
+   * Set up event forwarding from one generation's IPC host to runtime listeners.
    */
-  private setupEventForwarding(): void {
-    if (!this.ipcHost) return;
+  private setupEventForwarding(gen: ChildGeneration): void {
+    const { ipcHost } = gen;
 
     // Forward task events
-    this.ipcHost.on(TASK_CREATED, (payload: TaskCreatedPayload) => {
+    ipcHost.on(TASK_CREATED, (payload: TaskCreatedPayload) => {
       this.emit("task:created", payload.task);
     });
 
-    this.ipcHost.on(TASK_MOVED, (payload: TaskMovedPayload) => {
+    ipcHost.on(TASK_MOVED, (payload: TaskMovedPayload) => {
       this.emit("task:moved", { task: payload.task, from: payload.from, to: payload.to });
     });
 
-    this.ipcHost.on(TASK_UPDATED, (payload: TaskUpdatedPayload) => {
+    ipcHost.on(TASK_UPDATED, (payload: TaskUpdatedPayload) => {
       this.emit("task:updated", payload.task);
     });
 
-    this.ipcHost.on(TASK_DELETED, (payload: TaskDeletedPayload) => {
+    ipcHost.on(TASK_DELETED, (payload: TaskDeletedPayload) => {
       this.emit("task:deleted", payload.task, payload.meta);
     });
 
     // Forward error events
-    this.ipcHost.on(ERROR_EVENT, (payload: ErrorEventPayload) => {
+    ipcHost.on(ERROR_EVENT, (payload: ErrorEventPayload) => {
       const error = new Error(payload.message);
       if (payload.code) {
         (error as Error & { code: string }).code = payload.code;
@@ -312,15 +355,15 @@ export class ChildProcessRuntime
     });
 
     // Forward health change events
-    this.ipcHost.on(HEALTH_CHANGED, (payload: HealthChangedPayload) => {
+    ipcHost.on(HEALTH_CHANGED, (payload: HealthChangedPayload) => {
       this.status = payload.status as RuntimeStatus;
       this.emit("health-changed", { status: payload.status, previous: payload.previous });
     });
 
     // Handle disconnect
-    this.ipcHost.on("disconnect", () => {
+    ipcHost.on("disconnect", () => {
       runtimeLog.warn("IPC host disconnected");
-      this.handleDisconnection();
+      this.reportFailure(gen, "IPC channel disconnected");
     });
   }
 
@@ -331,7 +374,7 @@ export class ChildProcessRuntime
    * 1. Set status to "stopping"
    * 2. Stop health monitoring
    * 3. Send STOP_RUNTIME command with 30s timeout
-   * 4. Kill child process if graceful shutdown fails
+   * 4. Retire the child and wait for it (and any child still being retired) to exit
    * 5. Set status to "stopped"
    */
   async stop(): Promise<void> {
@@ -342,73 +385,93 @@ export class ChildProcessRuntime
     this.setStatus("stopping");
     runtimeLog.log(`Stopping ChildProcessRuntime for project ${this.config.projectId}`);
 
-    // Cancel all pending timers (SIGKILL timeout, restart backoff)
+    // Cancel restart backoff
     this.clearAllTimers();
 
     // Stop health monitoring
     this.healthMonitor.stop();
 
+    const gen = this.current;
     try {
       // Send graceful shutdown command
-      if (this.ipcHost?.isConnected()) {
+      if (gen?.ipcHost.isConnected()) {
         runtimeLog.log("Sending STOP_RUNTIME command to child");
-        await this.ipcHost.sendCommand(STOP_RUNTIME, { timeoutMs: 30000 }, 35000);
+        await gen.ipcHost.sendCommand(STOP_RUNTIME, { timeoutMs: 30000 }, 35000);
       }
     } catch (error) {
       runtimeLog.warn(`Graceful shutdown failed: ${error}`);
     }
 
-    // Kill child process if still running
-    this.killChild();
+    if (gen) void this.retire(gen);
+    await Promise.all([...this.terminations]);
 
     this.setStatus("stopped");
     runtimeLog.log(`ChildProcessRuntime stopped for project ${this.config.projectId}`);
   }
 
   /**
-   * Kill the child process forcefully.
+   * Retire a generation: stop forwarding its events, ignore its late signals, and terminate its child.
+   * Resolves once the child has exited (or could not be observed exiting after a force kill).
    */
-  private killChild(): void {
-    if (this.sigkillTimer !== null) {
-      clearTimeout(this.sigkillTimer);
-      this.sigkillTimer = null;
-    }
+  private retire(gen: ChildGeneration): Promise<void> {
+    gen.settled = true;
+    if (this.current === gen) this.current = null;
+    gen.ipcHost.removeAllListeners();
 
-    if (this.child && !this.child.killed) {
+    const termination = this.terminate(gen.child);
+    this.terminations.add(termination);
+    void termination.finally(() => this.terminations.delete(termination));
+    return termination;
+  }
+
+  /** SIGTERM (a tree kill on Windows), then SIGKILL after a grace period, both bound to this child. */
+  private terminate(child: ChildProcess): Promise<void> {
+    if (hasExited(child)) return Promise.resolve();
+
+    return new Promise<void>((resolve) => {
+      let abandon: ReturnType<typeof setTimeout> | undefined;
+      const escalation = setTimeout(() => {
+        if (hasExited(child)) return finish();
+        runtimeLog.warn("Force killing child process");
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // already gone
+        }
+        abandon = setTimeout(() => {
+          runtimeLog.error(`Child process ${child.pid ?? "?"} did not report exit after SIGKILL`);
+          finish();
+        }, CHILD_EXIT_AFTER_SIGKILL_MS);
+      }, CHILD_SIGKILL_GRACE_MS);
+      function finish(): void {
+        clearTimeout(escalation);
+        clearTimeout(abandon);
+        child.removeListener("exit", finish);
+        resolve();
+      }
+      child.once("exit", finish);
+
       runtimeLog.log("Killing child process");
-      this.child.kill("SIGTERM");
-
-      const gen = this.generation;
-      this.sigkillTimer = setTimeout(() => {
-        this.sigkillTimer = null;
-
-        if (this.generation !== gen) {
-          return;
+      try {
+        if (process.platform === "win32") {
+          // Windows has no graceful SIGTERM and `kill` ends only the direct child; take the worker's agents with it.
+          killProcessTree(child);
+        } else {
+          child.kill("SIGTERM");
         }
-
-        if (this.child && !this.child.killed) {
-          runtimeLog.warn("Force killing child process");
-          this.child.kill("SIGKILL");
-        }
-      }, 5000);
-    }
-
-    this.child = null;
-    this.ipcHost = null;
+      } catch {
+        // already gone; the exit event or the escalation settles it
+      }
+    });
   }
 
   /**
-   * Clears all delayed lifecycle timers.
+   * Clears the restart backoff timer.
    *
-   * This is called during shutdown and before replacing pending callbacks so
-   * stale SIGKILL/restart timers cannot fire against newer runtime state.
+   * This is called during shutdown and before replacing a pending restart so
+   * a stale restart cannot fire against newer runtime state.
    */
   private clearAllTimers(): void {
-    if (this.sigkillTimer !== null) {
-      clearTimeout(this.sigkillTimer);
-      this.sigkillTimer = null;
-    }
-
     if (this.restartTimer !== null) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
@@ -448,10 +511,11 @@ export class ChildProcessRuntime
    * Get current runtime metrics (via IPC query).
    */
   getMetrics(): RuntimeMetrics {
+    const ipcHost = this.current?.ipcHost;
     // Query metrics via IPC if connected
-    if (this.ipcHost?.isConnected()) {
+    if (ipcHost?.isConnected()) {
       // Fire-and-forget metrics request - returns cached value immediately
-      this.ipcHost
+      ipcHost
         .sendCommand(GET_METRICS, {})
         .then((metrics: unknown) => {
           this.lastMetrics = metrics as RuntimeMetrics;
@@ -472,12 +536,13 @@ export class ChildProcessRuntime
    * Check health by pinging the child process.
    */
   private async checkHealth(): Promise<boolean> {
-    if (!this.ipcHost?.isConnected()) {
+    const ipcHost = this.current?.ipcHost;
+    if (!ipcHost?.isConnected()) {
       return false;
     }
 
     try {
-      await this.ipcHost.ping(5000);
+      await ipcHost.ping(5000);
       return true;
     } catch {
       return false;
@@ -485,7 +550,18 @@ export class ChildProcessRuntime
   }
 
   /**
-   * Handle unhealthy child process (restart or error).
+   * Report a generation's failure once. Signals from a retired or already-failed generation, or while stopping, are ignored.
+   */
+  private reportFailure(gen: ChildGeneration, reason: string): void {
+    if (gen.settled || this.current !== gen) return;
+    if (this.isStopping()) return;
+    gen.settled = true;
+    runtimeLog.warn(`Unexpected child failure (${reason})`);
+    this.handleUnhealthy();
+  }
+
+  /**
+   * Schedule a restart with backoff, or transition to errored once restarts are exhausted.
    */
   private handleUnhealthy(): void {
     const maxRestarts = 3;
@@ -499,6 +575,7 @@ export class ChildProcessRuntime
       runtimeLog.error(`Max restart attempts (${maxRestarts}) reached, transitioning to errored`);
       this.setStatus("errored");
       this.emit("error", new Error("Child process failed after max restart attempts"));
+      if (this.current) void this.retire(this.current);
       return;
     }
 
@@ -515,15 +592,24 @@ export class ChildProcessRuntime
         return;
       }
 
-      if (this.status === "stopping" || this.status === "stopped") {
+      if (this.isStopping()) {
         return;
       }
 
       try {
-        this.killChild();
+        // The replacement starts only after the failed child is gone; a fresh heartbeat count goes with it.
+        this.healthMonitor.stop();
+        if (this.current) await this.retire(this.current);
+        if (this.isStopping()) return;
         await this.spawnChild();
+        if (this.isStopping()) {
+          // stop() ran while the replacement was starting; it must not outlive the runtime.
+          if (this.current) await this.retire(this.current);
+          return;
+        }
         runtimeLog.log("Child process restarted successfully");
       } catch (error) {
+        if (this.isStopping()) return;
         runtimeLog.error("Failed to restart child process:", error);
         this.setStatus("errored");
         this.emit("error", error instanceof Error ? error : new Error(String(error)));
@@ -531,28 +617,8 @@ export class ChildProcessRuntime
     }, delay);
   }
 
-  /**
-   * Handle child process exit.
-   */
-  private handleChildExit(code: number | null, signal: string | null): void {
-    // Don't restart if we're intentionally stopping
-    if (this.status === "stopping" || this.status === "stopped") {
-      return;
-    }
-
-    // Unexpected exit - trigger restart
-    runtimeLog.warn(`Unexpected child exit (code: ${code}, signal: ${signal})`);
-    this.handleUnhealthy();
-  }
-
-  /**
-   * Handle IPC disconnection.
-   */
-  private handleDisconnection(): void {
-    if (this.status !== "stopping" && this.status !== "stopped") {
-      runtimeLog.error("IPC channel disconnected unexpectedly");
-      this.handleUnhealthy();
-    }
+  private isStopping(): boolean {
+    return this.status === "stopping" || this.status === "stopped";
   }
 
   /**

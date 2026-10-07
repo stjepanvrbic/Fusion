@@ -9,6 +9,9 @@
  * determinism.
  */
 import { describe, expect, it, vi } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { CustomFieldRejection, TaskDetail, WorkflowIrNode } from "@fusion/core";
 
 import {
@@ -20,6 +23,7 @@ import {
   CodeNodeError,
   CODE_NODE_MAX_SOURCE_BYTES,
   CODE_NODE_OUTPUT_CAP_BYTES,
+  buildChildHarness,
   type CodeNodeResult,
 } from "../execution/code-node-runner.js";
 import { FOREACH_ACTIVE_CONTEXT_KEY } from "../workflows/workflow-node-handlers.js";
@@ -271,4 +275,18 @@ describe("runCodeNode real child process (U14, hermetic)", () => {
       }),
     ).rejects.toMatchObject({ reason: "timeout" });
   }, 10_000);
+});
+
+// FNXC:CodeNodes 2026-10-07-20:07: ESM accepts only URL specifiers for absolute paths on Windows; the harness must import the user module by file URL on every platform.
+describe("code node harness module specifier", () => {
+  it("imports the user module by a file: URL that resolves back to its absolute path", () => {
+    const userModuleFile = join(tmpdir(), "fusion code node", "user.mjs");
+    const harness = buildChildHarness(userModuleFile);
+
+    const match = /^import userMod from (".*");$/m.exec(harness);
+    expect(match).not.toBeNull();
+    const specifier = JSON.parse(match![1]) as string;
+    expect(specifier.startsWith("file:///")).toBe(true);
+    expect(fileURLToPath(specifier)).toBe(userModuleFile);
+  });
 });

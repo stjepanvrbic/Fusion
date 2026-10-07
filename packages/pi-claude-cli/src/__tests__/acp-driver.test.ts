@@ -71,6 +71,51 @@ function eventsOf(stream: { _events: Array<Record<string, unknown>> }) {
 }
 const flush = () => new Promise((r) => setTimeout(r, 30));
 
+
+/*
+FNXC:ClaudeCliProvider 2026-10-07-19:34:
+The ACP route settles a failed or cancelled turn with pi-ai's `error` event (stopReason `error`/`aborted`), never a completed `stop`, and an already-aborted request settles without spawning.
+*/
+describe("streamViaAcp — failure and abort settlement", () => {
+  beforeEach(() => { scriptedUpdates = []; scriptedUsage = undefined; scriptedHang = false; vi.mocked(spawn).mockClear(); });
+  const terminal = (s: { _events: Array<Record<string, unknown>> }) =>
+    s._events.filter((e) => e.type === "done" || e.type === "error") as Array<{ type: string; reason?: string; error?: { stopReason?: string; errorMessage?: string } }>;
+
+  it("settles an already-aborted request as aborted without spawning the bridge", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const s = streamViaAcp(MODEL, CTX, { ...OPTS, signal: controller.signal }) as unknown as { _events: Array<Record<string, unknown>>; end: ReturnType<typeof vi.fn> };
+    await flush();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(terminal(s).map((e) => [e.type, e.reason, e.error?.stopReason])).toEqual([["error", "aborted", "aborted"]]);
+    expect(s.end).toHaveBeenCalledTimes(1);
+  });
+
+  it("settles an abort mid-prompt as aborted", async () => {
+    scriptedHang = true;
+    const controller = new AbortController();
+    const s = streamViaAcp(MODEL, CTX, { ...OPTS, signal: controller.signal }) as unknown as { _events: Array<Record<string, unknown>> };
+    await flush();
+    expect(terminal(s)).toHaveLength(0);
+    controller.abort();
+    await flush();
+    expect(terminal(s).map((e) => [e.type, e.reason, e.error?.stopReason])).toEqual([["error", "aborted", "aborted"]]);
+  });
+
+  it("fails the turn when the bridge exits mid-prompt", async () => {
+    scriptedHang = true;
+    const s = streamViaAcp(MODEL, CTX, OPTS) as unknown as { _events: Array<Record<string, unknown>> };
+    await flush();
+    (vi.mocked(spawn).mock.results[0].value as EventEmitter).emit("close", 1);
+    await flush();
+    const [failure] = terminal(s);
+    expect(terminal(s)).toHaveLength(1);
+    expect(failure.type).toBe("error");
+    expect(failure.error?.stopReason).toBe("error");
+    expect(failure.error?.errorMessage).toContain("ACP bridge exited (code 1)");
+  });
+});
+
 describe("streamViaAcp — ACP→pi translation (U11)", () => {
   beforeEach(() => { scriptedUpdates = []; scriptedUsage = undefined; scriptedHang = false; });
 
@@ -267,10 +312,11 @@ describe("connection reuse (item 1) — gated by FUSION_CLAUDE_ACP_REUSE", () =>
     // CURRENT (reuse) turn via router.fail, so it ends immediately.
     child.emit("close", 1);
     await flush();
-    const done = s2._events.find((e) => e.type === "done") as { reason?: string; message?: { content?: Array<{ text?: string }> } };
-    expect(done).toBeDefined();
-    expect(done!.reason).toBe("stop");
-    expect(JSON.stringify(done!.message?.content)).toContain("Error");
+    const terminal = s2._events.filter((e) => e.type === "done" || e.type === "error") as Array<{ type: string; reason?: string; error?: { stopReason?: string; errorMessage?: string } }>;
+    expect(terminal.map((e) => e.type)).toEqual(["error"]);
+    expect(terminal[0].reason).toBe("error");
+    expect(terminal[0].error?.stopReason).toBe("error");
+    expect(terminal[0].error?.errorMessage).toContain("ACP bridge exited");
 
     // Cache was evicted: a subsequent turn cold-spawns a fresh bridge.
     scriptedHang = false;

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { EventEmitter } from "node:events";
 import type { CentralCore, Task } from "@fusion/core";
 import { ChildProcessRuntime } from "../child-process-runtime.js";
 import type {
@@ -33,35 +34,54 @@ type MockChildOptions = {
   pingResults?: boolean[];
   metricsResponse?: RuntimeMetrics;
   sendCallbackErrors?: Partial<Record<string, Error>>;
-  markKilledOnSigterm?: boolean;
-  emitExitOnKill?: boolean;
+  /** The child receives SIGTERM but keeps running, like a worker hung in its shutdown handler. */
+  ignoreSigterm?: boolean;
 };
 
-type MockChildProcess = {
-  on: ReturnType<typeof vi.fn>;
+type MockChildProcess = EventEmitter & {
   send: ReturnType<typeof vi.fn>;
   kill: ReturnType<typeof vi.fn>;
   disconnect: ReturnType<typeof vi.fn>;
-  emit: (event: string, ...args: unknown[]) => void;
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+  pid: number;
   connected: boolean;
   killed: boolean;
+  exitCode: number | null;
+  signalCode: string | null;
   sentMessages: CommandMessage[];
+  /** Exit as a real process does: the IPC channel closes, then `exit` fires. */
+  exitNow: (code: number | null, signal: string | null) => void;
 };
 
 const forkedChildren: MockChildProcess[] = [];
+/** Forked children that have not exited; the runtime must never hold more than one. */
+const liveChildren = new Set<MockChildProcess>();
+let maxLiveChildren = 0;
 const queuedForkOptions: MockChildOptions[] = [];
 
+let nextPid = 5000;
+
 function createMockChildProcess(options: MockChildOptions = {}): MockChildProcess {
-  const listeners = new Map<string, Listener[]>();
   const pingResults = [...(options.pingResults ?? [])];
 
-  const child: MockChildProcess = {
-    on: vi.fn((event: string, handler: Listener) => {
-      const existing = listeners.get(event) ?? [];
-      existing.push(handler);
-      listeners.set(event, existing);
-      return child;
-    }),
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: nextPid++,
+    exitCode: null as number | null,
+    signalCode: null as string | null,
+    exitNow: (code: number | null, signal: string | null) => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      child.exitCode = code;
+      child.signalCode = signal;
+      liveChildren.delete(child);
+      if (child.connected) {
+        child.connected = false;
+        child.emit("disconnect");
+      }
+      child.emit("exit", code, signal);
+    },
     send: vi.fn((message: CommandMessage, callback?: (error: Error | null) => void) => {
       child.sentMessages.push(message);
 
@@ -109,30 +129,22 @@ function createMockChildProcess(options: MockChildOptions = {}): MockChildProces
       return true;
     }),
     kill: vi.fn((signal?: string | number) => {
-      if (signal === "SIGKILL" || (signal === "SIGTERM" && options.markKilledOnSigterm !== false)) {
-        child.killed = true;
-      }
-
-      if (options.emitExitOnKill) {
-        child.emit("exit", signal === "SIGKILL" ? 137 : 0, typeof signal === "string" ? signal : null);
-      }
-
+      // `killed` means a signal was delivered, not that the process exited.
+      child.killed = true;
+      if (signal === "SIGTERM" && options.ignoreSigterm) return true;
+      queueMicrotask(() => child.exitNow(null, typeof signal === "string" ? signal : "SIGTERM"));
       return true;
     }),
     disconnect: vi.fn(() => {
       child.connected = false;
       child.emit("disconnect");
     }),
-    emit: (event: string, ...args: unknown[]) => {
-      for (const handler of listeners.get(event) ?? []) {
-        handler(...(args as any[]));
-      }
-    },
     connected: true,
     killed: false,
-    sentMessages: [],
-  };
+    sentMessages: [] as CommandMessage[],
+  }) as MockChildProcess;
 
+  liveChildren.add(child);
   return child;
 }
 
@@ -140,11 +152,25 @@ const mockFork = vi.fn(() => {
   const options = queuedForkOptions.shift() ?? {};
   const child = createMockChildProcess(options);
   forkedChildren.push(child);
+  maxLiveChildren = Math.max(maxLiveChildren, liveChildren.size);
   return child;
 });
 
-vi.mock("node:child_process", () => ({
+// taskkill for the Windows tree kill; resolves the target's exit like the real one.
+const mockSpawn = vi.fn((_command: string, args: string[]) => {
+  const killer = Object.assign(new EventEmitter(), { unref: vi.fn() });
+  const pid = Number(args[1]);
+  queueMicrotask(() => {
+    forkedChildren.find((child) => child.pid === pid)?.exitNow(1, null);
+    killer.emit("exit", 0);
+  });
+  return killer;
+});
+
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   fork: (...args: unknown[]) => (mockFork as (...mockArgs: unknown[]) => unknown)(...args),
+  spawn: (...args: unknown[]) => (mockSpawn as (...mockArgs: unknown[]) => unknown)(...args),
 }));
 
 function queueChild(options: MockChildOptions = {}): void {
@@ -195,8 +221,13 @@ describe("ChildProcessRuntime", () => {
 
   beforeEach(() => {
     mockFork.mockClear();
+    mockSpawn.mockClear();
     forkedChildren.length = 0;
     queuedForkOptions.length = 0;
+    liveChildren.clear();
+    maxLiveChildren = 0;
+    // Termination is platform-specific; the default suite asserts the POSIX signals.
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
 
     const mockCentralCore = {
       getGlobalConcurrencyState: vi.fn().mockResolvedValue({
@@ -326,23 +357,29 @@ describe("ChildProcessRuntime", () => {
       expect(runtime.getStatus()).toBe("stopped");
     });
 
-    it("force-kills with SIGKILL after 5s timeout when child remains alive", async () => {
+    it("force-kills the same child with SIGKILL when it ignores SIGTERM, and waits for it to exit", async () => {
       vi.useFakeTimers();
-      queueChild({ markKilledOnSigterm: false });
+      queueChild({ ignoreSigterm: true });
 
       await runtime.start();
       const child = getLatestChild();
 
-      await runtime.stop();
-
-      // Keep a live child reference so the delayed SIGKILL callback can execute the force-kill path.
-      runtimeAny.child = child;
-      child.killed = false;
-
-      await vi.advanceTimersByTimeAsync(5000);
-
+      let stopped = false;
+      const stopping = runtime.stop().then(() => {
+        stopped = true;
+      });
+      await vi.advanceTimersByTimeAsync(4_999);
       expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(child.kill).not.toHaveBeenCalledWith("SIGKILL");
+      expect(stopped).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await stopping;
+
       expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+      expect(child.signalCode).toBe("SIGKILL");
+      expect(liveChildren.size).toBe(0);
+      expect(runtime.getStatus()).toBe("stopped");
     });
   });
 
@@ -512,6 +549,149 @@ describe("ChildProcessRuntime", () => {
       child.emit("disconnect");
 
       expect(unhealthySpy).not.toHaveBeenCalled();
+    });
+  });
+
+  /*
+  FNXC:ChildProcessRuntime 2026-10-07-20:07:
+  At most one live child per runtime and none after stop(); one failure per child generation; failed starts leave no child.
+  */
+  describe("child lifecycle invariants", () => {
+    it("charges one restart attempt when a crash fires both exit and disconnect", async () => {
+      vi.useFakeTimers();
+      queueChild();
+      queueChild();
+      runtime.on("error", () => {});
+      await runtime.start();
+
+      getLatestChild().exitNow(1, null);
+      expect(runtimeAny.healthMonitor.getRestartAttempts()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(mockFork).toHaveBeenCalledTimes(2);
+      expect(runtime.getStatus()).toBe("active");
+    });
+
+    it("keeps the healthy replacement when the old child's late exit arrives after a heartbeat restart", async () => {
+      vi.useFakeTimers();
+      queueChild({ pingResults: [false, false, false], ignoreSigterm: true });
+      queueChild({ pingResults: [true, true, true, true] });
+      runtime.on("error", () => {});
+      await runtime.start();
+      const first = getLatestChild();
+
+      // Three missed heartbeats, then the 1s backoff: the old child is signalled but has not exited yet.
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(first.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(mockFork).toHaveBeenCalledTimes(1);
+
+      // The replacement forks only after the old child is gone.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(first.signalCode).toBe("SIGKILL");
+      expect(mockFork).toHaveBeenCalledTimes(2);
+      const second = getLatestChild();
+
+      first.emit("exit", 137, "SIGKILL");
+      first.emit("disconnect");
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      expect(second.kill).not.toHaveBeenCalled();
+      expect(mockFork).toHaveBeenCalledTimes(2);
+      expect(runtime.getStatus()).toBe("active");
+      expect(maxLiveChildren).toBe(1);
+    });
+
+    it("charges one restart attempt for repeated missed heartbeats from the same child", async () => {
+      vi.useFakeTimers();
+      queueChild({ pingResults: Array(10).fill(false), ignoreSigterm: true });
+      queueChild();
+      runtime.on("error", () => {});
+      await runtime.start();
+
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(4_000);
+
+      expect(runtimeAny.healthMonitor.getRestartAttempts()).toBe(1);
+
+      // The SIGTERM-ignoring child is still being retired; let stop() escalate on the fake clock.
+      const stopping = runtime.stop();
+      await vi.advanceTimersByTimeAsync(10_000);
+      await stopping;
+      expect(liveChildren.size).toBe(0);
+    });
+
+    it("kills the forked child when START_RUNTIME fails", async () => {
+      queueChild({ sendCallbackErrors: { [START_RUNTIME]: new Error("start send failed") } });
+      runtime.on("error", () => {});
+
+      await expect(runtime.start()).rejects.toThrow("start send failed");
+
+      const child = getLatestChild();
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(liveChildren.size).toBe(0);
+    });
+
+    it("leaves no child when stop() lands during restart backoff", async () => {
+      vi.useFakeTimers();
+      queueChild();
+      runtime.on("error", () => {});
+      await runtime.start();
+
+      getLatestChild().exitNow(1, null);
+      await runtime.stop();
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      expect(mockFork).toHaveBeenCalledTimes(1);
+      expect(liveChildren.size).toBe(0);
+      expect(runtime.getStatus()).toBe("stopped");
+    });
+
+    it("retires the child when restarts are exhausted", async () => {
+      queueChild();
+      runtime.on("error", () => {});
+      await runtime.start();
+      const child = getLatestChild();
+      runtimeAny.healthMonitor.incrementRestartAttempts();
+      runtimeAny.healthMonitor.incrementRestartAttempts();
+      runtimeAny.healthMonitor.incrementRestartAttempts();
+
+      child.emit("disconnect");
+      await Promise.resolve();
+
+      expect(runtime.getStatus()).toBe("errored");
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    });
+
+    it("drains the child's piped stdout and stderr into the runtime log", async () => {
+      const logSpy = vi.spyOn(runtimeLog, "log");
+      const warnSpy = vi.spyOn(runtimeLog, "warn");
+      queueChild();
+      await runtime.start();
+      const child = getLatestChild();
+
+      child.stdout.emit("data", Buffer.from("worker says hi\n"));
+      child.stderr.emit("data", Buffer.from("worker warns\n"));
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("worker says hi"));
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("worker warns"));
+    });
+
+    it("terminates the child's whole process tree on Windows", async () => {
+      vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+      queueChild();
+      await runtime.start();
+      const child = getLatestChild();
+
+      await runtime.stop();
+
+      expect(mockSpawn).toHaveBeenCalledWith(
+        // Core resolves taskkill under %SystemRoot%\System32 when it is set.
+        expect.stringMatching(/(^|[\\/])taskkill(\.exe)?$/i),
+        ["/PID", String(child.pid), "/T", "/F"],
+        expect.objectContaining({ shell: false }),
+      );
+      expect(liveChildren.size).toBe(0);
     });
   });
 

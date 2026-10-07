@@ -9,7 +9,7 @@
  * 2. Creates an IpcWorker instance
  * 3. Registers command handlers (START_RUNTIME, STOP_RUNTIME, etc.)
  * 4. Forwards all runtime events to the host via IPC
- * 5. Handles graceful shutdown on SIGTERM
+ * 5. Handles graceful shutdown on SIGTERM, and exits when the host's IPC channel closes
  */
 
 import { IpcWorker } from "../ipc/ipc-worker.js";
@@ -172,6 +172,30 @@ process.on("SIGINT", async () => {
   }
 
   ipcWorker.shutdown();
+});
+
+/** Upper bound on engine shutdown after the host is gone; the worker exits either way. */
+const ORPHAN_SHUTDOWN_TIMEOUT_MS = 30_000;
+
+/*
+FNXC:ChildProcessRuntime 2026-10-07-20:07:
+A host that crashes or is killed never sends STOP_RUNTIME or SIGTERM; its IPC channel closing is the only signal the worker gets.
+Stop the engine and exit, bounded, so no orphan engine keeps working the project after its host is gone.
+*/
+ipcWorker.on("disconnect", () => {
+  runtimeLog.warn("Host IPC channel closed; stopping engine and exiting");
+  const forceExit = setTimeout(() => process.exit(1), ORPHAN_SHUTDOWN_TIMEOUT_MS);
+  forceExit.unref?.();
+  void (async () => {
+    if (engine) {
+      try {
+        await engine.stop();
+      } catch (error) {
+        runtimeLog.error("Error stopping engine after host disconnect:", error);
+      }
+    }
+    process.exit(0);
+  })();
 });
 
 runtimeLog.log("Child process worker initialized and ready");

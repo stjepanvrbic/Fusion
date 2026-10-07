@@ -47,6 +47,75 @@ class RemoteNodeRequestError extends Error {
 const RETRY_BASE_DELAY_MS = 1000;
 const DEFAULT_MAX_RETRIES = 3;
 
+/**
+ * One request's cancellation: the caller's signal plus a deadline, kept attached until the response body is consumed.
+ *
+ * FNXC:RemoteNodeRuntime 2026-10-07-19:50:
+ * The timeout and the caller's abort used to detach as soon as fetch returned headers, so a body that stalled after its headers could never be cancelled.
+ * A silent SSE stream then kept `RemoteNodeRuntime.stop()` waiting forever on a pending read, and JSON bodies outlived the request timeout.
+ * Every request now keeps both attached through body consumption: ordinary JSON bodies stay under the deadline, long-lived stream bodies drop only the deadline, and an abort cancels the pending body read.
+ */
+interface RequestScope {
+  readonly signal: AbortSignal;
+  timedOut(): boolean;
+  /** Stop the deadline; a long-lived stream body stays bounded by the caller's signal. */
+  clearDeadline(): void;
+  /** Detach from the caller's signal and abort the request so an unread body releases its connection. Idempotent. */
+  dispose(): void;
+}
+
+export interface RemoteNodeRequestOptions {
+  signal?: AbortSignal;
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("The operation was aborted");
+}
+
+/**
+ * Yield a body's chunks, cancelling the reader the moment `signal` aborts so a stalled read wakes up.
+ * Ends quietly on abort; a consumer that stops early also cancels the body.
+ */
+async function* readChunks(body: ReadableStream<Uint8Array>, signal: AbortSignal): AsyncGenerator<Uint8Array> {
+  const reader = body.getReader();
+  const cancel = () => {
+    void reader.cancel(signal.reason).catch(() => undefined);
+  };
+  signal.addEventListener("abort", cancel, { once: true });
+  let finished = false;
+  try {
+    while (!signal.aborted) {
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await reader.read();
+      } catch (error) {
+        if (signal.aborted) return;
+        throw error;
+      }
+      if (result.done) {
+        finished = true;
+        return;
+      }
+      if (result.value) yield result.value;
+    }
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    if (!finished) void reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
+/** Read a whole body as text; an abort mid-read rejects instead of returning a truncated body. */
+async function readAllText(body: ReadableStream<Uint8Array>, signal: AbortSignal): Promise<string> {
+  const decoder = new TextDecoder();
+  let text = "";
+  for await (const chunk of readChunks(body, signal)) {
+    text += decoder.decode(chunk, { stream: true });
+  }
+  if (signal.aborted) throw abortReason(signal);
+  return text + decoder.decode();
+}
+
 export class RemoteNodeClient {
   private readonly baseUrl: string;
   private readonly apiKey: string;
@@ -58,11 +127,16 @@ export class RemoteNodeClient {
     this.timeoutMs = options.timeoutMs ?? 30_000;
   }
 
-  async health(): Promise<{ status: string; version: string; uptime: number }> {
-    return this.withRetry(() =>
-      this.requestJson<{ status: string; version: string; uptime: number }>("/api/health", {
-        method: "GET",
-      })
+  async health(options?: RemoteNodeRequestOptions): Promise<{ status: string; version: string; uptime: number }> {
+    return this.withRetry(
+      () =>
+        this.requestJson<{ status: string; version: string; uptime: number }>(
+          "/api/health",
+          { method: "GET" },
+          options?.signal
+        ),
+      DEFAULT_MAX_RETRIES,
+      options?.signal
     );
   }
 
@@ -112,7 +186,9 @@ export class RemoteNodeClient {
     );
   }
 
-  async pollPendingAssignments(options?: { since?: string }): Promise<RemoteNodeTaskAssignedPayload[]> {
+  async pollPendingAssignments(
+    options?: { since?: string } & RemoteNodeRequestOptions
+  ): Promise<RemoteNodeTaskAssignedPayload[]> {
     const query = new URLSearchParams();
     if (options?.since) {
       query.set("since", options.since);
@@ -120,93 +196,121 @@ export class RemoteNodeClient {
     const path = query.size > 0
       ? `/api/events/assignments?${query.toString()}`
       : "/api/events/assignments";
-    return this.withRetry(() =>
-      this.requestJson<RemoteNodeTaskAssignedPayload[]>(path, {
-        method: "GET",
-      })
+    return this.withRetry(
+      () => this.requestJson<RemoteNodeTaskAssignedPayload[]>(path, { method: "GET" }, options?.signal),
+      DEFAULT_MAX_RETRIES,
+      options?.signal
     );
   }
 
-  async *streamEvents(options?: { signal?: AbortSignal }): AsyncIterable<RemoteNodeEvent> {
-    const response = await this.withRetry(
-      () => this.openStream("/api/events/stream", options?.signal),
-      DEFAULT_MAX_RETRIES
+  async *streamEvents(options?: RemoteNodeRequestOptions): AsyncIterable<RemoteNodeEvent> {
+    const path = "/api/events/stream";
+    const { response, scope } = await this.withRetry(
+      () => this.openStream(path, options?.signal),
+      DEFAULT_MAX_RETRIES,
+      options?.signal
     );
-
-    const contentType = response.headers.get("content-type") ?? "";
-    if (!response.body) {
-      throw new Error("Remote node event stream opened without a body");
-    }
-
-    if (contentType.includes("text/event-stream")) {
-      yield* this.parseSseStream(response.body, options?.signal);
-      return;
-    }
-
-    // Fallback for long-polling endpoints that return JSON payloads.
-    if (contentType.includes("application/json")) {
-      const payload = (await response.json()) as unknown;
-      if (Array.isArray(payload)) {
-        for (const rawEvent of payload) {
-          yield this.normalizeEvent(rawEvent, "message");
-        }
-      } else {
-        yield this.normalizeEvent(payload, "message");
-      }
-      return;
-    }
-
-    // Generic fallback: treat each line as one JSON event.
-    yield* this.parseJsonLines(response.body, options?.signal);
-  }
-
-  private async requestJson<T>(path: string, init: RequestInit): Promise<T> {
-    const response = await this.fetchWithTimeout(path, {
-      ...init,
-      headers: {
-        ...this.getAuthHeaders(),
-        Accept: "application/json",
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
-        ...(init.headers ?? {}),
-      },
-    });
-
-    if (!response.ok) {
-      await this.throwHttpError(path, response);
-    }
 
     try {
-      return (await response.json()) as T;
-    } catch (error) {
-      throw new RemoteNodeRequestError(
-        `Failed to parse JSON response for ${path}: ${error instanceof Error ? error.message : String(error)}`,
-        false
-      );
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!response.body) {
+        throw new Error("Remote node event stream opened without a body");
+      }
+
+      if (contentType.includes("text/event-stream")) {
+        scope.clearDeadline();
+        yield* this.parseSseStream(response.body, scope.signal);
+        return;
+      }
+
+      // Fallback for long-polling endpoints that return JSON payloads; the body stays under the request deadline.
+      if (contentType.includes("application/json")) {
+        const payload = JSON.parse(await this.readBodyText(path, response, scope)) as unknown;
+        if (Array.isArray(payload)) {
+          for (const rawEvent of payload) {
+            yield this.normalizeEvent(rawEvent, "message");
+          }
+        } else {
+          yield this.normalizeEvent(payload, "message");
+        }
+        return;
+      }
+
+      // Generic fallback: treat each line as one JSON event.
+      scope.clearDeadline();
+      yield* this.parseJsonLines(response.body, scope.signal);
+    } finally {
+      scope.dispose();
     }
   }
 
-  private async openStream(path: string, signal?: AbortSignal): Promise<Response> {
-    const response = await this.fetchWithTimeout(
-      path,
-      {
-        method: "GET",
-        headers: {
-          ...this.getAuthHeaders(),
-          Accept: "text/event-stream, application/json",
+  private async requestJson<T>(path: string, init: RequestInit, signal?: AbortSignal): Promise<T> {
+    const scope = this.openScope(path, signal);
+    try {
+      const response = await this.fetchInScope(
+        path,
+        {
+          ...init,
+          headers: {
+            ...this.getAuthHeaders(),
+            Accept: "application/json",
+            ...(init.body ? { "Content-Type": "application/json" } : {}),
+            ...(init.headers ?? {}),
+          },
         },
-      },
-      signal
-    );
+        scope
+      );
 
-    if (!response.ok) {
-      await this.throwHttpError(path, response);
+      if (!response.ok) {
+        await this.throwHttpError(path, response, scope);
+      }
+
+      const text = await this.readBodyText(path, response, scope);
+      try {
+        return JSON.parse(text) as T;
+      } catch (error) {
+        throw new RemoteNodeRequestError(
+          `Failed to parse JSON response for ${path}: ${error instanceof Error ? error.message : String(error)}`,
+          false
+        );
+      }
+    } finally {
+      scope.dispose();
     }
-
-    return response;
   }
 
-  private async throwHttpError(path: string, response: Response): Promise<never> {
-    const responseBody = (await response.text()).trim();
+  private async openStream(
+    path: string,
+    signal?: AbortSignal
+  ): Promise<{ response: Response; scope: RequestScope }> {
+    const scope = this.openScope(path, signal);
+    try {
+      const response = await this.fetchInScope(
+        path,
+        {
+          method: "GET",
+          headers: {
+            ...this.getAuthHeaders(),
+            Accept: "text/event-stream, application/json",
+          },
+        },
+        scope
+      );
+
+      if (!response.ok) {
+        await this.throwHttpError(path, response, scope);
+      }
+
+      return { response, scope };
+    } catch (error) {
+      scope.dispose();
+      throw error;
+    }
+  }
+
+  private async throwHttpError(path: string, response: Response, scope: RequestScope): Promise<never> {
+    // The status is the error; a body that fails or stalls must not replace it.
+    const responseBody = (await this.readBodyText(path, response, scope).catch(() => "")).trim();
     const snippet = responseBody.length > 0 ? ` — ${responseBody.slice(0, 300)}` : "";
     const retryable = response.status >= 500;
 
@@ -223,66 +327,82 @@ export class RemoteNodeClient {
     };
   }
 
-  private async fetchWithTimeout(
-    path: string,
-    init: RequestInit,
-    externalSignal?: AbortSignal
-  ): Promise<Response> {
+  private openScope(path: string, externalSignal?: AbortSignal): RequestScope {
+    if (externalSignal?.aborted) {
+      throw new RemoteNodeRequestError(`Remote node request aborted (${path})`, false);
+    }
+
     const controller = new AbortController();
     let timedOut = false;
-
-    const timeout = setTimeout(() => {
+    let deadline: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
       timedOut = true;
       controller.abort();
     }, this.timeoutMs);
-
+    const clearDeadline = () => {
+      if (deadline !== undefined) clearTimeout(deadline);
+      deadline = undefined;
+    };
     const onAbort = () => controller.abort(externalSignal?.reason);
-    if (externalSignal) {
-      if (externalSignal.aborted) {
-        clearTimeout(timeout);
-        throw new RemoteNodeRequestError("Request aborted", false);
-      }
-      externalSignal.addEventListener("abort", onAbort, { once: true });
-    }
+    externalSignal?.addEventListener("abort", onAbort, { once: true });
 
+    return {
+      signal: controller.signal,
+      timedOut: () => timedOut,
+      clearDeadline,
+      dispose: () => {
+        clearDeadline();
+        externalSignal?.removeEventListener("abort", onAbort);
+        controller.abort();
+      },
+    };
+  }
+
+  private async fetchInScope(path: string, init: RequestInit, scope: RequestScope): Promise<Response> {
     try {
       return await fetch(`${this.baseUrl}${path}`, {
         ...init,
-        signal: controller.signal,
+        signal: scope.signal,
       });
     } catch (error) {
-      if (error instanceof RemoteNodeRequestError) {
-        throw error;
-      }
+      throw this.toRequestError(path, scope, error);
+    }
+  }
 
-      if (timedOut) {
-        throw new RemoteNodeRequestError(
-          `Remote node request timed out after ${this.timeoutMs}ms (${path})`,
-          true
-        );
-      }
+  private async readBodyText(path: string, response: Response, scope: RequestScope): Promise<string> {
+    if (!response.body) return "";
+    try {
+      return await readAllText(response.body, scope.signal);
+    } catch (error) {
+      throw this.toRequestError(path, scope, error);
+    }
+  }
 
-      if (error instanceof Error && error.name === "AbortError") {
-        throw new RemoteNodeRequestError(`Remote node request aborted (${path})`, false);
-      }
+  private toRequestError(path: string, scope: RequestScope, error: unknown): RemoteNodeRequestError {
+    if (error instanceof RemoteNodeRequestError) {
+      return error;
+    }
 
-      throw new RemoteNodeRequestError(
-        `Remote node network error (${path}): ${error instanceof Error ? error.message : String(error)}`,
+    if (scope.timedOut()) {
+      return new RemoteNodeRequestError(
+        `Remote node request timed out after ${this.timeoutMs}ms (${path})`,
         true
       );
-    } finally {
-      clearTimeout(timeout);
-      if (externalSignal) {
-        externalSignal.removeEventListener("abort", onAbort);
-      }
     }
+
+    if (scope.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+      return new RemoteNodeRequestError(`Remote node request aborted (${path})`, false);
+    }
+
+    return new RemoteNodeRequestError(
+      `Remote node network error (${path}): ${error instanceof Error ? error.message : String(error)}`,
+      true
+    );
   }
 
   private async *parseSseStream(
     stream: ReadableStream<Uint8Array>,
-    signal?: AbortSignal
+    signal: AbortSignal
   ): AsyncIterable<RemoteNodeEvent> {
-    const reader = stream.getReader();
     const decoder = new TextDecoder();
 
     let buffer = "";
@@ -303,91 +423,74 @@ export class RemoteNodeClient {
       return normalized;
     };
 
-    try {
-      while (true) {
-        if (signal?.aborted) {
-          break;
+    for await (const value of readChunks(stream, signal)) {
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (line.length === 0) {
+          const event = flushEvent();
+          if (event) {
+            yield event;
+          }
+          continue;
         }
 
-        const { done, value } = await reader.read();
-        if (done) break;
+        if (line.startsWith(":")) {
+          continue;
+        }
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() ?? "";
+        const separator = line.indexOf(":");
+        const field = separator === -1 ? line : line.slice(0, separator);
+        const valuePart = separator === -1 ? "" : line.slice(separator + 1).trimStart();
 
-        for (const line of lines) {
-          if (line.length === 0) {
-            const event = flushEvent();
-            if (event) {
-              yield event;
-            }
-            continue;
-          }
-
-          if (line.startsWith(":")) {
-            continue;
-          }
-
-          const separator = line.indexOf(":");
-          const field = separator === -1 ? line : line.slice(0, separator);
-          const valuePart = separator === -1 ? "" : line.slice(separator + 1).trimStart();
-
-          if (field === "event") {
-            eventType = valuePart || "message";
-          } else if (field === "data") {
-            dataLines.push(valuePart);
-          }
+        if (field === "event") {
+          eventType = valuePart || "message";
+        } else if (field === "data") {
+          dataLines.push(valuePart);
         }
       }
+    }
 
-      if (buffer.trim().length > 0) {
-        dataLines.push(buffer.trim());
-      }
+    // A cancelled stream's partial tail is not an event.
+    if (signal.aborted) return;
 
-      const trailingEvent = flushEvent();
-      if (trailingEvent) {
-        yield trailingEvent;
-      }
-    } finally {
-      reader.releaseLock();
+    buffer += decoder.decode();
+    if (buffer.trim().length > 0) {
+      dataLines.push(buffer.trim());
+    }
+
+    const trailingEvent = flushEvent();
+    if (trailingEvent) {
+      yield trailingEvent;
     }
   }
 
   private async *parseJsonLines(
     stream: ReadableStream<Uint8Array>,
-    signal?: AbortSignal
+    signal: AbortSignal
   ): AsyncIterable<RemoteNodeEvent> {
-    const reader = stream.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
 
-    try {
-      while (true) {
-        if (signal?.aborted) {
-          break;
-        }
+    for await (const value of readChunks(stream, signal)) {
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
 
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          yield this.normalizeEvent(trimmed, "message");
-        }
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        yield this.normalizeEvent(trimmed, "message");
       }
+    }
 
-      const trailing = buffer.trim();
-      if (trailing.length > 0) {
-        yield this.normalizeEvent(trailing, "message");
-      }
-    } finally {
-      reader.releaseLock();
+    if (signal.aborted) return;
+
+    const trailing = (buffer + decoder.decode()).trim();
+    if (trailing.length > 0) {
+      yield this.normalizeEvent(trailing, "message");
     }
   }
 
@@ -426,7 +529,12 @@ export class RemoteNodeClient {
     }
   }
 
-  private async withRetry<T>(fn: () => Promise<T>, maxRetries = DEFAULT_MAX_RETRIES): Promise<T> {
+  /** Retry transient failures with backoff; a caller abort ends the retries, including one waiting out a backoff. */
+  private async withRetry<T>(
+    fn: () => Promise<T>,
+    maxRetries = DEFAULT_MAX_RETRIES,
+    signal?: AbortSignal
+  ): Promise<T> {
     let attempt = 0;
 
     while (true) {
@@ -438,7 +546,7 @@ export class RemoteNodeClient {
             ? error.retryable
             : this.isLikelyNetworkError(error);
 
-        if (!isRetryable || attempt >= maxRetries) {
+        if (!isRetryable || attempt >= maxRetries || signal?.aborted) {
           throw error;
         }
 
@@ -448,7 +556,10 @@ export class RemoteNodeClient {
           `Request failed, retrying in ${delayMs}ms (attempt ${attempt}/${maxRetries})`,
           error
         );
-        await this.sleep(delayMs);
+        await this.sleep(delayMs, signal);
+        if (signal?.aborted) {
+          throw new RemoteNodeRequestError("Remote node request aborted during retry backoff", false);
+        }
       }
     }
   }
@@ -465,9 +576,15 @@ export class RemoteNodeClient {
     return error instanceof TypeError;
   }
 
-  private async sleep(ms: number): Promise<void> {
+  private async sleep(ms: number, signal?: AbortSignal): Promise<void> {
     await new Promise<void>((resolve) => {
-      setTimeout(resolve, ms);
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      signal?.addEventListener("abort", done, { once: true });
     });
   }
 }
