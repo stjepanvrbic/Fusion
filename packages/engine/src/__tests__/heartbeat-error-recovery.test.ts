@@ -660,3 +660,83 @@ describe("HeartbeatMonitor error-state recovery", () => {
     expect(readHeartbeatErrorRetryCount(store.agent)).toBe(0);
   });
 });
+
+/*
+FNXC:HeartbeatRecovery 2026-10-07-18:40:
+Timer registration and timer dispatch must make the same eligibility decision.
+Registration admits an under-budget heartbeat-model-unavailable park, so the tick must deliver it to the monitor's recovery gate instead of unregistering it.
+Exhausted, disabled, ephemeral, and operator-paused agents stay excluded at both points.
+*/
+describe("HeartbeatTriggerScheduler to HeartbeatMonitor recovery boundary", () => {
+  const MODEL_UNAVAILABLE_ERROR = 'No API key for provider: anthropic. Configure credentials for provider "anthropic" in settings, then resume the agent.';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedCreateFnAgent.mockReset();
+  });
+
+  function wire(agent: Agent) {
+    const store = createAgentStore(agent);
+    const taskStore = createNoTaskStore();
+    const monitor = new HeartbeatMonitor({ store, taskStore, rootDir: process.cwd() });
+    const dispatched = vi.fn(async (agentId: string, source: Parameters<HeartbeatMonitor["executeHeartbeat"]>[0]["source"]) => {
+      await monitor.executeHeartbeat({ agentId, source });
+    });
+    const scheduler = new HeartbeatTriggerScheduler(store, dispatched, taskStore);
+    scheduler.start();
+    return { store, scheduler, dispatched };
+  }
+
+  async function tick(scheduler: HeartbeatTriggerScheduler, agentId: string): Promise<void> {
+    const internals = scheduler as unknown as {
+      currentTimerArm: Map<string, number>;
+      onTimerTick: (agentId: string, intervalMs: number, armId?: number) => Promise<void>;
+    };
+    await internals.onTimerTick(agentId, 60_000, internals.currentTimerArm.get(agentId));
+  }
+
+  it("arms and then dispatches an under-budget model-unavailable park into monitor recovery", async () => {
+    const session = createSession(async () => undefined);
+    mockedCreateFnAgent.mockResolvedValueOnce(session as never);
+    const { store, scheduler, dispatched } = wire(baseAgent({
+      state: "paused",
+      pauseReason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON,
+      lastError: MODEL_UNAVAILABLE_ERROR,
+      metadata: buildHeartbeatErrorRecoveryMetadata(baseAgent(), 1),
+    }));
+    try {
+      (scheduler as unknown as { syncTimerForAgent: (agent: Agent, reason: string) => void }).syncTimerForAgent(store.agent, "test");
+      expect(scheduler.getRegisteredAgents()).toContain(store.agent.id);
+
+      await tick(scheduler, store.agent.id);
+
+      expect(dispatched).toHaveBeenCalledTimes(1);
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+      expect(store.agent.state).toBe("active");
+      expect(store.agent.pauseReason).toBeUndefined();
+    } finally {
+      scheduler.stop();
+    }
+  });
+
+  it.each([
+    ["an exhausted model-unavailable park", baseAgent({ state: "paused", pauseReason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON, lastError: MODEL_UNAVAILABLE_ERROR, metadata: buildHeartbeatErrorRecoveryMetadata(baseAgent(), 5) })],
+    ["a disabled model-unavailable park", baseAgent({ state: "paused", pauseReason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON, lastError: MODEL_UNAVAILABLE_ERROR, runtimeConfig: { enabled: false } })],
+    ["an ephemeral model-unavailable park", baseAgent({ state: "paused", pauseReason: HEARTBEAT_MODEL_UNAVAILABLE_PAUSE_REASON, lastError: MODEL_UNAVAILABLE_ERROR, metadata: { agentKind: "task-worker" } })],
+    ["an operator-paused agent", baseAgent({ state: "paused", pauseReason: undefined, lastError: undefined })],
+  ])("neither arms nor dispatches %s", async (_label, agent) => {
+    const { store, scheduler, dispatched } = wire(agent);
+    try {
+      (scheduler as unknown as { syncTimerForAgent: (agent: Agent, reason: string) => void }).syncTimerForAgent(store.agent, "test");
+      expect(scheduler.getRegisteredAgents()).not.toContain(store.agent.id);
+
+      scheduler.registerAgent(store.agent.id, { heartbeatIntervalMs: 60_000 });
+      await tick(scheduler, store.agent.id);
+
+      expect(dispatched).not.toHaveBeenCalled();
+      expect(scheduler.getRegisteredAgents()).not.toContain(store.agent.id);
+    } finally {
+      scheduler.stop();
+    }
+  });
+});

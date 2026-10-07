@@ -5853,16 +5853,15 @@ export class HeartbeatTriggerScheduler {
         this.unregisterAgent(agentId);
         return;
       }
-      if (!isHeartbeatManaged(agent) || (agent.state !== "error" && !isTickableState(agent.state))) {
-        heartbeatLog.debug(`Timer tick skipped for ${agentId} (state=${agent.state})`);
-        this.unregisterAgent(agentId);
-        return;
-      }
-
+      /*
+      FNXC:HeartbeatRecovery 2026-10-07-18:40:
+      Dispatch uses the same isTimerEligibleAgent decision as registration, with the live recovery limit.
+      A separate state check here admitted only tickable or error agents, so it unregistered the under-budget heartbeat-model-unavailable parks that registration deliberately arms.
+      */
       const settings = this.taskStore ? await this.taskStore.getSettings() : null;
-      const errorRecoveryLimit = this.updateErrorRecoveryLimit(settings);
-      if (agent.state === "error" && !isErrorRecoveryEligible(agent, errorRecoveryLimit)) {
-        heartbeatLog.debug(`Timer tick skipped for ${agentId} (state=${agent.state}, error recovery ineligible)`);
+      this.updateErrorRecoveryLimit(settings);
+      if (!this.isTimerEligibleAgent(agent)) {
+        heartbeatLog.debug(`Timer tick skipped for ${agentId} (state=${agent.state})`);
         this.unregisterAgent(agentId);
         return;
       }
