@@ -105,7 +105,7 @@ describe("same-agent duplicate intake policy (FN-8401)", () => {
 
     await resolveSameAgentDuplicateIntake(store as any, created as any, created as any);
 
-    expect(store.moveTask).toHaveBeenCalledWith("FN-NEW", "archived");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-NEW", "archived", { moveSource: "engine", bypassGuards: false });
     expect(store.moveTask).not.toHaveBeenCalledWith("FN-SIBLING", "archived");
     expect(store.deleteTaskById).not.toHaveBeenCalled();
     expect(created.column).toBe("archived");
