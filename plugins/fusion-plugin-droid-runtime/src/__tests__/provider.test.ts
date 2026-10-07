@@ -232,8 +232,13 @@ describe("streamViaCli", () => {
     streamViaCli({ id: "droid-pro", provider: "droid-cli" } as any, { systemPrompt: "instructions B", messages: [{ role: "user", content: "b" }] } as any, { cwd: isolatedCwd } as any);
     await flush();
 
-    expect(promptFiles.map((file) => file.prompt)).toEqual(["instructions A", "instructions B"]);
+    // A host-level ~/.pi/agent/AGENTS.md may be appended, so assert only that each file carries its own session's instructions.
+    expect(promptFiles).toHaveLength(2);
     const [fileA, fileB] = promptFiles;
+    expect(fileA.prompt).toContain("instructions A");
+    expect(fileA.prompt).not.toContain("instructions B");
+    expect(fileB.prompt).toContain("instructions B");
+    expect(fileB.prompt).not.toContain("instructions A");
     expect(fileA.path).not.toBe(fileB.path);
     expect(mocks.spawnDroid.mock.calls[0][1]).toBe(fileA.path);
     expect(mocks.spawnDroid.mock.calls[1][1]).toBe(fileB.path);
@@ -259,14 +264,23 @@ describe("streamViaCli", () => {
   });
 
   it("launches in the requested cwd with the configured binary and marks a crash as an error", async () => {
-    const proc = makeProc();
-    mocks.spawnDroid.mockReturnValue(proc);
-    const stream = streamViaCli({ id: "droid-pro", provider: "droid-cli" } as any, { messages: [{ role: "user", content: "a" }] } as any, { cwd: "C:\\worktrees\\task-a", binaryPath: "C:\\tools\\droid.exe" } as any);
-    await flush();
-    expect(mocks.spawnDroid).toHaveBeenCalledWith("droid-pro", undefined, expect.objectContaining({ cwd: "C:\\worktrees\\task-a", binaryPath: "C:\\tools\\droid.exe" }));
-    proc.emit("close", 1, null);
-    const result = await stream.result();
-    expect(result.errorMessage).toContain("exited unexpectedly with code 1");
+    // Only the launch options are under test. Whether a system prompt file exists depends on AGENTS.md lookup
+    // from the cwd, which reads the host filesystem (a Windows-shaped cwd is relative on POSIX and finds the repo's AGENTS.md).
+    // The repo checkout always has an AGENTS.md above it, so the last case covers the prompt-file branch on every host.
+    for (const [cwd, binaryPath] of [["C:\\worktrees\\task-a", "C:\\tools\\droid.exe"], ["/worktrees/task-b", "/opt/droid/bin/droid"], [process.cwd(), "droid"]]) {
+      mocks.spawnDroid.mockClear();
+      const proc = makeProc();
+      mocks.spawnDroid.mockReturnValue(proc);
+      const stream = streamViaCli({ id: "droid-pro", provider: "droid-cli" } as any, { messages: [{ role: "user", content: "a" }] } as any, { cwd, binaryPath } as any);
+      await flush();
+      expect(mocks.spawnDroid).toHaveBeenCalledTimes(1);
+      const [modelId, , launchOptions] = mocks.spawnDroid.mock.calls[0] as unknown as [string, string | undefined, { cwd?: string; binaryPath?: string }];
+      expect(modelId).toBe("droid-pro");
+      expect(launchOptions).toMatchObject({ cwd, binaryPath });
+      proc.emit("close", 1, null);
+      const result = await stream.result();
+      expect(result.errorMessage).toContain("exited unexpectedly with code 1");
+    }
   });
 
   it("settles instead of hanging when the signal is already aborted", async () => {
