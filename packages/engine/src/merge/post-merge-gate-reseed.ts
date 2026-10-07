@@ -18,7 +18,7 @@ import { emitBoundedRunAudit } from "../util/emit-bounded-run-audit.js";
 import { generateSyntheticRunId } from "../util/run-audit.js";
 import { createMergeWriteFence, type MergeWriteFence } from "./merge-write-fence.js";
 import { isTaskExecutionLive } from "./merge-execution-exclusion.js";
-import { probeLandedCommitPublication, type GitRun, type LandedCommitPublication } from "./landed-commit-publication.js";
+import { probeLandedCommitPublication, reconcileRewrittenLandedCommit, type GitRun, type LandedCommitPublication } from "./landed-commit-publication.js";
 import { isPushAfterMergeEnabled } from "./push-after-merge-policy.js";
 import { recoverConfirmedMergePush } from "./recover-confirmed-merge-push.js";
 
@@ -247,6 +247,10 @@ export async function resumeMissingPostMergeGate(
   if (requiresPublishedLanding(task, node.id)) {
     // A queued or running gate owns this tick; probing or pushing for it would only race the seed refusal.
     if (items.some((item) => ACTIVE_WORKFLOW_WORK_ITEM_STATES.includes(item.state))) return { outcome: "not-resumable" };
+    // A push-divergence rebase may have rewritten this landing; probe the published rewrite, not the orphaned SHA.
+    if (await reconcileRewrittenLandedCommit(store, task, { run: options.git, fence })) {
+      return resumeMissingPostMergeGate(store, taskId, { ...options, fence });
+    }
     const waitKey = `${task.id}:${task.mergeDetails?.commitSha}`;
     const cachedWait = publicationWaits.get(waitKey);
     if (cachedWait && !manualRetry && Date.now() - cachedWait.probedAt < POST_MERGE_PUBLICATION_REPROBE_INTERVAL_MS) return cachedWait.result;

@@ -2,8 +2,8 @@ import { allowsAutoMergeProcessing, getPostMergeFinalizeBlocker, type Settings, 
 import { activeSessionRegistry, executingTaskLock } from "../agents/active-session-registry.js";
 import { isTaskExecutionLive } from "./merge-execution-exclusion.js";
 import { isPushAfterMergeEnabled } from "./push-after-merge-policy.js";
-import { createMergeWriteFence, type MergeWriteFence } from "./merge-write-fence.js";
-import { isCommitOnRemoteBranch, resolveConfirmedMergePushTarget, runGit, type GitRun } from "./landed-commit-publication.js";
+import { createMergeWriteFence, isMergeAbortedError, type MergeWriteFence } from "./merge-write-fence.js";
+import { isCommitOnRemoteBranch, reconcileRewrittenLandedCommit, resolveConfirmedMergePushTarget, runGit, type GitRun } from "./landed-commit-publication.js";
 
 const COOLDOWN_MS = 5 * 60_000;
 const branchAttempts = new Map<string, number>();
@@ -91,7 +91,21 @@ export async function recoverConfirmedMergePush(
   try {
     await git(["check-ref-format", `refs/heads/${branch}`]);
     await git(["check-ref-format", `refs/heads/${targetBranch}`]);
-    await git(["merge-base", "--is-ancestor", sha, `refs/heads/${branch}`]);
+    /*
+    FNXC:PostMergePublication 2026-10-07-21:05:
+    A landing rewritten off its branch by a push-divergence rebase is delivered as its verified rewrite instead of
+    failing this ancestry proof forever. Without a verified rewrite the proof still fails closed.
+    */
+    const ancestryError = await git(["merge-base", "--is-ancestor", sha, `refs/heads/${branch}`]).then(() => undefined, (error: unknown) => {
+      if (isMergeAbortedError(error)) throw error;
+      return error ?? new Error(`Landed commit ${sha} is not on ${branch}.`);
+    });
+    if (ancestryError) {
+      const rewritten = await reconcileRewrittenLandedCommit(store, task, { run, fence });
+      if (!rewritten) throw ancestryError;
+      branchAttempts.delete(key);
+      return await recoverConfirmedMergePush(store, rewritten, settings, run, suppliedFence ?? fence, options);
+    }
     await fence.write("finalization", () => store.updateTaskAtomic(task.id, (live) => {
       if (live.updatedAt !== task.updatedAt || !eligible(live, settings)
         || live.mergeDetails?.commitSha !== sha || live.mergeDetails.mergeTargetBranch !== branch) return null;

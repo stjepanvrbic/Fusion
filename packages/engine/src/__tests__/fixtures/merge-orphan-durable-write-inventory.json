@@ -6091,6 +6091,46 @@
       "followUpTaskId": "none:no-follow-up-required"
     },
     {
+      "callSiteId": "packages/engine/src/merge/landed-commit-publication.ts::reconcileRewrittenLandedCommit>log::store.logEntry::#1",
+      "callSiteFingerprint": "store.logEntry(task.id,`[post-merge] Landed commit ${oldSha.slice(0, 12)} was rewritten to ${rewrittenSha.slice(0, 12)} by a push-divergence re)",
+      "file": "packages/engine/src/merge/landed-commit-publication.ts",
+      "enclosingSymbolPath": "reconcileRewrittenLandedCommit>log",
+      "writer": "store.logEntry",
+      "ordinal": 1,
+      "lineHint": 143,
+      "owningEntryPoint": "indeterminate",
+      "reachableDataStates": [
+        "Confirmed single-repository landing whose recorded commit was rewritten off its branch by a push-divergence rebase; independent of evidence approval."
+      ],
+      "axis1": "checkpoint-covered",
+      "axis1Evidence": "Both writes run inside the caller's merge-generation fence.write when a fence is supplied (post-merge reseed and push recovery always supply one); the task update compares the exact recorded commitSha, so a concurrent writer or a successor wins.",
+      "axis2Provisional": "already-fenced",
+      "axis2Final": "already-fenced",
+      "observedInSuite": "post-merge-rewritten-landing.real-git.test.ts: reseed and push recovery re-point rewritten landings; ambiguous change is never re-pointed",
+      "executionProof": "post-merge-rewritten-landing.real-git.test.ts proves the compare-and-swap re-point against real rewritten history.",
+      "followUpTaskId": "none:no-follow-up-required"
+    },
+    {
+      "callSiteId": "packages/engine/src/merge/landed-commit-publication.ts::reconcileRewrittenLandedCommit>write::store.updateTaskAtomic::#1",
+      "callSiteFingerprint": "store.updateTaskAtomic(task.id,(live) => live.mergeDetails?.mergeConfirmed && live.mergeDetails.commitSha === oldSha ? { mergeDetails: { ...live.mergeD)",
+      "file": "packages/engine/src/merge/landed-commit-publication.ts",
+      "enclosingSymbolPath": "reconcileRewrittenLandedCommit>write",
+      "writer": "store.updateTaskAtomic",
+      "ordinal": 1,
+      "lineHint": 138,
+      "owningEntryPoint": "indeterminate",
+      "reachableDataStates": [
+        "Confirmed single-repository landing whose recorded commit was rewritten off its branch by a push-divergence rebase; independent of evidence approval."
+      ],
+      "axis1": "checkpoint-covered",
+      "axis1Evidence": "Both writes run inside the caller's merge-generation fence.write when a fence is supplied (post-merge reseed and push recovery always supply one); the task update compares the exact recorded commitSha, so a concurrent writer or a successor wins.",
+      "axis2Provisional": "already-fenced",
+      "axis2Final": "already-fenced",
+      "observedInSuite": "post-merge-rewritten-landing.real-git.test.ts: reseed and push recovery re-point rewritten landings; ambiguous change is never re-pointed",
+      "executionProof": "post-merge-rewritten-landing.real-git.test.ts proves the compare-and-swap re-point against real rewritten history.",
+      "followUpTaskId": "none:no-follow-up-required"
+    },
+    {
       "callSiteId": "packages/engine/src/merge/merger-ai.ts::finalizeMerged::store.recordBranchGroupMemberLanded::#1",
       "callSiteFingerprint": "(store as { recordBranchGroupMemberLanded?: TaskStore[\"recordBranchGroupMemberLanded\"] }).recordBranchGroupMemberLanded(groupRouting.branchGroup.id,{worktreePath,status})",
       "file": "packages/engine/src/merge/merger-ai.ts",
@@ -7225,7 +7265,7 @@
       "enclosingSymbolPath": "resumeMissingPostMergeGate",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 278,
+      "lineHint": 282,
       "owningEntryPoint": "runAiMerge>finalizeTask>finalizeProvenAutoMergeTask",
       "reachableDataStates": [
         "Confirmed merge awaiting required post-merge evidence; legacy recovery-owned failure cleanup and missing/rejected gate continuation reseeding."
@@ -7245,7 +7285,7 @@
       "enclosingSymbolPath": "resumeMissingPostMergeGate>seeded",
       "writer": "store.seedWorkspaceCodeReviewContinuationIfIdle",
       "ordinal": 1,
-      "lineHint": 263,
+      "lineHint": 267,
       "owningEntryPoint": "runAiMerge>finalizeTask>finalizeProvenAutoMergeTask",
       "reachableDataStates": [
         "Confirmed merge awaiting required post-merge evidence; legacy recovery-owned failure cleanup and missing/rejected gate continuation reseeding."
@@ -7503,7 +7543,7 @@
       "enclosingSymbolPath": "recoverConfirmedMergePush",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 115,
+      "lineHint": 129,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "Confirmed single-repository landing awaiting remote delivery; independent of evidence approval."
@@ -7523,7 +7563,7 @@
       "enclosingSymbolPath": "recoverConfirmedMergePush",
       "writer": "store.logEntry",
       "ordinal": 2,
-      "lineHint": 123,
+      "lineHint": 137,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "Confirmed single-repository landing awaiting remote delivery; independent of evidence approval."
@@ -7543,7 +7583,7 @@
       "enclosingSymbolPath": "recoverConfirmedMergePush",
       "writer": "store.updateTaskAtomic",
       "ordinal": 1,
-      "lineHint": 95,
+      "lineHint": 109,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "Confirmed single-repository landing awaiting remote delivery; independent of evidence approval."
@@ -7563,7 +7603,7 @@
       "enclosingSymbolPath": "recoverConfirmedMergePush",
       "writer": "store.updateTaskAtomic",
       "ordinal": 2,
-      "lineHint": 112,
+      "lineHint": 126,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "Confirmed single-repository landing awaiting remote delivery; independent of evidence approval."
@@ -7583,7 +7623,7 @@
       "enclosingSymbolPath": "recoverConfirmedMergePush",
       "writer": "store.updateTaskAtomic",
       "ordinal": 3,
-      "lineHint": 120,
+      "lineHint": 134,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "Confirmed single-repository landing awaiting remote delivery; independent of evidence approval."
