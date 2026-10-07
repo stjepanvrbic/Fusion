@@ -12,3 +12,4 @@ export * from "./run-command.js";
 export * from "./posix-shell.js";
 export * from "./test-safety.js";
 export * from "./vitest-processes.js";
+export * from "./windows-command.js";

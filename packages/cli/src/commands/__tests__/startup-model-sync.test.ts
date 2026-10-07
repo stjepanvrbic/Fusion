@@ -1,11 +1,15 @@
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockSpawn } = vi.hoisted(() => ({
   mockSpawn: vi.fn(),
 }));
 
-vi.mock("node:child_process", () => ({
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: mockSpawn,
 }));
 
@@ -413,7 +417,14 @@ describe("startup-model-sync", () => {
     });
 
     const registerProvider = vi.fn();
-    await refreshOpencodeGoModels({ modelRegistry: { registerProvider }, log: vi.fn(), apiKey: "test-key" });
+    const emptyPath = mkdtempSync(join(tmpdir(), "fn-opencode-empty-"));
+    vi.stubEnv("PATH", emptyPath);
+    try {
+      await refreshOpencodeGoModels({ modelRegistry: { registerProvider }, log: vi.fn(), apiKey: "test-key" });
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(emptyPath, { recursive: true, force: true });
+    }
 
     expect(mockSpawn).toHaveBeenCalledWith(
       "opencode",
@@ -422,5 +433,39 @@ describe("startup-model-sync", () => {
         env: expect.objectContaining({ OPENCODE_API_KEY: "test-key" }),
       }),
     );
+  });
+
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  An npm-installed opencode on Windows is a `.cmd` shim; model refresh must launch it through cmd.exe with escaped arguments instead of failing with ENOENT.
+  */
+  it("launches an npm opencode .cmd shim on Windows through cmd.exe", async () => {
+    const shimDir = mkdtempSync(join(tmpdir(), "fn-opencode-shim-"));
+    writeFileSync(join(shimDir, "opencode.cmd"), "@node opencode.js %*\r\n");
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    vi.stubEnv("PATH", shimDir);
+    vi.stubEnv("PATHEXT", ".EXE;.CMD");
+    mockSpawn.mockImplementation(() => {
+      const proc = createSpawnProcess();
+      queueMicrotask(() => {
+        proc.stdout.emit("data", Buffer.from("opencode/foo\n"));
+        proc.emit("exit", 0);
+      });
+      return proc;
+    });
+    try {
+      await refreshOpencodeGoModels({ modelRegistry: { registerProvider: vi.fn() }, log: vi.fn() });
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+
+    const [command, args, options] = mockSpawn.mock.calls[0] as [string, string[], { windowsVerbatimArguments?: boolean }];
+    expect(command.toLowerCase()).toMatch(/cmd(\.exe)?$/);
+    expect(args.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
+    expect(args[3]).toContain("opencode.cmd");
+    expect(args[3]).toContain("--refresh");
+    expect(options.windowsVerbatimArguments).toBe(true);
   });
 });

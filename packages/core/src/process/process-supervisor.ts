@@ -37,8 +37,12 @@ export interface ProcessTreeKillLauncher {
   spawnSync: typeof spawnSync;
 }
 
-const defaultTreeKillLauncher: ProcessTreeKillLauncher = { spawn, spawnSync };
-let treeKillLauncher: ProcessTreeKillLauncher = defaultTreeKillLauncher;
+// Resolved at call time so a partial `node:child_process` test mock cannot break this module at import.
+let treeKillLauncher: ProcessTreeKillLauncher | null = null;
+
+function currentTreeKillLauncher(): ProcessTreeKillLauncher {
+  return treeKillLauncher ?? { spawn, spawnSync };
+}
 
 function taskkillExecutable(): string {
   const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
@@ -91,7 +95,7 @@ function killWindowsProcessTrees(pids: readonly number[], options: KillProcessTr
   const args = windowsTreeKillArgs(pids);
   if (options.sync) {
     try {
-      const result = treeKillLauncher.spawnSync(taskkillExecutable(), args, {
+      const result = currentTreeKillLauncher().spawnSync(taskkillExecutable(), args, {
         stdio: "ignore",
         windowsHide: true,
         timeout: TREE_KILL_SYNC_TIMEOUT_MS,
@@ -105,7 +109,7 @@ function killWindowsProcessTrees(pids: readonly number[], options: KillProcessTr
     return;
   }
   try {
-    const killer = treeKillLauncher.spawn(taskkillExecutable(), args, { stdio: "ignore", windowsHide: true });
+    const killer = currentTreeKillLauncher().spawn(taskkillExecutable(), args, { stdio: "ignore", windowsHide: true });
     killer.once("error", () => options.onTreeKillFailed?.());
     killer.once("exit", (code) => {
       if (code !== 0) {
@@ -567,7 +571,7 @@ export const ProcessSupervisor = {
 
 /** Replace the launcher that runs `taskkill`, so tests can observe win32 tree kills on any host. */
 export function __setProcessTreeKillLauncherForTests(launcher: ProcessTreeKillLauncher | null): void {
-  treeKillLauncher = launcher ?? defaultTreeKillLauncher;
+  treeKillLauncher = launcher;
 }
 
 export function __getProcessSupervisorStateForTests(): { registrySize: number; handlersInstalled: boolean } {
@@ -588,7 +592,7 @@ export function __resetProcessSupervisorForTests(): void {
     clearStdioReleaseTimer(entry);
   }
   registry.clear();
-  treeKillLauncher = defaultTreeKillLauncher;
+  treeKillLauncher = null;
   activeShutdown = null;
   for (const [event, handler] of cleanupHandlers.entries()) {
     process.removeListener(event as NodeJS.Signals | "uncaughtException" | "unhandledRejection" | "exit", handler as (...args: unknown[]) => void);

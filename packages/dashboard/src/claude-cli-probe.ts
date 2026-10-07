@@ -17,10 +17,12 @@
  *   reason rather than blocking the HTTP request.
  *
  * - No authorization. We never shell-interpolate PATH or user input.
- *   We spawn `claude --version` directly with argv, no shell.
+ *   We spawn `claude --version` directly with argv, no shell. On Windows an
+ *   npm `.cmd` shim runs through cmd.exe with its fixed arguments escaped.
  */
 
 import { spawn } from "node:child_process";
+import { killProcessTree, prepareNativeCommand, resolveWindowsExecutable } from "@fusion/core";
 
 /** Result shape returned to the dashboard status endpoint. */
 export interface ClaudeCliBinaryStatus {
@@ -47,12 +49,21 @@ const PROBE_TIMEOUT_MS = 2000;
  * try/catch.
  */
 export async function probeClaudeCli(
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<ClaudeCliBinaryStatus> {
   const startedAt = Date.now();
   const timeoutMs = options.timeoutMs ?? PROBE_TIMEOUT_MS;
+  const env = options.env ?? process.env;
 
-  const binaryPath = await tryResolveBinaryPath("claude");
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-18:00:
+  An npm-installed Claude CLI must probe as available on Windows.
+  `where claude` can return the extensionless POSIX wrapper and spawn without a shell cannot run the `.cmd` shim, so Windows resolves through PATH and PATHEXT and launches a shim via cmd.exe with escaped arguments.
+  */
+  const binaryPath = process.platform === "win32"
+    ? resolveWindowsExecutable("claude", { env }) ?? undefined
+    : await tryResolveBinaryPath("claude", env);
+  const launch = prepareNativeCommand(binaryPath ?? "claude", ["--version"], { env });
 
   return new Promise<ClaudeCliBinaryStatus>((resolvePromise) => {
     const finish = (result: Omit<ClaudeCliBinaryStatus, "probeDurationMs">): void => {
@@ -60,17 +71,25 @@ export async function probeClaudeCli(
     };
 
     let settled = false;
-    const child = spawn(binaryPath ?? "claude", ["--version"], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(launch.command, launch.args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+        windowsHide: true,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
+      });
+    } catch (err) {
+      finish({ available: false, binaryPath, reason: err instanceof Error ? err.message : String(err) });
+      return;
+    }
 
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // Process already gone — nothing to do.
+      if (typeof child.pid === "number") {
+        // A cmd.exe shim wrapper has the real CLI as a child; end the whole tree.
+        killProcessTree(child.pid, "SIGKILL");
       }
       finish({
         available: false,
@@ -127,10 +146,9 @@ export async function probeClaudeCli(
  * the path — the spawn above is the actual authority. This is just for
  * surfacing a friendly "found at /opt/homebrew/bin/claude" in the UI.
  */
-async function tryResolveBinaryPath(binary: string): Promise<string | undefined> {
+async function tryResolveBinaryPath(binary: string, env: NodeJS.ProcessEnv): Promise<string | undefined> {
   return new Promise((resolvePromise) => {
-    const which = process.platform === "win32" ? "where" : "which";
-    const child = spawn(which, [binary], { stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn("which", [binary], { stdio: ["ignore", "pipe", "ignore"], env });
     let out = "";
     child.stdout?.on("data", (chunk) => {
       out += chunk.toString("utf-8");
