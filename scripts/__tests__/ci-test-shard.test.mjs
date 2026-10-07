@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -36,7 +37,9 @@ import {
   buildShardCommands,
   TIMINGS_STALENESS_DAYS,
   writeShardDiagnosticPayload,
+  runShardCommands,
 } from "../ci-test-shard.mjs";
+import { runWithWatchdog } from "../lib/run-vitest-watchdog.mjs";
 
 function silentLogger() {
   return { log() {}, warn() {}, error() {} };
@@ -748,4 +751,158 @@ test("U6: buildShardCommands forwards JSON timing flags to plain package test sc
   });
 
   assert.deepEqual(command.args, ["--filter", "@fusion/desktop", "test", ...timingFlags]);
+});
+
+/*
+FNXC:CiShardLanes 2026-10-07-19:57:
+A shard runs every assigned lane even after an earlier lane fails or is killed by the watchdog, so no lane's result is left unknown.
+The shard prints one summary row per lane and still exits non-zero with the first failed lane's exit code.
+*/
+function fakeLane(packageName, slice, script, budgetMs = 30_000) {
+  return { kind: "virtual", label: `${packageName} [${slice}]`, packageName, slice, script, budgetMs };
+}
+
+function runFakeLane(command) {
+  return runWithWatchdog({
+    command: process.execPath,
+    args: ["-e", command.script],
+    budgetMs: command.budgetMs,
+    graceMs: 200,
+    heartbeatMs: 60_000,
+    label: command.label,
+    log: () => {},
+    spawn,
+  });
+}
+
+test("CI shard lanes: every lane runs after earlier failures and watchdog kills, and the summary lists each one", async () => {
+  const commands = [
+    fakeLane("@fusion/core", "1/2", "process.exit(3)"),
+    fakeLane("@fusion/core", "2/2", "process.exit(0)"),
+    fakeLane("@fusion/dashboard", "test:quality:api", "setTimeout(() => {}, 60_000)", 300),
+    fakeLane("@fusion/dashboard", "test:quality:ui", "process.exit(0)"),
+  ];
+  const executed = [];
+  const lines = [];
+
+  await assert.rejects(
+    runShardCommands(commands, {
+      label: "shard 4/4",
+      execute: async (command) => {
+        executed.push(command.slice);
+        return runFakeLane(command);
+      },
+      log: (line) => lines.push(line),
+      signals: new EventEmitter(),
+    }),
+    (error) => {
+      assert.deepEqual(error.shardDiagnostic, { stage: "test-command", exitCode: 3, signal: null, timedOut: false });
+      assert.deepEqual(
+        error.shardResults.map((r) => [r.command.slice, r.status, r.exitCode]),
+        [["1/2", "failed", 3], ["2/2", "passed", 0], ["test:quality:api", "timed-out", 124], ["test:quality:ui", "passed", 0]],
+      );
+      return true;
+    },
+  );
+
+  assert.deepEqual(executed, ["1/2", "2/2", "test:quality:api", "test:quality:ui"]);
+  const summary = lines.join("\n");
+  assert.match(summary, /shard 4\/4 summary: 2 passed, 1 failed, 1 timed out/);
+  for (const [pkg, slice, status] of [
+    ["@fusion/core", "1/2", "failed"],
+    ["@fusion/core", "2/2", "passed"],
+    ["@fusion/dashboard", "test:quality:api", "timed-out"],
+    ["@fusion/dashboard", "test:quality:ui", "passed"],
+  ]) {
+    const row = summary.split("\n").find((line) => line.includes(pkg) && line.includes(slice));
+    assert.ok(row, `summary row for ${pkg} ${slice}`);
+    assert.ok(row.trim().split(/\s+/).includes(status), `status ${status} in row: ${row}`);
+    assert.match(row, /\d+\.\ds/);
+  }
+});
+
+test("CI shard lanes: a timed-out first lane sets the timeout exit code and the summary still prints", async () => {
+  const lines = [];
+  await assert.rejects(
+    runShardCommands(
+      [fakeLane("@fusion/engine", "1/2", "setTimeout(() => {}, 60_000)", 300), fakeLane("@fusion/engine", "2/2", "process.exit(5)")],
+      { label: "shard 1/4", execute: runFakeLane, log: (line) => lines.push(line), signals: new EventEmitter() },
+    ),
+    (error) => {
+      assert.deepEqual(error.shardDiagnostic, { stage: "test-command", exitCode: 124, signal: null, timedOut: true });
+      return true;
+    },
+  );
+  assert.match(lines.join("\n"), /shard 1\/4 summary: 0 passed, 1 failed, 1 timed out/);
+});
+
+test("CI shard lanes: an all-green shard resolves with every lane passed", async () => {
+  const lines = [];
+  const results = await runShardCommands(
+    [fakeLane("@fusion/core", "1/2", "process.exit(0)"), fakeLane("@fusion/desktop", "all", "process.exit(0)")],
+    { label: "shard 2/4", execute: runFakeLane, log: (line) => lines.push(line), signals: new EventEmitter() },
+  );
+  assert.deepEqual(results.map((r) => r.status), ["passed", "passed"]);
+  assert.match(lines.join("\n"), /shard 2\/4 summary: 2 passed, 0 failed, 0 timed out/);
+});
+
+test("CI shard lanes: a launch error is recorded as a failed lane and later lanes still run", async () => {
+  const executed = [];
+  await assert.rejects(
+    runShardCommands([fakeLane("@fusion/core", "1/2", ""), fakeLane("@fusion/core", "2/2", "")], {
+      label: "shard 3/4",
+      execute: async (command) => {
+        executed.push(command.slice);
+        if (command.slice === "1/2") throw new Error("spawn pnpm ENOENT");
+        return { code: 0, signal: null, timedOut: false };
+      },
+      log: () => {},
+      signals: new EventEmitter(),
+    }),
+    (error) => {
+      assert.equal(error.shardDiagnostic.exitCode, 1);
+      assert.deepEqual(error.shardResults.map((r) => r.status), ["failed", "passed"]);
+      return true;
+    },
+  );
+  assert.deepEqual(executed, ["1/2", "2/2"]);
+});
+
+test("CI shard lanes: runner cancellation stops launching lanes and reports the rest as not run", async () => {
+  const signals = new EventEmitter();
+  const executed = [];
+  const lines = [];
+  await assert.rejects(
+    runShardCommands([fakeLane("@fusion/core", "1/2", ""), fakeLane("@fusion/core", "2/2", ""), fakeLane("@fusion/cli", "all", "")], {
+      label: "shard 1/4",
+      execute: async (command) => {
+        executed.push(command.slice);
+        signals.emit("SIGTERM");
+        return { code: null, signal: "SIGTERM", timedOut: false };
+      },
+      log: (line) => lines.push(line),
+      signals,
+    }),
+    (error) => {
+      assert.deepEqual(error.shardResults.map((r) => r.status), ["failed", "not-run", "not-run"]);
+      assert.equal(error.shardDiagnostic.exitCode, 1);
+      return true;
+    },
+  );
+  assert.deepEqual(executed, ["1/2"]);
+  assert.equal(signals.listenerCount("SIGTERM"), 0);
+  assert.match(lines.join("\n"), /2 not run/);
+});
+
+test("CI shard lanes: buildShardCommands names the package and slice of every command", () => {
+  const commands = buildShardCommands([
+    { name: "@fusion/core", weight: 1 },
+    { name: "@fusion/desktop", weight: 1 },
+    { name: "@fusion/engine", weight: 1, shardIndex: 1, shardCount: 2 },
+    { name: "@fusion/dashboard", weight: 1, runKind: "dashboard-lane", lane: "test:quality:api" },
+  ]);
+  assert.deepEqual(
+    commands.map((c) => [c.packageName, c.slice]),
+    [["@fusion/core, @fusion/desktop", "all"], ["@fusion/engine", "1/2"], ["@fusion/dashboard", "test:quality:api"]],
+  );
 });

@@ -20,7 +20,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureTestArtifacts } from "./ensure-test-artifacts.mjs";
 import { listWorkspacePackageInfos } from "./test-changed.mjs";
-import { deriveBudgetMs, runWithWatchdog } from "./lib/run-vitest-watchdog.mjs";
+import { deriveBudgetMs, runWithWatchdog, TIMEOUT_EXIT_CODE } from "./lib/run-vitest-watchdog.mjs";
 import { describeSpawnFailure, resolveCommandInvocation } from "./lib/pnpm-invocation.mjs";
 
 // Quick, non-test commands (e.g. skill-sync check) stay synchronous — they have
@@ -77,29 +77,99 @@ export function writeShardDiagnosticPayload(diagnostic, options = {}) {
   return outputFile;
 }
 
-// Test invocations run under the L2 wall-clock watchdog so a wedged vitest run
-// is SIGTERM/SIGKILLed at its budget instead of blocking to the CI job ceiling.
-// Preserves the fail-fast contract of `run` (exit non-zero on failure/timeout).
-async function runWatched(command, commandArgs, { env, budgetMs, label } = {}) {
-  const { code, signal, timedOut } = await runWithWatchdog({
-    command,
-    args: commandArgs,
-    env: env ?? process.env,
-    budgetMs,
-    label: label ?? command,
-    log: console.error,
-    spawn,
-  });
-  if (timedOut || signal || code !== 0) {
-    const error = new Error(`Test command failed: ${label ?? command}`);
-    error.shardDiagnostic = {
-      stage: "test-command",
-      exitCode: timedOut ? 124 : (code ?? 1),
-      signal,
-      timedOut,
-    };
-    throw error;
+const CANCEL_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+function classifyLaneOutcome({ code, signal, timedOut }) {
+  if (timedOut) return { status: "timed-out", exitCode: TIMEOUT_EXIT_CODE, signal: null, timedOut: true };
+  if (signal || code !== 0) return { status: "failed", exitCode: code ?? 1, signal: signal ?? null, timedOut: false };
+  return { status: "passed", exitCode: 0, signal: null, timedOut: false };
+}
+
+/**
+ * Render the per-shard lane table: one row per command, including lanes a cancellation left unrun.
+ *
+ * @param {string} label
+ * @param {Array<{ command: { packageName?: string, slice?: string, label: string }, status: string, durationMs: number | null }>} results
+ * @returns {string}
+ */
+export function formatShardSummary(label, results) {
+  const count = (status) => results.filter((r) => r.status === status).length;
+  const notRun = count("not-run");
+  const header =
+    `[ci-test-shard] ${label} summary: ${count("passed")} passed, ${count("failed")} failed, ${count("timed-out")} timed out` +
+    (notRun > 0 ? `, ${notRun} not run` : "");
+  const rows = results.map((r) => [
+    r.command.packageName ?? r.command.label,
+    r.command.slice ?? "-",
+    r.status,
+    r.durationMs == null ? "-" : `${(r.durationMs / 1000).toFixed(1)}s`,
+  ]);
+  const table = [["package", "slice", "status", "duration"], ...rows];
+  const widths = table[0].map((_, i) => Math.max(...table.map((row) => row[i].length)));
+  return [header, ...table.map((row) => `  ${row.map((cell, i) => cell.padEnd(widths[i])).join("  ").trimEnd()}`)].join("\n");
+}
+
+/**
+ * Run every shard command to completion, then print the lane summary.
+ *
+ * @param {Array<{ label: string, packageName?: string, slice?: string }>} commands
+ * @param {{
+ *   label: string,
+ *   execute: (command: object) => Promise<{ code: number | null, signal?: string | null, timedOut?: boolean }>,
+ *   log?: (line: string) => void,
+ *   signals?: Pick<NodeJS.EventEmitter, "on" | "removeListener">,
+ *   now?: () => number,
+ * }} options
+ * @returns {Promise<Array<object>>} per-lane results when every lane passed
+ * @throws {Error} carrying `shardDiagnostic` (first failed lane's exit code) and `shardResults` when any lane did not pass
+ */
+export async function runShardCommands(commands, { label, execute, log = console.log, signals = process, now = Date.now }) {
+  /*
+  FNXC:CiShardLanes 2026-10-07-19:57:
+  A shard runs every assigned lane even after an earlier lane fails or is killed by the watchdog, so no lane's result is left unknown; per-lane watchdog budgets are unchanged.
+  It prints one summary row per lane (package, slice, status, duration) and exits non-zero with the first failed lane's exit code (124 for a watchdog kill), the contract the fail-fast runner had.
+  A signal to the runner itself (CI cancellation, Ctrl-C) stops launching further lanes; they are reported as not run.
+  */
+  let cancelSignal = null;
+  const onCancel = (sig) => {
+    cancelSignal ??= sig;
+  };
+  const handlers = CANCEL_SIGNALS.map((sig) => [sig, () => onCancel(sig)]);
+  for (const [sig, handler] of handlers) signals.on(sig, handler);
+
+  const results = [];
+  try {
+    for (const command of commands) {
+      if (cancelSignal) {
+        results.push({ command, status: "not-run", exitCode: null, signal: null, timedOut: false, durationMs: null });
+        continue;
+      }
+      const startedAt = now();
+      let outcome;
+      try {
+        outcome = classifyLaneOutcome(await execute(command));
+      } catch (error) {
+        log(`[ci-test-shard] ${command.label} could not run: ${error instanceof Error ? error.message : String(error)}`);
+        outcome = { status: "failed", exitCode: 1, signal: null, timedOut: false };
+      }
+      results.push({ command, ...outcome, durationMs: now() - startedAt });
+    }
+  } finally {
+    for (const [sig, handler] of handlers) signals.removeListener(sig, handler);
   }
+
+  log(formatShardSummary(label, results));
+
+  const firstFailure = results.find((r) => r.status === "failed" || r.status === "timed-out");
+  if (!firstFailure && !cancelSignal) return results;
+
+  const failedLabels = results.filter((r) => r.status !== "passed").map((r) => r.command.label);
+  const error = new Error(`Test commands did not pass in ${label}: ${failedLabels.join("; ")}`);
+  error.shardDiagnostic = firstFailure
+    ? { stage: "test-command", exitCode: firstFailure.exitCode, signal: firstFailure.signal, timedOut: firstFailure.timedOut }
+    : { stage: "test-command", exitCode: 1, signal: cancelSignal, timedOut: false };
+  error.shardResults = results;
+  throw error;
 }
 
 function parsePositiveInteger(value) {
@@ -1300,6 +1370,8 @@ export function buildShardCommands(shardEntries, options = {}) {
     commands.push({
       kind: "plain",
       label: plain.map((e) => e.name).join(", "),
+      packageName: plain.map((e) => e.name).join(", "),
+      slice: "all",
       // A single plain command fans out across every packed package, so its
       // expected duration is the SUM of their weights — not a per-package value
       // (see the watchdog budget aggregation, KTD-2).
@@ -1312,6 +1384,8 @@ export function buildShardCommands(shardEntries, options = {}) {
     commands.push({
       kind: "virtual",
       label: `${entry.name} [${entry.shardIndex}/${entry.shardCount}]`,
+      packageName: entry.name,
+      slice: `${entry.shardIndex}/${entry.shardCount}`,
       weightMs: entry.weight ?? 0,
       // NB: no `--` between `test` and `--shard`; cac would treat the value as a
       // positional file filter and silently disable sharding.
@@ -1323,6 +1397,8 @@ export function buildShardCommands(shardEntries, options = {}) {
     commands.push({
       kind: "dashboard-lane",
       label: `${entry.name} run ${entry.lane}`,
+      packageName: entry.name,
+      slice: entry.lane,
       weightMs: entry.weight ?? 0,
       args: ["--filter", entry.name, "run", entry.lane, ...timingFlags()],
     });
@@ -1469,17 +1545,21 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     };
 
     const commands = buildShardCommands(shardEntries, { timingFlags });
-    for (const command of commands) {
-      const klass = command.kind === "dashboard-lane" ? "dashboard-lane" : "shard";
-      const budgetMs = deriveBudgetMs({
-        klass,
-        expectedDurationMs: command.weightMs,
-        timingsFresh,
-      });
-      const label = `shard ${shard}/${total}: ${command.label}`;
-      console.log(`[ci-test-shard] ${label} (watchdog budget ${Math.round(budgetMs / 1000)}s)`);
-      await runWatched("pnpm", command.args, { env: shardEnv, budgetMs, label });
-    }
+    await runShardCommands(commands, {
+      label: `shard ${shard}/${total}`,
+      // Each test invocation runs under the L2 wall-clock watchdog so a wedged vitest run is SIGTERM/SIGKILLed at its budget instead of blocking to the CI job ceiling.
+      execute: (command) => {
+        const klass = command.kind === "dashboard-lane" ? "dashboard-lane" : "shard";
+        const budgetMs = deriveBudgetMs({
+          klass,
+          expectedDurationMs: command.weightMs,
+          timingsFresh,
+        });
+        const label = `shard ${shard}/${total}: ${command.label}`;
+        console.log(`[ci-test-shard] ${label} (watchdog budget ${Math.round(budgetMs / 1000)}s)`);
+        return runWithWatchdog({ command: "pnpm", args: command.args, env: shardEnv, budgetMs, label, log: console.error, spawn });
+      },
+    });
   } catch (error) {
     /*
      * FNXC:FullSuiteEvidence 2026-10-05-07:07:
