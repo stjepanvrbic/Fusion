@@ -57,6 +57,11 @@ export function buildTaskRecommendationNoticeContent(
 ): string {
   const title = task.title?.trim();
   const heading = title ? `## Recommendations from ${task.id} — ${title}` : `## Recommendations from ${task.id}`;
+  /*
+  FNXC:TaskRecommendations 2026-10-07-20:04:
+  The notice is sent at accepted fn_task_done, before review and merge, but the create route refuses until the source lands or completes.
+  The text must not invite an action the server will refuse, so it names when the button becomes available.
+  */
   return [
     heading,
     "",
@@ -64,7 +69,7 @@ export function buildTaskRecommendationNoticeContent(
     "",
     ...recommendations.map((recommendation) => `- **${recommendation.title}** — \`${recommendation.category}\`: ${recommendation.description}`),
     "",
-    `Use the **Create task** button beside each recommendation to file it through guarded intake. You can also open ${task.id}'s **Recommendations** tab to review them.`,
+    `Once ${task.id} lands or completes, use the **Create task** button beside each recommendation to file it through guarded intake, or open ${task.id}'s **Recommendations** tab to review them. Until then the button stays disabled.`,
   ].join("\n");
 }
 

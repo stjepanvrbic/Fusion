@@ -11,7 +11,7 @@ vi.mock("../../api", () => ({
   fetchInbox: vi.fn(), fetchOutbox: vi.fn(), fetchUnreadCount: vi.fn(), fetchAgentMailbox: vi.fn(), fetchAllAgentMailbox: vi.fn(),
   markMessageRead: vi.fn(), markAllMessagesRead: vi.fn(), deleteMessage: vi.fn(), fetchConversation: vi.fn(), fetchMessage: vi.fn(),
   sendMessage: vi.fn(), fetchAgents: vi.fn(), fetchApprovals: vi.fn(), fetchApprovalDetail: vi.fn(), decideApproval: vi.fn(),
-  artifactMediaUrlWithToken: vi.fn(), fetchNativeStructurePreview: vi.fn(), fetchTaskDetail: vi.fn(), createTaskFromRecommendation: vi.fn(), archiveMessage: vi.fn(), unarchiveMessage: vi.fn(),
+  artifactMediaUrlWithToken: vi.fn(), fetchNativeStructurePreview: vi.fn(), fetchTaskDetail: vi.fn(), createTaskFromRecommendation: vi.fn(), fetchRecommendationEligibility: vi.fn(), archiveMessage: vi.fn(), unarchiveMessage: vi.fn(),
 }));
 vi.mock("../../hooks/useViewportMode", () => ({ useViewportMode: vi.fn(() => "desktop"), isMobileViewport: () => false, isFullScreenSheetViewport: () => false, isShortViewport: () => false, getViewportMode: () => "desktop", isTabletTouchViewport: () => false }));
 vi.mock("../../hooks/useMobileKeyboard", () => ({ useMobileKeyboard: vi.fn(() => ({ keyboardOverlap: 0, viewportHeight: null, viewportOffsetTop: 0, keyboardOpen: false })) }));
@@ -46,6 +46,7 @@ describe("mailbox task recommendation production surfaces", () => {
     vi.mocked(api.fetchAllAgentMailbox).mockResolvedValue({ messages: [], total: 0, unreadCount: 0 });
     vi.mocked(api.fetchTaskDetail).mockResolvedValue({ id: "FN-9100", recommendations: [{ id: "rec-1", title: "Follow up", description: "Optional follow-up", category: "feature" }] } as never);
     vi.mocked(api.createTaskFromRecommendation).mockResolvedValue({ task: { id: "FN-9101" }, parent: { id: "FN-9100" } } as never);
+    vi.mocked(api.fetchRecommendationEligibility).mockResolvedValue({ actionable: true, reason: null });
   });
 
   it.each([
@@ -75,6 +76,30 @@ describe("mailbox task recommendation production surfaces", () => {
     expect(api.createTaskFromRecommendation).toHaveBeenCalledTimes(1);
     expect(api.createTaskFromRecommendation).toHaveBeenCalledWith("FN-9100", "rec-1", "project-1");
     expect(await screen.findByRole("button", { name: "View task FN-9101" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["MailboxView", "desktop", "selected", (props: any) => <MailboxView {...props} />],
+    ["MailboxView", "mobile", "conversation", (props: any) => <MailboxView {...props} />],
+    ["MailboxModal", "desktop", "conversation", (props: any) => <MailboxModal isOpen onClose={vi.fn()} agents={agents as never} {...props} />],
+    ["MailboxModal", "mobile", "selected", (props: any) => <MailboxModal isOpen onClose={vi.fn()} agents={agents as never} {...props} />],
+  ] as const)("disables Create task before the source lands in %s %s %s body", async (_name, viewport, pane, Host) => {
+    const reason = "Recommendations from FN-9100 can be filed as tasks after FN-9100 lands or completes";
+    vi.mocked(api.fetchRecommendationEligibility).mockResolvedValue({ actionable: false, reason });
+    vi.mocked(useViewportMode).mockReturnValue(viewport);
+    vi.mocked(useHeaderViewportMode).mockReturnValue(viewport);
+    const messages = [recommendationNotice("notice"), { ...ordinary("ordinary"), metadata: { replyTo: { messageId: "notice" } } }];
+    vi.mocked(api.fetchConversation).mockResolvedValue(pane === "conversation" ? messages as never : []);
+    const user = userEvent.setup({ delay: null, pointerEventsCheck: 0 });
+    render(<Host projectId="project-1" addToast={vi.fn()} onOpenNativeStructure={vi.fn()} nativeStructureCandidates={[]} />);
+    await user.click(await screen.findByTestId("mailbox-item-notice"));
+    if (pane === "conversation") await waitFor(() => expect(screen.getByTestId("mailbox-conversation")).toBeInTheDocument());
+    const controls = await screen.findAllByRole("button", { name: "Create task" });
+    expect(controls).toHaveLength(1);
+    expect(controls[0]).toBeDisabled();
+    expect(screen.getAllByText(reason)).toHaveLength(1);
+    await user.click(controls[0]!);
+    expect(api.createTaskFromRecommendation).not.toHaveBeenCalled();
   });
 
   /*

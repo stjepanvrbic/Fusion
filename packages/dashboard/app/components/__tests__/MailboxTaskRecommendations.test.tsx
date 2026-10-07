@@ -1,11 +1,11 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { MessageMetadata } from "@fusion/core";
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { createTaskFromRecommendation, fetchTaskDetail } from "../../api";
+import { createTaskFromRecommendation, fetchRecommendationEligibility, fetchTaskDetail } from "../../api";
 import { MailboxTaskRecommendations } from "../MailboxTaskRecommendations";
 import { ApiRequestError } from "../../api/client/client";
 
-vi.mock("../../api", () => ({ createTaskFromRecommendation: vi.fn(), fetchTaskDetail: vi.fn() }));
+vi.mock("../../api", () => ({ createTaskFromRecommendation: vi.fn(), fetchTaskDetail: vi.fn(), fetchRecommendationEligibility: vi.fn() }));
 
 const metadata: MessageMetadata = { kind: "task-recommendation-notice", taskId: "FN-9100", recommendationCount: 1, recommendationIds: ["recommendation-1"], categories: ["feature"], recommendationSnapshot: [{ id: "recommendation-1", title: "Saved follow up", description: "Saved optional work.", category: "feature" }] };
 const legacyMetadata: MessageMetadata = { kind: "task-recommendation-notice", taskId: "FN-9100", recommendationCount: 1, categories: ["feature"] };
@@ -18,7 +18,10 @@ function expectMailboxCardWithoutBoardClass(): void {
 }
 
 describe("MailboxTaskRecommendations", () => {
-  beforeEach(() => vi.resetAllMocks());
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(fetchRecommendationEligibility).mockResolvedValue({ actionable: true, reason: null });
+  });
 
   it("renders nothing for non-notices, missing parents, malformed ids, and empty recommendation ids", () => {
     for (const candidate of [{}, { kind: "task-recommendation-notice", recommendationIds: ["recommendation-1"] }, { kind: "task-recommendation-notice", taskId: "FN-9100", recommendationIds: [] }, { kind: "task-recommendation-notice", taskId: "FN-9100", recommendationIds: [null] }, { kind: "task-recommendation-notice", taskId: "FN-9100", recommendationIds: "recommendation-1" }]) {
@@ -134,6 +137,46 @@ describe("MailboxTaskRecommendations", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Create task" }));
     expect(await screen.findByText("Could not create task. Try again.")).toBeInTheDocument();
     expect(screen.queryByText("Internal error")).not.toBeInTheDocument();
+  });
+
+  /*
+  FNXC:TaskRecommendations 2026-10-07-20:06:
+  The notice arrives at accepted fn_task_done, before the source lands. Create task must be enabled exactly when the create route would accept it, with the reason shown while it is not yet available.
+  */
+  it("disables Create task with the server's explanation while the source has not landed", async () => {
+    const reason = "Recommendations from FN-9100 can be filed as tasks after FN-9100 lands or completes";
+    vi.mocked(fetchTaskDetail).mockResolvedValue({ ...detail, column: "in-review", mergeDetails: { mergeConfirmed: false } } as never);
+    vi.mocked(fetchRecommendationEligibility).mockResolvedValue({ actionable: false, reason });
+    render(<MailboxTaskRecommendations metadata={metadata} projectId="project-1" />);
+    const button = await screen.findByRole("button", { name: "Create task" });
+    expect(button).toBeDisabled();
+    expect(screen.getByText(reason)).toBeInTheDocument();
+    expect(button).toHaveAccessibleDescription(reason);
+    fireEvent.click(button);
+    expect(createTaskFromRecommendation).not.toHaveBeenCalled();
+    expect(fetchRecommendationEligibility).toHaveBeenCalledWith("FN-9100", "project-1");
+  });
+
+  it.each([
+    ["a landed review source", { column: "in-review", mergeDetails: { mergeConfirmed: true } }],
+    ["a completed source", { column: "done" }],
+  ])("enables Create task for %s", async (_label, shape) => {
+    vi.mocked(fetchTaskDetail).mockResolvedValue({ ...detail, ...shape } as never);
+    vi.mocked(fetchRecommendationEligibility).mockResolvedValue({ actionable: true, reason: null });
+    render(<MailboxTaskRecommendations metadata={metadata} />);
+    expect(await screen.findByRole("button", { name: "Create task" })).toBeEnabled();
+    expect(screen.queryByText(/lands or completes/)).not.toBeInTheDocument();
+  });
+
+  it("leaves Create task enabled when eligibility cannot be read, so the server stays the authority", async () => {
+    vi.mocked(fetchTaskDetail).mockResolvedValue(detail as never);
+    vi.mocked(fetchRecommendationEligibility).mockRejectedValue(new Error("offline"));
+    vi.mocked(createTaskFromRecommendation).mockRejectedValueOnce(new ApiRequestError("Recommendations from FN-9100 can be filed as tasks after FN-9100 lands or completes", 409));
+    render(<MailboxTaskRecommendations metadata={metadata} />);
+    const button = await screen.findByRole("button", { name: "Create task" });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    expect(await screen.findByText("Recommendations from FN-9100 can be filed as tasks after FN-9100 lands or completes")).toBeInTheDocument();
   });
 
   it("ignores a stale parent lookup after the notice changes", async () => {

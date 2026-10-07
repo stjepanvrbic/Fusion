@@ -42,7 +42,7 @@ describe("task recommendation notice", () => {
         recommendationSnapshot: recommendations,
       },
     });
-    expect(sent[0].input.content).toContain("Use the **Create task** button beside each recommendation");
+    expect(sent[0].input.content).toContain(`Once ${task.id} lands or completes, use the **Create task** button beside each recommendation`);
     expect(sent[0].input.content).toContain(`open ${task.id}'s **Recommendations** tab`);
     for (const recommendation of recommendations) {
       expect(sent[0].input.content).toContain(recommendation.title);
@@ -77,7 +77,7 @@ describe("task recommendation notice", () => {
   });
 
   it("keeps the inline-action copy in the standalone content builder", () => {
-    expect(buildTaskRecommendationNoticeContent(task, recommendations)).toContain("Use the **Create task** button beside each recommendation");
+    expect(buildTaskRecommendationNoticeContent(task, recommendations)).toContain(`Once ${task.id} lands or completes, use the **Create task** button beside each recommendation`);
   });
 
   it("refuses malformed or mismatched immutable snapshots", () => {

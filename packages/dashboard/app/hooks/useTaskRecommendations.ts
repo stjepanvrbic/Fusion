@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TaskRecommendationListItem } from "@fusion/core";
 import { createTaskFromRecommendation, fetchTaskRecommendations } from "../api";
+import { recommendationCreateRefusalReason } from "../utils/recommendationCreateRefusal";
 
 export const MAX_RECOMMENDATION_PAGES = 20;
 const PAGE_SIZE = 50;
-export interface RecommendationActionState { running: boolean; error: string | null; }
+/**
+ * FNXC:TaskRecommendations 2026-10-07-20:00:
+ * `refusal` carries the server's 4xx reason so Insights can show it like task detail and the mailbox do; any other failure sets only `failed`.
+ */
+export interface RecommendationActionState { running: boolean; failed: boolean; refusal: string | null; }
 
 /**
  * FNXC:TaskRecommendations 2026-08-13-04:41:
@@ -95,16 +100,16 @@ export function useTaskRecommendations(projectId?: string) {
     if (creatingRef.current.has(key)) return;
     creatingRef.current.add(key);
     const epoch = epochRef.current;
-    setCreateStates((current) => new Map(current).set(key, { running: true, error: null }));
+    setCreateStates((current) => new Map(current).set(key, { running: true, failed: false, refusal: null }));
     try {
       const response = await createTaskFromRecommendation(taskId, recommendationId, projectRef.current);
       if (epoch !== epochRef.current) return;
       setItems((current) => current.map((item) => item.taskId === taskId && item.recommendation.id === recommendationId
         ? { ...item, recommendation: { ...item.recommendation, createdTaskId: response.task.id } }
         : item));
-      setCreateStates((current) => new Map(current).set(key, { running: false, error: null }));
+      setCreateStates((current) => new Map(current).set(key, { running: false, failed: false, refusal: null }));
     } catch (cause) {
-      if (epoch === epochRef.current) setCreateStates((current) => new Map(current).set(key, { running: false, error: cause instanceof Error ? cause.message : "Could not create task" }));
+      if (epoch === epochRef.current) setCreateStates((current) => new Map(current).set(key, { running: false, failed: true, refusal: recommendationCreateRefusalReason(cause) }));
     } finally {
       // FNXC:TaskRecommendations 2026-08-13-04:41: An old project's completion must not
       // clear the same composite key after a project switch has started a new create request.

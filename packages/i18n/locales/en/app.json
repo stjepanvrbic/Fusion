@@ -3566,6 +3566,7 @@
     "audioArtifactAria": "Audio artifact: {{label}}",
     "createTask": "Create task",
     "createTaskError": "Could not create task. Try again.",
+    "recommendationNotYetActionable": "These recommendations can be filed as tasks after the source task lands or completes.",
     "creatingTask": "Creating task…",
     "deny": "Deny",
     "inboxFilter": "Inbox filter",

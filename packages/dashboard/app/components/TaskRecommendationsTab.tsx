@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { Task, TaskRecommendation } from "@fusion/core";
 import { createTaskFromRecommendation } from "../api";
-import { ApiRequestError } from "../api/client/client";
+import { recommendationCreateRefusalReason } from "../utils/recommendationCreateRefusal";
 import "./TaskRecommendationsTab.css";
 
 export function TaskRecommendationsTab({
@@ -66,9 +66,7 @@ export function TaskRecommendationsTab({
         setCreatedIds((current) => ({ ...current, [actionKey]: response.task.id }));
       }
     } catch (cause) {
-      const reason = cause instanceof ApiRequestError && cause.status >= 400 && cause.status < 500 && cause.message.trim()
-        ? cause.message.trim()
-        : true;
+      const reason = recommendationCreateRefusalReason(cause) ?? true;
       if (taskIdRef.current === task.id) setErrorActions((current) => ({ ...current, [actionKey]: reason }));
     } finally {
       creatingIdsRef.current.delete(actionKey);
