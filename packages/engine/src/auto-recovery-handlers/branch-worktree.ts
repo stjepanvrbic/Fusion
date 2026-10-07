@@ -1,4 +1,5 @@
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import type { Task, TaskStore } from "@fusion/core";
@@ -15,7 +16,7 @@ import { resolveIntegrationBranch } from "../merge/integration-branch.js";
 import { createLogger, type Logger } from "../logger.js";
 import type { RunAuditor } from "../util/run-audit.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 const baseLog = createLogger("auto-recovery:branch-worktree");
 const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 10 * 1024 * 1024;

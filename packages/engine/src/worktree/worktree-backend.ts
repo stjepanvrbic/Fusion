@@ -1,4 +1,5 @@
 import { exec, execFile } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { existsSync } from "node:fs";
 import { access, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, resolve } from "node:path";
@@ -27,7 +28,7 @@ import {
 } from "./worktree-stale-lock.js";
 import { parseStaleRegistrationPath, recoverStaleRegistration } from "./worktree-stale-registration.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 const execFileAsync = promisify(execFile);
 const NATIVE_TIMEOUT_MS = 120_000;
 const REMOVE_TIMEOUT_MS = 60_000;

@@ -30,14 +30,15 @@ const SHORT_GIT_PLUMBING = "short deterministic git plumbing";
 const BOUNDED_GIT_DIFF = "bounded data-dependent git diff plumbing";
 
 const allowlist: AllowlistEntry[] = [
+  // FNXC:PosixShell 2026-10-07-16:28: POSIX-syntax git plumbing passes its options through withPosixShell so Windows runs it under Git Bash, not cmd.exe; the audited calls are unchanged.
   // FNXC:FullSuiteBookkeeping 2026-08-05-00:25: Re-pin after code-organization peels moved git plumbing under merge/, worktree/, execution/ and shifted self-healing/executor line numbers. Identity remains file+primitive+signature; lines are documentation only.
   { file: "src/execution/review-checkout.ts", line: 35, primitive: "execFileSync", signature: "const topLevel = execFileSync(\"git\", [\"rev-parse\", \"--show-toplevel\"], {", reason: SHORT_GIT_PLUMBING },
   // FNXC:EngineProcessRules 2026-08-23-18:30: the executor ancestry check moved to src/executor/worktree-git-refs.ts in the wave-18 executor pure peels (1cf86baa1c). Identity is file+primitive+signature; re-pin the path, not the behavior.
   { file: "src/executor/worktree-git-refs.ts", line: 121, primitive: "execSync", signature: "execSync(`git merge-base --is-ancestor ${task.baseCommitSha} HEAD`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/merge/already-merged-detector.ts", line: 204, primitive: "execSync", signature: "branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/merge/already-merged-detector.ts", line: 223, primitive: "execSync", signature: "execSync(`git merge-base --is-ancestor ${shellQuote(branchTip)} ${shellQuote(baseBranch)}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/merge/already-merged-detector.ts", line: 270, primitive: "execSync", signature: "branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/merge/already-merged-detector.ts", line: 345, primitive: "execSync", signature: "execSync(`git rev-parse --verify ${shellQuote(treeBranchName)}`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/merge/already-merged-detector.ts", line: 204, primitive: "execSync", signature: "branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, withPosixShell({", reason: SHORT_GIT_PLUMBING },
+  { file: "src/merge/already-merged-detector.ts", line: 223, primitive: "execSync", signature: "execSync(`git merge-base --is-ancestor ${shellQuote(branchTip)} ${shellQuote(baseBranch)}`, withPosixShell({", reason: SHORT_GIT_PLUMBING },
+  { file: "src/merge/already-merged-detector.ts", line: 270, primitive: "execSync", signature: "branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, withPosixShell({", reason: SHORT_GIT_PLUMBING },
+  { file: "src/merge/already-merged-detector.ts", line: 345, primitive: "execSync", signature: "execSync(`git rev-parse --verify ${shellQuote(treeBranchName)}`, withPosixShell({", reason: SHORT_GIT_PLUMBING },
   { file: "src/merge/integration-branch.ts", line: 71, primitive: "execSync", signature: "const stdout = execSync(\"git symbolic-ref --short refs/remotes/origin/HEAD\", {", reason: SHORT_GIT_PLUMBING },
   { file: "src/merge/integration-branch.ts", line: 107, primitive: "execSync", signature: "const stdout = execSync(\"git remote\", {", reason: SHORT_GIT_PLUMBING },
   /*
@@ -51,8 +52,8 @@ const allowlist: AllowlistEntry[] = [
   { file: "src/merge/merger-git-parse.ts", line: 102, primitive: "execFileSync", signature: "const output = execFileSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/merge/merger-workspace-test-commands.ts", line: 204, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/merge/merger-workspace-test-commands.ts", line: 301, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
-  { file: "src/merger.ts", line: 753, primitive: "execSync", signature: "const output = execSync(command, options);", reason: SHORT_GIT_PLUMBING },
-  { file: "src/merger.ts", line: 800, primitive: "execSync", signature: "treeSha = execSync(\"git rev-parse HEAD^{tree}\", { cwd: rootDir, stdio: \"pipe\" })", reason: SHORT_GIT_PLUMBING },
+  { file: "src/merger.ts", line: 753, primitive: "execSync", signature: "const output = execSync(command, withPosixShell(options));", reason: SHORT_GIT_PLUMBING },
+  { file: "src/merger.ts", line: 800, primitive: "execSync", signature: "treeSha = execSync(\"git rev-parse HEAD^{tree}\", withPosixShell({ cwd: rootDir, stdio: \"pipe\" }))", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger.ts", line: 1409, primitive: "execSync", signature: "execSync(\"git reset --merge\", { cwd: rootDir, stdio: \"pipe\" });", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger.ts", line: 1621, primitive: "execSync", signature: "beforeRaw = execSync(\"git status -z --porcelain\", { cwd: rootDir, stdio: [\"ignore\", \"pipe\", \"ignore\"] }).toString(\"utf-8\");", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger.ts", line: 1633, primitive: "execSync", signature: "afterRaw = execSync(\"git status -z --porcelain\", { cwd: rootDir, stdio: [\"ignore\", \"pipe\", \"ignore\"] }).toString(\"utf-8\");", reason: SHORT_GIT_PLUMBING },
@@ -68,10 +69,10 @@ const allowlist: AllowlistEntry[] = [
   { file: "src/merger.ts", line: 10293, primitive: "execSync", signature: "const squashIsEmpty = execSync(", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger.ts", line: 10327, primitive: "execSync", signature: "const squashIsEmpty = execSync(", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger.ts", line: 10514, primitive: "execSync", signature: "execSync(\"git reset --merge\", { cwd: rootDir, stdio: \"pipe\" });", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 4640, primitive: "execSync", signature: "const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 4646, primitive: "execSync", signature: "const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote(\"main\")}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 4691, primitive: "execSync", signature: "const branchesRaw = String(execSync(\"git branch --list 'fusion/*'\", {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 15113, primitive: "execSync", signature: "execSync(`git branch -d ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 4640, primitive: "execSync", signature: "const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, withPosixShell({", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 4646, primitive: "execSync", signature: "const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote(\"main\")}`, withPosixShell({", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 4691, primitive: "execSync", signature: "const branchesRaw = String(execSync(\"git branch --list 'fusion/*'\", withPosixShell({", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 15113, primitive: "execSync", signature: "execSync(`git branch -d ${shellQuote(branch)}`, withPosixShell({", reason: SHORT_GIT_PLUMBING },
   { file: "src/worktree/worktree-prune.ts", line: 69, primitive: "execSync", signature: "execSync(\"git worktree prune\", {", reason: SHORT_GIT_PLUMBING },
 ];
 

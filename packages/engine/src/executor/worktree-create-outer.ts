@@ -4,6 +4,7 @@
  * TaskExecutor (U4 Slice B). Inject deps; keep thin class facades for spy/assignment surfaces.
  */
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -15,7 +16,7 @@ import { executorLog } from "../logger.js";
 import { quoteShellArg } from "./shell-quote.js";
 import { NonRetryableWorktreeError } from "./worktree-registry-helpers.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 
 export type WorktreeOuterStore = {
   updateTask: (taskId: string, patch: Record<string, unknown>) => Promise<unknown>;

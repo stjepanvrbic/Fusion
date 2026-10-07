@@ -4,12 +4,13 @@
  * Pure relative to executor instance state — only need cwd + git exec.
  */
 import { exec, execFile, execSync } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 import type { Task } from "@fusion/core";
 import { resolveCapturedBaseCommitSha } from "../execution/base-commit-capture.js";
 import { executorLog } from "../logger.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 const execFileAsync = promisify(execFile);
 
 /** True when a pre-execution worktree holds commits past its base or any uncommitted change. */

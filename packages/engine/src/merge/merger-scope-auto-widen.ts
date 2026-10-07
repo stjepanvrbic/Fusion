@@ -1,4 +1,5 @@
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -8,7 +9,7 @@ import { resolveWorkflowIrForTask, columnsWithFlag } from "@fusion/core";
 
 import { toTaskToken } from "../merger.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 const GIT_MAX_BUFFER = 10 * 1024 * 1024;
 
 type Attribution = "subject-prefix" | "bracketed-prefix" | "trailer";

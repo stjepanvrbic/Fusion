@@ -176,6 +176,9 @@ import * as core from "@fusion/core";
 import { type TaskStore, type Task, type MergeResult, DEFAULT_SETTINGS } from "@fusion/core";
 import { posixFixturePath } from "./_posix-fixture-path.js";
 
+/** Inferred commands are quoted for the native shell: POSIX single quotes, or double quotes on Windows. */
+const q = (value: string): string => (process.platform === "win32" ? `"${value}"` : `'${value}'`);
+
 const mockedCreateFnAgent = vi.mocked(createFnAgent);
 const mockedExecSync = vi.mocked(execSync);
 const mockedExec = vi.mocked(exec);
@@ -3068,7 +3071,7 @@ describe("inferDefaultTestCommand — pnpm workspace scoping", () => {
     });
 
     const result = inferDefaultTestCommand("/tmp/root", undefined, undefined, "main", "fusion/fn-123");
-    expect(result?.command).toBe(`pnpm --filter '...@fusion/dashboard' test`);
+    expect(result?.command).toBe(`pnpm --filter ${q("...@fusion/dashboard")} test`);
     expect(result?.command).not.toMatch(/\.\.\.\^/);
     expect(result?.testSource).toBe("inferred-scoped");
     expect(mockedExecSync).toHaveBeenCalledWith(
@@ -3106,7 +3109,7 @@ describe("inferDefaultTestCommand — pnpm workspace scoping", () => {
 
     const result = inferDefaultTestCommand("/tmp/root", undefined, undefined, "main", "fusion/fn-123");
     expect(result?.command).toBe(
-      "pnpm --filter '...@fusion/dashboard' --filter '...@fusion/engine' test",
+      `pnpm --filter ${q("...@fusion/dashboard")} --filter ${q("...@fusion/engine")} test`,
     );
     expect(result?.command).not.toMatch(/\.\.\.\^/);
     expect(result?.testSource).toBe("inferred-scoped");
@@ -3131,7 +3134,9 @@ describe("inferDefaultTestCommand — pnpm workspace scoping", () => {
       : "");
 
     const result = inferDefaultTestCommand("/tmp/root", undefined, undefined, "main", "fusion/fn-123");
-    expect(result?.command).toBe("pnpm --filter '...@evil/pkg'\\''; rm -rf /' test");
+    expect(result?.command).toBe(process.platform === "win32"
+      ? `pnpm --filter "...@evil/pkg'; rm -rf /" test`
+      : "pnpm --filter '...@evil/pkg'\\''; rm -rf /' test");
     expect(result?.command).not.toMatch(/\.\.\.\^/);
   });
 

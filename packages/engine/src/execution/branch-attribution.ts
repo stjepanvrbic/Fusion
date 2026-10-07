@@ -1,7 +1,8 @@
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 10 * 1024 * 1024;
 

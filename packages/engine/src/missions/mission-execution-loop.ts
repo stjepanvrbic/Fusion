@@ -44,9 +44,10 @@ import { createFallbackModelObserver } from "../auth/fallback-model-observer.js"
 import { resolveMcpServersForStore } from "../mcp/mcp-resolution.js";
 import { createRunAuditor, generateSyntheticRunId } from "../util/run-audit.js";
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 
 /** Shell-quote a single argument for a `git` invocation (mirror of the local
  * helper in branch-conflicts.ts — kept local rather than shared per repo

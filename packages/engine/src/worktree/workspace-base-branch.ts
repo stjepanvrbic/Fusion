@@ -1,10 +1,11 @@
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 import type { RunMutationContext, Settings, Task, TaskStore } from "@fusion/core";
 import type { RunAuditor } from "../util/run-audit.js";
 import { resolveIntegrationBranch } from "../merge/integration-branch.js";
 
-const defaultExecAsync = promisify(exec);
+const defaultExecAsync = bindPosixShell(promisify(exec));
 type ExecAsyncImpl = typeof defaultExecAsync;
 
 export type WorkspaceBaseBranchSource = "task-base-branch" | "recorded-base" | "repo-integration" | "legacy-entry";

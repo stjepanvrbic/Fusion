@@ -1,9 +1,10 @@
 import { exec, execSync } from "node:child_process";
+import { bindPosixShell, withPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 
 import { canonicalFusionBranchName, resolveTaskWorkingBranch } from "../worktree/worktree-names.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 
 export type AlreadyMergedDetectionStrategy = "trailer" | "ancestry" | "patch-id" | "tree-equal" | "no-diff";
 
@@ -201,11 +202,11 @@ export async function findAlreadyMergedTaskCommit(
   let branchTipHasNoUniqueDiff = false;
   let branchTipForeignNoDiff = false;
   try {
-    branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, {
+    branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, withPosixShell({
       cwd: repoDir,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
+    })).trim();
     if (hasCanonicalBranchIdentity) {
       branchTipHasNoUniqueDiff = await branchHasNoUniqueDiff(repoDir, branchTip, baseBranch).catch(() => false);
     }
@@ -220,10 +221,10 @@ export async function findAlreadyMergedTaskCommit(
     branchTipForeignNoDiff = branchTipHasNoUniqueDiff && branchTipHasForeignOwnership;
     branchTipOwnershipVerified = true;
 
-    execSync(`git merge-base --is-ancestor ${shellQuote(branchTip)} ${shellQuote(baseBranch)}`, {
+    execSync(`git merge-base --is-ancestor ${shellQuote(branchTip)} ${shellQuote(baseBranch)}`, withPosixShell({
       cwd: repoDir,
       stdio: ["pipe", "pipe", "pipe"],
-    });
+    }));
     if (branchTipForeignNoDiff) {
       return { sha: branchTip, strategy: "no-diff", ownershipProof: "canonical-branch-no-diff" };
     }
@@ -267,11 +268,11 @@ export async function findAlreadyMergedTaskCommit(
       return null;
     }
     if (!branchTip || !branchTipOwnershipVerified) {
-      branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, {
+      branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, withPosixShell({
         cwd: repoDir,
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
+      })).trim();
       if (hasCanonicalBranchIdentity) {
         branchTipHasNoUniqueDiff = await branchHasNoUniqueDiff(repoDir, branchTip, baseBranch).catch(() => false);
       }
@@ -303,7 +304,6 @@ export async function findAlreadyMergedTaskCommit(
     const branchPatchIdCommand = `git diff ${shellQuote(branchBase)}..${shellQuote(branchTip)} | git patch-id`;
     const { stdout: branchPatchIdOut } = await execAsync(branchPatchIdCommand, {
       cwd: repoDir,
-      shell: "/bin/sh",
       timeout: 60_000,
       maxBuffer: 32 * 1024 * 1024,
     });
@@ -316,7 +316,6 @@ export async function findAlreadyMergedTaskCommit(
       const basePatchMapCommand = `git log -n 200 -p --format='%H' ${shellQuote(baseBranch)} | git patch-id`;
       const { stdout: basePatchIdsOut } = await execAsync(basePatchMapCommand, {
         cwd: repoDir,
-        shell: "/bin/sh",
         timeout: 60_000,
         maxBuffer: 32 * 1024 * 1024,
       });
@@ -342,11 +341,11 @@ export async function findAlreadyMergedTaskCommit(
     if (treeBranchName !== canonicalBranchName) {
       return null;
     }
-    execSync(`git rev-parse --verify ${shellQuote(treeBranchName)}`, {
+    execSync(`git rev-parse --verify ${shellQuote(treeBranchName)}`, withPosixShell({
       cwd: repoDir,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
+    })).trim();
 
     const { stdout: baseTreeStdout } = await execAsync(`git rev-parse ${shellQuote(baseBranch)}^{tree}`, {
       cwd: repoDir,

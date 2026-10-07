@@ -2,6 +2,7 @@ import { exec } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { resolvePosixShell } from "@fusion/core";
 
 const execAsync = promisify(exec);
 
@@ -115,7 +116,7 @@ function parseProbeOutput(stdout: string, candidates: readonly string[]): Enviro
 
 async function runProbe(command: string, candidates: readonly string[], timeoutMs: number): Promise<EnvironmentCapabilityProbe> {
   try {
-    const { stdout } = await execAsync(command, { timeout: timeoutMs, maxBuffer: PROBE_MAX_BUFFER_BYTES, encoding: "utf-8", shell: "/bin/bash" });
+    const { stdout } = await execAsync(command, { timeout: timeoutMs, maxBuffer: PROBE_MAX_BUFFER_BYTES, encoding: "utf-8", shell: resolvePosixShell() ?? "/bin/bash" });
     return parseProbeOutput(stdout ?? "", candidates);
   } catch { return { capabilities: [], degraded: true }; }
 }

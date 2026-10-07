@@ -25,6 +25,8 @@ import {
   deriveFileScopedPnpmTestCommand,
   inferDefaultTestCommand,
 } from "../merger.js";
+import { quoteInferredCommandArg } from "../merge/merger-workspace-test-commands.js";
+import { posixFixturePath } from "./_posix-fixture-path.js";
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 
@@ -32,6 +34,9 @@ const mockedExecSync = vi.mocked(execSync);
 const mockedExistsSync = vi.mocked(existsSync);
 const mockedReadFileSync = vi.mocked(readFileSync);
 const mockedReaddirSync = vi.mocked(readdirSync);
+
+/** Inferred commands are quoted for the native shell: POSIX single quotes, or double quotes on Windows. */
+const q = (value: string): string => (process.platform === "win32" ? `"${value}"` : `'${value}'`);
 
 /**
  * Wire a single-package ("packages/engine" → "@fusion/engine") workspace, with
@@ -46,7 +51,7 @@ function setupSinglePackageWorkspace(opts: {
   const existing = new Set(opts.existingTestFiles.map((p) => `/tmp/root/${p}`));
 
   mockedExistsSync.mockImplementation((p: any) => {
-    const path = String(p);
+    const path = posixFixturePath(p);
     if (path.endsWith("pnpm-workspace.yaml")) return true;
     if (path.endsWith("pnpm-lock.yaml")) return true;
     // package.json existence for resolveWorkspacePackageRoots + name reads
@@ -57,7 +62,7 @@ function setupSinglePackageWorkspace(opts: {
     packages.map((pkg) => ({ name: pkg.dir, isDirectory: () => true })) as any,
   );
   mockedReadFileSync.mockImplementation((p: any) => {
-    const path = String(p);
+    const path = posixFixturePath(p);
     if (path.endsWith("pnpm-workspace.yaml")) return `packages:\n  - "packages/*"\n`;
     for (const pkg of packages) {
       if (path.endsWith(`packages/${pkg.dir}/package.json`)) {
@@ -86,7 +91,7 @@ describe("deriveFileScopedPnpmTestCommand", () => {
     });
     const result = deriveFileScopedPnpmTestCommand("/tmp/root", "main", "fusion/fn-1");
     expect(result).toBe(
-      `pnpm --filter '@fusion/engine' exec vitest run 'src/__tests__/foo.test.ts' --silent=passed-only --reporter=dot`,
+      `pnpm --filter ${q("@fusion/engine")} exec vitest run ${q("src/__tests__/foo.test.ts")} --silent=passed-only --reporter=dot`,
     );
   });
 
@@ -96,8 +101,8 @@ describe("deriveFileScopedPnpmTestCommand", () => {
       existingTestFiles: ["packages/engine/src/__tests__/foo.test.ts"],
     });
     const result = deriveFileScopedPnpmTestCommand("/tmp/root", "main", "fusion/fn-1");
-    expect(result).toContain(`--filter '@fusion/engine'`);
-    expect(result).toContain(`'src/__tests__/foo.test.ts'`);
+    expect(result).toContain(`--filter ${q("@fusion/engine")}`);
+    expect(result).toContain(`${q("src/__tests__/foo.test.ts")}`);
   });
 
   it("maps a changed source file to a sibling .test file", () => {
@@ -106,7 +111,7 @@ describe("deriveFileScopedPnpmTestCommand", () => {
       existingTestFiles: ["packages/engine/src/bar.test.ts"],
     });
     const result = deriveFileScopedPnpmTestCommand("/tmp/root", "main", "fusion/fn-1");
-    expect(result).toContain(`'src/bar.test.ts'`);
+    expect(result).toContain(`${q("src/bar.test.ts")}`);
   });
 
   it("excludes a changed source file with no co-located test", () => {
@@ -141,9 +146,9 @@ describe("deriveFileScopedPnpmTestCommand", () => {
     expect(result).toContain(" && ");
     // Package roots are sorted, so dashboard precedes engine.
     expect(result).toBe(
-      `pnpm --filter '@fusion/dashboard' exec vitest run 'src/__tests__/b.test.ts' --silent=passed-only --reporter=dot` +
+      `pnpm --filter ${q("@fusion/dashboard")} exec vitest run ${q("src/__tests__/b.test.ts")} --silent=passed-only --reporter=dot` +
         ` && ` +
-        `pnpm --filter '@fusion/engine' exec vitest run 'src/__tests__/a.test.ts' --silent=passed-only --reporter=dot`,
+        `pnpm --filter ${q("@fusion/engine")} exec vitest run ${q("src/__tests__/a.test.ts")} --silent=passed-only --reporter=dot`,
     );
   });
 
@@ -153,7 +158,7 @@ describe("deriveFileScopedPnpmTestCommand", () => {
       existingTestFiles: ["packages/engine/src/__tests__/foo.test.ts"],
     });
     const result = deriveFileScopedPnpmTestCommand("/tmp/root", "main", "fusion/fn-1");
-    const occurrences = (result ?? "").split(`'src/__tests__/foo.test.ts'`).length - 1;
+    const occurrences = (result ?? "").split(`${q("src/__tests__/foo.test.ts")}`).length - 1;
     expect(occurrences).toBe(1);
   });
 
@@ -199,7 +204,7 @@ describe("inferDefaultTestCommand — scopeToChangedFiles", () => {
     );
     expect(result?.testSource).toBe("inferred-scoped");
     expect(result?.command).toBe(
-      `pnpm --filter '@fusion/engine' exec vitest run 'src/__tests__/foo.test.ts' --silent=passed-only --reporter=dot`,
+      `pnpm --filter ${q("@fusion/engine")} exec vitest run ${q("src/__tests__/foo.test.ts")} --silent=passed-only --reporter=dot`,
     );
   });
 
@@ -251,6 +256,24 @@ describe("inferDefaultTestCommand — scopeToChangedFiles", () => {
       true,
     );
     expect(result?.testSource).toBe("inferred-scoped");
-    expect(result?.command).toContain(`exec vitest run 'src/__tests__/foo.test.ts'`);
+    expect(result?.command).toContain(`exec vitest run ${q("src/__tests__/foo.test.ts")}`);
+  });
+});
+
+describe("quoteInferredCommandArg", () => {
+  it("POSIX-quotes off Windows, including embedded single quotes", () => {
+    expect(quoteInferredCommandArg("...@fusion/engine", "linux")).toBe(`'...@fusion/engine'`);
+    expect(quoteInferredCommandArg("a'b", "darwin")).toBe("'a'\\''b'");
+  });
+
+  it("double-quotes on Windows so cmd.exe passes the argument without literal quotes", () => {
+    expect(quoteInferredCommandArg("...@fusion/engine", "win32")).toBe(`"...@fusion/engine"`);
+    expect(quoteInferredCommandArg("src/a b.test.ts", "win32")).toBe(`"src/a b.test.ts"`);
+  });
+
+  it("refuses values cmd.exe cannot carry inside double quotes", () => {
+    for (const value of [`a"b`, "%PATH%", "a$b", "a`b", "a\nb"]) {
+      expect(quoteInferredCommandArg(value, "win32")).toBeNull();
+    }
   });
 });

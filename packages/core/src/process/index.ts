@@ -9,5 +9,6 @@ export * from "./logger.js";
 export * from "./otel-metrics.js";
 export * from "./process-supervisor.js";
 export * from "./run-command.js";
+export * from "./posix-shell.js";
 export * from "./test-safety.js";
 export * from "./vitest-processes.js";

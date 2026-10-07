@@ -1,4 +1,5 @@
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 import {
   resolveTitleSummarizerSettingsModel,
@@ -7,7 +8,7 @@ import {
 } from "@fusion/core";
 import { mergerLog } from "../logger.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 
 function quoteArg(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;

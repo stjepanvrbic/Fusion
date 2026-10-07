@@ -1,4 +1,5 @@
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 
 import type {
@@ -7,7 +8,7 @@ import type {
 } from "./merger-squash-audit.js";
 import type { Logger } from "../logger.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_BUFFER = 10 * 1024 * 1024;
 const NOISE_LINE_RE = /^[\s{}()[\];,]*$/;

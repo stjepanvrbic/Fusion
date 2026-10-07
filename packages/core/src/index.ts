@@ -1545,6 +1545,8 @@ export { AutomationStore } from "./automation/automation-store.js";
 export type { AutomationStoreEvents } from "./automation/automation-store.js";
 export { runCommandAsync } from "./process/run-command.js";
 export type { RunCommandOptions, RunCommandResult } from "./process/run-command.js";
+export { resolvePosixShell, findPosixShell, resetPosixShellCache, withPosixShell, bindPosixShell, execPosix } from "./process/posix-shell.js";
+export type { PosixShellHost } from "./process/posix-shell.js";
 export {
   EXPERIMENT_SESSION_STATUSES,
   EXPERIMENT_METRIC_DIRECTIONS,

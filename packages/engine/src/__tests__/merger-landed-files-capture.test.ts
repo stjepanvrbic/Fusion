@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+// FNXC:PosixShell 2026-10-07-16:28: import the helper first so its node:child_process/node:fs mocks are registered before any production module loads @fusion/core.
+import { createMockStore, mockedCreateFnAgent, mockedExecSync, mockedExistsSync, type Task } from "./merger-test-helpers.js";
 import { BranchAttributionError, SilentNoOpAttributionMismatchError } from "../execution/branch-attribution.js";
 import * as attributionModule from "../execution/branch-attribution.js";
-import { createMockStore, mockedCreateFnAgent, mockedExecSync, mockedExistsSync, type Task } from "./merger-test-helpers.js";
 import * as mergerModule from "../merger.js";
 
 describe("FN-4646 aiMergeTask landedFiles capture", () => {

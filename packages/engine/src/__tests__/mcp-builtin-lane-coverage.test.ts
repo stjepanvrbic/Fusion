@@ -29,14 +29,14 @@ type LedgerRow = { file: string; line: number; bucket: Bucket; expression: strin
 const LEDGER: LedgerRow[] = [
   ["packages/engine/src/executor/resolve-mcp-servers.ts",32,"A","deps.store","TaskStore","executor TaskStore"],
   ["packages/engine/src/execution/reviewer.ts",580,"A","options.store","TaskStore","reviewer TaskStore"],
-  ["packages/engine/src/merger.ts",391,"A","store","TaskStore","merger TaskStore"],
+  ["packages/engine/src/merger.ts",392,"A","store","TaskStore","merger TaskStore"],
   ["packages/engine/src/merge/merger-ai.ts",566,"A","store","TaskStore","merger AI TaskStore"],
   ["packages/engine/src/merge/merger-ai.ts",640,"A","store","TaskStore","merger AI TaskStore"],
   ["packages/engine/src/merge/pr-response-run-ops.ts",112,"A","store","TaskStore","PR response TaskStore"],
   ["packages/engine/src/agent-heartbeat.ts",196,"A","taskStore","nullable-root","heartbeat accepts a nullable root"],
   ["packages/engine/src/triage.ts",3555,"A","this.store","TaskStore","triage TaskStore"],
   ["packages/engine/src/scheduling/cron-runner.ts",1073,"A","store","TaskStore","cron TaskStore"],
-  ["packages/engine/src/missions/mission-execution-loop.ts",1125,"A","this.taskStore","TaskStore","mission TaskStore"],
+  ["packages/engine/src/missions/mission-execution-loop.ts",1126,"A","this.taskStore","TaskStore","mission TaskStore"],
   ["packages/engine/src/agents/agent-reflection.ts",161,"A","this.taskStore","TaskStore","reflection TaskStore"],
   ["packages/engine/src/eval/evaluator.ts",170,"A","this.deps.store","TaskStore","evaluator TaskStore"],
   // FNXC:MemoryMcpCoverage 2026-08-23-19:48: memory-semantics runs a readonly model session on `input.taskStore` (typed TaskStore, root-capable), so it is an A lane like every other store-backed resolver call.

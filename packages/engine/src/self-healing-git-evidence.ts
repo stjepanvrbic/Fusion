@@ -27,6 +27,7 @@ combination that hid the last four safeguard regressions. An abstract base keeps
 */
 import { promisify } from "node:util";
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 /* NOTE: `findAlreadyMergedTaskCommit` here is the FREE function from the
    detector module — it shares a name with the protected method below, and inside
    the class body the bare identifier resolves to this import. That collision
@@ -40,7 +41,7 @@ const log = createLogger("self-healing");
    self-healing.ts imports this file's class at definition time. */
 import type { SelfHealingOptions } from "./self-healing.js";
 
-export const execAsync = promisify(exec);
+export const execAsync = bindPosixShell(promisify(exec));
 
 /**
  * FNXC:Workspace 2026-08-15-04:42:

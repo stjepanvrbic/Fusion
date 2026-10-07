@@ -3,10 +3,10 @@ import { exec as execCb } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { GlobalSettings, ProjectSettings, Settings, Task, TaskStore } from "@fusion/core";
-import { isValidTaskBranchName, resolveTaskPrHeadBranch, resolveTitleSummarizerSettingsModel } from "@fusion/core";
+import { bindPosixShell, isValidTaskBranchName, resolveTaskPrHeadBranch, resolveTitleSummarizerSettingsModel } from "@fusion/core";
 import { createFnAgent, resolveMcpServersForStore } from "@fusion/engine";
 
-const execAsync = promisify(execCb);
+const execAsync = bindPosixShell(promisify(execCb));
 export const PR_METADATA_TIMEOUT_MS = 60_000;
 
 /*

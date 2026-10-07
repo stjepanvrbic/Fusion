@@ -4,11 +4,12 @@
  * Inject rootDir + settings reader; no class state.
  */
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 import type { Settings } from "@fusion/core";
 import { quoteShellArg } from "./shell-quote.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 
 export type SquashImportPlanStore = {
   getSettings: () => Promise<Settings | Partial<Settings>>;

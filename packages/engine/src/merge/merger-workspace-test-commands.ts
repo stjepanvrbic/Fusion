@@ -6,14 +6,30 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { execSync } from "node:child_process";
+import { withPosixShell } from "@fusion/core";
 import { mergerLog } from "../logger.js";
 
 const BOUNDED_GIT_DIFF_TIMEOUT_MS = 5_000;
 const BOUNDED_GIT_DIFF_MAX_BUFFER = 10 * 1024 * 1024;
 
-/** Shell-safe single-argument quoting for command composition. */
+/** POSIX single-quote quoting for the git probes below, which run under `withPosixShell`. */
 function quoteArg(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/** Characters cmd.exe cannot carry literally inside double quotes, plus expansions other readers' shells would apply. */
+const WIN32_UNQUOTABLE = /["%$`\r\n]/;
+
+/*
+FNXC:PosixShell 2026-10-07-16:28:
+Inferred verification commands are Fusion-generated but executed by the same native-shell runner as the operator's testCommand (cmd.exe on Windows), and they are shown verbatim in task logs and handed to merge-fix agents.
+So they are quoted for the native shell instead of being routed to Git Bash: POSIX single quotes off Windows, double quotes on Windows, which cmd.exe, PowerShell and Git Bash all read the same way for these values.
+A value that cannot be double-quoted safely on Windows yields null, so inference returns no scoped command and the caller falls back to its unscoped command rather than running a mangled one.
+*/
+export function quoteInferredCommandArg(value: string, platform: NodeJS.Platform = process.platform): string | null {
+  if (platform !== "win32") return quoteArg(value);
+  if (WIN32_UNQUOTABLE.test(value)) return null;
+  return `"${value}"`;
 }
 
 /** Result of inferring a default test command */
@@ -203,13 +219,13 @@ export function deriveScopedPnpmTestCommand(rootDir: string, baseBranch: string,
   try {
     changedFilesOutput = execSync(
       `git diff --name-only ${quoteArg(baseBranch)}...${quoteArg(branch)}`,
-      {
+      withPosixShell({
         cwd: rootDir,
         stdio: "pipe",
         encoding: "utf-8",
         timeout: BOUNDED_GIT_DIFF_TIMEOUT_MS,
         maxBuffer: BOUNDED_GIT_DIFF_MAX_BUFFER,
-      },
+      }),
     ).toString();
   } catch {
     return null;
@@ -239,7 +255,9 @@ export function deriveScopedPnpmTestCommand(rootDir: string, baseBranch: string,
   // Package names come from workspace package.json files (potentially
   // untrusted) so we quote each filter argument via `quoteArg` to prevent
   // shell interpolation if a name contains metacharacters.
-  const filters = packageNames.map((name) => `--filter ${quoteArg(`...${name}`)}`).join(" ");
+  const quotedFilters = packageNames.map((name) => quoteInferredCommandArg(`...${name}`));
+  if (quotedFilters.some((filter) => filter === null)) return null;
+  const filters = quotedFilters.map((filter) => `--filter ${filter}`).join(" ");
   return `pnpm ${filters} test`;
 }
 
@@ -307,13 +325,13 @@ export function deriveFileScopedPnpmTestCommand(
   try {
     changedFilesOutput = execSync(
       `git diff --name-only ${quoteArg(baseBranch)}...${quoteArg(branch)}`,
-      {
+      withPosixShell({
         cwd: rootDir,
         stdio: "pipe",
         encoding: "utf-8",
         timeout: BOUNDED_GIT_DIFF_TIMEOUT_MS,
         maxBuffer: BOUNDED_GIT_DIFF_MAX_BUFFER,
-      },
+      }),
     ).toString();
   } catch {
     return null;
@@ -398,10 +416,12 @@ export function deriveFileScopedPnpmTestCommand(
     if (!entry) continue;
     const quotedPaths = Array.from(entry.tests)
       .sort()
-      .map((p) => quoteArg(p));
+      .map((p) => quoteInferredCommandArg(p));
     if (quotedPaths.length === 0) continue;
+    const quotedName = quoteInferredCommandArg(entry.name);
+    if (quotedName === null || quotedPaths.some((path) => path === null)) return null;
     segments.push(
-      `pnpm --filter ${quoteArg(entry.name)} exec vitest run ${quotedPaths.join(" ")} --silent=passed-only --reporter=dot`,
+      `pnpm --filter ${quotedName} exec vitest run ${quotedPaths.join(" ")} --silent=passed-only --reporter=dot`,
     );
   }
   if (segments.length === 0) return null;

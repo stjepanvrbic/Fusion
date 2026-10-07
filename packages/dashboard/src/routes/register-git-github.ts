@@ -1,4 +1,4 @@
-import { createLogger, createIngestedCheckResolver, resolveRequiredCheckNames, resolveWorkflowIrForTask, resolveReviewColumns, resolveReboundTarget, resolveTaskPrHeadBranch } from "@fusion/core";
+import { bindPosixShell, createLogger, createIngestedCheckResolver, resolveRequiredCheckNames, resolveWorkflowIrForTask, resolveReviewColumns, resolveReboundTarget, resolveTaskPrHeadBranch } from "@fusion/core";
 
 const severityAuditLog = createLogger("dashboard-register-git-github");
 import { type NextFunction, type Request, type Response } from "express";
@@ -72,7 +72,7 @@ import { runGitCommand } from "./resolve-diff-base.js";
 import { assertWorktreePathSafe, isPathWithin, listRegisteredWorktreePaths } from "../git-worktree-safety.js";
 import { getTaskPrimaryPr } from "../task-planner-pr-status.js";
 
-const execAsync = promisify(execCb);
+const execAsync = bindPosixShell(promisify(execCb));
 const PR_ROUTE_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const PR_PREFLIGHT_TIMEOUT_MS = 15_000;
 const PR_OPTIONS_TIMEOUT_MS = 10_000;

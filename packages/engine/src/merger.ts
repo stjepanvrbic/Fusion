@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { execSync, exec } from "node:child_process";
+import { bindPosixShell, withPosixShell } from "@fusion/core";
 import * as childProcess from "node:child_process";
 import { promisify } from "node:util";
 import { IDENTITY_GUARD_BYPASS_ENV } from "./worktree/worktree-hooks.js";
@@ -7,7 +8,7 @@ import { mergeEffectiveSettings } from "./project/effective-settings.js";
 import { buildUserCommentsPromptSection, selectUserCommentsForAgentContext } from "./agents/agent-user-comments.js";
 
 // Internal git plumbing intentionally bypasses sandbox backends.
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 // `execFile` is resolved lazily through the namespace import so test mocks that
 // only stub `exec`/`execSync` (the repo's established node:child_process mock
 // convention) can still load this module; `execFile` is only required when a
@@ -806,7 +807,7 @@ function rethrowIfMergeAborted(error: unknown): void {
  * this helper normalises all three cases.
  */
 function execSyncText(command: string, options: Parameters<typeof execSync>[1]): string {
-  const output = execSync(command, options);
+  const output = execSync(command, withPosixShell(options));
   if (output == null) return "";
   if (typeof output === "string") return output.trim();
   return (output as Buffer).toString("utf-8").trim();
@@ -862,7 +863,7 @@ export async function runDeterministicVerification(
   const effectiveBuildCommand = normalizedBuildCommand ?? "";
   let treeSha: string | null = null;
   try {
-    treeSha = execSync("git rev-parse HEAD^{tree}", { cwd: rootDir, stdio: "pipe" })
+    treeSha = execSync("git rev-parse HEAD^{tree}", withPosixShell({ cwd: rootDir, stdio: "pipe" }))
       .toString()
       .trim();
   } catch (err) {
@@ -10531,7 +10532,7 @@ export async function executeMergeAttempt(
         // No conflicts - check if squash is empty
         const squashIsEmpty = execSync(
           "git diff --cached --quiet 2>&1; echo $?",
-          { cwd: rootDir, encoding: "utf-8" },
+          withPosixShell({ cwd: rootDir, encoding: "utf-8" }),
         ).trim() === "0";
 
         if (squashIsEmpty) {
@@ -10565,7 +10566,7 @@ export async function executeMergeAttempt(
       // Check if squash is empty
       const squashIsEmpty = execSync(
         "git diff --cached --quiet 2>&1; echo $?",
-        { cwd: rootDir, encoding: "utf-8" },
+        withPosixShell({ cwd: rootDir, encoding: "utf-8" }),
       ).trim() === "0";
 
       if (squashIsEmpty) {

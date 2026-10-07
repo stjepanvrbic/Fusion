@@ -1,7 +1,8 @@
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 
 /**
  * Resolve the fork-point base SHA for a freshly acquired task worktree.

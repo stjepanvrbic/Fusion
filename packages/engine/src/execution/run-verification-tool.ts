@@ -26,6 +26,7 @@ import type { SandboxBackend, SandboxPolicy, SandboxStreamingResult } from "../s
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { executorLog } from "../logger.js";
 import { withVerificationSlot } from "../concurrency/verification-concurrency.js";
+import { quoteInferredCommandArg } from "../merge/merger-workspace-test-commands.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -180,9 +181,15 @@ export function detectMarathonVerification(command: string, scope?: "package" | 
   return { isMarathon: false, guidance };
 }
 
-function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
-  return `'${value.replace(/'/g, "'\\''")}'`;
+/*
+FNXC:PosixShell 2026-10-07-17:05:
+The rewritten verification command runs in the native shell (cmd.exe on Windows), where POSIX single quotes reach vitest literally.
+Quote non-plain tokens for that shell via the same rule as inferred verification commands; null means the token cannot be carried safely, and the caller keeps the agent's original command.
+`%` is not plain because cmd.exe expands it.
+*/
+function shellQuote(value: string): string | null {
+  if (/^[A-Za-z0-9_@+=:,./-]+$/.test(value)) return value;
+  return quoteInferredCommandArg(value);
 }
 
 function findWorkspacePackageDir(rootDir: string, packageName: string): string | null {
@@ -305,7 +312,9 @@ export function normalizeVerificationCommand(command: string, rootDir: string): 
     ...(hasSilent ? [] : ["--silent=passed-only"]),
     ...(hasReporter ? [] : ["--reporter=dot"]),
   ];
-  const normalizedCommand = normalizedTokens.map(shellQuote).join(" ");
+  const quotedTokens = normalizedTokens.map(shellQuote);
+  if (quotedTokens.some((token) => token === null)) return { command, warnings };
+  const normalizedCommand = quotedTokens.join(" ");
 
   if (normalizedCommand !== command) {
     warnings.push(

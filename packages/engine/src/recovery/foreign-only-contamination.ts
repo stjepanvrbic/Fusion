@@ -1,4 +1,5 @@
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import { isFusionDeletableBranch, type Task, type TaskStore } from "@fusion/core";
@@ -11,7 +12,7 @@ import {
 import type { RunAuditor } from "../util/run-audit.js";
 import { isUsableTaskWorktree } from "../worktree/worktree-pool.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 10 * 1024 * 1024;
 

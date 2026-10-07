@@ -7,11 +7,12 @@
  */
 import { isWorkspaceTask, loadWorkspaceConfig, type Task } from "@fusion/core";
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { promisify } from "node:util";
 import { resolveTaskWorkingBranch } from "../worktree/worktree-names.js";
 import { executorLog } from "../logger.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 
 export type ResetStepsIfWorkLostDeps = {
   rootDir: string;

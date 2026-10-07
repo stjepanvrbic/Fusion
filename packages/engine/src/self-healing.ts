@@ -24,6 +24,7 @@ import { isPostMergeGateRecoveryDue, resumeMissingPostMergeGate } from "./merge/
  */
 
 import { execSync } from "node:child_process";
+import { withPosixShell } from "@fusion/core";
 import { setImmediate as setImmediateCb } from "node:timers";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -5509,17 +5510,17 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
 
   private async inspectOrphanedBranch(branch: string): Promise<{ tipSha: string; uniqueCommitCount: number } | null> {
     try {
-      const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, {
+      const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, withPosixShell({
         cwd: this.options.rootDir,
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
-      })).trim();
+      }))).trim();
       if (!tipSha) return null;
-      const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote("main")}`, {
+      const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote("main")}`, withPosixShell({
         cwd: this.options.rootDir,
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
-      })).trim(), 10) || 0;
+      }))).trim(), 10) || 0;
       return { tipSha, uniqueCommitCount };
     } catch (err: unknown) {
       log.warn(`Failed to inspect branch ${branch} during stale-active reclaim: ${err instanceof Error ? err.message : String(err)}`);
@@ -5560,11 +5561,11 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         }
       }
 
-      const branchesRaw = String(execSync("git branch --list 'fusion/*'", {
+      const branchesRaw = String(execSync("git branch --list 'fusion/*'", withPosixShell({
         cwd: this.options.rootDir,
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
-      }) || "");
+      })) || "");
       const branches = branchesRaw
         .split("\n")
         .map((line) => line.replace(/^[*+]\s*/, "").trim())
@@ -17703,10 +17704,10 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         if (inspection.uniqueCommitCount > 0) continue;
 
         try {
-          execSync(`git branch -d ${shellQuote(branch)}`, {
+          execSync(`git branch -d ${shellQuote(branch)}`, withPosixShell({
             cwd: this.options.rootDir,
             stdio: ["pipe", "pipe", "pipe"],
-          });
+          }));
           cleaned++;
           prunedBranches.push(branch);
 

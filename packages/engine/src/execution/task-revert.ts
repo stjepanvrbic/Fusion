@@ -48,6 +48,7 @@
  * comment below for the full contract.
  */
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { isWorkspaceTask, type Settings, type Task, type TaskCommitAssociation, type TaskCreateInput, type TaskStore } from "@fusion/core";
@@ -56,7 +57,7 @@ import { type IntegrationBranchSettings } from "../merge/integration-branch.js";
 import { recordWorkspaceBaseBranchDecision, resolveWorkspaceRepoBaseBranch } from "../worktree/workspace-base-branch.js";
 import { createRunAuditor, generateSyntheticRunId, type RunAuditor } from "../util/run-audit.js";
 
-const defaultExecAsync = promisify(exec);
+const defaultExecAsync = bindPosixShell(promisify(exec));
 type ExecAsyncImpl = typeof defaultExecAsync;
 
 const GIT_TIMEOUT_MS = 30_000;

@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { resolvePosixShell } from "@fusion/core";
 
 const { mockExecAsync, mockExec, mockReadFile } = vi.hoisted(() => ({ mockExecAsync: vi.fn(), mockExec: vi.fn(), mockReadFile: vi.fn() }));
-vi.mock("node:child_process", () => {
+vi.mock("node:child_process", async (importOriginal) => {
   Object.defineProperty(mockExec, Symbol.for("nodejs.util.promisify.custom"), { value: mockExecAsync, configurable: true });
-  return { exec: mockExec };
+  return { ...(await importOriginal<typeof import("node:child_process")>()), exec: mockExec };
 });
-vi.mock("node:fs/promises", () => ({ readFile: mockReadFile }));
+vi.mock("node:fs/promises", async (importOriginal) => ({ ...(await importOriginal<typeof import("node:fs/promises")>()), readFile: mockReadFile }));
 
 import {
   BASELINE_ENVIRONMENT_CAPABILITY_COMMANDS, extractCommandBinaries, formatEnvironmentCapabilitiesSection,
@@ -36,7 +37,7 @@ describe("environment capability probe", () => {
     expect(probe.degraded).toBe(false);
     expect(probe.capabilities).toHaveLength(BASELINE_ENVIRONMENT_CAPABILITY_COMMANDS.length);
     expect(probe.capabilities.every(({ available }) => available)).toBe(true);
-    expect(mockExecAsync).toHaveBeenCalledWith(expect.stringContaining("for name in"), expect.objectContaining({ timeout: 5_000, maxBuffer: 64 * 1024, shell: "/bin/bash" }));
+    expect(mockExecAsync).toHaveBeenCalledWith(expect.stringContaining("for name in"), expect.objectContaining({ timeout: 5_000, maxBuffer: 64 * 1024, shell: resolvePosixShell() ?? "/bin/bash" }));
   });
 
   it("discovers an unset-settings root flake through the fixed Nix wrapper", async () => {

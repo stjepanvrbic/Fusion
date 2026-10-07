@@ -1,4 +1,5 @@
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import type { Task } from "@fusion/core";
 import { isFusionDeletableBranch } from "@fusion/core";
 import { promisify } from "node:util";
@@ -7,7 +8,7 @@ import { quoteShellArg } from "../executor/shell-quote.js";
 import { canonicalFusionBranchName } from "./worktree-names.js";
 import { canonicalizePath, getRegisteredWorktreeBranches } from "./worktree-pool.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 const RESET_BRANCH_GIT_TIMEOUT_MS = 30_000;
 const RESET_BRANCH_GIT_MAX_BUFFER = 10 * 1024 * 1024;
 

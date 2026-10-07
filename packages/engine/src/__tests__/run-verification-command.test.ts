@@ -180,6 +180,23 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       );
     });
 
+    it("quotes rewritten tokens for the shell that will run them", () => {
+      const result = normalizeVerificationCommand(
+        'pnpm --filter @fusion/dashboard test -- --run packages/dashboard/src/__tests__/routes-tasks.test.ts -t "creates a task"',
+        workspaceRoot,
+      );
+      const quoted = process.platform === "win32" ? '"creates a task"' : "'creates a task'";
+      expect(result.command).toBe(
+        `pnpm --filter @fusion/dashboard exec vitest run src/__tests__/routes-tasks.test.ts -t ${quoted} --silent=passed-only --reporter=dot`,
+      );
+    });
+
+    it("leaves a command unrewritten when a token cannot be quoted safely for the native shell", () => {
+      if (process.platform !== "win32") return;
+      const command = 'pnpm --filter @fusion/dashboard test -- --run packages/dashboard/src/__tests__/routes-tasks.test.ts -t "100% done"';
+      expect(normalizeVerificationCommand(command, workspaceRoot)).toEqual({ command, warnings: [] });
+    });
+
     it("verifies the CLI package directory through package.json before rewriting", () => {
       const result = normalizeVerificationCommand(
         "pnpm --filter @runfusion/fusion test -- --run packages/cli/src/__tests__/cli.test.ts",

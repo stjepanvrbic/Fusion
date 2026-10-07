@@ -1,9 +1,10 @@
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import { resolveIntegrationBranch } from "../merge/integration-branch.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 const FUSION_TASK_ID_TRAILER_KEY = "Fusion-Task-Id";
 const GIT_TIMEOUT_MS = 120_000;
 const GIT_MAX_BUFFER = 10 * 1024 * 1024;

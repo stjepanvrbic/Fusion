@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { exec } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { acquireWorktreePathReservation, assertWorkspaceRepoRelPath, canonicalizeWorktreePath, classifyTaskBranchOrigin, isLegacyWorkspaceWorktreeLayout, resolveEngineIncarnationId, resolveEngineNodeId, resolveWorkspaceRepoWorktreePath, resolveWorkspaceTaskWorktreeDir, workspaceWorktreeGroupSegment, WORKSPACE_GROUP_MARKER_FILENAME, type RunMutationContext, type Settings, type Task, type TaskStore, type SecretsStore, type WorkspaceConfig, type WorkspaceLeaseHandle, type WorkspaceWorktreeContext } from "@fusion/core";
@@ -62,7 +63,7 @@ import { getConfiguredWorktreeInitCommand } from "./dependency-bootstrap-inferen
 import { removeDirectoryWithRetry, retryTransientFilesystemOperation } from "./worktree-removal-retry.js";
 import { inspectCheckoutGitEntry, recordCheckoutRemovalPartial } from "./remove-checkout.js";
 
-const execAsync = promisify(exec);
+const execAsync = bindPosixShell(promisify(exec));
 const PRESERVED_ORPHAN_RETENTION_COUNT = 10;
 /** Errno codes a lingering handle produces on a rename-aside; EXDEV is deliberately excluded. */
 const TRANSIENT_RENAME_ASIDE_CODES = new Set(["EPERM", "EACCES", "EBUSY", "ENOTEMPTY"]);
