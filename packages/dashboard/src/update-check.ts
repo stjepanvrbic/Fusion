@@ -4,7 +4,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
-  EXTERNALLY_MANAGED_UPDATE_MESSAGE,
+  resolveExternallyManagedUpdateMessage,
   resolveGlobalDir,
   resolveUpdatesExternallyManaged,
   isVersionNewer,
@@ -203,7 +203,8 @@ export function detectUnsupportedInstallMethod(input: {
   hasNpm?: boolean;
 }): { reason: "externally-managed" | "source-checkout" | "homebrew" | "npm-missing"; message: string } | null {
   if (input.externallyManaged) {
-    return { reason: "externally-managed", message: EXTERNALLY_MANAGED_UPDATE_MESSAGE };
+    // FNXC:UpdateManagement 2026-10-07-18:02: inside the desktop app the guidance names its built-in updater (see update-management.ts).
+    return { reason: "externally-managed", message: resolveExternallyManagedUpdateMessage() };
   }
   if (input.sourceWorkspaceRoot) {
     return { reason: "source-checkout", message: `This Fusion is running from a source checkout at ${input.sourceWorkspaceRoot}; a global npm install will not change it — pull and rebuild the checkout instead.` };

@@ -50,6 +50,8 @@ const mocks = vi.hoisted(() => {
       appEvents.set(event, handler);
     }),
     quit: vi.fn(),
+    exit: vi.fn(),
+    requestSingleInstanceLock: vi.fn(() => true),
     isQuitting: false,
   };
 
@@ -92,6 +94,7 @@ const mocks = vi.hoisted(() => {
 
   const setupDeepLinkHandler = vi.fn(() => {
     callLog.push("setupDeepLinkHandler");
+    return { flushPending: vi.fn() };
   });
 
   const setupAutoUpdater = vi.fn(() => {
@@ -276,7 +279,6 @@ describe("main integration", () => {
       "setupTray",
       "registerIpcHandlers",
       "registerDeepLinkProtocol",
-      "setupDeepLinkHandler",
       "setupAutoUpdater",
       "startUpdateCheckInterval",
     ]);
@@ -356,13 +358,12 @@ describe("main integration", () => {
     expect(mocks.setupTray).toHaveBeenCalledWith(instance, trayInstance);
   });
 
-  it("registerIpcHandlers is called with mainWindow and tray", async () => {
+  it("registerIpcHandlers is called with mainWindow and runtime options", async () => {
     const { initializeApp } = await importMainModule();
     await initializeApp();
 
     const [{ instance }] = mocks.windowInstances;
-    const [trayInstance] = mocks.trayInstances;
-    expect(mocks.registerIpcHandlers).toHaveBeenCalledWith(instance, trayInstance, expect.any(Object));
+    expect(mocks.registerIpcHandlers).toHaveBeenCalledWith(instance, expect.any(Object));
   });
 
   it("window close hides to tray when app is not quitting", async () => {
@@ -398,7 +399,7 @@ describe("main integration", () => {
     await flushPromises();
 
     const beforeQuitHandler = mocks.appEvents.get("before-quit");
-    beforeQuitHandler?.();
+    beforeQuitHandler?.({ preventDefault: vi.fn() });
 
     const [trayInstance] = mocks.trayInstances;
     expect(mocks.app.isQuitting).toBe(true);

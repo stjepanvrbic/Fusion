@@ -40,9 +40,6 @@ export interface FusionAPI {
   getDesktopLaunchContext(): Promise<{ mode: "remote"; profileId: string; serverBaseUrl: string; serverLabel?: string; authToken?: string } | null>;
   openConnectionManager(): Promise<void>;
 
-  // Tray status
-  updateTrayStatus(status: string): Promise<void>;
-
   // Native dialogs
   showExportDialog(): Promise<string | null>;
   showImportDialog(): Promise<string | null>;

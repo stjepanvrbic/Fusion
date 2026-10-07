@@ -184,6 +184,23 @@ describe("update-check", () => {
     expect(readCachedUpdateCheck(fusionDir)).toEqual(value);
   });
 
+  // C-045: a global npm install can never change the Electron desktop app, so it is refused pre-flight.
+  it("performUpdateInstall refuses to run npm inside the Electron desktop host", async () => {
+    const versionsDescriptor = Object.getOwnPropertyDescriptor(process, "versions")!;
+    Object.defineProperty(process, "versions", { ...versionsDescriptor, value: { ...process.versions, electron: "35.0.0" } });
+    try {
+      const execFake = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+
+      const result = await performUpdateInstall("1.0.0", "2.0.0", { exec: execFake, fusionDir });
+
+      expect(execFake).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ updated: false, outcome: "unsupported-install-method" });
+      expect(result.message).toMatch(/desktop app/i);
+    } finally {
+      Object.defineProperty(process, "versions", versionsDescriptor);
+    }
+  });
+
   it("performUpdateInstall installs latest and clears the update-check cache", async () => {
     const cachePath = join(fusionDir, "update-check.json");
     await writeFile(cachePath, JSON.stringify({ ok: true }), "utf-8");

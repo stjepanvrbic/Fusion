@@ -8,6 +8,8 @@ import type { AddressInfo } from "node:net";
 
 import { resolveDesktopRuntimePrimaryProject } from "./engine-runtime.js";
 import { resolveDesktopBundlePluginDirs } from "./bundled-plugin-dirs.js";
+import { closeServerDraining, listenOnLoopback, trackServerSockets } from "./server-lifecycle.js";
+import { DESKTOP_SHUTDOWN_TIMEOUT_MS } from "./quit-coordinator.js";
 
 /*
  * FNXC:DesktopRuntime 2026-07-02-14:35:
@@ -202,6 +204,8 @@ export interface LocalRuntimeManagerOptions {
   startupRetries?: number;
   /** Delay between failed embedded-start attempts, in ms. Overridable (use 0 in tests). */
   startupRetryDelayMs?: number;
+  /** Grace before held connections are destroyed on stop, in ms. Overridable so tests stay fast. */
+  serverDrainGraceMs?: number;
 }
 
 const DEFAULT_STARTUP_RETRIES = 3;
@@ -255,9 +259,14 @@ omitted and the System panel disables its restart controls. Rebuild controls
 never appear on desktop (no sourceWorkspaceRoot — nothing to rebuild).
 Cross-reference: local-server.ts carries the matching wiring for the other
 desktop startup path.
+
+FNXC:DesktopShutdown 2026-10-07-18:02:
+quit() alone never ran teardown: before-quit discarded the stop promise and Electron exited immediately.
+The quit coordinator in main.ts now holds the quit until teardown settles, bounded by DESKTOP_SHUTDOWN_TIMEOUT_MS.
+This fallback only covers a quit that never begins, so it must fire after that bound rather than cut a running teardown short.
 */
 const DESKTOP_RESTART_FLUSH_MS = 300;
-const DESKTOP_QUIT_FALLBACK_MS = 5_000;
+const DESKTOP_QUIT_FALLBACK_MS = DESKTOP_SHUTDOWN_TIMEOUT_MS + 5_000;
 
 export async function resolveDesktopSystemControl(): Promise<
   Pick<import("@fusion/dashboard").ServerOptions, "systemControl">
@@ -452,8 +461,9 @@ async function createDashboardServerDefault(store: TaskStoreLike, rootDir: strin
       ...(await resolveDesktopSystemControl()),
     });
 
-    strace("createDashboardServer: app.listen(0)");
-    const server = app.listen(0);
+    // FNXC:DesktopServerExposure 2026-10-07-18:02: loopback only; this server has no daemon token (see server-lifecycle.ts).
+    strace("createDashboardServer: listen on loopback");
+    const server = listenOnLoopback(app);
     strace("createDashboardServer: returning server object");
     return {
       server,
@@ -500,6 +510,7 @@ export class LocalRuntimeManager {
   private readonly createDashboardServer: (store: TaskStoreLike, rootDir: string) => Promise<Server | { server: Server; cleanup?: RuntimeCleanup }>;
   private readonly startupRetries: number;
   private readonly startupRetryDelayMs: number;
+  private readonly serverDrainGraceMs: number | undefined;
   private lastAttemptPhase: DesktopStartupFailure["phase"] = "create-store";
 
   constructor(private readonly options: LocalRuntimeManagerOptions) {
@@ -508,6 +519,7 @@ export class LocalRuntimeManager {
     this.createDashboardServer = options.createDashboardServer ?? createDashboardServerDefault;
     this.startupRetries = Math.max(1, options.startupRetries ?? DEFAULT_STARTUP_RETRIES);
     this.startupRetryDelayMs = options.startupRetryDelayMs ?? DEFAULT_STARTUP_RETRY_DELAY_MS;
+    this.serverDrainGraceMs = options.serverDrainGraceMs;
   }
 
   getStatus(): DesktopRuntimeStatus {
@@ -549,6 +561,15 @@ export class LocalRuntimeManager {
         baseUrl: `http://127.0.0.1:${externalPort}`,
       };
       return this.status;
+    }
+
+    /*
+    FNXC:DesktopShutdown 2026-10-07-18:02:
+    A start issued while a stop is still draining waits for that stop to settle.
+    Starting at once would boot a second store, plugin loader and dashboard server beside the runtime that is still shutting down, whose engine lock then refuses the new engines.
+    */
+    if (this.stopPromise) {
+      await this.stopPromise.catch(() => undefined);
     }
 
     if (this.runtime) {
@@ -676,6 +697,7 @@ export class LocalRuntimeManager {
       const dashboardServer = await this.createDashboardServer(store, this.options.rootDir);
       cleanup = "server" in dashboardServer ? dashboardServer.cleanup : undefined;
       server = "server" in dashboardServer ? dashboardServer.server : dashboardServer;
+      trackServerSockets(server);
       strace("startEmbedded: awaiting server 'listening' | 'error'");
       this.lastAttemptPhase = "server-listen";
       await Promise.race([
@@ -694,9 +716,7 @@ export class LocalRuntimeManager {
       return this.status;
     } catch (error) {
       if (server) {
-        await new Promise<void>((resolve) => {
-          server!.close(() => resolve());
-        });
+        await closeServerDraining(server, { graceMs: this.serverDrainGraceMs });
       }
       await Promise.resolve(cleanup?.()).catch(() => undefined);
       if (store) {
@@ -715,7 +735,7 @@ export class LocalRuntimeManager {
       return this.stopPromise;
     }
 
-    this.stopPromise = this.stopInternal(options);
+    this.stopPromise = this.stopAfterPendingStartup(options);
     try {
       return await this.stopPromise;
     } finally {
@@ -723,11 +743,23 @@ export class LocalRuntimeManager {
     }
   }
 
+  /*
+  FNXC:DesktopShutdown 2026-10-07-18:02:
+  A stop requested during an embedded start (quit during a slow first-run migration, or a mode change) waits for that start to settle and then tears down what it built.
+  Reporting "stopped" immediately would let the start publish a runtime that nothing ever stops, and quit would exit with it still running.
+  */
+  private async stopAfterPendingStartup(options: { keepEmbeddedPostgres?: boolean }): Promise<DesktopRuntimeStatus> {
+    if (this.startupPromise) {
+      await this.startupPromise.catch(() => undefined);
+    }
+    return this.stopInternal(options);
+  }
+
   private async stopInternal(options: { keepEmbeddedPostgres?: boolean } = {}): Promise<DesktopRuntimeStatus> {
     if (this.runtime) {
       const runtime = this.runtime;
       this.runtime = null;
-      await new Promise<void>((resolve) => runtime.server.close(() => resolve()));
+      await closeServerDraining(runtime.server, { graceMs: this.serverDrainGraceMs });
       let cleanupError: unknown;
       try {
         await runtime.cleanup?.();

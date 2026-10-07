@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import http, { type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 
 const mocks = vi.hoisted(() => {
   type Handler = (...args: unknown[]) => void;
@@ -413,5 +415,74 @@ describe("DesktopLocalServerManager", () => {
       expect.anything(),
       expect.not.objectContaining({ ensureBundledPluginInstalled: expect.anything() }),
     );
+  });
+
+  /*
+   * C-040 / C-042: this legacy entrypoint shares the primary runtime's exposure and shutdown
+   * invariants. It binds loopback only and its stop drains held realtime connections in bounded time.
+   */
+  it("listens on 127.0.0.1 only", async () => {
+    const realServer = http.createServer();
+    mocks.createServer.mockReturnValueOnce({
+      listen: vi.fn((...args: unknown[]) => realServer.listen(...(args as Parameters<Server["listen"]>))),
+    } as never);
+    const { DesktopLocalServerManager } = await import("../local-server.ts");
+    const manager = new DesktopLocalServerManager("/repo", { serverDrainGraceMs: 20 });
+
+    try {
+      await manager.start();
+      expect((realServer.address() as AddressInfo).address).toBe("127.0.0.1");
+    } finally {
+      await manager.stop();
+    }
+  });
+
+  it.each(["sse", "websocket"] as const)("stop reaches engine and backend shutdown while a %s connection is held open", async (kind) => {
+    const realServer = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("data: hello\n\n");
+    });
+    realServer.on("upgrade", (_req, socket) => {
+      socket.on("error", () => undefined);
+      socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+    });
+    mocks.createServer.mockReturnValueOnce({
+      listen: vi.fn((...args: unknown[]) => realServer.listen(...(args as Parameters<Server["listen"]>))),
+    } as never);
+    const { DesktopLocalServerManager } = await import("../local-server.ts");
+    const manager = new DesktopLocalServerManager("/repo", { serverDrainGraceMs: 20 });
+    const { port } = await manager.start();
+
+    await new Promise<void>((resolve, reject) => {
+      if (kind === "sse") {
+        http.get({ host: "127.0.0.1", port, path: "/api/events" }, (res) => {
+          res.on("data", () => undefined);
+          res.on("error", () => undefined);
+          resolve();
+        }).on("error", reject);
+        return;
+      }
+      const req = http.request({ host: "127.0.0.1", port, path: "/api/ws", headers: { Connection: "Upgrade", Upgrade: "websocket" } });
+      req.on("upgrade", (_res, socket) => {
+        socket.on("error", () => undefined);
+        resolve();
+      });
+      req.on("error", reject);
+      req.end();
+    });
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      manager.stop().then(() => "stopped" as const),
+      new Promise<"hung">((resolve) => {
+        timer = setTimeout(() => resolve("hung"), 3_000);
+      }),
+    ]);
+    clearTimeout(timer);
+
+    expect(outcome).toBe("stopped");
+    expect(mocks.engineManager.stopAll).toHaveBeenCalledTimes(1);
+    expect(mocks.backendShutdown).toHaveBeenCalledTimes(1);
+    expect(realServer.listening).toBe(false);
   });
 });

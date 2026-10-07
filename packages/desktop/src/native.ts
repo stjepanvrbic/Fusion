@@ -217,6 +217,7 @@ type AutoUpdaterLike = {
   autoInstallOnAppQuit: boolean;
   channel?: string | null;
   allowPrerelease?: boolean;
+  allowDowngrade?: boolean;
   on: (event: string, handler: (...args: unknown[]) => void) => unknown;
   checkForUpdates: () => Promise<unknown>;
 };
@@ -314,11 +315,24 @@ FNXC:UpdateChannels 2026-07-19-13:15:
 The desktop updater honors the shared `updateChannel` global setting. On the
 beta channel we set electron-updater's `channel` to "beta" (so it reads the
 `beta*.yml` manifests published by beta desktop builds) and `allowPrerelease`
-(so GitHub prereleases are considered). Stable leaves electron-updater at its
-defaults: the GitHub "latest" non-prerelease release only. Failures fall back
+(so GitHub prereleases are considered). Stable selects the explicit "latest"
+channel: the GitHub non-prerelease release only. Failures fall back
 to stable — the updater must never break because settings are unreadable.
 */
-async function applyConfiguredUpdateChannel(autoUpdater: AutoUpdaterLike): Promise<void> {
+let channelApplication: Promise<void> = Promise.resolve();
+
+/*
+FNXC:UpdateChannels 2026-10-07-18:02:
+setupAutoUpdater and triggerUpdateCheck both apply the channel, and a manual check runs them together.
+Applications are serialized so each one reads settings and sets the channel in request order, and a slower stale read can never land after a newer one.
+*/
+function applyConfiguredUpdateChannel(autoUpdater: AutoUpdaterLike): Promise<void> {
+  const next = channelApplication.then(() => applyConfiguredUpdateChannelNow(autoUpdater));
+  channelApplication = next.catch(() => undefined);
+  return next;
+}
+
+async function applyConfiguredUpdateChannelNow(autoUpdater: AutoUpdaterLike): Promise<void> {
   let channel: "stable" | "beta" = "stable";
   try {
     const { GlobalSettingsStore } = await import("@fusion/core");
@@ -330,13 +344,15 @@ async function applyConfiguredUpdateChannel(autoUpdater: AutoUpdaterLike): Promi
     console.warn("[desktop/native] Could not read update channel setting; defaulting to stable", error);
   }
 
-  if (channel === "beta") {
-    autoUpdater.channel = "beta";
-    autoUpdater.allowPrerelease = true;
-  } else {
-    autoUpdater.channel = null;
-    autoUpdater.allowPrerelease = false;
-  }
+  /*
+  FNXC:UpdateChannels 2026-10-07-18:02:
+  electron-updater's channel setter throws ERR_UPDATER_INVALID_CHANNEL for any non-string once a channel has been set, so assigning null for stable broke every check after a beta check until restart.
+  Stable selects the explicit "latest" channel, which is the name the GitHub provider uses for its default `latest*.yml` manifests.
+  The setter also forces allowDowngrade on, so it is set back afterwards: switching channel never installs an older version, because store migrations only move forward.
+  */
+  autoUpdater.channel = channel === "beta" ? "beta" : "latest";
+  autoUpdater.allowPrerelease = channel === "beta";
+  autoUpdater.allowDowngrade = false;
 }
 
 export function setupAutoUpdater(mainWindow?: BrowserWindow): void {

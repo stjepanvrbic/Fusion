@@ -280,6 +280,68 @@ describe("startAutoUpdateWatcher", () => {
     expect(serverSource).not.toMatch(/startAutoUpdateWatcher\(\s*\{\s*getSettings:/s);
   });
 
+  /*
+   * C-045: desktop wires a supervised systemControl, so the watcher runs inside Electron. There the npm
+   * installer can never change the app, and restarting after it relaunches the same version in a loop.
+   */
+  describe("inside the Electron desktop host", () => {
+    const versionsDescriptor = Object.getOwnPropertyDescriptor(process, "versions")!;
+
+    beforeEach(() => {
+      Object.defineProperty(process, "versions", {
+        ...versionsDescriptor,
+        value: { ...process.versions, electron: "35.0.0" },
+      });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(process, "versions", versionsDescriptor);
+      vi.useRealTimers();
+    });
+
+    function desktopDeps() {
+      const checkForUpdate = vi.fn().mockResolvedValue({ currentVersion: "1.0.0", latestVersion: "2.0.0", updateAvailable: true, lastChecked: 0 });
+      const installUpdate = vi.fn().mockResolvedValue({ currentVersion: "1.0.0", latestVersion: "2.0.0", updated: true, outcome: "installed" });
+      const requestRestart = vi.fn().mockReturnValue(true);
+      const deps = {
+        ...buildAutoUpdateDeps({
+          getSettings: async () => ({ autoUpdateAndRestart: true }),
+          currentVersion: "1.0.0",
+          systemControl: { supervised: true, requestRestart },
+          log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+          fusionDir: "/tmp/fusion-auto-update-test",
+        }),
+        coordinator: new UpdateInstallCoordinator(),
+        checkForUpdate,
+        installUpdate,
+      };
+      return { deps, checkForUpdate, installUpdate, requestRestart };
+    }
+
+    it("a cycle never checks, installs or restarts", async () => {
+      const { deps, checkForUpdate, installUpdate, requestRestart } = desktopDeps();
+
+      await expect(runAutoUpdateCycle(deps)).resolves.toBe("externally-managed");
+
+      expect(checkForUpdate).not.toHaveBeenCalled();
+      expect(installUpdate).not.toHaveBeenCalled();
+      expect(requestRestart).not.toHaveBeenCalled();
+    });
+
+    it("the periodic watcher never installs or restarts across repeated cycles", async () => {
+      vi.useFakeTimers();
+      const { deps, checkForUpdate, installUpdate, requestRestart } = desktopDeps();
+
+      const stop = startAutoUpdateWatcher(deps, { initialDelayMs: 10, intervalMs: 10 });
+      await vi.advanceTimersByTimeAsync(100);
+      stop();
+
+      expect(checkForUpdate).not.toHaveBeenCalled();
+      expect(installUpdate).not.toHaveBeenCalled();
+      expect(requestRestart).not.toHaveBeenCalled();
+    });
+  });
+
   it("buildAutoUpdateDeps preserves host system-control context", () => {    const systemControl = { supervised: true, requestRestart: vi.fn(), sourceWorkspaceRoot: "/repo/fusion" };
     const deps = buildAutoUpdateDeps({ getSettings: async () => ({}), currentVersion: "1.0.0", systemControl, log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } });
     expect(deps).toMatchObject({ supervised: true, requestRestart: systemControl.requestRestart, sourceWorkspaceRoot: "/repo/fusion" });

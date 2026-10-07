@@ -65,6 +65,8 @@ const mocks = vi.hoisted(() => {
     getVersion: vi.fn(() => "0.1.0"),
     getPath: vi.fn(() => "/mock/home"),
     quit: vi.fn(),
+    exit: vi.fn(),
+    requestSingleInstanceLock: vi.fn(() => true),
     on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
       appHandlers.set(event, handler);
       return app;
@@ -145,6 +147,7 @@ vi.mock("electron", () => ({
 }));
 
 const mainDeps = vi.hoisted(() => {
+  const deepLinkRouter = { flushPending: vi.fn() };
   const startLocal = vi.fn(async () => ({ source: "embedded-local", state: "running", port: 4545 }));
   const stopLocal = vi.fn(async () => ({ source: "none", state: "stopped" }));
   const getStatus = vi.fn(() => ({ source: "none", state: "stopped" }));
@@ -156,7 +159,8 @@ const mainDeps = vi.hoisted(() => {
     buildAppMenu: vi.fn(),
     setupTray: vi.fn(),
     registerDeepLinkProtocol: vi.fn(),
-    setupDeepLinkHandler: vi.fn(),
+    setupDeepLinkHandler: vi.fn(() => deepLinkRouter),
+    deepLinkRouter,
     setupAutoUpdater: vi.fn(),
     loadWindowState: vi.fn(async () => null),
     loadDesktopLaunchMode,
@@ -466,7 +470,7 @@ describe("main process", () => {
 
     await initializeApp();
 
-    const options = mainDeps.registerIpcHandlers.mock.calls[0]?.[2] as
+    const options = mainDeps.registerIpcHandlers.mock.calls[0]?.[1] as
       | { onDesktopModeChange?: (mode: "local" | "remote") => Promise<void> }
       | undefined;
     await options?.onDesktopModeChange?.("remote");
@@ -517,13 +521,59 @@ describe("main process", () => {
 
     closeHandler?.(event);
     mocks.appHandlers.get("window-all-closed")?.();
-    mocks.appHandlers.get("before-quit")?.();
+    const quitEvent = { preventDefault: vi.fn() };
+    mocks.appHandlers.get("before-quit")?.(quitEvent);
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mainDeps.saveWindowState).toHaveBeenCalledWith(mocks.browserWindowInstance);
     expect(event.preventDefault).not.toHaveBeenCalled();
     expect(mocks.browserWindowInstance.hide).not.toHaveBeenCalled();
-    expect(mocks.app.quit).toHaveBeenCalledTimes(1);
+    expect(quitEvent.preventDefault).toHaveBeenCalledTimes(1);
     expect(mainDeps.stopLocal).toHaveBeenCalledTimes(1);
+    expect(mainDeps.stopLocal).toHaveBeenCalledWith({ keepEmbeddedPostgres: false });
+    // window-all-closed quit, then the coordinator's re-quit once teardown settled.
+    expect(mocks.app.quit).toHaveBeenCalledTimes(2);
+  });
+
+  /*
+   * C-041: before-quit must hold the process until stopLocal settles; Electron otherwise exits
+   * within milliseconds and kills in-flight merges with leases and the engine lock still held.
+   */
+  it.each([
+    ["Exit and stop PostgreSQL", 1, false],
+    ["Exit, leave PostgreSQL running", 2, true],
+  ])("before-quit after '%s' awaits stopLocal before quitting again", async (_label, choice, keepEmbeddedPostgres) => {
+    mockPlatform("win32");
+    mocks.dialog.showMessageBoxSync.mockReturnValue(choice);
+    let releaseStop!: () => void;
+    mainDeps.stopLocal.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        releaseStop = () => resolve({ source: "none", state: "stopped" });
+      }),
+    );
+    const { initializeApp, run } = await importMainModule();
+    await initializeApp();
+    run();
+    mainDeps.LocalRuntimeManager.mock.results.at(-1)?.value.getStatus.mockReturnValueOnce({ source: "embedded-local", state: "running" });
+    const closeHandler = mocks.browserWindowHandlers.get("close") as (event: { preventDefault: () => void }) => void;
+    closeHandler({ preventDefault: vi.fn() });
+
+    const quitEvent = { preventDefault: vi.fn() };
+    mocks.appHandlers.get("before-quit")?.(quitEvent);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(quitEvent.preventDefault).toHaveBeenCalledTimes(1);
+    expect(mainDeps.stopLocal).toHaveBeenCalledWith({ keepEmbeddedPostgres });
+    expect(mocks.app.quit).not.toHaveBeenCalled();
+    expect(mocks.app.exit).not.toHaveBeenCalled();
+
+    releaseStop();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.app.quit).toHaveBeenCalledTimes(1);
+
+    const finalQuit = { preventDefault: vi.fn() };
+    mocks.appHandlers.get("before-quit")?.(finalQuit);
+    expect(finalQuit.preventDefault).not.toHaveBeenCalled();
   });
 
   it("windows window close with Minimize to tray hides instead of quitting", async () => {
@@ -619,6 +669,56 @@ describe("main process", () => {
 
     const [options] = mocks.BrowserWindow.mock.calls[0] as Array<Record<string, unknown>>;
     expect(options).toMatchObject({ x: 100, y: 100 });
+  });
+
+  /*
+   * C-044: only the single-instance lock holder may ever boot a runtime. A losing process must quit
+   * before migration, store creation, engine start, plugin load or window creation, whatever its
+   * launch arguments.
+   */
+  it.each([
+    ["a plain relaunch", [] as string[], undefined],
+    ["a relaunch carrying a deep link", ["fusion://task/FN-1"], undefined],
+    ["FUSION_SERVER_PORT attach mode", [] as string[], "51234"],
+  ])("a second instance that loses the lock quits without booting (%s)", async (_label, extraArgv, serverPort) => {
+    mocks.app.requestSingleInstanceLock.mockReturnValueOnce(false);
+    const originalArgv = process.argv;
+    const originalServerPort = process.env.FUSION_SERVER_PORT;
+    process.argv = [...originalArgv, ...extraArgv];
+    if (serverPort) process.env.FUSION_SERVER_PORT = serverPort;
+    try {
+      const { run } = await importMainModule();
+      run();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(mocks.app.quit).toHaveBeenCalledTimes(1);
+      expect(mocks.app.whenReady).not.toHaveBeenCalled();
+      expect(mainDeps.LocalRuntimeManager).not.toHaveBeenCalled();
+      expect(mainDeps.startLocal).not.toHaveBeenCalled();
+      expect(mocks.BrowserWindow).not.toHaveBeenCalled();
+      expect(mainDeps.setupDeepLinkHandler).not.toHaveBeenCalled();
+    } finally {
+      process.argv = originalArgv;
+      if (originalServerPort === undefined) delete process.env.FUSION_SERVER_PORT;
+      else process.env.FUSION_SERVER_PORT = originalServerPort;
+    }
+  });
+
+  it("the lock holder takes the lock and registers relaunch handlers before boot, then flushes held deep links", async () => {
+    const { run } = await importMainModule();
+
+    run();
+
+    const lockOrder = mocks.app.requestSingleInstanceLock.mock.invocationCallOrder[0];
+    const handlerOrder = mainDeps.setupDeepLinkHandler.mock.invocationCallOrder[0];
+    const readyOrder = mocks.app.whenReady.mock.invocationCallOrder[0];
+    expect(lockOrder).toBeLessThan(handlerOrder);
+    expect(handlerOrder).toBeLessThan(readyOrder);
+    expect(mainDeps.deepLinkRouter.flushPending).not.toHaveBeenCalled();
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mocks.BrowserWindow).toHaveBeenCalledTimes(1);
+    expect(mainDeps.deepLinkRouter.flushPending).toHaveBeenCalledTimes(1);
   });
 
   it("importing main does not auto-start", async () => {

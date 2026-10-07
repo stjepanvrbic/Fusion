@@ -56,14 +56,7 @@ export function parseDeepLink(rawUrl: string): DeepLinkResult | null {
   }
 }
 
-export function handleDeepLink(mainWindow: BrowserWindow, url: string): void {
-  const parsed = parseDeepLink(url);
-
-  if (!parsed || parsed.type === "unknown") {
-    console.warn(`[desktop/deep-link] Ignoring unsupported deep link: ${url}`);
-    return;
-  }
-
+function revealWindow(mainWindow: BrowserWindow): void {
   if (!mainWindow.isVisible()) {
     mainWindow.show();
   }
@@ -73,27 +66,65 @@ export function handleDeepLink(mainWindow: BrowserWindow, url: string): void {
   }
 
   mainWindow.focus();
-  mainWindow.webContents.send(DEEP_LINK_EVENT, parsed);
 }
 
-export function setupDeepLinkHandler(mainWindow: BrowserWindow): void {
-  const hasLock = app.requestSingleInstanceLock();
-  if (!hasLock) {
-    app.quit();
+export function handleDeepLink(mainWindow: BrowserWindow, url: string): void {
+  const parsed = parseDeepLink(url);
+
+  if (!parsed || parsed.type === "unknown") {
+    console.warn(`[desktop/deep-link] Ignoring unsupported deep link: ${url}`);
     return;
   }
 
+  revealWindow(mainWindow);
+  mainWindow.webContents.send(DEEP_LINK_EVENT, parsed);
+}
+
+export interface DeepLinkRouter {
+  /** Deliver a deep link that arrived before the main window existed. */
+  flushPending(): void;
+}
+
+/*
+FNXC:DesktopSingleInstance 2026-10-07-18:02:
+main's run() takes the single-instance lock before boot and registers these handlers before the window exists, so the window is resolved when an event arrives and a link received during boot is held until flushPending().
+Every second-instance launch reveals the window, with or without a fusion:// argument: relaunching Fusion is the operator's way back to a window hidden in the tray, so a hidden window must always be recoverable.
+*/
+export function setupDeepLinkHandler(getMainWindow: () => BrowserWindow | null): DeepLinkRouter {
+  let pendingDeepLink: string | null = null;
+
+  const route = (url: string): void => {
+    const mainWindow = getMainWindow();
+    if (!mainWindow) {
+      pendingDeepLink = url;
+      return;
+    }
+    handleDeepLink(mainWindow, url);
+  };
+
   app.on("open-url", (event, url) => {
     event.preventDefault();
-    handleDeepLink(mainWindow, url);
+    route(url);
   });
 
   app.on("second-instance", (_event, argv) => {
     const deepLink = argv.find((arg) => arg.startsWith("fusion://"));
-    if (!deepLink) {
-      return;
+    const mainWindow = getMainWindow();
+    if (mainWindow) {
+      revealWindow(mainWindow);
     }
-
-    handleDeepLink(mainWindow, deepLink);
+    if (deepLink) {
+      route(deepLink);
+    }
   });
+
+  return {
+    flushPending: () => {
+      const mainWindow = getMainWindow();
+      if (!pendingDeepLink || !mainWindow) return;
+      const url = pendingDeepLink;
+      pendingDeepLink = null;
+      handleDeepLink(mainWindow, url);
+    },
+  };
 }

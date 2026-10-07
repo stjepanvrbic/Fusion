@@ -100,6 +100,8 @@ export { resolveUpdateAutomationSettings } from "./config/update-automation.js";
 export {
   EXTERNALLY_MANAGED_UPDATES_ENV,
   EXTERNALLY_MANAGED_UPDATE_MESSAGE,
+  DESKTOP_APP_UPDATE_MESSAGE,
+  resolveExternallyManagedUpdateMessage,
   resolveUpdatesExternallyManaged,
 } from "./config/update-management.js";
 export { resolveRequiredCheckNames } from "./config/required-checks.js";

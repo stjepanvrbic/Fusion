@@ -49,6 +49,7 @@ import {
 import { setupTray } from "./tray.js";
 import { getRendererUrl, getRendererFilePath, isUrlRenderer } from "./renderer.js";
 import { LocalRuntimeManager } from "./local-runtime.js";
+import { installQuitCoordinator } from "./quit-coordinator.js";
 import { readShellSettings, writeShellSettings } from "./shell-settings.js";
 
 // Re-export for backward compatibility
@@ -473,7 +474,7 @@ export async function initializeApp(): Promise<void> {
   tray = new Tray(nativeImage.createEmpty());
   setupTray(createdWindow, tray);
 
-  registerIpcHandlers(createdWindow, tray, {
+  registerIpcHandlers(createdWindow, {
     onDesktopModeChange: async (mode) => {
       if (!localRuntimeManager) {
         return;
@@ -527,7 +528,6 @@ export async function initializeApp(): Promise<void> {
     getDesktopLaunchContext: () => currentRemoteLaunch,
   });
   registerDeepLinkProtocol();
-  setupDeepLinkHandler(createdWindow);
   setupAutoUpdater(createdWindow);
   stopUpdateCheckInterval = startUpdateCheckInterval(createdWindow);
 
@@ -537,10 +537,25 @@ export async function initializeApp(): Promise<void> {
 }
 
 export function run(): void {
+  /*
+  FNXC:DesktopSingleInstance 2026-10-07-18:02:
+  Only the single-instance lock holder may ever start a runtime.
+  The lock used to be taken at the end of initializeApp, so every fusion:// click and Start-menu relaunch first booted a duplicate embedded PostgreSQL lease, store, engines, plugins (with onLoad side effects), dashboard server and window, then quit mid-teardown.
+  Take it before whenReady and before any boot work; the lock is keyed on userData, which the module prologue has already redirected, and the user-data migration it runs first is a one-time copy that a losing instance skips.
+  */
+  if (!app.requestSingleInstanceLock()) {
+    app.quit();
+    return;
+  }
+  const deepLinkRouter = setupDeepLinkHandler(() => mainWindow);
+
   const appWithQuitFlag = getAppWithQuitFlag();
   appWithQuitFlag.isQuitting = false;
 
-  void app.whenReady().then(() => initializeApp());
+  void app
+    .whenReady()
+    .then(() => initializeApp())
+    .then(() => deepLinkRouter.flushPending());
 
   app.on("window-all-closed", () => {
     if (process.platform !== "darwin") {
@@ -552,22 +567,22 @@ export function run(): void {
     osSessionEnding = true;
   });
 
-  app.on("before-quit", () => {
-    appWithQuitFlag.isQuitting = true;
+  // FNXC:DesktopShutdown 2026-10-07-18:02: quit is held until runtime teardown settles or its bound expires (see quit-coordinator.ts).
+  installQuitCoordinator(app, {
+    onBeforeQuit: () => {
+      appWithQuitFlag.isQuitting = true;
 
-    if (stopUpdateCheckInterval) {
-      stopUpdateCheckInterval();
-      stopUpdateCheckInterval = null;
-    }
+      if (stopUpdateCheckInterval) {
+        stopUpdateCheckInterval();
+        stopUpdateCheckInterval = null;
+      }
 
-    if (tray) {
-      tray.destroy();
-      tray = null;
-    }
-
-    if (localRuntimeManager) {
-      void localRuntimeManager.stopLocal({ keepEmbeddedPostgres: keepEmbeddedPostgresOnQuit });
-    }
+      if (tray) {
+        tray.destroy();
+        tray = null;
+      }
+    },
+    teardown: () => localRuntimeManager?.stopLocal({ keepEmbeddedPostgres: keepEmbeddedPostgresOnQuit }),
   });
 
   app.on("activate", () => {

@@ -6,6 +6,7 @@ import type { AsyncDataLayer, LoadedPluginSchemaContract } from "@fusion/core";
 import { resolveDesktopRuntimePrimaryProject } from "./engine-runtime.js";
 import { resolveDesktopBundlePluginDirs } from "./bundled-plugin-dirs.js";
 import { resolveDesktopSystemControl } from "./local-runtime.js";
+import { closeServerDraining, listenOnLoopback, trackServerSockets } from "./server-lifecycle.js";
 
 /*
  * FNXC:DesktopRuntime 2026-07-07-12:00:
@@ -46,7 +47,10 @@ export class DesktopLocalServerManager {
   private runtime: DesktopLocalRuntime | null = null;
   private state: DesktopLocalServerState = { status: "idle", error: null };
 
-  constructor(private readonly rootDir: string) {}
+  constructor(
+    private readonly rootDir: string,
+    private readonly options: { serverDrainGraceMs?: number } = {},
+  ) {}
 
   getState(): DesktopLocalServerState {
     return this.state;
@@ -200,7 +204,9 @@ export class DesktopLocalServerManager {
         // app.relaunch(); see resolveDesktopSystemControl in local-runtime.ts.
         ...(await resolveDesktopSystemControl()),
       });
-      server = app.listen(0);
+      // FNXC:DesktopServerExposure 2026-10-07-18:02: same loopback-only and drainable-stop contract as local-runtime.ts.
+      server = listenOnLoopback(app);
+      trackServerSockets(server);
 
       await Promise.race([
         once(server, "listening"),
@@ -219,7 +225,7 @@ export class DesktopLocalServerManager {
       return this.runtime;
     } catch (error) {
       if (server) {
-        await new Promise<void>((resolve) => server!.close(() => resolve()));
+        await closeServerDraining(server, { graceMs: this.options.serverDrainGraceMs });
       }
       await Promise.resolve(cleanup?.()).catch(() => undefined);
       const backendShutdown = (store as (TaskStoreLike & { __backendShutdown?: () => Promise<void> }) | null)?.__backendShutdown;
@@ -242,7 +248,7 @@ export class DesktopLocalServerManager {
     const runtime = this.runtime;
     this.runtime = null;
 
-    await new Promise<void>((resolve) => runtime.server.close(() => resolve()));
+    await closeServerDraining(runtime.server, { graceMs: this.options.serverDrainGraceMs });
     let cleanupError: unknown;
     try {
       await runtime.cleanup?.();
