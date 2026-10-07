@@ -28,7 +28,8 @@ Consequence for conversion PRs, stated because it is a real cost: lowering a cou
 re-recording the baseline in the same PR (`--strict --update-baseline`). That is deliberate — it puts
 the new number in the diff, where a reviewer sees it, instead of in a hand-written claim.
 */
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { listGitSourceFiles } from "./lib/list-git-source-files.mjs";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -129,15 +130,19 @@ try {
   filesystem with `readdirSync` and therefore always saw untracked files. The two instruments
   disagreeing on WHICH FILES EXIST is how one probe can be caught by one and missed by the other
   (#3252) — that discrepancy cost a full investigation to attribute, so the scopes are aligned here.
+
+  FNXC:WindowsShell 2026-10-07-18:03: listGitSourceFiles passes the pathspecs as argv; the old execSync shell string ran cmd.exe on Windows, which kept the single quotes, so the census listed no files and failed closed on every Windows run.
   */
-  const PATHSPECS = "'packages/*/src/**/*.ts' 'packages/*/src/*.ts' 'packages/*/src/**/*.tsx' 'packages/*/app/**/*.ts' 'packages/*/app/**/*.tsx' 'plugins/*/src/**/*.ts' 'plugins/*/src/**/*.tsx'";
-  files = injectedList !== undefined ? injectedList : execSync(
-    `git ls-files --cached --others --exclude-standard ${PATHSPECS}`,
-    { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
-  )
-    .split("\n")
-    .map((f) => f.trim())
-    .filter(Boolean)
+  const PATHSPECS = Object.freeze([
+    "packages/*/src/**/*.ts",
+    "packages/*/src/*.ts",
+    "packages/*/src/**/*.tsx",
+    "packages/*/app/**/*.ts",
+    "packages/*/app/**/*.tsx",
+    "plugins/*/src/**/*.ts",
+    "plugins/*/src/**/*.tsx",
+  ]);
+  files = (injectedList !== undefined ? injectedList : listGitSourceFiles(PATHSPECS, { cwd: REPO_ROOT }))
     .filter((f) => !f.includes("__tests__") && !/\.(test|spec)\.tsx?$/.test(f));
   /* A path can be listed by both --cached and --others in some index states; counting it twice would
      double every guard in it. */
@@ -1034,7 +1039,7 @@ if (stale.length > 0) {
     try {
       const base = process.env.GITHUB_BASE_REF ? `origin/${process.env.GITHUB_BASE_REF}` : "origin/main";
       touched = new Set(
-        execSync(`git diff --name-only ${base}...HEAD`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+        execFileSync("git", ["diff", "--name-only", `${base}...HEAD`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
           .split("\n").map((f) => f.trim()).filter(Boolean),
       );
     } catch {

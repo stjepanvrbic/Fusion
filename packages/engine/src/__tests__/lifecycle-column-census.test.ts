@@ -27,6 +27,8 @@ import {
 } from "../../../../scripts/lib/lifecycle-column-census.mjs";
 
 import { execFileSync as memoExecFileSync, spawnSync } from "node:child_process";
+// FNXC:WindowsVerification 2026-10-07-18:03: URL.pathname is "/C:/..." on Windows; fileURLToPath yields a usable native path on every platform.
+import { fileURLToPath } from "node:url";
 
 /*
 FNXC:LifecycleColumnCensus 2026-07-31-17:12 (test wall-time — memoize identical full-repo census spawns):
@@ -42,8 +44,8 @@ Only deterministic real-repo, default-env, no-baseline-override READS use this c
 their own process, since their output depends on inputs the argv cache cannot key on. These read-only
 commands always exit 0 (they report, never gate), so a cache miss cannot swallow a nonzero exit.
 */
-const MEMO_CENSUS_CLI_PATH = new URL("../../../../scripts/lifecycle-column-census.mjs", import.meta.url).pathname;
-const MEMO_CENSUS_REPO_ROOT = new URL("../../../..", import.meta.url).pathname;
+const MEMO_CENSUS_CLI_PATH = fileURLToPath(new URL("../../../../scripts/lifecycle-column-census.mjs", import.meta.url));
+const MEMO_CENSUS_REPO_ROOT = fileURLToPath(new URL("../../../..", import.meta.url));
 const readOnlyCensusCache = new Map<string, string>();
 function readOnlyCensus(args: string[]): string {
   const key = args.join("\u0000");
@@ -421,7 +423,7 @@ marker slices rather than character windows, and each marker checked for uniquen
 repeated marker is the magic-number problem wearing a name.
 */
 describe("the baseline can always be re-recorded", () => {
-  const cliPath = new URL("../../../../scripts/lifecycle-column-census.mjs", import.meta.url).pathname;
+  const cliPath = fileURLToPath(new URL("../../../../scripts/lifecycle-column-census.mjs", import.meta.url));
 
   /*
   FNXC:LifecycleColumnCensus 2026-07-31-06:30:
@@ -499,7 +501,7 @@ describe("the baseline can always be re-recorded", () => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const path = require("node:path");
 
-    const repoRoot = new URL("../../../..", import.meta.url).pathname;
+    const repoRoot = fileURLToPath(new URL("../../../..", import.meta.url));
 
     function runCli(args: string[], baseline: unknown): { status: number; stdout: string } {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-census-"));
@@ -825,7 +827,7 @@ describe("mixed-vocabulary detection", () => {
 });
 
 describe("the ratchet follows the count down", () => {
-  const repoRoot = new URL("../../../../", import.meta.url).pathname;
+  const repoRoot = fileURLToPath(new URL("../../../../", import.meta.url));
   const cliPath = `${repoRoot}scripts/lifecycle-column-census.mjs`;
 
   /*
@@ -1118,7 +1120,7 @@ that gate regressing, and they could not see it, because they import the matcher
 without creating files inside a live checkout that the operator is writing to concurrently.
 */
 describe("the census scans the files it claims to scan", () => {
-  const repoRootPath = new URL("../../../../", import.meta.url).pathname;
+  const repoRootPath = fileURLToPath(new URL("../../../../", import.meta.url));
   const cli = `${repoRootPath}scripts/lifecycle-column-census.mjs`;
 
   async function runOnFixture(files: Record<string, string>, args: string[] = []) {
