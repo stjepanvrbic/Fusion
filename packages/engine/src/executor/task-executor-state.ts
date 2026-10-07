@@ -72,6 +72,10 @@ export abstract class TaskExecutorState {
    */
   protected workflowGateActivityPrincipals = new Map<string, string>();
   protected executing = new Set<string>();
+  /** FNXC:LifecycleContainment 2026-10-07-18:04: armed in-place executor retry timers, one per task; cleared on engine stop. */
+  protected inPlaceExecutionResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** FNXC:RecoveryOwnership 2026-10-07-18:04: orphan resumes scheduled at startup but not yet started; liveness treats them as live. */
+  protected pendingOrphanResumes = new Set<string>();
   /** Deferred terminal-park callbacks currently in flight (restart-recovery intent chain). */
   protected deferredTerminalParksInFlight = new Set<string>();
   protected resumingUnpaused = new Set<string>();

@@ -402,7 +402,8 @@ describe("ProjectEngine merge error recovery", () => {
       error: null,
       mergeConflictBounceCount: 1,
     });
-    expect(store.moveTask).toHaveBeenCalledWith(TASK_ID, "in-progress");
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the merge-conflict bounce names its merge-fix REVISE reason so FN-207 sanctions review-to-WIP.
+    expect(store.moveTask).toHaveBeenCalledWith(TASK_ID, "in-progress", { moveSource: "engine", lifecycleReason: "merge-fix-remediation", bypassGuards: false });
     expect(store.addTaskComment).toHaveBeenCalledWith(
       TASK_ID,
       expect.stringContaining("Bouncing back to in-progress"),
@@ -1210,7 +1211,7 @@ describe("ProjectEngine merge error recovery", () => {
 
     await runMergeCycle(engine);
 
-    expect(store.moveTask).not.toHaveBeenCalledWith(TASK_ID, "in-progress");
+    expect(store.moveTask).not.toHaveBeenCalledWith(TASK_ID, "in-progress", expect.anything());
     expect(store.updateTask).not.toHaveBeenCalledWith(
       TASK_ID,
       expect.objectContaining({ status: "merging-fix" }),
@@ -1292,7 +1293,7 @@ describe("ProjectEngine merge error recovery", () => {
 
     await runMergeCycle(engine);
 
-    expect(store.moveTask).not.toHaveBeenCalledWith(TASK_ID, "in-progress");
+    expect(store.moveTask).not.toHaveBeenCalledWith(TASK_ID, "in-progress", expect.anything());
     expect(store.updateTask).not.toHaveBeenCalledWith(
       TASK_ID,
       expect.objectContaining({ verificationFailureCount: 3 }),

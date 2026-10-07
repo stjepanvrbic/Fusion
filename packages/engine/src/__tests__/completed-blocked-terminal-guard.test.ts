@@ -23,6 +23,7 @@ import { describe, expect, it, vi } from "vitest";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
 import { createMockStore } from "./executor-test-helpers.js";
+import { COMPLETED_BLOCKED_PAUSE_REASON } from "../self-healing.js";
 import type { WorkflowIr } from "@fusion/core";
 
 /** Standard traits under non-default names: `shipped` is complete, `attic` is archived. */
@@ -131,11 +132,20 @@ describe("the terminal guard covers the ARCHIVED role and refuses to guess", () 
     await expect(h.park(completedTaskIn("some-column-this-board-lacks"))).resolves.toBe(true);
     /*
     FNXC:WorkflowLifecycleColumns 2026-07-30-09:15 (#2670 review):
-    The boolean alone is satisfied by an implementation that reports success and moves nothing, or
-    moves to the wrong lane. The parked card must land in the workflow's HOLD column, resolved by
-    role — `queued` here, not `todo`.
+    The boolean alone is satisfied by an implementation that reports success and writes nothing.
+
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The park now lands in place: the former hold move was rejected by FN-207 for WIP-to-hold, so the
+    card keeps its column and carries the completed-blocked park fields instead.
     */
-    expect(h.moves).toEqual([["FN-DONE", "queued"]]);
+    expect(h.moves).toEqual([]);
+    const stored = await h.store.getTask("FN-DONE");
+    expect(stored).toMatchObject({
+      column: "some-column-this-board-lacks",
+      paused: true,
+      pausedReason: COMPLETED_BLOCKED_PAUSE_REASON,
+      status: "queued",
+    });
   });
 
   it("re-reads the card AFTER resolving the workflow, so a mid-await move into a terminal lane is honoured", async () => {

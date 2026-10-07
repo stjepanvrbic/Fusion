@@ -10,10 +10,7 @@ import { executorLog } from "../logger.js";
 import { generateSyntheticRunId, type EngineRunContext } from "../util/run-audit.js";
 import { emitBoundedRunAudit } from "./emit-bounded-run-audit.js";
 import { isTaskWorkComplete } from "./task-predicates.js";
-import {
-  resolveReboundColumnFor,
-  resolveTerminalColumnsFor,
-} from "./lifecycle-columns.js";
+import { resolveTerminalColumnsFor } from "./lifecycle-columns.js";
 
 export type CompletionFinalizationDeps = {
   store: TaskStore;
@@ -70,17 +67,13 @@ export async function parkCompletedBlockedTask(
   post-await `liveTask` re-read. Taking either side alone loses the other — the
   literal comes back, or the stale snapshot does.
   */
-  const reboundColumn = await resolveReboundColumnFor(deps.store, task.id);
-  if (liveTask.column !== reboundColumn) {
-    await deps.store.moveTask(task.id, reboundColumn, {
-      preserveProgress: true,
-      preserveResumeState: true,
-      preserveWorktree: true,
-      moveSource: "engine",
-      lifecycleReason: "self-healing-stranded-recovery",
-      recoveryRehome: true,
-    });
-  }
+  /*
+  FNXC:LifecycleContainment 2026-10-07-18:04:
+  The completed-blocked park lands in place. The former hold move used the same-role-only
+  `self-healing-stranded-recovery` reason, which FN-207 rejects for WIP-to-hold, so the throw escaped
+  finalization before this park was written. Self-healing's completed-blocked reconciler scans the
+  WIP and hold lanes and advances the card to review once the blocker clears.
+  */
   await deps.store.updateTask(task.id, {
     paused: true,
     pausedReason: COMPLETED_BLOCKED_PAUSE_REASON,

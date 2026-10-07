@@ -15,6 +15,7 @@ import { resolveIntegrationBranch } from "../merge/integration-branch.js";
 import { mergeEffectiveSettings } from "../project/effective-settings.js";
 import { preservedWorktreeTargetPathForTask } from "../worktree/worktree-pinning.js";
 import { executorLog } from "../logger.js";
+import { parkExhaustedRecovery, recordRecoveryEscalation } from "../healing/recovery-exhaustion.js";
 import type { AutoRecoveryDispatcher } from "../healing/auto-recovery.js";
 import type { EngineRunContext, RunAuditor } from "../util/run-audit.js";
 import { resolveDiffBaseRef } from "./worktree-git-refs.js";
@@ -41,6 +42,7 @@ export type BranchConflictHandleDeps = {
   getAutoRecoveryDispatcher: (audit: RunAuditor) => AutoRecoveryDispatcher;
   createRunAuditor: (runContext: EngineRunContext | undefined) => RunAuditor;
   persistTokenUsage: (taskId: string) => Promise<void>;
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
   onError?: (task: Task, error: Error) => void;
 };
 
@@ -75,24 +77,43 @@ export async function reclaimExistingWorktree(
  * A branch-conflict retry cap changes recovery strategy, not task ownership. The
  * executor must clear only the conflicting checkout identity under the task fence,
  * leaving the resolved workflow lane dispatchable for fresh acquisition on its next pass.
+ *
+ * FNXC:RecoveryOwnership 2026-10-07-18:04:
+ * The auto-recovery dispatcher escalates whenever `recoveryRetryCount >= maxRetries`, and FN-9512
+ * reset the counter here, so a persistent conflict reseeded forever. The reseed now pushes the
+ * counter to `maxRetries + 1`; a count above the budget therefore proves the episode's reseed is
+ * spent, and the next escalation parks the card `failed` in its lane with an audit row.
  */
 export async function reseedExhaustedBranchConflict(
-  deps: Pick<BranchConflictHandleDeps, "store" | "getRunContextFor">,
+  deps: Pick<BranchConflictHandleDeps, "store" | "getRunContextFor" | "scheduleInPlaceExecutionResume">,
   task: Task,
+  input: { maxRetries: number; detail: string },
 ): Promise<boolean> {
+  const count = task.recoveryRetryCount ?? 0;
+  const sameGeneration = (live: Task) => live.column === task.column
+    && (live.status ?? null) === (task.status ?? null)
+    && live.branch === task.branch
+    && live.worktree === task.worktree
+    && (live.recoveryRetryCount ?? null) === (task.recoveryRetryCount ?? null);
+  if (count > input.maxRetries) {
+    return parkExhaustedRecovery(deps.store, task, {
+      owner: "executor-branch-conflict",
+      attempts: count,
+      detail: input.detail,
+      agentId: "executor",
+      runContext: deps.getRunContextFor(task.id),
+      isSameEpisode: (live) => sameGeneration(live) && live.status !== "blocked",
+    });
+  }
+  const reseedCount = Math.max(count, input.maxRetries) + 1;
   let reseeded = false;
   await deps.store.updateTaskAtomic(task.id, (live) => {
-    const sameGeneration = live.column === task.column
-      && (live.status ?? null) === (task.status ?? null)
-      && live.branch === task.branch
-      && live.worktree === task.worktree
-      && (live.recoveryRetryCount ?? null) === (task.recoveryRetryCount ?? null);
-    if (!sameGeneration || live.userPaused || live.paused || live.status === "blocked") return null;
+    if (!sameGeneration(live) || live.userPaused || live.paused || live.status === "blocked") return null;
     reseeded = true;
     return {
       status: null,
       error: null,
-      recoveryRetryCount: null,
+      recoveryRetryCount: reseedCount,
       recoveryDisposition: "escalated-reseed",
       nextRecoveryAt: null,
       worktree: null,
@@ -103,10 +124,18 @@ export async function reseedExhaustedBranchConflict(
   if (reseeded) {
     await deps.store.logEntry(
       task.id,
-      "Branch-conflict retry budget escalated to a fenced fresh-checkout reseed.",
+      "Branch-conflict retry budget escalated to a fenced fresh-checkout reseed; the next exhaustion parks the task for an operator.",
       undefined,
       deps.getRunContextFor(task.id),
     );
+    await recordRecoveryEscalation(deps.store, task.id, {
+      owner: "executor-branch-conflict",
+      outcome: "reseeded",
+      attempts: reseedCount,
+      column: task.column,
+      agentId: "executor",
+    });
+    deps.scheduleInPlaceExecutionResume(task.id);
   }
   return reseeded;
 }
@@ -230,7 +259,8 @@ export async function handleBranchConflict(
   });
 
   if (decision.action === "escalate") {
-    return (await reseedExhaustedBranchConflict(deps, task)) ? "recovered" : "sticky";
+    const maxRetries = (await deps.store.getSettings()).autoRecovery?.maxRetries ?? 3;
+    return (await reseedExhaustedBranchConflict(deps, task, { maxRetries, detail: conflictMessage })) ? "recovered" : "sticky";
   }
 
   if (decision.action === "pause") {

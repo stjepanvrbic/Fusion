@@ -23,7 +23,13 @@ export async function clearResumeFailureState(
     updates.status = null;
     updates.error = null;
   }
-  if (task.status === "queued") {
+  /*
+  FNXC:RecoveryOwnership 2026-10-07-18:04:
+  `stuck-killed` is a pre-resume marker too: restart recovery and the stuck-session detector leave it
+  on a row they hand back to execution, and it survived into the resumed run because only queued and
+  failed statuses were cleared here.
+  */
+  if (task.status === "queued" || task.status === "stuck-killed") {
     updates.status = null;
   }
   if (task.blockedBy) {

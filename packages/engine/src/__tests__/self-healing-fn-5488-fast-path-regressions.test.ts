@@ -388,13 +388,15 @@ describe("SelfHealingManager FN-5488 fast-path regressions", () => {
       worktree: "/wt/fn-254-holder",
       dependencies: [dependency.id],
     });
-    const { store } = makeStore([holder, dependency]);
+    const { store, tasks } = makeStore([holder, dependency]);
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-    const rebound = vi.spyOn(manager as any, "reboundTask");
 
     await expect(manager.reconcileDependencyBlockingLeases()).resolves.toBe(0);
 
-    expect(rebound).not.toHaveBeenCalled();
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: `reboundTask` was removed (it was an FN-217 no-op); assert the observable outcome: a waived lease is left completely alone. */
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalled();
+    expect(tasks.get(holder.id)).toMatchObject({ column: "in-progress", worktree: "/wt/fn-254-holder" });
   });
 
   it("preserves overlapBlockedBy + queued status when failed-retry-exhausted blocker clears", async () => {

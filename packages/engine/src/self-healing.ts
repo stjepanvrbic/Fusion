@@ -30,7 +30,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSy
 import { readFile } from "node:fs/promises";
 import { tmpdir, hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { PRE_MERGE_STEPS_NOT_RUN_BLOCKER, loadWorkspaceConfig, type TaskMoveLanes, resolveColumnFlags, IN_REVIEW_STALL_DEADLOCK_LOG_PREFIX, IN_REVIEW_STALL_LOG_PREFIX, IN_REVIEW_STALL_TERMINAL_LOG_PREFIX, allowsAutoMergeProcessing, hasSharedBranchMemberAutoMergeHold, hasUserAutoMergeHold, resolveEffectiveAutoMerge, countRecentIdenticalStallEntries, detectDependencyCycle, detectSelfDefeatingDependency, evaluateNoCommitsNoOpFinalize, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, getInReviewStalledSignal, getInReviewStallReason, getPrimaryPrInfo, getStalePausedReviewSignal, getStalePausedTodoSignal, getTaskHardMergeBlocker, getMergeConfirmedFinalizationBlocker, getPostMergeFinalizeBlocker, getRequiredPostMergeEvidenceBlocker, getRequiredPostMergeEvidenceDecision, planConfirmedMergeChecklistReconciliation, getTaskMergeBlocker, isStaleContentApprovalBlocker, resolvePreMergeGateForTask, isEphemeralAgent, isMergeRequestContractShadowEnabled, isWorkspaceTask, isSharedBranchGroupMemberIntegration, isLiveSharedBranchGroupMemberIntegration, isNearDuplicateCanonicalInactive, resolveExplicitDuplicateMarker, flagTriageDuplicate, isTriageDuplicateKeepAcknowledged, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, getBuiltinWorkflow, isBuiltinWorkflowId, resolveWorkflowIrForTask, resolveWorkflowIrForTaskWithProvenance, resolveRequiredPreMergeStepIds, resolveReboundTarget, columnsWithFlag, resolveLifecycleColumns, resolveTaskLifecycleColumns, isWipColumnRole, isReviewColumnRole, isTerminalColumnRole, workflowHasColumn, planLegacyAdoption, resolveOrphanedPendingStepResults, resolveUnprovenReviewApproval, classifyReviewLease, PLAN_REVIEW_LEASE_STALENESS_MS, DEFAULT_MAX_POST_REVIEW_FIXES, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AWAITING_APPROVAL_PAUSE_REASON, type Agent, type AgentStore, type ChatStore, type MessageStore, type TaskStore, type MoveTaskOptions, type Settings, type Task, type MergeDetails, type TaskPriority, type MergeResult, type WorkflowStepResult, type WorkflowIr, type WorkflowIrV2,
+import { PRE_MERGE_STEPS_NOT_RUN_BLOCKER, loadWorkspaceConfig, type TaskMoveLanes, resolveColumnFlags, IN_REVIEW_STALL_DEADLOCK_LOG_PREFIX, IN_REVIEW_STALL_LOG_PREFIX, IN_REVIEW_STALL_TERMINAL_LOG_PREFIX, allowsAutoMergeProcessing, hasSharedBranchMemberAutoMergeHold, hasUserAutoMergeHold, resolveEffectiveAutoMerge, countRecentIdenticalStallEntries, detectDependencyCycle, detectSelfDefeatingDependency, evaluateNoCommitsNoOpFinalize, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, getInReviewStalledSignal, getInReviewStallReason, getPrimaryPrInfo, getStalePausedReviewSignal, getStalePausedTodoSignal, getTaskHardMergeBlocker, getMergeConfirmedFinalizationBlocker, getPostMergeFinalizeBlocker, getRequiredPostMergeEvidenceBlocker, getRequiredPostMergeEvidenceDecision, planConfirmedMergeChecklistReconciliation, getTaskMergeBlocker, isStaleContentApprovalBlocker, resolvePreMergeGateForTask, isEphemeralAgent, isMergeRequestContractShadowEnabled, isWorkspaceTask, isSharedBranchGroupMemberIntegration, isLiveSharedBranchGroupMemberIntegration, isNearDuplicateCanonicalInactive, resolveExplicitDuplicateMarker, flagTriageDuplicate, isTriageDuplicateKeepAcknowledged, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, getBuiltinWorkflow, isBuiltinWorkflowId, resolveWorkflowIrForTask, resolveWorkflowIrForTaskWithProvenance, resolveRequiredPreMergeStepIds, resolveReboundTarget, columnsWithFlag, resolveLifecycleColumns, resolveTaskLifecycleColumns, isWipColumnRole, isReviewColumnRole, isTerminalColumnRole, workflowHasColumn, planLegacyAdoption, resolveOrphanedPendingStepResults, resolveUnprovenReviewApproval, classifyReviewLease, PLAN_REVIEW_LEASE_STALENESS_MS, DEFAULT_MAX_POST_REVIEW_FIXES, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AWAITING_APPROVAL_PAUSE_REASON, type Agent, type AgentStore, type ChatStore, type MessageStore, type TaskStore, type Settings, type Task, type MergeDetails, type TaskPriority, type MergeResult, type WorkflowStepResult, type WorkflowIr, type WorkflowIrV2,
 
   resolveNearDuplicateCanonicalFlags,
   LEGACY_COLUMN_IDS_BY_ROLE,
@@ -61,7 +61,6 @@ import { classifyStaleContentPark } from "./merge/stale-content-park.js";
 import type { MeshLeaseManager } from "./project/mesh-lease-manager.js";
 import { createLogger, schedulerLog } from "./logger.js";
 import { registerLifecycleMoveLog } from "./execution/lifecycle-move-log.js";
-import { moveTaskToContainedBackwardTarget, type ContainedLifecycleMoveResult } from "./execution/lifecycle-move.js";
 import { emitBoundedRunAudit, emitBoundedRunAuditWithOutcome } from "./util/emit-bounded-run-audit.js";
 import {
   TRIAGE_MARKER_CLEARED_REPLAN_LOG_ACTION,
@@ -162,6 +161,7 @@ import { SelfHealingGitEvidence, execAsync, shellQuote } from "./self-healing-gi
 import { evaluateParkedAgentTaskLink, PARKED_AGENT_LINK_FRESH_RUN_MS } from "./agents/task-agent-sync.js";
 import { describeSelfHealingNoActionWedge } from "./notification/task-wedge-notification.js";
 import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES } from "./healing/recovery-policy.js";
+import { formatRecoveryExhaustedError, recordRecoveryEscalation } from "./healing/recovery-exhaustion.js";
 
 type FileScopeLeaseTaskRoles = {
   isWipColumn: boolean;
@@ -586,6 +586,13 @@ export interface SelfHealingOptions {
    * lifecycle; the executor seam owns all in-memory double-execution guards.
    */
   resumeAssignedTaskForAgent?: (agentId: string) => Promise<void>;
+  /**
+   * FNXC:LifecycleContainment 2026-10-07-18:04:
+   * Arms the executor's guarded in-place re-dispatch for a WIP card a sweep repaired. Self-healing
+   * may not move a card backward (FN-217), so a repair that needs the implementation re-run asks the
+   * executor to resume the same lane instead.
+   */
+  resumeExecutionInPlace?: (taskId: string) => void;
   restartDurableAgentHeartbeat?: (agentId: string, context: { reason: string; attempt: number }) => Promise<boolean>;
   autoRecoveryDispatcher?: AutoRecoveryDispatcher;
   /** Optional ChatStore for maintenance chat-retention cleanup. */
@@ -971,6 +978,12 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
   */
   private prunedWorkspaceWorktreeTeardowns = new Set<string>();
   private finalizeUnprovenWarned = new Set<string>();
+  /** FNXC:LifecycleContainment 2026-10-07-18:04: last reported scope-decay no-action signature per holder, so an unchanged holder is reported once. */
+  private readonly scopeDecayNoActionReported = new Map<string, string>();
+  /** FNXC:LifecycleContainment 2026-10-07-18:04: last reported dependency-lease no-action signature per holder. */
+  private readonly dependencyLeaseNoActionReported = new Map<string, string>();
+  /** FNXC:LifecycleContainment 2026-10-07-18:04: tasks already reported by the partial-progress observer in this process. */
+  private readonly partialProgressNoActionReported = new Map<string, string>();
   /*
    * FNXC:Lifecycle 2026-07-16-10:30:
    * FN-8141 dedup: `task:reconcile-stranded-completed-no-action` is emitted at most once per taskId
@@ -1544,20 +1557,30 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
   live-role recovery. Containment is only as honest as the role it is computed from. The fallback
   survives solely for an unreadable row, where the caller's snapshot is the best evidence available.
   */
-  private async reboundTask(
-    taskId: string,
-    reason: string,
-    fallbackColumn: string,
-    options?: MoveTaskOptions,
-  ): Promise<ContainedLifecycleMoveResult> {
-    const liveColumn = (await this.store.getTask(taskId).catch(() => undefined))?.column ?? fallbackColumn;
-    return moveTaskToContainedBackwardTarget(
-      this.store,
-      taskId,
-      reason,
-      { ...options, moveSource: "engine" },
-      liveColumn,
-    );
+  /*
+  FNXC:LifecycleContainment 2026-10-07-18:04:
+  FN-217 left self-healing with no backward-move authority: `reboundTask` resolved every one of its
+  reasons to an in-place no-op, appended a "no backward-move authority" log line on every call, and
+  its result was never read, so sweeps logged "requeued to todo", audited success and counted a
+  recovery for a move that never happened. It is replaced by this explicit in-place contract: the
+  card keeps its lane, a WIP card is re-dispatched in place, and callers report only what they did.
+  */
+  /*
+  FNXC:LifecycleContainment 2026-10-07-18:04:
+  A review card that the no-op finalizer refuses has no in-role continuation: implementation lives in
+  WIP and self-healing may not move it back. The former "moving back to todo" was a no-op that left
+  the card a candidate for the next pass. It is now parked failed in its review lane (the finalizer
+  skips failed cards), the visible state an operator Retry acts on.
+  */
+  private async parkFinalizeBlockedReviewTask(task: Task, error: string): Promise<void> {
+    await this.store.updateTaskAtomic(task.id, (live) => {
+      if (live.deletedAt || live.paused || live.userPaused || live.column !== task.column || live.status === "failed") return null;
+      return { status: "failed", error: `${error}. Retry the task to re-run implementation.` };
+    });
+  }
+
+  private resumeInPlaceIfExecutionLane(task: Pick<Task, "id">): void {
+    this.options.resumeExecutionInPlace?.(task.id);
   }
 
   private async emitBackwardMoveNoAction(task: Task, stage: string, mutationType: string, proof: { stalenessMs: number; reason: string; metadata: Record<string, unknown> }): Promise<void> {
@@ -2837,7 +2860,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         },
       });
     }
-    return await this.store.moveTask(task.id, completeLane);
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: engine-attributed forward move; guards (including the merge blocker) still run. */
+    return await this.store.moveTask(task.id, completeLane, { moveSource: "engine", bypassGuards: false });
   }
 
   /*
@@ -4427,12 +4451,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             status: null,
             error: null,
           });
-          await this.reboundTask(task.id, "self-healing-worktree-reclaim", task.column, {
-            recoveryRehome: true,
-            preserveWorktree: true,
-            preserveProgress: true,
-            preserveResumeState: true,
-          });
+          /* FNXC:LifecycleContainment 2026-10-07-18:04: the reclaim re-pin above IS the in-place repair; the card keeps its review lane. */
         }
       } else {
         /*
@@ -4494,8 +4513,9 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         settings: (await this.store.getSettings()).autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 },
       });
       if (decision.action === "escalate") {
-        const escalated = await this.reseedExhaustedBranchConflict(task);
-        return withPerPr({ outcome: escalated ? "escalated-reseed" : "skipped", reason: message });
+        const escalated = await this.reseedExhaustedBranchConflict(task, message);
+        if (escalated === "parked") return withPerPr({ outcome: "paused-unrecoverable", reason: message });
+        return withPerPr({ outcome: escalated === "reseeded" ? "escalated-reseed" : "skipped", reason: message });
       }
       if (decision.action === "pause") {
         return withPerPr({ outcome: "held-by-policy", reason: message });
@@ -4510,33 +4530,59 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
    * reclaim classifier, not authorization to convert a recoverable card into a manual park.
    * Keep the current workflow lane intact and fence the reset against an operator pause or a
    * newer ownership generation so the next maintenance pass owns the conservative reseed.
+   *
+   * FNXC:RecoveryOwnership 2026-10-07-18:04:
+   * The dispatcher escalates whenever `recoveryRetryCount >= maxRetries`, and the counter used to be
+   * reset here, so a persistent PR conflict reseeded every maintenance pass. The reseed now pushes the
+   * counter to `maxRetries + 1`; a count above the budget proves the reseed is spent, and the next
+   * escalation parks the card failed with an audit row.
    */
-  private async reseedExhaustedBranchConflict(task: Task): Promise<boolean> {
+  private async reseedExhaustedBranchConflict(task: Task, detail: string): Promise<"reseeded" | "parked" | "skipped"> {
+    const maxRetries = (await this.store.getSettings()).autoRecovery?.maxRetries ?? 3;
+    const count = task.recoveryRetryCount ?? 0;
+    const stillOwnsFailure = (live: Task) => live.branch === task.branch
+      && live.worktree === task.worktree
+      && live.status === task.status
+      && live.error === task.error
+      && live.paused === task.paused
+      && live.pausedReason === task.pausedReason
+      && live.userPaused !== true;
+    if (count > maxRetries) {
+      let parked = false;
+      const error = formatRecoveryExhaustedError(count, detail);
+      await this.store.updateTaskAtomic(task.id, (live) => {
+        if (!stillOwnsFailure(live) || live.status === "failed") return null;
+        parked = true;
+        return { status: "failed", error, recoveryRetryCount: count, recoveryDisposition: null, nextRecoveryAt: null };
+      });
+      if (!parked) return "skipped";
+      await this.store.logEntry(task.id, error).catch(() => undefined);
+      await recordRecoveryEscalation(this.store, task.id, {
+        owner: "self-healing-pr-conflict", outcome: "parked", attempts: count, column: task.column, agentId: "self-healing",
+      });
+      return "parked";
+    }
+    const reseedCount = Math.max(count, maxRetries) + 1;
     let reseeded = false;
     await this.store.updateTaskAtomic(task.id, (live) => {
-      const stillOwnsFailure = live.branch === task.branch
-        && live.worktree === task.worktree
-        && live.status === task.status
-        && live.error === task.error
-        && live.paused === task.paused
-        && live.pausedReason === task.pausedReason
-        && live.userPaused !== true;
-      if (!stillOwnsFailure) return null;
+      if (!stillOwnsFailure(live)) return null;
       reseeded = true;
       return {
         status: null,
         error: null,
         paused: false,
         pausedReason: undefined,
-        recoveryRetryCount: null,
+        recoveryRetryCount: reseedCount,
         recoveryDisposition: "escalated-reseed",
         nextRecoveryAt: null,
       };
     });
-    if (reseeded) {
-      await this.store.logEntry(task.id, "Branch-conflict recovery retry budget escalated to a fenced reclaim reseed");
-    }
-    return reseeded;
+    if (!reseeded) return "skipped";
+    await this.store.logEntry(task.id, "Branch-conflict recovery retry budget escalated to a fenced reclaim reseed; the next exhaustion parks the task for an operator");
+    await recordRecoveryEscalation(this.store, task.id, {
+      owner: "self-healing-pr-conflict", outcome: "reseeded", attempts: reseedCount, column: task.column, agentId: "self-healing",
+    });
+    return "reseeded";
   }
 
   /**
@@ -4569,6 +4615,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         taskStore: this.store,
         runAudit: auditor,
         integrationBranch,
+        resumeInPlace: (taskId) => this.options.resumeExecutionInPlace?.(taskId),
       });
       if (!recovered.recovered) return false;
       await this.store.logEntry(
@@ -4763,11 +4810,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
                   signalReason: liveExecutionSignal.reason,
                 },
               });
-              await this.reboundTask(task.id, "self-healing-session-recovery", task.column, {
-                recoveryRehome: true,
-                preserveProgress: true,
-                preserveWorktree: true,
-              });
+              /* FNXC:LifecycleContainment 2026-10-07-18:04: the cleared phantom binding is resumed in its WIP lane instead of the former no-op rebound. */
+              this.resumeInPlaceIfExecutionLane(task);
               recovered++;
               continue;
             }
@@ -4953,17 +4997,11 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
               triple-proof gate is skipped entirely and the card is moved back without it — a safety
               check silently bypassed BY the conversion.
               */
-              if (lanesOfReclaim(task.id).review.has(task.column)) {
-                if (!reviewProof?.ok) {
-                  await this.emitBackwardMoveNoAction(task, "reclaim-self-owned-branch-conflict", "task:reclaim-self-owned-branch-conflict-no-action", reviewProof!);
-                } else {
-                  await this.reboundTask(task.id, "self-healing-worktree-reclaim", task.column, {
-                    recoveryRehome: true,
-                    // worktree-discard-intended: reclaim proved the branch already merged / has zero unique commits; the checkout holds nothing worth keeping and worktree was explicitly nulled above.
-                    preserveProgress: true,
-                    preserveResumeState: true,
-                  });
-                }
+              /* FNXC:LifecycleContainment 2026-10-07-18:04: a review card keeps its lane after reclaim; the former rebound here was a no-op. Without the review proof the no-action audit still records why nothing else happened. */
+              if (lanesOfReclaim(task.id).review.has(task.column) && !reviewProof?.ok) {
+                await this.emitBackwardMoveNoAction(task, "reclaim-self-owned-branch-conflict", "task:reclaim-self-owned-branch-conflict-no-action", reviewProof!);
+              } else {
+                this.resumeInPlaceIfExecutionLane(task);
               }
 
               try {
@@ -5098,17 +5136,11 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
                   `[recovery] reclaim-live-zero-commits ${task.id} branch=${task.branch} worktree=${inspection.livePath} tip=${inspection.tipSha.slice(0, 12)} reason=zero-unique-commits-vs-main`,
                 );
 
-                if (lanesOfReclaim(task.id).review.has(task.column)) {
-                  if (!reviewProof?.ok) {
-                    await this.emitBackwardMoveNoAction(task, "reclaim-self-owned-branch-conflict", "task:reclaim-self-owned-branch-conflict-no-action", reviewProof!);
-                  } else {
-                    await this.reboundTask(task.id, "self-healing-worktree-reclaim", task.column, {
-                      recoveryRehome: true,
-                      // worktree-discard-intended: reclaim proved the branch already merged / has zero unique commits; the checkout holds nothing worth keeping and worktree was explicitly nulled above.
-                      preserveProgress: true,
-                      preserveResumeState: true,
-                    });
-                  }
+                /* FNXC:LifecycleContainment 2026-10-07-18:04: a review card keeps its lane after reclaim; the former rebound here was a no-op. Without the review proof the no-action audit still records why nothing else happened. */
+                if (lanesOfReclaim(task.id).review.has(task.column) && !reviewProof?.ok) {
+                  await this.emitBackwardMoveNoAction(task, "reclaim-self-owned-branch-conflict", "task:reclaim-self-owned-branch-conflict-no-action", reviewProof!);
+                } else {
+                  this.resumeInPlaceIfExecutionLane(task);
                 }
 
                 try {
@@ -5193,25 +5225,31 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             && !hasActiveSessionSignal;
           const resumeAttemptCount = isNoProgressResume ? (task.resumeLimboCount ?? 0) + 1 : 0;
 
+          /* FNXC:LifecycleContainment 2026-10-07-18:04: an escalated resume-limbo card is already parked failed; re-escalating it every sweep would rewrite it and duplicate the audit row. */
+          if (lanesOfReclaim(task.id).wip.has(task.column) && task.status === "failed" && (task.resumeLimboCount ?? 0) >= MAX_NO_PROGRESS_RESUME_ATTEMPTS) {
+            continue;
+          }
           if (lanesOfReclaim(task.id).wip.has(task.column) && isNoProgressResume && resumeAttemptCount >= MAX_NO_PROGRESS_RESUME_ATTEMPTS) {
             const idleAnchor = task.executionStartedAt ?? task.columnMovedAt ?? task.updatedAt;
             const idleAnchorMs = Date.parse(idleAnchor ?? "");
             const idleMs = Number.isFinite(idleAnchorMs) ? Math.max(0, Date.now() - idleAnchorMs) : null;
-            await this.reboundTask(task.id, "self-healing-session-recovery", task.column, {
-              recoveryRehome: true,
-              preserveWorktree: true,
-              preserveProgress: true,
-              preserveResumeState: true,
-            });
+            /*
+            FNXC:LifecycleContainment 2026-10-07-18:04:
+            The escalation used to "move to todo", which FN-217 made a no-op while the counter reset to
+            zero, so the no-progress loop restarted. It now parks the card visibly in its WIP lane with
+            the counter kept; an operator Retry resets it.
+            */
             await this.store.updateTask(task.id, {
               ...(placement.relocated ? { worktree: reclaimedWorktreePath } : {}),
-              resumeLimboCount: 0,
+              status: "failed",
+              error: `Resume made no progress after ${resumeAttemptCount} reclaim/resume attempts (tip ${inspection.tipSha.slice(0, 12)} unchanged). Inspect the worktree, then retry the task.`,
+              resumeLimboCount: resumeAttemptCount,
               resumeLimboTipSha: inspection.tipSha,
               resumeLimboStepSignature: stepSignature,
             });
             await this.store.logEntry(
               task.id,
-              `[recovery] resume-limbo-escalated ${task.id} moved to todo after ${resumeAttemptCount} no-progress reclaim/resume attempts`,
+              `[recovery] resume-limbo-escalated ${task.id} parked failed in place after ${resumeAttemptCount} no-progress reclaim/resume attempts`,
               JSON.stringify({
                 frozenTipSha: inspection.tipSha,
                 idleMs,
@@ -5240,7 +5278,6 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             } catch (auditErr: unknown) {
               log.warn(`Failed to write task:resume-limbo-escalated run-audit event for ${task.id}: ${auditErr instanceof Error ? auditErr.message : String(auditErr)}`);
             }
-            recovered++;
             continue;
           }
 
@@ -5267,17 +5304,11 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             `[recovery] ${wasPausedBranchConflict ? "reclaim-paused-review" : "reclaim-self-owned"} ${task.id} at ${reclaimedWorktreePath} (${preservedCommitCount} commits preserved, tip ${inspection.tipSha.slice(0, 12)})`,
           );
 
-          if (lanesOfReclaim(task.id).review.has(task.column)) {
-            if (!reviewProof?.ok) {
-              await this.emitBackwardMoveNoAction(task, "reclaim-self-owned-branch-conflict", "task:reclaim-self-owned-branch-conflict-no-action", reviewProof!);
-            } else {
-              await this.reboundTask(task.id, "self-healing-worktree-reclaim", task.column, {
-                recoveryRehome: true,
-                preserveWorktree: true,
-                preserveProgress: true,
-                preserveResumeState: true,
-              });
-            }
+          /* FNXC:LifecycleContainment 2026-10-07-18:04: a review card keeps its lane after reclaim; the former rebound here was a no-op. Without the review proof the no-action audit still records why nothing else happened. */
+          if (lanesOfReclaim(task.id).review.has(task.column) && !reviewProof?.ok) {
+            await this.emitBackwardMoveNoAction(task, "reclaim-self-owned-branch-conflict", "task:reclaim-self-owned-branch-conflict-no-action", reviewProof!);
+          } else {
+            this.resumeInPlaceIfExecutionLane(task);
           }
 
           try {
@@ -5367,7 +5398,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             settings: (await this.store.getSettings()).autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 },
           });
           if (decision.action === "escalate") {
-            await this.reseedExhaustedBranchConflict(task);
+            await this.reseedExhaustedBranchConflict(task, `self-owned branch conflict on ${task.branch ?? "unknown branch"} could not be reclaimed`);
           }
         }
       }
@@ -6653,34 +6684,27 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         continue;
       }
 
-      await this.reboundTask(task.id, "self-healing-stranded-recovery", task.column, {
-        preserveProgress: true,
-        preserveWorktree: true,
-        preserveResumeState: true,
-        recoveryRehome: true,
-      });
-      await this.store.logEntry(
-        task.id,
-        `Auto-rebounded (FN-4890): paused in-progress holder exceeded scope-decay threshold with ${followerCount} blocked follower(s)`,
-      );
-      const auditor = createRunAuditor(this.store, {
-        runId: generateSyntheticRunId("fn4890-paused-scope-decay", task.id),
-        agentId: "self-healing",
-        taskId: task.id,
-        phase: "auto-rebound-paused-scope-decay",
-      });
-      await auditor.database({
-        type: "task:auto-rebound-paused-scope-decay",
-        target: task.id,
-        metadata: {
-          taskId: task.id,
-          followerCount,
-          ignoredAgeGate: options?.ignoreAgeGate === true,
-          thresholdMs,
-          ageMs,
-        },
-      });
-      reboundedIds.push(task.id);
+      /*
+      FNXC:LifecycleContainment 2026-10-07-18:04:
+      The FN-4890 rebound was the sweep's only repair, and FN-217 made it a no-op: the holder stayed
+      paused in WIP, its followers stayed blocked, and the sweep still logged "Auto-rebounded",
+      audited success and counted a recovery (which also fed the board-stall watchdog a false
+      recovery). There is no in-place repair that releases a WIP holder's lease without overriding
+      its pause, so the sweep now reports a deduplicated no-action and never claims recovery.
+      */
+      const scopeDecaySignature = `${task.pausedReason ?? ""}|${task.columnMovedAt ?? ""}|${followerCount}`;
+      if (this.scopeDecayNoActionReported.get(task.id) !== scopeDecaySignature) {
+        this.scopeDecayNoActionReported.set(task.id, scopeDecaySignature);
+        await this.store.logEntry(
+          task.id,
+          `Paused holder exceeded the scope-decay threshold with ${followerCount} blocked follower(s); automatic recovery cannot move it backward — unpause or move it to release its followers`,
+        ).catch(() => undefined);
+        await this.emitBackwardMoveNoAction(task, "auto-rebound-paused-scope-decay", "task:auto-rebound-scope-decay-no-action", {
+          stalenessMs: proof.stalenessMs,
+          reason: "no-in-place-repair",
+          metadata: { taskId: task.id, followerCount, thresholdMs, ageMs, reason: "no-in-place-repair" },
+        });
+      }
     }
 
     return { count: reboundedIds.length, reboundedIds };
@@ -7453,13 +7477,27 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         continue;
       }
 
-      await this.reboundTask(holder.id, "self-healing-dependency-rebound", holder.column, {
-        preserveProgress: true,
-        preserveWorktree: true,
-        preserveResumeState: true,
-        recoveryRehome: true,
-      });
-      if (deadlockingDependency.overlapBlockedBy === holder.id) {
+      /*
+      FNXC:LifecycleContainment 2026-10-07-18:04:
+      The holder keeps its WIP lane (FN-217 removed the rebound). The real in-place repair is the
+      stale overlap marker on the dependency: the WIP holder's lease already waives toward its own
+      unmet dependencies, so clearing that marker lets the dependency run. When there is no stale
+      marker to clear, nothing changed, so the sweep reports a deduplicated no-action instead of the
+      former "Auto-rebounded" success that re-fired every maintenance pass.
+      */
+      if (deadlockingDependency.overlapBlockedBy !== holder.id) {
+        const leaseSignature = `${deadlockingDependency.id}|${deadlockEvidence}|${holder.columnMovedAt ?? ""}`;
+        if (this.dependencyLeaseNoActionReported.get(holder.id) !== leaseSignature) {
+          this.dependencyLeaseNoActionReported.set(holder.id, leaseSignature);
+          await this.emitBackwardMoveNoAction(holder, "reconcile-dependency-blocking-lease", "task:reconcile-dependency-blocking-lease-no-action", {
+            stalenessMs: proof.stalenessMs,
+            reason: "no-in-place-repair",
+            metadata: { holderId: holder.id, dependencyId: deadlockingDependency.id, deadlockEvidence, reason: "no-in-place-repair" },
+          });
+        }
+        continue;
+      }
+      {
         await this.store.updateTask(deadlockingDependency.id, { overlapBlockedBy: null, status: null });
         /*
         FNXC:OverlapWaitSynchronization 2026-09-18-01:15:
@@ -7477,7 +7515,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       }
       await this.store.logEntry(
         holder.id,
-        `Auto-rebounded (FN-6292): released dependency-blocking file-scope lease; dependency ${deadlockingDependency.id} can run before this task resumes`,
+        `Auto-recovered (FN-6292): cleared the stale overlap marker that held dependency ${deadlockingDependency.id} behind this task; the dependency can run first`,
       );
       await createRunAuditor(this.store, {
         runId: generateSyntheticRunId("fn6292-dependency-blocking-lease", holder.id),
@@ -7548,7 +7586,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     }
 
     const executingIds = this.options.getExecutingTaskIds?.() ?? new Set<string>();
-    const completedBlockedHoldColumns = await resolveProjectColumnsForRoles(this.store, ["hold"]);
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: the park now lands in place in the WIP lane; hold stays scanned for rows parked before that change. */
+    const completedBlockedHoldColumns = await resolveProjectColumnsForRoles(this.store, ["hold", "countsTowardWip"]);
     let recovered = 0;
     for (const snapshot of tasks) {
       if (snapshot.deletedAt) continue;
@@ -7665,6 +7704,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
 
       const unmetDeps = getUnmetSchedulingDependencies(task, tasks, dependencyOptions);
       if (unmetDeps.length === 0) continue;
+      /* FNXC:LifecycleContainment 2026-10-07-18:04: the in-place dependency hold is already recorded; re-writing it every pass reported a repeated recovery for unchanged state. */
+      if (task.status === "queued" && task.blockedBy === unmetDeps[0]) continue;
 
       /*
       FNXC:DependencyGating 2026-06-20-09:22:
@@ -7728,17 +7769,11 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       }
 
       try {
-        await this.reboundTask(task.id, "self-healing-dependency-rebound", task.column, {
-          preserveProgress: true,
-          preserveWorktree: true,
-          preserveResumeState: true,
-          recoveryRehome: true,
-          bypassGuards: true,
-        });
+        /* FNXC:LifecycleContainment 2026-10-07-18:04: FN-6793 records the dependency hold in place; the former no-op rebound and its "Auto-rebounded" wording are gone. */
         await this.store.updateTask(task.id, { status: "queued", blockedBy: unmetDeps[0] });
         await this.store.logEntry(
           task.id,
-          `Auto-rebounded (FN-6793): in-review task had unmet dependencies: ${unmetDeps.join(", ")}`,
+          `Dependency hold recorded in place (FN-6793): in-review task has unmet dependencies: ${unmetDeps.join(", ")}`,
         );
         await createRunAuditor(this.store, {
           runId: generateSyntheticRunId("fn6793-in-review-unmet-dependencies", task.id),
@@ -9502,7 +9537,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             this.finalizeUnprovenWarned.add(task.id);
             await this.store.logEntry(
               task.id,
-              `Finalize blocked: unproven ownership evidence (${classification.reason}); no owned landed commit was found — auto-retrying via todo requeue`,
+              `Finalize blocked: unproven ownership evidence (${classification.reason}); no owned landed commit was found`,
               JSON.stringify(classification.details, null, 2),
             );
             await this.store.updateTask(task.id, {
@@ -9522,7 +9557,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           await this.recordIntegrityAudit(task.id, "task:finalize-unproven-blocked", {
             reason: classification.reason,
             details: classification.details,
-            autoRetry: true,
+            autoRetry: false,
           });
           const proof = await this.evaluateBackwardMoveTripleProof(task, {
             stage: "finalize-no-op-review",
@@ -9534,8 +9569,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             await this.emitBackwardMoveNoAction(task, "finalize-no-op-review", "task:finalize-no-op-review-no-action", proof);
             continue;
           }
-          // #1411: backward recovery — skip order-derived adjacency.
-          await this.reboundTask(task.id, "self-healing-stranded-recovery", task.column, { preserveProgress: true, preserveWorktree: true, recoveryRehome: true });
+          await this.parkFinalizeBlockedReviewTask(task, `Finalize blocked: unproven ownership evidence (${classification.reason}); no owned landed commit was found`);
           continue;
         }
 
@@ -9570,8 +9604,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           // primary site of the bug — it would clear `modifiedFiles: []`
           // (line below) while moving the task to Done, silently destroying
           // the audit trail of the lost work. Now we refuse to finalize and
-          // move the task back to todo with progress preserved so the next
-          // executor run can re-attempt.
+          // park the task failed in review (no backward move; see parkFinalizeBlockedReviewTask) so an
+          // operator Retry can re-run implementation.
           const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task, {
             requiredVerificationStepIds: await resolveNoOpFinalizeGateIds(this.store, task),
           });
@@ -9584,7 +9618,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             await this.store.updateTask(task.id, { error: reason });
             await this.store.logEntry(
               task.id,
-              `Finalize blocked (no-commits incomplete-work guard): ${reason} — moving back to todo with progress preserved`,
+              `Finalize blocked (no-commits incomplete-work guard): ${reason}`,
               JSON.stringify({
                 doneCount: noCommitsFinalize.doneCount,
                 incompleteCount: noCommitsFinalize.incompleteCount,
@@ -9601,15 +9635,13 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
               baseRef: classification.baseRef,
               lane: "self-healing-finalize-no-op-review",
             });
-            // #1411: backward recovery — skip order-derived adjacency.
-            await this.reboundTask(task.id, "self-healing-stranded-recovery", task.column, { preserveProgress: true, preserveWorktree: true, recoveryRehome: true });
-            recovered++;
+            await this.parkFinalizeBlockedReviewTask(task, `Finalize blocked (no-commits incomplete-work guard): ${reason}`);
             continue;
           }
           if (task.modifiedFiles && task.modifiedFiles.length > 0) {
             await this.store.logEntry(
               task.id,
-              `Finalize blocked (lost-work guard): task claims ${task.modifiedFiles.length} modifiedFiles but classification would finalize as no-op — moving back to todo with progress preserved`,
+              `Finalize blocked (lost-work guard): task claims ${task.modifiedFiles.length} modifiedFiles but classification would finalize as no-op`,
               JSON.stringify({
                 modifiedFilesSample: task.modifiedFiles.slice(0, 5),
                 classification: "proven-no-op",
@@ -9621,9 +9653,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
               classification: "proven-no-op",
               baseRef: classification.baseRef,
             });
-            // #1411: backward recovery — skip order-derived adjacency.
-            await this.reboundTask(task.id, "self-healing-stranded-recovery", task.column, { preserveProgress: true, preserveWorktree: true, recoveryRehome: true });
-            recovered++;
+            await this.parkFinalizeBlockedReviewTask(task, `Finalize blocked (lost-work guard): task claims ${task.modifiedFiles.length} modifiedFiles but the branch has no net changes`);
             continue;
           }
           const noOpReason = `branch has zero commits ahead of ${classification.baseRef}`;
@@ -14706,6 +14736,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             repoDir: this.options.rootDir,
             taskStore: this.store,
             integrationBranch,
+            resumeInPlace: (taskId) => this.options.resumeExecutionInPlace?.(taskId),
             runAudit: createRunAuditor(this.store, {
               runId: generateSyntheticRunId("self-heal", task.id),
               agentId: "self-healing",
@@ -14934,6 +14965,15 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           the literal happened to spell twice. Resolved once, before the write, and read by both:
           deriving one question two ways is how a converted guard and an unconverted target drift.
           */
+          /*
+          FNXC:LifecycleContainment 2026-10-07-18:04:
+          The node requeue stays in the card's current lane. The former WIP-to-hold move used the
+          same-role-only `self-healing-session-recovery` reason, which FN-207 rejects, and it ran AFTER
+          the status/error clear, so the rejection erased the park (this sweep's only selection signal)
+          and left a null-status WIP row with no owner. Clearing the park is now the single write, and it
+          is the handoff: the executor's task:updated resume path re-dispatches a WIP card with no live
+          session (gated above), a hold card is scheduled normally, and review is preserved.
+          */
           const requeueLifecycle = await resolveTaskLifecycleColumns(this.store, task.id);
           const requeueTarget = requeueLifecycle?.hold ?? requeueLifecycle?.intake ?? "todo";
           await this.store.updateTask(task.id, {
@@ -14943,16 +14983,6 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
               ? { workflowTransitionNotification }
               : {}),
           });
-          if (route.kind === "node-requeue" && fresh.column !== requeueTarget) {
-            await this.store.moveTask(task.id, requeueTarget, {
-              preserveProgress: true,
-              preserveWorktree: true,
-              moveSource: "engine",
-              lifecycleReason: "self-healing-session-recovery",
-              recoveryRehome: true,
-            });
-            await this.store.updateTask(task.id, { workflowTransitionNotification });
-          }
           /*
           FNXC:NodeWorktreeIsolation 2026-07-29-06:05 (FN-6756 — ordering, PR #2531 review):
           Release worktree ownership only AFTER the fallible writes have committed.
@@ -14988,7 +15018,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
                router did — a literal here describes a renamed-board recovery as the wrong kind. */
             freshColumns.review.has(fresh.column)
               ? "Auto-recovered: in-review pause-abort park cleared — preserved for normal review progression"
-              : "Auto-recovered: pause-abort park cleared — requeued for normal scheduling",
+              : `Auto-recovered: pause-abort park cleared — resuming in '${fresh.column}'`,
           );
           /*
           FNXC:RunAudit 2026-08-20-04:15:
@@ -15022,7 +15052,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       }
 
       if (recovered > 0) {
-        log.log(`Recovered ${recovered} pause-abort park(s) → requeued to todo or preserved in review`);
+        log.log(`Recovered ${recovered} pause-abort park(s) → resumed in place or preserved in review`);
       }
       return recovered;
     } catch (err: unknown) { const errorMessage = err instanceof Error ? err.message : String(err);
@@ -16534,7 +16564,12 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
    * Skips tasks not eligible for auto-merge processing (global `autoMerge`
    * off without an explicit per-task `autoMerge: true` override) — PR-based
    * review flow owns lifecycle until human merge.
-   * @returns Number of tasks requeued for retry
+   *
+   * FNXC:LifecycleContainment 2026-10-07-18:04:
+   * Superseded: a review card cannot resume implementation in place and FN-217 removed the backward
+   * move, so the requeue described above no longer happens. The sweep is observation-only: it keeps
+   * the failed park (the operator's Retry signal) and reports each candidate once.
+   * @returns Always 0; no recovery is performed
    */
   async recoverPartialProgressNoTaskDoneFailures(): Promise<number> {
     try {
@@ -16585,11 +16620,11 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
 
       if (candidates.length === 0) return 0;
 
-      log.warn(
-        `Found ${candidates.length} partial-progress no-task_done failure(s) eligible for auto-retry`,
+      log.debug(
+        `Found ${candidates.length} partial-progress no-task_done failure(s) with no in-place repair`,
       );
 
-      let recovered = 0;
+      const recovered = 0;
       for (const task of candidates) {
         try {
           const proof = await this.evaluateBackwardMoveTripleProof(task, {
@@ -16603,20 +16638,22 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             continue;
           }
 
-          const nextCount = (task.taskDoneRetryCount ?? 0) + 1;
-          await this.store.updateTask(task.id, {
-            status: null,
-            error: null,
-            sessionFile: null,
-            taskDoneRetryCount: nextCount,
-          });
-          await this.store.logEntry(
-            task.id,
-            `Auto-retry ${nextCount}/${MAX_TASK_DONE_RETRIES}: agent finished without fn_task_done — requeuing to todo to resume partial work`,
-          );
-          // #1411: backward recovery — skip order-derived adjacency.
-          await this.reboundTask(task.id, "self-healing-stranded-recovery", task.column, { preserveProgress: true, preserveWorktree: true, recoveryRehome: true });
-          recovered++;
+          /*
+          FNXC:LifecycleContainment 2026-10-07-18:04:
+          A review card cannot resume implementation in place, and FN-217 removed the backward move.
+          The former retry cleared the failed park first and then "requeued to todo" through a no-op,
+          leaving a null-status review card with incomplete steps and no owner. The failed park is
+          the visible operator signal, so it is left intact and reported once.
+          */
+          const partialSignature = `${task.taskDoneRetryCount ?? 0}|${task.columnMovedAt ?? ""}`;
+          if (this.partialProgressNoActionReported.get(task.id) !== partialSignature) {
+            this.partialProgressNoActionReported.set(task.id, partialSignature);
+            await this.emitBackwardMoveNoAction(task, "partial-progress-no-task-done", "task:partial-progress-no-task-done-no-action", {
+              stalenessMs: proof.stalenessMs,
+              reason: "no-in-place-repair",
+              metadata: { taskId: task.id, column: task.column, reason: "no-in-place-repair" },
+            });
+          }
         } catch (err: unknown) {
           const errorMessage = err instanceof Error ? err.message : String(err);
           log.error(
@@ -16625,11 +16662,6 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         }
       }
 
-      if (recovered > 0) {
-        log.log(
-          `Auto-retried ${recovered} partial-progress no-task_done failure(s) → todo`,
-        );
-      }
       return recovered;
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -16708,20 +16740,36 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     verification retries, re-admit the card through triage's existing needs-replan owner
     instead of terminalizing it, so startup and maintenance cannot strand planning work.
     */
-    const patch = decision.shouldRetry
+    /*
+    FNXC:RecoveryOwnership 2026-10-07-18:04:
+    The fresh planning pass is spent once per episode and keeps the counter; the next exhaustion
+    parks the card failed instead of re-admitting it through needs-replan forever.
+    */
+    const parkError = decision.disposition === "escalate" && decision.escalation === "park"
+      ? formatRecoveryExhaustedError(decision.attempts, `planning lifecycle lock transport failure during approved triage recovery: ${error.message}`)
+      : null;
+    const patch = decision.disposition === "retry"
       ? {
           status: "planning" as const,
           error: null,
           recoveryRetryCount: decision.nextState.recoveryRetryCount,
           nextRecoveryAt: decision.nextState.nextRecoveryAt,
         }
-      : {
-          status: "needs-replan" as const,
-          error: null,
-          recoveryRetryCount: null,
-          recoveryDisposition: "escalated-reseed" as const,
-          nextRecoveryAt: null,
-        };
+      : parkError
+        ? {
+            status: "failed" as const,
+            error: parkError,
+            recoveryRetryCount: decision.attempts,
+            recoveryDisposition: null,
+            nextRecoveryAt: null,
+          }
+        : {
+            status: "needs-replan" as const,
+            error: null,
+            recoveryRetryCount: decision.nextState.recoveryRetryCount,
+            recoveryDisposition: "escalated-reseed" as const,
+            nextRecoveryAt: null,
+          };
     let persisted = false;
 
     if (typeof this.store.updateTaskAtomic === "function") {
@@ -16739,10 +16787,20 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     }
 
     if (!persisted) return;
-    const action = decision.shouldRetry
-      ? `Planning lifecycle lock transport failure during approved triage recovery — retry ${decision.nextState.recoveryRetryCount}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)}: ${error.message}`
-      : `Planning lifecycle lock transport recovery exhausted after ${MAX_RECOVERY_RETRIES} retries; escalated to a fresh planning pass.`;
+    const action = decision.disposition === "retry"
+      ? `Planning lifecycle lock transport failure during approved triage recovery — retry ${decision.attempt}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)}: ${error.message}`
+      : parkError
+        ?? `Planning lifecycle lock transport recovery exhausted after ${MAX_RECOVERY_RETRIES} retries; escalated to one fresh planning pass (the next exhaustion parks the task).`;
     await this.store.logEntry(task.id, action).catch(() => undefined);
+    if (decision.disposition === "escalate") {
+      await recordRecoveryEscalation(this.store, task.id, {
+        owner: "self-healing-planning-handoff",
+        outcome: parkError ? "parked" : "reseeded",
+        attempts: decision.nextState.recoveryRetryCount ?? decision.attempts,
+        column: task.column,
+        agentId: "self-healing",
+      });
+    }
   }
 
   async recoverApprovedTriageTasks(): Promise<number> {

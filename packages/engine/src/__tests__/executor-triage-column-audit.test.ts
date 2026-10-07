@@ -34,25 +34,29 @@ function planningOnlyIr(): WorkflowIr {
   } as unknown as WorkflowIr;
 }
 
-describe("dependency-abort cleanup requeues to a DECLARED column", () => {
-  it("uses the workflow's own planner column, never the literal triage", async () => {
+describe("dependency-abort cleanup stays in a DECLARED column", () => {
+  it("keeps the card in its own WIP lane, never the literal triage", async () => {
     resetExecutorMocks();
     const store = createMockStore();
     const selection = { workflowId: WF, stepIds: [] };
-    store.getTask.mockResolvedValue({ id: "FN-DEP", column: "in-progress", branch: null } as unknown as TaskDetail);
+    store.getTask.mockResolvedValue({ id: "FN-DEP", column: "in-progress", branch: null, steps: [], dependencies: [] } as unknown as TaskDetail);
     store.getTaskWorkflowSelection = vi.fn(() => selection);
     store.getTaskWorkflowSelectionAsync = vi.fn(async () => selection);
     store.getWorkflowDefinition = vi.fn(async () => ({ id: WF, ir: planningOnlyIr() }));
+    Object.assign(store, { taskDir: (id: string) => `/tmp/test/.fusion/tasks/${id}`, resetPromptCheckboxes: vi.fn(async () => undefined) });
     const executor = new TaskExecutor(store, "/tmp/test");
+    const scheduleInPlace = vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
 
     await (executor as any).handleDepAbortCleanup("FN-DEP", "/tmp/test/wt");
 
     /*
-    The failure this pins: the card was parked in a column its workflow does not declare, where
-    nothing routes it onward and only a restart-time reconcile could rescue it.
+    The failure this pinned: the card was parked in a column its workflow does not declare, where
+    nothing routes it onward. FNXC:LifecycleContainment 2026-10-07-18:04: the abort now discards work
+    in place, so the card never leaves its declared WIP lane (FN-207 forbids the old WIP-to-hold move)
+    and is re-dispatched there once its dependencies allow.
     */
-    expect(store.moveTask).toHaveBeenCalledWith("FN-DEP", "todo");
-    expect(store.moveTask).not.toHaveBeenCalledWith("FN-DEP", "triage");
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(scheduleInPlace).toHaveBeenCalledWith("FN-DEP");
   });
 
   /*
@@ -67,12 +71,16 @@ describe("dependency-abort cleanup requeues to a DECLARED column", () => {
       id: "FN-EXT",
       column: "in-progress",
       branch: "fusion/fn-ext",
+      steps: [],
+      dependencies: [],
       sourceMetadata: {
         externalExecutionCheckout: "/tmp/operator-owned-checkout",
         externalExecutionBranch: "operator/runtime-fixes",
       },
     } as unknown as TaskDetail);
+    Object.assign(store, { taskDir: (id: string) => `/tmp/test/.fusion/tasks/${id}`, resetPromptCheckboxes: vi.fn(async () => undefined) });
     const executor = new TaskExecutor(store, "/tmp/test");
+    vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
     const removeManagedWorktree = vi.spyOn(executor as any, "removeOwnWorktreeWithReconcile");
 
     await (executor as any).handleDepAbortCleanup("FN-EXT", "/tmp/test/.worktrees/fn-ext");

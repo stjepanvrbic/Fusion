@@ -12,13 +12,14 @@ import {
 import { classifyTaskWorktree } from "../worktree/worktree-pool.js";
 import { formatError } from "../logger.js";
 import type { EngineRunContext, RunAuditor } from "../util/run-audit.js";
-import { resolveReboundColumnFor } from "./lifecycle-columns.js";
+import { requeueExecutionInPlace } from "./in-place-execution-requeue.js";
 
 export type BootstrapMisbindingRecoveryDeps = {
   rootDir: string;
   store: TaskStore;
   getRunContextFor: (taskId: string) => EngineRunContext | undefined;
   markGraphExecuteSelfRequeued: (taskId: string) => void;
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
 };
 
 export async function tryBootstrapMisbindingRecovery(
@@ -76,8 +77,8 @@ export async function tryBootstrapMisbindingRecovery(
       paused: false,
       pausedReason: null,
     });
-    deps.markGraphExecuteSelfRequeued(task.id);
-    await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveResumeState: false, preserveWorktree: true });
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: the re-anchored checkout is retried in its WIP lane; FN-207 forbids the former automatic WIP-to-hold rebound. */
+    await requeueExecutionInPlace(deps, task.id);
     return true;
   } catch (error) {
     await deps.store.logEntry(task.id, `[recovery] bootstrap re-anchor failed; falling back to contamination safety path: ${formatError(error)}`, undefined, deps.getRunContextFor(task.id));

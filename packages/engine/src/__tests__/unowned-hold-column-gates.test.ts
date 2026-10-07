@@ -201,19 +201,20 @@ describe("mission autopilot retries into the workflow's own hold column", () => 
     return moved[0];
   }
 
-  it("moves a retried card to the DEFAULT hold column (no-regression half)", async () => {
-    expect(await retryTarget(DEFAULT_NAMES)).toBe("todo");
+  /*
+  FNXC:LifecycleContainment 2026-10-07-18:04:
+  Mission retries no longer move the card to any hold column, default or renamed: FN-207 forbids the
+  automatic WIP-to-hold move. The retry clears the failure in the card's own lane instead, so the
+  hold-column resolution these cases pinned is gone with it.
+  */
+  it.each([
+    ["default", DEFAULT_NAMES],
+    ["renamed", RENAMED],
+  ])("retries a %s-board card in its own lane without moving it", async (_label, names) => {
+    expect(await retryTarget(names)).toBeUndefined();
   });
 
-  it("moves a retried card to a RENAMED hold column, not the literal", async () => {
-    // Pre-conversion autopilot moved it to `todo` — a column this workflow does not
-    // declare — on EVERY retry, which is the R7 violation by repetition.
-    const target = await retryTarget(RENAMED);
-    expect(target).toBe("drafting");
-    expect(target).not.toBe("todo");
-  });
-
-  it("does NOT move the card, and leaves it visibly FAILED, when the workflow declares no hold column", async () => {
+  it("does NOT move the card when the workflow declares no hold column, and still retries it in place", async () => {
     /*
     FNXC:UnownedHoldColumnGates 2026-07-29-20:10 (PR #2561 review — greptile P1):
     My first version cleared the failure state and left the card in WIP, reasoning
@@ -225,9 +226,15 @@ describe("mission autopilot retries into the workflow's own hold column", () => 
     Leaving the failure intact is the correct trade: an operator can act on a failed
     card, and nothing can act on a clean-looking abandoned one.
     */
+    /*
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    Superseded: the retry no longer depends on a hold column at all. Clearing the failure in the WIP
+    lane is now the retry (the executor's in-place resume path re-dispatches it), so a board with no
+    hold column is retried the same way and never moved.
+    */
     const store = await retryStoreFor({ hold: "unused", wip: "building" }, { declaresHold: false });
 
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.updateTask).toHaveBeenCalledWith("FN-RETRY", expect.objectContaining({ error: null, status: null, paused: false }));
   });
 });

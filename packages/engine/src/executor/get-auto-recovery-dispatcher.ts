@@ -15,6 +15,7 @@ export type GetAutoRecoveryDispatcherDeps = {
   store: TaskStore;
   rootDir: string;
   autoRecoveryDispatcher?: AutoRecoveryDispatcher | null;
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
 };
 
 export function getAutoRecoveryDispatcher(
@@ -40,6 +41,7 @@ export function getAutoRecoveryDispatcher(
     runAudit: audit,
     logger: executorLog,
     repoDir: deps.rootDir,
+    resumeInPlace: deps.scheduleInPlaceExecutionResume,
   });
   return new AutoRecoveryDispatcher({
     taskStore: deps.store,

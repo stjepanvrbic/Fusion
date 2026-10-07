@@ -8,9 +8,9 @@ import { executorLog } from "../logger.js";
 import type { EngineRunContext } from "../util/run-audit.js";
 import { evaluateTaskDoneRefusal } from "./task-done-refusal.js";
 import { skipBypassTaintUpdateForRefusal } from "./completion-predicates.js";
-import { resolveReboundColumnFor } from "./lifecycle-columns.js";
+import { requeueExecutionInPlace } from "./in-place-execution-requeue.js";
 
-/** Maximum todo requeues after exhausting in-session fn_task_done retries. */
+/** Maximum in-place requeues after exhausting in-session fn_task_done retries. */
 export const MAX_TASK_DONE_REQUEUE_RETRIES = 3;
 
 export type TaskDoneRefusalHandlerDeps = {
@@ -20,6 +20,7 @@ export type TaskDoneRefusalHandlerDeps = {
   persistTokenUsage: (taskId: string) => Promise<void>;
   deleteActiveSession: (taskId: string) => void;
   clearTokenUsageBaseline: (taskId: string) => void;
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
 };
 
 export async function handleImplicitTaskDoneRefusal(
@@ -34,23 +35,19 @@ export async function handleImplicitTaskDoneRefusal(
   const priorRequeues = task.taskDoneRetryCount ?? 0;
   const nextRequeueCount = priorRequeues + 1;
   if (priorRequeues < MAX_TASK_DONE_REQUEUE_RETRIES) {
-    await deps.store.updateTask(task.id, {
-      status: "queued",
-      error: null,
-      taskDoneRetryCount: nextRequeueCount,
-      ...taintUpdate,
-      paused: false,
-      pausedByAgentId: null,
-      sessionFile: null,
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: a refused completion is retried in its WIP lane; FN-207 forbids the former automatic WIP-to-hold rebound. */
+    await requeueExecutionInPlace(deps, task.id, {
+      updates: {
+        status: "queued",
+        error: null,
+        taskDoneRetryCount: nextRequeueCount,
+        ...taintUpdate,
+        paused: false,
+        pausedByAgentId: null,
+        sessionFile: null,
+      },
+      logMessage: `${refusal.message} — retrying in place with progress preserved (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`,
     });
-    await deps.store.logEntry(
-      task.id,
-      `${refusal.message} — requeued to todo immediately (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`,
-      undefined,
-      deps.getRunContextFor(task.id),
-    );
-    deps.markGraphExecuteSelfRequeued(task.id);
-    await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveProgress: true });
   } else {
     await deps.store.updateTask(task.id, {
       status: "failed",

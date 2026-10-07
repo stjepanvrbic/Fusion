@@ -146,6 +146,7 @@
     "packages/engine/src/goals/goal-injection-diagnostics.ts",
     "packages/engine/src/healing/auto-recovery.ts",
     "packages/engine/src/healing/no-progress-requeue-budget.ts",
+    "packages/engine/src/healing/recovery-exhaustion.ts",
     "packages/engine/src/healing/recovery-policy.ts",
     "packages/engine/src/healing/restart-recovery-coordinator.ts",
     "packages/engine/src/healing/self-healing-branch.ts",
@@ -4331,7 +4332,7 @@
       "enclosingSymbolPath": "moveTaskToContainedBackwardTarget",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 43,
+      "lineHint": 45,
       "owningEntryPoint": "runAiMerge",
       "reachableDataStates": [
         "single-repository merge finalization or fenced merge-failure recovery"
@@ -4351,7 +4352,7 @@
       "enclosingSymbolPath": "moveTaskToContainedBackwardTarget",
       "writer": "store.logEntry",
       "ordinal": 2,
-      "lineHint": 51,
+      "lineHint": 53,
       "owningEntryPoint": "runAiMerge",
       "reachableDataStates": [
         "single-repository merge finalization or fenced merge-failure recovery"
@@ -4371,7 +4372,7 @@
       "enclosingSymbolPath": "moveTaskWithLifecycleReason",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 76,
+      "lineHint": 91,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -4389,7 +4390,7 @@
       "enclosingSymbolPath": "moveTaskWithLifecycleReason",
       "writer": "store.moveTask",
       "ordinal": 1,
-      "lineHint": 68,
+      "lineHint": 83,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -5269,7 +5270,7 @@
       "enclosingSymbolPath": "recoverMergeBoundaryEvidenceGap",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 193,
+      "lineHint": 195,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5289,7 +5290,7 @@
       "enclosingSymbolPath": "recoverMergeBoundaryEvidenceGap",
       "writer": "store.logEntry",
       "ordinal": 2,
-      "lineHint": 197,
+      "lineHint": 199,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5309,7 +5310,7 @@
       "enclosingSymbolPath": "recoverMergeBoundaryEvidenceGap",
       "writer": "store.logEntry",
       "ordinal": 3,
-      "lineHint": 236,
+      "lineHint": 238,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5329,7 +5330,7 @@
       "enclosingSymbolPath": "recoverMergeBoundaryEvidenceGap",
       "writer": "store.updateTaskAtomic",
       "ordinal": 1,
-      "lineHint": 154,
+      "lineHint": 156,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5349,7 +5350,7 @@
       "enclosingSymbolPath": "recoverMergeBoundaryEvidenceGap",
       "writer": "store.updateTaskAtomic",
       "ordinal": 2,
-      "lineHint": 260,
+      "lineHint": 262,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5369,7 +5370,7 @@
       "enclosingSymbolPath": "recoverMergeBoundaryEvidenceGap>moved",
       "writer": "store.moveTask",
       "ordinal": 1,
-      "lineHint": 254,
+      "lineHint": 256,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5389,7 +5390,7 @@
       "enclosingSymbolPath": "recoverMergeBoundaryEvidenceGap>moved",
       "writer": "store.moveTaskIf",
       "ordinal": 1,
-      "lineHint": 249,
+      "lineHint": 251,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5409,7 +5410,7 @@
       "enclosingSymbolPath": "releaseBoundaryRecoveryClaim",
       "writer": "store.updateTaskAtomic",
       "ordinal": 1,
-      "lineHint": 274,
+      "lineHint": 276,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5429,7 +5430,7 @@
       "enclosingSymbolPath": "routeGraphFailureToExecutionResume",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 413,
+      "lineHint": 415,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5449,7 +5450,7 @@
       "enclosingSymbolPath": "routeGraphFailureToExecutionResume",
       "writer": "store.logEntry",
       "ordinal": 2,
-      "lineHint": 453,
+      "lineHint": 455,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5469,7 +5470,7 @@
       "enclosingSymbolPath": "routeGraphFailureToExecutionResume",
       "writer": "store.updateTask",
       "ordinal": 1,
-      "lineHint": 455,
+      "lineHint": 457,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5489,7 +5490,7 @@
       "enclosingSymbolPath": "seedBoundaryRecoveryContinuation>seeded",
       "writer": "store.replaceActiveTaskWorkflowContinuation",
       "ordinal": 1,
-      "lineHint": 302,
+      "lineHint": 304,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -5984,6 +5985,46 @@
       "lineHint": 145,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
+      "axis1": "out-of-frontier",
+      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo; this scanned closure call belongs to another engine caller.",
+      "axis2Provisional": "out-of-frontier",
+      "axis2Final": "out-of-frontier",
+      "observedInSuite": "out-of-frontier",
+      "executionProof": "none:out-of-frontier",
+      "followUpTaskId": "none:out-of-frontier"
+    },
+    {
+      "callSiteId": "packages/engine/src/healing/recovery-exhaustion.ts::parkExhaustedRecovery::store.logEntry::#1",
+      "callSiteFingerprint": "store.logEntry(task.id,error,undefined,input.runContext)",
+      "file": "packages/engine/src/healing/recovery-exhaustion.ts",
+      "enclosingSymbolPath": "parkExhaustedRecovery",
+      "writer": "store.logEntry",
+      "ordinal": 1,
+      "lineHint": 115,
+      "owningEntryPoint": "indeterminate",
+      "reachableDataStates": [
+        "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
+      ],
+      "axis1": "out-of-frontier",
+      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo; this scanned closure call belongs to another engine caller.",
+      "axis2Provisional": "out-of-frontier",
+      "axis2Final": "out-of-frontier",
+      "observedInSuite": "out-of-frontier",
+      "executionProof": "none:out-of-frontier",
+      "followUpTaskId": "none:out-of-frontier"
+    },
+    {
+      "callSiteId": "packages/engine/src/healing/recovery-exhaustion.ts::parkExhaustedRecovery::store.updateTaskAtomic::#1",
+      "callSiteFingerprint": "store.updateTaskAtomic(task.id,(live) => { if (live.deletedAt || live.column !== task.column || live.userPaused || live.paused) return null; if (live.s)",
+      "file": "packages/engine/src/healing/recovery-exhaustion.ts",
+      "enclosingSymbolPath": "parkExhaustedRecovery",
+      "writer": "store.updateTaskAtomic",
+      "ordinal": 1,
+      "lineHint": 101,
+      "owningEntryPoint": "indeterminate",
+      "reachableDataStates": [
+        "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
+      ],
       "axis1": "out-of-frontier",
       "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo; this scanned closure call belongs to another engine caller.",
       "axis2Provisional": "out-of-frontier",
@@ -10889,7 +10930,7 @@
       "enclosingSymbolPath": "recoverApprovedStrandedAiMergeCommit>finalized",
       "writer": "finalizeProvenAutoMergeTask",
       "ordinal": 1,
-      "lineHint": 14048,
+      "lineHint": 14078,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -10909,7 +10950,7 @@
       "enclosingSymbolPath": "recoverMergedReviewTasks>finalization",
       "writer": "finalizeProvenAutoMergeTask",
       "ordinal": 1,
-      "lineHint": 12910,
+      "lineHint": 12940,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"

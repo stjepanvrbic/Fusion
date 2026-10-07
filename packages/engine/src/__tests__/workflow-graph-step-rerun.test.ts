@@ -102,8 +102,15 @@ describe("runGraphTaskStep (FIX 3)", () => {
       expect(executor.execute).toHaveBeenCalledTimes(scenario === "ready" ? 1 : 0);
       expect(store.moveTask).not.toHaveBeenCalled();
       expect(store.updateTask.mock.calls.some(([, patch]) => patch?.status === "failed")).toBe(false);
-      if (scenario === "exhausted") expect(store.logEntry).toHaveBeenCalledWith(task.id, expect.stringContaining("retry budget exhausted"), undefined, undefined);
-      else expect(store.updateTask).toHaveBeenCalledWith(task.id, { graphResumeRetryCount: 1 }, undefined);
+      if (scenario === "exhausted") {
+        /* FNXC:RecoveryOwnership 2026-10-07-18:04: exhaustion parks visibly in place instead of holding silently with no scheduled resume. */
+        expect(store.logEntry).toHaveBeenCalledWith(task.id, expect.stringContaining("Automatic recovery exhausted after 2 attempts: worktree base refresh remains blocked"), undefined, undefined);
+        const parkUpdater = store.updateTaskAtomic.mock.calls.at(-1)?.[1] as (current: unknown) => Record<string, unknown> | null;
+        expect(parkUpdater(live)).toMatchObject({ status: "failed" });
+      } else {
+        expect(store.updateTask).toHaveBeenCalledWith(task.id, { graphResumeRetryCount: 1 }, undefined);
+        expect(store.logEntry).not.toHaveBeenCalledWith(task.id, expect.stringContaining("Automatic recovery exhausted"), undefined, undefined);
+      }
     } finally {
       vi.useRealTimers();
     }

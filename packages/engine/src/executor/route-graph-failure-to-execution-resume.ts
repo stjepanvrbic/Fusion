@@ -43,6 +43,8 @@ export type RouteGraphFailureToExecutionResumeDeps = {
    * Detects fire-and-forget remediation / plan-replan nodes (IR action + built-in ids).
    */
   isRemediationGraphNode: (taskId: string, failedNode: string | undefined) => Promise<boolean>;
+  /** Arms the guarded WIP-lane re-dispatch; required because no move event follows an in-place resume. */
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
   /** Shared-branch integration remains the single narrow exception to a human auto-merge hold. */
   isLiveSharedBranchGroupMember?: (live: Pick<TaskDetail, "branchContext" | "autoMerge" | "autoMergeProvenance">) => Promise<boolean>;
 };
@@ -462,5 +464,12 @@ export async function routeGraphFailureToExecutionResume(
     */
     await deps.clearTerminalStepFailuresForRetry(live.id, "archive");
     await deps.persistTokenUsage(live.id);
+    /*
+    FNXC:RecoveryOwnership 2026-10-07-18:04:
+    "Resuming in place" must schedule the resume. The only other re-dispatcher is the task:updated
+    listener, and every write above happens while this run still holds its executor claims, so that
+    resume was dropped and the card sat in WIP with no session until an unrelated update or restart.
+    */
+    if (!mayRepairBoundary) deps.scheduleInPlaceExecutionResume(live.id);
     return true;
 }

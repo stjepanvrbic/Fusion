@@ -19,7 +19,7 @@
  * - `completing` → `inactive`: Mission complete
  */
 
-import { AsyncMissionStore, resolveTaskLifecycleColumns } from "@fusion/core";
+import { AsyncMissionStore } from "@fusion/core";
 import { reconcileMissionState } from "./mission-state-reconcile.js";
 import type {
   TaskStore,
@@ -98,6 +98,12 @@ export class MissionAutopilot {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private scheduler: MissionAutopilotOptions["scheduler"];
+  /** FNXC:LifecycleContainment 2026-10-07-18:04: arms the executor's guarded in-place re-dispatch after an in-place mission retry. */
+  private resumeExecutionInPlace?: (taskId: string) => void;
+
+  setResumeExecutionInPlace(resume: (taskId: string) => void): void {
+    this.resumeExecutionInPlace = resume;
+  }
 
   constructor(
     private taskStore: TaskStore,
@@ -377,43 +383,16 @@ export class MissionAutopilot {
       );
 
       /*
-      FNXC:UnownedHoldColumnGates 2026-07-29-13:20 (U7 / R3):
-      Retry returns the card to its workflow's HOLD column. Keyed on the literal
-      `todo`, a renamed workflow answered "not there" on every retry AND moved the
-      card to `todo` — a column it may not declare (R7), on every single retry.
-
-      No resolvable hold column: leave the card where it is rather than relocating
-      it somewhere nothing renders. The error/status clear below still runs, so the
-      retry is not lost — the card simply stays put for the scheduler to pick up
-      from its own lane.
+      FNXC:LifecycleContainment 2026-10-07-18:04:
+      A mission retry stays in the card's lane. It used to move the failed card back to the hold
+      column, an automatic backward move (WIP-to-hold, or review-to-hold) that FN-207 forbids. Clearing
+      the failure state is the retry: the executor's task:updated resume path re-dispatches a WIP card
+      with no live session, and a review card returns to normal review progression.
       */
-      const task = await this.taskStore.getTask(taskId);
-      const holdColumn = (await resolveTaskLifecycleColumns(this.taskStore, taskId))?.hold;
-      if (!holdColumn) {
-        /*
-        FNXC:UnownedHoldColumnGates 2026-07-29-20:10 (PR #2561 review — greptile P1):
-        No hold column means there is NOWHERE to retry from: the hold-release sweep
-        only dispatches out of hold columns, so a card left in WIP is never picked up
-        again. Clearing its failure state here would therefore convert a visible
-        failure into a SILENT STALL — the mission would show a task that is not
-        failed, not running, and never will be.
-
-        So leave the failure state intact and say why. A card that stays visibly
-        failed is one an operator can act on; that is strictly better than a clean-
-        looking row nothing will ever touch. The feature keeps its own status, which
-        the retry-count path above already manages.
-        */
-        autopilotLog.warn(
-          `Mission retry for ${taskId} NOT scheduled — its workflow declares no hold column to retry from, `
-          + `so nothing would dispatch it. Leaving the task visibly failed in ${task?.column ?? "its current column"} for a human.`,
-        );
-        return;
-      }
-      if (task?.column !== holdColumn) {
-        await this.taskStore.moveTask(taskId, holdColumn);
-      }
-
       await this.taskStore.updateTask(taskId, { error: null, status: null, paused: false });
+      // The failure callback can fire while the executor still holds the task, which drops the
+      // task:updated resume; the guarded timer waits for those claims and then re-dispatches.
+      this.resumeExecutionInPlace?.(taskId);
     } catch (err) {
       autopilotLog.error(`Error handling task failure for ${taskId}:`, err);
     }

@@ -142,7 +142,8 @@ describe("self-healing reclaim live zero commits", () => {
     expect((store as any).updateTaskAtomic).toHaveBeenCalledWith("FN-9001", expect.any(Function));
     expect(store.updateTask).toHaveBeenCalledWith("FN-9001", expect.objectContaining({ worktree: null, branch: null, paused: false }));
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(store.logEntry).toHaveBeenCalledWith("FN-9001", expect.stringContaining("has no backward-move authority"));
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: the review card keeps its lane; the former no-op rebound and its per-pass "no backward-move authority" log line are gone. */
+    expect(store.logEntry).not.toHaveBeenCalledWith("FN-9001", expect.stringContaining("no backward-move authority"));
     expect(store.logEntry).toHaveBeenCalledWith("FN-9001", expect.stringContaining("[recovery] reclaim-live-zero-commits"));
     expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
       mutationType: "branch:auto-reclaim",

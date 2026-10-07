@@ -77,7 +77,13 @@ describe("executor graph execute self-requeue gate", () => {
     );
   });
 
-  it("parks invalid persisted step dependencies for planner repair before generic graph failure handling", async () => {
+  /*
+  FNXC:StepDependencyValidation 2026-10-07-18:04:
+  `needs-replan` written on a WIP card had no consumer (triage admits replans only from planning
+  lanes). An invalid step-dependency graph now takes the sanctioned plan-revision handoff into the
+  hold lane, bounded by planReviewReplanCount, and parks visibly in place once the bound is spent.
+  */
+  it("hands invalid persisted step dependencies to the planner lane before generic graph failure handling", async () => {
     resetExecutorMocks();
     const store = createMockStore();
     const live = task({
@@ -96,11 +102,17 @@ describe("executor graph execute self-requeue gate", () => {
       },
     });
 
+    expect(store.moveTask).toHaveBeenCalledWith(
+      live.id,
+      "todo",
+      expect.objectContaining({ moveSource: "engine", lifecycleReason: "plan-review-revise-replan" }),
+    );
     expect(store.updateTask).toHaveBeenCalledWith(live.id, {
       status: "needs-replan",
       error: null,
-      recoveryRetryCount: null,
+      planReviewReplanCount: 1,
       nextRecoveryAt: null,
+      graphResumeRetryCount: 0,
     }, undefined);
     expect(store.logEntry).toHaveBeenCalledWith(
       live.id,
@@ -108,12 +120,40 @@ describe("executor graph execute self-requeue gate", () => {
       "Step dependency validation rejected the plan: step 1 depends on invalid step 2 (self-or-forward)",
       undefined,
     );
-    expect(store.updateTaskAtomic).not.toHaveBeenCalled();
     expect(store.updateTask).not.toHaveBeenCalledWith(
       live.id,
       expect.objectContaining({ status: "failed" }),
       expect.anything(),
     );
+  });
+
+  it("parks invalid step dependencies visibly in place once the planner-repair bound is spent", async () => {
+    resetExecutorMocks();
+    const store = createMockStore();
+    const live = task({
+      id: "FN-INVALID-DAG-CAP",
+      steps: [{ name: "First", status: "pending", dependsOn: [1] }],
+      planReviewReplanCount: 2,
+    } as Partial<TaskDetail>);
+    store.getTask.mockResolvedValue(live);
+    const executor = new TaskExecutor(store, "/tmp/test");
+
+    await (executor as any).handleGraphFailure(live, {
+      disposition: "failed",
+      outcome: "failure",
+      visitedNodeIds: ["steps"],
+      context: {
+        "node:steps:value": "invalid-plan-dependency:step 1 depends on invalid step 2 (self-or-forward)",
+      },
+    });
+
+    expect(store.moveTask).not.toHaveBeenCalled();
+    const parkUpdater = store.updateTaskAtomic.mock.calls.at(-1)?.[1] as (current: TaskDetail) => Record<string, unknown> | null;
+    const park = parkUpdater(live);
+    expect(park).toMatchObject({ status: "failed" });
+    expect(String(park?.error)).toContain("step dependencies stayed invalid after 2 automatic replans");
+    expect(park).not.toHaveProperty("column");
+    expect(store.updateTask).not.toHaveBeenCalledWith(live.id, expect.objectContaining({ status: "needs-replan" }), expect.anything());
   });
 
   it("keeps in-review graph failures in review without a REVISE handoff", async () => {

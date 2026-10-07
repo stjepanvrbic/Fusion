@@ -321,15 +321,18 @@ describe("FN-5866 reliability interactions: post-done continuation no wedge", ()
     } as any);
 
     const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    const scheduleInPlace = vi.spyOn(executor, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
     await executor.execute(task);
 
-    expect(task.column).toBe("todo");
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the fresh-session retry stays in the WIP lane behind its persisted backoff.
+    expect(task.column).toBe("in-progress");
     expect(task.status).toBeUndefined();
     expect(task.error).toBeUndefined();
     expect(task.sessionFile).toBeNull();
     expect(task.recoveryRetryCount).toBe(1);
     expect(task.nextRecoveryAt).toEqual(expect.any(String));
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveResumeState: true });
+    expect(store.moveTask).not.toHaveBeenCalledWith(task.id, "todo", expect.anything());
+    expect(scheduleInPlace).toHaveBeenCalledWith(task.id);
     expect(store.handoffToReview).not.toHaveBeenCalled();
     expect(onError).not.toHaveBeenCalled();
     // FNXC:PostDoneContinuation 2026-07-16-11:57: Incomplete assistant-last transcripts use the dedicated stale-continuation recovery lane. Assert its fresh-session retry action rather than conflating it with the completed-work suppression path.
@@ -348,15 +351,17 @@ describe("FN-5866 reliability interactions: post-done continuation no wedge", ()
     mockExecuteAll.mockRejectedValue(new Error("Cannot continue from message role: assistant"));
 
     const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    const scheduleInPlace = vi.spyOn(executor, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
     await executor.execute(task);
 
-    expect(task.column).toBe("todo");
+    expect(task.column).toBe("in-progress");
     expect(task.status).toBeUndefined();
     expect(task.error).toBeUndefined();
     expect(task.sessionFile).toBeNull();
     expect(task.recoveryRetryCount).toBe(1);
     expect(task.nextRecoveryAt).toEqual(expect.any(String));
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveResumeState: true });
+    expect(store.moveTask).not.toHaveBeenCalledWith(task.id, "todo", expect.anything());
+    expect(scheduleInPlace).toHaveBeenCalledWith(task.id);
     expect(store.handoffToReview).not.toHaveBeenCalled();
     expect(onError).not.toHaveBeenCalled();
     expect((task.log ?? []).some((entry: any) => entry.action.includes("Non-continuable session — fresh-session retry"))).toBe(true);
@@ -502,18 +507,57 @@ describe("FN-5866 reliability interactions: post-done continuation no wedge", ()
     } as any);
 
     const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    const scheduleInPlace = vi.spyOn(executor, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
     await executor.execute(task);
 
-    expect(task.column).toBe("todo");
+    /*
+    FNXC:RecoveryOwnership 2026-10-07-18:04:
+    The first exhaustion spends the episode's single reseed in place: the counter is kept (not reset)
+    so the next exhaustion parks the card instead of restarting the ladder.
+    */
+    expect(task.column).toBe("in-progress");
     expect(task.status).toBeFalsy();
     expect(task.error).toBeFalsy();
     expect(task.recoveryDisposition).toBe("escalated-reseed");
-    expect(task.recoveryRetryCount).toBeFalsy();
+    expect(task.recoveryRetryCount).toBe(MAX_RECOVERY_RETRIES + 1);
     expect(task.nextRecoveryAt).toBeFalsy();
     expect(task.sessionFile).toBeFalsy();
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveResumeState: true });
+    expect(store.moveTask).not.toHaveBeenCalledWith(task.id, "todo", expect.anything());
+    expect(scheduleInPlace).toHaveBeenCalledWith(task.id);
     expect(store.handoffToReview).not.toHaveBeenCalled();
     expect(onError).not.toHaveBeenCalled();
     expect((task.log ?? []).some((entry: any) => entry.action.includes("recovery exhausted its retry cadence; reseeding"))).toBe(true);
+  });
+
+  it("parks non-continuable recovery visibly once the episode's reseed is already spent", async () => {
+    const task = makeTask({
+      id: "FN-5866-INCOMPLETE-PARKED",
+      recoveryRetryCount: 2 * MAX_RECOVERY_RETRIES + 1,
+      sessionFile: "/tmp/test/.fusion/sessions/FN-5866-INCOMPLETE-PARKED.json",
+    });
+    const store = createStore(task);
+    const onError = vi.fn();
+
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        prompt: vi.fn().mockRejectedValue(new Error("Cannot continue from message role: assistant")),
+        dispose: vi.fn(),
+        getSessionStats: vi.fn().mockResolvedValue({
+          tokens: { input: 5, output: 0, cacheRead: 0, cacheWrite: 0, total: 5 },
+        }),
+      },
+    } as any);
+
+    const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    const scheduleInPlace = vi.spyOn(executor, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
+    await executor.execute(task);
+
+    expect(task.column).toBe("in-progress");
+    expect(task.status).toBe("failed");
+    expect(task.error).toContain("Automatic recovery exhausted");
+    expect(task.recoveryRetryCount).toBe(2 * MAX_RECOVERY_RETRIES + 1);
+    expect(store.moveTask).not.toHaveBeenCalledWith(task.id, "todo", expect.anything());
+    expect(scheduleInPlace).not.toHaveBeenCalled();
+    expect(store.handoffToReview).not.toHaveBeenCalled();
   });
 });

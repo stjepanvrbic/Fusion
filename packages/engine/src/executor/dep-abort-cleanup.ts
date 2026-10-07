@@ -1,7 +1,13 @@
 /**
  * FNXC:CodeOrganization 2026-08-03-18:20:
  * handleDepAbortCleanup peeled from TaskExecutor (U4).
- * After mid-execution fn_task_add_dep: remove worktree, delete branch, rebound for replan.
+ * After mid-execution fn_task_add_dep: remove worktree, delete branch, discard progress.
+ *
+ * FNXC:LifecycleContainment 2026-10-07-18:04:
+ * The discarded card stays in its WIP lane. It used to move back to the hold lane without a move
+ * source, an automatic WIP-to-hold move FN-207 reserves for Plan Review REVISE. The work is still
+ * discarded (checkout, branch, step progress, prompt checkboxes), and the new dependency becomes the
+ * executor's in-place dependency hold; the scheduler's dependency wake-up re-dispatches the lane.
  */
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
@@ -10,7 +16,9 @@ import { resolveTaskWorkingBranch } from "../worktree/worktree-names.js";
 import { RemovalReason } from "../worktree/worktree-pool.js";
 import { executorLog } from "../logger.js";
 import { resolveExternalExecutionCheckoutRoute } from "../execution/external-execution-checkout.js";
-import { resolveReboundColumnFor } from "./lifecycle-columns.js";
+import { blockOuterDispatchWhenDependenciesUnmet } from "./dependency-dispatch-gate.js";
+import { requeueExecutionInPlace } from "./in-place-execution-requeue.js";
+import type { EngineRunContext } from "../util/run-audit.js";
 
 const execAsync = promisify(exec);
 
@@ -24,6 +32,9 @@ export type DepAbortCleanupDeps = {
     taskId: string;
     reason: RemovalReason;
   }) => Promise<void>;
+  getRunContextFor: (taskId: string) => EngineRunContext | undefined;
+  markGraphExecuteSelfRequeued: (taskId: string) => void;
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
 };
 
 export async function handleDepAbortCleanup(
@@ -31,7 +42,7 @@ export async function handleDepAbortCleanup(
   taskId: string,
   worktreePath: string,
 ): Promise<void> {
-  executorLog.log(`${taskId} dependency added — work discarded, moved to triage for re-planning`);
+  executorLog.log(`${taskId} dependency added — work discarded, waiting in place for the new dependency`);
 
   const task = await deps.store.getTask(taskId);
   const externalExecutionRoute = await resolveExternalExecutionCheckoutRoute(task);
@@ -75,21 +86,25 @@ export async function handleDepAbortCleanup(
   // Clear worktree tracking
   deps.activeWorktrees.delete(taskId);
 
-  // Update task: clear worktree and status, move to triage
-  await deps.store.updateTask(taskId, { worktree: null, status: null });
-  /*
-  FNXC:WorkflowLifecycleColumns 2026-07-29-15:10 (P0 audit after the Planning-column merge):
-  This wrote the LITERAL `triage`. The default coding lineage no longer declares that column —
-  it has one pre-implementation column, id `todo` — so a card that gained a dependency
-  mid-execution had its work discarded and was then parked in a column its own workflow does
-  not define. Nothing in the graph routes a card out of an undeclared column, and the only
-  rescue is `reconcileUndeclaredTaskColumns` on the NEXT ENGINE START, so between the abort and
-  a restart the card is stalled with no automatic recovery. It does not throw, which is why it
-  would have surfaced as a user report rather than a red test.
-
-  Resolve the rebound target from the task's own workflow (hold -> intake -> first declared
-  column), the same helper the other ~16 executor rebounds already use.
-  */
-  await deps.store.moveTask(taskId, await resolveReboundColumnFor(deps.store, taskId));
-  await deps.store.logEntry(taskId, "Execution stopped — work discarded, requeued for re-planning");
+  // Discard progress in place: clear the checkout, the session, and every step's status.
+  const discardedSteps = task.steps.map((step) => ({ ...step, status: "pending" as const }));
+  await deps.store.updateTask(taskId, {
+    worktree: null,
+    branch: null,
+    branchWriteOrigin: "engine" as const,
+    sessionFile: null,
+    status: null,
+    error: null,
+    ...(discardedSteps.length > 0 ? { steps: discardedSteps, currentStep: 0 } : {}),
+  });
+  await deps.store.resetPromptCheckboxes(deps.store.taskDir(taskId)).catch((err: unknown) => {
+    executorLog.warn(`${taskId}: failed to reset prompt checkboxes during dep-abort cleanup: ${err instanceof Error ? err.message : String(err)}`);
+  });
+  await deps.store.logEntry(taskId, "Execution stopped — work discarded, waiting in place for the added dependency");
+  const liveTask = await deps.store.getTask(taskId);
+  if (await blockOuterDispatchWhenDependenciesUnmet(deps, liveTask)) {
+    deps.markGraphExecuteSelfRequeued(taskId);
+    return;
+  }
+  await requeueExecutionInPlace(deps, taskId);
 }

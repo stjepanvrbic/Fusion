@@ -2,7 +2,6 @@ import type { Task, TaskStore } from "@fusion/core";
 import type { TaskExecutor } from "../executor.js";
 import { createLogger } from "../logger.js";
 import { resolveProjectColumnsForRoles } from "@fusion/core";
-import { moveTaskToContainedBackwardTarget } from "../execution/lifecycle-move.js";
 import { setImmediate as setImmediateCb } from "node:timers";
 import { NO_PROGRESS_REQUEUE_BUDGET_EXHAUSTED_PREFIX } from "./no-progress-requeue-budget.js";
 
@@ -180,7 +179,12 @@ export class RestartRecoveryCoordinator {
     private readonly executor: TaskExecutor,
   ) {}
 
-  async recoverInterruptedRuns(): Promise<void> {
+  /**
+   * FNXC:RecoveryOwnership 2026-10-07-18:04:
+   * `resumeOrphans: false` lets the runtime run self-healing startup recovery between the safe
+   * retry writes and orphan resumption, so startup sweeps and deferred resumes never race.
+   */
+  async recoverInterruptedRuns(options: { resumeOrphans?: boolean } = {}): Promise<void> {
     /*
     FNXC:WorkflowLifecycleColumns 2026-07-31-23:20 (the FLAGGED query, now converted):
     The note this replaces was right that the QUERY was the live filter and the `.filter` below it a
@@ -195,9 +199,8 @@ export class RestartRecoveryCoordinator {
     selected on adds nothing, and a second copy of the same rule is how a read and its filter drift —
     the `paused` check is the only thing that predicate contributed.
 
-    FN-207 later replaced the hold-first destination with the contained-backward seam: this sweep
-    reads WIP cards, so they return one rank to hold, while an unexpected review source could only
-    return to WIP. A missing target stays in place instead of inventing a column.
+    FN-207 later replaced the hold-first destination with the contained-backward seam, and FN-217
+    made that seam an in-place no-op for recovery; the retry now stays in the WIP lane.
     */
     const wipColumns = await resolveProjectColumnsForRoles(this.store, ["countsTowardWip"]);
     const byId = new Map<string, Task>();
@@ -220,6 +223,10 @@ export class RestartRecoveryCoordinator {
       log.log(`Restart recovery requeued ${requeued} interrupted task(s) for safe retry`);
     }
 
+    if (options.resumeOrphans !== false) await this.executor.resumeOrphaned();
+  }
+
+  async resumeOrphaned(): Promise<void> {
     await this.executor.resumeOrphaned();
   }
 
@@ -234,9 +241,16 @@ export class RestartRecoveryCoordinator {
       && !hasStepProgress(task);
   }
 
+  /*
+  FNXC:LifecycleContainment 2026-10-07-18:04:
+  The safe retry happens in place: the fresh checkout state is written here and `resumeOrphaned`
+  (which runs right after this sweep) re-executes the WIP card. The former contained move resolved
+  to an in-place no-op under FN-217, and the `stuck-killed` status it left survived into the resumed
+  run because only failed/queued statuses were cleared before execute.
+  */
   private async safeRequeue(task: Task): Promise<void> {
     await this.store.updateTask(task.id, {
-      status: "stuck-killed",
+      status: null,
       worktree: null,
       branch: null, branchWriteOrigin: "engine" as const,
       sessionFile: null,
@@ -244,20 +258,7 @@ export class RestartRecoveryCoordinator {
     });
     await this.store.logEntry(
       task.id,
-      "Restart recovery: interrupted run had no step progress and no fn_task_done — queued for contained safe retry",
-    );
-    /*
-    FNXC:LifecycleContainment 2026-08-28-03:03:
-    Restart recovery uses the live source column and the task's own workflow to choose exactly one
-    adjacent backward lane. The helper keeps unresolved and capacity-blocked recovery in place and
-    preserves the explicit engine source plus registered recovery reason.
-    */
-    await moveTaskToContainedBackwardTarget(
-      this.store,
-      task.id,
-      "self-healing-session-recovery",
-      { moveSource: "engine" },
-      task.column,
+      "Restart recovery: interrupted run had no step progress and no fn_task_done — retrying in place with a fresh checkout",
     );
   }
 }

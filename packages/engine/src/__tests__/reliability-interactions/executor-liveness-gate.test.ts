@@ -106,6 +106,7 @@ describe("reliability interactions: FN-4935 executor liveness gate", () => {
     store.recordRunAuditEvent = vi.fn(async (event: any) => events.push(event));
 
     const executor = new TaskExecutor(store as any, "/repo");
+    const scheduleInPlace = vi.spyOn(executor, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
     await executor.execute(makeTask({ sessionFile: null }));
 
     expect(store.logEntry).toHaveBeenCalledWith(
@@ -120,8 +121,11 @@ describe("reliability interactions: FN-4935 executor liveness gate", () => {
       undefined,
       expect.anything(),
     );
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4935-T", "todo", { preserveProgress: true });
-    expect(store.updateTask).toHaveBeenCalledWith("FN-4935-T", expect.objectContaining({ taskDoneRetryCount: 1 }));
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the liveness requeue retries in the WIP lane; FN-207 forbids the former move to todo.
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-4935-T", "todo", expect.anything());
+    expect(scheduleInPlace).toHaveBeenCalledWith("FN-4935-T");
+    expect(store.updateTask.mock.calls.some(([id, patch]: any[]) =>
+      id === "FN-4935-T" && patch?.taskDoneRetryCount === 1 && patch?.status === "queued" && patch?.worktree === null)).toBe(true);
     expect(events.some((event) => (event.type === "worktree:incomplete-detected" || event.mutationType === "worktree:incomplete-detected") && event.metadata?.source === "executor-liveness-gate" && event.metadata?.terminalAction === "requeue-todo")).toBe(true);
   });
 

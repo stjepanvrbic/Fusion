@@ -55,11 +55,21 @@ const mockedReviewStep = vi.mocked(mockedReviewStepFn);
  * refresh-safe checkout renewal; it must not bypass graph admission or worktree refresh, so
  * each existing Git/worktree assertion continues to exercise the production acquisition path.
  */
+/*
+FNXC:LifecycleContainment 2026-10-07-18:04:
+Mock sessions here end without fn_task_done, which now retries in the WIP lane through the executor's
+guarded in-place re-dispatch timer instead of a mocked hold-lane move. These worktree cases drive one
+run each, so the timer is stubbed: a retry armed by one case must not re-execute (and re-acquire a
+worktree for) the mocked task inside the next case. Retry behavior itself is covered in
+recovery-ownership-executor.test.ts.
+*/
 function createWorktreeExecutor(store: any, rootDir: string, options: any = {}) {
-  return new TaskExecutor(store, rootDir, {
+  const executor = new TaskExecutor(store, rootDir, {
     agentStore: createWorkflowRoutingAgentStore(store).agentStore,
     ...options,
   });
+  vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
+  return executor;
 }
 
 describe("worktree workflow routing fixture", () => {
@@ -958,25 +968,65 @@ describe("TaskExecutor worktree recovery", () => {
       startPoint: "main",
       recommendedAction: "reclaim the conflicting checkout",
     });
-    const exhaustedTask = makeTask({ recoveryRetryCount: 3, status: "queued", branch: "fusion/fn-050", worktree: "/tmp/test/.worktrees/fn-050" });
+    const exhaustedTask = { ...makeTask(), recoveryRetryCount: 3, status: "queued", branch: "fusion/fn-050", worktree: "/tmp/test/.worktrees/fn-050" };
     const { id: taskId, ...exhaustedPatch } = exhaustedTask;
     store._setRow(taskId, exhaustedPatch);
     vi.spyOn(branchConflictModule, "inspectBranchConflict").mockResolvedValue({ kind: "stale" } as any);
     vi.spyOn(executor as any, "getAutoRecoveryDispatcher").mockReturnValue({
       dispatch: vi.fn(async () => ({ action: "escalate" })),
     });
+    const scheduleInPlaceExecutionResume = vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
 
     const result = await (executor as any).handleBranchConflict(exhaustedTask, conflictError);
 
+    /*
+    FNXC:RecoveryOwnership 2026-10-07-18:04:
+    The reseed pushes the counter past the dispatcher budget (3 -> 4) instead of resetting it, and the
+    fresh-checkout retry is re-dispatched in place. A count above the budget proves the reseed is spent.
+    */
     expect(result).toBe("recovered");
     expect(store.updateTaskAtomic).toHaveBeenCalled();
     expect(await store.getTask(taskId)).toEqual(expect.objectContaining({
       status: null,
       error: null,
-      recoveryRetryCount: null,
+      recoveryRetryCount: 4,
+      recoveryDisposition: "escalated-reseed",
       worktree: null,
       branch: null,
     }));
+    expect(scheduleInPlaceExecutionResume).toHaveBeenCalledWith(taskId);
+  });
+
+  it("parks a second exhausted branch-conflict escalation instead of reseeding again", async () => {
+    const store = createMockStore();
+    const executor = createWorktreeExecutor(store, "/tmp/test");
+    const conflictError = new BranchConflictError({
+      branchName: "fusion/fn-050",
+      conflictingWorktreePath: "/tmp/test/.worktrees/fn-050",
+      existingTipSha: "abc123def456",
+      strandedCommits: [],
+      startPoint: "main",
+      recommendedAction: "reclaim the conflicting checkout",
+    });
+    const reseededTask = { ...makeTask(), recoveryRetryCount: 4, branch: "fusion/fn-050", worktree: "/tmp/test/.worktrees/fn-050" };
+    const { id: taskId, ...reseededPatch } = reseededTask;
+    store._setRow(taskId, reseededPatch);
+    vi.spyOn(branchConflictModule, "inspectBranchConflict").mockResolvedValue({ kind: "stale" } as any);
+    vi.spyOn(executor as any, "getAutoRecoveryDispatcher").mockReturnValue({
+      dispatch: vi.fn(async () => ({ action: "escalate" })),
+    });
+    const scheduleInPlaceExecutionResume = vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
+
+    const result = await (executor as any).handleBranchConflict(reseededTask, conflictError);
+
+    expect(result).toBe("recovered");
+    expect(await store.getTask(taskId)).toEqual(expect.objectContaining({
+      status: "failed",
+      recoveryRetryCount: 4,
+      error: expect.stringContaining("Task branch conflict"),
+    }));
+    expect(scheduleInPlaceExecutionResume).not.toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
   });
 
   it("stops the original conflict retry after a foreign-unmerged recovery pins a sibling", async () => {

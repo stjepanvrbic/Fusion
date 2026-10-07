@@ -39,8 +39,20 @@ export type UnpauseResumeDeps = {
 export async function dispatchUnpauseResume(
   deps: UnpauseResumeDeps,
   task: Task,
+  options: { logMessage?: string; now?: number } = {},
 ): Promise<boolean> {
   if (task.status === "failed") {
+    return false;
+  }
+
+  /*
+  FNXC:RecoveryOwnership 2026-10-07-18:04:
+  A persisted `nextRecoveryAt` is an automatic recovery's backoff. Every task:updated event reaches
+  this dispatcher, so without this gate an unrelated write re-dispatched a retrying card before its
+  deadline. The in-place retry timer and restart recovery re-dispatch once the deadline passes.
+  */
+  const notBeforeMs = task.nextRecoveryAt ? Date.parse(task.nextRecoveryAt) : Number.NaN;
+  if (Number.isFinite(notBeforeMs) && notBeforeMs > (options.now ?? Date.now())) {
     return false;
   }
 
@@ -118,7 +130,7 @@ export async function dispatchUnpauseResume(
         resumeLimboTipSha: null,
         resumeLimboStepSignature: null,
       });
-      await deps.store.logEntry(task.id, "Resuming execution after unpause", undefined, deps.getRunContextFor(task.id));
+      await deps.store.logEntry(task.id, options.logMessage ?? "Resuming execution after unpause", undefined, deps.getRunContextFor(task.id));
       await deps.recoverApprovedStepsOnResume(task.id);
     } catch (clearErr) {
       executorLog.warn(`${task.id} clearResumeFailureState failed during unpause: ${clearErr instanceof Error ? clearErr.message : String(clearErr)}`);

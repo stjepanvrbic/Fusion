@@ -357,8 +357,10 @@ describe("execute requeue loop guard", () => {
     const shouldFinalize = await (h.executor as any).shouldFinalizeCompletedTask("FN-7926-TASKDONE", true);
 
     expect(shouldFinalize).toBe(false);
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the completed-blocked park lands in place (FN-207 rejects the former WIP-to-hold move).
+    expect(h.store.moveTask).not.toHaveBeenCalled();
     expect(h.live).toMatchObject({
-      column: "todo",
+      column: "in-progress",
       paused: true,
       pausedReason: COMPLETED_BLOCKED_PAUSE_REASON,
       status: "queued",
@@ -499,17 +501,19 @@ describe("execute requeue loop guard", () => {
 
     await failAtExecute(h.executor, h.live);
 
+    /*
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The park lands in the WIP lane: the former hold move used a same-role-only reason that FN-207
+    rejects, which threw before the park was written. Progress and checkout stay untouched.
+    */
     expect(h.live).toMatchObject({
-      column: "todo",
+      column: "in-progress",
       paused: true,
       pausedReason: COMPLETED_BLOCKED_PAUSE_REASON,
       status: "queued",
+      steps: [{ name: "Implement", status: "done" }],
     });
-    expect(h.store.moveTask).toHaveBeenCalledWith("FN-7926-STALE", "todo", expect.objectContaining({
-      preserveProgress: true,
-      preserveResumeState: true,
-      preserveWorktree: true,
-    }));
+    expect(h.store.moveTask).not.toHaveBeenCalled();
   });
 
   it.each([

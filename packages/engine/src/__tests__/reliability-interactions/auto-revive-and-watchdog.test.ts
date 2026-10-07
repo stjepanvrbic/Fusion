@@ -39,10 +39,15 @@ describe("reliability interactions: auto-revive + watchdog", () => {
     Restart recovery clears only stale execution metadata. It is not a review or
     verification revision, so the shared lifecycle owner retains the card's current
     role rather than authorizing an implicit backward move to `todo`.
+
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The safe retry is written in place with a cleared status (not `stuck-killed`, which leaked into
+    the resumed run) and no longer routes through the no-op contained-move seam, so it logs an
+    explicit in-place retry instead of a "no backward-move authority" line.
     */
     expect(store.moveTask).not.toHaveBeenCalled();
     expect(store.updateTask).toHaveBeenCalledWith("FN-1", expect.objectContaining({
-      status: "stuck-killed",
+      status: null,
       worktree: null,
       branch: null,
       sessionFile: null,
@@ -50,8 +55,9 @@ describe("reliability interactions: auto-revive + watchdog", () => {
     }));
     expect(store.logEntry).toHaveBeenCalledWith(
       "FN-1",
-      expect.stringContaining("has no backward-move authority"),
+      expect.stringContaining("retrying in place with a fresh checkout"),
     );
+    expect(store.updateTask).not.toHaveBeenCalledWith("FN-2", expect.anything());
   });
 
   it("Case 8: recovery coordinator skips resume when no in-progress candidates", async () => {
@@ -69,7 +75,7 @@ describe("reliability interactions: auto-revive + watchdog", () => {
     const rc = new RestartRecoveryCoordinator(store, executor);
     await rc.recoverInterruptedRuns();
     expect(store.updateTask).toHaveBeenCalledWith("FN-3", expect.objectContaining({
-      status: "stuck-killed",
+      status: null,
       worktree: null,
       branch: null,
       sessionFile: null,
@@ -78,7 +84,7 @@ describe("reliability interactions: auto-revive + watchdog", () => {
     expect(store.moveTask).not.toHaveBeenCalled();
     expect(store.logEntry).toHaveBeenCalledWith(
       "FN-3",
-      expect.stringContaining("has no backward-move authority"),
+      expect.stringContaining("retrying in place with a fresh checkout"),
     );
   });
 });

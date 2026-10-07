@@ -70,8 +70,16 @@ describe("reliability interactions: board stall auto-recovery", () => {
     byId.set("FN-2", makeTask("FN-2", { column: "todo", blockedBy: "FN-1" }));
 
     const first = await manager.runBoardStallAutoRecoverySweep();
-    expect(first.recovered).toBe(1);
+    /*
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    Scope decay cannot release a paused WIP holder in place, so the stall breaker no longer reports the
+    holder as recovered; it records the broken event with no recovered holders and the verification
+    pass then reports the stall unrecovered honestly.
+    */
+    expect(first.recovered).toBe(0);
+    expect(first.holders).toEqual([]);
     expect(audits).toContain("task:auto-board-stall-broken");
+    expect(byId.get("FN-1")).toMatchObject({ column: "in-progress", paused: true });
     expect(notify).not.toHaveBeenCalled();
 
     (manager as any).maintenanceTickCounter++;

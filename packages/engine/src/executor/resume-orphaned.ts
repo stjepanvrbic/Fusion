@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { executorLog } from "../logger.js";
 import { getResumeOrphanDelayMs } from "./resume-orphan-delay.js";
 import { isNoProgressNoTaskDoneFailure, isTaskWorkComplete } from "./task-predicates.js";
+import { isRecoveryEpisodeParked } from "../healing/recovery-policy.js";
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
 
@@ -31,11 +32,15 @@ export type ResumeOrphanedDeps = {
   executing: Set<string>;
   recoveringCompleted: Set<string>;
   processWideGraphRouting: Set<string>;
+  pendingOrphanResumes: Set<string>;
   listWipLaneTasks: () => Promise<Task[]>;
   clearResumeFailureState: (task: Task) => Promise<void>;
   recoverApprovedStepsOnResume: (taskId: string) => Promise<void>;
   recoverCompletedTask: (task: Task) => Promise<boolean>;
   execute: (task: Task) => Promise<void>;
+  /** Re-arms an in-place executor retry whose persisted backoff has not elapsed. */
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
+  now?: () => number;
 };
 
 export async function resumeOrphaned(deps: ResumeOrphanedDeps): Promise<void> {
@@ -67,9 +72,20 @@ export async function resumeOrphaned(deps: ResumeOrphanedDeps): Promise<void> {
   // When the delay is zero (default in tests and when explicitly disabled),
   // skip the setTimeout indirection so the spawn happens on the current
   // microtask — matching the legacy behavior callers may rely on.
-  const scheduleResume = resumeDelayMs > 0
-    ? (fn: () => void) => { setTimeout(fn, resumeDelayMs); }
-    : (fn: () => void) => { fn(); };
+  /*
+  FNXC:RecoveryOwnership 2026-10-07-18:04:
+  A deferred resume is registered as live until it starts, so self-healing sweeps that run during
+  the delay treat the task as owned instead of rewriting the row the resume will execute.
+  */
+  const scheduleResume = (taskId: string, fn: () => void) => {
+    deps.pendingOrphanResumes.add(taskId);
+    const run = () => {
+      deps.pendingOrphanResumes.delete(taskId);
+      fn();
+    };
+    if (resumeDelayMs > 0) setTimeout(run, resumeDelayMs);
+    else run();
+  };
   let yieldNext = false;
   for (const task of inProgress) {
     if (yieldNext) await yieldEventLoop();
@@ -196,7 +212,7 @@ export async function resumeOrphaned(deps: ResumeOrphanedDeps): Promise<void> {
       }
       executorLog.log(`${task.id} is already complete — fast-pathing to in-review`);
       deps.recoveringCompleted.add(task.id);
-      scheduleResume(() => {
+      scheduleResume(task.id, () => {
         void deps.recoverCompletedTask(task)
           .catch((err) =>
             executorLog.error(`Failed to recover completed orphan ${task.id}:`, err),
@@ -213,6 +229,23 @@ export async function resumeOrphaned(deps: ResumeOrphanedDeps): Promise<void> {
       continue;
     }
 
+    /*
+    FNXC:RecoveryOwnership 2026-10-07-18:04:
+    A card parked by an exhausted recovery episode stays parked across restarts; re-executing it
+    would spend one more attempt per restart on a failure an operator must fix. A card still inside
+    a retry backoff keeps its deadline: the in-place retry timer is re-armed instead of executing now.
+    */
+    if (task.status === "failed" && isRecoveryEpisodeParked(task)) {
+      executorLog.log(`${task.id} parked by exhausted automatic recovery — leaving for operator retry`);
+      continue;
+    }
+    const notBeforeMs = task.nextRecoveryAt ? Date.parse(task.nextRecoveryAt) : Number.NaN;
+    if (Number.isFinite(notBeforeMs) && notBeforeMs > (deps.now?.() ?? Date.now())) {
+      executorLog.log(`${task.id} is inside an automatic recovery backoff — re-arming its in-place retry`);
+      deps.scheduleInPlaceExecutionResume(task.id);
+      continue;
+    }
+
     executorLog.log(`Resuming ${task.id}: ${task.title || task.description.slice(0, 60)}`);
     try {
       await deps.clearResumeFailureState(task);
@@ -221,7 +254,7 @@ export async function resumeOrphaned(deps: ResumeOrphanedDeps): Promise<void> {
     } catch (err) {
       executorLog.error(`Failed to write resume log for ${task.id}:`, err);
     }
-    scheduleResume(() => {
+    scheduleResume(task.id, () => {
       deps.execute(task).catch((err) =>
         executorLog.error(`Failed to resume ${task.id}:`, err),
       );

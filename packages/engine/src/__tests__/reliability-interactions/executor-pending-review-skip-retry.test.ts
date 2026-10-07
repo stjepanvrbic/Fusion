@@ -111,9 +111,12 @@ describe("reliability interactions: FN-5436 executor pending-review skip", () =>
     store.getTask.mockResolvedValue(task);
 
     const executor = new TaskExecutor(store as any, "/repo");
+    const scheduleInPlace = vi.spyOn(executor, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
     await executor.execute(task);
 
-    expect(store.moveTask).toHaveBeenCalledWith("FN-5436-RI-B", "todo", { preserveProgress: true });
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the reclaim-abort requeue stays in the WIP lane and re-dispatches in place.
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-5436-RI-B", "todo", expect.anything());
+    expect(scheduleInPlace).toHaveBeenCalledWith("FN-5436-RI-B");
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-5436-RI-B", {
       status: "failed",
       error: "executor-exit-while-review-pending",
@@ -216,6 +219,7 @@ describe("reliability interactions: FN-5436 executor pending-review skip", () =>
     store.getTask.mockResolvedValue(task);
 
     const executor = new TaskExecutor(store as any, "/repo");
+    const scheduleInPlace = vi.spyOn(executor, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
     await executor.execute(task);
 
     /*
@@ -231,11 +235,11 @@ describe("reliability interactions: FN-5436 executor pending-review skip", () =>
       ([opts]: any[]) => (opts?.customTools ?? []).some((tool: any) => tool?.name === "fn_task_done"),
     );
     expect(implementationSessions).toHaveLength(4);
-    expect(store.updateTask).toHaveBeenCalledWith("FN-5436-RI-E", {
-      status: "queued",
-      error: null,
-      taskDoneRetryCount: 1,
-    });
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the requeue is written in place (with its run context) and re-dispatched in the WIP lane.
+    expect(store.updateTask.mock.calls.some(([id, patch]: any[]) =>
+      id === "FN-5436-RI-E" && patch?.status === "queued" && patch?.error === null && patch?.taskDoneRetryCount === 1)).toBe(true);
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-5436-RI-E", "todo", expect.anything());
+    expect(scheduleInPlace).toHaveBeenCalledWith("FN-5436-RI-E");
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-5436-RI-E", {
       status: "failed",
       error: "executor-exit-while-review-pending",

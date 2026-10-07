@@ -6,10 +6,11 @@
 import type { Task, TaskStore } from "@fusion/core";
 import { isNonContinuableSessionError } from "../errors/transient-error-detector.js";
 import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES } from "../healing/recovery-policy.js";
+import { parkExhaustedRecovery, recordRecoveryEscalation } from "../healing/recovery-exhaustion.js";
+import { requeueExecutionInPlace } from "./in-place-execution-requeue.js";
 import { executorLog } from "../logger.js";
 import type { EngineRunContext } from "../util/run-audit.js";
 import { isTaskAlreadyCompleteForNonContinuableSession } from "./completion-predicates.js";
-import { resolveReboundColumnFor } from "./lifecycle-columns.js";
 
 export type NonContinuableSessionDeps = {
   store: TaskStore;
@@ -20,6 +21,7 @@ export type NonContinuableSessionDeps = {
   signalTaskComplete: (task: Task) => void;
   handoffTaskToReview: (task: Task, reason: string) => Promise<unknown>;
   markGraphExecuteSelfRequeued: (taskId: string) => void;
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
 };
 
 export async function handleNonContinuableSessionError(
@@ -92,38 +94,59 @@ export async function handleNonContinuableSessionRetry(
     nextRecoveryAt: liveTask.nextRecoveryAt,
   });
 
-  if (decision.shouldRetry) {
-    const attempt = decision.nextState.recoveryRetryCount;
+  if (decision.disposition === "retry") {
+    const attempt = decision.attempt;
     const delay = formatDelay(decision.delayMs);
     executorLog.warn(`⚡ ${task.id} non-continuable session — fresh-session retry ${attempt}/${MAX_RECOVERY_RETRIES} in ${delay}`);
-    await deps.store.logEntry(task.id, `Non-continuable session — fresh-session retry (${attempt}/${MAX_RECOVERY_RETRIES} in ${delay}): ${errorMessage}`, undefined, deps.getRunContextFor(task.id));
-    await deps.store.updateTask(task.id, {
-      recoveryRetryCount: decision.nextState.recoveryRetryCount,
-      nextRecoveryAt: decision.nextState.nextRecoveryAt,
-      sessionFile: null,
+    await requeueExecutionInPlace(deps, task.id, {
+      updates: {
+        recoveryRetryCount: decision.nextState.recoveryRetryCount,
+        sessionFile: null,
+      },
+      notBefore: decision.nextState.nextRecoveryAt,
+      logMessage: `Non-continuable session — fresh-session retry (${attempt}/${MAX_RECOVERY_RETRIES} in ${delay}): ${errorMessage}`,
     });
-    deps.markGraphExecuteSelfRequeued(task.id);
-    await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveResumeState: true });
     return true;
   }
 
   /*
   FNXC:RecoveryOwnership 2026-10-06-15:28:
   A non-continuable transcript has no safe terminal interpretation. After bounded fresh-session
-  verification, clear only the stale session/cadence and let the existing rebound owner create
-  a new session in the task's current lifecycle role.
+  verification, clear only the stale session/cadence and create a new session in the task's
+  current lifecycle role.
+
+  FNXC:RecoveryOwnership 2026-10-07-18:04:
+  That reseed is spent once per episode. The counter is no longer reset, so a second exhaustion
+  parks the card `failed` in its lane with the cause instead of restarting the ladder forever.
   */
+  if (decision.escalation === "park") {
+    executorLog.warn(`⚡ ${task.id} non-continuable session recovery exhausted after a reseed; parking for an operator`);
+    return parkExhaustedRecovery(deps.store, liveTask, {
+      owner: "executor-non-continuable",
+      attempts: decision.attempts,
+      detail: `non-continuable session: ${errorMessage}`,
+      agentId: "executor",
+      runContext: deps.getRunContextFor(task.id),
+    });
+  }
   executorLog.warn(`⚡ ${task.id} non-continuable session retry cadence exhausted; reseeding fresh session`);
-  await deps.store.logEntry(task.id, "Non-continuable session recovery exhausted its retry cadence; reseeding a fresh session.", undefined, deps.getRunContextFor(task.id));
   await deps.store.updateTask(task.id, {
     status: null,
     error: null,
-    recoveryRetryCount: null,
+    recoveryRetryCount: decision.nextState.recoveryRetryCount,
     recoveryDisposition: "escalated-reseed",
     nextRecoveryAt: null,
     sessionFile: null,
   });
-  deps.markGraphExecuteSelfRequeued(task.id);
-  await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveResumeState: true });
+  await recordRecoveryEscalation(deps.store, task.id, {
+    owner: "executor-non-continuable",
+    outcome: "reseeded",
+    attempts: decision.nextState.recoveryRetryCount ?? decision.attempts,
+    column: liveTask.column,
+    agentId: "executor",
+  });
+  await requeueExecutionInPlace(deps, task.id, {
+    logMessage: "Non-continuable session recovery exhausted its retry cadence; reseeding a fresh session in place.",
+  });
   return true;
 }

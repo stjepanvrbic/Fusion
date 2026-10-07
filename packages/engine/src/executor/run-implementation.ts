@@ -168,7 +168,7 @@ import {
   runConfiguredCommand,
 } from "./configured-command.js";
 import { buildExecutionPrompt } from "./execution-prompt.js";
-import { resolveReboundColumnFor, resolveTerminalColumnsFor } from "./lifecycle-columns.js";
+import { resolveTerminalColumnsFor } from "./lifecycle-columns.js";
 import { recoverAbortedStepSessionInPlace } from "./recover-aborted-step-session.js";
 import { detectPendingReviewBlock } from "./pending-review-block.js";
 import { detectPseudoPause } from "./pseudo-pause.js";
@@ -194,7 +194,9 @@ import { reseedExhaustedBranchConflict } from "./worktree-branch-conflict-handle
 import type { ImplementationExitReporter } from "./implementation-exit.js";
 import type { GraphCompletionCallback } from "./run-implementation-phase.js";
 import { resolveAndEmitGoalContext } from "../goals/goal-injection-diagnostics.js";
-import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES } from "../healing/recovery-policy.js";
+import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES, type RecoveryEscalationDecision } from "../healing/recovery-policy.js";
+import { parkExhaustedRecovery, recordRecoveryEscalation, type RecoveryOwner } from "../healing/recovery-exhaustion.js";
+import { requeueExecutionInPlace } from "./in-place-execution-requeue.js";
 import { executorLog, formatError } from "../logger.js";
 import { classifyOrphanOurAdvance, rehomeOrphanOntoIntegration } from "../merge/merger-orphan-rehome.js";
 import { isTaskMergeInFlight } from "../merge/merge-execution-exclusion.js";
@@ -313,6 +315,8 @@ export type RunImplementationDeps = {
   resolveTaskCustomFieldDefs: AnyFn;
   resumeApprovalAfterUnwindIfNeeded: AnyFn;
   reexecuteTaskInPlace: (taskId: string) => Promise<void>;
+  /** Arms the guarded WIP-lane re-dispatch used by every executor retry (no backward move). */
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
   runExecutorDeterministicVerification: AnyFn;
   runWithExecutorSemaphore: AnyFn;
   scheduleCompletedTaskWatchdog: AnyFn;
@@ -395,22 +399,21 @@ export async function parkExternalSessionObstacle(
 }
 
 export async function retryPlanningLifecycleLockTransportFailure(
-  deps: Pick<RunImplementationDeps, "store" | "getRunContextFor" | "markGraphExecuteSelfRequeued">,
+  deps: Pick<RunImplementationDeps, "store" | "getRunContextFor" | "markGraphExecuteSelfRequeued" | "scheduleInPlaceExecutionResume">,
   task: Task,
   errorMessage: string,
-  resolveReboundColumnFor: (store: TaskStore, taskId: string) => Promise<string>,
 ): Promise<boolean> {
   const decision = computeRecoveryDecision({ recoveryRetryCount: task.recoveryRetryCount, nextRecoveryAt: task.nextRecoveryAt });
-  if (!decision.shouldRetry) {
+  if (decision.disposition === "escalate") {
     /* FNXC:RecoveryOwnership 2026-10-06-16:13: Planning-lock transport exhaustion retains executor ownership; a fenced fresh-session reseed replaces the former generic failure fallthrough. */
-    return reseedExhaustedTransientExecution(deps, task, resolveReboundColumnFor);
+    return escalateExhaustedExecutionRecovery(deps, task, decision, { owner: "executor-planning-lock", detail: errorMessage });
   }
-  const attempt = decision.nextState.recoveryRetryCount;
   const delay = formatDelay(decision.delayMs);
-  await deps.store.logEntry(task.id, `Planning lifecycle lock transport failure (retry ${attempt}/${MAX_RECOVERY_RETRIES} in ${delay}): ${errorMessage}`, undefined, deps.getRunContextFor(task.id));
-  await deps.store.updateTask(task.id, { recoveryRetryCount: attempt, nextRecoveryAt: decision.nextState.nextRecoveryAt });
-  deps.markGraphExecuteSelfRequeued(task.id);
-  await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveProgress: true });
+  await requeueExecutionInPlace(deps, task.id, {
+    updates: { recoveryRetryCount: decision.nextState.recoveryRetryCount },
+    notBefore: decision.nextState.nextRecoveryAt,
+    logMessage: `Planning lifecycle lock transport failure (retry ${decision.attempt}/${MAX_RECOVERY_RETRIES} in ${delay}): ${errorMessage}`,
+  });
   return true;
 }
 
@@ -418,43 +421,61 @@ export async function retryPlanningLifecycleLockTransportFailure(
  * FNXC:RecoveryOwnership 2026-10-06-15:51:
  * A transient executor failure remains owned by the execution role after its ordinary
  * retry cadence is spent. Fence the reset on the live row so an operator pause or a
- * newer session wins, then re-enter the current resolved execution lane with fresh
- * session and checkout metadata rather than parking recoverable work as failed.
+ * newer session wins, then re-enter the current execution lane with fresh session and
+ * checkout metadata.
+ *
+ * FNXC:RecoveryOwnership 2026-10-07-18:04:
+ * The reseed is spent once per recovery episode. FN-9512 reset the counter here, so a
+ * deterministic failure cycled retry, retry, retry, reseed forever with no visible stop.
+ * The counter now survives the reseed; the next exhaustion parks the card `failed` in its
+ * WIP lane with the cause and an audit row. Both outcomes stay in the current lifecycle role.
  */
-export async function reseedExhaustedTransientExecution(
-  deps: Pick<RunImplementationDeps, "store" | "getRunContextFor" | "markGraphExecuteSelfRequeued">,
+export async function escalateExhaustedExecutionRecovery(
+  deps: Pick<RunImplementationDeps, "store" | "getRunContextFor" | "markGraphExecuteSelfRequeued" | "scheduleInPlaceExecutionResume">,
   task: Task,
-  resolveReboundColumnFor: (store: TaskStore, taskId: string) => Promise<string>,
+  decision: RecoveryEscalationDecision,
+  input: { owner: RecoveryOwner; detail: string; preserveCheckout?: boolean },
 ): Promise<boolean> {
+  const sameFailureGeneration = (live: Task) => live.column === task.column
+    && (live.status ?? null) === (task.status ?? null)
+    && live.error === task.error
+    && (live.recoveryRetryCount ?? null) === (task.recoveryRetryCount ?? null);
+  if (decision.escalation === "park") {
+    return parkExhaustedRecovery(deps.store, task, {
+      owner: input.owner,
+      attempts: decision.attempts,
+      detail: input.detail,
+      agentId: "executor",
+      runContext: deps.getRunContextFor(task.id),
+      isSameEpisode: (live) => sameFailureGeneration(live) && live.status !== "blocked",
+    });
+  }
   let reseeded = false;
   await deps.store.updateTaskAtomic(task.id, (live) => {
-    const sameFailureGeneration = live.column === task.column
-      && (live.status ?? null) === (task.status ?? null)
-      && live.error === task.error
-      && (live.recoveryRetryCount ?? null) === (task.recoveryRetryCount ?? null);
-    if (!sameFailureGeneration || live.userPaused || live.paused || live.status === "blocked") return null;
+    if (!sameFailureGeneration(live) || live.userPaused || live.paused || live.status === "blocked") return null;
     reseeded = true;
     return {
       status: null,
       error: null,
-      recoveryRetryCount: null,
+      recoveryRetryCount: decision.nextState.recoveryRetryCount,
       recoveryDisposition: "escalated-reseed",
       nextRecoveryAt: null,
       sessionFile: null,
-      worktree: null,
-      branch: null,
-      branchWriteOrigin: "engine" as const,
+      // A stale transcript is the only broken piece of a stale-continuation episode; its checkout and branch stay.
+      ...(input.preserveCheckout ? {} : { worktree: null, branch: null, branchWriteOrigin: "engine" as const }),
     };
   });
   if (!reseeded) return false;
-  await deps.store.logEntry(
-    task.id,
-    "Transient execution recovery retry budget escalated to a fenced fresh-session reseed.",
-    undefined,
-    deps.getRunContextFor(task.id),
-  );
-  deps.markGraphExecuteSelfRequeued(task.id);
-  await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveProgress: true });
+  await recordRecoveryEscalation(deps.store, task.id, {
+    owner: input.owner,
+    outcome: "reseeded",
+    attempts: decision.nextState.recoveryRetryCount ?? decision.attempts,
+    column: task.column,
+    agentId: "executor",
+  });
+  await requeueExecutionInPlace(deps, task.id, {
+    logMessage: "Execution recovery retry budget escalated to a fenced fresh-session reseed; the next exhaustion parks the task for an operator.",
+  });
   return true;
 }
 
@@ -509,8 +530,13 @@ export async function runImplementation(
     A new executor claim is the persisted reseed handoff boundary. Clear the board diagnostic
     only after live ownership is established, so queued cards retain the route through the reset.
     */
-    if (task.recoveryDisposition === "escalated-reseed") {
-      await deps.store.updateTask(task.id, { recoveryDisposition: null });
+    /*
+    FNXC:RecoveryOwnership 2026-10-07-18:04:
+    The claim also consumes a pending in-place retry deadline: once the run owns the card, a stale
+    `nextRecoveryAt` must not hold back the next automatic re-entry. The episode counter is kept.
+    */
+    if (task.recoveryDisposition === "escalated-reseed" || task.nextRecoveryAt) {
+      await deps.store.updateTask(task.id, { recoveryDisposition: null, nextRecoveryAt: null });
     }
 
     if (task.deletedAt) {
@@ -1131,25 +1157,20 @@ export async function runImplementation(
         }
 
         if (priorRequeues < MAX_TASK_DONE_REQUEUE_RETRIES) {
-          await deps.store.updateTask(task.id, {
-            status: "queued",
-            error: null,
-            worktree: null,
-            branch: null, branchWriteOrigin: "engine" as const,
-            sessionFile: null,
-            taskDoneRetryCount: nextRequeueCount,
-            paused: false,
-            pausedByAgentId: null,
+          await requeueExecutionInPlace(deps, task.id, {
+            updates: {
+              status: "queued",
+              error: null,
+              worktree: null,
+              branch: null, branchWriteOrigin: "engine" as const,
+              sessionFile: null,
+              taskDoneRetryCount: nextRequeueCount,
+              paused: false,
+              pausedByAgentId: null,
+            },
+            logMessage: `${failureMessage} — retrying in place with a fresh worktree (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`,
           });
-          await deps.store.logEntry(
-            task.id,
-            `${failureMessage} — requeued to todo immediately (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`,
-            undefined,
-            deps.getRunContextFor(task.id),
-          );
-          deps.markGraphExecuteSelfRequeued(task.id);
-          await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveProgress: true });
-          executorLog.log(`✗ ${task.id} worktree liveness failed — requeued to todo (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`);
+          executorLog.log(`✗ ${task.id} worktree liveness failed — retrying in place (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`);
         } else {
           await deps.store.updateTask(task.id, {
             status: "failed",
@@ -1819,7 +1840,7 @@ export async function runImplementation(
             await deps.store.logEntry(task.id, `Waiting for shared workspace resource: ${errorMessage}`, undefined, deps.getRunContextFor(task.id));
             throw err;
           } else if (isPlanningLifecycleLockTransportFailure(err, errorMessage)) {
-            if (await retryPlanningLifecycleLockTransportFailure(deps, task, errorMessage, resolveReboundColumnFor)) return;
+            if (await retryPlanningLifecycleLockTransportFailure(deps, task, errorMessage)) return;
             throw err;
           } else if (isTransientError(errorMessage)) {
             const decision = computeRecoveryDecision({
@@ -1827,8 +1848,8 @@ export async function runImplementation(
               nextRecoveryAt: task.nextRecoveryAt,
             });
 
-            if (decision.shouldRetry) {
-              const attempt = decision.nextState.recoveryRetryCount;
+            if (decision.disposition === "retry") {
+              const attempt = decision.attempt;
               const delay = formatDelay(decision.delayMs);
               if (!isSilentTransientError(errorMessage)) {
                 executorLog.warn(`⚡ ${task.id} transient error — retry ${attempt}/${MAX_RECOVERY_RETRIES} in ${delay}: ${errorMessage}`);
@@ -1852,14 +1873,14 @@ export async function runImplementation(
                   executorLog.warn(`${task.id}: worktree removal failed during transient-error retry cleanup (${worktreePath}): ${msg}`);
                 }
               }
-              await deps.store.updateTask(task.id, {
-                recoveryRetryCount: decision.nextState.recoveryRetryCount,
-                nextRecoveryAt: decision.nextState.nextRecoveryAt,
-                worktree: null,
-                branch: null, branchWriteOrigin: "engine" as const,
+              await requeueExecutionInPlace(deps, task.id, {
+                updates: {
+                  recoveryRetryCount: decision.nextState.recoveryRetryCount,
+                  worktree: null,
+                  branch: null, branchWriteOrigin: "engine" as const,
+                },
+                notBefore: decision.nextState.nextRecoveryAt,
               });
-              deps.markGraphExecuteSelfRequeued(task.id);
-              await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveProgress: true });
               stuckRequeue = null; // Prevent outer finally from re-processing
               return;
             }
@@ -1870,7 +1891,7 @@ export async function runImplementation(
             }
             const externallyBlocked = await parkExternalSessionObstacle(deps, task.id, errorMessage);
             if (!externallyBlocked) {
-              await reseedExhaustedTransientExecution(deps, task, resolveReboundColumnFor);
+              await escalateExhaustedExecutionRecovery(deps, task, decision, { owner: "executor-transient", detail: errorMessage });
             }
             if (accumulatedStepTokenUsage) {
               await deps.persistTaskTokenUsage(task.id, accumulatedStepTokenUsage);
@@ -2719,10 +2740,11 @@ export async function runImplementation(
               await deps.persistTokenUsage(task.id);
               return;
             } else {
-              executorLog.log(`${task.id} paused (graceful session exit) — moving to todo`);
-              await deps.store.logEntry(task.id, "Execution paused — session preserved for resume, moved to todo");
-              deps.markGraphExecuteSelfRequeued(task.id);
-              await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveResumeState: true });
+              /* FNXC:LifecycleContainment 2026-10-07-18:04: a paused WIP card stays in its lane; unpause resumes it there through the task:updated resume path. */
+              executorLog.log(`${task.id} paused (graceful session exit) — session preserved for resume in place`);
+              await requeueExecutionInPlace(deps, task.id, {
+                logMessage: "Execution paused — session preserved for resume in place",
+              });
             }
             return;
           }
@@ -3101,23 +3123,18 @@ export async function runImplementation(
             } else if (retryAbortedDueToReclaim) {
               // FN-4806: Worktree/branch was reclaimed mid-retry by an engine-side housekeeping path
               // (e.g. FN-4546 stale-active-branch reclaim, FN-4742 self-healing removals). This is NOT
-              // an agent failure — the agent never got a fair retry attempt. Silently requeue to todo
+              // an agent failure — the agent never got a fair retry attempt. Silently retry in place
               // with preserved progress so a fresh worktree is created on next pickup. Do not mark
               // status=failed, do not surface onError, do not burn taskDoneRetryCount budget.
-              const silentMessage = `${task.id}: worktree/branch reclaimed mid-retry — requeued to todo (engine self-heal, no failure)`;
-              await deps.store.logEntry(
-                task.id,
-                "Worktree/branch reclaimed mid-retry — requeued to todo (engine self-heal, no failure)",
-                undefined,
-                deps.getRunContextFor(task.id),
-              );
+              const silentMessage = `${task.id}: worktree/branch reclaimed mid-retry — retrying in place (engine self-heal, no failure)`;
               // Clear any stale binding so the next pickup creates a fresh worktree.
               // baseCommitSha is also cleared because it pinned to the now-reclaimed worktree;
               // the next pickup will re-anchor it on the fresh checkout.
-              await deps.store.updateTask(task.id, { worktree: null, branch: null, branchWriteOrigin: "engine" as const, baseCommitSha: null });
               await deps.persistTokenUsage(task.id);
-              deps.markGraphExecuteSelfRequeued(task.id);
-              await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveProgress: true });
+              await requeueExecutionInPlace(deps, task.id, {
+                updates: { worktree: null, branch: null, branchWriteOrigin: "engine" as const, baseCommitSha: null },
+                logMessage: "Worktree/branch reclaimed mid-retry — retrying in place (engine self-heal, no failure)",
+              });
               executorLog.log(silentMessage);
             } else if (refusalHandled) {
               return;
@@ -3133,20 +3150,15 @@ export async function runImplementation(
               const errorMessage = `Agent finished without calling fn_task_done (after ${MAX_TASK_DONE_SESSION_RETRIES} retries)`;
 
               if (priorRequeues < MAX_TASK_DONE_REQUEUE_RETRIES) {
-                await deps.store.updateTask(task.id, {
-                  status: "queued",
-                  error: null,
-                  taskDoneRetryCount: nextRequeueCount,
+                await requeueExecutionInPlace(deps, task.id, {
+                  updates: {
+                    status: "queued",
+                    error: null,
+                    taskDoneRetryCount: nextRequeueCount,
+                  },
+                  logMessage: `${errorMessage} — retrying in place with progress preserved (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`,
                 });
-                await deps.store.logEntry(
-                  task.id,
-                  `${errorMessage} — requeued to todo immediately (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`,
-                  undefined,
-                  deps.getRunContextFor(task.id),
-                );
-                deps.markGraphExecuteSelfRequeued(task.id);
-                await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveProgress: true });
-                executorLog.log(`✗ ${task.id} failed after ${MAX_TASK_DONE_SESSION_RETRIES} retries — requeued to todo (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`);
+                executorLog.log(`✗ ${task.id} failed after ${MAX_TASK_DONE_SESSION_RETRIES} retries — retrying in place (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`);
               } else {
                 await deps.store.updateTask(task.id, { status: "failed", error: errorMessage });
                 await deps.store.logEntry(task.id, `${errorMessage} — execution failed after task-done retry budget was exhausted`, undefined, deps.getRunContextFor(task.id));
@@ -3306,43 +3318,34 @@ export async function runImplementation(
           recoveryRetryCount: liveTask.recoveryRetryCount,
           nextRecoveryAt: liveTask.nextRecoveryAt,
         });
-        if (!decision.shouldRetry) {
+        if (decision.disposition === "escalate") {
           /* FNXC:RecoveryOwnership 2026-10-06-15:28: Exhausted stale-session retries reseed a fresh executor session; terminalizing would strand a card whose worktree and graph state remain recoverable. */
-          executorLog.warn(`⚡ ${task.id} stale assistant-continuation retry cadence exhausted; reseeding fresh session`);
-          await deps.store.logEntry(
-            task.id,
-            "Stale assistant-continuation recovery exhausted its retry cadence; reseeding a fresh session.",
-            undefined,
-            deps.getRunContextFor(task.id),
-          );
-          await deps.store.updateTask(task.id, {
-            status: null,
-            error: null,
-            recoveryRetryCount: null,
-            recoveryDisposition: "escalated-reseed",
-            nextRecoveryAt: null,
-            sessionFile: null,
-          });
-          deps.markGraphExecuteSelfRequeued(task.id);
-          await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveResumeState: true });
+          /* FNXC:RecoveryOwnership 2026-10-07-18:04: the reseed is spent once per episode; the next exhaustion parks the task visibly in its WIP lane. */
+          executorLog.warn(`⚡ ${task.id} stale assistant-continuation retry cadence exhausted; escalating (${decision.escalation})`);
+          if (decision.escalation === "reseed") {
+            await deps.store.logEntry(
+              task.id,
+              "Stale assistant-continuation recovery exhausted its retry cadence; reseeding a fresh session.",
+              undefined,
+              deps.getRunContextFor(task.id),
+            );
+          }
+          await escalateExhaustedExecutionRecovery(deps, liveTask, decision, { owner: "executor-stale-continuation", detail: errorMessage, preserveCheckout: true });
           await deps.persistTokenUsage(task.id);
           return;
         }
 
         staleAssistantContinuationRequeue = true;
-        const attempt = decision.nextState.recoveryRetryCount;
+        const attempt = decision.attempt;
         const delay = formatDelay(decision.delayMs);
         executorLog.warn(`${task.id} stale assistant-continuation session detected — fresh-session retry ${attempt}/${MAX_RECOVERY_RETRIES} in ${delay} after executor lock release`);
-        await deps.store.logEntry(
-          task.id,
-          `Detected stale assistant-continuation session — fresh-session retry ${attempt}/${MAX_RECOVERY_RETRIES} in ${delay} with progress preserved: ${errorMessage}`,
-          undefined,
-          deps.getRunContextFor(task.id),
-        );
-        await deps.store.updateTask(task.id, {
-          sessionFile: null,
-          recoveryRetryCount: decision.nextState.recoveryRetryCount,
-          nextRecoveryAt: decision.nextState.nextRecoveryAt,
+        await requeueExecutionInPlace(deps, task.id, {
+          updates: {
+            sessionFile: null,
+            recoveryRetryCount: decision.nextState.recoveryRetryCount,
+          },
+          notBefore: decision.nextState.nextRecoveryAt,
+          logMessage: `Detected stale assistant-continuation session — fresh-session retry ${attempt}/${MAX_RECOVERY_RETRIES} in ${delay} with progress preserved: ${errorMessage}`,
         });
         return;
       } else if (errorMessage.includes("Invalid transition")) {
@@ -3482,22 +3485,17 @@ export async function runImplementation(
           Pause-bounce loop (observed on FN-7851): this teardown runs BECAUSE the user paused the task, but the plain move-to-todo below wiped the pause flags (store reopen block), leaving an unpaused dispatchable todo row. The graph-failure classifier then read `paused=false, userPaused=false`, misclassified the abort as engine-internal, and auto-continued the session; once the shared graphResumeRetryCount budget was exhausted the scheduler simply re-dispatched the row seconds later — so pausing an in-progress task could never stick. When the pause that caused this abort is still in force at teardown time, move with `preservePause` so the row lands in todo still parked (`paused` kept; scheduler skips paused/userPaused todo rows) and the classifier sees the pause and routes benignly. An unpause during the teardown window leaves `paused` unset and restores the old requeue-for-normal-scheduling behavior.
           */
           const pauseStillInForce = latestTask?.paused === true;
-          await deps.store.updateTask(
-            task.id,
-            hasResumableProgress ? { worktree: undefined } : { worktree: undefined, branch: undefined },
-          );
-          await deps.store.logEntry(
-            task.id,
-            pauseStillInForce
-              ? "Execution paused — agent terminated, parked in todo (pause preserved, awaiting explicit unpause)"
-              : "Execution paused — agent terminated, moved to todo",
-            undefined,
-            deps.getRunContextFor(task.id),
-          );
-          deps.markGraphExecuteSelfRequeued(task.id);
-          await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), {
-            ...(hasResumableProgress ? { preserveResumeState: true } : {}),
-            ...(pauseStillInForce ? { preservePause: true } : {}),
+          /*
+          FNXC:LifecycleContainment 2026-10-07-18:04:
+          The paused card stays in its WIP lane (FN-207 forbids an automatic WIP-to-hold move). The pause
+          flags are untouched, so the classifier still sees the pause and the task:updated unpause path
+          resumes the same lane. An unpause during teardown re-dispatches in place immediately.
+          */
+          await requeueExecutionInPlace(deps, task.id, {
+            updates: hasResumableProgress ? { worktree: undefined } : { worktree: undefined, branch: undefined },
+            logMessage: pauseStillInForce
+              ? "Execution paused — agent terminated, parked in place (pause preserved, awaiting explicit unpause)"
+              : "Execution paused — agent terminated, resuming in place",
           });
         }
       } else if (deps.stuckAborted.has(task.id)) {
@@ -3575,16 +3573,16 @@ export async function runImplementation(
         }
 
         // Fresh-session requeue for context-limit errors: the saturated session
-        // cannot be salvaged, but the task's git state is intact. Move the task
-        // back to todo so the next scheduling pass creates a new session.
+        // cannot be salvaged, but the task's git state is intact. Retry in place
+        // so the next dispatch creates a new session in the same WIP lane.
         if (isContextError) {
           const decision = computeRecoveryDecision({
             recoveryRetryCount: task.recoveryRetryCount,
             nextRecoveryAt: task.nextRecoveryAt,
           });
 
-          if (decision.shouldRetry) {
-            const attempt = decision.nextState.recoveryRetryCount;
+          if (decision.disposition === "retry") {
+            const attempt = decision.attempt;
             const delay = formatDelay(decision.delayMs);
             executorLog.warn(`⚡ ${task.id} context-overflow fresh-session requeue ${attempt}/${MAX_RECOVERY_RETRIES} in ${delay}`);
             await deps.store.logEntry(task.id, `Context-overflow fresh-session requeue (${attempt}/${MAX_RECOVERY_RETRIES} in ${delay}): ${errorMessage}`, undefined, deps.getRunContextFor(task.id));
@@ -3597,13 +3595,13 @@ export async function runImplementation(
             // wins the task lock first, the next executor pass would
             // observe a stale sessionFile and resume into the saturated
             // session, looping on the same context-limit failure.
-            await deps.store.updateTask(task.id, {
-              recoveryRetryCount: decision.nextState.recoveryRetryCount,
-              nextRecoveryAt: decision.nextState.nextRecoveryAt,
-              sessionFile: null,
+            await requeueExecutionInPlace(deps, task.id, {
+              updates: {
+                recoveryRetryCount: decision.nextState.recoveryRetryCount,
+                sessionFile: null,
+              },
+              notBefore: decision.nextState.nextRecoveryAt,
             });
-            deps.markGraphExecuteSelfRequeued(task.id);
-            await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveResumeState: true });
             return;
           }
 
@@ -3615,7 +3613,7 @@ export async function runImplementation(
           */
           executorLog.warn(`⚡ ${task.id} context-overflow requeue cadence exhausted (${MAX_RECOVERY_RETRIES} attempts); reseeding fresh session`);
           await deps.store.logEntry(task.id, "Context-overflow recovery cadence exhausted; reseeding a fresh execution session.", undefined, deps.getRunContextFor(task.id));
-          await reseedExhaustedTransientExecution(deps, task, resolveReboundColumnFor);
+          await escalateExhaustedExecutionRecovery(deps, task, decision, { owner: "executor-context-overflow", detail: errorMessage });
           return;
         // Contamination recovery lives in executor because branch cross-contamination
         // is surfaced here from task execution preflight; merger empty-cherry-pick
@@ -3787,8 +3785,7 @@ export async function runImplementation(
               // "worktree gone" from "pointer not yet repopulated". Matches sibling
               // recovery paths in auto-recovery-handlers/contamination.ts,
               // tryBootstrapMisbindingRecovery, and self-healing reclaim.
-              deps.markGraphExecuteSelfRequeued(task.id);
-              await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveResumeState: true, preserveWorktree: true });
+              await requeueExecutionInPlace(deps, task.id);
               return;
             }
 
@@ -3840,7 +3837,10 @@ export async function runImplementation(
             settings: (await deps.store.getSettings()).autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 },
           });
           if (decision.action === "escalate") {
-            await reseedExhaustedBranchConflict(deps, task);
+            await reseedExhaustedBranchConflict(deps, task, {
+              maxRetries: (await deps.store.getSettings()).autoRecovery?.maxRetries ?? 3,
+              detail: err.message,
+            });
             return;
           }
           if (decision.action === "pause") {
@@ -3882,7 +3882,10 @@ export async function runImplementation(
               settings: (await deps.store.getSettings()).autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 },
             });
             if (decision.action === "escalate") {
-              await reseedExhaustedBranchConflict(deps, task);
+              await reseedExhaustedBranchConflict(deps, task, {
+                maxRetries: (await deps.store.getSettings()).autoRecovery?.maxRetries ?? 3,
+                detail: tripwireMessage,
+              });
               return;
             }
             if (decision.action === "pause") {
@@ -3930,7 +3933,10 @@ export async function runImplementation(
               settings: (await deps.store.getSettings()).autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 },
             });
             if (decision.action === "escalate") {
-              await reseedExhaustedBranchConflict(deps, task);
+              await reseedExhaustedBranchConflict(deps, task, {
+                maxRetries: (await deps.store.getSettings()).autoRecovery?.maxRetries ?? 3,
+                detail: err.message,
+              });
               return;
             }
             if (decision.action === "pause") {
@@ -3955,7 +3961,7 @@ export async function runImplementation(
           await deps.store.logEntry(task.id, `Waiting for shared workspace resource: ${errorMessage}`, undefined, deps.getRunContextFor(task.id));
           throw err;
         } else if (isPlanningLifecycleLockTransportFailure(err, errorMessage)) {
-          if (await retryPlanningLifecycleLockTransportFailure(deps, task, errorMessage, resolveReboundColumnFor)) return;
+          if (await retryPlanningLifecycleLockTransportFailure(deps, task, errorMessage)) return;
           // Exhaustion falls through to the terminal failure path below.
         } else if (isTransientError(errorMessage)) {
           // Transient network/infrastructure error — use bounded recovery policy
@@ -3964,8 +3970,8 @@ export async function runImplementation(
             nextRecoveryAt: task.nextRecoveryAt,
           });
 
-          if (decision.shouldRetry) {
-            const attempt = decision.nextState.recoveryRetryCount;
+          if (decision.disposition === "retry") {
+            const attempt = decision.attempt;
             const delay = formatDelay(decision.delayMs);
             // Silent transient errors (e.g., "request was aborted") are noisy — skip logging
             if (!isSilentTransientError(errorMessage)) {
@@ -3992,23 +3998,23 @@ export async function runImplementation(
                 executorLog.warn(`Failed to remove old worktree ${worktreePath}: ${cleanupErrMessage}`);
               }
             }
-            await deps.store.updateTask(task.id, {
-              recoveryRetryCount: decision.nextState.recoveryRetryCount,
-              nextRecoveryAt: decision.nextState.nextRecoveryAt,
-              worktree: null,
-              branch: null, branchWriteOrigin: "engine" as const,
+            await requeueExecutionInPlace(deps, task.id, {
+              updates: {
+                recoveryRetryCount: decision.nextState.recoveryRetryCount,
+                worktree: null,
+                branch: null, branchWriteOrigin: "engine" as const,
+              },
+              notBefore: decision.nextState.nextRecoveryAt,
             });
-            deps.markGraphExecuteSelfRequeued(task.id);
-            await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveProgress: true });
             return;
           }
 
-          // The exhausted cadence is a role-preserving fresh-session reseed, not a terminal park.
+          // The first exhausted cadence is a role-preserving fresh-session reseed; the second parks visibly.
           executorLog.warn(`⚡ ${task.id} transient error retry cadence exhausted (${MAX_RECOVERY_RETRIES} attempts): ${errorDetail}`);
           await deps.store.logEntry(task.id, `Transient error retry cadence exhausted after ${MAX_RECOVERY_RETRIES} attempts: ${errorMessage}`, errorStack ?? errorDetail, deps.getRunContextFor(task.id));
           const externallyBlocked = await parkExternalSessionObstacle(deps, task.id, errorMessage);
           if (!externallyBlocked) {
-            await reseedExhaustedTransientExecution(deps, task, resolveReboundColumnFor);
+            await escalateExhaustedExecutionRecovery(deps, task, decision, { owner: "executor-transient", detail: errorMessage });
           }
           await deps.persistTokenUsage(task.id);
           executorLog.log(`⚡ ${task.id} transient retries exhausted — execution reseed requested`);
@@ -4122,52 +4128,39 @@ export async function runImplementation(
         }
       }
 
-      // Requeue stale assistant-continuation sessions AFTER deps.executing is cleared.
-      // Moving the task while the execution guard is still held can cause the scheduler's
-      // task:moved dispatch to no-op, stranding the task in todo with no fresh run.
-      if (staleAssistantContinuationRequeue) {
-        /*
-        FNXC:ExecutorSessionRecovery 2026-07-14-06:26:
-        Claim the process-wide executor lock for deferred cleanup, release it immediately before moveTask emits task:moved, and always drop the claim on errors. This closes the guard-release race without recreating the original no-op dispatch: a fresh retry cannot start while stale state is being cleared, but can claim the task when the committed move event fires.
+      /*
+      FNXC:ExecutorSessionRecovery 2026-07-14-06:34:
+      Release the stale run's activeWorktrees slot once the executor lock is free, so a card waiting
+      out its retry backoff does not keep consuming maxWorktrees capacity.
 
-        FNXC:ExecutorSessionRecovery 2026-07-14-06:34:
-        Release the stale run's activeWorktrees slot before releasing the executor lock. Once the lock is open, the fresh retry may install its own slot while moveTask dispatches; deleting afterward would erase the new run's capacity and liveness tracking.
-        */
+      FNXC:LifecycleContainment 2026-10-07-18:04:
+      The retry itself stays in the WIP lane: requeueExecutionInPlace persisted the backoff and armed
+      the guarded re-dispatch. This block only clears transient run state; it never moves the card.
+      */
+      if (staleAssistantContinuationRequeue) {
         const cleanupClaimed = executingTaskLock.tryClaim(task.id);
         if (!cleanupClaimed) {
-          executorLog.debug(`${task.id} stale assistant-continuation requeue skipped — a fresh executor already claimed the task`);
+          executorLog.debug(`${task.id} stale assistant-continuation cleanup skipped — a fresh executor already claimed the task`);
         } else {
-          let cleanupLockHeld = true;
           try {
             const latestTask = await deps.store.getTask(task.id);
             const continuationLanes = await deps.resolveResumeLanes(task.id);
-            if (latestTask.column === continuationLanes.wip || latestTask.column === continuationLanes.hold) {
+            if (latestTask.column === continuationLanes.wip) {
               await deps.store.updateTask(task.id, {
                 sessionFile: null,
                 status: null,
                 error: null,
               });
-              const continuationReboundColumn = await resolveReboundColumnFor(deps.store, task.id);
-              if (latestTask.column !== continuationReboundColumn) {
-                deps.markGraphExecuteSelfRequeued(task.id);
-                deps.activeWorktrees.delete(task.id);
-                executingTaskLock.release(task.id);
-                cleanupLockHeld = false;
-                await deps.store.moveTask(task.id, continuationReboundColumn, { preserveResumeState: true });
-              } else {
-                deps.activeWorktrees.delete(task.id);
-              }
-              executorLog.log(`${task.id} stale assistant-continuation session cleared — requeued to ${continuationReboundColumn} with progress preserved`);
+              deps.activeWorktrees.delete(task.id);
+              executorLog.log(`${task.id} stale assistant-continuation session cleared — retrying in place with progress preserved`);
             } else {
-              executorLog.debug(`${task.id} stale assistant-continuation requeue skipped — task is now in '${latestTask.column}'`);
+              executorLog.debug(`${task.id} stale assistant-continuation cleanup skipped — task is now in '${latestTask.column}'`);
             }
           } catch (err: unknown) {
             const errorMessage = err instanceof Error ? err.message : String(err);
-            executorLog.error(`Failed to requeue stale assistant-continuation task ${task.id}: ${errorMessage}`);
+            executorLog.error(`Failed to clear stale assistant-continuation state for ${task.id}: ${errorMessage}`);
           } finally {
-            if (cleanupLockHeld) {
-              executingTaskLock.release(task.id);
-            }
+            executingTaskLock.release(task.id);
           }
         }
       }
