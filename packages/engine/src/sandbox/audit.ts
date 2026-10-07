@@ -1,5 +1,6 @@
 import { createLogger } from "../logger.js";
-import type { RunAuditor } from "../util/run-audit.js";
+import { emitBoundedRunAudit } from "../util/emit-bounded-run-audit.js";
+import { errnoCodeOf, type RunAuditor } from "../util/run-audit.js";
 import type {
   SandboxBackend,
   SandboxCapabilities,
@@ -11,17 +12,31 @@ import type {
 
 const log = createLogger("sandbox-audit");
 
+/**
+ * FNXC:RunAudit 2026-10-07-20:11:
+ * Sandbox audit metadata is ids/counts/fixed outcomes only: configured-command and routine execution pass operator command text here, and failing commands print credential-bearing diagnostics.
+ * Command text, stdout/stderr and thrown error messages never enter run-audit; their lengths, the exit code, signal, an errno code and a fixed failure kind do.
+ * Every emit goes through the bounded seam so an injected auditor that throws, rejects or hangs cannot block or fail the sandboxed command.
+ */
 async function emitSandboxAudit(
   auditor: RunAuditor,
   type: "sandbox:prepare" | "sandbox:run" | "sandbox:failure" | "sandbox:fallback",
   target: string,
   metadata?: Record<string, unknown>,
 ): Promise<void> {
-  try {
-    await auditor.sandbox({ type, target, metadata });
-  } catch (error) {
-    log.warn(`Failed to emit ${type} audit event: ${error instanceof Error ? error.message : String(error)}`);
-  }
+  await emitBoundedRunAudit(
+    { recordRunAuditEvent: () => auditor.sandbox({ type, target, metadata }) },
+    { mutationType: type },
+    { log },
+  );
+}
+
+type SandboxFailureKind = "exit" | "timeout" | "buffer-overflow" | "error";
+
+function failureKindOf(result: SandboxRunResult): SandboxFailureKind {
+  if (result.timedOut) return "timeout";
+  if (result.bufferExceeded) return "buffer-overflow";
+  return "exit";
 }
 
 function makeFallbackPolicy(policy: SandboxPolicy, backendId: SandboxCapabilities["id"], auditor: RunAuditor): SandboxPolicy {
@@ -59,40 +74,44 @@ export function withSandboxAudit(backend: SandboxBackend, auditor: RunAuditor): 
     },
     run: async (command: string, options: SandboxRunOptions): Promise<SandboxRunResult> => {
       const startedAt = Date.now();
-      const commandSnippet = command.slice(0, 200);
+      const commandLength = command.length;
       try {
         const result = await backend.run(command, options);
         const durationMs = Date.now() - startedAt;
 
         await emitSandboxAudit(auditor, "sandbox:run", backendId, {
           backendId,
-          command: commandSnippet,
+          commandLength,
           cwd: options.cwd,
           timeoutMs: options.timeoutMs,
           exitCode: result.exitCode,
           durationMs,
-          timedOut: false,
-          bufferExceeded: false,
+          timedOut: result.timedOut,
+          bufferExceeded: result.bufferExceeded,
         });
 
         if (result.exitCode !== 0 || result.timedOut || result.bufferExceeded) {
           await emitSandboxAudit(auditor, "sandbox:failure", backendId, {
             backendId,
-            command: commandSnippet,
+            commandLength,
+            failureKind: failureKindOf(result),
             exitCode: result.exitCode,
             signal: result.signal,
             timedOut: result.timedOut,
             bufferExceeded: result.bufferExceeded,
-            stderrExcerpt: result.stderr.slice(0, 500),
+            stdoutBytes: Buffer.byteLength(result.stdout),
+            stderrBytes: Buffer.byteLength(result.stderr),
           });
         }
 
         return result;
       } catch (error) {
+        const errorCode = errnoCodeOf(error);
         await emitSandboxAudit(auditor, "sandbox:failure", backendId, {
           backendId,
-          command: commandSnippet,
-          errorMessage: error instanceof Error ? error.message : String(error),
+          commandLength,
+          failureKind: "error" satisfies SandboxFailureKind,
+          ...(errorCode ? { errorCode } : {}),
         });
         throw error;
       }
