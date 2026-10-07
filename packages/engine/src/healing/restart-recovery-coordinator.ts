@@ -226,8 +226,20 @@ export class RestartRecoveryCoordinator {
     if (options.resumeOrphans !== false) await this.executor.resumeOrphaned();
   }
 
-  async resumeOrphaned(): Promise<void> {
-    await this.executor.resumeOrphaned();
+  /** Boot-time WIP orphan candidates (id -> columnMovedAt), taken before any startup sweep runs. */
+  async snapshotBootOrphans(): Promise<Map<string, string | null>> {
+    const wipColumns = await resolveProjectColumnsForRoles(this.store, ["countsTowardWip"]);
+    const snapshot = new Map<string, string | null>();
+    for (const column of wipColumns) {
+      for (const task of await this.store.listTasks({ slim: true, column })) {
+        if (!task.paused && !task.deletedAt) snapshot.set(task.id, task.columnMovedAt ?? null);
+      }
+    }
+    return snapshot;
+  }
+
+  async resumeOrphaned(bootSnapshot?: ReadonlyMap<string, string | null>): Promise<void> {
+    await this.executor.resumeOrphaned(bootSnapshot ? { bootSnapshot } : undefined);
   }
 
   private mustSafeRetry(task: Task): boolean {

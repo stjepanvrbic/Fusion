@@ -79,6 +79,21 @@ describe("restart recovery and the recovery contract", () => {
     expect(isTaskActive(liveness, "FN-ORPH")).toBe(false);
   });
 
+  it("resumes only cards that were orphaned at boot and have not moved since", async () => {
+    const atBoot = { id: "FN-BOOT", title: "boot", description: "boot", column: "in-progress", columnMovedAt: "2026-10-01T00:00:00.000Z", steps: [] } as unknown as Task;
+    const movedLater = { id: "FN-LATER", title: "later", description: "later", column: "in-progress", columnMovedAt: "2026-10-07T12:00:00.000Z", steps: [] } as unknown as Task;
+    const rebounced = { id: "FN-REMOVED", title: "re", description: "re", column: "in-progress", columnMovedAt: "2026-10-07T12:05:00.000Z", steps: [] } as unknown as Task;
+    const fake = createRecoveryFakeStore(atBoot);
+    const deps = orphanDeps([atBoot, movedLater, rebounced], fake);
+    const bootSnapshot = new Map<string, string | null>([
+      ["FN-BOOT", "2026-10-01T00:00:00.000Z"],
+      ["FN-REMOVED", "2026-10-01T00:00:00.000Z"],
+    ]);
+    await resumeOrphaned(deps, { bootSnapshot });
+    expect(deps.execute).toHaveBeenCalledTimes(1);
+    expect(deps.execute).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-BOOT" }));
+  });
+
   it("can stop before orphan resumption so startup sweeps run first, and retries in place", async () => {
     const interrupted = {
       id: "FN-INT",

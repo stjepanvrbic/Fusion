@@ -2631,6 +2631,8 @@ export class InProcessRuntime
   dispatches and returns), so awaiting them cannot hold orphan resumption behind AI sessions.
   */
   private async resumeStartupRecoverySequence(): Promise<void> {
+    // Orphans are the cards in WIP at boot; anything moved into WIP later has its own owner.
+    const bootOrphans = await this.restartRecoveryCoordinator!.snapshotBootOrphans();
     // Restart recovery decides when interrupted runs can safely resume versus
     // when they must be retried in place with a fresh checkout.
     await this.restartRecoveryCoordinator!.recoverInterruptedRuns({ resumeOrphans: false });
@@ -2645,7 +2647,7 @@ export class InProcessRuntime
       runtimeLog.error("Self-healing startup recovery failed:", err);
     }
 
-    await this.restartRecoveryCoordinator!.resumeOrphaned();
+    await this.restartRecoveryCoordinator!.resumeOrphaned(bootOrphans);
   }
 
   /**
