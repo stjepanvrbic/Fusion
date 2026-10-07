@@ -59,6 +59,7 @@ import {
   chmodSync,
   writeFileSync,
 } from "node:fs";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { createServer, type Server } from "node:net";
@@ -820,6 +821,20 @@ export function __setWindowsLauncherForTests(
   windowsLauncherForTests = launcher;
 }
 
+/** Request for a clean `pg_ctl stop -m fast` of an owned Windows postmaster. */
+export interface WindowsPgCtlStopRequest {
+  readonly pgCtl: string;
+  readonly dataDir: string;
+  readonly timeoutSeconds: number;
+}
+type WindowsPgCtlStop = (request: WindowsPgCtlStopRequest) => Promise<{ status: number | null }>;
+let windowsPgCtlStopForTests: WindowsPgCtlStop | null = null;
+
+/** Test seam: replaces the pg_ctl stop and forces the Windows clean-stop branch on any host. */
+export function __setWindowsPgCtlStopForTests(stop: WindowsPgCtlStop | null): void {
+  windowsPgCtlStopForTests = stop;
+}
+
 function getEmbeddedPostgresCtor(): EmbeddedPostgresCtor {
   if (embeddedPostgresCtorCache) return embeddedPostgresCtorCache;
   // FNXC:DesktopEmbeddedPostgres 2026-07-14-18:30:
@@ -976,6 +991,68 @@ export interface EmbeddedLifecycleOptions {
  * Reuse starts (no initdb) finish in seconds, well within the bound.
  */
 export const DEFAULT_START_TIMEOUT_MS = 120_000;
+
+/** pg_ctl's own `-t` wait for a fast shutdown of an owned Windows postmaster. */
+const WINDOWS_PG_CTL_STOP_TIMEOUT_SECONDS = 30;
+/** Wall-clock beyond pg_ctl's `-t` before a pg_ctl process itself is treated as hung. */
+const WINDOWS_PG_CTL_PROCESS_GRACE_MS = 10_000;
+/** After pg_ctl reports a completed shutdown, how long the postmaster child may take to exit. */
+const WINDOWS_POSTMASTER_EXIT_WAIT_MS = 5_000;
+
+/** The embedded-postgres library's postmaster child, read for a clean Windows stop. */
+type PostmasterChildLike = {
+  readonly exitCode: number | null;
+  readonly signalCode: NodeJS.Signals | string | null;
+  readonly spawnfile: string;
+  once(event: "exit", listener: () => void): unknown;
+  removeListener(event: "exit", listener: () => void): unknown;
+};
+
+function hasChildExited(child: PostmasterChildLike): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForChildExit(child: PostmasterChildLike, timeoutMs: number): Promise<boolean> {
+  if (hasChildExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const onExit = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      child.removeListener("exit", onExit);
+      resolve(hasChildExited(child));
+    }, timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
+function runWindowsPgCtlFastStop(request: WindowsPgCtlStopRequest): Promise<{ status: number | null }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (status: number | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status });
+    };
+    const child = spawn(
+      request.pgCtl,
+      ["-D", request.dataDir, "-m", "fast", "-t", String(request.timeoutSeconds), "-w", "stop"],
+      {
+        windowsHide: true,
+        stdio: "ignore",
+        env: withWindowsNativeBinPath(process.env, dirname(dirname(request.pgCtl))),
+      },
+    );
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(null);
+    }, request.timeoutSeconds * 1000 + WINDOWS_PG_CTL_PROCESS_GRACE_MS);
+    child.once("error", () => finish(null));
+    child.once("exit", (code) => finish(code));
+  });
+}
 
 /**
  * The marker file `initdb` writes into a data directory once initialization
@@ -1937,7 +2014,7 @@ export class EmbeddedPostgresLifecycle {
       this.options.onLog("embedded postgres: detected Windows DLL initialization shutdown; attempting one owned-cluster recovery");
       try {
         if (this.nonAdminHandle) await this.nonAdminHandle.stop();
-        else await this.pg?.stop();
+        else if (this.pg) await this.stopLibraryPostgres(this.pg);
         this.pg = null;
         this.nonAdminHandle = null;
         this.running = false;
@@ -1978,7 +2055,7 @@ export class EmbeddedPostgresLifecycle {
       }
     }
     try {
-      await pg.stop();
+      await this.stopLibraryPostgres(pg);
     } catch (error) {
       this.options.onError(`embedded postgres: cancelled startup cleanup failed: ${String(error)}`);
     } finally {
@@ -2213,6 +2290,35 @@ export class EmbeddedPostgresLifecycle {
     runningInstances.delete(this.options.dataDir);
   }
 
+  /**
+   * Stop the library-launched (non-elevated) postmaster.
+   *
+   * FNXC:PostgresEmbedded 2026-10-07-19:39:
+   * embedded-postgres stops Windows postmasters with `taskkill /f /t`, a forced TerminateProcess with no shutdown checkpoint, so every ordinary Fusion stop or restart was a PostgreSQL crash followed by WAL recovery on the next boot.
+   * An owned Windows postmaster must stop cleanly on every stop path (stop, signal hook, cancelled start, fatal recovery): run `pg_ctl stop -m fast -w` from the postmaster's own bin directory and force-kill only when pg_ctl cannot stop it.
+   * A postmaster child that already exited is never signalled: the library would wait forever for an exit that already happened and taskkill a pid Windows may have recycled.
+   */
+  private async stopLibraryPostgres(pg: EmbeddedPostgresInstance): Promise<void> {
+    const gracefulStop = windowsPgCtlStopForTests ?? (process.platform === "win32" ? runWindowsPgCtlFastStop : null);
+    const child = (pg as { process?: PostmasterChildLike }).process;
+    if (!gracefulStop || !child) {
+      await pg.stop();
+      return;
+    }
+    if (hasChildExited(child)) return;
+    const { status } = await gracefulStop({
+      pgCtl: join(dirname(child.spawnfile), "pg_ctl.exe"),
+      dataDir: this.options.dataDir,
+      timeoutSeconds: WINDOWS_PG_CTL_STOP_TIMEOUT_SECONDS,
+    });
+    if (status === 0 && (await waitForChildExit(child, WINDOWS_POSTMASTER_EXIT_WAIT_MS))) return;
+    if (hasChildExited(child)) return;
+    this.options.onLog(
+      `embedded postgres: pg_ctl fast stop did not stop the postmaster (status=${String(status)}); falling back to a forced stop`,
+    );
+    await pg.stop();
+  }
+
   async stop(): Promise<void> {
     this.stopRequested = true;
     this.uninstallShutdownHook();
@@ -2250,7 +2356,7 @@ export class EmbeddedPostgresLifecycle {
       return;
     }
     try {
-      await this.pg.stop();
+      await this.stopLibraryPostgres(this.pg);
     } catch (err) {
       this.options.onError(`embedded postgres: error during stop: ${String(err)}`);
     } finally {

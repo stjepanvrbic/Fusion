@@ -26,6 +26,7 @@ import {
   symlinkSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -51,6 +52,7 @@ import {
   __setWindowsElevatedAdminForTests,
   __setWindowsEmbeddedPostgresNativeRootForTests,
   __setWindowsLauncherForTests,
+  __setWindowsPgCtlStopForTests,
   resolveElectronAsarUnpackedPath,
   fingerprintEmbeddedPostgresNativeRoot,
   buildEmbeddedPostgresMaterializationMarker,
@@ -90,6 +92,7 @@ afterEach(async () => {
   __setWindowsElevatedAdminForTests(null);
   __setWindowsEmbeddedPostgresNativeRootForTests(null);
   __setWindowsLauncherForTests(null);
+  __setWindowsPgCtlStopForTests(null);
   clearEmbeddedPayloadIntegrityFailure();
   vi.useRealTimers();
   while (tracked.length > 0) {
@@ -1599,6 +1602,108 @@ describe("embedded-lifecycle: stale postmaster.pid recovery (issue #2411)", () =
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("embedded-lifecycle: owned Windows postmaster stops cleanly (pg_ctl fast)", () => {
+  type FakeChild = EventEmitter & { exitCode: number | null; signalCode: string | null; spawnfile: string; pid: number };
+  function fakePostgresChild(): FakeChild {
+    return Object.assign(new EventEmitter(), {
+      exitCode: null,
+      signalCode: null,
+      spawnfile: join("C:", "pg", "native", "bin", "postgres.exe"),
+      pid: 4242,
+    });
+  }
+
+  function setup(options: { pgCtlStatus?: number; exitOnPgCtl?: boolean } = {}) {
+    const dataDir = makeDataDir();
+    writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+    const child = fakePostgresChild();
+    const libraryStop = vi.fn(async () => {});
+    class ChildOwningEmbeddedPostgres {
+      process: FakeChild | undefined;
+      initialise = vi.fn(async () => {});
+      start = vi.fn(async () => { this.process = child; });
+      stop = libraryStop;
+    }
+    __setEmbeddedPostgresCtorForTests(ChildOwningEmbeddedPostgres as never);
+    __setWindowsElevatedAdminForTests(false);
+    const pgCtlCalls: Array<{ pgCtl: string; dataDir: string }> = [];
+    __setWindowsPgCtlStopForTests(async (request) => {
+      pgCtlCalls.push({ pgCtl: request.pgCtl, dataDir: request.dataDir });
+      if (options.exitOnPgCtl !== false) {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+      }
+      return { status: options.pgCtlStatus ?? 0 };
+    });
+    vi.spyOn(EmbeddedPostgresLifecycle.prototype, "ensureDatabase").mockResolvedValue(undefined);
+    const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), port: 55460, startTimeoutMs: 0 });
+    tracked.push({ lifecycle, dataDir });
+    return { dataDir, child, libraryStop, pgCtlCalls, lifecycle };
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("stop() runs pg_ctl fast shutdown from the postmaster's own bin and never force-kills", async () => {
+    const { dataDir, libraryStop, pgCtlCalls, lifecycle } = setup();
+    await lifecycle.start();
+    await lifecycle.stop();
+    expect(pgCtlCalls).toEqual([{ pgCtl: join("C:", "pg", "native", "bin", "pg_ctl.exe"), dataDir }]);
+    expect(libraryStop).not.toHaveBeenCalled();
+    expect(lifecycle.isRunning()).toBe(false);
+  });
+
+  it("the signal hook stops through pg_ctl", async () => {
+    const { pgCtlCalls, libraryStop, lifecycle } = setup();
+    await lifecycle.start();
+    const realKill = process.kill;
+    (process as unknown as { kill: () => void }).kill = () => {};
+    try {
+      await (lifecycle as unknown as { boundShutdown: (s: NodeJS.Signals) => Promise<void> }).boundShutdown("SIGINT");
+    } finally {
+      (process as unknown as { kill: typeof realKill }).kill = realKill;
+    }
+    expect(pgCtlCalls).toHaveLength(1);
+    expect(libraryStop).not.toHaveBeenCalled();
+  });
+
+  it("Windows fatal recovery stops the crashed owner through pg_ctl before restarting", async () => {
+    const { pgCtlCalls, libraryStop, lifecycle } = setup();
+    await lifecycle.start();
+    await (lifecycle as unknown as { recoverWindowsFatalOnce: () => Promise<void> }).recoverWindowsFatalOnce();
+    expect(pgCtlCalls.length).toBeGreaterThanOrEqual(1);
+    expect(libraryStop).not.toHaveBeenCalled();
+  });
+
+  it("a cancelled start settles its postmaster through pg_ctl", async () => {
+    const { pgCtlCalls, libraryStop, lifecycle, child } = setup();
+    const internal = lifecycle as unknown as {
+      settleCancelledStart: (pg: { process?: unknown; stop: () => Promise<void> }) => Promise<void>;
+    };
+    await internal.settleCancelledStart({ process: child, stop: libraryStop });
+    expect(pgCtlCalls).toHaveLength(1);
+    expect(libraryStop).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the library stop when pg_ctl cannot stop the postmaster", async () => {
+    const { pgCtlCalls, libraryStop, lifecycle } = setup({ pgCtlStatus: 1, exitOnPgCtl: false });
+    await lifecycle.start();
+    await lifecycle.stop();
+    expect(pgCtlCalls).toHaveLength(1);
+    expect(libraryStop).toHaveBeenCalledOnce();
+  });
+
+  it("does not signal an already-exited postmaster pid, which Windows may have recycled", async () => {
+    const { pgCtlCalls, libraryStop, lifecycle, child } = setup();
+    await lifecycle.start();
+    child.exitCode = 1;
+    await lifecycle.stop();
+    expect(pgCtlCalls).toHaveLength(0);
+    expect(libraryStop).not.toHaveBeenCalled();
   });
 });
 
