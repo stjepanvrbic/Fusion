@@ -7,6 +7,11 @@ import {
   TRIAGE_HEARTBEAT_PATROL_DISABLED_INSTRUCTION,
 } from "@fusion/core";
 
+/*
+FNXC:OperatorMailDedup 2026-10-07-12:56:
+A CEO heartbeat asked the operator to run `git push origin main`, which the operator could not do (403), while the pushAfterMerge setting automates that exact action.
+Critical rules (which survive custom HEARTBEAT.md procedures) require verifying a human can perform an action, and that no setting or tool already automates it, before asking.
+*/
 export const HEARTBEAT_CRITICAL_RULES = `## Critical Rules
 
 - ONE concrete coordination action per tick, then call fn_heartbeat_done (or an explicit no-op with reason).
@@ -16,6 +21,7 @@ export const HEARTBEAT_CRITICAL_RULES = `## Critical Rules
 - Blocked-task dedup: if the same blocker is already logged and Wake Delta shows no new context, do not re-chase or re-comment — no-op with reason.
 - Before fn_task_create, scan open tasks; do not create duplicates of work already covered.
 - Prefer create/delegate to another agent over asking a human when an agent can do the work.
+- Before asking a human to act, verify they can (e.g. dry-run/read-check push access) and that no project setting (e.g. pushAfterMerge) or tool already automates it; if one does, recommend that instead.
 - Escalate via reports-to / chain of command when stuck after a concrete chase attempt.
 - Progress notes: short status line + done / remaining / next owner + task ids (FN-####).
 - Your assigned tasks list (when present) is coordination inventory, not an implement-from-heartbeat queue.`;

@@ -2235,6 +2235,83 @@ describe("executeHeartbeat", () => {
     });
   });
 
+  /*
+  FNXC:OperatorMailDedup 2026-10-07-12:56:
+  A durable agent cannot see its own sent operator mail through fn_read_messages, so it re-reported one blocker hourly.
+  Every heartbeat prompt (no-task and task-scoped) lists the agent's own recent agent->user messages: bounded, newest first, one truncated title line each, never full bodies.
+  */
+  describe("recent operator outbox in heartbeat prompt", () => {
+    const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+    const outboxMessage = (id: string, minutes: number, overrides: Partial<Message> = {}) => createMessage({
+      id,
+      fromId: "agent-001",
+      fromType: "agent",
+      toId: "dashboard",
+      toType: "user",
+      type: "agent-to-user",
+      createdAt: minutesAgo(minutes),
+      ...overrides,
+    });
+
+    const runWithOutbox = async (outbox: Message[], agentData: Partial<Agent>) => {
+      const store = createStoreWithAgentForExec(agentData);
+      const mockSession = createMockAgentSession();
+      mockedCreateFnAgent.mockResolvedValue({ session: mockSession as any });
+      const messageStore = {
+        setMessageToAgentHook: vi.fn(),
+        getInbox: vi.fn().mockReturnValue([]),
+        getOutbox: vi.fn().mockResolvedValue(outbox),
+        markAllAsRead: vi.fn(),
+      } as unknown as MessageStore;
+      const monitor = new HeartbeatMonitor({ store, messageStore, taskStore: mockTaskStore, rootDir: "/tmp" });
+      const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer", triggerDetail: "scheduled" });
+      const promptCalls = mockSession.prompt.mock.calls;
+      return { result, messageStore, executionPrompt: promptCalls[promptCalls.length - 1]![0] as string };
+    };
+
+    const outbox = [
+      outboxMessage("msg-old", 30 * 60),
+      outboxMessage("msg-a", 300, { content: "Board blocker: landed work not pushed\nfull body line that must not appear" }),
+      outboxMessage("msg-b", 120, { read: true, content: `Decision needed: ${"x".repeat(400)}` }),
+      outboxMessage("msg-c", 60, {
+        content: "See report body",
+        metadata: { mailKind: "report", report: { title: "Push main to unblock", sections: [{ heading: "H", body: "hidden report body" }] } },
+      }),
+      outboxMessage("msg-d", 50),
+      outboxMessage("msg-e", 40),
+      outboxMessage("msg-f", 30),
+    ];
+
+    it.each([
+      ["no-task", { taskId: undefined, soul: "I am the CEO" }],
+      ["task-scoped", {}],
+    ])("%s run lists the agent's own recent operator messages, bounded and newest first", async (_label, agentData) => {
+      const { result, messageStore, executionPrompt } = await runWithOutbox(outbox, agentData);
+
+      expect(result.status).toBe("completed");
+      expect(messageStore.getOutbox).toHaveBeenCalledWith("agent-001", "agent", expect.objectContaining({ type: "agent-to-user" }));
+      expect(executionPrompt).toContain("## Your Recent Operator Messages");
+      expect(executionPrompt).toMatch(/unless the facts changed/i);
+
+      const section = executionPrompt.slice(executionPrompt.indexOf("## Your Recent Operator Messages"));
+      const entryIds = [...section.matchAll(/^- \[id: (msg-[a-z]+)\]/gm)].map((match) => match[1]);
+      expect(entryIds).toEqual(["msg-f", "msg-e", "msg-d", "msg-c", "msg-b"]);
+      expect(section).not.toContain("msg-old");
+      expect(section).toMatch(/\[id: msg-c\].*\breport\b.*Push main to unblock/);
+      expect(section).toMatch(/\[id: msg-b\].*\bread\b/);
+      expect(section).toMatch(/\[id: msg-f\].*\bunread\b/);
+      expect(executionPrompt).not.toContain("x".repeat(200));
+      expect(executionPrompt).not.toContain("hidden report body");
+      expect(executionPrompt).not.toContain("full body line that must not appear");
+    });
+
+    it("omits the section when the agent sent no recent operator messages", async () => {
+      const { executionPrompt } = await runWithOutbox([outboxMessage("msg-old", 30 * 60)], { taskId: undefined, soul: "I am the CEO" });
+
+      expect(executionPrompt).not.toContain("## Your Recent Operator Messages");
+    });
+  });
+
   describe("blocked-task heartbeat: runs through without early exit", () => {
     it("invokes the model when task is blocked (no early exit)", async () => {
       const store = createStoreWithAgentForExec({ taskId: "FN-BLOCKED" });
@@ -3295,6 +3372,7 @@ describe("executeHeartbeat", () => {
         expect(prompt).toContain("Checkout/claim conflict");
         expect(prompt).toContain("Blocked-task dedup");
         expect(prompt).toContain("coordination inventory");
+        expect(prompt).toContain("Before asking a human to act");
       }
     });
 

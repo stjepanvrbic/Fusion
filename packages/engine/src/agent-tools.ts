@@ -29,6 +29,7 @@ import { mirrorPlanToProjectDb } from "./plan-artifact-writeback.js";
 import { fetchWebContent, WebFetchError } from "./util/web-fetch.js";
 import type { RunAuditor } from "./util/run-audit.js";
 import { computeApprovalDedupeKey } from "./agents/agent-action-gate.js";
+import { findUnreadDuplicateOperatorMessage } from "./agents/operator-outbox.js";
 import { MessageDeliveryAutoRecoveryHandler } from "./auto-recovery-handlers/message-delivery.js";
 import { emitGoalRetrievalAudit } from "./goals/goal-anchoring-audit.js";
 import { recordRetry } from "./errors/retry-burned-logger.js";
@@ -6263,6 +6264,34 @@ export function createSendMessageTool(
             return {
               content: [{ type: "text" as const, text: `ERROR: Recipient agent '${recipient.id}' does not exist — message not sent` }],
               details: {},
+            };
+          }
+        }
+
+        /*
+        FNXC:OperatorMailDedup 2026-10-07-12:56:
+        An agent->user send identical (normalized) to one this agent already sent the same recipient within the window, still unread, is not inserted; the agent is told which earlier message it repeats.
+        Agent->agent mail is never deduped here. A failed lookup degrades to the pre-guard behavior (deliver), because the guard prevents noise and must never drop a legitimate report.
+        */
+        if (recipient.type === "user") {
+          let duplicate: Message | null = null;
+          try {
+            duplicate = await findUnreadDuplicateOperatorMessage(messageStore, {
+              fromAgentId,
+              toId: recipient.id,
+              content,
+              report: params.report,
+            });
+          } catch (lookupError) {
+            log.warn(`fn_send_message duplicate lookup failed for ${fromAgentId}; delivering without dedupe: ${lookupError instanceof Error ? lookupError.message : String(lookupError)}`);
+          }
+          if (duplicate) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `Message NOT sent: duplicate of ${duplicate.id} (sent ${duplicate.createdAt}), which ${recipient.id} has not read yet. Do not resend; message again only when the facts change, and say what changed.`,
+              }],
+              details: { suppressed: true, duplicateOfMessageId: duplicate.id },
             };
           }
         }

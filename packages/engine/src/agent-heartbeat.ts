@@ -56,6 +56,7 @@ import {
   ensureDefaultHeartbeatProcedureFile,
 } from "./agents/agent-instructions.js";
 import { resolveHeartbeatPromptTemplate, resolveHeartbeatScopeDisciplineMode, selectHeartbeatProcedure } from "./agents/heartbeat-procedure-resolver.js";
+import { buildRecentOperatorOutboxLines, RECENT_OPERATOR_OUTBOX_MAX_ENTRIES } from "./agents/operator-outbox.js";
 import { buildPromptLayers, collapsePromptLayers } from "./execution/prompt-layers.js";
 import { resolveAndEmitGoalContext } from "./goals/goal-injection-diagnostics.js";
 import { createLogger, heartbeatLog, formatError } from "./logger.js";
@@ -3304,6 +3305,22 @@ export class HeartbeatMonitor {
             }
           }
 
+          /*
+          FNXC:OperatorMailDedup 2026-10-07-12:56:
+          fn_read_messages shows only the inbox, so the agent cannot see what it already told the operator and re-reports the same blocker every tick.
+          Inject its own recent agent->user mail (bounded, titles only) into every heartbeat prompt; a lookup failure only omits the section.
+          */
+          let recentOperatorOutboxLines: string[] = [];
+          if (this.messageStore) {
+            try {
+              recentOperatorOutboxLines = buildRecentOperatorOutboxLines(
+                await this.messageStore.getOutbox(agentId, "agent", { type: "agent-to-user", limit: RECENT_OPERATOR_OUTBOX_MAX_ENTRIES }),
+              );
+            } catch (outboxErr) {
+              heartbeatLog.warn(`Failed to fetch recent operator outbox for ${agentId}: ${outboxErr instanceof Error ? outboxErr.message : String(outboxErr)}`);
+            }
+          }
+
           const wakeInboxEmpty =
             pendingMessages.length === 0
             && pendingRoomMessages.total === 0
@@ -3573,6 +3590,7 @@ export class HeartbeatMonitor {
               "prioritize existing work that aligns with your role and soul before creating tasks.",
               ...candidateLines,
               ...pendingMessagesLines,
+              ...recentOperatorOutboxLines,
               ...pendingRoomMessagesLines,
               ...roomAmbiguityNoticesLines,
               ...roomCoordinationNoticesLines,
@@ -3663,6 +3681,7 @@ export class HeartbeatMonitor {
               taskDetail!.prompt ? `PROMPT.md:\n${trimPromptMd(taskDetail!.prompt, promptTemplate)}` : "No PROMPT.md available.",
               ...trimTriggeringComments(triggeringCommentLines, promptTemplate),
               ...pendingMessagesLines,
+              ...recentOperatorOutboxLines,
               ...pendingRoomMessagesLines,
               ...roomAmbiguityNoticesLines,
               ...roomCoordinationNoticesLines,
