@@ -604,6 +604,10 @@ Route handlers receive the same loader-built `PluginContext` used by hooks/tools
 - Route path: `/status`
 - Full URL: `/api/plugins/fusion-plugin-notification/status`
 
+A request is served only when the plugin is loaded in the request's project (`projectId` in the query or body, otherwise the launch project), and the handler's `taskStore` belongs to that project. A plugin disabled in that project answers 404 even when another project enables it.
+
+Plugin management routes are mounted first, so a plugin route with the same method and path never runs. These are skipped with a warning in the dashboard log: `GET` of `/`, `/settings` or `/setup-status`; `POST` of `/enable`, `/disable`, `/reload`, `/rescan`, `/setup/install` or `/setup/uninstall`; `PUT /settings`; `PATCH /`; and `DELETE /`. Matching ignores case and a trailing slash.
+
 ### UI metadata endpoints
 
 <!-- FNXC:UiMetadataApi 2026-07-14-00:00: Frontend plugins and command palettes must discover the host's registered view ids and Settings metadata through authenticated, read-only APIs instead of hardcoding dashboard-owned ids, labels, or search terms. -->

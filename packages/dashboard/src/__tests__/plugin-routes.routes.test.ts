@@ -9,7 +9,7 @@ import type { TaskStore } from "@fusion/core";
 import { PluginLoader, type PluginInstallation, type PluginStore } from "@fusion/core";
 import { PluginRunner } from "@fusion/engine";
 import { createApiRoutes } from "../routes.js";
-import { createPluginRouter } from "../plugin-routes.js";
+import { createPluginRouter, findReservedPluginRoute, RESERVED_PLUGIN_MANAGEMENT_ROUTES } from "../plugin-routes.js";
 import { get as performGet, request as performRequest } from "../test-request.js";
 import * as projectStoreResolver from "../project-store-resolver.js";
 
@@ -1600,5 +1600,58 @@ describe("Project scoping", () => {
 
     expect(res.status).toBe(200);
     expect(mockGetOrCreateProjectStore).toHaveBeenCalledWith("proj_123");
+  });
+});
+
+/*
+FNXC:PluginRoutes 2026-10-07-19:36:
+Plugin dispatch excludes plugin routes that a management route shadows, using RESERVED_PLUGIN_MANAGEMENT_ROUTES. That list must equal the management routes actually mounted under /plugins, or a new management route would shadow plugin routes silently again.
+*/
+describe("reserved plugin management routes", () => {
+  it("equals the management routes mounted under /api/plugins", () => {
+    type RouteLayer = { route?: { path?: unknown; methods?: Record<string, boolean> } };
+    const collect = (stack: RouteLayer[], prefix: string, into: Set<string>) => {
+      for (const layer of stack) {
+        const path = layer.route?.path;
+        if (typeof path !== "string") continue;
+        if (prefix && path !== prefix && !path.startsWith(`${prefix}/`)) continue;
+        const relative = path.slice(prefix.length) || "/";
+        for (const [method, enabled] of Object.entries(layer.route?.methods ?? {})) {
+          if (enabled && method !== "_all") into.add(`${method.toUpperCase()} ${relative}`);
+        }
+      }
+    };
+
+    const mounted = new Set<string>();
+    const apiRouter = createApiRoutes(createMockTaskStore({ getPluginStore: vi.fn().mockReturnValue(createMockPluginStore()) }), {
+      pluginStore: createMockPluginStore(),
+      pluginLoader: createMockPluginLoader(),
+    });
+    collect((apiRouter as unknown as { stack: RouteLayer[] }).stack, "/plugins", mounted);
+    const pluginRouter = createPluginRouter(createMockPluginStore(), createMockPluginLoader());
+    collect((pluginRouter as unknown as { stack: RouteLayer[] }).stack, "", mounted);
+
+    const reserved = RESERVED_PLUGIN_MANAGEMENT_ROUTES.map((entry) => `${entry.method} ${entry.path}`);
+    expect([...mounted].sort()).toEqual([...new Set(reserved)].sort());
+  });
+
+  it.each([
+    ["todos", "POST", "/enable", "POST /:id/enable"],
+    ["todos", "GET", "/", "GET /:id"],
+    ["todos", "GET", "/Settings/", "GET /:id/settings"],
+    ["registry", "GET", "", "GET /registry"],
+    ["install", "POST", "/", "POST /install"],
+  ])("reports %s %s %s as shadowed", (pluginId, method, path, expected) => {
+    const reserved = findReservedPluginRoute(pluginId, { method, path });
+    expect(reserved && `${reserved.method} ${reserved.path}`).toBe(expected);
+  });
+
+  it.each([
+    ["todos", "GET", "/items"],
+    ["todos", "GET", "/:section"],
+    ["todos", "POST", "/settings"],
+    ["todos", "GET", "/setup/install"],
+  ])("does not report %s %s %s as shadowed", (pluginId, method, path) => {
+    expect(findReservedPluginRoute(pluginId, { method, path })).toBeUndefined();
   });
 });
