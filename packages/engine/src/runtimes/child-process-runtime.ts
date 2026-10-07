@@ -429,14 +429,26 @@ export class ChildProcessRuntime
     if (hasExited(child)) return Promise.resolve();
 
     return new Promise<void>((resolve) => {
-      let escalation: ReturnType<typeof setTimeout> | undefined;
       let abandon: ReturnType<typeof setTimeout> | undefined;
-      const finish = () => {
+      const escalation = setTimeout(() => {
+        if (hasExited(child)) return finish();
+        runtimeLog.warn("Force killing child process");
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // already gone
+        }
+        abandon = setTimeout(() => {
+          runtimeLog.error(`Child process ${child.pid ?? "?"} did not report exit after SIGKILL`);
+          finish();
+        }, CHILD_EXIT_AFTER_SIGKILL_MS);
+      }, CHILD_SIGKILL_GRACE_MS);
+      function finish(): void {
         clearTimeout(escalation);
         clearTimeout(abandon);
         child.removeListener("exit", finish);
         resolve();
-      };
+      }
       child.once("exit", finish);
 
       runtimeLog.log("Killing child process");
@@ -450,20 +462,6 @@ export class ChildProcessRuntime
       } catch {
         // already gone; the exit event or the escalation settles it
       }
-
-      escalation = setTimeout(() => {
-        if (hasExited(child)) return finish();
-        runtimeLog.warn("Force killing child process");
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // already gone
-        }
-        abandon = setTimeout(() => {
-          runtimeLog.error(`Child process ${child.pid ?? "?"} did not report exit after SIGKILL`);
-          finish();
-        }, CHILD_EXIT_AFTER_SIGKILL_MS);
-      }, CHILD_SIGKILL_GRACE_MS);
     });
   }
 
