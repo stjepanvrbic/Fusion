@@ -367,15 +367,39 @@ jobs:
         shell: bash
         run: pnpm test:gate
 
+      # FNXC:CI 2026-10-07-21:10:
+      # Some core and engine files still fail on Windows only, and a permanently red Full Suite hides
+      # every new regression. Each lane records its Vitest JSON report and exit code without failing
+      # the step; the comparator step fails only on a failure outside
+      # scripts/lib/windows-known-failing-tests.json, a missing report, or an unexplained nonzero exit,
+      # and writes the result to the job summary.
       - name: Core unit lane
         if: ${{ !cancelled() }}
         shell: bash
-        run: pnpm --filter @fusion/core test
+        run: |
+          mkdir -p .windows-lane
+          set +e
+          pnpm --filter @fusion/core test --reporter=json --outputFile.json=../../.windows-lane/core.json
+          echo $? > .windows-lane/core.exit
+
+      - name: Compare core lane with known Windows failures
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: node scripts/check-windows-known-failing.mjs --package @fusion/core --report .windows-lane/core.json --exit-code .windows-lane/core.exit
 
       - name: Engine unit lane
         if: ${{ !cancelled() }}
         shell: bash
-        run: pnpm --filter @fusion/engine test
+        run: |
+          mkdir -p .windows-lane
+          set +e
+          pnpm --filter @fusion/engine test --reporter=json --outputFile.json=../../.windows-lane/engine.json
+          echo $? > .windows-lane/engine.exit
+
+      - name: Compare engine lane with known Windows failures
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: node scripts/check-windows-known-failing.mjs --package @fusion/engine --report .windows-lane/engine.json --exit-code .windows-lane/engine.exit
 
   # FNXC:PipelineSmoke 2026-08-23-14:52:
   # FN-182 runs the deterministic full-pipeline composition only after merge.

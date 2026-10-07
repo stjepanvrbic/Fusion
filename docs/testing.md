@@ -1018,6 +1018,10 @@ dependency changes, and other host-level shifts that can change test outcomes
 without changing any hashed file. Seven days bounds that blind spot while keeping
 the cache useful across a normal work week.
 
+## Windows Full Suite lane
+
+The non-blocking `test-windows` job runs the merge gate plus the full core and engine suites on `windows-latest`. Some files still fail on Windows only; they are listed in `scripts/lib/windows-known-failing-tests.json`. Each lane writes a Vitest JSON report, and `scripts/check-windows-known-failing.mjs` fails the job only when a file outside that list fails, the report is missing, or the lane exits nonzero with no failing file. The job summary lists every result. A listed file that now passes produces a warning: remove it and lower the ledger's `ceiling`. The ledger may only shrink; a new Windows-only failure is fixed or quarantined under the normal rules.
+
 ## No live provider credentials in test workers
 
 The shared Vitest setup removes provider credentials from every worker before any test runs: every `*_API_KEY`/`API_KEY_*` variable plus the provider token and cloud-credential names pi-ai resolves. A test that reaches a model session must mock the session seam, for example `reviewStep`, instead of relying on whatever keys the operator's shell exports. A deliberate live-provider run sets `FUSION_TEST_ALLOW_LIVE_PROVIDER_CREDENTIALS=1`. The same setup also drops `DATABASE_URL`.

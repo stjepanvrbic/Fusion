@@ -513,6 +513,21 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
       expect(indexOf(lane)).toBeGreaterThan(build);
       expect(indexOf(lane)).toBeGreaterThan(indexOf("Start-Service"));
     }
+
+    /*
+    FNXC:CI 2026-10-07-21:10:
+    Known Windows-only failures must not keep Full Suite permanently red, and they must not hide new ones. Each unit lane records its
+    Vitest JSON report and exit code, then the known-failing comparator decides the step. No step may use continue-on-error.
+    */
+    expect((job?.steps ?? []).some((step: any) => step["continue-on-error"] !== undefined)).toBe(false);
+    for (const [pkg, short] of [["@fusion/core", "core"], ["@fusion/engine", "engine"]] as const) {
+      const lane = indexOf(`pnpm --filter ${pkg} test`);
+      expect(runs[lane]).toContain(`--outputFile.json=../../.windows-lane/${short}.json`);
+      expect(runs[lane]).toContain(`> .windows-lane/${short}.exit`);
+      const compare = indexOf(`check-windows-known-failing.mjs --package ${pkg}`);
+      expect(compare).toBe(lane + 1);
+      expect(runs[compare]).toContain(`--report .windows-lane/${short}.json --exit-code .windows-lane/${short}.exit`);
+    }
   });
 
   /*

@@ -143,3 +143,6 @@ packages/core/src/postgres/pg_hba_trust.conf
 # recovery can't accidentally `git add` a multi-GB dump into history.
 fusion-pg-*.sql
 fusion-pg-*.dump
+
+# Windows Full Suite lane reports (scripts/check-windows-known-failing.mjs)
+.windows-lane/
