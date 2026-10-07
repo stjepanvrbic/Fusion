@@ -29,8 +29,9 @@ vi.mock("@fusion/core", () => ({
   CentralCore: class MockCentralCore {},
 }));
 
-vi.mock("../../ipc/ipc-worker.js", () => {
-  class MockIpcWorker {
+vi.mock("../../ipc/ipc-worker.js", async () => {
+  const { EventEmitter } = await import("node:events");
+  class MockIpcWorker extends EventEmitter {
     handlers = new Map<string, (payload: unknown) => Promise<unknown> | unknown>();
     onCommand = vi.fn((type: string, handler: (payload: unknown) => Promise<unknown> | unknown) => {
       this.handlers.set(type, handler);
@@ -39,6 +40,7 @@ vi.mock("../../ipc/ipc-worker.js", () => {
     shutdown = vi.fn();
 
     constructor() {
+      super();
       mockState.ipcWorkers.push(this);
     }
   }
@@ -108,6 +110,7 @@ vi.mock("../../project-engine.js", async () => {
 });
 
 type MockWorker = {
+  emit: (event: string, ...args: unknown[]) => boolean;
   handlers: Map<string, (payload: unknown) => Promise<unknown> | unknown>;
   onCommand: ReturnType<typeof vi.fn>;
   sendEvent: ReturnType<typeof vi.fn>;
@@ -400,6 +403,32 @@ describe("child-process-worker", () => {
 
     await vi.waitFor(() => {
       expect(worker.shutdown).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // FNXC:ChildProcessRuntime 2026-10-07-20:07: a host that dies sends nothing; the closed IPC channel must stop the engine and end the worker.
+  it("stops the engine and exits when the host's IPC channel closes", async () => {
+    const worker = await loadWorkerModule();
+    const startHandler = getHandler(worker, START_RUNTIME);
+
+    await startHandler({ config: testConfig });
+    const runtime = mockState.runtimes[0] as MockRuntime;
+
+    worker.emit("disconnect");
+
+    await vi.waitFor(() => {
+      expect(runtime.stop).toHaveBeenCalledTimes(1);
+      expect(process.exit).toHaveBeenCalledWith(0);
+    });
+  });
+
+  it("exits on host disconnect even when no engine was started", async () => {
+    const worker = await loadWorkerModule();
+
+    worker.emit("disconnect");
+
+    await vi.waitFor(() => {
+      expect(process.exit).toHaveBeenCalledWith(0);
     });
   });
 });

@@ -74,8 +74,9 @@ describe("engine task:updated emit surface", () => {
     (InProcessRuntime.prototype as any).setupEventForwarding.call(inProcess);
 
     const childUpstream = new EventEmitter();
-    const child = Object.assign(new EventEmitter(), { ipcHost: childUpstream });
-    (ChildProcessRuntime.prototype as any).setupEventForwarding.call(child);
+    const child = new EventEmitter();
+    // Forwarding is bound to one child generation's IPC host.
+    (ChildProcessRuntime.prototype as any).setupEventForwarding.call(child, { ipcHost: childUpstream });
 
     const remote = new RemoteNodeRuntime({
       nodeConfig: { id: "node", name: "node", url: "https://remote.invalid", apiKey: "test" },
