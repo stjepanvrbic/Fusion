@@ -3572,7 +3572,7 @@ async function buildDeterministicMergeMessage(params: {
   aiSummary?: string | null;
   aiBody?: string | null;
   aiSubject?: string | null;
-}): Promise<{ subjectArg: string; bodyArg: string }> {
+}): Promise<{ subject: string; body: string }> {
   const { taskId, branch, commitLog, diffStat, includeTaskId, aiSummary, aiBody, aiSubject } = params;
   const prefix = includeTaskId ? `feat(${taskId})` : "feat";
   const trimmedAiSubject = aiSubject?.trim() ?? "";
@@ -3592,13 +3592,28 @@ async function buildDeterministicMergeMessage(params: {
     aiBody,
   });
 
-  // -m args are double-quoted in the shell command, so escape backslashes,
-  // double quotes, dollar signs, and backticks.
-  const escape = (s: string) => s.replace(/(["\\$`])/g, "\\$1");
-  return {
-    subjectArg: `-m "${escape(subject)}"`,
-    bodyArg: `-m "${escape(body)}"`,
-  };
+  return { subject, body };
+}
+
+/**
+ * FNXC:MergeCommitMessage 2026-10-07-18:40:
+ * Every merger-authored squash or amend commit must carry its full body, its `Fusion-Task-Id` trailer and its
+ * co-author trailer on every platform. The message used to be a shell string of double-quoted `-m` args: cmd.exe
+ * ends a command at the first newline, and the backslash escaping was POSIX-only. Paragraphs now go to git as argv
+ * through execFile, so no shell parses them. Trailers form one final paragraph so git recognizes them as a trailer block.
+ */
+async function commitMergeMessage(
+  rootDir: string,
+  message: { subject: string; body: string; extraParagraphs?: string[]; trailers: string[] },
+  options: { amend?: boolean } = {},
+): Promise<void> {
+  const paragraphs = [message.subject, message.body, ...(message.extraParagraphs ?? []), message.trailers.join("\n")]
+    .filter((paragraph) => paragraph.trim().length > 0);
+  await execFileAsync(
+    "git",
+    ["commit", ...(options.amend ? ["--amend"] : []), ...paragraphs.flatMap((paragraph) => ["-m", paragraph])],
+    { cwd: rootDir, env: mergerCommitEnv() },
+  );
 }
 
 export { buildDeterministicMergeMessage as __testOnlyBuildDeterministicMergeMessage };
@@ -3761,7 +3776,7 @@ export async function commitOrAmendMergeWithFixes(
   commitLog: string,
   includeTaskId: boolean,
   preAttemptHeadSha: string,
-  authorArg: string,
+  authorTrailer: string,
   diffStat?: string,
   _settings?: Settings,
   _signal?: AbortSignal,
@@ -4123,7 +4138,7 @@ export async function commitOrAmendMergeWithFixes(
     const messageCommitLog = actualContext.commitLog || commitLog;
     const messageDiffStat = actualContext.diffStat || diffStat;
 
-    const { subjectArg, bodyArg } = await buildDeterministicMergeMessage({
+    const { subject, body } = await buildDeterministicMergeMessage({
       taskId,
       branch,
       commitLog: messageCommitLog,
@@ -4138,7 +4153,11 @@ export async function commitOrAmendMergeWithFixes(
       const existingTask = await store.getTask(taskId);
       lineageId = existingTask?.lineageId;
     }
-    const trailerArg = buildTaskTrailerArgs(taskId, lineageId);
+    const trailers = [
+      `${FUSION_TASK_ID_TRAILER_KEY}: ${taskId}`,
+      ...(lineageId ? [buildTaskLineageTrailer(lineageId)] : []),
+      ...(authorTrailer ? [authorTrailer] : []),
+    ];
 
     if (!headMoved) {
       // No merge commit yet — create one fresh on top of preAttemptHeadSha.
@@ -4155,10 +4174,7 @@ export async function commitOrAmendMergeWithFixes(
           auditor,
         });
       }
-      await execAsync(
-        `git commit ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
-        { cwd: rootDir, env: mergerCommitEnv() },
-      );
+      await commitMergeMessage(rootDir, { subject, body, trailers });
       if (store && lineageId) {
         await recordCommitAssociationFromHead(store, rootDir, taskId, lineageId);
       }
@@ -4179,10 +4195,7 @@ export async function commitOrAmendMergeWithFixes(
         auditor,
       });
     }
-    await execAsync(
-      `git commit --amend ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
-      { cwd: rootDir, env: mergerCommitEnv() },
-    );
+    await commitMergeMessage(rootDir, { subject, body, trailers }, { amend: true });
     if (store && lineageId) {
       await recordCommitAssociationFromHead(store, rootDir, taskId, lineageId);
     }
@@ -4593,12 +4606,14 @@ export async function resolveTaskDiffBaseRef({
  * Runs `git diff --name-only --diff-filter=U` and returns array of file paths.
  */
 
-/** Build the `-m "Fusion-Task-Id: <id>"` arg fragment used in fallback commit
- *  invocations. Returns a leading space + quoted -m arg. */
-function buildTaskTrailerArgs(taskId: string, lineageId?: string): string {
-  const taskIdTrailer = `${FUSION_TASK_ID_TRAILER_KEY}: ${taskId}`;
-  const lineageArg = lineageId ? ` -m "${buildTaskLineageTrailer(lineageId)}"` : "";
-  return ` -m "${taskIdTrailer}"${lineageArg}`;
+/** Trailer lines for merger-authored commits: task id, optional lineage, then the configured co-author. */
+function buildMergeCommitTrailers(taskId: string, settings: Parameters<typeof getCommitAuthorTrailer>[0], lineageId?: string): string[] {
+  const author = getCommitAuthorTrailer(settings);
+  return [
+    `${FUSION_TASK_ID_TRAILER_KEY}: ${taskId}`,
+    ...(lineageId ? [buildTaskLineageTrailer(lineageId)] : []),
+    ...(author ? [author] : []),
+  ];
 }
 
 /** True iff HEAD's commit message contains the `Fusion-Task-Id: <taskId>`
@@ -4906,10 +4921,19 @@ function getCommitAuthorArg(settings: {
   commitAuthorName?: string;
   commitAuthorEmail?: string;
 }): string {
-  if (settings.commitAuthorEnabled === false) return "";
+  const trailer = getCommitAuthorTrailer(settings);
+  return trailer ? ` -m "${trailer}"` : "";
+}
+
+function getCommitAuthorTrailer(settings: {
+  commitAuthorEnabled?: boolean;
+  commitAuthorName?: string;
+  commitAuthorEmail?: string;
+}): string | undefined {
+  if (settings.commitAuthorEnabled === false) return undefined;
   const name = settings.commitAuthorName || "Fusion";
   const email = settings.commitAuthorEmail || "noreply@runfusion.ai";
-  return ` -m "Co-authored-by: ${name} <${email}>"`;
+  return `Co-authored-by: ${name} <${email}>`;
 }
 
 export function buildSourceIssueRef(sourceIssue?: TaskSourceIssue | null): string {
@@ -6272,11 +6296,14 @@ async function pullWithRebaseAndResolveConflicts(
 
         try {
           throwIfAborted(options?.signal, taskId);
-          await execAsync("GIT_EDITOR=true git rebase --continue", {
+          // FNXC:MergePush 2026-10-07-22:40: `GIT_EDITOR=true cmd` is POSIX shell syntax and failed under cmd.exe whenever Git Bash
+          // was not resolved; the editor override now travels in the process env and git runs from argv.
+          await execFileAsync("git", ["rebase", "--continue"], {
             cwd: rootDir,
             timeout: PULL_REBASE_TIMEOUT_MS,
             maxBuffer: VERIFICATION_COMMAND_MAX_BUFFER,
             encoding: "utf-8",
+            env: { ...process.env, GIT_EDITOR: "true" },
           });
           mergerLog.log(`${taskId}: git rebase --continue succeeded (attempt ${attempt})`);
         } catch (continueError: unknown) {
@@ -9046,7 +9073,7 @@ export async function aiMergeTask(
               // Finalize the merge commit (fresh commit if HEAD didn't move,
               // amend if AI agent already committed). Always rewrites the
               // message deterministically from branch step commits.
-              const authorArg = getCommitAuthorArg(settings);
+              const authorTrailer = getCommitAuthorTrailer(settings) ?? "";
               const { stdout: finalizeHeadOut } = await execAsync("git rev-parse HEAD", { cwd: rootDir, encoding: "utf-8" });
               mergerLog.debug(`${taskId}: in-merge fix entering with preAttemptHeadSha=${preAttemptHeadSha}, currentHead=${finalizeHeadOut.trim()}`);
               const finalized = await commitOrAmendMergeWithFixes(
@@ -9056,7 +9083,7 @@ export async function aiMergeTask(
                 commitLog,
                 includeTaskId,
                 preAttemptHeadSha,
-                authorArg,
+                authorTrailer,
                 diffStat,
                 settings,
                 options.signal,
@@ -9195,7 +9222,7 @@ export async function aiMergeTask(
           }
 
           if (fixSuccess) {
-            const authorArg = getCommitAuthorArg(settings);
+            const authorTrailer = getCommitAuthorTrailer(settings) ?? "";
             const { stdout: finalizeHeadOut } = await execAsync("git rev-parse HEAD", { cwd: rootDir, encoding: "utf-8" });
             mergerLog.debug(`${taskId}: in-merge fix entering with preAttemptHeadSha=${preAttemptHeadSha}, currentHead=${finalizeHeadOut.trim()}`);
             const finalized = await commitOrAmendMergeWithFixes(
@@ -9205,7 +9232,7 @@ export async function aiMergeTask(
               commitLog,
               includeTaskId,
               preAttemptHeadSha,
-              authorArg,
+              authorTrailer,
               diffStat,
               settings,
               options.signal,
@@ -10479,9 +10506,7 @@ export async function executeMergeAttempt(
               settings: settings as Settings,
               signal: options.signal,
             });
-            const authorArg = getCommitAuthorArg(settings);
-            const trailerArg = buildTaskTrailerArgs(taskId);
-            const { subjectArg, bodyArg } = await buildDeterministicMergeMessage({
+            const { subject, body } = await buildDeterministicMergeMessage({
               taskId,
               branch,
               commitLog,
@@ -10499,10 +10524,7 @@ export async function executeMergeAttempt(
               resetLabel: "file-scope invariant violation",
               auditor: params.auditor,
             });
-            await execAsync(
-              `git commit ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
-              { cwd: rootDir, env: mergerCommitEnv() },
-            );
+            await commitMergeMessage(rootDir, { subject, body, trailers: buildMergeCommitTrailers(taskId, settings) });
             mergerLog.log(`${taskId}: committed after auto-resolving all conflicts`);
           } else {
             // Auto-resolution left nothing to commit — branch's changes were
@@ -10704,7 +10726,6 @@ export async function executeMergeAttempt(
     // tasks (especially on small diffs), and that message is what consumers
     // of mergeDetails surface. Subject keeps the conventional-commit shape.
     try {
-      const authorArg = getCommitAuthorArg(params.settings);
       // Recompute context against the AI commit's parent (= integration
       // target) so the message describes only what this commit actually
       // adds — not the wide branch range, which under squash-merge can
@@ -10726,7 +10747,7 @@ export async function executeMergeAttempt(
             branch,
           })
         : { commitLog: "", diffStat: "" };
-      const { subjectArg, bodyArg } = await buildDeterministicMergeMessage({
+      const { subject, body } = await buildDeterministicMergeMessage({
         taskId,
         branch,
         commitLog: actualContext.commitLog || commitLog,
@@ -10736,11 +10757,7 @@ export async function executeMergeAttempt(
         aiBody,
         aiSubject,
       });
-      const trailerArg = buildTaskTrailerArgs(taskId);
-      await execAsync(
-        `git commit --amend ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
-        { cwd: rootDir, env: mergerCommitEnv() },
-      );
+      await commitMergeMessage(rootDir, { subject, body, trailers: buildMergeCommitTrailers(taskId, params.settings) }, { amend: true });
       mergerLog.debug(`${taskId}: rewrote AI-authored merge commit message with deterministic body`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -10916,10 +10933,7 @@ async function finalizeSideStrategyAttempt(
     settings: settings as Settings,
     signal: params.options.signal,
   });
-  const authorArg = getCommitAuthorArg(settings);
-  const trailerArg = buildTaskTrailerArgs(taskId);
-  const issueRefBodyArg = sourceIssueRef ? ` -m "Ref: ${sourceIssueRef}"` : "";
-  const { subjectArg, bodyArg } = await buildDeterministicMergeMessage({
+  const { subject, body } = await buildDeterministicMergeMessage({
     taskId,
     branch,
     commitLog,
@@ -10937,10 +10951,12 @@ async function finalizeSideStrategyAttempt(
     resetLabel: "file-scope invariant violation",
     auditor: params.auditor,
   });
-  await execAsync(
-    `git commit ${subjectArg} ${bodyArg}${issueRefBodyArg}${trailerArg}${authorArg}`,
-    { cwd: rootDir, env: mergerCommitEnv() },
-  );
+  await commitMergeMessage(rootDir, {
+    subject,
+    body,
+    extraParagraphs: sourceIssueRef ? [`Ref: ${sourceIssueRef}`] : [],
+    trailers: buildMergeCommitTrailers(taskId, settings),
+  });
   mergerLog.log(`${taskId}: committed with -X ${side} auto-resolution`);
 
   if (testCommand || buildCommand) {
@@ -11349,10 +11365,7 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
           settings: settings as Settings,
           signal: options.signal,
         });
-        const authorArg = getCommitAuthorArg(settings);
-        const trailerArg = buildTaskTrailerArgs(taskId);
-        const issueRefBodyArg = sourceIssueRef ? ` -m "Ref: ${sourceIssueRef}"` : "";
-        const { subjectArg, bodyArg } = await buildDeterministicMergeMessage({
+        const { subject, body } = await buildDeterministicMergeMessage({
           taskId,
           branch,
           commitLog,
@@ -11362,10 +11375,12 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
           aiBody: aiBody?.trim().length ? aiBody : safeBody,
           aiSubject,
         });
-        await execAsync(
-          `git commit ${subjectArg} ${bodyArg}${issueRefBodyArg}${trailerArg}${authorArg}`,
-          { cwd: rootDir, env: mergerCommitEnv() },
-        );
+        await commitMergeMessage(rootDir, {
+          subject,
+          body,
+          extraParagraphs: sourceIssueRef ? [`Ref: ${sourceIssueRef}`] : [],
+          trailers: buildMergeCommitTrailers(taskId, settings),
+        });
       } else {
         // Build command was configured but agent didn't commit and didn't report failure
         // This is an error condition - agent didn't follow instructions

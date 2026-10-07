@@ -4,6 +4,11 @@ import { promisify } from "node:util";
 import type { BranchGroup, BranchGroupPrState, MergeTargetResolution, Settings, Task, TaskStore } from "@fusion/core";
 import { isBranchGroupMemberLanded, resolveEffectiveGroupAutoMerge, resolveTaskMergeTarget } from "@fusion/core";
 import { resolveIntegrationBranch } from "./integration-branch.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { RunAuditor } from "../util/run-audit.js";
+import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
 
 // argv-based git invocation: arguments are passed as an array (no shell), so
 // branch names like `foo$(touch /tmp/x)` can never trigger command substitution.
@@ -221,6 +226,72 @@ function throwIfPromotionAborted(signal: AbortSignal | undefined): void {
 }
 
 /**
+ * FNXC:BranchGroupPromotion 2026-10-07-19:05:
+ * Direct-mode promotion merges the group branch in a detached clean room at the integration tip, never by checking
+ * out or merging in the project root. A root on another branch is left alone and the integration ref moves by CAS.
+ * A root that has the integration branch checked out moves only by `--ff-only`, which is atomic: it succeeds with
+ * unrelated local edits and untracked files in place, or refuses without touching the checkout.
+ * A conflict aborts inside the clean room and throws, so the operator's checkout is never left mid-merge.
+ * An already-merged group branch is a no-op, preserving idempotent re-promotion.
+ */
+async function mergeGroupBranchInCleanRoom(input: PromoteBranchGroupInput, group: BranchGroup, integrationBranch: string): Promise<void> {
+  const run = async (args: string[], cwd: string) => (await execFileAsync("git", args, { cwd, signal: input.signal })).stdout.trim();
+  const tipSha = await run(["rev-parse", "--verify", `refs/heads/${integrationBranch}^{commit}`], input.rootDir);
+  const alreadyMerged = await run(["merge-base", "--is-ancestor", `refs/heads/${group.branchName}`, tipSha], input.rootDir)
+    .then(() => true, () => false);
+  if (alreadyMerged) return;
+
+  // Outside the repository: a clean room under the project root would read as untracked state and block the landing.
+  const cleanRoom = await mkdtemp(join(tmpdir(), `fusion-group-promote-${group.id.toLowerCase()}-`));
+  let worktreeAdded = false;
+  const forward = (domain: string) => async (event: { type: string; target: string; metadata?: Record<string, unknown> }) => {
+    await input.recordAudit?.({ domain, mutationType: event.type, target: event.target, metadata: event.metadata });
+  };
+  const audit: RunAuditor = { git: forward("git"), database: forward("database"), filesystem: forward("filesystem"), sandbox: forward("sandbox") };
+  try {
+    await run(["worktree", "add", "--detach", cleanRoom, tipSha], input.rootDir);
+    worktreeAdded = true;
+    throwIfPromotionAborted(input.signal);
+    try {
+      await run(["merge", "--no-ff", "--no-edit", `refs/heads/${group.branchName}`], cleanRoom);
+    } catch (error) {
+      await run(["merge", "--abort"], cleanRoom).catch(() => undefined);
+      throw new Error(
+        `Branch-group promotion of ${group.branchName} into ${integrationBranch} did not merge cleanly; the project checkout was not changed. ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const mergeSha = await run(["rev-parse", "HEAD"], cleanRoom);
+    throwIfPromotionAborted(input.signal);
+    const rootBranch = await run(["rev-parse", "--abbrev-ref", "HEAD"], input.rootDir).catch(() => "");
+    if (rootBranch === integrationBranch) {
+      // `--ff-only` either moves ref and tree together or refuses without touching the checkout.
+      if (await run(["rev-parse", "HEAD"], input.rootDir) !== tipSha) {
+        throw new Error(`Branch-group promotion of ${group.branchName}: ${integrationBranch} advanced concurrently; retry promotion.`);
+      }
+      try {
+        await run(["merge", "--ff-only", mergeSha], input.rootDir);
+      } catch (error) {
+        throw new Error(
+          `Branch-group promotion of ${group.branchName}: the project checkout on ${integrationBranch} has local changes the promotion would overwrite; the checkout was not changed. ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return;
+    }
+    const advanced = await advanceIntegrationBranchRef({
+      rootDir: input.rootDir, projectRootDir: input.rootDir, integrationBranch,
+      newSha: mergeSha, expectedCurrentSha: tipSha, taskId: group.id, audit,
+    });
+    if (!advanced.advanced) {
+      throw new Error(`Branch-group promotion of ${group.branchName} could not advance ${integrationBranch}: ${advanced.reason} (${advanced.diagnostic}); retry promotion.`);
+    }
+  } finally {
+    if (worktreeAdded) await execFileAsync("git", ["worktree", "remove", "--force", cleanRoom], { cwd: input.rootDir }).catch(() => undefined);
+    await rm(cleanRoom, { recursive: true, force: true }).catch(() => undefined);
+    if (worktreeAdded) await execFileAsync("git", ["worktree", "prune"], { cwd: input.rootDir }).catch(() => undefined);
+  }
+}
+
+/**
  * The only entrypoint allowed to perform shared-branch-group → default-branch promotion.
  * Promotion is intentionally idempotent and must never run inline in aiMergeTask.
  *
@@ -378,18 +449,7 @@ async function promoteBranchGroupInner(input: PromoteBranchGroupInput): Promise<
   if (!needsPrRepair && !isPrMode) {
     throwIfPromotionAborted(input.signal);
     await ensureGroupBranchExists(input.rootDir, group.branchName, integrationBranch);
-    const currentBranch = (
-      await execFileAsync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: input.rootDir })
-    ).stdout.trim();
-    try {
-      throwIfPromotionAborted(input.signal);
-      await execFileAsync("git", ["checkout", integrationBranch], { cwd: input.rootDir, signal: input.signal });
-      throwIfPromotionAborted(input.signal);
-      await execFileAsync("git", ["merge", "--no-ff", "--no-edit", group.branchName], { cwd: input.rootDir, signal: input.signal });
-    } finally {
-      // Restore the direct-merge caller's checkout even after cancellation.
-      await execFileAsync("git", ["checkout", currentBranch], { cwd: input.rootDir });
-    }
+    await mergeGroupBranchInCleanRoom(input, group, integrationBranch);
   }
 
   let prNumber: number | undefined = group.prNumber;

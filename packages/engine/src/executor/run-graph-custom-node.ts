@@ -54,6 +54,7 @@ import {
 import { resolveContentReviewInputProof } from "../worktree/review-diff-fingerprint.js";
 import { closeFusionBrowserSession } from "../agent-browser-lifecycle.js";
 import { classifyTaskWorktree } from "../worktree/worktree-pool.js";
+import { resolveIntegrationBranch } from "../merge/integration-branch.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -62,9 +63,9 @@ const execFileAsync = promisify(execFile);
  * Proves a freshly re-acquired post-merge checkout contains the landed commit. Uses async execFile
  * (never execSync) and treats any git failure as "not proven".
  */
-async function checkoutContainsCommit(worktreePath: string, commitSha: string): Promise<boolean> {
+async function checkoutContainsCommit(worktreePath: string, commitSha: string, commitish = "HEAD"): Promise<boolean> {
   try {
-    await execFileAsync("git", ["merge-base", "--is-ancestor", commitSha, "HEAD"], {
+    await execFileAsync("git", ["merge-base", "--is-ancestor", commitSha, commitish], {
       cwd: worktreePath,
       timeout: 30_000,
       windowsHide: true,
@@ -72,6 +73,36 @@ async function checkoutContainsCommit(worktreePath: string, commitSha: string): 
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * FNXC:PostMergeRecovery 2026-10-07-22:10:
+ * Automatic recovery for a landed post-merge checkout that does not contain the landed commit, tried before the gate
+ * parks. A clean checkout is detached in place at the tip of the branch the work landed on, when that branch contains
+ * the landed commit: the task pointer and the task branch stay where they are, and nothing is created or deleted.
+ * It refuses, with the operator-facing reason, when the checkout has uncommitted changes (moving it could lose them) or
+ * when the landed commit is not on that branch (no checkout could contain it).
+ */
+async function recoverCheckoutToLandedCommit(
+  rootDir: string,
+  worktreePath: string,
+  landedCommit: string,
+  landedBranch: string,
+): Promise<{ recovered: true } | { recovered: false; reason: string }> {
+  const git = async (args: string[], cwd: string) => (await execFileAsync("git", args, { cwd, timeout: 30_000, windowsHide: true })).stdout.toString().trim();
+  try {
+    if (await git(["status", "--porcelain"], worktreePath)) {
+      return { recovered: false, reason: `it has uncommitted changes; commit, stash or discard them in ${worktreePath}` };
+    }
+    const tipSha = await git(["rev-parse", "--verify", `refs/heads/${landedBranch}^{commit}`], rootDir);
+    if (!await checkoutContainsCommit(rootDir, landedCommit, tipSha)) {
+      return { recovered: false, reason: `landed commit ${landedCommit} is not on ${landedBranch}` };
+    }
+    await git(["checkout", "--detach", tipSha], worktreePath);
+    return { recovered: true };
+  } catch (error) {
+    return { recovered: false, reason: `automatic recovery failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
@@ -633,6 +664,24 @@ export async function runGraphCustomNode(
         );
         executionTarget = await deps.ensureGraphCustomNodeWorktree(executionTarget, settings, node.id);
       }
+      /*
+      FNXC:PostMergeRecovery 2026-10-07-19:40:
+      A landed workspace task carries one landed SHA per repository. Every configured repository checkout must contain
+      its own landed SHA before a post-merge reviewer starts, on every attempt, or the gate fails closed.
+      */
+      if (isLandedPostMergeNode) {
+        for (const [repository, landedSha] of Object.entries(executionTarget.mergeDetails?.workspaceLandedShas ?? {})) {
+          const path = executionTarget.workspaceWorktrees?.[repository]?.worktreePath;
+          if (typeof path === "string" && await checkoutContainsCommit(path, landedSha)) continue;
+          await deps.store.logEntry(
+            live.id,
+            `Workflow node '${node.id}' workspace checkout '${repository}' does not contain landed commit ${landedSha}; the gate will be rechecked later`,
+            path,
+            deps.getRunContextFor(live.id),
+          );
+          return { outcome: "failure", value: "post-merge-checkout-missing-landed-commit" };
+        }
+      }
     } else if (!workspaceConfig && isLandedPostMergeNode) {
       /*
       FNXC:PostMergeRecovery 2026-10-07-05:58:
@@ -657,11 +706,35 @@ export async function runGraphCustomNode(
         if (!executionTarget?.worktree) {
           return { outcome: "failure", value: "post-merge-checkout-unavailable" };
         }
-        const landedCommit = executionTarget.mergeDetails?.commitSha;
-        if (landedCommit && !await checkoutContainsCommit(executionTarget.worktree, landedCommit)) {
+      }
+      /*
+      FNXC:PostMergeRecovery 2026-10-07-19:40:
+      Landed-commit containment is an admission invariant for EVERY landed post-merge execution, including a reused
+      healthy checkout and a retry after an earlier attempt persisted a rejected checkout. It used to run only right after
+      re-acquisition, so the second attempt saw a healthy pointer and verified a tree without the landing.
+      FNXC:PostMergeRecovery 2026-10-07-22:10:
+      A checkout without the landed commit (a retained or preserved task checkout after a squash) is first recovered
+      automatically by `recoverCheckoutToLandedCommit`; the gate only fails when that recovery is unsafe or fails.
+      That failure is a plain recoverable gate result: the card stays in review and the rejected-gate recheck ladder
+      reruns this node, which retries the recovery, so it is never a terminal lane.
+      */
+      const landedCommit = executionTarget.mergeDetails?.commitSha;
+      const checkoutPath = executionTarget.worktree;
+      if (landedCommit && checkoutPath && !await checkoutContainsCommit(checkoutPath, landedCommit)) {
+        const landedBranch = executionTarget.mergeDetails?.mergeTargetBranch || await resolveIntegrationBranch(deps.rootDir, settings);
+        const recovery = await recoverCheckoutToLandedCommit(deps.rootDir, checkoutPath, landedCommit, landedBranch);
+        if (recovery.recovered && await checkoutContainsCommit(checkoutPath, landedCommit)) {
           await deps.store.logEntry(
             live.id,
-            `Workflow node '${node.id}' re-acquired ${executionTarget.worktree}, but it does not contain landed commit ${landedCommit}; the gate will be rechecked later`,
+            `Workflow node '${node.id}' detached ${checkoutPath} at the tip of ${landedBranch}, which contains landed commit ${landedCommit}; the task branch was left unchanged`,
+            undefined,
+            deps.getRunContextFor(live.id),
+          );
+        } else {
+          const reason = recovery.recovered ? "the recovered checkout still lacks it" : recovery.reason;
+          await deps.store.logEntry(
+            live.id,
+            `Workflow node '${node.id}' checkout ${checkoutPath} does not contain landed commit ${landedCommit} and could not be moved to it: ${reason}. The gate will be rechecked later`,
             undefined,
             deps.getRunContextFor(live.id),
           );

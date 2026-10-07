@@ -5,6 +5,7 @@ import {
   normalizeMergeIntegrationWorktreeMode,
   resolveWorkflowIrForTask,
   columnsWithFlag,
+  renewMergeQueueLease,
 } from "@fusion/core";
 import type {
   MergeIntegrationWorktreeMode,
@@ -28,10 +29,12 @@ import {
   getRegisteredWorktreeBranchMap,
 } from "../worktree/worktree-pool.js";
 import { canonicalFusionBranchName } from "../worktree/worktree-names.js";
+import { mergerLog } from "../logger.js";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const MERGE_HANDOFF_WORKER_ID = "merger-reuse-handoff";
+const MERGE_HANDOFF_LEASE_DURATION_MS = 15 * 60 * 1000;
 
 /** Shell-quote a value for safe interpolation into `git` command strings.
  *  Mirrors the `quoteArg` helper in merger.ts; kept local to avoid an
@@ -670,7 +673,7 @@ export async function acquireReuseHandoff(input: ReuseHandoffInput): Promise<Han
   const lease = await (input.store as TaskStore & {
     acquireMergeQueueLease(workerId: string, opts: { leaseDurationMs: number; now?: string; targetTaskId?: string }): Promise<unknown>;
   }).acquireMergeQueueLease(MERGE_HANDOFF_WORKER_ID, {
-    leaseDurationMs: 15 * 60 * 1000,
+    leaseDurationMs: MERGE_HANDOFF_LEASE_DURATION_MS,
     targetTaskId: input.task.id,
   });
   if (!lease) {
@@ -697,12 +700,14 @@ export async function acquireReuseHandoff(input: ReuseHandoffInput): Promise<Han
   // local executor could grab the task between them. Releasing here gives
   // a precise diagnostic instead of letting the merge proceed with a
   // conflicting executor lease and surfacing as a generic failure later.
+  const leaseToken = "leasedAt" in lease && typeof lease.leasedAt === "string" ? lease.leasedAt : undefined;
   if (executingTaskLock.has(input.task.id)) {
     (input.store as TaskStore & {
       releaseMergeQueueLease(taskId: string, workerId: string, outcome: MergeQueueReleaseOutcome): Promise<void>;
     }).releaseMergeQueueLease(input.task.id, MERGE_HANDOFF_WORKER_ID, {
       kind: "failure",
       error: "executor-lease-acquired-after-queue-lease",
+      ...(leaseToken ? { leaseToken } : {}),
     });
     throw new MergeHandoffRefusedError("lease-handoff-failed", "executor-lease-race-detected", {
       taskId: input.task.id,
@@ -711,16 +716,44 @@ export async function acquireReuseHandoff(input: ReuseHandoffInput): Promise<Han
     });
   }
 
+  /*
+  FNXC:TaskStoreMergeCoordination 2026-10-07-21:40:
+  A merge can outlive its fixed queue lease (AI merge plus verification on Windows). Without renewal the lease was
+  recovered as expired and handed to a second merger while the first was still landing.
+  The holder renews this exact lease generation (`leasedAt` token) every third of the lease duration until release,
+  stops once ownership is lost, and fences its release with the same token so it cannot release a successor's lease.
+  Renewal needs the store's async data layer; a store without one keeps the fixed lease.
+  */
+  const taskId = input.task.id;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  const stopHeartbeat = () => {
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = undefined;
+  };
+  if (leaseToken && (input.store as { asyncLayer?: unknown }).asyncLayer) {
+    heartbeat = setInterval(() => {
+      renewMergeQueueLease(input.store, taskId, MERGE_HANDOFF_WORKER_ID, {
+        leaseToken,
+        leaseDurationMs: MERGE_HANDOFF_LEASE_DURATION_MS,
+      }).catch((error: unknown) => {
+        stopHeartbeat();
+        mergerLog.warn(`${taskId}: merge-queue lease renewal stopped: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }, MERGE_HANDOFF_LEASE_DURATION_MS / 3);
+    heartbeat.unref?.();
+  }
+
   return {
     ok: true,
-    taskId: input.task.id,
+    taskId,
     worktreePath,
     branch: expectedBranch,
     workerId: MERGE_HANDOFF_WORKER_ID,
     releaseLease: (outcome) => {
+      stopHeartbeat();
       void (input.store as TaskStore & {
         releaseMergeQueueLease(taskId: string, workerId: string, outcome: MergeQueueReleaseOutcome): Promise<void>;
-      }).releaseMergeQueueLease(input.task.id, MERGE_HANDOFF_WORKER_ID, outcome);
+      }).releaseMergeQueueLease(taskId, MERGE_HANDOFF_WORKER_ID, leaseToken ? { ...outcome, leaseToken } : outcome);
     },
   };
 }

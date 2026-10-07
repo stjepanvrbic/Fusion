@@ -142,6 +142,41 @@ describe("runAiMerge approved-squash gates", () => {
     if (scopeOverride) expect(store.appendAgentLog).toHaveBeenCalledWith("FN-9050", expect.stringContaining("scopeOverride"), "status", undefined, "merger");
   });
 
+  /*
+  FNXC:FileScopeInvariant 2026-10-07-18:10:
+  A sibling of a declared file is not an overlap, and `custom` rules are enforced like a declared File Scope.
+  Neither may advance main.
+  */
+  it.each([
+    ["strict with a sibling of the declared file", { fileScope: "strict", fileScopeRules: [] }, ["allowed/a.txt"]],
+    ["custom rules that miss the squash", { fileScope: "custom", fileScopeRules: ["elsewhere/**"] }, ["allowed/**"]],
+  ] as const)("blocks %s before main advances", async (_label, resolvedPolicy, scope) => {
+    policy.mockResolvedValue(resolvedPolicy);
+    const dir = createRepo((root) => {
+      mkdirSync(join(root, "allowed"), { recursive: true });
+      writeFileSync(join(root, "allowed", "b.txt"), "sibling\n");
+    });
+    const before = git(dir, "rev-parse main");
+    const { store } = makeStore([...scope]);
+
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, {
+      mergeAgent: squashAgent("fusion/fn-9050"), reviewAgent: approve,
+    })).rejects.toBeInstanceOf(FileScopeViolationError);
+    expect(git(dir, "rev-parse main")).toBe(before);
+  });
+
+  it("lands when custom rules cover the squash", async () => {
+    policy.mockResolvedValue({ fileScope: "custom", fileScopeRules: ["allowed/**"] });
+    const dir = createRepo((root) => {
+      mkdirSync(join(root, "allowed"), { recursive: true });
+      writeFileSync(join(root, "allowed", "b.txt"), "inside\n");
+    });
+    const { store } = makeStore(["unrelated/**"]);
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, {
+      mergeAgent: squashAgent("fusion/fn-9050"), reviewAgent: approve,
+    })).resolves.toMatchObject({ merged: true });
+  });
+
   it("resets a recovered strict scope violation so a retry does not select it again", async () => {
     setPolicy();
     const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "outside\n"));
