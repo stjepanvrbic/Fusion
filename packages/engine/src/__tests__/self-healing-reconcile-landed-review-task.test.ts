@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Settings, Task, TaskStore } from "@fusion/core";
 import { SelfHealingManager } from "../self-healing.js";
+import * as publication from "../merge/landed-commit-publication.js";
 
 /*
 Surface enumeration: this covers the engine reconciliation seam shared by `fn task reconcile`
@@ -134,15 +135,50 @@ describe("SelfHealingManager.reconcileLandedReviewTask", () => {
       }),
     });
     const manager = managerWithStubs(store);
-
-    await expect(manager.reconcileLandedReviewTask(task.id, { source: "manual" })).resolves.toEqual({
-      outcome: "resumed", gateId: "post-merge-verification",
+    // FNXC:PostMergePublication 2026-10-07-15:20: The built-in gate reseeds only for a landing proven on the push remote; this fixture's landing is published.
+    const probe = vi.spyOn(publication, "probeLandedCommitPublication").mockResolvedValue({
+      state: "published", sha: "280fa38", target: { branch: "main", remote: "origin", targetBranch: "main", target: "origin/main" },
     });
-    await expect(manager.reconcileLandedReviewTask(task.id, { source: "manual" })).resolves.toEqual({
-      outcome: "raced", reason: "post-merge-continuation-not-idle",
-    });
+    try {
+      await expect(manager.reconcileLandedReviewTask(task.id, { source: "manual" })).resolves.toEqual({
+        outcome: "resumed", gateId: "post-merge-verification",
+      });
+      await expect(manager.reconcileLandedReviewTask(task.id, { source: "manual" })).resolves.toEqual({
+        outcome: "raced", reason: "post-merge-continuation-not-idle",
+      });
+    } finally {
+      probe.mockRestore();
+    }
     expect(continuations).toHaveLength(1);
     expect(continuations[0]).toMatchObject({ nodeId: "post-merge-verification", sourceColumn: "in-review", targetColumn: "in-review" });
+    expect(moveTask).not.toHaveBeenCalled();
+  });
+
+  it("does not resume an absent confirmed-merge gate while its landing is unpublished", async () => {
+    const task = baseTask({
+      id: "FN-9369", updatedAt: "2026-10-01T06:36:00.000Z", autoMerge: true,
+      mergeDetails: { mergeConfirmed: true, commitSha: "280fa38" },
+      enabledWorkflowSteps: ["post-merge-verification"], workflowStepResults: [],
+    });
+    const { store, moveTask } = storeWithTask(task);
+    const seed = vi.fn();
+    Object.assign(store, {
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: "builtin:coding", stepIds: ["post-merge-verification"] })),
+      getTaskWorkflowSelectionAsync: vi.fn(async () => ({ workflowId: "builtin:coding", stepIds: ["post-merge-verification"] })),
+      listWorkflowWorkItemsForTask: vi.fn(async () => []),
+      seedWorkspaceCodeReviewContinuationIfIdle: seed,
+    });
+    const manager = managerWithStubs(store);
+    const probe = vi.spyOn(publication, "probeLandedCommitPublication").mockResolvedValue({
+      state: "unpublished", sha: "280fa38", target: { branch: "main", remote: "origin", targetBranch: "main", target: "origin/main" },
+    });
+    try {
+      const result = await manager.reconcileLandedReviewTask(task.id, { source: "manual" });
+      expect(result).not.toMatchObject({ outcome: "resumed" });
+    } finally {
+      probe.mockRestore();
+    }
+    expect(seed).not.toHaveBeenCalled();
     expect(moveTask).not.toHaveBeenCalled();
   });
 
