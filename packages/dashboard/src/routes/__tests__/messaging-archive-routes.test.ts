@@ -36,6 +36,8 @@ function setup() {
     }),
     getInbox: vi.fn(async (_id: string, _type: string, filter: { archived?: boolean }) =>
       current && current.archived === (filter.archived === true) ? [current] : []),
+    countInbox: vi.fn(async (_id: string, _type: string, filter: { archived?: boolean }) =>
+      current && current.archived === (filter.archived === true) ? 1 : 0),
     getMailbox: vi.fn(async () => ({ unreadCount: current && !current.archived && !current.read ? 1 : 0 })),
   };
   const store = { getRootDir: () => "/test" } as unknown as TaskStore;

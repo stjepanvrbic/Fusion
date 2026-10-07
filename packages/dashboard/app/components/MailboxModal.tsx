@@ -45,6 +45,7 @@ import { MailboxRelatedWorkLink, hasRelatedTaskLink } from "./MailboxRelatedWork
 import { MailboxNativeStructureEmbeds } from "./MailboxNativeStructureEmbeds";
 import { MailboxTaskProposal } from "./MailboxTaskProposal";
 import { MailboxTaskRecommendations } from "./MailboxTaskRecommendations";
+import { MAILBOX_PAGE_SIZE, MailboxLoadMore, loadArchivedMailbox, loadMoreArchivedMailbox, mailboxRefreshLimit, mergeMailboxPage, type ArchivedMailboxState } from "./MailboxPaging";
 import { MailboxKindBadge, MailboxStructuralItem, isStructuralMail } from "./MailboxStructuralItem";
 import type { Agent } from "../api";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
@@ -319,7 +320,15 @@ export function MailboxModal({
   const [inbox, setInbox] = useState<InboxResponse | null>(() => initialInbox ?? null);
   const [structuralFilter, setStructuralFilter] = useState<"all" | "structural">("all");
   const [outbox, setOutbox] = useState<OutboxResponse | null>(() => initialOutbox ?? null);
-  const [archivedInbox, setArchivedInbox] = useState<InboxResponse | null>(null);
+  const [archivedInbox, setArchivedInbox] = useState<ArchivedMailboxState | null>(null);
+  const [loadingMore, setLoadingMore] = useState<"inbox" | "outbox" | "archived" | null>(null);
+  /* FNXC:Mailbox 2026-10-07-20:23: Refreshes keep every page already on screen, so the refresh callbacks read the loaded lists through refs instead of re-subscribing SSE on each page. */
+  const inboxRef = useRef(inbox);
+  const outboxRef = useRef(outbox);
+  const archivedInboxRef = useRef(archivedInbox);
+  useEffect(() => { inboxRef.current = inbox; }, [inbox]);
+  useEffect(() => { outboxRef.current = outbox; }, [outbox]);
+  useEffect(() => { archivedInboxRef.current = archivedInbox; }, [archivedInbox]);
   const [unreadCount, setUnreadCount] = useState(initialUnreadCount ?? 0);
   const [isLoading, setIsLoading] = useState(false);
   const [selectedMessage, setSelectedMessage] = useState<Message | null>(null);
@@ -338,6 +347,7 @@ export function MailboxModal({
   const [replyContextCache, setReplyContextCache] = useState<Map<string, Message>>(new Map());
   const consumedDeepLinkedMessageIdRef = useRef<string | null>(null);
   const highlightedDeepLinkedMessageIdRef = useRef<string | null>(null);
+  const directDeepLinkFetchRef = useRef<string | null>(null);
 
   /*
    * FNXC:MailboxMobile 2026-06-23-10:55:
@@ -388,12 +398,12 @@ export function MailboxModal({
     }
     skipOpenSpinnerInboxRef.current = false;
     try {
-      const data = await fetchInbox({ limit: 50 }, projectId);
+      const data = await fetchInbox({ limit: mailboxRefreshLimit(inboxRef.current?.messages.length) }, projectId);
       setInbox(data);
       setUnreadCount(data.unreadCount);
       writeCache(
         inboxCacheKey,
-        { ...data, messages: data.messages.slice(0, 100) },
+        { ...data, messages: data.messages.slice(0, 100), hasMore: data.hasMore || data.messages.length > 100 },
         { maxBytes: 500_000 },
       );
       writeCache(unreadCountCacheKey, data.unreadCount, { maxBytes: 500_000 });
@@ -412,14 +422,7 @@ export function MailboxModal({
       Archived mail must remain restorable regardless of whether it originated in the inbox, outbox, or an agent mailbox.
       Deduplicate the combined source results because aggregate agent queries can overlap a participant-specific response.
       */
-      const [inbox, outbox, agentMailbox] = await Promise.all([
-        fetchInbox({ limit: 50, archived: true }, projectId),
-        fetchOutbox({ limit: 50, archived: true }, projectId),
-        fetchAllAgentMailbox(projectId, { archived: true }),
-      ]);
-      const messages = [...inbox.messages, ...outbox.messages, ...agentMailbox.messages]
-        .filter((message, index, all) => all.findIndex(({ id }) => id === message.id) === index);
-      setArchivedInbox({ messages, total: messages.length, unreadCount: 0 });
+      setArchivedInbox(await loadArchivedMailbox(projectId, archivedInboxRef.current));
     } finally { setIsLoading(false); }
   }, [projectId]);
 
@@ -430,11 +433,11 @@ export function MailboxModal({
     }
     skipOpenSpinnerOutboxRef.current = false;
     try {
-      const data = await fetchOutbox({ limit: 50 }, projectId);
+      const data = await fetchOutbox({ limit: mailboxRefreshLimit(outboxRef.current?.messages.length) }, projectId);
       setOutbox(data);
       writeCache(
         outboxCacheKey,
-        { ...data, messages: data.messages.slice(0, 100) },
+        { ...data, messages: data.messages.slice(0, 100), hasMore: data.hasMore || data.messages.length > 100 },
         { maxBytes: 500_000 },
       );
     } catch {
@@ -443,6 +446,47 @@ export function MailboxModal({
       setIsLoading(false);
     }
   }, [outboxCacheKey, projectId]);
+
+  const loadMoreInbox = useCallback(async () => {
+    const current = inboxRef.current;
+    if (!current?.hasMore) return;
+    setLoadingMore("inbox");
+    try {
+      const page = await fetchInbox({ limit: MAILBOX_PAGE_SIZE, offset: current.messages.length }, projectId);
+      setInbox((prev) => mergeMailboxPage(prev, page));
+    } catch {
+      addToast?.(t("mailbox.loadMoreFailed", "Could not load more messages"), "error");
+    } finally {
+      setLoadingMore(null);
+    }
+  }, [projectId, addToast, t]);
+
+  const loadMoreOutbox = useCallback(async () => {
+    const current = outboxRef.current;
+    if (!current?.hasMore) return;
+    setLoadingMore("outbox");
+    try {
+      const page = await fetchOutbox({ limit: MAILBOX_PAGE_SIZE, offset: current.messages.length }, projectId);
+      setOutbox((prev) => mergeMailboxPage(prev, page));
+    } catch {
+      addToast?.(t("mailbox.loadMoreFailed", "Could not load more messages"), "error");
+    } finally {
+      setLoadingMore(null);
+    }
+  }, [projectId, addToast, t]);
+
+  const loadMoreArchived = useCallback(async () => {
+    const current = archivedInboxRef.current;
+    if (!current?.hasMore) return;
+    setLoadingMore("archived");
+    try {
+      setArchivedInbox(await loadMoreArchivedMailbox(projectId, current));
+    } catch {
+      addToast?.(t("mailbox.loadMoreFailed", "Could not load more messages"), "error");
+    } finally {
+      setLoadingMore(null);
+    }
+  }, [projectId, addToast, t]);
 
   const loadAgentMailbox = useCallback(async (agentId: string) => {
     setIsLoading(true);
@@ -641,12 +685,25 @@ export function MailboxModal({
     ].find((candidate) => candidate.id === deepLinkedMessageId);
 
     if (!message) {
+      /*
+      FNXC:Mailbox 2026-10-07-20:23:
+      A deep link to a message older than the loaded pages must still open it. Once the first inbox page has settled without the target, fetch that one message directly, once per link.
+      */
+      if (inbox === null || directDeepLinkFetchRef.current === deepLinkedMessageId) {
+        return;
+      }
+      directDeepLinkFetchRef.current = deepLinkedMessageId;
+      void fetchMessage(deepLinkedMessageId, projectId).then((fetched) => {
+        if (fetched.id !== deepLinkedMessageId || consumedDeepLinkedMessageIdRef.current === deepLinkedMessageId || getDeepLinkedMessageId() !== deepLinkedMessageId) return;
+        consumedDeepLinkedMessageIdRef.current = deepLinkedMessageId;
+        void handleOpenMessage(fetched, "deep-link");
+      }).catch(() => undefined);
       return;
     }
 
     consumedDeepLinkedMessageIdRef.current = deepLinkedMessageId;
     void handleOpenMessage(message, "deep-link");
-  }, [isOpen, inbox, outbox, agentMailbox, allAgentsMailbox, conversationMessages, handleOpenMessage]);
+  }, [isOpen, inbox, outbox, agentMailbox, allAgentsMailbox, conversationMessages, handleOpenMessage, projectId]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -1112,6 +1169,7 @@ export function MailboxModal({
                 <div className="mailbox-list" data-testid="mailbox-archived-list">
                   {archivedInbox?.messages.length === 0 && <div className="mailbox-empty" data-testid="mailbox-archived-empty">{t("mailbox.noArchivedMessages", "No archived messages")}</div>}
                   {archivedInbox?.messages.map((message) => <button type="button" className="mailbox-item" key={message.id} onClick={() => void handleOpenMessage(message)} data-testid={`mailbox-item-${message.id}`}>{message.content}</button>)}
+                  {archivedInbox?.hasMore && <MailboxLoadMore loading={loadingMore === "archived"} onLoadMore={() => void loadMoreArchived()} testId="mailbox-archived-load-more" />}
                 </div>
               )}
               {activeTab === "inbox" && (
@@ -1157,6 +1215,7 @@ export function MailboxModal({
                       {!msg.read && <div className="mailbox-item-unread-dot" data-testid={`mailbox-unread-dot-${msg.id}`} />}
                     </div>
                   ))}
+                  {inbox?.hasMore && <MailboxLoadMore loading={loadingMore === "inbox"} onLoadMore={() => void loadMoreInbox()} testId="mailbox-inbox-load-more" />}
                 </div>
               )}
 
@@ -1192,6 +1251,7 @@ export function MailboxModal({
                       </div>
                     </div>
                   ))}
+                  {outbox?.hasMore && <MailboxLoadMore loading={loadingMore === "outbox"} onLoadMore={() => void loadMoreOutbox()} testId="mailbox-outbox-load-more" />}
                 </div>
               )}
 

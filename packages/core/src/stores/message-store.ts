@@ -447,6 +447,25 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     return this.queryMessagesByParticipant("from", ownerId, ownerType, filter);
   }
 
+  /**
+   * FNXC:Mailbox 2026-10-07-20:16:
+   * Total size of a participant's filtered inbox, ignoring limit/offset, so mailbox pagination can report a real count and whether another page exists.
+   */
+  async countInbox(ownerId: string, ownerType: ParticipantType, filter?: MessageFilter): Promise<number> {
+    if (this.asyncLayer) {
+      return asyncMessageStore.countMessagesByParticipant(this.asyncLayer.db, "to", ownerId, ownerType, filter);
+    }
+    return this.countMessagesByParticipant("to", ownerId, ownerType, filter);
+  }
+
+  /** Total size of a participant's filtered outbox, ignoring limit/offset. */
+  async countOutbox(ownerId: string, ownerType: ParticipantType, filter?: MessageFilter): Promise<number> {
+    if (this.asyncLayer) {
+      return asyncMessageStore.countMessagesByParticipant(this.asyncLayer.db, "from", ownerId, ownerType, filter);
+    }
+    return this.countMessagesByParticipant("from", ownerId, ownerType, filter);
+  }
+
   private getParticipantIdsForLookup(ownerId: string, ownerType: ParticipantType): string[] {
     if (ownerType === "user" && ownerId === DASHBOARD_USER_ID) {
       return [DASHBOARD_USER_ID, "user", "user:dashboard", "User: user:dashboard"];
@@ -454,12 +473,12 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     return [ownerId];
   }
 
-  private queryMessagesByParticipant(
+  private participantMessageWhere(
     direction: "to" | "from",
     ownerId: string,
     ownerType: ParticipantType,
     filter?: MessageFilter,
-  ): Message[] {
+  ): { whereSql: string; params: (string | number)[] } {
     const idCol = direction === "to" ? "toId" : "fromId";
     const typeCol = direction === "to" ? "toType" : "fromType";
     const participantIds = this.getParticipantIdsForLookup(ownerId, ownerType);
@@ -480,7 +499,16 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     }
     whereClauses.push(filter?.archived === true ? "archived = 1" : "(archived = 0 OR archived IS NULL)");
 
-    const whereSql = whereClauses.join(" AND ");
+    return { whereSql: whereClauses.join(" AND "), params };
+  }
+
+  private queryMessagesByParticipant(
+    direction: "to" | "from",
+    ownerId: string,
+    ownerType: ParticipantType,
+    filter?: MessageFilter,
+  ): Message[] {
+    const { whereSql, params } = this.participantMessageWhere(direction, ownerId, ownerType, filter);
     const limit = filter?.limit ?? 100;
     const offset = filter?.offset ?? 0;
 
@@ -492,6 +520,17 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     `).all(...params, limit, offset);
 
     return (rows as unknown as MessageRow[]).map((row) => this.rowToMessage(row));
+  }
+
+  private countMessagesByParticipant(
+    direction: "to" | "from",
+    ownerId: string,
+    ownerType: ParticipantType,
+    filter?: MessageFilter,
+  ): number {
+    const { whereSql, params } = this.participantMessageWhere(direction, ownerId, ownerType, filter);
+    const row = this.db!.prepare(`SELECT COUNT(*) AS count FROM messages WHERE ${whereSql}`).get(...params) as { count: number } | undefined;
+    return row?.count ?? 0;
   }
 
   /**

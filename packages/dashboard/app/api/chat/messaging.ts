@@ -23,14 +23,20 @@ import { withProjectId } from "../client/health.js";
 /** Response shape for GET /messages/inbox */
 export interface InboxResponse {
   messages: Message[];
+  /** Size of the whole filtered inbox, not of this page. */
   total: number;
+  /** True when another page exists past this one. */
+  hasMore: boolean;
   unreadCount: number;
 }
 
 /** Response shape for GET /messages/outbox */
 export interface OutboxResponse {
   messages: Message[];
+  /** Size of the whole filtered outbox, not of this page. */
   total: number;
+  /** True when another page exists past this one. */
+  hasMore: boolean;
 }
 
 /** Response shape for GET /messages/unread-count */

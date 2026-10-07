@@ -136,6 +136,12 @@ badged Inbox tab was the first overflowing tab to collapse its icon to a dot.
   font-size: 0.9rem;
 }
 
+.mailbox-load-more {
+  display: flex;
+  justify-content: center;
+  padding: var(--space-md) var(--space-lg);
+}
+
 .mailbox-item {
   display: flex;
   align-items: flex-start;

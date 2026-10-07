@@ -23,6 +23,7 @@ vi.mock("../../api", () => ({
   markAllMessagesRead: vi.fn(),
   deleteMessage: vi.fn(),
   fetchConversation: vi.fn(),
+  fetchMessage: vi.fn(),
   sendMessage: vi.fn(),
   fetchAgents: vi.fn(),
   fetchApprovals: vi.fn(),
@@ -105,6 +106,7 @@ const mockMarkMessageRead = vi.mocked(apiModule.markMessageRead);
 const mockMarkAllMessagesRead = vi.mocked(apiModule.markAllMessagesRead);
 const mockDeleteMessage = vi.mocked(apiModule.deleteMessage);
 const mockFetchConversation = vi.mocked(apiModule.fetchConversation);
+const mockFetchMessage = vi.mocked(apiModule.fetchMessage);
 const mockSendMessage = vi.mocked(apiModule.sendMessage);
 const mockFetchApprovals = vi.mocked(apiModule.fetchApprovals);
 const mockFetchApprovalDetail = vi.mocked(apiModule.fetchApprovalDetail);
@@ -1457,12 +1459,15 @@ describe("MailboxView", () => {
     window.history.replaceState({}, "", "?view=mailbox&mailbox-message=missing#message-missing");
     mockFetchInbox.mockResolvedValue(makeInboxResponse([], 0));
     mockFetchConversation.mockResolvedValue([]);
+    // An unknown id is looked up directly (it may be older than the loaded page) and the server answers 404.
+    mockFetchMessage.mockRejectedValue(new Error("Message not found"));
 
     render(<MailboxView {...defaultProps} />);
 
     await waitFor(() => {
       expect(screen.getByTestId("mailbox-inbox-empty")).toBeDefined();
     });
+    await waitFor(() => expect(mockFetchMessage).toHaveBeenCalledWith("missing", undefined));
 
     expect(screen.queryByTestId("mailbox-message-detail")).toBeNull();
     expect(mockMarkMessageRead).not.toHaveBeenCalled();

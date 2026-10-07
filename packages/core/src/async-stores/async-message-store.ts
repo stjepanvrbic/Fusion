@@ -222,13 +222,12 @@ export async function reconcileProposalCreation(handle: QueryHandle, messageId: 
  * Query messages by participant direction (to = inbox, from = outbox).
  * Handles the dashboard-user multi-id lookup and optional filters.
  */
-export async function queryMessagesByParticipant(
-  handle: QueryHandle,
+function participantMessageConditions(
   direction: "to" | "from",
   ownerId: string,
   ownerType: ParticipantType,
   filter?: MessageFilter,
-): Promise<Message[]> {
+) {
   const idCol = direction === "to" ? schema.project.messages.toId : schema.project.messages.fromId;
   const typeCol = direction === "to" ? schema.project.messages.toType : schema.project.messages.fromType;
   const participantIds = participantIdsForLookup(ownerId, ownerType);
@@ -243,16 +242,45 @@ export async function queryMessagesByParticipant(
     conditions.push(eq(schema.project.messages.read, filter.read ? 1 : 0));
   }
   conditions.push(archivedCondition(filter?.archived));
+  return and(...conditions);
+}
+
+export async function queryMessagesByParticipant(
+  handle: QueryHandle,
+  direction: "to" | "from",
+  ownerId: string,
+  ownerType: ParticipantType,
+  filter?: MessageFilter,
+): Promise<Message[]> {
   const limit = filter?.limit ?? 100;
   const offset = filter?.offset ?? 0;
   const rows = await handle
     .select(messageColumns)
     .from(schema.project.messages)
-    .where(and(...conditions))
+    .where(participantMessageConditions(direction, ownerId, ownerType, filter))
     .orderBy(desc(schema.project.messages.createdAt), desc(schema.project.messages.id))
     .limit(limit)
     .offset(offset);
   return rows.map((row) => rowToMessage(row as MessageRow));
+}
+
+/**
+ * FNXC:Mailbox 2026-10-07-20:16:
+ * Total size of a participant's filtered inbox or outbox, using the same predicates as `queryMessagesByParticipant` and ignoring limit/offset.
+ * Mailbox pagination reports this instead of the returned page length, so messages past the first page stay reachable.
+ */
+export async function countMessagesByParticipant(
+  handle: QueryHandle,
+  direction: "to" | "from",
+  ownerId: string,
+  ownerType: ParticipantType,
+  filter?: MessageFilter,
+): Promise<number> {
+  const [row] = await handle
+    .select({ count: sql<number>`count(*)::int` })
+    .from(schema.project.messages)
+    .where(participantMessageConditions(direction, ownerId, ownerType, filter));
+  return row?.count ?? 0;
 }
 
 /**
