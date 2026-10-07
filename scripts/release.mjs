@@ -32,9 +32,11 @@
 //   (and the silent default for non-interactive dry-runs) is BETA.
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, readdirSync, writeFileSync, statSync, existsSync, unlinkSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync, writeFileSync, statSync, existsSync, unlinkSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { setTimeout as delay } from "node:timers/promises";
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
@@ -43,6 +45,9 @@ import { extractVersionNotes, replaceVersionSection } from "./lib/extract-versio
 import { parseChangesetFile } from "./lib/changeset-schema.mjs";
 import { distillReleaseNotes } from "./lib/distill-release-notes.mjs";
 import { shouldPromptForVersion } from "./lib/release-prompt-gate.mjs";
+import { describeSpawnFailure, resolveCommandInvocation } from "./lib/pnpm-invocation.mjs";
+import { createReleaseInputSnapshot, parsePorcelainPaths, releaseGeneratedPathMatcher } from "./lib/release-integrity.mjs";
+import { discoverWorkspacePackages } from "./build-workspace.mjs";
 import { selectChannelChangesets } from "./lib/channel-changeset-scope.mjs";
 import {
   evaluateBetaCycleAnchor,
@@ -147,15 +152,31 @@ const fail = (s) => {
   process.exit(1);
 };
 
-function run(cmd, { capture = false, allowFail = false, cwd } = {}) {
-  const r = spawnSync(cmd, {
-    shell: true,
+/*
+ * FNXC:ReleaseScript 2026-10-07-19:30:
+ * Commands run as argv through the shared launcher, never through a shell string.
+ * On Windows npm, pnpm and gh are .cmd shims that a shell-less spawn cannot start, and a shell string broke quoting (cmd.exe passes 'v*' with its quotes).
+ * A command that could not be launched is reported as a launch failure with its error, never as that command's own failure.
+ */
+function spawnCommand(command, args, { cwd, capture = false, timeout } = {}) {
+  const invocation = resolveCommandInvocation(command, args);
+  return spawnSync(invocation.command, invocation.args, {
+    cwd,
+    timeout,
     stdio: capture ? "pipe" : "inherit",
     encoding: "utf8",
-    cwd,
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments,
   });
-  if (r.status !== 0 && !allowFail) fail(`Command failed: ${cmd}`);
-  return { status: r.status, stdout: (r.stdout || "").trim() };
+}
+
+function run(command, args, { capture = false, allowFail = false, cwd, raw = false } = {}) {
+  const r = spawnCommand(command, args, { cwd, capture });
+  if (r.status !== 0 && !allowFail) {
+    const detail = capture ? `\n${(r.stderr || r.stdout || "").trim()}` : "";
+    fail(`Command failed (${describeSpawnFailure(r)}): ${[command, ...args].join(" ")}${detail}`);
+  }
+  const stdout = r.stdout || "";
+  return { status: r.status, stdout: raw ? stdout : stdout.trim() };
 }
 
 /**
@@ -294,12 +315,9 @@ const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 function computeReleasePlan() {
   const dir = mkdtempSync(join(tmpdir(), "fusion-release-"));
   const out = join(dir, "plan.json");
-  const r = spawnSync("pnpm", ["changeset", "status", "--output", out], {
-    stdio: "pipe",
-    encoding: "utf8",
-  });
+  const r = spawnCommand("pnpm", ["changeset", "status", "--output", out], { capture: true });
   if (r.status !== 0) {
-    fail(`Failed to compute release plan:\n${r.stderr || r.stdout}`);
+    fail(`Failed to compute release plan (${describeSpawnFailure(r)}):\n${r.stderr || r.stdout || ""}`);
   }
   const plan = JSON.parse(readFileSync(out, "utf8"));
   try { unlinkSync(out); } catch { /* tmp cleanup is best-effort */ }
@@ -402,7 +420,7 @@ function escapeRegex(s) {
 
 /** Highest published STABLE version from local `v*` git tags (prereleases excluded). */
 function latestStableTagVersion() {
-  const out = run("git tag --list 'v*'", { capture: true, allowFail: true }).stdout;
+  const out = run("git", ["tag", "--list", "v*"], { capture: true, allowFail: true }).stdout;
   return latestStableVersionFromTags(out);
 }
 
@@ -448,17 +466,13 @@ function runReleaseSmoke() {
   const aliasDir = join(repoRoot, "packages", "cli-alias");
   const smokeDir = mkdtempSync(join(tmpdir(), "fusion-smoke-"));
   const packDir = join(smokeDir, "tarballs");
-  spawnSync("mkdir", ["-p", packDir]);
+  mkdirSync(packDir, { recursive: true });
 
   const packOne = (cwd) => {
-    const r = spawnSync("pnpm", ["pack", "--pack-destination", packDir], {
-      cwd,
-      stdio: "pipe",
-      encoding: "utf8",
-    });
+    const r = spawnCommand("pnpm", ["pack", "--pack-destination", packDir], { cwd, capture: true });
     if (r.status !== 0) {
       cleanupSmoke(smokeDir);
-      fail(`pnpm pack failed in ${cwd}:\n${r.stderr || r.stdout}`);
+      fail(`pnpm pack failed in ${cwd} (${describeSpawnFailure(r)}):\n${r.stderr || r.stdout || ""}`);
     }
   };
   packOne(fusionDir);
@@ -475,7 +489,7 @@ function runReleaseSmoke() {
   const aliasTarballPath = join(packDir, aliasTarball);
 
   const installDir = join(smokeDir, "install");
-  spawnSync("mkdir", ["-p", installDir]);
+  mkdirSync(installDir, { recursive: true });
   // Override @runfusion/fusion to the local tarball — without this, npm tries
   // to fetch the version-matching tarball from the registry (which we haven't
   // published yet).
@@ -495,14 +509,14 @@ function runReleaseSmoke() {
     ),
   );
 
-  const npmInstall = spawnSync(
+  const npmInstall = spawnCommand(
     "npm",
     ["install", "--no-audit", "--no-fund", "--ignore-scripts", aliasTarballPath],
-    { cwd: installDir, stdio: "pipe", encoding: "utf8" },
+    { cwd: installDir, capture: true },
   );
   if (npmInstall.status !== 0) {
     cleanupSmoke(smokeDir);
-    fail(`npm install of packed tarballs failed:\n${npmInstall.stderr || npmInstall.stdout}`);
+    fail(`npm install of packed tarballs failed (${describeSpawnFailure(npmInstall)}):\n${npmInstall.stderr || npmInstall.stdout || ""}`);
   }
 
   // Invoke the bin via the alias entry. Exercises the same import graph as
@@ -513,7 +527,7 @@ function runReleaseSmoke() {
     cleanupSmoke(smokeDir);
     fail(`Smoke install missing alias bin at ${aliasBin}`);
   }
-  const invoke = spawnSync("node", [aliasBin, "--help"], {
+  const invoke = spawnSync(process.execPath, [aliasBin, "--help"], {
     cwd: installDir,
     stdio: "pipe",
     encoding: "utf8",
@@ -522,7 +536,7 @@ function runReleaseSmoke() {
   if (invoke.status !== 0) {
     cleanupSmoke(smokeDir);
     fail(
-      `Packed bin failed to start (exit ${invoke.status}):\n--- stdout ---\n${invoke.stdout}\n--- stderr ---\n${invoke.stderr}`,
+      `Packed bin failed to start (${describeSpawnFailure(invoke)}):\n--- stdout ---\n${invoke.stdout}\n--- stderr ---\n${invoke.stderr}`,
     );
   }
 
@@ -556,7 +570,7 @@ function runReleaseSmoke() {
   const consumerRequire = createRequire(join(installDir, "package.json"));
   const consumerTsc = consumerRequire.resolve("typescript/bin/tsc");
   const typecheck = spawnSync(
-    "node",
+    process.execPath,
     [consumerTsc, "--project", consumerTsconfigPath],
     { cwd: installDir, stdio: "pipe", encoding: "utf8", timeout: 120_000 },
   );
@@ -582,7 +596,21 @@ function cleanupSmoke(dir) {
  * published tarball, so we retry briefly. Failures are non-fatal — the user
  * can re-run the bump manually if needed; the release itself is already out.
  */
-function bumpHomebrewTap(version) {
+async function fetchSha256(url) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    return createHash("sha256").update(Buffer.from(await response.arrayBuffer())).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+/*
+ * FNXC:ReleaseScript 2026-10-07-19:30:
+ * The tarball hash is computed in-process (fetch + node:crypto) and the retry waits on a timer, so the stable tap bump does not depend on bash, curl, shasum, awk or sleep existing on the operator's machine.
+ */
+async function bumpHomebrewTap(version) {
   // FNXC:UpdateChannels 2026-07-19-15:10: the tap clone is gitignored and only
   // exists in the primary checkout. Assisted promotion runs this script from a
   // temporary worktree and passes the primary checkout's tap path via
@@ -600,19 +628,11 @@ function bumpHomebrewTap(version) {
   let sha256;
   const maxAttempts = 6;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const r = spawnSync(
-      "bash",
-      ["-c", `set -o pipefail; curl -sfL "${tarballUrl}" | shasum -a 256 | awk '{print $1}'`],
-      { stdio: "pipe", encoding: "utf8" }
-    );
-    const out = (r.stdout || "").trim();
-    if (r.status === 0 && /^[0-9a-f]{64}$/.test(out)) {
-      sha256 = out;
-      break;
-    }
+    sha256 = await fetchSha256(tarballUrl);
+    if (sha256) break;
     if (attempt < maxAttempts) {
       warn(`  npm registry not ready (attempt ${attempt}/${maxAttempts}); retrying in 5s…`);
-      spawnSync("sleep", ["5"]);
+      await delay(5_000);
     }
   }
   if (!sha256) {
@@ -633,9 +653,10 @@ function bumpHomebrewTap(version) {
   // homebrew-tap is a sibling clone (gitignored in this repo) with its own git
   // history; run git inside that working tree, not the main repo.
   const tapCwd = tapDir;
-  run(`git add Formula/fusion.rb`, { cwd: tapCwd });
+  run("git", ["add", "Formula/fusion.rb"], { cwd: tapCwd });
   const commit = run(
-    `git commit -m "chore(tap): bump fusion to v${version}" -m "Auto-bumped by scripts/release.mjs after npm publish."`,
+    "git",
+    ["commit", "-m", `chore(tap): bump fusion to v${version}`, "-m", "Auto-bumped by scripts/release.mjs after npm publish."],
     { allowFail: true, capture: true, cwd: tapCwd }
   );
   if (commit.status !== 0) {
@@ -643,7 +664,7 @@ function bumpHomebrewTap(version) {
     return;
   }
 
-  const push = run("git push origin main", { allowFail: true, capture: true, cwd: tapCwd });
+  const push = run("git", ["push", "origin", "main"], { allowFail: true, capture: true, cwd: tapCwd });
   if (push.status !== 0) {
     warn(`Failed to push tap bump commit to origin/main. Run \`git push origin main\` manually.`);
     return;
@@ -671,15 +692,16 @@ function findPackageDir(name) {
 // Check credentials before promotion or changesets can mutate the checkout.
 // Authentication does not prove package write permission; publish remains authoritative.
 if (!DRY_RUN) {
-  const auth = spawnSync("npm", ["whoami", "--registry=https://registry.npmjs.org/"], {
-    stdio: "pipe", encoding: "utf8", timeout: 30_000,
-  });
+  const auth = spawnCommand("npm", ["whoami", "--registry=https://registry.npmjs.org/"], { capture: true, timeout: 30_000 });
+  if (auth.error || auth.status === null) {
+    fail(`Could not run npm to check authentication (${describeSpawnFailure(auth)}). Make sure npm is installed and on PATH. No release changes were made.`);
+  }
   if (auth.status !== 0) {
     fail("npm authentication check failed. Run `npm login --registry=https://registry.npmjs.org/`, then retry. No release changes were made.");
   }
 }
 
-if (RESUME && !IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout === "main") {
+if (RESUME && !IS_BETA && run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { capture: true }).stdout === "main") {
   fail("Resume the stable release inside its retained 'release' worktree; --resume does not start a new promotion.");
 }
 
@@ -700,10 +722,10 @@ if (RESUME && !IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true
  * Dry-runs stop after reporting the promotion plan: creating the worktree
  * would move the local `release` ref, and dry-run must mutate nothing.
  */
-if (!IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout === "main") {
+if (!IS_BETA && run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { capture: true }).stdout === "main") {
   info("Stable release requested from 'main' — starting assisted promotion to the 'release' branch.");
 
-  const latestBetaTag = run("git tag --list 'v*-beta*' --merged HEAD --sort=-v:refname", { capture: true })
+  const latestBetaTag = run("git", ["tag", "--list", "v*-beta*", "--merged", "HEAD", "--sort=-v:refname"], { capture: true })
     .stdout.split("\n")[0]?.trim() ?? "";
   let promoteTarget = latestBetaTag;
   if (!promoteTarget) {
@@ -718,17 +740,17 @@ if (!IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout
     info(`Non-interactive: promoting ${promoteTarget}.`);
   }
 
-  const targetSha = run(`git rev-parse --verify --quiet ${promoteTarget}^{commit}`, { capture: true, allowFail: true });
+  const targetSha = run("git", ["rev-parse", "--verify", "--quiet", `${promoteTarget}^{commit}`], { capture: true, allowFail: true });
   if (targetSha.status !== 0 || !targetSha.stdout) {
     fail(`'${promoteTarget}' does not resolve to a commit.`);
   }
   const promoteSha = targetSha.stdout;
 
-  const originReleaseExists = run("git fetch origin release", { capture: true, allowFail: true }).status === 0;
-  const localReleaseExists = run("git show-ref --verify --quiet refs/heads/release", { capture: true, allowFail: true }).status === 0;
+  const originReleaseExists = run("git", ["fetch", "origin", "release"], { capture: true, allowFail: true }).status === 0;
+  const localReleaseExists = run("git", ["show-ref", "--verify", "--quiet", "refs/heads/release"], { capture: true, allowFail: true }).status === 0;
   const releaseBase = localReleaseExists ? "release" : originReleaseExists ? "origin/release" : null;
   if (releaseBase) {
-    const ff = run(`git merge-base --is-ancestor ${releaseBase} ${promoteSha}`, { capture: true, allowFail: true });
+    const ff = run("git", ["merge-base", "--is-ancestor", releaseBase, promoteSha], { capture: true, allowFail: true });
     if (ff.status !== 0) {
       fail(
         `'${releaseBase}' does not fast-forward to ${promoteTarget} (${promoteSha.slice(0, 10)}).\n` +
@@ -749,17 +771,17 @@ if (!IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout
   const promoteDir = mkdtempSync(join(tmpdir(), "fusion-release-promote-"));
   info(`Creating temporary release worktree at ${promoteDir}…`);
   if (localReleaseExists) {
-    run(`git worktree add "${promoteDir}" release`);
-    run(`git merge --ff-only ${promoteSha}`, { cwd: promoteDir });
+    run("git", ["worktree", "add", promoteDir, "release"]);
+    run("git", ["merge", "--ff-only", promoteSha], { cwd: promoteDir });
   } else if (originReleaseExists) {
-    run(`git worktree add -b release "${promoteDir}" origin/release`);
-    run(`git merge --ff-only ${promoteSha}`, { cwd: promoteDir });
+    run("git", ["worktree", "add", "-b", "release", promoteDir, "origin/release"]);
+    run("git", ["merge", "--ff-only", promoteSha], { cwd: promoteDir });
   } else {
-    run(`git worktree add -b release "${promoteDir}" ${promoteSha}`);
+    run("git", ["worktree", "add", "-b", "release", promoteDir, promoteSha]);
   }
 
   info("Installing dependencies in the promotion worktree (fresh checkout)…");
-  run("pnpm install --prefer-offline", { cwd: promoteDir });
+  run("pnpm", ["install", "--prefer-offline"], { cwd: promoteDir });
 
   info("Re-running the release inside the promotion worktree (interactive prompts continue there)…");
   const passThroughArgs = [
@@ -775,7 +797,7 @@ if (!IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout
 
   if (child.status === 0) {
     // node_modules makes the worktree "dirty" to git; --force is required and safe here.
-    const removed = run(`git worktree remove --force "${promoteDir}"`, { capture: true, allowFail: true });
+    const removed = run("git", ["worktree", "remove", "--force", promoteDir], { capture: true, allowFail: true });
     if (removed.status !== 0) {
       warn(`Could not remove promotion worktree; clean up manually: git worktree remove --force "${promoteDir}"`);
     } else {
@@ -793,11 +815,12 @@ if (!IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout
      */
     info("Back-merging the release branch into 'main' so the dev checkout carries the stable version…");
     const backMerge = run(
-      `git merge ${RELEASE_BRANCH} -m "chore(release): back-merge from ${RELEASE_BRANCH}"`,
+      "git",
+      ["merge", RELEASE_BRANCH, "-m", `chore(release): back-merge from ${RELEASE_BRANCH}`],
       { capture: true, allowFail: true },
     );
     if (backMerge.status !== 0) {
-      run("git merge --abort", { capture: true, allowFail: true });
+      run("git", ["merge", "--abort"], { capture: true, allowFail: true });
       warn(
         "Back-merge conflicted and was aborted — resolve it by hand:\n" +
         `    git merge ${RELEASE_BRANCH}\n` +
@@ -808,7 +831,7 @@ if (!IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout
     } else {
       const mainVersion = JSON.parse(readFileSync("packages/cli/package.json", "utf8")).version;
       ok(`'main' back-merged; local dev version is now v${mainVersion}.`);
-      const pushed = run("git push origin main", { capture: true, allowFail: true });
+      const pushed = run("git", ["push", "origin", "main"], { capture: true, allowFail: true });
       if (pushed.status !== 0) warn("Could not push 'main'; push the back-merge manually: git push origin main");
     }
   } else {
@@ -822,7 +845,7 @@ if (!IS_BETA && run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout
 
 info(`Preflight checks (${CHANNEL} channel)…`);
 
-const branch = run("git rev-parse --abbrev-ref HEAD", { capture: true }).stdout;
+const branch = run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { capture: true }).stdout;
 if (branch !== RELEASE_BRANCH) {
   if (IS_BETA) {
     fail(`Beta releases are cut from 'main' (currently '${branch}').`);
@@ -835,20 +858,63 @@ if (branch !== RELEASE_BRANCH) {
   );
 }
 
-const dirty = run("git status --porcelain", { capture: true }).stdout;
-if (dirty) fail("Working tree is not clean. Commit or stash first.");
+function workingTreeChanges() {
+  return parsePorcelainPaths(run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { capture: true, raw: true }).stdout);
+}
+
+if (workingTreeChanges().length > 0) fail("Working tree is not clean. Commit or stash first.");
+
+/*
+ * FNXC:ReleaseScript 2026-10-07-19:30:
+ * The release runs minutes in a checkout that the merger and Fusion agents also write to.
+ * HEAD is recorded once the tree is proven clean; the release commit must sit directly on it, so a fast-forward or commit landed meanwhile stops the release.
+ */
+const RELEASE_BASE_HEAD = run("git", ["rev-parse", "HEAD"], { capture: true }).stdout;
 
 // The remote release branch may not exist yet on the first stable promotion;
 // fall back to a warning and let the final push create it with -u.
-const fetchRemote = run(`git fetch origin ${RELEASE_BRANCH}`, { capture: true, allowFail: true });
+const fetchRemote = run("git", ["fetch", "origin", RELEASE_BRANCH], { capture: true, allowFail: true });
 let remoteBranchExists = fetchRemote.status === 0;
 if (remoteBranchExists) {
-  const ahead = run(`git rev-list --count origin/${RELEASE_BRANCH}..HEAD`, { capture: true }).stdout;
-  const behind = run(`git rev-list --count HEAD..origin/${RELEASE_BRANCH}`, { capture: true }).stdout;
+  const ahead = run("git", ["rev-list", "--count", `origin/${RELEASE_BRANCH}..HEAD`], { capture: true }).stdout;
+  const behind = run("git", ["rev-list", "--count", `HEAD..origin/${RELEASE_BRANCH}`], { capture: true }).stdout;
   if (behind !== "0") fail(`Local ${RELEASE_BRANCH} is behind origin/${RELEASE_BRANCH} by ${behind} commit(s). Pull first.`);
   if (ahead !== "0") warn(`Local ${RELEASE_BRANCH} is ahead of origin/${RELEASE_BRANCH} by ${ahead} commit(s); they will be pushed.`);
 } else {
   warn(`origin/${RELEASE_BRANCH} does not exist yet; the release push will create it.`);
+}
+
+/*
+ * FNXC:ReleaseScript 2026-10-07-19:30:
+ * Pre-mode entry/exit and stale-cycle version rewrites run before the operator confirms.
+ * Until confirmation, any exit (declined prompt, failed plan, missing changesets, dry run, error, Ctrl+C) restores those files byte for byte through an exit hook, so the next release does not trip the clean-tree preflight.
+ * A file someone else edited after the release wrote it is kept as they wrote it and named in a warning.
+ */
+function guardPreConfirmationInputs() {
+  const paths = new Set([PRE_JSON_PATH, "package.json"]);
+  for (const name of readFixedGroupPackageNames()) {
+    const dir = findPackageDir(name);
+    if (dir) paths.add(join(dir, "package.json"));
+  }
+  const snapshot = createReleaseInputSnapshot([...paths]);
+  const display = (path) => path.replaceAll("\\", "/");
+  const restore = () => {
+    const { restored, keptConcurrentEdits } = snapshot.restore();
+    if (restored.length > 0) ok(`Restored release inputs: ${restored.map(display).join(", ")}`);
+    for (const path of keptConcurrentEdits) warn(`Left ${display(path)} as found: it changed after the release preview wrote it.`);
+  };
+  const onSignal = (signal) => process.exit(signal === "SIGINT" ? 130 : 143);
+  process.on("exit", restore);
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  return {
+    seal: () => snapshot.seal(),
+    keep() {
+      process.off("exit", restore);
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+    },
+  };
 }
 
 async function prepareRelease() {
@@ -859,9 +925,9 @@ async function prepareRelease() {
    * .md files (recording them in pre.json), so the eventual stable release on
    * the `release` branch aggregates every changeset across all betas after
    * `changeset pre exit`. Beta auto-enters pre-mode here; stable auto-exits.
-   * Dry-runs revert whichever pre-mode mutation they made before exiting.
+   * Every exit before confirmation reverts these mutations (guardPreConfirmationInputs).
    */
-  let preModeMutation = "none"; // "entered" | "exited" | "none"
+  const preConfirmationInputs = guardPreConfirmationInputs();
   let rebasedVersionPaths = [];
   const preJsonExists = () => existsSync(PRE_JSON_PATH) && JSON.parse(readFileSync(PRE_JSON_PATH, "utf8")).mode === "pre";
   const LATEST_STABLE_VERSION = latestStableTagVersion();
@@ -889,39 +955,19 @@ async function prepareRelease() {
         `Beta cycle is anchored at ${cycleBase}, but stable v${LATEST_STABLE_VERSION} has shipped. ` +
         `Re-anchoring the beta track on v${anchor}.`,
       );
-      if (preState) run("pnpm changeset pre exit");
+      if (preState) run("pnpm", ["changeset", "pre", "exit"]);
       rebasedVersionPaths = rewriteFixedGroupVersions(anchor);
-      run("pnpm changeset pre enter beta");
-      preModeMutation = "entered";
+      run("pnpm", ["changeset", "pre", "enter", "beta"]);
       ok(`Beta cycle re-anchored on v${anchor} (${rebasedVersionPaths.length} package.json rewritten).`);
     } else if (!preState) {
       info("Entering changesets pre-mode (beta)…");
-      run("pnpm changeset pre enter beta");
-      preModeMutation = "entered";
+      run("pnpm", ["changeset", "pre", "enter", "beta"]);
     }
   } else if (existsSync(PRE_JSON_PATH) && preJsonExists()) {
     info("Exiting changesets pre-mode (promoting to stable)…");
-    run("pnpm changeset pre exit");
-    preModeMutation = "exited";
+    run("pnpm", ["changeset", "pre", "exit"]);
   }
-
-  function revertDryRunPreModeMutation() {
-    if (preModeMutation === "entered") {
-      // `pre enter` only creates/rewrites pre.json; restore or remove it.
-      const tracked = run(`git ls-files --error-unmatch ${PRE_JSON_PATH}`, { capture: true, allowFail: true });
-      if (tracked.status === 0) {
-        run(`git checkout -- ${PRE_JSON_PATH}`);
-      } else {
-        try { unlinkSync(PRE_JSON_PATH); } catch { /* best-effort */ }
-      }
-    } else if (preModeMutation === "exited") {
-      run(`git checkout -- ${PRE_JSON_PATH}`);
-    }
-    // A re-anchored cycle also rewrote tracked package.json versions; restore them.
-    for (const path of rebasedVersionPaths) {
-      run(`git checkout -- ${path}`, { allowFail: true });
-    }
-  }
+  preConfirmationInputs.seal();
 
   const changesetSummaries = readChangesetSummaries();
   if (changesetSummaries.length === 0) {
@@ -1034,9 +1080,7 @@ async function prepareRelease() {
     console.log(dryDistilled.tweet);
     console.log(color(90, `(${dryDistilled.tweet.length}/280 chars; source: ${dryDistilled.source})`));
     console.log(color(36, "──────────────────────────────────"));
-    // A dry-run must leave the tree exactly as it found it, including the
-    // pre-mode enter/exit performed to compute the channel's release plan.
-    revertDryRunPreModeMutation();
+    // The exit hook leaves the tree as it was found, including the plan's pre-mode enter/exit.
     process.exit(0);
   }
 
@@ -1050,6 +1094,7 @@ async function prepareRelease() {
     warn("Aborted by user.");
     process.exit(0);
   }
+  preConfirmationInputs.keep();
 
   // --- Version bump ---------------------------------------------------------
 
@@ -1070,13 +1115,13 @@ async function prepareRelease() {
   }).filter(Boolean);
 
   info("Applying changesets (version bump + CHANGELOG)…");
-  run("pnpm release:version");
+  run("pnpm", ["release:version"]);
 
   overrideVersion(releases, proposedVersion, chosenVersion);
-  run("node scripts/sync-workspace-version.mjs");
+  run(process.execPath, [join("scripts", "sync-workspace-version.mjs")]);
 
   info("Updating lockfile…");
-  run("pnpm install --no-frozen-lockfile");
+  run("pnpm", ["install", "--no-frozen-lockfile"]);
 
   const cliPkg = JSON.parse(readFileSync("packages/cli/package.json", "utf8"));
   const version = cliPkg.version;
@@ -1125,11 +1170,11 @@ async function resumeRelease() {
   }
   const workspaceVersion = JSON.parse(readFileSync("package.json", "utf8")).version;
   if (workspaceVersion !== version) fail("Cannot resume: workspace and CLI versions differ.");
-  const subject = run("git log -1 --format=%s -- packages/cli/package.json", { capture: true }).stdout;
+  const subject = run("git", ["log", "-1", "--format=%s", "--", "packages/cli/package.json"], { capture: true }).stdout;
   if (subject !== `chore(release): v${version}`) {
     fail(`Cannot resume: the latest CLI package change is not the release commit for v${version}.`);
   }
-  const tag = run(`git show-ref --verify --quiet refs/tags/v${version}`, { capture: true, allowFail: true });
+  const tag = run("git", ["show-ref", "--verify", "--quiet", `refs/tags/v${version}`], { capture: true, allowFail: true });
   if (tag.status === 0) fail(`v${version} is already tagged. --resume only recovers releases interrupted before tagging.`);
   const notes = extractVersionNotes(readFileSync("CHANGELOG.md", "utf8"), version);
   if (notes === `Release v${version}`) {
@@ -1152,18 +1197,61 @@ const { version, releaseTweet, distillSource } = await (RESUME ? resumeRelease()
 // --- Build ----------------------------------------------------------------
 
 info("Building all packages…");
-run("pnpm build:full");
+run("pnpm", ["build:full"]);
 
 // --- Commit ---------------------------------------------------------------
 
+const NOTHING_SHIPPED = "Nothing was published, pushed or tagged.";
+
+function headSha() {
+  return run("git", ["rev-parse", "HEAD"], { capture: true }).stdout;
+}
+
+/*
+ * FNXC:ReleaseScript 2026-10-07-19:30:
+ * The commit stages only release-generated paths, and only when every changed path is one; any other change came from a concurrent writer and stops the release before staging.
+ * A rejected commit (hook, signing) is fatal: the old allowFail let npm publish the working tree and tag the previous HEAD.
+ */
 if (!RESUME) {
   info("Committing version bump…");
-  run("git add -A");
-  run(
-    `git commit -m "chore(release): v${version}" -m "Version bump via changesets."`,
-    { allowFail: true }
-  );
+  if (headSha() !== RELEASE_BASE_HEAD) {
+    fail(`HEAD moved from ${RELEASE_BASE_HEAD.slice(0, 10)} to ${headSha().slice(0, 10)} while the release ran (another writer committed or fast-forwarded). ${NOTHING_SHIPPED} The version bump is left uncommitted for inspection.`);
+  }
+  const isReleasePath = releaseGeneratedPathMatcher(discoverWorkspacePackages(resolve(".")).map((pkg) => pkg.dir));
+  const changed = workingTreeChanges();
+  const foreign = changed.filter((path) => !isReleasePath(path));
+  if (foreign.length > 0) {
+    fail(`The working tree has changes the release did not make:\n    ${foreign.join("\n    ")}\n  ${NOTHING_SHIPPED} Remove or commit them separately, then rerun the release.`);
+  }
+  run("git", ["add", "-A", "--", ...changed]);
+  const commit = run("git", ["commit", "-m", `chore(release): v${version}`, "-m", "Version bump via changesets."], { allowFail: true });
+  if (commit.status !== 0) {
+    fail(`The release commit was rejected (${describeSpawnFailure(commit)}). ${NOTHING_SHIPPED} The staged version bump is left for inspection.`);
+  }
+  if (run("git", ["rev-parse", "HEAD^"], { capture: true }).stdout !== RELEASE_BASE_HEAD) {
+    fail(`The release commit is not directly on ${RELEASE_BASE_HEAD.slice(0, 10)}. ${NOTHING_SHIPPED}`);
+  }
 }
+
+/*
+ * FNXC:ReleaseScript 2026-10-07-19:30:
+ * npm publishes the working tree (--no-git-checks), so immediately before publishing the tree must be clean and HEAD must carry this version.
+ * The publish commit is pinned here; the push and tag use that SHA, so a commit landed after publish cannot be tagged as the release.
+ */
+function provePublishSource() {
+  const dirtyPaths = workingTreeChanges();
+  if (dirtyPaths.length > 0) {
+    fail(`The working tree changed after the release commit:\n    ${dirtyPaths.join("\n    ")}\n  ${NOTHING_SHIPPED}`);
+  }
+  const sha = headSha();
+  const shown = run("git", ["show", `${sha}:packages/cli/package.json`], { capture: true, allowFail: true });
+  const committedVersion = shown.status === 0 ? JSON.parse(shown.stdout).version : null;
+  if (committedVersion !== version) {
+    fail(`HEAD ${sha.slice(0, 10)} does not carry v${version} (packages/cli/package.json is ${committedVersion ?? "missing"}). ${NOTHING_SHIPPED}`);
+  }
+  return sha;
+}
+provePublishSource();
 
 // --- Pre-publish smoke ----------------------------------------------------
 // Pack the public CLI tarballs, install them with plain `npm` into a clean
@@ -1183,20 +1271,24 @@ ok("Pre-publish smoke passed.");
  * ALWAYS pass an explicit --tag. Relying on npm's implicit default (`latest`)
  * is how a beta would pollute the stable track for every `fn update` user.
  */
+const PUBLISH_SHA = provePublishSource();
 info(`Publishing to npm dist-tag '${NPM_DIST_TAG}' (non-private packages only)…`);
-const published = run(`pnpm -r publish --access public --no-git-checks --tag ${NPM_DIST_TAG}`, { allowFail: true });
+const published = run("pnpm", ["-r", "publish", "--access", "public", "--no-git-checks", "--tag", NPM_DIST_TAG], { allowFail: true });
 if (published.status !== 0) {
-  fail(`Publish failed. Fix npm authentication/permissions, then run: pnpm release --channel ${CHANNEL} --resume`);
+  fail(`Publish failed (${describeSpawnFailure(published)}). Fix npm authentication/permissions, then run: pnpm release --channel ${CHANNEL} --resume`);
 }
 
 // --- Push + tag -----------------------------------------------------------
 
-info(`Pushing commit to origin/${RELEASE_BRANCH}…`);
-run(remoteBranchExists ? `git push origin ${RELEASE_BRANCH}` : `git push -u origin ${RELEASE_BRANCH}`);
+info(`Pushing commit ${PUBLISH_SHA.slice(0, 10)} to origin/${RELEASE_BRANCH}…`);
+run("git", ["push", "origin", `${PUBLISH_SHA}:refs/heads/${RELEASE_BRANCH}`]);
+if (!remoteBranchExists) {
+  run("git", ["branch", `--set-upstream-to=origin/${RELEASE_BRANCH}`, RELEASE_BRANCH], { capture: true, allowFail: true });
+}
 
-info(`Creating and pushing tag v${version}…`);
-run(`git tag v${version}`);
-run(`git push origin v${version}`);
+info(`Creating and pushing tag v${version} at ${PUBLISH_SHA.slice(0, 10)}…`);
+run("git", ["tag", `v${version}`, PUBLISH_SHA]);
+run("git", ["push", "origin", `refs/tags/v${version}`]);
 
 // --- Homebrew tap bump ----------------------------------------------------
 // Sync homebrew-tap/Formula/fusion.rb (url + sha256) to the new version so
@@ -1206,7 +1298,7 @@ if (IS_BETA) {
   info("Beta channel: skipping Homebrew tap bump (tap tracks stable only).");
 } else {
   info("Bumping homebrew tap formula…");
-  bumpHomebrewTap(version);
+  await bumpHomebrewTap(version);
 }
 
 // --- GitHub Release ------------------------------------------------------
@@ -1214,7 +1306,7 @@ if (IS_BETA) {
 let githubReleaseStatus = "not-created";
 const changelogContent = readFileSync("CHANGELOG.md", "utf8");
 const releaseNotes = extractVersionNotes(changelogContent, version);
-const ghCheck = spawnSync("gh", ["--version"], { stdio: "pipe" });
+const ghCheck = spawnCommand("gh", ["--version"], { capture: true });
 
 // Betas are GitHub PRERELEASES; only stable releases carry --latest so the
 // desktop stable auto-updater (which follows the GitHub "latest" release) and
@@ -1231,10 +1323,9 @@ if (ghCheck.status !== 0) {
     notesFile = join(notesDir, `v${version}-notes.md`);
     writeFileSync(notesFile, `${releaseNotes}\n`, "utf8");
 
-    const ghCreate = spawnSync(
+    const ghCreate = spawnCommand(
       "gh",
       ["release", "create", `v${version}`, "--title", `v${version}`, "--notes-file", notesFile, ghReleaseTypeFlag],
-      { stdio: "inherit" }
     );
 
     if (ghCreate.status !== 0) {
