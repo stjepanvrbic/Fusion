@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { join } from "node:path";
 
 const {
   existsSyncMock,
@@ -886,14 +887,14 @@ describe("cleanupLandedWorkspaceTaskWorktrees", () => {
 
     expect(removeWorktreeMock).toHaveBeenCalledTimes(2);
     expect(removeWorktreeMock).toHaveBeenCalledWith(expect.objectContaining({
-      rootDir: "/workspace/api",
+      rootDir: join("/workspace", "api"),
       postLandingProof: { landedSha: "api-sha", source: "workspace-finalize" },
     }));
     expect(removeWorktreeMock).toHaveBeenCalledWith(expect.objectContaining({
-      rootDir: "/workspace/apps/web",
+      rootDir: join("/workspace", "apps/web"),
       postLandingProof: { landedSha: "web-sha", source: "workspace-finalize" },
     }));
-    expect(rmdirSyncMock).toHaveBeenCalledWith("/workspace/.fusion/worktrees/fn-268");
+    expect(rmdirSyncMock).toHaveBeenCalledWith(join("/workspace", ".fusion", "worktrees", "fn-268"));
   });
 
   it("preserves active and deliverable checkout paths without retiring their task directory", async () => {

@@ -1907,6 +1907,10 @@ FN-158 keeps this deliberately limited shell-text inspection as portable defence
 in depth. Shell parsing is not sound; the kernel sandbox is the hard control.
 This catches the known `cd ../../repo && touch` bypass and makes it visible with
 exactly the same boundary rejection as file tools.
+
+FNXC:WorkspaceBoundary 2026-10-07-15:46:
+Drive-qualified targets (`cd C:\Users\...`, `C:/...`) are absolute paths on Windows and must be inspected too; matching only `/`-rooted text let any Windows absolute path bypass this check.
+On POSIX such text is relative and resolves inside cwd, so the extra alternative cannot reject anything there.
 */
 function bashCommandTargetsOutsideBoundary(
   command: string,
@@ -1915,7 +1919,7 @@ function bashCommandTargetsOutsideBoundary(
   projectRoot: string,
   readOnlyExtraRoots: readonly string[],
 ): boolean {
-  const targets = command.matchAll(/(?:\b(?:cd|pushd)\s+|(?<!\S))(\/[^\s;&|]+|\.\.\/[^\s;&|]+)/g);
+  const targets = command.matchAll(/(?:\b(?:cd|pushd)\s+|(?<!\S))(\/[^\s;&|]+|\.\.\/[^\s;&|]+|[A-Za-z]:[\\/][^\s;&|]*)/g);
   for (const match of targets) {
     const target = match[1]?.replace(/["']/g, "");
     if (!target) continue;

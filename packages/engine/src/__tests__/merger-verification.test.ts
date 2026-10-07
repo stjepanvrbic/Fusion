@@ -174,6 +174,7 @@ import { createFnAgent } from "../pi.js";
 import { execSync, exec } from "node:child_process";
 import * as core from "@fusion/core";
 import { type TaskStore, type Task, type MergeResult, DEFAULT_SETTINGS } from "@fusion/core";
+import { posixFixturePath } from "./_posix-fixture-path.js";
 
 const mockedCreateFnAgent = vi.mocked(createFnAgent);
 const mockedExecSync = vi.mocked(execSync);
@@ -2940,7 +2941,7 @@ describe("resolveWorkspacePackageRoots", () => {
       { name: "dashboard", isDirectory: () => true },
       { name: ".cache", isDirectory: () => true },
     ] as any);
-    mockedExistsSync.mockImplementation((p: any) => String(p).includes("dashboard/package.json"));
+    mockedExistsSync.mockImplementation((p: any) => posixFixturePath(p).includes("dashboard/package.json"));
 
     const roots = resolveWorkspacePackageRoots("/repo", ["packages/*"]);
     expect(roots).toEqual(["packages/dashboard"]);
@@ -2980,7 +2981,7 @@ describe("mapChangedFilesToPackageNames", () => {
 
   it("assigns to the longest matching prefix", () => {
     mockedReadFileSync.mockImplementation((p: any) => {
-      const path = String(p);
+      const path = posixFixturePath(p);
       if (path.includes("plugins/examples/foo")) return JSON.stringify({ name: "@fusion/example-foo" });
       if (path.includes("plugins")) return JSON.stringify({ name: "@fusion/plugins" });
       return JSON.stringify({ name: "unknown" });
@@ -3046,7 +3047,7 @@ describe("inferDefaultTestCommand — pnpm workspace scoping", () => {
       return false;
     });
     mockedReadFileSync.mockImplementation((p: any) => {
-      const path = String(p);
+      const path = posixFixturePath(p);
       if (path.includes("pnpm-workspace.yaml")) {
         return `packages:\n  - "packages/*"\n`;
       }
@@ -3085,7 +3086,7 @@ describe("inferDefaultTestCommand — pnpm workspace scoping", () => {
       return false;
     });
     mockedReadFileSync.mockImplementation((p: any) => {
-      const path = String(p);
+      const path = posixFixturePath(p);
       if (path.includes("pnpm-workspace.yaml")) return `packages:\n  - "packages/*"\n`;
       if (path.includes("dashboard/package.json")) return JSON.stringify({ name: "@fusion/dashboard" });
       if (path.includes("engine/package.json")) return JSON.stringify({ name: "@fusion/engine" });
@@ -3117,7 +3118,7 @@ describe("inferDefaultTestCommand — pnpm workspace scoping", () => {
       return path.includes("pnpm-lock.yaml") || path.includes("pnpm-workspace.yaml") || path.includes("package.json");
     });
     mockedReadFileSync.mockImplementation((p: any) => {
-      const path = String(p);
+      const path = posixFixturePath(p);
       if (path.includes("pnpm-workspace.yaml")) return `packages:\n  - "packages/*"\n`;
       if (path.includes("dashboard/package.json")) return JSON.stringify({ name: "@evil/pkg'; rm -rf /" });
       return JSON.stringify({ name: "unknown" });

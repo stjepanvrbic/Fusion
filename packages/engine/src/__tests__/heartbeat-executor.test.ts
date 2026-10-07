@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   HeartbeatMonitor,
@@ -1857,7 +1857,7 @@ describe("executeHeartbeat", () => {
         const store = createStoreWithAgentForExec({
           taskId: undefined,
           soul: "I am a coordinator",
-          heartbeatProcedurePath: `${tmpDir.split("/").pop()}/HEARTBEAT.md`,
+          heartbeatProcedurePath: `${basename(tmpDir)}/HEARTBEAT.md`,
         });
         const mockSession = createMockAgentSession();
         mockedCreateFnAgent.mockResolvedValue({ session: mockSession as any });

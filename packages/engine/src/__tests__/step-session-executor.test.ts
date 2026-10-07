@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { join, sep } from "node:path";
 import {
   parseStepFileScopes,
   normalizeAuthoredStepScopes,
@@ -2585,7 +2586,7 @@ describe("StepSessionExecutor", () => {
         const executionEvents: string[] = [];
 
         mockedCreateFnAgent.mockImplementation(({ cwd }: any) => {
-          if (cwd === "/project/.fusion/worktrees/fn-001-step-0") {
+          if (cwd === join("/project", ".fusion", "worktrees", "fn-001-step-0")) {
             return Promise.resolve({
               session: makeMockSession(async () => {
                 executionEvents.push("step-0-start");
@@ -3035,7 +3036,7 @@ describe("StepSessionExecutor", () => {
           rootDir: "/project",
           taskId: "FN-001",
           settings,
-          worktreePath: expect.stringContaining("/project/.fusion/worktrees/"),
+          worktreePath: expect.stringContaining(join("/project", ".fusion", "worktrees") + sep),
         }),
       );
     });

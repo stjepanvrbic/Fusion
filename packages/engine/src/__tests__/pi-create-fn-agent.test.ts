@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PathLike } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { nativeFixturePath, posixFixturePath } from "./_posix-fixture-path.js";
 
 const createAgentSessionMock = vi.fn();
 const createBashToolMock = vi.fn((cwd: string, options?: any) => ({ name: "bash", cwd, options }));
@@ -91,10 +92,15 @@ vi.mock("node:fs", async () => {
   const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
   return {
     ...actual,
-    existsSync: existsSyncMock,
-    readFileSync: readFileSyncMock,
+    /*
+    FNXC:TestInfraWindows 2026-10-07-15:42:
+    Fixtures here are POSIX literals; on win32 the product hands these mocks resolved native paths.
+    Translate inputs into the fixture namespace and resolve fixture outputs back to native paths so each fixture keeps one spelling on every platform.
+    */
+    existsSync: (path: PathLike) => existsSyncMock(posixFixturePath(path)),
+    readFileSync: (path: any, ...rest: any[]) => (readFileSyncMock as any)(typeof path === "number" ? path : posixFixturePath(path), ...rest),
     realpathSync: Object.assign(vi.fn((path: PathLike) => String(path)), {
-      native: realpathSyncNativeMock,
+      native: (path: PathLike) => nativeFixturePath(realpathSyncNativeMock(posixFixturePath(path))),
     }),
   };
 });
@@ -447,8 +453,8 @@ describe("worktree path boundary helpers", () => {
         { symlink: `${userSkillRoot}/escape`, path: `${userSkillRoot}/escape/secret.txt` },
         { symlink: `${hostSkillRoot}/escape`, path: `${hostSkillRoot}/escape/secret.txt` },
       ];
-      const escapedPaths = new Set(escapeCases.map(({ path }) => path));
-      const symlinkTargets = new Map(escapeCases.map(({ symlink }) => [symlink, externalRoot]));
+      const escapedPaths = new Set(escapeCases.map(({ path }) => posixFixturePath(path)));
+      const symlinkTargets = new Map(escapeCases.map(({ symlink }) => [posixFixturePath(symlink), externalRoot]));
       realpathSyncNativeMock.mockImplementation((path: PathLike) => {
         const text = String(path);
         if (escapedPaths.has(text)) throw new Error("ENOENT");
@@ -561,6 +567,20 @@ describe("worktree path boundary helpers", () => {
       expect(verificationResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
       expect(bash.execute).not.toHaveBeenCalled();
       expect(verification.execute).not.toHaveBeenCalled();
+    });
+
+    it("rejects bash command text naming this platform's native absolute path outside the boundary", async () => {
+      // On Windows this is a drive-qualified path (C:\host\private), which the text inspection once ignored.
+      const bash = { name: "bash", label: "bash", description: "bash", parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) };
+      const { wrapToolsWithBoundary } = await import("../pi.js");
+      const wrapped = wrapToolsWithBoundary([bash] as any, "/project/.worktrees/fn-158", "/project");
+      const outside = nativeFixturePath("/host/private");
+
+      for (const command of [`cd ${outside} && touch x`, `touch ${outside.replace(/\\/g, "/")}/x`]) {
+        const result = await (wrapped[0] as any).execute("bash", { command });
+        expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
+      }
+      expect(bash.execute).not.toHaveBeenCalled();
     });
 
     it("allows task attachments from worktree session", async () => {
@@ -697,8 +717,8 @@ describe("worktree path boundary helpers", () => {
       const symlinkEscapePath = join(symlinkDir, "config.json");
       realpathSyncNativeMock.mockImplementation((path: PathLike) => {
         const text = String(path);
-        if (text === symlinkEscapePath) throw new Error("ENOENT");
-        return text === symlinkDir ? userAgentRoot : text;
+        if (text === posixFixturePath(symlinkEscapePath)) throw new Error("ENOENT");
+        return text === posixFixturePath(symlinkDir) ? userAgentRoot : text;
       });
       for (const tool of wrapped.slice(0, 5) as any[]) {
         const result = await tool.execute(`call-${tool.name}-symlink`, { path: symlinkEscapePath });
@@ -759,8 +779,8 @@ describe("worktree path boundary helpers", () => {
     it("normalizes one stable skill-root list for resource loading and boundary wiring", async () => {
       const { normalizeAdditionalSkillPaths } = await import("../pi.js");
       expect(normalizeAdditionalSkillPaths(["/skills/plugin", "", "/skills/plugin/", "/skills/ce"])).toEqual([
-        "/skills/plugin",
-        "/skills/ce",
+        nativeFixturePath("/skills/plugin"),
+        nativeFixturePath("/skills/ce"),
       ]);
 
       const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
@@ -2007,7 +2027,7 @@ describe("createFnAgent", () => {
     // registerExtensionProviders should receive the resolved project root,
     // not the raw subdirectory cwd. This is verified by checking the
     // DefaultPackageManager constructor received "/project" as cwd.
-    expect(packageManagerCwdCapture).toHaveBeenCalledWith("/project");
+    expect(packageManagerCwdCapture).toHaveBeenCalledWith(nativeFixturePath("/project"));
     expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
   });
 
@@ -2024,7 +2044,7 @@ describe("createFnAgent", () => {
     });
 
     // Falls back to the raw cwd when no .fusion is found
-    expect(packageManagerCwdCapture).toHaveBeenCalledWith("/unrelated/directory");
+    expect(packageManagerCwdCapture).toHaveBeenCalledWith(nativeFixturePath("/unrelated/directory"));
     expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
   });
 
@@ -2083,8 +2103,8 @@ describe("createFnAgent", () => {
 
     expect(discoverAndLoadExtensionsMock).toHaveBeenCalledWith(
       ["/extensions/zai-provider"],
-      "/tmp",
-      "/tmp/.fusion/disabled-auto-extension-discovery",
+      nativeFixturePath("/tmp"),
+      nativeFixturePath("/tmp/.fusion/disabled-auto-extension-discovery"),
     );
     expect(registerProviderMock).toHaveBeenCalledTimes(1);
     expect(registerProviderMock).toHaveBeenCalledWith("zai", expect.objectContaining({

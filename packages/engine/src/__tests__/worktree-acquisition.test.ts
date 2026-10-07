@@ -4,7 +4,7 @@ import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { promisify } from "node:util";
 import { acquireWorktreePathReservation, readWorktreePathReservation } from "@fusion/core";
 import { acquireTaskWorktree, RepoRootWorktreeError, WorktreeBaseRefreshError } from "../worktree/worktree-acquisition.js";
@@ -67,6 +67,14 @@ function track(path: string): string {
 
 function git(cwd: string, command: string): string {
   return execSync(command, { cwd, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+}
+
+/*
+FNXC:TestInfraWindows 2026-10-07-15:47:
+`git worktree list --porcelain` spells paths with forward slashes on every platform, so a native Windows path must be converted before a substring check; identity on POSIX.
+*/
+function porcelainPath(path: string): string {
+  return path.split(sep).join("/");
 }
 
 function makeRepo(): string {
@@ -433,7 +441,7 @@ describe("acquireTaskWorktree", () => {
       isResume: false,
     });
     expect(existsSync(join(pinnedPath, ".git"))).toBe(true);
-    expect(git(rootDir, "git worktree list --porcelain")).toContain(pinnedPath);
+    expect(git(rootDir, "git worktree list --porcelain")).toContain(porcelainPath(pinnedPath));
     const recoveryRoot = join(rootDir, ".fusion", "recovery", "worktrees");
     const preserved = readdirSync(recoveryRoot);
     expect(preserved).toHaveLength(1);
@@ -713,7 +721,7 @@ describe("acquireTaskWorktree", () => {
 
     expect(result.worktreePath).toBe(pinnedPath);
     expect(existsSync(join(pinnedPath, ".git"))).toBe(true);
-    expect(git(rootDir, "git worktree list --porcelain")).toContain(pinnedPath);
+    expect(git(rootDir, "git worktree list --porcelain")).toContain(porcelainPath(pinnedPath));
     expect(git(rootDir, "git branch --list fusion/fn-1")).toContain("fusion/fn-1");
     expect(await readWorktreePathReservation({ canonicalPath: pinnedPath, worktreesDir: reservationWorktreesDir })).toBeNull();
 
@@ -1053,7 +1061,7 @@ describe("acquireTaskWorktree", () => {
       isResume: false,
     });
     expect(result.worktreePath).not.toBe(rootDir);
-    expect(result.worktreePath).toContain(`${join(rootDir, ".fusion", "worktrees")}/`);
+    expect(result.worktreePath).toContain(`${join(rootDir, ".fusion", "worktrees")}${sep}`);
     expect(store.updateTask).toHaveBeenCalledWith("FN-1", { worktree: freshPath, branch: "fusion/fn-1", branchWriteOrigin: "engine" });
     expect(store.updateTask).toHaveBeenCalledWith("FN-1", { worktree: freshPath, branch: "fusion/fn-1", branchWriteOrigin: "engine" });
   });
@@ -1145,7 +1153,7 @@ describe("acquireTaskWorktree", () => {
     });
 
     expect(result).toMatchObject({ worktreePath: freshPath, source: "fresh", isResume: false });
-    expect(createWorktree).toHaveBeenCalledWith("fusion/fn-1", expect.stringContaining(`${join(rootDir, ".fusion", "worktrees")}/`), "FN-1", "main", false);
+    expect(createWorktree).toHaveBeenCalledWith("fusion/fn-1", expect.stringContaining(`${join(rootDir, ".fusion", "worktrees")}${sep}`), "FN-1", "main", false);
     expect(store.updateTask).toHaveBeenCalledWith("FN-1", { worktree: freshPath, branch: "fusion/fn-1", branchWriteOrigin: "engine" });
   });
 

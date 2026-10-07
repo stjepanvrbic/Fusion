@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createSourceFile, forEachChild, isCallExpression, isIdentifier, ScriptTarget } from "typescript";
 
@@ -110,7 +110,8 @@ function listProductionSource(dir: string): string[] {
 
 function scanEngineSource(): ShelloutSite[] {
   const root = join(process.cwd(), "src");
-  return listProductionSource(root).flatMap((path) => scanSource(relative(process.cwd(), path), readFileSync(path, "utf-8")));
+  // FNXC:TestInfraWindows 2026-10-07-15:52: allowlist keys are POSIX-relative; win32 relative() yields backslashes.
+  return listProductionSource(root).flatMap((path) => scanSource(relative(process.cwd(), path).split(sep).join("/"), readFileSync(path, "utf-8")));
 }
 
 /*

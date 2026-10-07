@@ -926,8 +926,11 @@ const WINDOWS_POSIX_SHELL: string | undefined = (() => {
 FNXC:TestInfraWindows 2026-10-07-15:55:
 Only commands that need POSIX syntax go to bash: single quotes, leading `NAME=value` env assignments, or `$(...)`.
 Fixtures that embed native Windows paths (`git remote add origin C:\Users\...`) must stay on cmd.exe, because bash treats each backslash as an escape.
+
+FNXC:TestInfraWindows 2026-10-07-15:42:
+Also route `^`, `$?` and `/dev/null`: cmd.exe consumes `^` as its escape character (`git rev-parse HEAD^{tree}` reached git as `HEAD{tree}`), `cmd; echo $?` needs POSIX `;` sequencing and exit-status expansion, and `git mktree </dev/null` names a device cmd.exe does not have.
 */
-const POSIX_ONLY_SYNTAX = /'|^\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s|\$\(/;
+const POSIX_ONLY_SYNTAX = /'|^\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s|\$\(|\^|\$\?|\/dev\/null\b/;
 
 function withFixtureShell<T extends { shell?: string | boolean | undefined }>(command: string, options: T | undefined): T | undefined {
   if (!WINDOWS_POSIX_SHELL || options?.shell !== undefined || !POSIX_ONLY_SYNTAX.test(command)) return options;

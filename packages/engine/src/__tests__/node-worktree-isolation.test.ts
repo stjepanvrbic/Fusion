@@ -13,6 +13,7 @@ Invariant under test across the node surfaces that previously degraded to the ro
  - workspace Plan Review acquires every configured child checkout and runs from the task directory.
 */
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { join, sep } from "node:path";
 import type { TaskDetail } from "@fusion/core";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
@@ -86,7 +87,7 @@ describe("every workflow node runs in the task worktree, never the shared checko
     await (executor as any).runGraphCustomNode(node, live, { reviewerInlineFixes: false }, undefined);
 
     expect(captured.worktreePath).not.toBe(ROOT);
-    expect(captured.worktreePath).toContain(`${ROOT}/.fusion/worktrees/`);
+    expect(captured.worktreePath).toContain(join(ROOT, ".fusion", "worktrees") + sep);
   });
 
   it("reuses an existing usable worktree instead of acquiring another", async () => {
@@ -132,8 +133,8 @@ describe("every workflow node runs in the task worktree, never the shared checko
     store.getTask.mockResolvedValueOnce(live as any).mockResolvedValueOnce(live as any).mockResolvedValue(acquiredTask as any);
     await (executor as any).runGraphCustomNode(PLAN_REVIEW_NODE, live, {}, undefined);
 
-    expect(captured.worktreePath).toBe(`${ROOT}/.fusion/worktrees/fn-1403`);
-    expect(captured.boundary).toMatchObject({ kind: "workspace-task-dir", writableRoot: `${ROOT}/.fusion/worktrees/fn-1403`, projectRoot: ROOT });
+    expect(captured.worktreePath).toBe(join(ROOT, ".fusion", "worktrees", "fn-1403"));
+    expect(captured.boundary).toMatchObject({ kind: "workspace-task-dir", writableRoot: join(ROOT, ".fusion", "worktrees", "fn-1403"), projectRoot: ROOT });
     expect(acquireSpy).toHaveBeenCalledTimes(1);
   });
 });

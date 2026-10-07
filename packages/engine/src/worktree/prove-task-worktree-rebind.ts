@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { realpath } from "node:fs/promises";
+import { resolve } from "node:path";
 import { promisify } from "node:util";
 import type { Task, TaskStore } from "@fusion/core";
 import { activeSessionRegistry, type ActiveSessionKind } from "../agents/active-session-registry.js";
@@ -34,7 +35,13 @@ export async function proveTaskWorktreeRebind(input: {
   const canonical = await realpath(worktreePath);
   if (canonical === await realpath(rootDir)) refuse();
   const registrations = (await git("worktree", "list", "--porcelain")).split("\n\n");
-  const matches = registrations.filter((entry) => entry.split("\n").includes(`worktree ${canonical}`));
+  /*
+  FNXC:WorktreeRebind 2026-10-07-15:47:
+  Git prints registered worktree paths with forward slashes on Windows (`C:/...`) while realpath returns backslashes, so a literal line match never proved a rebind there.
+  Compare each registration through path.resolve: the identity for git's absolute POSIX output, a separator normalization on Windows.
+  */
+  const matches = registrations.filter((entry) => entry.split("\n").some((line) =>
+    line.startsWith("worktree ") && resolve(line.slice("worktree ".length)) === canonical));
   if (matches.length !== 1) refuse();
   const branch = matches[0].split("\n").find((line) => line.startsWith("branch refs/heads/"))?.slice(18);
   const head = matches[0].split("\n").find((line) => line.startsWith("HEAD "))?.slice(5);
