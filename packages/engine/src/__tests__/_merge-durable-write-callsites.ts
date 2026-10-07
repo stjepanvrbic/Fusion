@@ -72,7 +72,11 @@ const STORE_METHOD_CLASSIFICATION: Record<string, Omit<SurfaceClassification, "m
   Deferred wedge-notification evidence belongs to the task row. These methods persist or remove
   `wedgeNotification.pending` through `updateTaskAtomic`, so an orphaned merge body reaching either
   method would mutate state it no longer owns; classify by that durable semantic, not current callers.
+
+  FNXC:MergeReliability 2026-10-07-22:23:
+  Delivery acknowledgement clears the owed marker and stamps the per-reason cooldown through `updateTaskAtomic`, so it is a writer of the same task-row evidence.
   */
+  acknowledgeTaskWedgeNotificationDelivery: { kind: "writer", reason: "clears owed wedge-notification delivery and persists the per-reason cooldown on the task row" },
   clearTaskWedgeNotificationPending: { kind: "writer", reason: "removes deferred wedge-notification evidence from the task row" },
   markTaskWedgeNotificationPending: { kind: "writer", reason: "persists deferred wedge-notification evidence on the task row" },
   appendCurrentPlanEvidence: { kind: "writer", reason: "persists or mutates TaskStore state" },
