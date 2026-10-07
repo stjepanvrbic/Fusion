@@ -2,10 +2,12 @@
 # machine's core.autocrlf (Git for Windows defaults it to true system-wide). CRLF checkouts
 # broke Windows development: Vite cannot parse a CRLF shebang in the engine merge-gate
 # globalSetup, and source-reading tests and checks saw different bytes than CI.
-# Windows batch scripts stay CRLF because cmd.exe requires it.
+# Windows batch scripts are stored with CRLF (cmd.exe requires it) and are kept byte-for-byte:
+# `-text` instead of `eol=crlf`, because a CRLF blob under a text rule reads as modified in every
+# fresh checkout, which made post-landing cleanup preserve clean task worktrees as "deliverable".
 * text=auto eol=lf
-*.cmd text eol=crlf
-*.bat text eol=crlf
+*.cmd -text
+*.bat -text
 
 # FNXC:RepoAssets 2026-06-25-09:00:
 # Demo reel GIFs dominate repo size (the same captures get re-shot and re-committed,
