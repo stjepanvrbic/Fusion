@@ -364,14 +364,21 @@ async function reconcileRestoredWorktreeState(
   };
 }
 
+/**
+ * FNXC:ArchiveRestore 2026-10-07-18:40:
+ * With `toColumn`, restore is the whole unarchive: clear the tombstone, move the row to its resolved lane, and delete the cold snapshot in one transaction under the task advisory lock.
+ * A task must never be live in the physical "archived" sentinel without its cold entry, because a retry then loses `preArchiveColumn` and the card is invisible to board lanes.
+ * Without a surviving row and with `toColumn`, nothing is consumed: deleting the only snapshot of a row that does not exist would lose the task.
+ */
 export async function restoreTaskFromArchive(
   layer: AsyncDataLayer,
   entry: ArchivedTaskEntry,
-  options: { now?: string } = {},
+  options: { now?: string; toColumn?: string; beforeCommitForTest?: () => Promise<void> } = {},
 ): Promise<void> {
   const now = options.now ?? new Date().toISOString();
 
   await layer.transactionImmediate(async (tx) => {
+    await acquireTaskAdvisoryXactLock(tx, layer.projectId, entry.id);
     // Clear the soft-delete: set column back from 'archived', clear deleted_at.
     // The project row may still exist (soft-delete path) or may have been
     // hard-deleted (cleanup path). Handle both.
@@ -386,11 +393,9 @@ export async function restoreTaskFromArchive(
         existing.workspaceWorktrees,
         existing.worktree,
       );
-      // Row exists (was soft-deleted). Restore it: clear deleted_at, keep
-      // column as "archived" so the caller (unarchiveTaskImpl) can verify the
-      // task is in the archived column and then moveTask it to the target
-      // column. Setting column to "done" here would break the unarchive guard
-      // ("task is in 'done', must be in 'archived'").
+      // Row exists (was soft-deleted). Restore it: clear deleted_at and land it
+      // in the caller's resolved lane, or in the "archived" sentinel when no
+      // lane was given.
       await tx
         .update(schema.project.tasks)
         .set({
@@ -399,16 +404,19 @@ export async function restoreTaskFromArchive(
           worktree: reconciledWorktreeState.worktree,
           /*
           FNXC:TaskStoreArchiveLineage 2026-08-01-23:23 DELIBERATE-LITERAL — STATE MARKER:
-          Restore exposes the durable row before the caller's validated move out of the archive state.
+          Without a resolved lane, restore exposes the durable row before the caller's validated move out of the archive state.
           This is a physical transition sentinel, not the custom workflow's archived lane id.
           */
-          column: "archived",
+          column: options.toColumn ?? "archived",
+          ...(options.toColumn ? { columnMovedAt: now } : {}),
           updatedAt: now,
         })
         .where(and(
           eq(schema.project.tasks.projectId, projectPartition(layer.projectId)),
           eq(schema.project.tasks.id, entry.id),
         ));
+    } else if (options.toColumn) {
+      throw new Error(`Cannot unarchive ${entry.id}: no task row exists to restore the archive snapshot into`);
     } else {
       // Row was hard-deleted. We cannot fully reconstruct it from the archive
       // snapshot alone here (the entry carries the public Task shape, not the
@@ -419,6 +427,7 @@ export async function restoreTaskFromArchive(
 
     // Remove the cold-storage snapshot (project row is the source of truth again).
     await deleteArchivedTaskEntry(tx, entry.id, layer.projectId);
+    await options.beforeCommitForTest?.();
   });
 }
 

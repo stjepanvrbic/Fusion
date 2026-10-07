@@ -11,6 +11,9 @@ import {
 } from "../../__test-utils__/pg-test-harness.js";
 import * as schema from "../../postgres/schema/index.js";
 import { findArchivedTaskEntry } from "../../task-store/async/async-archive-lineage.js";
+import { writePromptFileAtomic } from "../../task-store/prompt-file.js";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 pgDescribe("TaskStore archived read parity (PostgreSQL)", () => {
   const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
@@ -19,7 +22,10 @@ pgDescribe("TaskStore archived read parity (PostgreSQL)", () => {
 
   beforeAll(h.beforeAll);
   beforeEach(h.beforeEach);
-  afterEach(h.afterEach);
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await h.afterEach();
+  });
   afterAll(h.afterAll);
 
   /*
@@ -238,5 +244,110 @@ pgDescribe("TaskStore archived read parity (PostgreSQL)", () => {
     const restored = await store.unarchiveTask(task.id);
     expect(restored.id).toBe(task.id);
     expect(restored.column).toBe("todo");
+  });
+
+  /*
+  FNXC:ArchiveRestore 2026-10-07-18:40:
+  Unarchive must return the task with its plan. Default archive cleanup deletes the task directory while the soft-deleted row survives, so the cold snapshot's prompt is the only copy left.
+  Publish PROMPT.md before the snapshot is consumed, byte-for-byte, whether or not cleanup ran and whether or not the row survived; a failed publication leaves the snapshot and tombstone for a retry.
+  */
+  const PROMPTS = {
+    lf: "# Restored plan@@## Steps@@- [ ] keep the plan@@".replace(/@@/g, "\n\n"),
+    crlf: "# Restored plan@@## Steps@@- [ ] keep the plan@@".replace(/@@/g, "\r\n\r\n"),
+  } as const;
+
+  async function deleteLiveRow(taskId: string): Promise<void> {
+    await h.adminDb()
+      .delete(schema.project.tasks)
+      .where(and(
+        eq(schema.project.tasks.projectId, h.layer().projectId ?? "__legacy_unscoped__"),
+        eq(schema.project.tasks.id, taskId),
+      ));
+  }
+  async function liveRowState(taskId: string): Promise<{ column: string; deletedAt: string | null } | undefined> {
+    const rows = await h.adminDb()
+      .select({ column: schema.project.tasks.column, deletedAt: schema.project.tasks.deletedAt })
+      .from(schema.project.tasks)
+      .where(and(
+        eq(schema.project.tasks.projectId, h.layer().projectId ?? "__legacy_unscoped__"),
+        eq(schema.project.tasks.id, taskId),
+      ));
+    return rows[0] as { column: string; deletedAt: string | null } | undefined;
+  }
+
+  it.each([
+    { id: "FN-401", cleanup: true, row: "surviving", eol: "lf" },
+    { id: "FN-402", cleanup: true, row: "surviving", eol: "crlf" },
+    { id: "FN-403", cleanup: false, row: "surviving", eol: "crlf" },
+    { id: "FN-404", cleanup: true, row: "missing", eol: "crlf" },
+    { id: "FN-405", cleanup: false, row: "missing", eol: "lf" },
+  ] as const)("restores PROMPT.md byte-for-byte on unarchive ($row row, cleanup $cleanup, $eol)", async ({ id, cleanup, row, eol }) => {
+    const store = h.store();
+    const task = await store.createTaskWithReservedId(
+      { description: "prompt survives unarchive", column: "done" },
+      { taskId: id, applyDefaultWorkflowSteps: false },
+    );
+    const promptPath = join(store.taskDir(task.id), "PROMPT.md");
+    await writePromptFileAtomic(promptPath, PROMPTS[eol]);
+    await store.archiveTask(task.id, { cleanup });
+    expect(existsSync(store.taskDir(task.id))).toBe(!cleanup);
+    if (row === "missing") await deleteLiveRow(task.id);
+
+    const restored = await store.unarchiveTask(task.id);
+
+    expect(restored.column).toBe("done");
+    expect(readFileSync(promptPath, "utf8")).toBe(PROMPTS[eol]);
+    expect((await store.getTask(task.id)).prompt).toBe(PROMPTS[eol]);
+    expect(await findArchivedTaskEntry(h.layer().db, task.id, h.layer().projectId)).toBeUndefined();
+  });
+
+  it("keeps the snapshot and tombstone when prompt publication fails, and a retry restores the prompt", async () => {
+    const store = h.store();
+    const task = await store.createTaskWithReservedId(
+      { description: "prompt publication fails once", column: "done" },
+      { taskId: "FN-406", applyDefaultWorkflowSteps: false },
+    );
+    await writePromptFileAtomic(join(store.taskDir(task.id), "PROMPT.md"), PROMPTS.crlf);
+    await store.archiveTask(task.id, { cleanup: true });
+    // A regular file where the task directory belongs makes publication fail.
+    writeFileSync(store.taskDir(task.id), "blocks the task directory");
+
+    await expect(store.unarchiveTask(task.id)).rejects.toThrow();
+    expect(await findArchivedTaskEntry(h.layer().db, task.id, h.layer().projectId)).toBeDefined();
+    expect((await liveRowState(task.id))?.deletedAt).not.toBeNull();
+
+    rmSync(store.taskDir(task.id), { force: true });
+    const restored = await store.unarchiveTask(task.id);
+    expect(restored.column).toBe("done");
+    expect(readFileSync(join(store.taskDir(task.id), "PROMPT.md"), "utf8")).toBe(PROMPTS.crlf);
+  });
+
+  /*
+  FNXC:ArchiveRestore 2026-10-07-18:40:
+  A task is never live in the physical "archived" sentinel without a cold entry. Restore, the move to the resolved lane, and the snapshot delete commit together under the task advisory lock, so an interrupted unarchive leaves the archive intact and its retry still knows the original lane.
+  */
+  it("commits unarchive atomically so an interrupted attempt leaves the archive intact and the retry keeps the lane", async () => {
+    const store = h.store();
+    const task = await store.createTaskWithReservedId(
+      { description: "atomic unarchive", column: "done" },
+      { taskId: "FN-407", applyDefaultWorkflowSteps: false },
+    );
+    await store.archiveTask(task.id, { cleanup: false });
+    const seam = store as unknown as { __beforeUnarchiveCommitForTest?: () => Promise<void> };
+    seam.__beforeUnarchiveCommitForTest = async () => { throw new Error("injected crash before commit"); };
+
+    try {
+      await expect(store.unarchiveTask(task.id)).rejects.toThrow("injected crash before commit");
+    } finally {
+      delete seam.__beforeUnarchiveCommitForTest;
+    }
+    expect(await liveRowState(task.id)).toMatchObject({ column: "archived" });
+    expect((await liveRowState(task.id))?.deletedAt).not.toBeNull();
+    expect(await findArchivedTaskEntry(h.layer().db, task.id, h.layer().projectId)).toBeDefined();
+
+    const restored = await store.unarchiveTask(task.id);
+    expect(restored.column).toBe("done");
+    expect(await liveRowState(task.id)).toMatchObject({ column: "done", deletedAt: null });
+    expect(await findArchivedTaskEntry(h.layer().db, task.id, h.layer().projectId)).toBeUndefined();
   });
 });
