@@ -1,4 +1,8 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Settings, TaskDetail, WorkflowIr, WorkflowStep, WorkflowStepResult } from "@fusion/core";
 import { FAST_MODE_BYPASS_ACTOR, getTaskMergeBlocker } from "@fusion/core";
 
@@ -234,13 +238,34 @@ describe("content-binding review dispatch proof", () => {
     expect(result).not.toHaveProperty("verdict");
   });
 
+  /*
+  FNXC:ReviewEmptyContent 2026-10-07-16:40:
+  The empty-content approval first proves the review checkout is committed (probeReviewCheckout runs real `git status`).
+  Pointing it at process.cwd() made the verdict depend on the runner's own checkout: any dirty file there (CI artifacts, a Windows CRLF checkout) flipped APPROVE to REVISE.
+  Use a clean, isolated repository so the test asserts the contract, not the host's working tree.
+  */
+  const cleanCheckouts: string[] = [];
+  afterEach(() => { for (const dir of cleanCheckouts.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+  function cleanCheckout(): string {
+    const dir = mkdtempSync(join(tmpdir(), "fusion-review-clean-"));
+    cleanCheckouts.push(dir);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "ignore" });
+    git("init", "-q");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Test");
+    writeFileSync(join(dir, "README.md"), "fixture\n");
+    git("add", "README.md");
+    git("commit", "-q", "-m", "fixture");
+    return dir;
+  }
+
   it("keeps a pre-resolved empty proof even when shortstat capture fails", async () => {
     const row = task({ noCommitsExpected: true });
     const result = await executeWorkflowStep(
       executeDeps(row),
       row,
       step({ reviewKind: "code" }),
-      process.cwd(),
+      cleanCheckout(),
       {} as Settings,
       undefined,
       { reviewInputFingerprint: EMPTY_REVIEW_DIFF_FINGERPRINT },
