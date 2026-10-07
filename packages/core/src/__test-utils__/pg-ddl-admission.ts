@@ -75,6 +75,46 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+/**
+ * FNXC:PgTestDdlAdmission 2026-10-07-21:17:
+ * One process owns exactly one beforeExit backstop for every connected gate.
+ * The registry lives on globalThis because vitest isolation and resetModules evaluate this module once per test file or reload, so module-local state cannot dedupe; a per-gate hook added one listener per connected gate and tripped MaxListenersExceededWarning.
+ * A gate is tracked only while it holds a session and untracks itself when it discards one, so the registry never retains closed gates.
+ */
+interface LiveSessionRegistry {
+  readonly discards: Set<() => Promise<void>>;
+  exitHookInstalled: boolean;
+}
+
+const LIVE_SESSION_REGISTRY_KEY = Symbol.for("fusion.pgTestDdlAdmission.liveSessions");
+
+function liveSessionRegistry(): LiveSessionRegistry {
+  const holder = globalThis as typeof globalThis & { [LIVE_SESSION_REGISTRY_KEY]?: LiveSessionRegistry };
+  let registry = holder[LIVE_SESSION_REGISTRY_KEY];
+  if (!registry) {
+    registry = { discards: new Set(), exitHookInstalled: false };
+    holder[LIVE_SESSION_REGISTRY_KEY] = registry;
+  }
+  return registry;
+}
+
+function trackLiveSession(discard: () => Promise<void>): () => void {
+  const registry = liveSessionRegistry();
+  registry.discards.add(discard);
+  if (!registry.exitHookInstalled) {
+    registry.exitHookInstalled = true;
+    // Owns no timer or handle; an empty registry makes later beforeExit passes no-ops.
+    process.on("beforeExit", () => { void closeLivePgDdlAdmissionSessions(); });
+  }
+  return () => { registry.discards.delete(discard); };
+}
+
+/** Closes every connected admission session in this process; a gate reconnects lazily on its next region. */
+export async function closeLivePgDdlAdmissionSessions(): Promise<void> {
+  const discards = [...liveSessionRegistry().discards];
+  await Promise.all(discards.map((discard) => discard()));
+}
+
 interface Region {
   slot?: number;
   released: boolean;
@@ -133,7 +173,7 @@ export function createPgDdlAdmissionGate(options: PgDdlAdmissionGateOptions): Pg
   let sessionCount = 0;
   let observedMaxAdmittedConcurrency = 0;
   let observedMaxDistinctIndexCount = 0;
-  let exitHookInstalled = false;
+  let untrackSession: (() => void) | undefined;
 
   const markDegraded = (region: Region, reason: PgDdlAdmissionDegradation): void => {
     if (region.degraded) return;
@@ -151,6 +191,8 @@ export function createPgDdlAdmissionGate(options: PgDdlAdmissionGateOptions): Pg
     const previous = session;
     session = undefined;
     sessionPromise = undefined;
+    untrackSession?.();
+    untrackSession = undefined;
     // The server has already released all session-owned locks; retaining these
     // local claims would permanently shrink this fork's available slot range.
     ledger.clear();
@@ -170,15 +212,7 @@ export function createPgDdlAdmissionGate(options: PgDdlAdmissionGateOptions): Pg
         session = created;
         sessionCount += 1;
         if (sessionCount > 1) reconnectCount += 1;
-        if (!exitHookInstalled) {
-          exitHookInstalled = true;
-          // This hook is installed only after lazy connection succeeds. It owns
-          // no timer/handle, is idempotent through discardSession(), and does
-          // not reconnect during shutdown if availability was turned off.
-          process.once("beforeExit", () => {
-            if (options.available()) void discardSession();
-          });
-        }
+        untrackSession = trackLiveSession(discardSession);
         return created;
       });
     }

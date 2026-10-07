@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  closeLivePgDdlAdmissionSessions,
   createPgDdlAdmissionGate,
+  type PgDdlAdmissionGate,
   type PgDdlAdmissionSession,
 } from "../__test-utils__/pg-ddl-admission.js";
 
@@ -290,5 +292,59 @@ describe("pg DDL admission", () => {
     expect(createSession).not.toHaveBeenCalled();
     expect(gate.observe().ledger).toEqual([]);
     expect(Object.values(gate.observe().degradedCount)).toEqual([0, 0, 0, 0]);
+  });
+
+  /*
+   * FNXC:PgTestDdlAdmission 2026-10-07-21:17:
+   * Every gate in one process shares a single beforeExit backstop, including gates from fresh module instances (vitest isolation, resetModules).
+   * A per-gate hook accumulated one listener per connected gate and tripped MaxListenersExceededWarning at eleven.
+   */
+  it("registers at most one beforeExit listener for any number of connected gates across module instances", async () => {
+    const baseline = process.listenerCount("beforeExit");
+    const closed: number[] = [];
+    const gates: PgDdlAdmissionGate[] = [];
+    for (let index = 0; index < 12; index += 1) {
+      vi.resetModules();
+      const fresh = await import("../__test-utils__/pg-ddl-admission.js");
+      const session = new CountedSession();
+      session.close = async () => { closed.push(index); };
+      gates.push(fresh.createPgDdlAdmissionGate({
+        available: () => true,
+        createSession: async () => session,
+        random: () => 0,
+      }));
+    }
+    await Promise.all(gates.map((gate) => gate.run(() => undefined)));
+    expect(gates.every((gate) => gate.observe().connected)).toBe(true);
+    expect(process.listenerCount("beforeExit") - baseline).toBeLessThanOrEqual(1);
+
+    await closeLivePgDdlAdmissionSessions();
+    expect(closed.sort((a, b) => a - b)).toEqual(Array.from({ length: 12 }, (_, index) => index));
+    expect(gates.every((gate) => !gate.observe().connected)).toBe(true);
+
+    // A discarded session is no longer tracked, so a second sweep closes nothing twice.
+    await closeLivePgDdlAdmissionSessions();
+    expect(closed).toHaveLength(12);
+  });
+
+  it("tracks a gate again after it reconnects following a sweep", async () => {
+    let closes = 0;
+    const gate = createPgDdlAdmissionGate({
+      available: () => true,
+      createSession: async () => {
+        const session = new CountedSession();
+        session.close = async () => { closes += 1; };
+        return session;
+      },
+      random: () => 0,
+    });
+    await gate.run(() => undefined);
+    await closeLivePgDdlAdmissionSessions();
+    expect(closes).toBe(1);
+    await gate.run(() => undefined);
+    expect(gate.observe()).toMatchObject({ connected: true, sessionCount: 2 });
+    await closeLivePgDdlAdmissionSessions();
+    expect(closes).toBe(2);
+    expect(gate.observe().connected).toBe(false);
   });
 });
