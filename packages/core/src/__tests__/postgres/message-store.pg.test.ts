@@ -190,6 +190,39 @@ pgTest("MessageStore send (PostgreSQL backend mode)", () => {
   });
 
   /*
+  FNXC:OperatorMailDedup 2026-10-07-20:33:
+  Duplicate operator mail is decided atomically with the insert. Concurrent sessions sharing one agent identity race the same report over separate pool connections; exactly one may insert, the rest must see that row as their duplicate.
+  The predicate still decides: a different recipient, or a duplicate the recipient has since read, is delivered.
+  */
+  it("inserts exactly one of several concurrent duplicate sends and keeps distinct sends deliverable", async () => {
+    const { MessageStore } = await import("../../stores/message-store.js");
+    const store = new MessageStore(null, { asyncLayer: h.layer() });
+    const guard = {
+      scan: { type: "agent-to-user" as const, read: false, limit: 20 },
+      isDuplicate: (candidate: { toId: string; content: string }, prior: { toId: string; content: string; read: boolean }) =>
+        !prior.read && prior.toId === candidate.toId && prior.content === candidate.content,
+    };
+    const input = { fromId: "agent-ceo", fromType: "agent" as const, toId: "dashboard", toType: "user" as const, content: "Push main: tasks waiting", type: "agent-to-user" as const };
+    // Open every pooled connection first; a cold pool connects lazily, so the first transaction would commit before any rival connected and the race would never happen.
+    const { drizzleSql } = await import("../../index.js");
+    await Promise.all(Array.from({ length: 5 }, () => h.layer().db.execute(drizzleSql`SELECT pg_sleep(0.05)`)));
+
+    const outcomes = await Promise.all(Array.from({ length: 8 }, () => store.sendMessageUnlessDuplicate(input, guard)));
+    const inserted = outcomes.filter((outcome) => outcome.sent);
+    expect(inserted).toHaveLength(1);
+    const winnerId = inserted[0]!.sent ? inserted[0]!.message.id : "";
+    expect(outcomes.filter((outcome) => !outcome.sent).every((outcome) => !outcome.sent && outcome.duplicateOf.id === winnerId)).toBe(true);
+    expect((await store.getOutbox("agent-ceo", "agent")).filter((message) => message.content === input.content)).toHaveLength(1);
+
+    const otherRecipient = await store.sendMessageUnlessDuplicate({ ...input, toId: "cli" }, guard);
+    expect(otherRecipient.sent).toBe(true);
+
+    await store.markAsRead(winnerId);
+    const afterRead = await store.sendMessageUnlessDuplicate(input, guard);
+    expect(afterRead.sent).toBe(true);
+  });
+
+  /*
   FNXC:PostgresMigrationNulSanitize 2026-07-20:
   Same NUL-byte hazard as the chat-store regression (chat-store-content-search-edit.pg.test.ts):
   agent-to-agent/agent-to-user mailbox content can carry raw tool output

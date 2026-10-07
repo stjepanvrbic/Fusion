@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { createSendMessageTool } from "../agent-tools.js";
 
 const execute = async (params: Record<string, unknown>, parent?: Record<string, unknown>) => {
-  const sendMessage = vi.fn(async () => ({ id: "msg-1" }));
-  const tool = createSendMessageTool({ sendMessage, getMessage: vi.fn(async () => parent ?? null) } as never, "agent-a");
+  const sendMessage = vi.fn(async (_input: unknown) => ({ id: "msg-1" }));
+  // Operator mail goes through the atomic dedupe seam; this fake never finds a duplicate.
+  const sendMessageUnlessDuplicate = vi.fn(async (input: unknown) => ({ sent: true, message: await sendMessage(input) }));
+  const tool = createSendMessageTool({ sendMessage, sendMessageUnlessDuplicate, getMessage: vi.fn(async () => parent ?? null) } as never, "agent-a");
   return { result: await tool.execute("1", params as never), sendMessage };
 };
 const text = (result: any) => result.content[0].text as string;

@@ -169,6 +169,32 @@ export async function sendMessageOnce(
 }
 
 /**
+ * FNXC:OperatorMailDedup 2026-10-07-20:32:
+ * Duplicate suppression must be atomic with the insert: a separate outbox read followed by an ordinary insert let two concurrent sessions sharing one agent identity both see "no duplicate" and both deliver.
+ * The check and the insert run in one transaction under an advisory lock scoped to project, sender and recipient, so concurrent sends for the same pair serialize and the loser sees the winner's row.
+ * The lock is per pair and per transaction, never a permanent fingerprint ban: the caller's predicate decides what counts as a duplicate (unread, inside a window, same thread).
+ * Returns the earlier message that made this send a duplicate, or null after inserting it.
+ */
+export async function sendMessageUnlessDuplicate(
+  layer: Pick<AsyncDataLayer, "transactionImmediate">,
+  message: PersistedMessage,
+  scan: MessageFilter,
+  isDuplicate: (prior: Message) => boolean,
+): Promise<Message | null> {
+  return layer.transactionImmediate(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(
+      CONCAT('message-send-dedupe:', COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'), ':', CAST(${message.fromId} AS text), '->', CAST(${message.toId} AS text)),
+      0
+    ))`);
+    const priors = await queryMessagesByParticipant(tx, "from", message.fromId, message.fromType as ParticipantType, scan);
+    const duplicate = priors.find(isDuplicate) ?? null;
+    if (duplicate) return duplicate;
+    await sendMessage(tx, message);
+    return null;
+  });
+}
+
+/**
  * Get a single message by id.
  */
 export async function getMessage(handle: QueryHandle, id: string): Promise<Message | null> {

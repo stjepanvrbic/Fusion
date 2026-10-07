@@ -29,7 +29,7 @@ import { mirrorPlanToProjectDb } from "./plan-artifact-writeback.js";
 import { fetchWebContent, WebFetchError } from "./util/web-fetch.js";
 import type { RunAuditor } from "./util/run-audit.js";
 import { computeApprovalDedupeKey } from "./agents/agent-action-gate.js";
-import { findUnreadDuplicateOperatorMessage } from "./agents/operator-outbox.js";
+import { operatorMailDuplicateGuard, operatorMessageFingerprint } from "./agents/operator-outbox.js";
 import { MessageDeliveryAutoRecoveryHandler } from "./auto-recovery-handlers/message-delivery.js";
 import { emitGoalRetrievalAudit } from "./goals/goal-anchoring-audit.js";
 import { recordRetry } from "./errors/retry-burned-logger.js";
@@ -573,6 +573,7 @@ export const sendMessageParams = Type.Object({
     title: Type.String({ description: "Report title" }),
     sections: Type.Array(Type.Object({ heading: Type.String(), body: Type.String() }), { description: "Non-empty report sections" }),
   }, { description: "Structured report payload for mail" })),
+  changes: Type.Optional(Type.String({ description: "What changed since an earlier unread report to the same human with the same title and tasks. Required to resend such a report; it is shown at the top of the message." })),
 });
 
 export const readMessagesParams = Type.Object({
@@ -6268,50 +6269,43 @@ export function createSendMessageTool(
           }
         }
 
-        /*
-        FNXC:OperatorMailDedup 2026-10-07-12:56:
-        An agent->user send identical (normalized) to one this agent already sent the same recipient within the window, still unread, is not inserted; the agent is told which earlier message it repeats.
-        Agent->agent mail is never deduped here. A failed lookup degrades to the pre-guard behavior (deliver), because the guard prevents noise and must never drop a legitimate report.
-        */
-        if (recipient.type === "user") {
-          let duplicate: Message | null = null;
-          try {
-            duplicate = await findUnreadDuplicateOperatorMessage(messageStore, {
-              fromAgentId,
-              toId: recipient.id,
-              content,
-              report: params.report,
-            });
-          } catch (lookupError) {
-            log.warn(`fn_send_message duplicate lookup failed for ${fromAgentId}; delivering without dedupe: ${lookupError instanceof Error ? lookupError.message : String(lookupError)}`);
-          }
-          if (duplicate) {
-            return {
-              content: [{
-                type: "text" as const,
-                text: `Message NOT sent: duplicate of ${duplicate.id} (sent ${duplicate.createdAt}), which ${recipient.id} has not read yet. Do not resend; message again only when the facts change, and say what changed.`,
-              }],
-              details: { suppressed: true, duplicateOfMessageId: duplicate.id },
-            };
-          }
+        const changeNote = params.changes?.trim();
+        const deliveredContent = changeNote ? `What changed: ${changeNote}\n\n${content}` : content;
+        if (deliveredContent.length > 2000) {
+          return {
+            content: [{ type: "text" as const, text: "ERROR: Message content plus the changes note exceeds 2000 character limit" }],
+            details: {},
+          };
         }
-
+        const sendInput = {
+          fromId: fromAgentId,
+          fromType: "agent" as const,
+          toId: recipient.id,
+          toType: recipient.type,
+          content: deliveredContent,
+          type: messageType,
+          ...((replyToMessageId || params.mail_kind || params.report) ? {
+            metadata: {
+              ...(replyToMessageId ? { replyTo: { messageId: replyToMessageId } } : {}),
+              ...(params.mail_kind ? { mailKind: params.mail_kind } : {}),
+              ...(params.report ? { report: params.report } : {}),
+            },
+          } : {}),
+        };
+        /*
+        FNXC:OperatorMailDedup 2026-10-07-20:40:
+        Operator mail goes through the store's atomic dedupe seam, so the duplicate decision and the insert cannot race another session sharing this agent identity.
+        Agent->agent mail is never deduped. A store failure is a delivery failure handled by the bounded retry below, not a silent bypass of the guard.
+        */
+        let suppressedBy: Message | null = null;
         const result = await deliveryHandler.runWithBoundedRetry({
-          run: async () => messageStore.sendMessage({
-            fromId: fromAgentId,
-            fromType: "agent",
-            toId: recipient.id,
-            toType: recipient.type,
-            content,
-            type: messageType,
-            ...((replyToMessageId || params.mail_kind || params.report) ? {
-              metadata: {
-                ...(replyToMessageId ? { replyTo: { messageId: replyToMessageId } } : {}),
-                ...(params.mail_kind ? { mailKind: params.mail_kind } : {}),
-                ...(params.report ? { report: params.report } : {}),
-              },
-            } : {}),
-          }),
+          run: async () => {
+            if (recipient.type !== "user") return messageStore.sendMessage(sendInput);
+            const outcome = await messageStore.sendMessageUnlessDuplicate(sendInput, operatorMailDuplicateGuard({ hasChangeNote: Boolean(changeNote) }));
+            if (outcome.sent) return outcome.message;
+            suppressedBy = outcome.duplicateOf;
+            return outcome.duplicateOf;
+          },
           correlation: { kind: "direct", fromAgentId, toId: recipient.id },
         }, options?.autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 }, async () => {
           const taskId = _ctx?.taskId as string | undefined;
@@ -6329,6 +6323,23 @@ export function createSendMessageTool(
           return {
             content: [{ type: "text" as const, text: `ERROR: Failed to send message: ${result.error.message}` }],
             details: {},
+          };
+        }
+
+        const duplicate = suppressedBy as Message | null;
+        if (duplicate) {
+          const kind = operatorMessageFingerprint(deliveredContent, params.report) === operatorMessageFingerprint(duplicate.content, duplicate.metadata?.report)
+            ? "exact"
+            : "structural";
+          const instruction = kind === "structural"
+            ? "It has the same title and tasks with only counts or timestamps changed. If the facts changed, resend with `changes` saying exactly what changed; otherwise do not resend."
+            : "Do not resend; message again only when the facts change, and say what changed.";
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Message NOT sent: duplicate of ${duplicate.id} (sent ${duplicate.createdAt}), which ${recipient.id} has not read yet. ${instruction}`,
+            }],
+            details: { suppressed: true, duplicateOfMessageId: duplicate.id, duplicateKind: kind },
           };
         }
 

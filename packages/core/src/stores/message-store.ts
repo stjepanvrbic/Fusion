@@ -170,36 +170,7 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
    * @returns The created message
    */
   async sendMessage(input: MessageCreateInput): Promise<Message> {
-    validateMessageMetadata(input.metadata);
-
-    const now = new Date().toISOString();
-    const messageId = `msg-${randomUUID().slice(0, 8)}`;
-
-    const from = normalizeMessageParticipant(input.fromId ?? "system", input.fromType ?? "system");
-    const to = normalizeMessageParticipant(input.toId, input.toType);
-
-    const message: Message = {
-      id: messageId,
-      fromId: from.id,
-      fromType: from.type,
-      toId: to.id,
-      toType: to.type,
-      // FNXC:PostgresMigrationNulSanitize 2026-07-21: sanitize here so the
-      // exact same object is persisted, emitted (message:sent/message:received,
-      // consumed by the agent wake hook), and returned to the caller. The
-      // async-message-store.ts sendMessage() layer also sanitizes before its
-      // own insert, but this class discarded that function's return value and
-      // used its own locally-built (unsanitized) `message` object for
-      // everything else — this closes that gap.
-      content: sanitizeTextValue(input.content),
-      type: input.type,
-      read: false,
-      archived: false,
-      metadata: sanitizeJsonbValue(input.metadata),
-      createdAt: now,
-      updatedAt: now,
-    };
-
+    const message = this.buildMessage(input);
     if (this.asyncLayer) {
       const layer = this.asyncLayer;
       await asyncMessageStore.sendMessage(layer.db, {
@@ -234,6 +205,92 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
       this.db!.bumpLastModified();
     }
 
+    await this.publishSentMessage(message);
+    return message;
+  }
+
+  /**
+   * FNXC:OperatorMailDedup 2026-10-07-20:32:
+   * Send unless an earlier message from the same sender to the same recipient makes this one a duplicate, deciding and inserting atomically.
+   * `scan` selects the sender's outbox rows to compare (for example unread agent->user mail) and `isDuplicate` decides per row; the PostgreSQL path runs both inside one transaction under a sender/recipient advisory lock, so concurrent sends from sessions sharing an agent identity cannot both pass the check.
+   * The SQLite path reads and inserts synchronously with no await in between, which is atomic within its single process.
+   * Events and delivery hooks fire only for an inserted message.
+   */
+  async sendMessageUnlessDuplicate(
+    input: MessageCreateInput,
+    guard: { scan: MessageFilter; isDuplicate: (candidate: Message, prior: Message) => boolean },
+  ): Promise<{ sent: true; message: Message } | { sent: false; duplicateOf: Message }> {
+    const message = this.buildMessage(input);
+    let duplicateOf: Message | null;
+    if (this.asyncLayer) {
+      duplicateOf = await asyncMessageStore.sendMessageUnlessDuplicate(
+        this.asyncLayer,
+        { ...message, metadata: message.metadata ?? null },
+        guard.scan,
+        (prior) => guard.isDuplicate(message, prior),
+      );
+    } else {
+      duplicateOf = this.queryMessagesByParticipant("from", message.fromId, message.fromType, guard.scan)
+        .find((prior) => guard.isDuplicate(message, prior)) ?? null;
+      if (!duplicateOf) {
+        this.stmtInsert.run(
+          message.id,
+          message.fromId,
+          message.fromType,
+          message.toId,
+          message.toType,
+          message.content,
+          message.type,
+          message.read ? 1 : 0,
+          message.archived ? 1 : 0,
+          toJsonNullable(message.metadata),
+          message.createdAt,
+          message.updatedAt,
+        );
+        this.db!.bumpLastModified();
+      }
+    }
+    if (duplicateOf) return { sent: false, duplicateOf };
+    await this.publishSentMessage(message);
+    return { sent: true, message };
+  }
+
+  /** Build the persisted shape of a new message (id, normalized participants, sanitized content). */
+  private buildMessage(input: MessageCreateInput): Message {
+    validateMessageMetadata(input.metadata);
+
+    const now = new Date().toISOString();
+    const messageId = `msg-${randomUUID().slice(0, 8)}`;
+
+    const from = normalizeMessageParticipant(input.fromId ?? "system", input.fromType ?? "system");
+    const to = normalizeMessageParticipant(input.toId, input.toType);
+
+    const message: Message = {
+      id: messageId,
+      fromId: from.id,
+      fromType: from.type,
+      toId: to.id,
+      toType: to.type,
+      // FNXC:PostgresMigrationNulSanitize 2026-07-21: sanitize here so the
+      // exact same object is persisted, emitted (message:sent/message:received,
+      // consumed by the agent wake hook), and returned to the caller. The
+      // async-message-store.ts sendMessage() layer also sanitizes before its
+      // own insert, but this class discarded that function's return value and
+      // used its own locally-built (unsanitized) `message` object for
+      // everything else — this closes that gap.
+      content: sanitizeTextValue(input.content),
+      type: input.type,
+      read: false,
+      archived: false,
+      metadata: sanitizeJsonbValue(input.metadata),
+      createdAt: now,
+      updatedAt: now,
+    };
+    return message;
+  }
+
+  /** Post-insert side effects of a send: activity telemetry, events, and the agent wake hook. */
+  private async publishSentMessage(message: Message): Promise<void> {
     /*
     FNXC:CommandCenterActivity 2026-08-09-10:46:
     Human mailbox sends count as activity only after durable delivery succeeds. Usage telemetry contains
@@ -271,8 +328,6 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
         );
       }
     }
-
-    return message;
   }
 
   /**
