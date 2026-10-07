@@ -688,6 +688,8 @@ describe("HeartbeatTriggerScheduler to HeartbeatMonitor recovery boundary", () =
   }
 
   async function tick(scheduler: HeartbeatTriggerScheduler, agentId: string): Promise<void> {
+    // Let the registration's settings-multiplier re-arm settle, so the tick runs under the current arm.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     const internals = scheduler as unknown as {
       currentTimerArm: Map<string, number>;
       onTimerTick: (agentId: string, intervalMs: number, armId?: number) => Promise<void>;

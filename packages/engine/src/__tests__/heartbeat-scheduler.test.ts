@@ -3369,3 +3369,199 @@ describe("HeartbeatTriggerScheduler", () => {
     });
   });
 });
+
+/*
+FNXC:AgentHeartbeat 2026-10-07-19:05:
+stop() is a hard boundary for every piece of asynchronous scheduler work already in flight.
+A multiplier lookup, a lifecycle refresh, the timer audit, a timer tick, and assignment wakes must re-check the scheduler generation after each await, so none of them can install a timer or dispatch a heartbeat after stop, or after a stop/start restart that has superseded them.
+*/
+describe("HeartbeatTriggerScheduler stop boundary for in-flight work", () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((res) => { resolve = res; });
+    return { promise, resolve };
+  }
+
+  const durableAgent = (patch: Partial<Agent> = {}): Agent => ({
+    id: "agent-001",
+    name: "Agent 001",
+    role: "executor",
+    state: "active",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    metadata: {},
+    runtimeConfig: { heartbeatIntervalMs: 60_000 },
+    ...patch,
+  }) as Agent;
+
+  function createStore(agent: Agent) {
+    return Object.assign(new EventEmitter(), {
+      getAgent: vi.fn(async () => agent),
+      getActiveHeartbeatRun: vi.fn(async () => null),
+      getBudgetStatus: vi.fn(async () => createBudgetStatus()),
+      listAgents: vi.fn(async () => [agent]),
+      getRecentRuns: vi.fn(async () => []),
+      updateAgent: vi.fn(async () => agent),
+    }) as unknown as AgentStore & EventEmitter & {
+      getAgent: ReturnType<typeof vi.fn>;
+      getActiveHeartbeatRun: ReturnType<typeof vi.fn>;
+      listAgents: ReturnType<typeof vi.fn>;
+    };
+  }
+
+  const flush = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
+
+  let scheduler: HeartbeatTriggerScheduler | undefined;
+  afterEach(() => {
+    scheduler?.stop();
+    scheduler = undefined;
+  });
+
+  it("drops a multiplier re-arm whose settings read resolves after stop", async () => {
+    const settings = deferred<Record<string, unknown>>();
+    const taskStore = { getSettings: vi.fn(() => settings.promise) } as unknown as TaskStore;
+    const store = createStore(durableAgent());
+    scheduler = new HeartbeatTriggerScheduler(store, vi.fn(async () => undefined), taskStore);
+    scheduler.start();
+    await flush();
+
+    scheduler.registerAgent("agent-001", { heartbeatIntervalMs: 60_000 });
+    scheduler.stop();
+    settings.resolve({ heartbeatMultiplier: 2 });
+    await flush();
+
+    expect(scheduler.getRegisteredAgents()).toEqual([]);
+  });
+
+  it("keeps the post-restart registration when a pre-stop multiplier read resolves late", async () => {
+    const stale = deferred<Record<string, unknown>>();
+    const getSettings = vi.fn()
+      .mockResolvedValueOnce({})
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValue({ heartbeatMultiplier: 1 });
+    const taskStore = { getSettings } as unknown as TaskStore;
+    const store = createStore(durableAgent());
+    scheduler = new HeartbeatTriggerScheduler(store, vi.fn(async () => undefined), taskStore);
+    scheduler.start();
+    await flush();
+
+    scheduler.registerAgent("agent-001", { heartbeatIntervalMs: 60_000 });
+    scheduler.stop();
+    scheduler.start();
+    await flush();
+    scheduler.registerAgent("agent-001", { heartbeatIntervalMs: 60_000 });
+    await flush();
+    const timers = (scheduler as unknown as { timers: Map<string, { intervalMs: number }> }).timers;
+    const intervalAfterRestart = timers.get("agent-001")?.intervalMs;
+
+    stale.resolve({ heartbeatMultiplier: 4 });
+    await flush();
+
+    expect(scheduler.getRegisteredAgents()).toEqual(["agent-001"]);
+    expect(timers.get("agent-001")?.intervalMs).toBe(intervalAfterRestart);
+  });
+
+  it("does not dispatch a timer tick whose store read resolves after stop", async () => {
+    const callback = vi.fn(async () => undefined);
+    const store = createStore(durableAgent());
+    scheduler = new HeartbeatTriggerScheduler(store, callback);
+    scheduler.start();
+    await flush();
+    scheduler.registerAgent("agent-001", { heartbeatIntervalMs: 60_000 });
+    const pendingAgent = deferred<Agent>();
+    store.getAgent.mockReturnValueOnce(pendingAgent.promise);
+    const internals = scheduler as unknown as {
+      currentTimerArm: Map<string, number>;
+      onTimerTick: (agentId: string, intervalMs: number, armId?: number) => Promise<void>;
+    };
+
+    const tick = internals.onTimerTick("agent-001", 60_000, internals.currentTimerArm.get("agent-001"));
+    scheduler.stop();
+    pendingAgent.resolve(durableAgent());
+    await tick;
+
+    expect(callback).not.toHaveBeenCalled();
+    expect(scheduler.getRegisteredAgents()).toEqual([]);
+  });
+
+  it("does not dispatch a legacy tick (no arm id) that crosses a stop/start restart", async () => {
+    const callback = vi.fn(async () => undefined);
+    const store = createStore(durableAgent());
+    scheduler = new HeartbeatTriggerScheduler(store, callback);
+    scheduler.start();
+    await flush();
+    const pendingRun = deferred<null>();
+    store.getActiveHeartbeatRun.mockReturnValueOnce(pendingRun.promise);
+    const internals = scheduler as unknown as { onTimerTick: (agentId: string, intervalMs: number, armId?: number) => Promise<void> };
+
+    const tick = internals.onTimerTick("agent-001", 60_000);
+    await flush();
+    scheduler.stop();
+    scheduler.start();
+    pendingRun.resolve(null);
+    await tick;
+
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it("does not re-arm from a lifecycle refresh whose read resolves after stop", async () => {
+    const store = createStore(durableAgent());
+    scheduler = new HeartbeatTriggerScheduler(store, vi.fn(async () => undefined));
+    scheduler.start();
+    await flush();
+    const pendingAgent = deferred<Agent>();
+    store.getAgent.mockReturnValueOnce(pendingAgent.promise);
+    const internals = scheduler as unknown as { syncTimerForAgentFromStore: (agentId: string, reason: string) => Promise<void> };
+
+    const refresh = internals.syncTimerForAgentFromStore("agent-001", "runtime-config-updated");
+    scheduler.stop();
+    pendingAgent.resolve(durableAgent());
+    await refresh;
+
+    expect(scheduler.getRegisteredAgents()).toEqual([]);
+  });
+
+  it("does not re-arm from a timer audit whose agent listing resolves after stop", async () => {
+    const store = createStore(durableAgent());
+    scheduler = new HeartbeatTriggerScheduler(store, vi.fn(async () => undefined));
+    scheduler.start();
+    await flush();
+    scheduler.unregisterAgent("agent-001");
+    const pendingAgents = deferred<Agent[]>();
+    store.listAgents.mockReturnValueOnce(pendingAgents.promise);
+
+    const audit = scheduler.auditTimerRegistrations("interval");
+    scheduler.stop();
+    pendingAgents.resolve([durableAgent()]);
+    await audit;
+
+    expect(scheduler.getRegisteredAgents()).toEqual([]);
+  });
+
+  it("does not dispatch an assignment wake or a deferred-assignment drain that resolves after stop", async () => {
+    const callback = vi.fn(async () => undefined);
+    const store = createStore(durableAgent());
+    scheduler = new HeartbeatTriggerScheduler(store, callback);
+    scheduler.start();
+    await flush();
+
+    const pendingRun = deferred<null>();
+    store.getActiveHeartbeatRun.mockReturnValueOnce(pendingRun.promise);
+    store.emit("agent:assigned", durableAgent(), "FN-1");
+    await flush();
+    (scheduler as unknown as { pendingAssignments: Map<string, { taskId: string }> }).pendingAssignments.set("agent-001", { taskId: "FN-2" });
+    const pendingAgent = deferred<Agent>();
+    store.getAgent.mockReturnValueOnce(pendingAgent.promise);
+    const drain = scheduler.drainPendingAssignment("agent-001");
+
+    scheduler.stop();
+    pendingRun.resolve(null);
+    pendingAgent.resolve(durableAgent());
+    await drain;
+    await flush();
+
+    expect(callback).not.toHaveBeenCalled();
+  });
+});

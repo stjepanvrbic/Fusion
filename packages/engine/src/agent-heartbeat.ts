@@ -4687,6 +4687,13 @@ export class HeartbeatTriggerScheduler {
   private timerArmSeq = 0;
   private currentTimerArm: Map<string, number> = new Map();
   private running = false;
+  /*
+   * FNXC:AgentHeartbeat 2026-10-07-19:05:
+   * stop() advances this generation so asynchronous work already in flight cannot act afterward.
+   * Every async path (multiplier re-arm, lifecycle refresh, timer audit, timer tick, assignment wake, deferred-assignment drain) captures the generation before its first await and re-checks it after each await and immediately before it registers a timer or dispatches a heartbeat.
+   * start() does not advance it, so a registration made before start keeps its multiplier refresh.
+   */
+  private lifecycleGeneration = 0;
   private assignedListener: ((agent: import("@fusion/core").Agent, taskId: string) => void) | null = null;
   private createdListener: ((agent: import("@fusion/core").Agent) => void) | null = null;
   private updatedListener: ((agent: import("@fusion/core").Agent) => void) | null = null;
@@ -4814,6 +4821,7 @@ export class HeartbeatTriggerScheduler {
   stop(): void {
     if (!this.running) return;
     this.running = false;
+    this.lifecycleGeneration += 1;
 
     // Unwatch assignments
     this.unwatchAssignments();
@@ -4855,6 +4863,11 @@ export class HeartbeatTriggerScheduler {
    */
   isActive(): boolean {
     return this.running;
+  }
+
+  /** True while the scheduler runs in the same lifecycle generation that `generation` was captured in. */
+  private isLiveGeneration(generation: number): boolean {
+    return this.running && this.lifecycleGeneration === generation;
   }
 
   /** Default heartbeat interval when not explicitly configured (3600 seconds / 1 hour) */
@@ -4901,7 +4914,7 @@ export class HeartbeatTriggerScheduler {
 
     // If project settings are available, refresh registration with the current multiplier.
     if (this.taskStore && typeof (this.taskStore as { getSettings?: () => Promise<Settings> }).getSettings === "function") {
-      void this.applyProjectMultiplierRegistration(agentId, intervalMs, usingDefaultInterval, registrationEpoch, lastHeartbeatAt);
+      void this.applyProjectMultiplierRegistration(agentId, intervalMs, usingDefaultInterval, registrationEpoch, lastHeartbeatAt, this.lifecycleGeneration);
     }
   }
 
@@ -4911,6 +4924,7 @@ export class HeartbeatTriggerScheduler {
     usingDefaultInterval: boolean,
     expectedEpoch: number,
     lastHeartbeatAt: string | null,
+    expectedGeneration: number,
   ): Promise<void> {
     let multiplier = 1;
 
@@ -4926,8 +4940,8 @@ export class HeartbeatTriggerScheduler {
 
     this.lastKnownHeartbeatMultiplier = multiplier;
 
-    // Guard against stale async completions after subsequent register/unregister calls.
-    if (this.registrationEpochs.get(agentId) !== expectedEpoch) {
+    // Guard against stale async completions after subsequent register/unregister calls or a stop().
+    if (this.registrationEpochs.get(agentId) !== expectedEpoch || this.lifecycleGeneration !== expectedGeneration) {
       return;
     }
 
@@ -5120,6 +5134,7 @@ export class HeartbeatTriggerScheduler {
 
     this.assignedListener = async (agent, taskId) => {
       if (!this.running) return;
+      const generation = this.lifecycleGeneration;
 
       try {
         if (!isHeartbeatManaged(agent)) {
@@ -5142,6 +5157,7 @@ export class HeartbeatTriggerScheduler {
         // assignment for completion-driven re-fire so it is not stranded by
         // long/idle-skipped timer intervals.
         const activeRun = await this.store.getActiveHeartbeatRun(agent.id);
+        if (!this.isLiveGeneration(generation)) return;
         if (activeRun) {
           this.pendingAssignments.set(agent.id, { taskId });
           heartbeatLog.debug(`Assignment trigger skipped for ${agent.id} (active run)`);
@@ -5195,6 +5211,8 @@ export class HeartbeatTriggerScheduler {
           }
         }
 
+        // FNXC:AgentHeartbeat 2026-10-07-19:05: an assignment wake that crossed a stop() must not dispatch.
+        if (!this.isLiveGeneration(generation)) return;
         heartbeatLog.log(`Assignment trigger for ${agent.id} (task: ${taskId})`);
         await this.callback(agent.id, "assignment", {
           taskId,
@@ -5230,9 +5248,11 @@ export class HeartbeatTriggerScheduler {
     if (!pending) {
       return;
     }
+    const generation = this.lifecycleGeneration;
 
     try {
       const agent = await this.store.getAgent(agentId);
+      if (!this.isLiveGeneration(generation)) return;
       if (!agent) {
         this.pendingAssignments.delete(agentId);
         heartbeatLog.log(`Deferred assignment cleared for ${agentId} (agent missing)`);
@@ -5293,6 +5313,8 @@ export class HeartbeatTriggerScheduler {
         heartbeatLog.warn(`Deferred assignment budget check failed for ${agentId}: ${budgetErr instanceof Error ? budgetErr.message : String(budgetErr)} — proceeding without budget check`);
       }
 
+      // FNXC:AgentHeartbeat 2026-10-07-19:05: a drain that crossed a stop() keeps its pending entry and does not dispatch.
+      if (!this.isLiveGeneration(generation)) return;
       this.pendingAssignments.delete(agentId);
       heartbeatLog.log(`Deferred assignment re-fired for ${agentId} (task: ${pending.taskId})`);
       await this.callback(agentId, "assignment", {
@@ -5385,7 +5407,9 @@ export class HeartbeatTriggerScheduler {
   }
 
   private async syncTimerForAgentFromStore(agentId: string, reason: string): Promise<void> {
+    const generation = this.lifecycleGeneration;
     const agent = await this.store.getAgent(agentId);
+    if (this.lifecycleGeneration !== generation) return;
     if (!agent) {
       this.unregisterAgent(agentId);
       return;
@@ -5566,12 +5590,14 @@ export class HeartbeatTriggerScheduler {
 
   async auditTimerRegistrations(reason: "start" | "interval" = "interval"): Promise<void> {
     if (!this.running) return;
+    const generation = this.lifecycleGeneration;
     this.lastAuditRanAtMs = Date.now();
 
     try {
       const settings = this.taskStore && typeof this.taskStore.getSettings === "function"
         ? await this.taskStore.getSettings()
         : null;
+      if (!this.isLiveGeneration(generation)) return;
       const staleMultiplier = this.resolveRepairStaleMultiplier(settings);
       this.lastKnownHeartbeatMultiplier = HeartbeatTriggerScheduler.resolveHeartbeatMultiplier(settings?.heartbeatMultiplier);
       this.updateErrorRecoveryLimit(settings);
@@ -5579,6 +5605,8 @@ export class HeartbeatTriggerScheduler {
       let rearmedCount = 0;
       let zombieRearmedCount = 0;
       for (const agent of agents) {
+        // FNXC:AgentHeartbeat 2026-10-07-19:05: a stop() during any await of this pass ends the pass before it re-arms or unregisters anything.
+        if (!this.isLiveGeneration(generation)) return;
         /*
          * FNXC:AgentHeartbeat 2026-07-09-00:00:
          * FN-7718 — CLI-driven `fn agent stop`/`start` mutate the agent row from
@@ -5668,6 +5696,7 @@ export class HeartbeatTriggerScheduler {
         const isZombieRearm = hasTimerEntry && staleAtRepair;
 
         const activeRun = await this.store.getActiveHeartbeatRun(agent.id);
+        if (!this.isLiveGeneration(generation)) return;
         const activeRunId = activeRun?.id ?? null;
         let reapedActiveRun = false;
         let activeRunElapsedMs = Number.NaN;
@@ -5679,6 +5708,7 @@ export class HeartbeatTriggerScheduler {
             continue;
           }
           const reapResult = await this.maybeReapStaleActiveRun(agent, activeRun, "audit", staleMultiplier);
+          if (!this.isLiveGeneration(generation)) return;
           reapedActiveRun = reapResult.reaped;
           activeRunElapsedMs = reapResult.elapsedMs;
           activeRunThresholdMs = reapResult.thresholdMs;
@@ -5801,8 +5831,18 @@ export class HeartbeatTriggerScheduler {
      */
     this.lastTimerFireAtMs.set(agentId, Date.now());
 
+    /*
+     * FNXC:AgentHeartbeat 2026-10-07-19:05:
+     * The entry guards above run before any await; a stop, restart, or re-arm can land during the reads below.
+     * Re-check the lifecycle generation, running state, and arm identity after every await and immediately before dispatch.
+     */
+    const generation = this.lifecycleGeneration;
+    const superseded = (): boolean => !this.isLiveGeneration(generation)
+      || (armId !== undefined && this.currentTimerArm.get(agentId) !== armId);
+
     try {
       const agent = await this.store.getAgent(agentId);
+      if (superseded()) return;
       /*
       FNXC:EngineDiagnostics 2026-07-26-08:17:
       Timer skip reasons (pause, idle, active run, ineligible state) fire on every interval for every registered agent. That is steady-state gating, not a lifecycle event — demote to debug (FUSION_DEBUG=heartbeat). Keep reap/re-arm and actual executeHeartbeat start/complete on log/warn.
@@ -5818,6 +5858,7 @@ export class HeartbeatTriggerScheduler {
       A separate state check here admitted only tickable or error agents, so it unregistered the under-budget heartbeat-model-unavailable parks that registration deliberately arms.
       */
       const settings = this.taskStore ? await this.taskStore.getSettings() : null;
+      if (superseded()) return;
       this.updateErrorRecoveryLimit(settings);
       if (!this.isTimerEligibleAgent(agent)) {
         heartbeatLog.debug(`Timer tick skipped for ${agentId} (state=${agent.state})`);
@@ -5864,9 +5905,11 @@ export class HeartbeatTriggerScheduler {
 
       // Check for active runs
       const activeRun = await this.store.getActiveHeartbeatRun(agentId);
+      if (superseded()) return;
       if (activeRun) {
         const staleMultiplier = this.resolveRepairStaleMultiplier(settings);
         const reapResult = await this.maybeReapStaleActiveRun(agent, activeRun, "timer", staleMultiplier);
+        if (superseded()) return;
         if (!reapResult.reaped) {
           heartbeatLog.debug(`Timer tick skipped for ${agentId} (active run)`);
           return;
@@ -5881,6 +5924,7 @@ export class HeartbeatTriggerScheduler {
       // can create explicit run records with budget_exhausted/budget_threshold_exceeded reasons.
       // This makes timer budget skips observable rather than silent drops.
 
+      if (superseded()) return;
       await this.callback(agentId, "timer", {
         wakeReason: "timer",
         triggerDetail: "scheduled",
