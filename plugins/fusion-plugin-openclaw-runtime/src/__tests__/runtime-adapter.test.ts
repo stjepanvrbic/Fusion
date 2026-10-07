@@ -164,8 +164,37 @@ describe("OpenClawRuntimeAdapter — describeModel/dispose", () => {
     expect(mockDescribeCliModel).toHaveBeenCalledWith(session);
   });
 
-  it("dispose is a no-op", async () => {
+  it("dispose without an active turn resolves", async () => {
     const adapter = new OpenClawRuntimeAdapter();
-    await expect(adapter.dispose!({} as any)).resolves.toBeUndefined();
+    const { session } = await adapter.createSession({ cwd: "/repo", systemPrompt: "sys" });
+    await expect(adapter.dispose!(session)).resolves.toBeUndefined();
+  });
+});
+
+describe("OpenClawRuntimeAdapter — task working directory and disposal", () => {
+  it("creates each session in its own task cwd", async () => {
+    const adapter = new OpenClawRuntimeAdapter();
+    await adapter.createSession({ cwd: "C:\\worktrees\\task-a", systemPrompt: "sys" });
+    await adapter.createSession({ cwd: "/worktrees/task-b", systemPrompt: "sys" });
+    expect(mockCreateCliSession.mock.calls.map((call) => call[0].cwd)).toEqual(["C:\\worktrees\\task-a", "/worktrees/task-b"]);
+  });
+
+  it("aborts the active turn on adapter or session disposal and settles the prompt", async () => {
+    for (const disposeVia of ["adapter", "session"] as const) {
+      let signal: AbortSignal | undefined;
+      mockPromptCli.mockImplementationOnce((_s, _p, _c, _cb, turnSignal: AbortSignal) => {
+        signal = turnSignal;
+        return new Promise((_resolve, reject) => turnSignal.addEventListener("abort", () => reject(new Error("openclaw: invocation aborted")), { once: true }));
+      });
+      const adapter = new OpenClawRuntimeAdapter();
+      const { session } = await adapter.createSession({ cwd: "/repo", systemPrompt: "sys" });
+      const pending = adapter.promptWithFallback(session, "long task");
+      await Promise.resolve();
+      expect(signal?.aborted).toBe(false);
+      if (disposeVia === "adapter") await adapter.dispose!(session);
+      else await session.dispose?.();
+      expect(signal?.aborted).toBe(true);
+      await expect(pending).rejects.toThrow("openclaw: invocation aborted");
+    }
   });
 });

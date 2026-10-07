@@ -11,6 +11,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { killProcessTree, resolveShellFreeLaunch } from "@fusion/plugin-sdk";
 
 /** Default timeout for the version probe. */
 const DEFAULT_PROBE_TIMEOUT_MS = 2_000;
@@ -47,7 +48,14 @@ export async function probeOpenClawBinary(
   const binary = opts.binaryPath ?? "openclaw";
   const timeoutMs = opts.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
 
-  const resolvedPath = await tryResolveBinaryPath(binary);
+  // FNXC:WindowsProcessLaunch 2026-10-07-18:02: Probe through the same shell-free launch resolution as sessions so "available" implies spawnable on Windows npm installs.
+  let launch: { command: string; args: string[]; resolvedPath?: string };
+  try {
+    launch = resolveShellFreeLaunch(binary, ["--version"]);
+  } catch (err) {
+    return { available: false, reason: (err as Error).message, probeDurationMs: Date.now() - startedAt };
+  }
+  const resolvedPath = launch.resolvedPath ?? (await tryResolveBinaryPath(binary));
 
   return new Promise<OpenClawBinaryStatus>((resolvePromise) => {
     const finish = (
@@ -58,18 +66,16 @@ export async function probeOpenClawBinary(
 
     let settled = false;
 
-    const child = spawn(resolvedPath ?? binary, ["--version"], {
+    const child = spawn(launch.command, launch.args, {
       stdio: ["ignore", "pipe", "pipe"],
+      shell: false,
+      windowsHide: true,
     });
 
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // Process already gone.
-      }
+      killProcessTree(child);
       finish({
         available: false,
         binaryPath: resolvedPath,

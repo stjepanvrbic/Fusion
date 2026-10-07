@@ -8,8 +8,9 @@
  * runtime-adapter, and dashboard probe façade all import it under this name.)
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { killProcessTree, resolveShellFreeLaunch } from "@fusion/plugin-sdk";
 import { readFile } from "node:fs/promises";
 import type {
   CliConfig,
@@ -151,6 +152,21 @@ export function extractStderrError(stderr: string, stdout?: string): string {
   );
 }
 
+/*
+FNXC:WindowsProcessLaunch 2026-10-07-18:02:
+OpenClaw installs with `npm i -g openclaw`, which is `openclaw.cmd` on Windows; a shell-free spawn of the bare name fails with ENOENT.
+Every OpenClaw launch resolves through the shared shell-free seam, so prompt text and MCP JSON stay literal argv and never pass through cmd.exe.
+*/
+function spawnOpenClaw(binaryPath: string, args: string[], cwd?: string): ChildProcess {
+  const launch = resolveShellFreeLaunch(binaryPath, args);
+  return spawn(launch.command, launch.args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    cwd,
+    shell: false,
+    windowsHide: true,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // createCliSession — mints a UUID + transcript bookkeeping
 // ---------------------------------------------------------------------------
@@ -161,8 +177,10 @@ export function createCliSession(opts: {
   callbacks?: GatewayCallbacks;
   mcpProfile?: string;
   mcpConfigPath?: string;
+  cwd?: string;
 }): GatewaySession {
   return {
+    cwd: opts.cwd,
     sessionId: randomUUID(),
     agentId: opts.agentId ?? DEFAULT_AGENT_ID,
     systemPrompt: opts.systemPrompt,
@@ -188,9 +206,13 @@ export async function configureOpenClawMcpServer(opts: {
   const serverValue = await readFile(opts.serverConfigPath, "utf-8");
 
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(opts.binaryPath, ["--no-color", "--profile", opts.profile, "mcp", "set", opts.serverName, serverValue], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    let child: ChildProcess;
+    try {
+      child = spawnOpenClaw(opts.binaryPath, ["--no-color", "--profile", opts.profile, "mcp", "set", opts.serverName, serverValue]);
+    } catch (err) {
+      reject(new Error(`openclaw: failed to configure MCP server — ${(err as Error).message}`));
+      return;
+    }
 
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
@@ -227,18 +249,23 @@ export async function promptCli(
   return new Promise<void>((resolve, reject) => {
     let settled = false;
 
-    const child = spawn(config.binaryPath, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    /*
+    FNXC:OpenClawCli 2026-10-07-18:02:
+    The CLI runs in the session's task working directory, never Fusion's own cwd.
+    Abort (session disposal) settles the turn immediately and terminates the process tree; output arriving afterwards is ignored so no callback fires after disposal.
+    */
+    let child: ChildProcess;
+    try {
+      child = spawnOpenClaw(config.binaryPath, args, session.cwd);
+    } catch (err) {
+      reject(new Error(`openclaw: spawn error — ${(err as Error).message}`));
+      return;
+    }
 
     const hardKill = setTimeout(() => {
       if (settled) return;
       settled = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // already gone
-      }
+      killProcessTree(child);
       reject(
         new Error(
           `openclaw: process timed out after ${config.cliTimeoutMs}ms`,
@@ -248,11 +275,10 @@ export async function promptCli(
 
     const onAbort = (): void => {
       if (settled) return;
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // already gone
-      }
+      settled = true;
+      clearTimeout(hardKill);
+      killProcessTree(child);
+      reject(new Error("openclaw: invocation aborted"));
     };
     if (signal) {
       if (signal.aborted) {
