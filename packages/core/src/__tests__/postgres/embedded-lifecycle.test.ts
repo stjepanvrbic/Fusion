@@ -14,7 +14,7 @@
  *   - VAL-CONN-007: graceful shutdown stops the Postgres process; no orphan.
  */
 
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import {
   mkdtempSync,
   existsSync,
@@ -53,6 +53,8 @@ import {
   __setWindowsEmbeddedPostgresNativeRootForTests,
   __setWindowsLauncherForTests,
   __setWindowsPgCtlStopForTests,
+  __setPostmasterImageProbeForTests,
+  probePostmasterImage,
   resolveElectronAsarUnpackedPath,
   fingerprintEmbeddedPostgresNativeRoot,
   buildEmbeddedPostgresMaterializationMarker,
@@ -87,7 +89,16 @@ const tracked: Array<{
   dataDir: string;
 }> = [];
 
+/*
+Join-path fixtures record this test process's pid as the live postmaster in postmaster.pid.
+A join requires that pid to be a postgres process, so the image probe declares it one; the stale-pid suite restores the real probe.
+*/
+beforeEach(() => {
+  __setPostmasterImageProbeForTests(async (pid) => (pid === process.pid ? "postgres" : "other"));
+});
+
 afterEach(async () => {
+  __setPostmasterImageProbeForTests(null);
   __setEmbeddedPostgresCtorForTests(null);
   __setWindowsElevatedAdminForTests(null);
   __setWindowsEmbeddedPostgresNativeRootForTests(null);
@@ -1581,6 +1592,86 @@ describe("embedded-lifecycle: stale postmaster.pid recovery (issue #2411)", () =
       expect(ctor).toHaveBeenCalledOnce();
       expect(logLines.some((line) => /stale lock from a crash/i.test(line))).toBe(true);
     } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("identifies a live non-postgres process with the real platform probe", async () => {
+    await expect(probePostmasterImage(process.pid)).resolves.toBe("other");
+  });
+
+  it.each(["preflight join", "lock-collision join"] as const)(
+    "%s: never joins a postmaster.pid that names a live recycled non-postgres pid",
+    async (surface) => {
+      __setPostmasterImageProbeForTests(null);
+      const dataDir = makeDataDir();
+      writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+      const recordRecycledPid = () =>
+        writeFileSync(
+          join(dataDir, "postmaster.pid"),
+          [String(process.pid), dataDir, "1784424901", "55452", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+        );
+      if (surface === "preflight join") recordRecycledPid();
+      const lockCollision = new Error('lock file "postmaster.pid" already exists');
+      const ownedStartReached = new Error("owned start reached");
+      const ctor = vi.fn();
+      class RecycledPidEmbeddedPostgres {
+        constructor() {
+          ctor();
+        }
+        initialise = vi.fn(async () => {});
+        start = vi.fn(async () => {
+          if (surface === "lock-collision join") {
+            recordRecycledPid();
+            throw lockCollision;
+          }
+          throw ownedStartReached;
+        });
+        stop = vi.fn(async () => {});
+      }
+      __setEmbeddedPostgresCtorForTests(RecycledPidEmbeddedPostgres as never);
+      __setWindowsElevatedAdminForTests(false);
+      const ensureJoinedDatabase = vi.spyOn(EmbeddedPostgresLifecycle.prototype as never, "ensureJoinedDatabase");
+      try {
+        const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), startTimeoutMs: 0 });
+        // Preflight: the owned start runs instead of joining. Lock collision: the
+        // collision is surfaced instead of being rescued into a join of a dead port.
+        await expect(lifecycle.start()).rejects.toBe(surface === "preflight join" ? ownedStartReached : lockCollision);
+        expect(ctor).toHaveBeenCalledOnce();
+        expect(ensureJoinedDatabase).not.toHaveBeenCalled();
+      } finally {
+        ensureJoinedDatabase.mockRestore();
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("keeps the fail-closed join when the image probe cannot answer", async () => {
+    __setPostmasterImageProbeForTests(async () => "unknown");
+    const dataDir = makeDataDir();
+    const ctor = vi.fn();
+    class UnexpectedEmbeddedPostgres {
+      constructor() {
+        ctor();
+      }
+      initialise = vi.fn(async () => {});
+      start = vi.fn(async () => {});
+      stop = vi.fn(async () => {});
+    }
+    __setEmbeddedPostgresCtorForTests(UnexpectedEmbeddedPostgres as never);
+    const ensureJoinedDatabase = vi
+      .spyOn(EmbeddedPostgresLifecycle.prototype as never, "ensureJoinedDatabase")
+      .mockResolvedValue(undefined as never);
+    try {
+      writeFileSync(
+        join(dataDir, "postmaster.pid"),
+        [String(process.pid), dataDir, "1784424901", "55453", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+      );
+      const lifecycle = new EmbeddedPostgresLifecycle(baseOptions(dataDir));
+      await expect(lifecycle.start()).resolves.toMatchObject({ runtimeUrl: expect.stringContaining(":55453/") });
+      expect(ctor).not.toHaveBeenCalled();
+    } finally {
+      ensureJoinedDatabase.mockRestore();
       rmSync(dataDir, { recursive: true, force: true });
     }
   });

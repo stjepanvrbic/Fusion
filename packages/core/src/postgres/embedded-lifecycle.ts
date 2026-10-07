@@ -59,7 +59,7 @@ import {
   chmodSync,
   writeFileSync,
 } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { createServer, type Server } from "node:net";
@@ -1353,6 +1353,65 @@ function isPostmasterProcessAlive(pid: number): boolean {
   }
 }
 
+/** What the process at a recorded postmaster pid is: a postgres server, something else, or unknowable. */
+export type PostmasterImageVerdict = "postgres" | "other" | "unknown";
+type PostmasterImageProbe = (pid: number) => Promise<PostmasterImageVerdict>;
+let postmasterImageProbeForTests: PostmasterImageProbe | null = null;
+const POSTMASTER_IMAGE_PROBE_TIMEOUT_MS = 5_000;
+
+/** Test seam replacing {@link probePostmasterImage}; null restores the platform probe. */
+export function __setPostmasterImageProbeForTests(probe: PostmasterImageProbe | null): void {
+  postmasterImageProbeForTests = probe;
+}
+
+function execFileStdout(file: string, args: readonly string[]): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(file, [...args], { timeout: POSTMASTER_IMAGE_PROBE_TIMEOUT_MS, windowsHide: true }, (error, stdout) => {
+      resolve(error ? null : String(stdout));
+    });
+  });
+}
+
+function classifyImageName(image: string): PostmasterImageVerdict {
+  return /^postgres(?:\.exe)?$/i.test(basename(image.trim())) ? "postgres" : "other";
+}
+
+/**
+ * Identify the executable behind a live recorded postmaster pid.
+ *
+ * FNXC:PostgresEmbedded 2026-10-07-19:43:
+ * Windows recycles pids aggressively, so a crash-left postmaster.pid can name a live unrelated process; signal-0 liveness then made every boot join a dead port until the operator deleted the file.
+ * A join requires the recorded pid to be a postgres process: Windows reads the image name via tasklist, Linux via /proc, other hosts via ps.
+ * A probe that cannot answer reports unknown, which keeps the historical fail-closed join.
+ */
+export async function probePostmasterImage(pid: number): Promise<PostmasterImageVerdict> {
+  if (process.platform === "win32") {
+    const stdout = await execFileStdout("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"]);
+    if (stdout === null) return "unknown";
+    const row = stdout.split(/\r?\n/).find((line) => line.startsWith("\""));
+    if (!row) return "other";
+    const [image, rowPid] = row.split("\",\"").map((field) => field.replace(/^"|"$/g, ""));
+    if (Number.parseInt(rowPid ?? "", 10) !== pid) return "other";
+    return classifyImageName(image ?? "");
+  }
+  if (process.platform === "linux") {
+    try {
+      return classifyImageName(readFileSync(`/proc/${pid}/comm`, "utf-8"));
+    } catch (error) {
+      return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" ? "other" : "unknown";
+    }
+  }
+  const stdout = await execFileStdout("ps", ["-o", "comm=", "-p", String(pid)]);
+  if (stdout === null) return "unknown";
+  const image = stdout.trim();
+  return image ? classifyImageName(image) : "other";
+}
+
+async function isRecordedPostmasterLive(pid: number): Promise<boolean> {
+  if (!isPostmasterProcessAlive(pid)) return false;
+  return (await (postmasterImageProbeForTests ?? probePostmasterImage)(pid)) !== "other";
+}
+
 /**
  * Check whether an embedded PG is already running for the given data dir.
  * Uses both the in-process registry AND a probe of the postmaster.pid file
@@ -1482,9 +1541,9 @@ async function isAlreadyRunning(
   if (!existsSync(pidPath)) return null;
 
   const pid = readPidFromPostmasterPid(dataDir);
-  if (pid !== null && !isPostmasterProcessAlive(pid)) {
+  if (pid !== null && !(await isRecordedPostmasterLive(pid))) {
     onLog?.(
-      `embedded postgres: postmaster.pid in ${dataDir} records pid ${pid}, which is not running (stale lock from a crash); starting an owned postmaster — PostgreSQL reclaims the stale lock file itself`,
+      `embedded postgres: postmaster.pid in ${dataDir} records pid ${pid}, which is not a running postgres process (stale lock from a crash); starting an owned postmaster — PostgreSQL reclaims the stale lock file itself`,
     );
     return null;
   }
