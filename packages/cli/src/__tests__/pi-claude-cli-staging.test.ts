@@ -63,4 +63,19 @@ describe("pi-claude-cli staging", () => {
     });
     expect(typeof staged.killProcessTree).toBe("function");
   });
+
+  /*
+  FNXC:WindowsProcessLaunch 2026-10-07-20:58:
+  The staged seam is core's windows-launch.ts copied verbatim into a tree that cannot resolve workspace packages, so it must import Node built-ins only; core's single process-tree kill lives there and the supervisor imports from it, never the reverse.
+  */
+  it("ships a seam that imports Node built-ins only", () => {
+    destDir = mkdtempSync(join(tmpdir(), "fusion-pi-claude-stage-"));
+    stagePiClaudeCliSources(packagesRoot, destDir);
+
+    const source = readFileSync(join(destDir, "src", "windows-launch.ts"), "utf8");
+    const specifiers = [...source.matchAll(/(?:^|\n)\s*(?:import|export)\b[^;]*?\bfrom\s*["']([^"']+)["']/g)].map((m) => m[1]);
+    const dynamic = [...source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']/g)].map((m) => m[1]);
+    expect(specifiers.length).toBeGreaterThan(0);
+    expect([...specifiers, ...dynamic].filter((specifier) => !specifier.startsWith("node:"))).toEqual([]);
+  });
 });
