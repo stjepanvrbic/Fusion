@@ -166,11 +166,11 @@ export const BUILTIN_TRAIT_DEFINITIONS: TraitDefinition[] = [
         {
           key: "fileScope",
           type: "enum",
-          // strict = throw on zero-overlap (today); warn = log + proceed (audit
-          // carries the violating file list); off = skip the throw + emit one
-          // per-merge "scope enforcement disabled" audit (per-task scopeOverride
-          // is a documented no-op here); custom = evaluate `rules` in place of
-          // the task's File Scope section.
+          // strict = throw on zero-overlap (the default when unset); warn = log +
+          // proceed (audit carries the violating file list); off = skip the throw +
+          // emit one per-merge "scope enforcement disabled" audit (per-task
+          // scopeOverride is a documented no-op here); custom = evaluate `rules` in
+          // place of the task's File Scope section and throw on zero-overlap.
           enumValues: ["strict", "warn", "off", "custom"],
           description: "File-scope enforcement mode",
         },

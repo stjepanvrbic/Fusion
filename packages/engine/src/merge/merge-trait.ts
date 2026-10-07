@@ -89,11 +89,10 @@ function settingsPolicy(settings: Pick<Settings, "directMergeCommitStrategy" | "
   return {
     commitStrategy: settings.directMergeCommitStrategy ?? "always-squash",
     pullRequestOnly: settings.mergeStrategy === "pull-request",
-    // Legacy file-scope behavior is a soft warn (see
-    // `enforceSquashFileScopeInvariant`, which logs + proceeds), so the
-    // back-compat read-through reports `warn` — the existing call path is
-    // unchanged when the flag is OFF.
-    fileScope: "warn",
+    // FNXC:FileScopeInvariant 2026-10-07-18:10:
+    // A squash that misses its declared File Scope must fail unless a waiver is recorded.
+    // The settings default is therefore `strict`; `warn` is only an explicitly authored workflow choice.
+    fileScope: "strict",
     fileScopeRules: [],
     source: "settings",
   };

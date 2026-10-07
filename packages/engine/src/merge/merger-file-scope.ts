@@ -100,6 +100,22 @@ export function matchesScope(filePath: string, scopePatterns: string[]): boolean
   return false;
 }
 
+/**
+ * FNXC:FileScopeInvariant 2026-10-07-18:10:
+ * The squash file-scope invariant needs a declared-scope match, not the advisory `matchesScope` heuristic.
+ * An explicit file matches only itself; a glob matches by `matchGlob`; a directory matches only its descendants,
+ * whether declared as `dir`, `dir/`, `dir/*` or `dir/**`. A sibling file in the same directory is NOT an overlap.
+ * `matchesScope` keeps its lenient same-directory rule for conflict partitioning and advisory warnings, where
+ * narrowing it would resolve a task's own sibling-file conflicts to main and drop its edits.
+ */
+export function overlapsDeclaredScope(filePath: string, scopePatterns: string[]): boolean {
+  return scopePatterns.some((pattern) => {
+    if (filePath === pattern || matchGlob(filePath, pattern)) return true;
+    const directory = pattern.replace(/\/\*\*?$/, "").replace(/\/+$/, "");
+    return directory.length > 0 && !/[*?]/.test(directory) && filePath.startsWith(`${directory}/`);
+  });
+}
+
 export function partitionConflictsByFileScope(params: {
   conflictFiles: string[];
   declaredScope: string[];
@@ -220,7 +236,7 @@ export async function assertSquashOverlapsFileScope(params: {
   }
 
   const stagedFiles = await stagedFilesReader(rootDir);
-  const hasOverlap = stagedFiles.some((file) => matchesScope(file, declaredScope));
+  const hasOverlap = stagedFiles.some((file) => overlapsDeclaredScope(file, declaredScope));
   if (forcedViolation || !hasOverlap) {
     throw new FileScopeViolationError(taskId, stagedFiles, forcedViolation ? resolvedScope : declaredScope);
   }
@@ -287,10 +303,13 @@ export async function enforceSquashFileScopeInvariant(params: {
     if (!(error instanceof FileScopeViolationError)) {
       throw error;
     }
-    // `strict` re-throws the violation (hard guardrail that blocks the merge);
-    // `warn`/`custom` log + proceed, with the audit carrying the violating file
-    // list (same payload as the error).
-    if (mode === "strict") {
+    /*
+    FNXC:FileScopeInvariant 2026-10-07-18:10:
+    Every squash must overlap its declared File Scope or fail with FileScopeViolationError.
+    `strict` (now also the settings default) and `custom` (its rules replace the File Scope section) re-throw.
+    Only an explicitly authored workflow `warn` logs and proceeds; its audit row is the recorded waiver.
+    */
+    if (mode !== "warn") {
       if (params.auditor) {
         try {
           await params.auditor.git({
@@ -298,7 +317,7 @@ export async function enforceSquashFileScopeInvariant(params: {
             target: params.taskId,
             metadata: {
               resetLabel: params.resetLabel,
-              mode: "strict",
+              mode,
               stagedFiles: error.stagedFiles,
               declaredScope: error.declaredScope,
               stagedFileCount: error.stagedFiles.length,
