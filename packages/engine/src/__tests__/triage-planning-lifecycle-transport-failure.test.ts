@@ -141,10 +141,24 @@ describe("triage planning lifecycle lock transport failures (FN-8911)", () => {
     mockPromptWithFallback.mockResolvedValueOnce(undefined);
     await new TriageProcessor(fixture.store, root).specifyTask(fixture.task());
 
-    expect(fixture.task().status).toBe("failed");
-    expect(fixture.task().error).toContain("Planning lifecycle lock transport failure recorded at");
-    expect(fixture.task().error).not.toContain("did not update the authoritative PROMPT.md");
+    /*
+    FNXC:TriagePlanningRetry 2026-10-07-05:26:
+    FN-9512 hands exhausted lifecycle-lock transport failures to the needs-replan owner with an escalated-reseed disposition instead of parking them failed.
+    The transport diagnosis must survive into the escalation log rather than being laundered into an unchanged-PROMPT verdict.
+    */
+    expect(fixture.task().status).toBe("needs-replan");
+    expect(fixture.task().error).toBeNull();
+    expect(fixture.task().recoveryRetryCount).toBeNull();
+    expect(fixture.task().recoveryDisposition).toBe("escalated-reseed");
+    expect(fixture.task().nextRecoveryAt).toBeNull();
     expect(fixture.task().planningFailure?.lifecycleLockTransport).toBeUndefined();
+    expect(fixture.task().customFields).toEqual({ unrelated: "preserve-me" });
+
+    const escalationLog = fixture.logs.find((message) => message.includes("exhausted its retry cadence"));
+    expect(escalationLog).toBeDefined();
+    expect(escalationLog).toContain("Planning lifecycle lock transport failure recorded at");
+    expect(escalationLog).not.toContain("did not update the authoritative PROMPT.md");
+    expect(fixture.logs.some((message) => message.includes("did not update the authoritative PROMPT.md"))).toBe(false);
   });
 
   it("keeps the ordinary unchanged-PROMPT verdict when no persisted transport marker exists", async () => {
