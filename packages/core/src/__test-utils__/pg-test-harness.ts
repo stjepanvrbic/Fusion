@@ -14,8 +14,10 @@
  *   - The returned `PgTestHarness` exposes the ready `TaskStore`, the raw
  *     `AsyncDataLayer` (for direct row seeding), and a `teardown()` that drops
  *     the database and closes all connections.
- *   - When PostgreSQL is unreachable (FUSION_PG_TEST_SKIP=1), the describe
- *     blocks that use `pgDescribe` are skipped so the merge gate stays green.
+ *   - When PostgreSQL is unreachable (or FUSION_PG_TEST_SKIP=1), the describe
+ *     blocks that use `pgDescribe` are skipped in optional lanes. A lane that
+ *     sets FUSION_PG_TEST_REQUIRED=1 (the `test:pg-gate` merge-gate lane)
+ *     fails instead, so the gate can never pass with its PG suites skipped.
  *
  * Usage pattern:
  * ```ts
@@ -34,9 +36,10 @@
  * });
  * ```
  *
- * The gate-safe contract: tests using this helper are auto-skipped when PG is
- * not available, so they never break the merge gate in CI environments without
- * PostgreSQL. Run locally with PG on 5432 to exercise the PG paths.
+ * The optional-lane contract: tests using this helper are auto-skipped when PG
+ * is not available. The required `test:pg-gate` lane is the exception and fails
+ * loudly. Run locally with PG on 5432 (or FUSION_PG_TEST_URL_BASE) to exercise
+ * the PG paths.
  */
 
 import { randomUUID } from "node:crypto";
@@ -188,14 +191,46 @@ function probeTcpReachable(host: string, port: number, timeoutMs = 1500): boolea
  * never set in CI, so pgDescribe suites ran (and failed) in environments
  * without PostgreSQL. Now they correctly skip via describe.skip.
  */
-function computePgAvailable(): boolean {
-  if (process.env.FUSION_PG_TEST_SKIP === "1") return false;
-  if (!PG_TEST_URL_BASE) return false;
-  const { host, port } = parseProbeTarget(PG_TEST_URL_BASE);
-  return probeTcpReachable(host, port);
+/*
+FNXC:PgGateRequired 2026-10-07-18:03:
+The blocking PostgreSQL gate lane must execute its suites, never skip them: a stopped server, a wrong port, or an inherited FUSION_PG_TEST_SKIP=1 previously turned `test:pg-gate` green with zero PG coverage.
+A lane that sets FUSION_PG_TEST_REQUIRED=1 (the dedicated vitest.pg.config.ts) fails at harness load with the reason; every other lane keeps the optional skip.
+*/
+export type PgAvailability =
+  | { available: true }
+  | { available: false; reason: "skip-requested" | "no-url" | "unreachable"; detail: string };
+
+/**
+ * Decide whether PostgreSQL-backed suites run. Throws when the lane requires PostgreSQL and it is not usable.
+ * Pure apart from the injected probe, so the required/optional contract is unit-testable without a server.
+ */
+export function resolvePgAvailability(
+  env: NodeJS.ProcessEnv,
+  urlBase: string,
+  probe: (host: string, port: number) => boolean,
+): PgAvailability {
+  const required = env.FUSION_PG_TEST_REQUIRED === "1";
+  let result: PgAvailability;
+  if (env.FUSION_PG_TEST_SKIP === "1") {
+    result = { available: false, reason: "skip-requested", detail: "FUSION_PG_TEST_SKIP=1 is set" };
+  } else if (!urlBase) {
+    result = { available: false, reason: "no-url", detail: "FUSION_PG_TEST_URL_BASE is empty" };
+  } else {
+    const { host, port } = parseProbeTarget(urlBase);
+    result = probe(host, port)
+      ? { available: true }
+      : { available: false, reason: "unreachable", detail: `no PostgreSQL accepting connections at ${host}:${port}` };
+  }
+  if (required && !result.available) {
+    throw new Error(
+      `PostgreSQL is required for this test lane (FUSION_PG_TEST_REQUIRED=1) but ${result.detail}. ` +
+        "Start PostgreSQL and point FUSION_PG_TEST_URL_BASE at it; the required gate lane never skips.",
+    );
+  }
+  return result;
 }
 
-export const PG_AVAILABLE = computePgAvailable();
+export const PG_AVAILABLE = resolvePgAvailability(process.env, PG_TEST_URL_BASE, probeTcpReachable).available;
 
 /** Test-only observation seam for proving harness DDL remains structurally bounded. */
 export const __pgTestDdlAdmission = createPostgresDdlAdmissionGate({

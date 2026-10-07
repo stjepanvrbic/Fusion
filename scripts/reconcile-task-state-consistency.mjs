@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import process from "node:process";
 import { openBackend, importCore } from "./lib/backend-db.mjs";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 const DEFAULT_NOTE = "FN-4000 reconciliation: cleared stale transient failure state using TaskStore done-normalization so database and task JSON remain synchronized.";
 
@@ -125,7 +126,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   main().then((code) => {
     process.exitCode = code;
   }).catch((error) => {

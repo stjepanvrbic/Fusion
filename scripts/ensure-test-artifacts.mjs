@@ -9,6 +9,8 @@ import {
   fusionCacheDir,
   readJsonCache,
 } from "./lib/content-hash.mjs";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
+import { resolveCommandInvocation } from "./lib/pnpm-invocation.mjs";
 
 export const REQUIRED_BUILD_PACKAGES = [
   {
@@ -408,8 +410,11 @@ function run(
     readdirFn = readdirSync,
   } = {},
 ) {
-  const result = spawnFn(command, args, { cwd, stdio: "inherit" });
+  // FNXC:WindowsPnpmLaunch 2026-10-07-18:03: the rebuild launches pnpm through the shared launcher so the bootstrap can build on Windows.
+  const invocation = resolveCommandInvocation(command, args);
+  const result = spawnFn(invocation.command, invocation.args, { cwd, stdio: "inherit", windowsVerbatimArguments: invocation.windowsVerbatimArguments });
   if (result.status !== 0) {
+    if (result.error) stderrWrite(`[test-bootstrap] could not launch ${command}: ${result.error.message}\n`);
     const filterCommand = `${command} ${args.join(" ")}`;
     const packageNames = args.filter((entry, index) => args[index - 1] === "--filter");
     const packagesToReport = pkgEntries.length > 0
@@ -539,7 +544,7 @@ export function seedArtifactCache(rootDir = process.cwd(), existsFn = existsSync
   return present.map((pkg) => pkg.name);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   const argv = process.argv.slice(2);
   if (argv.includes("--print-source-hash")) {
     const hash = computeCombinedSourceHash();

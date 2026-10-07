@@ -28,7 +28,7 @@ Report-only by default; `--strict` fails on any change from the baseline, in EIT
 drop is re-recorded in the same PR that earns it rather than leaving a stale allowance open.
 */
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { listGitSourceFiles } from "./lib/list-git-source-files.mjs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -128,25 +128,31 @@ because there was nowhere to put a regression.
 Behaviour-preserving: the CLI body is unchanged, only wrapped so it runs when this file is the entry point
 and not when imported. The two pure helpers are hoisted above it and `destinationLiterals` is exported.
 */
+/** Git pathspecs for the scanned production sources; passed as argv so no shell reinterprets the globs. */
+export const MOVE_TARGET_PATHSPECS = Object.freeze([
+  "packages/*/src/**/*.ts",
+  "packages/*/src/*.ts",
+  "packages/*/src/**/*.tsx",
+  "packages/*/app/**/*.ts",
+  "packages/*/app/**/*.tsx",
+]);
+
 const isEntryPoint = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isEntryPoint) {
   let files;
   try {
-    files = execSync(
-      /*
-      FNXC:MoveTargetRatchet 2026-07-31-22:30 (#3254's finding, same blind spot here):
-      `--cached --others --exclude-standard` so a BRAND-NEW file is visible before it is committed.
-      Plain `git ls-files` lists TRACKED files only, so a new file with `moveTask(id, "done")` scored
-      0 locally and flipped the ratchet the moment it was staged — the author sees a green gate, then
-      CI disagrees. Changes nothing in CI (nothing is untracked there) and nothing for the tracked
-      population; it only makes the local reading honest. #3254 made the same change to the census.
-      */
-      "git ls-files --cached --others --exclude-standard 'packages/*/src/**/*.ts' 'packages/*/src/*.ts' 'packages/*/src/**/*.tsx' 'packages/*/app/**/*.ts' 'packages/*/app/**/*.tsx'",
-      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
-    ).split("\n").map((f) => f.trim()).filter(Boolean)
-      /* A path can appear under both --cached and --others in some index states; scanning it twice
-         would double-count its hits against a baseline that expects one. */
-      .filter((f, i, all) => all.indexOf(f) === i)
+    /*
+    FNXC:MoveTargetRatchet 2026-07-31-22:30 (#3254's finding, same blind spot here):
+    `--cached --others --exclude-standard` so a BRAND-NEW file is visible before it is committed.
+    Plain `git ls-files` lists TRACKED files only, so a new file with `moveTask(id, "done")` scored
+    0 locally and flipped the ratchet the moment it was staged — the author sees a green gate, then
+    CI disagrees. Changes nothing in CI (nothing is untracked there) and nothing for the tracked
+    population; it only makes the local reading honest. #3254 made the same change to the census.
+    A path listed by both --cached and --others is scanned once, so the baseline never double-counts.
+
+    FNXC:WindowsShell 2026-10-07-18:03: listGitSourceFiles passes the pathspecs as argv; the old execSync shell string ran cmd.exe on Windows, which kept the single quotes, so the list came back empty and the ratchet failed closed on every Windows run.
+    */
+    files = listGitSourceFiles(MOVE_TARGET_PATHSPECS, { cwd: REPO })
       .filter((f) => !f.includes("__tests__") && !/\.(test|spec)\.tsx?$/.test(f));
   } catch (err) {
     /* FAIL CLOSED: an unreadable file list means nothing was checked, which must not read as clean. */

@@ -35,6 +35,7 @@ import { build } from "esbuild";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { writeFileSync, mkdirSync } from "node:fs";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -163,7 +164,7 @@ export async function setup() {
 
 // Allow direct invocation for manual measurement / debugging:
 //   node scripts/build-engine-core-gate-bundle.mjs
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   const started = Date.now();
   const metafile = await buildCoreGateBundle();
   const elapsedMs = Date.now() - started;

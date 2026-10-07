@@ -64,7 +64,7 @@ import { mkdirSync, writeFileSync, mkdtempSync, rmSync, existsSync, utimesSync }
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const thisFile = fileURLToPath(import.meta.url);
 const scriptModulePath = path.resolve(path.dirname(thisFile), "..", "test-changed.mjs");
@@ -1553,7 +1553,7 @@ function makeChainRepo(dir) {
  */
 function runInRepo(repoDir, snippet) {
   const code = `
-    import * as mod from ${JSON.stringify(scriptModulePath)};
+    import * as mod from ${JSON.stringify(pathToFileURL(scriptModulePath).href)};
     const out = (${snippet})(mod);
     console.log(JSON.stringify(out));
   `;
@@ -2131,4 +2131,71 @@ test("resolveRepoRoot: honors FUSION_PROJECT_DIR else resolves the git toplevel 
 test("GATE_COVERED_MEMORY_ENVELOPE_PACKAGES: engine covered, dashboard not", () => {
   assert.equal(GATE_COVERED_MEMORY_ENVELOPE_PACKAGES.has(ENGINE_SCOPED_AFFECTED_PACKAGE), true);
   assert.equal(GATE_COVERED_MEMORY_ENVELOPE_PACKAGES.has(DASHBOARD_SCOPED_AFFECTED_PACKAGE), false);
+});
+
+/*
+FNXC:VerificationSelection 2026-10-07-18:03:
+Selection must cover every way the working tree can differ from the base: committed, staged, unstaged, untracked, deleted and renamed files.
+Ignored files stay out, and a working-tree edit with HEAD still at the base must not read as "no changes".
+*/
+function makeBranchedChainRepo(dir) {
+  makeChainRepo(dir);
+  writeFileSync(path.join(dir, ".gitignore"), "dist/\n");
+  writeFileSync(path.join(dir, "packages", "d", "src", "old-name.ts"), "export const o = 1;\n");
+  writeFileSync(path.join(dir, "packages", "b", "src", "gone.ts"), "export const g = 1;\n");
+  git(dir, ["add", "-A"]);
+  git(dir, ["commit", "-q", "-m", "base"]);
+  git(dir, ["branch", "-f", "main", "HEAD"]);
+  git(dir, ["checkout", "-q", "-b", "feature"]);
+}
+
+const changedFilesSnippet = `(mod) => {
+  const base = mod.detectComparisonBase(mod.getBaseBranch());
+  const files = mod.changedFilesSince(base);
+  const byDir = mod.listWorkspacePackages(mod.listWorkspacePackageInfos());
+  return { files: files === null ? null : [...files].sort(), affected: files === null ? null : mod.resolveAffectedPackages(files, byDir) };
+}`;
+
+test("integration: changedFilesSince covers committed, staged, unstaged, untracked, deleted and renamed files", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tc-worktree-"));
+  try {
+    makeBranchedChainRepo(dir);
+    writeFileSync(path.join(dir, "packages", "a", "src", "index.ts"), `export const x = "a-committed";\n`);
+    git(dir, ["commit", "-qam", "committed change"]);
+    writeFileSync(path.join(dir, "packages", "b", "src", "index.ts"), `export const x = "b-staged";\n`);
+    git(dir, ["add", "packages/b/src/index.ts"]);
+    writeFileSync(path.join(dir, "packages", "c", "src", "index.ts"), `export const x = "c-unstaged";\n`);
+    writeFileSync(path.join(dir, "packages", "d", "src", "brand-new.ts"), "export const n = 1;\n");
+    git(dir, ["rm", "-q", "packages/b/src/gone.ts"]);
+    git(dir, ["mv", "packages/d/src/old-name.ts", "packages/d/src/new-name.ts"]);
+    mkdirSync(path.join(dir, "packages", "a", "dist"), { recursive: true });
+    writeFileSync(path.join(dir, "packages", "a", "dist", "index.js"), "ignored build output\n");
+
+    const { files, affected } = runInRepo(dir, changedFilesSnippet);
+    assert.deepEqual(files, [
+      "packages/a/src/index.ts",
+      "packages/b/src/gone.ts",
+      "packages/b/src/index.ts",
+      "packages/c/src/index.ts",
+      "packages/d/src/brand-new.ts",
+      "packages/d/src/new-name.ts",
+      "packages/d/src/old-name.ts",
+    ]);
+    assert.deepEqual([...affected].sort(), ["@x/a", "@x/b", "@x/c", "@x/d"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("integration: a working-tree edit with HEAD at the base is still selected", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tc-uncommitted-"));
+  try {
+    makeBranchedChainRepo(dir);
+    writeFileSync(path.join(dir, "packages", "c", "src", "index.ts"), `export const x = "c-edited";\n`);
+    const { files, affected } = runInRepo(dir, changedFilesSnippet);
+    assert.deepEqual(files, ["packages/c/src/index.ts"]);
+    assert.deepEqual(affected, ["@x/c"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

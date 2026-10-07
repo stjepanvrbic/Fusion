@@ -293,3 +293,107 @@ test("runWithWatchdog: passes cwd through to spawn when provided", async () => {
   await p;
   assert.equal(capturedOpts.cwd, "/tmp/repo-root");
 });
+
+/*
+FNXC:WindowsPnpmLaunch 2026-10-07-18:03:
+On win32 the watchdog must launch the pnpm shim through its resolved entry and kill the whole tree on timeout.
+*/
+const WIN_PNPM_CLI = String.raw`C:\npm\node_modules\pnpm\bin\pnpm.cjs`;
+
+test("runWithWatchdog: win32 launches pnpm through the resolved entry without a detached console", async () => {
+  let captured = null;
+  const child = makeFakeChild();
+  const p = runWithWatchdog({
+    command: "pnpm",
+    args: ["--filter", "@fusion/engine", "test:core"],
+    env: { npm_execpath: WIN_PNPM_CLI },
+    budgetMs: 10_000,
+    label: "win-launch",
+    log: () => {},
+    platform: "win32",
+    spawn: (cmd, args, opts) => {
+      captured = { cmd, args, opts };
+      return child;
+    },
+    killGroup: () => {},
+  });
+  child.emit("close", 0, null);
+  await p;
+  assert.equal(captured.cmd, process.execPath);
+  assert.deepEqual(captured.args, [WIN_PNPM_CLI, "--filter", "@fusion/engine", "test:core"]);
+  assert.equal(captured.opts.detached, false);
+});
+
+test("runWithWatchdog: POSIX keeps pnpm and its own process group", async () => {
+  let captured = null;
+  const child = makeFakeChild();
+  const p = runWithWatchdog({
+    command: "pnpm",
+    args: ["test"],
+    env: { npm_execpath: "/usr/lib/pnpm/bin/pnpm.cjs" },
+    budgetMs: 10_000,
+    label: "posix-launch",
+    log: () => {},
+    platform: "linux",
+    spawn: (cmd, args, opts) => {
+      captured = { cmd, args, opts };
+      return child;
+    },
+    killGroup: () => {},
+  });
+  child.emit("close", 0, null);
+  await p;
+  assert.equal(captured.cmd, "pnpm");
+  assert.equal(captured.opts.detached, true);
+});
+
+test("runWithWatchdog: win32 timeout kills the whole tree with taskkill", async () => {
+  const child = makeFakeChild();
+  const killedTrees = [];
+  const p = runWithWatchdog({
+    command: "pnpm",
+    args: ["exec", "vitest"],
+    env: {},
+    budgetMs: 20,
+    graceMs: 10,
+    heartbeatMs: 1000,
+    label: "win-hang",
+    log: () => {},
+    platform: "win32",
+    spawn: fakeSpawn(child),
+    taskkill: (pid) => {
+      killedTrees.push(pid);
+      setTimeout(() => child.emit("close", 1, null), 1);
+      return true;
+    },
+  });
+  const result = await p;
+  assert.equal(result.timedOut, true);
+  assert.equal(result.code, TIMEOUT_EXIT_CODE);
+  assert.deepEqual(killedTrees, [999999]);
+});
+
+test("runWithWatchdog: win32 falls back to child.kill when taskkill cannot kill the tree", async () => {
+  const child = makeFakeChild();
+  const directKills = [];
+  child.kill = (sig) => {
+    directKills.push(sig);
+    setTimeout(() => child.emit("close", null, sig), 1);
+  };
+  const p = runWithWatchdog({
+    command: "pnpm",
+    args: [],
+    env: {},
+    budgetMs: 20,
+    graceMs: 10,
+    heartbeatMs: 1000,
+    label: "win-fallback",
+    log: () => {},
+    platform: "win32",
+    spawn: fakeSpawn(child),
+    taskkill: () => false,
+  });
+  const result = await p;
+  assert.equal(result.timedOut, true);
+  assert.deepEqual(directKills, ["SIGTERM"]);
+});

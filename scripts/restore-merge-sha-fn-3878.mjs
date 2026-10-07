@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 import { openBackend } from "./lib/backend-db.mjs";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 export const RESTORATIONS = [
   { id: "FN-3794", canonicalSha: "7d20a348d82320bc57310169aaa2d3b3f0d5a946" },
@@ -145,7 +146,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   main().then((code) => {
     process.exitCode = code;
   }).catch((error) => {

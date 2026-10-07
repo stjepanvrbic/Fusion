@@ -5,170 +5,200 @@
  * Serializes `pnpm test:full` across concurrent git-worktree agent sessions so
  * multiple Claude Code instances don't saturate the machine with vitest forks.
  *
- * Acquires an exclusive lock at ~/.fusion/test.lock (Darwin/Linux, O_EXLOCK)
- * before running the underlying test command, then releases it on exit.
- * While waiting it prints the PID and worktree path of the lock holder so
- * the developer knows who is blocking.
+ * Acquires an exclusive lock at ~/.fusion/test.lock before running the
+ * underlying test command, then releases it on exit. macOS uses an O_EXLOCK
+ * file lock; Linux and Windows use an atomic O_CREAT|O_EXCL create. While
+ * waiting it prints the PID and worktree path of the lock holder so the
+ * developer knows who is blocking.
  *
  * Usage:  pnpm test:locked [extra args passed to pnpm test:full]
  * e.g.:   pnpm test:locked --filter @fusion/core
  */
 
+/*
+FNXC:TestLockOwnership 2026-10-07-18:03:
+The lock must stay mutually exclusive across cancellation. A waiter that receives Ctrl-C must exit without touching the holder's lock or metadata; before, its signal handler unlinked the lock file and the meta file unconditionally, so a third runner could start a second full suite while the first was still running.
+Release is owner-only and idempotent: only the acquisition that created the lock removes it, after checking the lock file still carries its own token.
+A holder that is signalled while its test child runs forwards the signal and releases only after the child has exited.
+*/
+
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
+import { describeSpawnFailure, resolveCommandInvocation } from "./lib/pnpm-invocation.mjs";
 
-const LOCK_DIR = path.join(os.homedir(), ".fusion");
-const LOCK_FILE = path.join(LOCK_DIR, "test.lock");
-const META_FILE = path.join(LOCK_DIR, "test.lock.meta");
 const POLL_MS = 1_500;
-
 // O_EXLOCK is a BSD/Darwin extension; value 0x20 on macOS.
-// On Linux this flag is silently ignored by glibc — fall back to a best-effort
-// advisory lock using a separate meta-file race (good enough for the single
-// macOS use-case described in the brief).
 const O_EXLOCK = 0x20;
-const O_CREAT = fs.constants.O_CREAT;
-const O_RDWR = fs.constants.O_RDWR;
-const O_NONBLOCK = fs.constants.O_NONBLOCK;
 
-const isMacOS = process.platform === "darwin";
+/**
+ * Create one lock handle. Each handle represents at most one acquisition.
+ *
+ * @param {{
+ *   lockFile: string,
+ *   metaFile: string,
+ *   fsImpl?: typeof fs,
+ *   platform?: NodeJS.Platform,
+ *   pid?: number,
+ *   cwd?: string,
+ *   token?: string,
+ * }} options
+ */
+export function createTestLock({ lockFile, metaFile, fsImpl = fs, platform = process.platform, pid = process.pid, cwd = process.cwd(), token = randomUUID() }) {
+  const isMacOS = platform === "darwin";
+  const ownerRecord = `${pid}\n${cwd}\n${token}`;
+  let lockFd = -1;
+  let owned = false;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Read PID + worktree from the meta file, or return null on any error. */
-function readMeta() {
-  try {
-    const raw = fs.readFileSync(META_FILE, "utf8").trim();
-    const [pidStr, ...rest] = raw.split("\n");
-    return { pid: Number(pidStr), worktree: rest.join("\n") || "(unknown)" };
-  } catch {
-    return null;
+  function readHolder() {
+    try {
+      const [pidStr, ...rest] = fsImpl.readFileSync(metaFile, "utf8").trim().split("\n");
+      return { pid: Number(pidStr), worktree: rest[0] || "(unknown)" };
+    } catch {
+      return null;
+    }
   }
-}
 
-/** Write our PID + CWD into the meta file so waiters can identify us. */
-function writeMeta() {
-  fs.writeFileSync(META_FILE, `${process.pid}\n${process.cwd()}`, "utf8");
-}
+  /** Try once to take the lock. Returns true only when THIS handle now owns it. */
+  function tryAcquire() {
+    if (owned) return true;
+    fsImpl.mkdirSync(path.dirname(lockFile), { recursive: true });
+    try {
+      lockFd = isMacOS
+        ? fsImpl.openSync(lockFile, fsImpl.constants.O_CREAT | fsImpl.constants.O_RDWR | O_EXLOCK | fsImpl.constants.O_NONBLOCK)
+        : fsImpl.openSync(lockFile, fsImpl.constants.O_CREAT | fsImpl.constants.O_EXCL | fsImpl.constants.O_RDWR);
+    } catch (err) {
+      if (err?.code === "EEXIST" || err?.code === "EWOULDBLOCK" || err?.code === "EAGAIN") return false;
+      throw err;
+    }
+    owned = true;
+    if (!isMacOS) fsImpl.writeFileSync(lockFd, ownerRecord, "utf8");
+    fsImpl.writeFileSync(metaFile, ownerRecord, "utf8");
+    return true;
+  }
 
-/** Remove meta file, ignoring errors. */
-function cleanMeta() {
-  try { fs.unlinkSync(META_FILE); } catch { /* ignore */ }
-}
+  function stillOurs(file) {
+    try {
+      return fsImpl.readFileSync(file, "utf8") === ownerRecord;
+    } catch {
+      return false;
+    }
+  }
 
-// ---------------------------------------------------------------------------
-// Lock acquisition (macOS O_EXLOCK, non-blocking with busy-wait)
-// ---------------------------------------------------------------------------
+  /** Release this handle's acquisition. A no-op when it never acquired or already released. */
+  function release() {
+    if (!owned) return false;
+    owned = false;
+    // Remove only what this acquisition wrote; close the fd last so the macOS flock covers the cleanup.
+    if (!isMacOS && stillOurs(lockFile)) {
+      try { fsImpl.unlinkSync(lockFile); } catch { /* already gone */ }
+    }
+    if (stillOurs(metaFile)) {
+      try { fsImpl.unlinkSync(metaFile); } catch { /* already gone */ }
+    }
+    if (lockFd >= 0) {
+      try { fsImpl.closeSync(lockFd); } catch { /* ignore */ }
+      lockFd = -1;
+    }
+    return true;
+  }
 
-let lockFd = -1;
-
-function ensureLockDir() {
-  fs.mkdirSync(LOCK_DIR, { recursive: true });
+  return { tryAcquire, release, readHolder, isOwned: () => owned };
 }
 
 /**
- * Try to open the lock file with O_EXLOCK | O_NONBLOCK.
- * Returns true on success, false if another process holds the lock.
- * Throws on unexpected errors.
+ * Wait for the lock, run the test child, and exit with its status.
+ *
+ * @param {{
+ *   lock: ReturnType<typeof createTestLock>,
+ *   args?: string[],
+ *   spawnChild?: (command: string, args: string[], options: object) => import("node:child_process").ChildProcess,
+ *   proc?: Pick<NodeJS.Process, "on" | "removeListener" | "exit">,
+ *   log?: (message: string) => void,
+ *   errorLog?: (message: string) => void,
+ *   sleep?: (ms: number) => Promise<void>,
+ *   pollMs?: number,
+ * }} options
  */
-function tryAcquire() {
-  if (!isMacOS) {
-    // Non-macOS: use a simple existence check (advisory, not atomic, but
-    // sufficient for the documented single-platform use case).
-    try {
-      // O_EXCL + O_CREAT is atomic on POSIX for the create step.
-      lockFd = fs.openSync(LOCK_FILE, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR);
-      return true;
-    } catch (err) {
-      if (err.code === "EEXIST") return false;
-      throw err;
-    }
-  }
+export async function runLocked({
+  lock,
+  args = [],
+  spawnChild = spawn,
+  proc = process,
+  log = console.log,
+  errorLog = console.error,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  pollMs = POLL_MS,
+}) {
+  let child = null;
+  let finished = false;
 
-  try {
-    lockFd = fs.openSync(LOCK_FILE, O_CREAT | O_RDWR | O_EXLOCK | O_NONBLOCK);
-    return true;
-  } catch (err) {
-    if (err.code === "EWOULDBLOCK" || err.code === "EAGAIN") return false;
-    throw err;
-  }
-}
+  const onExit = () => lock.release();
+  const signalHandlers = ["SIGINT", "SIGTERM", "SIGHUP"].map((signal) => {
+    const handler = () => {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        // The holder keeps the lock until its child has actually exited; the close handler releases.
+        try { child.kill(signal); } catch { /* already gone */ }
+        return;
+      }
+      // A waiter, or a holder whose child already exited: release only what we own, then exit.
+      lock.release();
+      proc.exit(signal === "SIGINT" ? 130 : 1);
+    };
+    proc.on(signal, handler);
+    return [signal, handler];
+  });
+  proc.on("exit", onExit);
 
-function releaseLock() {
-  if (lockFd >= 0) {
-    try { fs.closeSync(lockFd); } catch { /* ignore */ }
-    lockFd = -1;
-  }
-  // Remove the lock file so the next waiter's O_EXCL create succeeds on Linux.
-  if (!isMacOS) {
-    try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ }
-  }
-  cleanMeta();
-}
-
-/** Block until we hold the lock, printing status while waiting. */
-async function acquireWithWait() {
-  ensureLockDir();
+  const finish = (code) => {
+    if (finished) return;
+    finished = true;
+    lock.release();
+    for (const [signal, handler] of signalHandlers) proc.removeListener(signal, handler);
+    proc.removeListener("exit", onExit);
+    proc.exit(code);
+  };
 
   let waited = false;
-  while (!tryAcquire()) {
+  while (!lock.tryAcquire()) {
     if (!waited) {
-      const meta = readMeta();
-      if (meta) {
-        console.log(
-          `[test-with-lock] waiting for test lock held by PID ${meta.pid} (worktree: ${meta.worktree})`,
-        );
-      } else {
-        console.log("[test-with-lock] waiting for test lock…");
-      }
+      const holder = lock.readHolder();
+      log(holder
+        ? `[test-with-lock] waiting for test lock held by PID ${holder.pid} (worktree: ${holder.worktree})`
+        : "[test-with-lock] waiting for test lock…");
       waited = true;
     }
-    await new Promise((r) => setTimeout(r, POLL_MS));
+    await sleep(pollMs);
   }
+  if (waited) log("[test-with-lock] lock acquired, starting tests.");
 
-  writeMeta();
-  if (waited) {
-    console.log("[test-with-lock] lock acquired, starting tests.");
+  const invocation = resolveCommandInvocation("pnpm", ["test:full", ...args]);
+  try {
+    child = spawnChild(invocation.command, invocation.args, {
+      stdio: "inherit",
+      shell: false,
+      ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    });
+  } catch (err) {
+    errorLog(`[test-with-lock] failed to spawn pnpm: ${err?.message ?? err}`);
+    finish(1);
+    return;
   }
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-// Release on any kind of exit so we don't leave stale locks.
-for (const sig of ["exit", "SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(sig, () => {
-    releaseLock();
-    if (sig !== "exit") process.exit(1);
+  child.on("close", (code) => finish(code ?? 1));
+  child.on("error", (err) => {
+    errorLog(`[test-with-lock] failed to spawn pnpm: ${describeSpawnFailure({ status: null, error: err })}`);
+    finish(1);
   });
 }
 
-await acquireWithWait();
-
-// Forward all argv after the script name to `pnpm test:full`.
-const extraArgs = process.argv.slice(2);
-const child = spawn(
-  "pnpm",
-  ["test:full", ...extraArgs],
-  { stdio: "inherit", shell: false },
-);
-
-child.on("close", (code) => {
-  releaseLock();
-  process.exit(code ?? 1);
-});
-
-child.on("error", (err) => {
-  console.error("[test-with-lock] failed to spawn pnpm:", err.message);
-  releaseLock();
-  process.exit(1);
-});
+if (isEntryPoint(import.meta.url)) {
+  const lockDir = path.join(os.homedir(), ".fusion");
+  await runLocked({
+    lock: createTestLock({ lockFile: path.join(lockDir, "test.lock"), metaFile: path.join(lockDir, "test.lock.meta") }),
+    args: process.argv.slice(2),
+  });
+}

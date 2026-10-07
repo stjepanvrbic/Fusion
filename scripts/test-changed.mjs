@@ -11,6 +11,7 @@ import { ensureTestArtifacts } from "./ensure-test-artifacts.mjs";
 import { isSkillSyncCheckCached } from "./sync-fusion-skill-tools.mjs";
 import { computeContentHash, createRepoContentSnapshot } from "./lib/content-hash.mjs";
 import { deriveBudgetMs, runWithWatchdog } from "./lib/run-vitest-watchdog.mjs";
+import { describeSpawnFailure, resolveCommandInvocation } from "./lib/pnpm-invocation.mjs";
 
 /** Generous local full-suite budget (60min): far above a real full run, far below an infinite hang. */
 const FULL_SUITE_BUDGET_MS = 60 * 60 * 1000;
@@ -162,15 +163,18 @@ const SHARED_HASH_INPUT_PATHS = [
 /** @type {number} Max age (ms) for a cache entry to count as a pass. */
 const CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+// FNXC:WindowsPnpmLaunch 2026-10-07-18:03: synchronous pnpm steps use the shared launcher too; a launch error is reported, not hidden behind "exit code 1".
 function run(command, commandArgs, options = {}) {
-  const result = spawnSync(command, commandArgs, {
+  const invocation = resolveCommandInvocation(command, commandArgs, { env: options.env ?? process.env });
+  const result = spawnSync(invocation.command, invocation.args, {
     cwd: rootDir,
     stdio: "inherit",
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     ...options,
   });
 
   if (result.status !== 0) {
-    const error = new Error(`${command} ${commandArgs.join(" ")} failed with exit code ${result.status ?? 1}`);
+    const error = new Error(`${command} ${commandArgs.join(" ")} failed (${describeSpawnFailure(result)})`);
     error.exitCode = result.status ?? 1;
     throw error;
   }
@@ -720,15 +724,30 @@ export function detectComparisonBase(baseBranch) {
   return null;
 }
 
+/*
+FNXC:VerificationSelection 2026-10-07-18:03:
+Change selection must cover the current working tree, not only commits: an operator who edits a file before committing must get that package typechecked/tested by `pnpm test` and verify:fast.
+Union the committed range with staged and unstaged changes (`git diff HEAD`) and untracked, non-ignored files.
+`--no-renames` lists both sides of a rename, and deletions stay listed so the package that lost a file is still selected.
+Any git read failure returns null, which callers already treat as "could not determine" rather than "nothing changed".
+*/
 export function changedFilesSince(baseSha) {
-  const diff = gitOutput(["diff", "--name-only", `${baseSha}...HEAD`]);
-  if (diff === null) {
+  const reads = [
+    ["diff", "--name-only", "--no-renames", "-z", `${baseSha}...HEAD`],
+    ["diff", "--name-only", "--no-renames", "-z", "HEAD"],
+    ["ls-files", "--others", "--exclude-standard", "-z"],
+  ].map((args) => gitOutput(args));
+  if (reads.some((output) => output === null)) {
     return null;
   }
-  if (!diff) {
-    return [];
+  const files = new Set();
+  for (const output of reads) {
+    for (const entry of output.split("\0")) {
+      const file = entry.trim().replaceAll("\\", "/");
+      if (file) files.add(file);
+    }
   }
-  return diff.split("\n").map((entry) => entry.trim()).filter(Boolean);
+  return [...files];
 }
 
 export function resolveAffectedPackages(changedFiles, packageNameByDir) {
@@ -1145,9 +1164,10 @@ export function __setCleanupRmSyncForTests(nextRmSync) {
   cleanupRmSync = typeof nextRmSync === "function" ? nextRmSync : rmSync;
 }
 
+// FNXC:WindowsVerification 2026-10-07-18:03: block in-process instead of spawning POSIX `sleep`, which Windows lacks outside Git Bash, so the cleanup retry actually waits there.
 function sleepMsSync(ms) {
   if (ms <= 0) return;
-  spawnSync("sleep", [String(ms / 1000)], { stdio: "ignore" });
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /**

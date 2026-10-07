@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { openBackend } from "./lib/backend-db.mjs";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 function createSummary() {
   return { total_input: 0, total_cached: 0, total_cache_write: 0, total_output: 0, n_tasks: 0, hit_ratio: 0 };
@@ -84,7 +85,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   main().then((code) => {
     process.exitCode = code;
   }).catch((error) => {

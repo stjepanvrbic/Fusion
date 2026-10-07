@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { readFileSync, accessSync, constants, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { parse } from "yaml";
 
 const workspaceRoot = join(import.meta.dirname!, "..", "..", "..", "..");
@@ -237,19 +238,25 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
   only in test:gate would encourage a future serial regression, while checking
   only the runner could hide a removed policy guard.
   */
-  it("pins test:gate to the fail-closed guard runner and curated suites", () => {
+  /*
+  FNXC:MergeGateWindows 2026-10-07-18:03:
+  test:gate is now the Node orchestrator, which runs the static validator runner and launches the curated lanes without a shell so cmd.exe cannot split them.
+  */
+  it("pins test:gate to the fail-closed guard runner and curated suites", async () => {
     const testGateScript = rootPackageJson.scripts?.["test:gate"] ?? "";
     const staticGateScript = rootPackageJson.scripts?.["test:gate:static"] ?? "";
+    const gate = await import(pathToFileURL(join(workspaceRoot, "scripts", "run-test-gate.mjs")).href);
+    const laneCommands = [...gate.CONCURRENT_GATE_LANES, gate.FINAL_GATE_LANE].map((lane: { args: string[] }) => `pnpm ${lane.args.join(" ")}`);
 
-    expect(testGateScript).toContain("node scripts/run-static-gate-checks.mjs");
+    expect(testGateScript).toBe("node scripts/run-test-gate.mjs");
     expect(staticGateScript).toContain("node scripts/check-no-" + "no" + "hup" + ".mjs"); // process-supervisor-allowlist: asserts the gate wires the checker; not a real spawn
     expect(staticGateScript).toContain("node scripts/check-no-kill-" + "40" + "40" + ".mjs"); // port-4040-allowlist: asserts the gate wires the checker; not a real port bind
     expect(staticGateScript).toContain("node scripts/check-no-test-timeout-appeasement.mjs");
     expect(staticGateScript).toContain("node scripts/check-changeset-format.mjs");
-    expect(testGateScript).toContain("pnpm --filter @fusion/engine test:core");
-    expect(testGateScript).toContain("pnpm --filter @fusion/core test:pg-gate");
-    expect(testGateScript).toContain("pnpm --filter @fusion/core test:unit-gate");
-    expect(testGateScript).toContain("pnpm --filter @runfusion/fusion test:ci-shape");
+    expect(laneCommands).toContain("pnpm --filter @fusion/engine test:core");
+    expect(laneCommands).toContain("pnpm --filter @fusion/core test:pg-gate");
+    expect(laneCommands).toContain("pnpm --filter @fusion/core test:unit-gate");
+    expect(laneCommands).toContain("pnpm --filter @runfusion/fusion test:ci-shape");
   });
 
   it("pins engine test:core to the engine-core vitest project", () => {

@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(currentFilePath), "..");
@@ -306,7 +307,7 @@ export async function main(argv = process.argv.slice(2), { rootDir = repoRoot, s
   return summary.ok ? 0 : 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   const exitCode = await main();
   process.exitCode = exitCode;
 }

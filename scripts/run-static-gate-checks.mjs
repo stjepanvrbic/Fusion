@@ -13,6 +13,7 @@ import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 export const repoRoot = resolve(scriptDir, "..");
@@ -101,6 +102,6 @@ export async function runStaticGateChecks(checkScripts, options = {}) {
   return results;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isEntryPoint(import.meta.url)) {
   await runStaticGateChecks(readStaticGateChecks());
 }

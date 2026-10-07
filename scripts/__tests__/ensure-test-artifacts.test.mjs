@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   computeCombinedSourceHash,
   detectMissingOrStaleArtifacts,
@@ -12,6 +14,13 @@ import {
   REQUIRED_BUILD_PACKAGES,
   seedArtifactCache,
 } from "../ensure-test-artifacts.mjs";
+
+/*
+FNXC:WindowsVerification 2026-10-07-18:03:
+The fakes below describe a POSIX "/repo" tree, while production joins paths natively (`C:\repo\...` on Windows).
+Normalize every path a fake receives so the same assertions hold on Windows and Linux.
+*/
+const norm = (p) => String(p).replaceAll("\\", "/").replace(/^[A-Za-z]:/, "");
 
 const ENGINE_ENTRY = REQUIRED_BUILD_PACKAGES.find((pkg) => pkg.name === "@fusion/engine");
 const ANTIGRAVITY_ENTRY = REQUIRED_BUILD_PACKAGES.find((pkg) => pkg.name === "@fusion-plugin-examples/antigravity-runtime");
@@ -76,7 +85,7 @@ test("ensureTestArtifacts builds only missing packages", () => {
   const built = ensureTestArtifacts(
     "/repo",
     (cmd, args, cwd) => calls.push({ cmd, args, cwd }),
-    (fullPath) => !fullPath.includes("fusion-plugin-openclaw-runtime"),
+    (fullPath) => !norm(fullPath).includes("fusion-plugin-openclaw-runtime"),
   );
 
   assert.deepEqual(built, ["@fusion-plugin-examples/openclaw-runtime"]);
@@ -86,7 +95,7 @@ test("ensureTestArtifacts builds only missing packages", () => {
 });
 
 test("detectMissingArtifacts flags @fusion/dashboard when dist/index.js is missing", () => {
-  const missing = detectMissingOrStaleArtifacts("/repo", (fullPath) => !fullPath.endsWith("packages/dashboard/dist/index.js"));
+  const missing = detectMissingOrStaleArtifacts("/repo", (fullPath) => !norm(fullPath).endsWith("packages/dashboard/dist/index.js"));
   const names = missing.map((pkg) => pkg.name);
 
   assert.ok(names.includes("@fusion/dashboard"));
@@ -97,7 +106,7 @@ test("ensureTestArtifacts rebuilds @fusion/dashboard when its dist is missing", 
   const built = ensureTestArtifacts(
     "/repo",
     (cmd, args, cwd) => calls.push({ cmd, args, cwd }),
-    (fullPath) => !fullPath.endsWith("packages/dashboard/dist/index.js"),
+    (fullPath) => !norm(fullPath).endsWith("packages/dashboard/dist/index.js"),
   );
 
   assert.deepEqual(built, ["@fusion/dashboard"]);
@@ -107,7 +116,7 @@ test("ensureTestArtifacts rebuilds @fusion/dashboard when its dist is missing", 
 });
 
 test("detectMissingArtifacts flags @fusion/engine when dist/index.js is missing", () => {
-  const missing = detectMissingOrStaleArtifacts("/repo", (fullPath) => !fullPath.endsWith("packages/engine/dist/index.js"));
+  const missing = detectMissingOrStaleArtifacts("/repo", (fullPath) => !norm(fullPath).endsWith("packages/engine/dist/index.js"));
   const names = missing.map((pkg) => pkg.name);
 
   assert.ok(names.includes("@fusion/engine"));
@@ -118,7 +127,7 @@ test("ensureTestArtifacts rebuilds @fusion/engine when dist is missing", () => {
   const built = ensureTestArtifacts(
     "/repo",
     (cmd, args, cwd) => calls.push({ cmd, args, cwd }),
-    (fullPath) => !fullPath.endsWith("packages/engine/dist/index.js"),
+    (fullPath) => !norm(fullPath).endsWith("packages/engine/dist/index.js"),
   );
 
   assert.deepEqual(built, ["@fusion/engine"]);
@@ -142,14 +151,14 @@ test("ensureTestArtifacts restores missing Antigravity exports once without reta
 
   const calls = [];
   let missingArtifact = "plugins/fusion-plugin-antigravity-runtime/dist/runtime-adapter.js";
-  const existsFn = (fullPath) => missingArtifact === undefined || !fullPath.endsWith(missingArtifact);
+  const existsFn = (fullPath) => missingArtifact === undefined || !norm(fullPath).endsWith(missingArtifact);
 
   const rebuilt = ensureTestArtifacts("/repo", (cmd, args, cwd) => calls.push({ cmd, args, cwd }), existsFn);
   missingArtifact = undefined;
   const healthyRepeat = ensureTestArtifacts("/repo", (cmd, args, cwd) => calls.push({ cmd, args, cwd }), existsFn);
 
   assert.deepEqual(rebuilt, ["@fusion-plugin-examples/antigravity-runtime"]);
-  assert.deepEqual(calls, [{
+  assert.deepEqual(calls.map((call) => ({ ...call, cwd: norm(call.cwd) })), [{
     cmd: "pnpm",
     args: ["--filter", "@fusion-plugin-examples/antigravity-runtime", "build"],
     cwd: "/repo",
@@ -160,7 +169,7 @@ test("ensureTestArtifacts restores missing Antigravity exports once without reta
 test("detectMissingArtifacts flags dependency-graph when dist/dashboard-view.js is missing", () => {
   const missing = detectMissingOrStaleArtifacts(
     "/repo",
-    (fullPath) => !fullPath.endsWith("plugins/fusion-plugin-dependency-graph/dist/dashboard-view.js"),
+    (fullPath) => !norm(fullPath).endsWith("plugins/fusion-plugin-dependency-graph/dist/dashboard-view.js"),
   );
   const names = missing.map((pkg) => pkg.name);
 
@@ -172,7 +181,7 @@ test("ensureTestArtifacts rebuilds dependency-graph for incomplete dist artifact
   const built = ensureTestArtifacts(
     "/repo",
     (cmd, args, cwd) => calls.push({ cmd, args, cwd }),
-    (fullPath) => !fullPath.endsWith("plugins/fusion-plugin-dependency-graph/dist/dashboard-view.js"),
+    (fullPath) => !norm(fullPath).endsWith("plugins/fusion-plugin-dependency-graph/dist/dashboard-view.js"),
   );
 
   assert.deepEqual(built, ["@fusion-plugin-examples/dependency-graph"]);
@@ -182,7 +191,7 @@ test("ensureTestArtifacts rebuilds dependency-graph for incomplete dist artifact
 });
 
 test("detectMissingArtifacts flags hermes when dist/index.js exists but dist/cli-spawn.js is missing", () => {
-  const missing = detectMissingOrStaleArtifacts("/repo", (fullPath) => !fullPath.endsWith("dist/cli-spawn.js"));
+  const missing = detectMissingOrStaleArtifacts("/repo", (fullPath) => !norm(fullPath).endsWith("dist/cli-spawn.js"));
   const names = missing.map((pkg) => pkg.name);
 
   assert.ok(names.includes("@fusion-plugin-examples/hermes-runtime"));
@@ -193,7 +202,7 @@ test("ensureTestArtifacts rebuilds hermes for incomplete dist artifacts", () => 
   const built = ensureTestArtifacts(
     "/repo",
     (cmd, args, cwd) => calls.push({ cmd, args, cwd }),
-    (fullPath) => !fullPath.endsWith("plugins/fusion-plugin-hermes-runtime/dist/cli-spawn.js"),
+    (fullPath) => !norm(fullPath).endsWith("plugins/fusion-plugin-hermes-runtime/dist/cli-spawn.js"),
   );
 
   assert.deepEqual(built, ["@fusion-plugin-examples/hermes-runtime"]);
@@ -205,7 +214,7 @@ test("ensureTestArtifacts rebuilds hermes for incomplete dist artifacts", () => 
 test("detectMissingArtifacts flags openclaw when dist/index.js exists but transitive files are missing", () => {
   const missing = detectMissingOrStaleArtifacts(
     "/repo",
-    (fullPath) => fullPath.endsWith("plugins/fusion-plugin-openclaw-runtime/dist/index.js"),
+    (fullPath) => norm(fullPath).endsWith("plugins/fusion-plugin-openclaw-runtime/dist/index.js"),
   );
   const names = missing.map((pkg) => pkg.name);
 
@@ -217,7 +226,7 @@ test("ensureTestArtifacts rebuilds openclaw for incomplete dist artifacts", () =
   const built = ensureTestArtifacts(
     "/repo",
     (cmd, args, cwd) => calls.push({ cmd, args, cwd }),
-    (fullPath) => !fullPath.endsWith("plugins/fusion-plugin-openclaw-runtime/dist/runtime-adapter.js"),
+    (fullPath) => !norm(fullPath).endsWith("plugins/fusion-plugin-openclaw-runtime/dist/runtime-adapter.js"),
   );
 
   assert.deepEqual(built, ["@fusion-plugin-examples/openclaw-runtime"]);
@@ -230,13 +239,13 @@ function createStaleFsForPackage({ sourceDir, artifactPathFragment }, { artifact
   const sourceFile = `${sourceDir}/index.ts`;
 
   const statFn = (fullPath) => {
-    if (fullPath.includes(artifactPathFragment)) return { mtimeMs: artifactMtime };
-    if (fullPath === sourceFile) return { mtimeMs: sourceMtime };
+    if (norm(fullPath).includes(artifactPathFragment)) return { mtimeMs: artifactMtime };
+    if (norm(fullPath) === sourceFile) return { mtimeMs: sourceMtime };
     return { mtimeMs: 0 };
   };
 
   const readdirFn = (dirPath) => {
-    if (dirPath === sourceDir) {
+    if (norm(dirPath) === sourceDir) {
       return [{ name: "index.ts", isDirectory: () => false }];
     }
     return [];
@@ -318,7 +327,7 @@ test("detectMissingOrStaleArtifacts merges missing and stale results without dup
 
   const result = detectMissingOrStaleArtifacts(
     "/repo",
-    (fullPath) => !fullPath.endsWith("packages/dashboard/dist/index.js"),
+    (fullPath) => !norm(fullPath).endsWith("packages/dashboard/dist/index.js"),
     statFn,
     readdirFn,
   );
@@ -421,7 +430,7 @@ test("ensureTestArtifacts rebuilds only dependency-graph when only dashboard-vie
   const built = ensureTestArtifacts(
     "/repo",
     (cmd, args, cwd) => calls.push({ cmd, args, cwd }),
-    (fullPath) => !fullPath.endsWith("plugins/fusion-plugin-dependency-graph/dist/dashboard-view.js"),
+    (fullPath) => !norm(fullPath).endsWith("plugins/fusion-plugin-dependency-graph/dist/dashboard-view.js"),
   );
 
   assert.deepEqual(built, ["@fusion-plugin-examples/dependency-graph"]);
@@ -436,7 +445,7 @@ test("ensureTestArtifacts remediation labels missing artifact paths", () => {
   const built = ensureTestArtifacts(
     "/repo",
     undefined,
-    (fullPath) => !fullPath.endsWith("plugins/fusion-plugin-dependency-graph/dist/dashboard-view.js"),
+    (fullPath) => !norm(fullPath).endsWith("plugins/fusion-plugin-dependency-graph/dist/dashboard-view.js"),
     () => ({ mtimeMs: 1_000 }),
     () => [],
     {
@@ -625,7 +634,7 @@ test("seedArtifactCache: does NOT record a package whose artifacts are missing",
   try {
     writeFileSync(path.join(root, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
     // Engine dist is missing; everything else present.
-    const existsFn = (p) => !p.endsWith("packages/engine/dist/index.js");
+    const existsFn = (p) => !norm(p).endsWith("packages/engine/dist/index.js");
     const seeded = seedArtifactCache(root, existsFn, fakeGitForAllSources());
     assert.ok(!seeded.includes("@fusion/engine"), "missing-artifact package must not be seeded");
 
@@ -636,4 +645,15 @@ test("seedArtifactCache: does NOT record a package whose artifacts are missing",
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+/*
+FNXC:WindowsEntryGuard 2026-10-07-18:03:
+The CLI entry must do its work when run directly; on Windows the old guard exited 0 having printed nothing.
+*/
+test("direct CLI invocation prints the combined source hash", () => {
+  const script = path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), "ensure-test-artifacts.mjs");
+  const result = spawnSync(process.execPath, [script, "--print-source-hash"], { cwd: path.dirname(path.dirname(script)), encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout.trim(), /^[0-9a-f]{64}$/);
 });

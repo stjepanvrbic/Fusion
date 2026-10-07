@@ -169,15 +169,26 @@ The CLI keeps quarantines in a static list so direct file requests can bypass no
 Recognize that literal list without evaluating config, while preserving the same two-way ledger ownership as
 ordinary exclude arrays.
 */
-function extractStaticQuarantinedCliTests(source) {
+/*
+FNXC:QuarantineLockstep 2026-10-07-19:10:
+A package may keep its quarantines in a named static list (`const quarantined<Package>Tests: string[] = [...]`) that its config spreads into every project exclude, as the CLI and dashboard configs do.
+Read every such declaration, not only the CLI one, so a dashboard quarantine is checked in both directions instead of reading as missing-exclude.
+*/
+function extractStaticQuarantinedTestLists(source) {
   const commentFree = stripComments(source);
-  const declaration = /\bconst\s+quarantinedCliTests\s*:\s*string\[\]\s*=\s*/.exec(commentFree);
-  if (declaration == null) return [];
-  let index = declaration.index + declaration[0].length;
-  while (/\s/.test(commentFree[index] ?? "")) index += 1;
-  if (commentFree[index] !== "[") return [];
-  const array = extractBalancedArray(commentFree, index);
-  return array == null ? [] : extractStringTestPaths(array);
+  const declarationPattern = /\bconst\s+quarantined\w*Tests\s*:\s*string\[\]\s*=\s*/g;
+  const paths = [];
+  let declaration;
+  while ((declaration = declarationPattern.exec(commentFree))) {
+    let index = declaration.index + declaration[0].length;
+    while (/\s/.test(commentFree[index] ?? "")) index += 1;
+    if (commentFree[index] !== "[") continue;
+    const array = extractBalancedArray(commentFree, index);
+    if (array == null) continue;
+    paths.push(...extractStringTestPaths(array));
+    declarationPattern.lastIndex = index + array.length;
+  }
+  return paths;
 }
 
 function discoverPackageConfigs(rootDir) {
@@ -210,7 +221,7 @@ export function findLockstepViolations({ rootDir, ledger, packageConfigs = disco
     const configSource = readFileSync(configPath, "utf8");
     configExcludes.set(relativeConfig, [
       ...extractConcreteExcludes(configSource),
-      ...extractStaticQuarantinedCliTests(configSource),
+      ...extractStaticQuarantinedTestLists(configSource),
     ]);
   }
 
@@ -224,7 +235,8 @@ export function findLockstepViolations({ rootDir, ledger, packageConfigs = disco
     }
 
     const packageMatch = /^packages\/([^/]+)\/(.+)$/.exec(file);
-    const config = packageMatch ? path.join("packages", packageMatch[1], "vitest.config.ts") : null;
+    // FNXC:QuarantineLockstep 2026-10-07-18:03: the lookup key must use the same forward-slash form as the map keys; native path.join gave `packages\x\vitest.config.ts` on Windows, so every entry read as unmapped.
+    const config = packageMatch ? path.posix.join("packages", packageMatch[1], "vitest.config.ts") : null;
     if (config == null || !configExcludes.has(config)) {
       violations.push({ kind: "unmapped-entry", file, config: config ?? undefined, detail: "ledger file has no package Vitest config" });
       continue;

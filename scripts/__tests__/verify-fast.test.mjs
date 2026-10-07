@@ -10,10 +10,11 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   buildTypecheckStep,
@@ -24,7 +25,6 @@ import {
   buildVerifyPlan,
   batchVerifySteps,
   runStep,
-  resolveStepInvocation,
   runVerifyPlan,
   PRETEST_STATIC_CHECK_SCRIPTS,
   VERIFY_EXCLUDED_PACKAGES,
@@ -38,57 +38,12 @@ const BOOTSTRAP = "/repo/scripts/ensure-test-artifacts.mjs";
 const NODE = "/usr/bin/node";
 const REPO_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 /*
-FNXC:TestInfrastructure 2026-07-22-12:00:
-Keep policy-scanner trigger phrases on distinct source lines. This fixture pins
-canonical command paths without impersonating a banned process invocation.
+FNXC:TestInfrastructure 2026-10-07-18:03:
+The validator inventory had three hand-maintained copies (this file, docs/testing.md, package.json) and drifted again when check-no-comment-assertions-in-tests joined pretest.
+package.json pretest is authoritative and docs/testing.md is the one human-maintained mirror, asserted in exact order below; this file derives from the manifest instead of keeping a third copy.
 */
-const PRETEST_CHECKS = [
-  [
-    "scripts/check-no-",
-    "no",
-    "hup.mjs",
-  ].join(""),
-  "scripts/check-no-cwd-relative-dashboard-test-reads.mjs",
-  [
-    "scripts/check-no-",
-    "kill-",
-    "4040.mjs",
-  ].join(""),
-  "scripts/check-no-getdatabase.mjs",
-  "scripts/check-prerebase-inert.mjs",
-  /* FNXC:TestInfrastructure 2026-07-31-19:15: added when the assertion below went red on `main`.
-     Both validators are real scripts, both run in `package.json`'s pretest chain, and
-     `PRETEST_STATIC_CHECK_SCRIPTS` already picked them up — verify:fast was RIGHT and this mirror was
-     stale. Kept in production order, since the assertion is a deepEqual and order is part of it. */
-  "scripts/check-capacity-pool-id.mjs",
-  /*
-  FNXC:TestInfrastructure 2026-08-16-10:52:
-  FN-8991, FN-8994, and FN-9096 added runtime-skill-loader-drift,
-  workspace-package-graph, and cli-runtime-routing validators to the
-  authoritative production chains. Keep this pretest mirror in that order;
-  it must report divergence without inventing validators from the gate-only list.
-
-  FNXC:MergeGatePerformance 2026-08-16-10:29:
-  FN-9122 repaired the W33 gate inventory ledger after three validators had
-  entered canonical pretest/gate compositions without their test mirrors.
-  Keep these in manifest order so verify:fast validates the same policy set.
-  */
-  "scripts/check-cli-runtime-routing.mjs",
-  "scripts/check-no-node-only-core-imports-in-dashboard.mjs",
-  "scripts/check-pi-versions-pinned.mjs",
-  "scripts/check-workspace-package-graph.mjs",
-  "scripts/check-no-test-timeout-appeasement.mjs",
-  "scripts/check-changeset-format.mjs",
-  /*
-  FNXC:TestInfrastructure 2026-08-19-12:04:
-  Commit 027faaa09f added check-pre-json-anchor to the canonical pretest chain.
-  verify:fast was right while this hardcoded mirror was stale, so retain its
-  production position for the order-sensitive deepEqual drift guard.
-  */
-  "scripts/check-pre-json-anchor.mjs",
-  "scripts/check-routes-modular.mjs",
-  "scripts/check-runtime-skill-loader-drift.mjs",
-];
+const ROOT_MANIFEST = JSON.parse(readFileSync(resolve(REPO_ROOT, "package.json"), "utf8"));
+const PRETEST_CHECKS = ROOT_MANIFEST.scripts.pretest.split("&&").map((command) => command.trim().replace(/^node\s+/, ""));
 const STATIC_STEP_IDS = PRETEST_CHECKS.map((script) => `static-check:${script.slice("scripts/".length, -".mjs".length)}`);
 const PRETEST_VALIDATORS_START = "<!-- pretest-validators:start -->";
 const PRETEST_VALIDATORS_END = "<!-- pretest-validators:end -->";
@@ -177,7 +132,7 @@ test("buildArtifactBootstrapStep: runs the artifact bootstrap script via node", 
 test("buildStaticCheckStep: invokes a canonical validator directly through Node", () => {
   const step = buildStaticCheckStep("scripts/check-changeset-format.mjs", "/repo", NODE);
   assert.equal(step.command, NODE);
-  assert.deepEqual(step.args, ["/repo/scripts/check-changeset-format.mjs"]);
+  assert.deepEqual(step.args, [join("/repo", "scripts/check-changeset-format.mjs")]);
   assert.equal(step.kind, "static-check");
   assert.equal(step.id, "static-check:check-changeset-format");
 });
@@ -189,6 +144,7 @@ test("buildStaticCheckStep: invokes a canonical validator directly through Node"
 test("buildVerifyPlan: defaults to every canonical pretest validator before established non-test steps", () => {
   const plan = buildVerifyPlan({ packages: [], staticCheckRoot: "/repo", bootSmokeScriptPath: SMOKE, nodeBin: NODE });
   assert.deepEqual(PRETEST_STATIC_CHECK_SCRIPTS, PRETEST_CHECKS);
+  for (const script of PRETEST_STATIC_CHECK_SCRIPTS) assert.ok(existsSync(resolve(REPO_ROOT, script)), `pretest validator must exist: ${script}`);
   assert.deepEqual(stepIds(plan), [
     ...STATIC_STEP_IDS,
     "bootstrap-artifacts",
@@ -198,7 +154,7 @@ test("buildVerifyPlan: defaults to every canonical pretest validator before esta
 
   for (const step of stepByKind(plan, "static-check")) {
     assert.equal(step.command, NODE);
-    assert.match(step.args[0], /^\/repo\/scripts\/check-[\w-]+\.mjs$/);
+    assert.match(step.args[0].replaceAll("\\", "/"), /^\/repo\/scripts\/check-[\w-]+\.mjs$/);
     assert.equal(step.args.length, 1); // A validator path only: no test lane or mutation flag.
   }
 });
@@ -489,27 +445,43 @@ test("runVerifyPlan reports the first failure in plan order and skips later batc
   assert.ok(!started.includes("boot-smoke"));
 });
 
+
 /*
-FNXC:VerifyFastWindows 2026-10-07-17:45:
-On Windows `pnpm` is a .cmd shim that spawn cannot run without a shell (ENOENT), so typecheck/build steps never started there.
+FNXC:VerificationSelection 2026-10-07-18:03:
+verify:fast must typecheck/build the package an operator edited before committing; with HEAD at the base the old committed-only diff planned no package checks.
 */
-test("resolveStepInvocation runs pnpm through node via npm_execpath on Windows", () => {
-  const env = { npm_execpath: "C:\\pnpm\\bin\\pnpm.cjs" };
-  assert.deepEqual(
-    resolveStepInvocation("pnpm", ["--filter", "@runfusion/fusion", "build"], { platform: "win32", env, execPath: "C:\\node\\node.exe" }),
-    { command: "C:\\node\\node.exe", args: ["C:\\pnpm\\bin\\pnpm.cjs", "--filter", "@runfusion/fusion", "build"] },
-  );
-});
+test("resolveAffectedForVerify selects a package edited in the working tree with HEAD at the base", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vf-worktree-"));
+  const git = (...args) => {
+    const r = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  try {
+    git("init", "-q");
+    git("config", "user.email", "t@t.t");
+    git("config", "user.name", "t");
+    writeFileSync(join(dir, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
+    mkdirSync(join(dir, ".changeset"), { recursive: true });
+    writeFileSync(join(dir, ".changeset", "config.json"), JSON.stringify({ baseBranch: "main" }));
+    for (const name of ["one", "two"]) {
+      mkdirSync(join(dir, "packages", name, "src"), { recursive: true });
+      writeFileSync(join(dir, "packages", name, "src", "index.ts"), "export const v = 1;\n");
+      writeFileSync(join(dir, "packages", name, "package.json"), JSON.stringify({ name: `@x/${name}`, version: "1.0.0" }));
+    }
+    git("add", "-A");
+    git("commit", "-q", "-m", "base");
+    git("branch", "-f", "main", "HEAD");
+    writeFileSync(join(dir, "packages", "two", "src", "index.ts"), "export const v = 2;\n");
 
-test("resolveStepInvocation leaves pnpm untouched off Windows and for non-pnpm commands", () => {
-  const args = ["--filter", "x", "build"];
-  assert.deepEqual(resolveStepInvocation("pnpm", args, { platform: "linux", env: { npm_execpath: "/x/pnpm.cjs" }, execPath: "/node" }), { command: "pnpm", args });
-  assert.deepEqual(resolveStepInvocation("node", args, { platform: "win32", env: { npm_execpath: "C:\\pnpm.cjs" }, execPath: "C:\\node.exe" }), { command: "node", args });
-});
-
-test("resolveStepInvocation falls back to the .cmd shim through cmd.exe on Windows when npm_execpath is not a pnpm script", () => {
-  assert.deepEqual(
-    resolveStepInvocation("pnpm", ["build"], { platform: "win32", env: {}, execPath: "C:\node.exe" }),
-    { command: "cmd.exe", args: ["/d", "/s", "/c", "pnpm", "build"] },
-  );
+    const code = `
+      const mod = await import(${JSON.stringify(pathToFileURL(resolve(REPO_ROOT, "scripts/verify-fast.mjs")).href)});
+      const { packages } = mod.resolveAffectedForVerify();
+      console.log(JSON.stringify(packages));
+    `;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd: dir, encoding: "utf8", env: { ...process.env, FUSION_PROJECT_DIR: dir } });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout.trim().split("\n").pop()), ["@x/two"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
