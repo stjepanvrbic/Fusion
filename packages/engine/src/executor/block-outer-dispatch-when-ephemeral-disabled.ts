@@ -11,7 +11,6 @@ import type { Task, TaskStore, AgentStore } from "@fusion/core";
 import { isEphemeralAgent } from "@fusion/core";
 import type { EngineRunContext } from "../util/run-audit.js";
 import { executorLog } from "../logger.js";
-import { resolveReboundColumnFor } from "./lifecycle-columns.js";
 import { clearDispatchBlockedLogState, logDispatchBlockedOnce } from "./dispatch-block-log.js";
 
 export type BlockOuterDispatchWhenEphemeralDisabledDeps = {
@@ -49,17 +48,13 @@ export async function blockOuterDispatchWhenEphemeralDisabled(
     }
 
     const liveTask = (await deps.store.getTask(task.id).catch(() => null)) ?? task;
-    const reboundColumn = await resolveReboundColumnFor(deps.store, liveTask.id);
-    if (liveTask.column !== reboundColumn) {
-      await deps.store.moveTask(liveTask.id, reboundColumn, {
-        preserveProgress: true,
-        preserveWorktree: true,
-        preserveResumeState: true,
-        moveSource: "engine",
-        lifecycleReason: "self-healing-session-recovery",
-        recoveryRehome: true,
-      });
-    }
+    /*
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The dispatch block is an in-place hold. The former WIP-to-hold move used the same-role-only
+    `self-healing-session-recovery` reason, which the FN-207 direction policy rejects, so the throw
+    skipped the queued write and left the card unexplained. Assigning a permanent agent or enabling
+    ephemeral workers updates the card, and the WIP resume path re-dispatches it from this lane.
+    */
     await deps.store.updateTask(liveTask.id, { status: "queued" }, deps.getRunContextFor(liveTask.id));
     await deps.store.logEntry(
       liveTask.id,

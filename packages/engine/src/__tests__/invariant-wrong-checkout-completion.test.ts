@@ -1,7 +1,12 @@
 /*
 FN-4115 invariant: fn_task_done is the only path from in-progress to done, and it must refuse completion unless (1) git toplevel is a valid task worktree under <repo>/.worktrees, (2) branch matches fusion/<task-id>, and (3) there is at least one commit beyond baseCommitSha. Violations must requeue via taskDoneRetryCount + moveTask("todo", { preserveProgress: true }) and must not log successful completion.
+
+FNXC:LifecycleContainment 2026-10-07-18:04:
+Superseded requeue shape. A refusal now stays in its WIP lane and live session (FN-207 forbids the old
+WIP-to-hold move) and keeps the checkout pointer, which is the evidence the refusal names; it still
+spends taskDoneRetryCount and still never logs a successful completion.
 */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -63,12 +68,27 @@ async function setup(overrides: Record<string, unknown> = {}) {
   return { store, tool, getTask: () => task };
 }
 
+function expectRefusedInPlace(store: ReturnType<typeof createMockStore>, getTask: () => any, retriesBefore: number) {
+  expect(store.moveTask).not.toHaveBeenCalledWith("FN-4115", "todo", expect.anything());
+  expect(store.moveTask).not.toHaveBeenCalledWith("FN-4115", "todo");
+  expect(getTask()).toMatchObject({ column: "in-progress", worktree: worktreePath, branch: "fusion/fn-4115", taskDoneRetryCount: retriesBefore + 1 });
+  expect(store.logEntry).toHaveBeenCalledWith(
+    "FN-4115",
+    expect.stringContaining(`refused in place; the session must repair before completing (${retriesBefore + 1}/3)`),
+    undefined,
+    undefined,
+  );
+}
+
 function makeCompletionCheckoutVisible() {
   mockedExistsSync.mockReturnValue(true);
 }
 
 describe("FN-4115 wrong-checkout completion rejection", () => {
+  let scheduleInPlace: MockInstance;
   beforeEach(() => {
+    // The in-place retry timer would re-dispatch execute() against the shared mocks mid-test.
+    scheduleInPlace = vi.spyOn(TaskExecutor.prototype as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
     rootDir = mkdtempSync(join(tmpdir(), "fusion-fn-4115-"));
     worktreePath = join(rootDir, ".fusion", "worktrees", "fn-4115");
     mkdirSync(worktreePath, { recursive: true });
@@ -85,7 +105,8 @@ describe("FN-4115 wrong-checkout completion rejection", () => {
   });
 
   it("FN-4115: fn_task_done refuses completion when git toplevel resolves to repo root", async () => {
-    const { store, tool } = await setup();
+    const { store, tool, getTask } = await setup();
+    const retriesBefore = getTask().taskDoneRetryCount ?? 0;
     makeCompletionCheckoutVisible();
     mockedExecSync.mockImplementation((cmd: string) => {
       if (cmd.includes("rev-parse --show-toplevel")) return Buffer.from(`${rootDir}\n`);
@@ -105,12 +126,13 @@ describe("FN-4115 wrong-checkout completion rejection", () => {
     expect(
       store.updateStep.mock.calls.some(([id, , status]) => id === "FN-4115" && status === "done"),
     ).toBe(false);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4115", "todo", { preserveProgress: true });
+    expectRefusedInPlace(store, getTask, retriesBefore);
     expect(store.logEntry).not.toHaveBeenCalledWith("FN-4115", expect.stringContaining("Task marked done by agent"));
   });
 
   it("FN-4115: fn_task_done refuses completion when current branch is not fusion/<task-id>", async () => {
-    const { store, tool } = await setup();
+    const { store, tool, getTask } = await setup();
+    const retriesBefore = getTask().taskDoneRetryCount ?? 0;
     makeCompletionCheckoutVisible();
     mockedExecSync.mockImplementation((cmd: string) => {
       if (cmd.includes("rev-parse --show-toplevel")) return Buffer.from(`${worktreePath}\n`);
@@ -120,11 +142,12 @@ describe("FN-4115 wrong-checkout completion rejection", () => {
     });
     const result = await tool.execute("id", {});
     expect(result.content[0].text).toContain("fn_task_done refused: wrong_branch");
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4115", "todo", { preserveProgress: true });
+    expectRefusedInPlace(store, getTask, retriesBefore);
   });
 
   it("FN-4115: fn_task_done refuses completion when there are zero commits beyond base", async () => {
-    const { store, tool } = await setup();
+    const { store, tool, getTask } = await setup();
+    const retriesBefore = getTask().taskDoneRetryCount ?? 0;
     makeCompletionCheckoutVisible();
     mockedExecSync.mockImplementation((cmd: string) => {
       if (cmd.includes("rev-parse --show-toplevel")) return Buffer.from(`${worktreePath}\n`);
@@ -135,7 +158,7 @@ describe("FN-4115 wrong-checkout completion rejection", () => {
     });
     const result = await tool.execute("id", {});
     expect(result.content[0].text).toContain("fn_task_done refused: no_commits");
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4115", "todo", { preserveProgress: true });
+    expectRefusedInPlace(store, getTask, retriesBefore);
   });
 
   it("FN-4115: fn_task_done completes on valid worktree branch and commit state", async () => {

@@ -385,13 +385,23 @@ describe("MissionAutopilot", () => {
       return { feature, slice, milestone };
     }
 
-    it("increments retries and requeues failed tasks", async () => {
+    /*
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    A mission retry stays in the card's lane (FN-207 forbids the former automatic move back to the
+    hold column). The retry is the in-place failure clear, so retries are counted by those writes.
+    */
+    const retryClears = () => (taskStore.updateTask.mock.calls as unknown[][]).filter(([, patch]) => {
+      const p = patch as Record<string, unknown>;
+      return p.error === null && p.status === null && p.paused === false;
+    }).length;
+
+    it("increments retries and retries failed tasks in place", async () => {
       wireMissionTask();
       await autopilot.watchMission("M-TEST1");
 
       await autopilot.handleTaskFailure("FN-001");
 
-      expect(taskStore.moveTask).toHaveBeenCalledWith("FN-001", "todo");
+      expect(taskStore.moveTask).not.toHaveBeenCalled();
       expect(taskStore.updateTask).toHaveBeenCalledWith(
         "FN-001",
         expect.objectContaining({ error: null, status: null, paused: false }),
@@ -433,7 +443,8 @@ describe("MissionAutopilot", () => {
       await autopilot.handleTaskFailure("FN-001");
 
       expect(missionStore.updateFeatureStatus).toHaveBeenCalledWith(feature.id, "blocked");
-      expect(taskStore.moveTask).toHaveBeenCalledTimes(1);
+      expect(taskStore.moveTask).not.toHaveBeenCalled();
+      expect(retryClears()).toBe(1);
       expect(taskStore.updateTask).toHaveBeenCalledWith(
         "FN-001",
         expect.objectContaining({ status: "failed", paused: true }),
@@ -458,7 +469,8 @@ describe("MissionAutopilot", () => {
       await autopilot.handleTaskFailure("FN-001");
 
       expect(missionStore.updateFeatureStatus).not.toHaveBeenCalledWith("F-001", "blocked");
-      expect(taskStore.moveTask).toHaveBeenCalledTimes(2);
+      expect(taskStore.moveTask).not.toHaveBeenCalled();
+      expect(retryClears()).toBe(2);
     });
 
     it("is a no-op when task is not linked to a feature", async () => {

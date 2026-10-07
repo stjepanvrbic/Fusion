@@ -182,9 +182,36 @@ describe("RestartRecoveryCoordinator", () => {
     const coordinator = new RestartRecoveryCoordinator(store, executor);
     await coordinator.recoverInterruptedRuns();
 
-    expect(store.updateTask).toHaveBeenCalledWith("FN-1", expect.objectContaining({ status: "stuck-killed" }));
+    /*
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The safe retry happens in place: fresh checkout fields and a cleared status (a leftover
+    `stuck-killed` used to survive into the resumed run), no move, then orphan resumption.
+    */
+    expect(store.updateTask).toHaveBeenCalledWith("FN-1", expect.objectContaining({
+      status: null, error: null, worktree: null, branch: null, sessionFile: null,
+    }));
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(store.logEntry).toHaveBeenCalledWith("FN-1", expect.stringContaining("has no backward-move authority"));
+    expect(store.logEntry).toHaveBeenCalledWith("FN-1", expect.stringContaining("retrying in place with a fresh checkout"));
+    expect(executor.resumeOrphaned).toHaveBeenCalledTimes(1);
+  });
+
+  it("can defer orphan resumption so startup sweeps run between the safe retry and the resume", async () => {
+    const tasks = [createTask({ id: "FN-1", status: "failed", error: "Agent finished without calling fn_task_done", steps: [] })];
+    const store = {
+      listTasks: vi.fn().mockResolvedValue(tasks),
+      getTask: vi.fn(async (id: string) => tasks.find((task) => task.id === id)),
+      updateTask: vi.fn().mockResolvedValue({}),
+      logEntry: vi.fn().mockResolvedValue(undefined),
+      moveTask: vi.fn().mockResolvedValue(undefined),
+    } as unknown as TaskStore;
+    const executor = { resumeOrphaned: vi.fn().mockResolvedValue(undefined) } as any;
+    const coordinator = new RestartRecoveryCoordinator(store, executor);
+
+    await coordinator.recoverInterruptedRuns({ resumeOrphans: false });
+    expect(store.updateTask).toHaveBeenCalledWith("FN-1", expect.objectContaining({ status: null }));
+    expect(executor.resumeOrphaned).not.toHaveBeenCalled();
+
+    await coordinator.resumeOrphaned();
     expect(executor.resumeOrphaned).toHaveBeenCalledTimes(1);
   });
 
@@ -284,7 +311,8 @@ describe("restart recovery resolves the board's own wip lane", () => {
 
     await coordinator.recoverInterruptedRuns();
 
-    expect(store.updateTask).toHaveBeenCalledWith("FN-1", expect.objectContaining({ status: "stuck-killed" }));
+    expect(store.updateTask).toHaveBeenCalledWith("FN-1", expect.objectContaining({ status: null, worktree: null }));
+    expect(store.moveTask).not.toHaveBeenCalled();
   });
 
   it("still skips a PAUSED task — the only thing the deleted filter contributed", async () => {

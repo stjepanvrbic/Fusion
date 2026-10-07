@@ -249,7 +249,12 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
     );
   });
 
-  it("reseeds the current role when missing-artifact recovery is exhausted", async () => {
+  /*
+  FNXC:RecoveryOwnership 2026-10-07-18:04:
+  A reseed cannot restore a missing artifact, and FN-9512's reset re-armed the ladder against the same
+  absence forever. Exhaustion now parks the card visibly in its current lane, keeping the counter.
+  */
+  it("parks visibly in the current role when missing-artifact recovery is exhausted", async () => {
     const store = createMockStore();
     const liveTask = task({ recoveryRetryCount: MAX_RECOVERY_RETRIES });
     store.getTask.mockResolvedValue(liveTask);
@@ -267,14 +272,19 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
 
     expect(scheduled).toBe(true);
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(store.updateTask).toHaveBeenCalledWith(liveTask.id, expect.objectContaining({
-      status: null,
-      error: null,
-      recoveryRetryCount: null,
-    }), undefined);
+    expect(store.updateTask).not.toHaveBeenCalledWith(liveTask.id, expect.objectContaining({ recoveryRetryCount: null }), undefined);
+    const parkUpdater = store.updateTaskAtomic.mock.calls.at(-1)?.[1] as (current: typeof liveTask) => Record<string, unknown> | null;
+    const park = parkUpdater(liveTask);
+    expect(park).toMatchObject({ status: "failed", recoveryRetryCount: MAX_RECOVERY_RETRIES });
+    expect(String(park?.error)).toContain("required workflow artifact missing (PROMPT.md)");
+    expect(park).not.toHaveProperty("column");
     expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
       mutationType: "task:required-artifact-missing",
-      metadata: expect.objectContaining({ action: "reseed-in-place" }),
+      metadata: expect.objectContaining({ action: "park-in-place" }),
+    }));
+    expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+      mutationType: "auto-recovery:retry-budget-escalated",
+      metadata: expect.objectContaining({ owner: "executor-required-artifact", outcome: "parked" }),
     }));
   });
 

@@ -28,7 +28,8 @@ describe("ContaminationAutoRecoveryHandler", () => {
   it("skips when userPaused", async () => {
     const taskStore = makeTaskStore();
     const runAudit = { database: vi.fn(), git: vi.fn(), filesystem: vi.fn() } as any;
-    const handler = new ContaminationAutoRecoveryHandler({ taskStore, runAudit, repoDir: process.cwd() });
+    const resumeInPlace = vi.fn();
+    const handler = new ContaminationAutoRecoveryHandler({ taskStore, runAudit, repoDir: process.cwd(), resumeInPlace });
     await handler.issueRetry({ class: "branch-cross-contamination", taskId: "FN-1", pausedReason: "branch-cross-contamination" }, { action: "retry", rationale: "mode-programmatic", auditMetadata: {}, legacyPausedReason: "x" }, { task: { ...baseTask, userPaused: true } as Task, retryCount: 0, settings: { mode: "programmatic", maxRetries: 3 } });
     expect(taskStore.moveTask).not.toHaveBeenCalled();
   });
@@ -36,7 +37,8 @@ describe("ContaminationAutoRecoveryHandler", () => {
   it("requeues and clears paused state", async () => {
     const taskStore = makeTaskStore();
     const runAudit = { database: vi.fn(), git: vi.fn(), filesystem: vi.fn() } as any;
-    const handler = new ContaminationAutoRecoveryHandler({ taskStore, runAudit, repoDir: process.cwd() });
+    const resumeInPlace = vi.fn();
+    const handler = new ContaminationAutoRecoveryHandler({ taskStore, runAudit, repoDir: process.cwd(), resumeInPlace });
     await handler.issueRetry({ class: "branch-cross-contamination", taskId: "FN-1", pausedReason: "branch-cross-contamination", evidence: { ownCommits: 0, foreignAttributedCommits: 2 } }, { action: "retry", rationale: "mode-programmatic", auditMetadata: {}, legacyPausedReason: "x" }, { task: { ...baseTask } as Task, retryCount: 1, settings: { mode: "programmatic", maxRetries: 3 } });
     /*
     FNXC:LifecycleContainment 2026-08-31-09:28:
@@ -45,20 +47,25 @@ describe("ContaminationAutoRecoveryHandler", () => {
     four revision reasons. "contamination-recovery" is deliberately not among them -- the rule names
     contamination recovery as work that "stays in the current lifecycle role".
 
-    So the card is retained and the retention is narrated. The recovery itself is unchanged and still
-    proven below: the pause is cleared and the attempt is audited. Asserting the move again would be
-    asking for the backward transition the containment rule exists to prevent.
+    So the card is retained. The recovery itself is unchanged and still proven below: the pause is
+    cleared and the attempt is audited. Asserting the move again would be asking for the backward
+    transition the containment rule exists to prevent.
+
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The former no-op contained move (and its "retained" log line) is gone; the in-role continuation
+    is an explicit in-place re-dispatch of the WIP lane after the unpark.
     */
     expect(taskStore.moveTask).not.toHaveBeenCalled();
-    expect(taskStore.logEntry).toHaveBeenCalledWith("FN-1", expect.stringContaining("retained in 'in-progress'"));
     expect(taskStore.updateTask).toHaveBeenCalledWith("FN-1", expect.objectContaining({ paused: false, pausedReason: null, error: null }));
+    expect(resumeInPlace).toHaveBeenCalledWith("FN-1");
     expect(runAudit.database).toHaveBeenCalledWith(expect.objectContaining({ type: "contamination:retry-issued" }));
   });
 
   it("uses foreign-only recovery helper when branch/worktree metadata exists", async () => {
     const taskStore = makeTaskStore();
     const runAudit = { database: vi.fn(), git: vi.fn(), filesystem: vi.fn() } as any;
-    const handler = new ContaminationAutoRecoveryHandler({ taskStore, runAudit, repoDir: process.cwd() });
+    const resumeInPlace = vi.fn();
+    const handler = new ContaminationAutoRecoveryHandler({ taskStore, runAudit, repoDir: process.cwd(), resumeInPlace });
     await handler.issueRetry({ class: "branch-cross-contamination", taskId: "FN-1", pausedReason: "branch-cross-contamination", evidence: { ownCommits: 0, foreignAttributedCommits: 2 } }, { action: "retry", rationale: "mode-programmatic", auditMetadata: {}, legacyPausedReason: "x" }, { task: { ...baseTask, branch: "fusion/fn-1", worktree: "/tmp/fn-1", baseCommitSha: "main" } as Task, retryCount: 1, settings: { mode: "programmatic", maxRetries: 3 } });
     expect(runAudit.database).toHaveBeenCalledWith(expect.objectContaining({ type: "contamination:retry-issued", metadata: expect.objectContaining({ recoveryKind: "foreign-only", subtype: "reanchor" }) }));
   });
@@ -66,7 +73,8 @@ describe("ContaminationAutoRecoveryHandler", () => {
   it("emits irreducible pause and skips retry for destructive ambiguity", async () => {
     const taskStore = makeTaskStore();
     const runAudit = { database: vi.fn(), git: vi.fn(), filesystem: vi.fn() } as any;
-    const handler = new ContaminationAutoRecoveryHandler({ taskStore, runAudit, repoDir: process.cwd() });
+    const resumeInPlace = vi.fn();
+    const handler = new ContaminationAutoRecoveryHandler({ taskStore, runAudit, repoDir: process.cwd(), resumeInPlace });
     await handler.issueRetry({ class: "branch-cross-contamination", taskId: "FN-1", pausedReason: "branch-cross-contamination", evidence: { ownCommits: 1, foreignAttributedCommits: 1 } }, { action: "retry", rationale: "mode-programmatic", auditMetadata: {}, legacyPausedReason: "x" }, { task: { ...baseTask } as Task, retryCount: 1, settings: { mode: "programmatic", maxRetries: 3 } });
     expect(taskStore.moveTask).not.toHaveBeenCalled();
     expect(runAudit.database).toHaveBeenCalledWith(expect.objectContaining({ type: "contamination:irreducible-pause" }));
@@ -75,7 +83,8 @@ describe("ContaminationAutoRecoveryHandler", () => {
   it("emits irreducible pause and skips retry when retry budget exhausted", async () => {
     const taskStore = makeTaskStore();
     const runAudit = { database: vi.fn(), git: vi.fn(), filesystem: vi.fn() } as any;
-    const handler = new ContaminationAutoRecoveryHandler({ taskStore, runAudit, repoDir: process.cwd() });
+    const resumeInPlace = vi.fn();
+    const handler = new ContaminationAutoRecoveryHandler({ taskStore, runAudit, repoDir: process.cwd(), resumeInPlace });
     await handler.issueRetry({ class: "branch-cross-contamination", taskId: "FN-1", pausedReason: "branch-cross-contamination", evidence: { ownCommits: 0, foreignAttributedCommits: 2 } }, { action: "retry", rationale: "mode-programmatic", auditMetadata: {}, legacyPausedReason: "x" }, { task: { ...baseTask } as Task, retryCount: 3, settings: { mode: "programmatic", maxRetries: 3 } });
     expect(taskStore.moveTask).not.toHaveBeenCalled();
     expect(runAudit.database).toHaveBeenCalledWith(expect.objectContaining({ type: "contamination:irreducible-pause" }));

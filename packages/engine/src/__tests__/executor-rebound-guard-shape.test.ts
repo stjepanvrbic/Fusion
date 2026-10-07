@@ -93,10 +93,16 @@ describe("no rebound move is guarded by a column literal", () => {
     expect(offenders).toEqual(["1"]);
   });
 
-  it("still sees the eight rebound moves it is meant to cover", () => {
-    // A guard that reports success on zero matches is worse than no guard.
+  /*
+  FNXC:LifecycleContainment 2026-10-07-18:04:
+  The eight rebound moves this guard covered are gone: FN-207 forbids an automatic WIP-to-hold move,
+  and every executor retry now stays in its WIP lane (see in-place-execution-requeue.ts). The
+  invariant is therefore stronger than "guarded by a resolved column": the executor issues no
+  rebound move at all. The literal-guard check above stays as a tripwire if one is reintroduced.
+  */
+  it("issues no rebound move anywhere in the executor family", () => {
     const reboundMoves = lines.filter(({ line }) => /moveTask\([^)]*(?:rebound|Rebound)Column/.test(line));
 
-    expect(reboundMoves.length).toBeGreaterThanOrEqual(8);
+    expect(reboundMoves.map(({ file, line }) => `${file}: ${line.trim()}`)).toEqual([]);
   });
 });

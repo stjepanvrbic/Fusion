@@ -48,6 +48,13 @@ function makeSession() {
 
 function makeExecutor(store: ReturnType<typeof createMockStore>): TaskExecutor {
   store.getRootDir = vi.fn().mockReturnValue("/tmp/test");
+  const executor = makeExecutorInstance(store);
+  /* FNXC:LifecycleContainment 2026-10-07-18:04: retries now re-dispatch in place; stub the timer so a test observes the request without a second run. */
+  vi.spyOn(executor, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
+  return executor;
+}
+
+function makeExecutorInstance(store: ReturnType<typeof createMockStore>): TaskExecutor {
   return new TaskExecutor(store as any, "/tmp/test", {
     agentStore: {
       listAgents: vi.fn().mockResolvedValue([{
@@ -122,9 +129,10 @@ describe("reliability interactions: executor no-fn_task_done vs worktree reclaim
     await executor.execute(state);
 
     expect(mockedCreateFnAgent).toHaveBeenCalledTimes(1);
-    // FN-4806: silent requeue — task goes to todo with preserveProgress, no failed status,
-    // no taskDoneRetryCount burn, no onError surface.
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4601", "todo", { preserveProgress: true });
+    // FN-4806: silent requeue — no failed status, no taskDoneRetryCount burn, no onError surface.
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the requeue stays in the WIP lane (no move to todo) and re-dispatches in place.
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-4601", "todo", expect.anything());
+    expect(executor.scheduleInPlaceExecutionResume).toHaveBeenCalledWith("FN-4601");
     expect(store.logEntry).toHaveBeenCalledWith(
       "FN-4601",
       expect.stringContaining("engine self-heal, no failure"),
@@ -140,11 +148,9 @@ describe("reliability interactions: executor no-fn_task_done vs worktree reclaim
       "FN-4601",
       expect.objectContaining({ taskDoneRetryCount: expect.any(Number) }),
     );
-    // Stale binding must be cleared so the next pickup creates a fresh worktree.
-    expect(store.updateTask).toHaveBeenCalledWith(
-      "FN-4601",
-      expect.objectContaining({ worktree: null, branch: null }),
-    );
+    // Stale binding must be cleared so the next pickup creates a fresh worktree (the in-place requeue also passes the run context).
+    expect(store.updateTask.mock.calls.some(([id, patch]: any[]) =>
+      id === "FN-4601" && patch?.worktree === null && patch?.branch === null)).toBe(true);
   });
 
   it("missing-worktree session-start error during retry clears metadata in place", async () => {
@@ -237,7 +243,9 @@ describe("reliability interactions: executor no-fn_task_done vs worktree reclaim
     const executor = makeExecutor(store);
     await executor.execute(state);
 
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4601", "todo", { preserveProgress: true });
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the reclaim requeue retries in place instead of moving to todo.
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-4601", "todo", expect.anything());
+    expect(executor.scheduleInPlaceExecutionResume).toHaveBeenCalledWith("FN-4601");
     expect(store.moveTask).not.toHaveBeenCalledWith("FN-4601", "in-review");
     expect(store.updateTask).not.toHaveBeenCalledWith(
       "FN-4601",

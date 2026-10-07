@@ -6,6 +6,8 @@
  * failures (worktree/session/remediation/resume), and park the task visibly when
  * no recovery path applies — never leave a failed graph invisible in in-progress.
  */
+import { moveTaskToReplanColumn } from "../execution/replan-target.js";
+import { parkExhaustedRecovery } from "../healing/recovery-exhaustion.js";
 import { join } from "node:path";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import type { Task, TaskStore, WorkflowIr } from "@fusion/core";
@@ -77,6 +79,9 @@ import {
   isTerminalMergeGraphFailureValue,
 } from "./task-predicates.js";
 import type { PausedAbortProvenance } from "./paused-abort-provenance.js";
+
+/** FNXC:StepDependencyValidation 2026-10-07-18:04: automatic planner repairs for an invalid step-dependency graph before the card parks for an operator. */
+export const MAX_INVALID_PLAN_DEPENDENCY_REPLANS = 2;
 
 const MAX_TRANSIENT_GRAPH_RESUME_RETRIES = 2;
 const TRANSIENT_GRAPH_RESUME_RETRY_BACKOFF_MS = process.env.VITEST || process.env.NODE_ENV === "test" ? 0 : 1_000;
@@ -430,12 +435,16 @@ export async function handleGraphFailure(
           const handle = setTimeout(scheduleRetry, TRANSIENT_GRAPH_RESUME_RETRY_BACKOFF_MS);
           handle.unref?.();
         } else {
-          await deps.store.logEntry(
-            task.id,
-            `Worktree base refresh remains blocked (${refreshKind}) — retry budget exhausted; task remains held`,
-            undefined,
-            deps.getRunContextFor(task.id),
-          );
+          /* FNXC:RecoveryOwnership 2026-10-07-18:04: an exhausted in-place hold must leave a visible park, never a silent WIP card with no session or scheduled resume. */
+          await parkExhaustedRecovery(deps.store, live, {
+            owner: "graph-worktree-base-refresh",
+            attempts: priorRetries,
+            detail: `worktree base refresh remains blocked (${refreshKind})`,
+            agentId: "executor",
+            reseeded: false,
+            preserveRecoveryCounter: true,
+            runContext: deps.getRunContextFor(task.id),
+          });
         }
         await deps.persistTokenUsage(task.id);
         return;
@@ -477,13 +486,17 @@ export async function handleGraphFailure(
           };
           const handle = setTimeout(scheduleRetry, TRANSIENT_GRAPH_RESUME_RETRY_BACKOFF_MS);
           handle.unref?.();
-        } else {
-          await deps.store.logEntry(
-            task.id,
-            "Required workflow artifact read retry budget exhausted — task remains held in its current state",
-            undefined,
-            deps.getRunContextFor(task.id),
-          );
+        } else if (!(await deps.isRequiredArtifactRecoveryProtected(live))) {
+          /* FNXC:RecoveryOwnership 2026-10-07-18:04: read-outage exhaustion parks visibly instead of holding silently. */
+          await parkExhaustedRecovery(deps.store, live, {
+            owner: "graph-artifact-read",
+            attempts: priorRetries,
+            detail: "required workflow artifact could not be read",
+            agentId: "executor",
+            reseeded: false,
+            preserveRecoveryCounter: true,
+            runContext: deps.getRunContextFor(task.id),
+          });
         }
         await deps.persistTokenUsage(task.id);
         return;
@@ -494,9 +507,18 @@ export async function handleGraphFailure(
          * FN-9438 requires a declared runtime or dependency-group mismatch to remain an operator
          * configuration hold. Scheduling it like a provider outage only retries an impossible command.
          */
-        const message = "Dependency bootstrap requires project configuration — task remains held until worktreeInitCommand or project runtime configuration is updated";
+        const message = "Dependency bootstrap requires project configuration — update worktreeInitCommand or the project runtime configuration, then choose Retry";
         executorLog.warn(`${task.id}: ${message}`);
-        await deps.store.logEntry(task.id, message, undefined, deps.getRunContextFor(task.id));
+        /* FNXC:RecoveryOwnership 2026-10-07-18:04: the configuration hold is a visible failed park; logging alone left an unexplained in-progress card. */
+        await parkExhaustedRecovery(deps.store, live, {
+          owner: "graph-dependency-bootstrap",
+          attempts: 0,
+          detail: message,
+          agentId: "executor",
+          preserveRecoveryCounter: true,
+          errorOverride: message,
+          runContext: deps.getRunContextFor(task.id),
+        });
         await deps.persistTokenUsage(task.id);
         return;
       }
@@ -516,17 +538,33 @@ export async function handleGraphFailure(
           await deps.store.updateTask(task.id, {
             graphResumeRetryCount: nextRetries,
           }, deps.getRunContextFor(task.id));
+          /* FNXC:RecoveryOwnership 2026-10-07-18:04: re-read human control and liveness at fire time; the stale `live` snapshot used to be re-executed unconditionally. */
           const scheduleRetry = () => {
-            deps.execute(live).catch((err: unknown) =>
-              executorLog.error(`Failed Plan Review provider retry for ${task.id}:`, err),
-            );
+            void (async () => {
+              const [resume, settings] = await Promise.all([deps.store.getTask(task.id), deps.store.getSettings()]);
+              if (!resume || resume.deletedAt || resume.paused || resume.userPaused
+                || resume.status === "failed" || resume.column !== live.column
+                || settings.globalPause || settings.enginePaused
+                || deps.hasLiveTaskSessionSurface(task.id)
+                || deps.executing.has(task.id) || deps.resumingUnpaused.has(task.id)
+                || deps.processWideGraphRouting.has(task.id)) return;
+              await deps.execute(resume);
+            })().catch((err: unknown) => executorLog.error(`Failed Plan Review provider retry for ${task.id}:`, err));
           };
           const handle = setTimeout(scheduleRetry, TRANSIENT_GRAPH_RESUME_RETRY_BACKOFF_MS);
           handle.unref?.();
         } else {
-          const message = "Plan Review provider retry budget exhausted — task remains held in its current state";
-          executorLog.warn(`${task.id}: ${message}`);
-          await deps.store.logEntry(task.id, message, undefined, deps.getRunContextFor(task.id));
+          /* FNXC:RecoveryOwnership 2026-10-07-18:04: an exhausted provider hold parks visibly; nothing retried the former silent hold. */
+          executorLog.warn(`${task.id}: Plan Review provider retry budget exhausted — parking for an operator`);
+          await parkExhaustedRecovery(deps.store, live, {
+            owner: "graph-plan-review-provider",
+            attempts: priorRetries,
+            detail: "Plan Review provider kept failing",
+            agentId: "executor",
+            reseeded: false,
+            preserveRecoveryCounter: true,
+            runContext: deps.getRunContextFor(task.id),
+          });
         }
         await deps.persistTokenUsage(task.id);
         return;
@@ -972,19 +1010,59 @@ export async function handleGraphFailure(
         && failureValue.startsWith("invalid-plan-dependency:")
       ) {
         const diagnostic = failureValue.slice("invalid-plan-dependency:".length).trim() || "Invalid step dependency graph";
-        await deps.store.updateTask(live.id, {
-          status: "needs-replan",
-          error: null,
-          recoveryRetryCount: null,
-          nextRecoveryAt: null,
-        }, deps.getRunContextFor(live.id));
+        /*
+        FNXC:StepDependencyValidation 2026-10-07-18:04:
+        Writing `needs-replan` on a WIP card had no consumer: triage admits replans only from the
+        planning lanes, so the card sat in WIP and every re-entry hit the same invalid graph. An invalid
+        step-dependency graph is a plan refusal, so it takes the sanctioned plan-revision route (the
+        `plan-review-revise-replan` WIP-to-hold handoff the planner consumes), bounded by the
+        plan-revision counter. Exhaustion, or a board with no planning lane to replan in, parks the
+        card visibly in place.
+        */
+        const priorReplans = live.planReviewReplanCount ?? 0;
+        const parkInvalidPlan = async (detail: string) => {
+          await parkExhaustedRecovery(deps.store, live, {
+            owner: "graph-invalid-plan-dependency",
+            attempts: priorReplans,
+            detail,
+            agentId: "executor",
+            reseeded: false,
+            preserveRecoveryCounter: true,
+            runContext: deps.getRunContextFor(live.id),
+          });
+          deps.activeWorktrees.delete(live.id);
+          await deps.persistTokenUsage(live.id);
+        };
+        if (priorReplans >= MAX_INVALID_PLAN_DEPENDENCY_REPLANS) {
+          executorLog.warn(`${live.id}: invalid plan dependency persisted after ${priorReplans} replans — parking: ${diagnostic}`);
+          await parkInvalidPlan(`the plan's step dependencies stayed invalid after ${priorReplans} automatic replans (${diagnostic})`);
+          return;
+        }
         await deps.store.logEntry(
           live.id,
           "AI spec revision requested",
           `Step dependency validation rejected the plan: ${diagnostic}`,
           deps.getRunContextFor(live.id),
         );
-        executorLog.warn(`${live.id}: invalid plan dependency parked for planner repair: ${diagnostic}`);
+        const replanResult = await moveTaskToReplanColumn(
+          deps.store,
+          { id: live.id, column: live.column },
+          "plan-review-revise-replan",
+          undefined,
+          { workflowMoveSource: "workflow-remediation" },
+        );
+        if (replanResult === undefined || typeof replanResult === "object") {
+          await parkInvalidPlan(`the plan's step dependencies are invalid and this workflow has no planning lane to replan in (${diagnostic})`);
+          return;
+        }
+        await deps.store.updateTask(live.id, {
+          status: "needs-replan",
+          error: null,
+          planReviewReplanCount: priorReplans + 1,
+          nextRecoveryAt: null,
+          graphResumeRetryCount: 0,
+        }, deps.getRunContextFor(live.id));
+        executorLog.warn(`${live.id}: invalid plan dependency sent to planner repair (${priorReplans + 1}/${MAX_INVALID_PLAN_DEPENDENCY_REPLANS}): ${diagnostic}`);
         deps.activeWorktrees.delete(live.id);
         await deps.persistTokenUsage(live.id);
         return;
@@ -1125,8 +1203,19 @@ export async function handleGraphFailure(
         await deps.persistTokenUsage(task.id);
         return;
       }
-      const executeNodeSelfRequeued = failedNode === "execute" && deps.graphExecuteSelfRequeued.has(task.id);
-      if (failedNode === "execute" && ((holdColumn !== undefined && live.column === holdColumn) || executeNodeSelfRequeued)) {
+      /*
+      FNXC:LifecycleContainment 2026-10-07-18:04:
+      Executor retries now stay in the WIP lane, so the self-requeue marker (not a hold-lane column) is
+      what proves the inner executor owns a scheduled in-place retry. Foreach step-execute nodes reach
+      the same seam; before the in-place change their requeue moved the card out of WIP and the run
+      ended benignly, so they must take this branch too instead of falling to the terminal sink.
+      */
+      const isExecuteSeamNode = failedNode === "execute"
+        || failedNode === "step-execute"
+        || failedNode?.endsWith(":step-execute") === true;
+      const executeNodeSelfRequeued = isExecuteSeamNode && deps.graphExecuteSelfRequeued.has(task.id);
+      // The hold-column arm stays execute-only: a step node in a hold-like column without the marker is not a requeue.
+      if ((failedNode === "execute" && holdColumn !== undefined && live.column === holdColumn) || executeNodeSelfRequeued) {
         /*
         FNXC:WorkflowLifecycle 2026-06-23-12:03:
         The graph execute node delegates to the authoritative executor. If that inner executor requeues the task to todo for self-heal/retry, the outer graph failure must not override it by parking the task in review.
@@ -1164,7 +1253,7 @@ export async function handleGraphFailure(
           && live.paused !== true
           && !(await resolveTerminalColumnsFor(deps.store, live.id)).includes(live.column);
         if (nextCount >= MAX_EXECUTE_REQUEUE_LOOP_CYCLES && canTerminalizeExecuteLoop) {
-          const terminalError = `EXECUTION_DISPATCH_LOOP_EXHAUSTED: execute node re-queued task to todo ${nextCount} times with no forward progress (last value=${failureValue ?? "no-value"}). No further automatic retries will run. Manually retry, decompose, or rescope the task.`;
+          const terminalError = `EXECUTION_DISPATCH_LOOP_EXHAUSTED: execute node re-queued the task ${nextCount} times with no forward progress (last value=${failureValue ?? "no-value"}). No further automatic retries will run. Manually retry, decompose, or rescope the task.`;
           await deps.store.updateTask(task.id, {
             status: "failed",
             error: terminalError,
@@ -1196,7 +1285,7 @@ export async function handleGraphFailure(
           await deps.persistTokenUsage(task.id);
           return;
         }
-        const benignMessage = `Workflow graph execute node ended after executor re-queued task to todo (${failureValue ?? "no-value"}) — executor recovery preserved`;
+        const benignMessage = `Workflow graph execute node ended after executor re-queued the task for an in-place retry (${failureValue ?? "no-value"}) — executor recovery preserved`;
         executorLog.log(`${task.id}: ${benignMessage}`);
         await deps.store.logEntry(task.id, benignMessage, undefined, deps.getRunContextFor(task.id));
         await deps.persistTokenUsage(task.id);

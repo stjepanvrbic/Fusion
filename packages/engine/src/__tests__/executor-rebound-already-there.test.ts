@@ -98,13 +98,20 @@ describe("an engine rebound does not move a card that is already in its rebound 
     expect(h.moves).toEqual([]);
   });
 
-  it("DOES move when the card is elsewhere on the renamed board", async () => {
-    // The paired positive: "never move" must not be able to pass for "compare properly".
+  /*
+  FNXC:LifecycleContainment 2026-10-07-18:04:
+  The park no longer moves a WIP card to the backlog: that WIP-to-hold move used a same-role-only
+  reason FN-207 rejects, so it threw before the park landed. The park now lands in place, on the
+  renamed board as on the default one, and the parked shape is what proves it ran.
+  */
+  it("parks in place when the card is in the renamed board's WIP lane", async () => {
     const h = harness(RENAMED_IR, "building");
 
-    await h.park(blockedCompletedTask("building"));
+    const parked = await h.park(blockedCompletedTask("building"));
 
-    expect(h.moves).toEqual([["FN-BLOCKED", "queued"]]);
+    expect(parked).toBe(true);
+    expect(h.moves).toEqual([]);
+    expect(await h.store.getTask("FN-BLOCKED")).toMatchObject({ column: "building", paused: true, status: "queued" });
   });
 
   it("still skips the redundant move on the default lineage", async () => {
@@ -126,7 +133,7 @@ describe("an engine rebound does not move a card that is already in its rebound 
   resolver's fail-soft path in production (a deleted or unreadable definition row, not an absent
   selection).
   */
-  it("still moves to the legacy backlog when a SELECTED workflow's definition cannot be read", async () => {
+  it("still parks in place when a SELECTED workflow's definition cannot be read", async () => {
     const h = harness(undefined, "in-progress");
     const selection = { workflowId: "wf-unreadable", stepIds: [] as string[] };
     const widened = h.store as unknown as Record<string, unknown>;
@@ -136,8 +143,11 @@ describe("an engine rebound does not move a card that is already in its rebound 
       throw new Error("definition row is gone");
     };
 
-    await h.park(blockedCompletedTask("in-progress"));
+    const parked = await h.park(blockedCompletedTask("in-progress"));
 
-    expect(h.moves).toEqual([["FN-BLOCKED", "todo"]]);
+    // FNXC:LifecycleContainment 2026-10-07-18:04: an unreadable definition no longer matters; the park lands in place.
+    expect(parked).toBe(true);
+    expect(h.moves).toEqual([]);
+    expect(await h.store.getTask("FN-BLOCKED")).toMatchObject({ column: "in-progress", paused: true, status: "queued" });
   });
 });

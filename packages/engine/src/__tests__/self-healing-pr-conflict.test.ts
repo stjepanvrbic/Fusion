@@ -269,8 +269,22 @@ describe("SelfHealingManager.reclaimPrConflictForTask", () => {
 
     expect(result.outcome).toBe("escalated-reseed");
     expect(task).toMatchObject({ column: "in-progress", paused: false, status: null, error: null });
-    expect(task.recoveryRetryCount).toBeNull();
+    /*
+    FNXC:RecoveryOwnership 2026-10-07-18:04:
+    The reseed keeps the episode counter (maxRetries + 1) instead of resetting it, so the next
+    escalation proves the reseed was spent and parks the card visibly instead of reseeding forever.
+    */
+    expect(task.recoveryRetryCount).toBe(4);
     expect(store.logEntry).toHaveBeenCalledWith(task.id, expect.stringContaining("fenced reclaim reseed"));
+
+    const second = await manager.reclaimPrConflictForTask(task.id);
+    expect(second.outcome).toBe("paused-unrecoverable");
+    expect(task).toMatchObject({ column: "in-progress", status: "failed", recoveryRetryCount: 4 });
+    expect(task.error).toContain("including one fresh-session reseed");
+
+    // A parked episode stays parked on later passes.
+    await manager.reclaimPrConflictForTask(task.id);
+    expect(task).toMatchObject({ status: "failed", recoveryRetryCount: 4 });
   });
 
   it("skips worktrunk operation failed paused tasks", async () => {

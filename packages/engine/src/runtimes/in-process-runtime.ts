@@ -1701,36 +1701,12 @@ export class InProcessRuntime
           runtimeLog.error(`Task ${task.id} failed:`, error.message);
           this.recordTaskCompletion(task.id, false);
 
-          // Mission-linked failures should be re-queued to todo so autopilot retry
-          // policies can decide whether to retry or block the feature.
-          if (task.sliceId) {
-            void (async () => {
-              try {
-                const latest = await this.taskStore.getTask(task.id);
-                /*
-                FNXC:WorkflowLifecycleColumns 2026-08-02-15:30 (fleet — GUARD AND DESTINATION together):
-                A mission task that errored is requeued from the WIP lane back to the HOLD lane. Both ends were
-                literals, so on a renamed board the guard never matched and the requeue never happened — the
-                errored mission task stayed in the wip lane holding a slot, which is worse than a requeue that
-                fails loudly.
-
-                Converting the guard alone would be worse still: it would admit the card and then move it to a
-                `todo` the board may not declare, `moveTask` rejects an unknown column, and the task stays put
-                with an exception in the log. A board that declares no hold lane keeps the card in place
-                deliberately — the same outcome it has today.
-                */
-                const requeueLifecycle = await resolveTaskLifecycleColumns(this.taskStore, task.id);
-                const requeueWip = requeueLifecycle?.wip ?? "in-progress";
-                const requeueHold = requeueLifecycle ? requeueLifecycle.hold : "todo";
-                if (latest?.column === requeueWip && requeueHold !== undefined) {
-                  await this.taskStore.moveTask(task.id, requeueHold as never);
-                }
-              } catch (moveErr) {
-                runtimeLog.warn(`Failed to requeue mission task ${task.id} after error:`, moveErr);
-              }
-            })();
-          }
-
+          /*
+          FNXC:LifecycleContainment 2026-10-07-18:04:
+          Mission-linked failures used to be moved from WIP back to the hold lane here before the
+          autopilot's retry policy ran. That optionless automatic WIP-to-hold move is forbidden by
+          FN-207; the autopilot owns the retry decision and retries in place.
+          */
         },
       };
 
@@ -1739,6 +1715,10 @@ export class InProcessRuntime
         this.config.workingDirectory,
         executorOptions
       );
+
+      /* FNXC:LifecycleContainment 2026-10-07-18:04: mission retries happen in place; let the autopilot arm the executor's guarded re-dispatch. */
+
+      this.missionAutopilot?.setResumeExecutionInPlace((taskId) => this.executor?.scheduleInPlaceExecutionResume(taskId));
       if (this.mergeRequester) {
         this.executor.setMergeRequester(this.mergeRequester);
       }
@@ -2065,6 +2045,8 @@ export class InProcessRuntime
         leaseManager: this.leaseManager,
         hasActiveAgentExecution: (agentId: string) => this.heartbeatMonitor?.getTrackedAgents().includes(agentId) ?? false,
         resumeAssignedTaskForAgent: (agentId: string) => this.executor.resumeTaskForAgent(agentId),
+        /* FNXC:LifecycleContainment 2026-10-07-18:04: self-healing repairs re-dispatch WIP cards in place through the executor's guarded timer. */
+        resumeExecutionInPlace: (taskId: string) => this.executor?.scheduleInPlaceExecutionResume(taskId),
         recoverActiveMissionValidations: async () => {
           if (!this.missionExecutionLoop) {
             return { recoveredCount: 0 };
@@ -2084,7 +2066,14 @@ export class InProcessRuntime
           if (!this.heartbeatMonitor) {
             return false;
           }
-          const run = await this.heartbeatMonitor.executeHeartbeat({
+          /*
+          FNXC:RecoveryOwnership 2026-10-07-18:04:
+          Dispatch and return. Awaiting executeHeartbeat ran a whole AI heartbeat session per agent,
+          sequentially, inside startup recovery and the maintenance sweep, so every later step (lease,
+          worktree and stalled-card reconciliation) waited behind model I/O. `true` means dispatched;
+          a refused or failed run is logged when it settles.
+          */
+          void this.heartbeatMonitor.executeHeartbeat({
             agentId,
             source: "automation",
             triggerDetail: `self-healing durable-agent transient recovery (${context.reason}, attempt ${context.attempt})`,
@@ -2095,8 +2084,12 @@ export class InProcessRuntime
                 source: "durable-agent-transient-error-recovery",
               },
             },
+          }).then((run) => {
+            if (!run) runtimeLog.warn(`Durable-agent heartbeat restart for ${agentId} did not start a run`);
+          }).catch((err: unknown) => {
+            runtimeLog.warn(`Durable-agent heartbeat restart for ${agentId} failed: ${err instanceof Error ? err.message : String(err)}`);
           });
-          return !!run;
+          return true;
         },
         /*
         FNXC:OverlapWaitSynchronization 2026-09-18-01:05:
@@ -2629,18 +2622,30 @@ export class InProcessRuntime
     }
   }
 
+  /*
+  FNXC:RecoveryOwnership 2026-10-07-18:04:
+  Startup recovery is sequenced: safe-retry writes, then the self-healing startup sweeps (awaited),
+  then orphan resumption. Running the sweeps fire-and-forget beside deferred orphan resumes let a
+  sweep clear or rewrite a row (status, worktree, session) that the deferred execute() then ran from
+  a stale snapshot. The sweeps no longer block on model I/O (the durable-agent heartbeat restart
+  dispatches and returns), so awaiting them cannot hold orphan resumption behind AI sessions.
+  */
   private async resumeStartupRecoverySequence(): Promise<void> {
     // Restart recovery decides when interrupted runs can safely resume versus
-    // when they must be reset to todo for a clean retry.
-    await this.restartRecoveryCoordinator!.recoverInterruptedRuns();
+    // when they must be retried in place with a fresh checkout.
+    await this.restartRecoveryCoordinator!.recoverInterruptedRuns({ resumeOrphans: false });
 
     // Some "stuck" tasks are already orphaned by the time the runtime boots:
     // they no longer have a tracked session/worktree, so the stuck detector
     // cannot recover them. Delegate the startup recovery pass to
     // SelfHealingManager so the policy lives in one place.
-    void this.selfHealingManager!.runStartupRecovery().catch((err) => {
+    try {
+      await this.selfHealingManager!.runStartupRecovery();
+    } catch (err) {
       runtimeLog.error("Self-healing startup recovery failed:", err);
-    });
+    }
+
+    await this.restartRecoveryCoordinator!.resumeOrphaned();
   }
 
   /**

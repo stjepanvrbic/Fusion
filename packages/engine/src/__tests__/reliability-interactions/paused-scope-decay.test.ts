@@ -58,7 +58,7 @@ function makeStore(tasks: Task[], settings: Partial<Settings> = {}) {
 }
 
 describe("reliability interactions: paused scope decay", () => {
-  it("records stale paused in-progress holder recovery in place and emits audit", async () => {
+  it("reports a stale paused holder once as no-action and never claims a recovery it did not make", async () => {
     const now = Date.now();
     const holder = makeTask("FN-1", {
       column: "in-progress",
@@ -74,22 +74,23 @@ describe("reliability interactions: paused scope decay", () => {
     const { store, byId, audits } = makeStore([holder, follower]);
     const manager = new SelfHealingManager(store, { rootDir: process.cwd(), getExecutingTaskIds: () => new Set() });
 
-    const count = await manager.autoReboundPausedScopeDecay();
-    expect(count).toBe(1);
     /*
-    FNXC:LifecycleContainment 2026-09-22-03:57:
-    Automatic scope-decay recovery has no revision authority, so it records its audit and keeps
-    the paused holder in its live lane rather than moving work backward to `todo`. The fixture
-    must assert this production containment rule instead of the retired rebound expectation.
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The sweep has no in-place repair for a paused WIP holder (FN-217 removed the rebound), so it
+    must not count a recovery, log "Auto-rebounded", or emit the success audit while the follower
+    stays blocked. It reports one no-action and stays silent on an unchanged second pass.
     */
+    expect(await manager.autoReboundPausedScopeDecay()).toBe(0);
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(byId.get("FN-1")?.currentStep).toBe(2);
-    expect(byId.get("FN-1")?.worktree).toBe("/tmp/wt");
-    expect(store.logEntry).toHaveBeenCalledWith("FN-1", expect.stringContaining("Auto-rebounded (FN-4890)"));
-    expect(audits.some((event) => event.mutationType === "task:auto-rebound-paused-scope-decay")).toBe(true);
+    expect(store.logEntry).not.toHaveBeenCalledWith("FN-1", expect.stringContaining("Auto-rebounded"));
+    expect(audits.some((event) => event.mutationType === "task:auto-rebound-paused-scope-decay")).toBe(false);
+    const noAction = audits.filter((event) => event.mutationType === "task:auto-rebound-scope-decay-no-action");
+    expect(noAction).toHaveLength(1);
 
-    expect(byId.get("FN-1")?.column).toBe("in-progress");
-    expect(byId.get("FN-1")?.paused).toBe(true);
+    expect(await manager.autoReboundPausedScopeDecay()).toBe(0);
+    expect(audits.filter((event) => event.mutationType === "task:auto-rebound-scope-decay-no-action")).toHaveLength(1);
+
+    expect(byId.get("FN-1")).toMatchObject({ column: "in-progress", paused: true, currentStep: 2, worktree: "/tmp/wt" });
     expect(byId.get("FN-2")?.blockedBy).toBe("FN-1");
   });
 
@@ -106,7 +107,9 @@ describe("reliability interactions: paused scope decay", () => {
     const manager = new SelfHealingManager(store, { rootDir: process.cwd(), getExecutingTaskIds: () => new Set() });
 
     expect(await manager.autoReboundPausedScopeDecay()).toBe(0);
-    expect(await manager.autoReboundPausedScopeDecay({ ignoreAgeGate: true })).toBe(1);
+    // The age-gate override reaches the candidate; it still reports no-action instead of a false recovery.
+    expect(await manager.autoReboundPausedScopeDecay({ ignoreAgeGate: true })).toBe(0);
+    expect(store.logEntry).toHaveBeenCalledWith("FN-3", expect.stringContaining("cannot move it backward"));
   });
 
   it("no-op when there are no followers", async () => {
@@ -171,8 +174,10 @@ describe("reliability interactions: paused scope decay", () => {
 
     const count = await manager.autoReboundPausedScopeDecay();
 
-    // Approval holds are excluded; the control reaches recovery but remains in place without revision authority.
-    expect(count).toBe(1);
+    // Approval holds are excluded; the control reaches the candidate and is reported, never counted as recovered.
+    expect(count).toBe(0);
+    expect(store.logEntry).not.toHaveBeenCalledWith("FN-APPROVAL", expect.anything());
+    expect(store.logEntry).toHaveBeenCalledWith("FN-CONTROL", expect.stringContaining("cannot move it backward"));
     expect(store.moveTask).not.toHaveBeenCalled();
     expect(byId.get("FN-APPROVAL")?.column).toBe("in-progress");
     expect(byId.get("FN-APPROVAL")?.paused).toBe(true);

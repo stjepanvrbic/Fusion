@@ -1,7 +1,6 @@
 import type { TaskStore } from "@fusion/core";
 import { classifyForeignOnlyContamination } from "../execution/branch-conflicts.js";
 import type { AutoRecoveryContext, AutoRecoveryDecision, AutoRecoveryFailure, AutoRecoveryHandlers } from "../healing/auto-recovery.js";
-import { moveTaskToContainedBackwardTarget } from "../execution/lifecycle-move.js";
 import { createLogger, type Logger } from "../logger.js";
 import { recoverForeignOnlyContamination } from "../recovery/foreign-only-contamination.js";
 import { resolveIntegrationBranch } from "../merge/integration-branch.js";
@@ -14,6 +13,8 @@ export interface ContaminationRecoveryDeps {
   runAudit: RunAuditor;
   logger?: Logger;
   repoDir: string;
+  /** Arms the executor's guarded in-place re-dispatch once the contamination is repaired. */
+  resumeInPlace: (taskId: string) => void;
 }
 
 export class ContaminationAutoRecoveryHandler implements Pick<AutoRecoveryHandlers, "issueRetry"> {
@@ -73,6 +74,7 @@ export class ContaminationAutoRecoveryHandler implements Pick<AutoRecoveryHandle
           taskStore: this.deps.taskStore,
           runAudit: this.deps.runAudit,
           integrationBranch,
+          resumeInPlace: this.deps.resumeInPlace,
         });
         if (recovered.recovered) {
           recoveryKind = "foreign-only";
@@ -83,28 +85,17 @@ export class ContaminationAutoRecoveryHandler implements Pick<AutoRecoveryHandle
 
     if (recoveryKind === "default") {
       /*
-      FNXC:LifecycleContainment 2026-08-28-03:03:
-      Contamination recovery uses the live source role and an adjacent target. Review returns to WIP,
-      WIP returns to hold, and missing/capacity-blocked destinations remain in place.
+      FNXC:LifecycleContainment 2026-10-07-18:04:
+      Contamination recovery stays in the card's lane. The former contained move resolved to an
+      in-place no-op under FN-217; the unpark below is the repair and the WIP lane is re-dispatched
+      in place, since this handler runs while the executor still holds the task.
       */
-      await moveTaskToContainedBackwardTarget(
-        this.deps.taskStore,
-        task.id,
-        "contamination-recovery",
-        {
-          moveSource: "engine",
-          preserveResumeState: true,
-          preserveProgress: true,
-          preserveWorktree: true,
-        },
-        task.column,
-      );
-
       await this.deps.taskStore.updateTask(task.id, {
         paused: false,
         pausedReason: null,
         error: null,
       });
+      this.deps.resumeInPlace(task.id);
     }
 
     await this.deps.runAudit.database({

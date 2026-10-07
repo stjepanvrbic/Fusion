@@ -110,7 +110,7 @@ describe("branch cross-contamination recovery (FN-4428/FN-4499)", () => {
     } as any;
   }
 
-  it("FN-4488 shape: reanchors bootstrap misbinding and requeues to todo", async () => {
+  it("FN-4488 shape: reanchors bootstrap misbinding and retries in place", async () => {
     const store = createMockStore();
     const contamination = new branchConflicts.BranchCrossContaminationError({
       branchName: "fusion/fn-4488",
@@ -141,20 +141,21 @@ describe("branch cross-contamination recovery (FN-4428/FN-4499)", () => {
       foreignCommitCount: 1,
       nonAttributedCount: 0,
     });
-    vi.spyOn(branchConflicts, "reanchorBranchToBase").mockResolvedValue({
+    const reanchorSpy = vi.spyOn(branchConflicts, "reanchorBranchToBase").mockResolvedValue({
       previousTipSha: "3333333333333333333333333333333333333333",
       newTipSha: "4444444444444444444444444444444444444444",
     });
 
     const executor = new TaskExecutor(store, "/tmp/test");
+    const scheduleInPlaceExecutionResume = vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
     const task = { ...makeTask(), id: "FN-4488", branch: "fusion/fn-4488" } as any;
     seedTaskRow(store, task);
     await executor.execute(task);
 
-    expect(store.moveTask).toHaveBeenCalled();
-    const [movedTaskId, movedColumn] = store.moveTask.mock.calls[0] as [string, string];
-    expect(movedTaskId).toBe("FN-4488");
-    expect(["todo", "in-review"]).toContain(movedColumn);
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: the re-anchored checkout is retried in its WIP lane; FN-207 forbids the former WIP-to-hold rebound. */
+    expect(reanchorSpy).toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-4488", "todo", expect.anything());
+    expect(scheduleInPlaceExecutionResume).toHaveBeenCalledWith("FN-4488");
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-4488", expect.objectContaining({ pausedReason: "branch-cross-contamination" }));
   });
 
@@ -210,10 +211,14 @@ describe("branch cross-contamination recovery (FN-4428/FN-4499)", () => {
     });
 
     const executor = new TaskExecutor(store, "/tmp/test");
+    const scheduleInPlaceExecutionResume = vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
     await executor.execute(makeTask());
 
     expect(recoverySpy).toHaveBeenCalledWith(expect.objectContaining({ shasToDrop: [misroutedCommit.sha] }));
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4428", "todo", { preserveResumeState: true, preserveWorktree: true });
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the repaired branch is retried in place with its worktree kept.
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-4428", "todo", expect.anything());
+    expect(scheduleInPlaceExecutionResume).toHaveBeenCalledWith("FN-4428");
+    expect(store.updateTask).not.toHaveBeenCalledWith("FN-4428", expect.objectContaining({ worktree: null }));
     expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:auto-recover-misrouted-foreign-commit" }));
   });
 
