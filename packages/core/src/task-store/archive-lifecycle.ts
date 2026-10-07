@@ -16,6 +16,7 @@ import {getErrorMessage} from "../process/error-message.js";
 import {ArchiveWorkspaceDisposalError, ArchiveWorkspaceDisposalIncompleteError, ArchiveWorkspaceWorktreeDisposerMissingError, getArchiveWorkspaceWorktreeDisposer, getArchiveWorktreeDisposer, type ArchiveWorkspaceDisposalResult, type WorkspaceDisposalPlanEntry} from "../db/archive-worktree-disposer.js";
 import {acquireWorktreePathReservation, canonicalizeWorktreePath} from "../tasks/worktree-path-reservation.js";
 import {LiveTaskWorktreeRemovalRefusedError} from "../tasks/task-archive-liveness.js";
+import {isSamePath, pathIdentityKey} from "../fs/path-identity.js";
 import {join} from "node:path";
 import {resolveWorktreesDirLayout, type WorkspaceWorktreeContext} from "../tasks/worktree-layout.js";
 
@@ -23,23 +24,26 @@ function resolveArchiveWorktreesDir(store: TaskStore, configured?: string, works
   return resolveWorktreesDirLayout(store.rootDir, {worktreesDir: configured}, workspaceContext);
 }
 
+/**
+ * FNXC:PathIdentity 2026-10-07-18:06:
+ * Disposal deduplicates by physical checkout, not by spelling: case, separator, extended-length and junction/symlink aliases of one worktree become one plan entry, so one reservation and one removal cover them.
+ */
 export async function buildWorkspaceDisposalPlan(store: TaskStore, task: Task): Promise<{plan: WorkspaceDisposalPlanEntry[]; singularDeduplicated: boolean}> {
   const entries = Object.entries(task.workspaceWorktrees ?? {}).sort(([a], [b]) => a.localeCompare(b));
-  const byCanonical = new Map<string, WorkspaceDisposalPlanEntry>();
+  const byIdentity = new Map<string, WorkspaceDisposalPlanEntry>();
   for (const [repoRel, entry] of entries) {
-    const canonical = await canonicalizeWorktreePath(entry.worktreePath);
+    const identity = pathIdentityKey(entry.worktreePath);
     const repoRootDir = join(store.rootDir, repoRel);
-    const existing = byCanonical.get(canonical);
+    const existing = byIdentity.get(identity);
     if (existing) existing.aliasRepoRels.push(repoRel);
-    else byCanonical.set(canonical, {repoRel, worktreePath: entry.worktreePath, branch: entry.branch, repoRootDir, aliasRepoRels: []});
+    else byIdentity.set(identity, {repoRel, worktreePath: entry.worktreePath, branch: entry.branch, repoRootDir, aliasRepoRels: []});
   }
   let singularDeduplicated = false;
   if (task.worktree) {
-    const canonical = await canonicalizeWorktreePath(task.worktree);
-    const existing = byCanonical.get(canonical);
+    const existing = byIdentity.get(pathIdentityKey(task.worktree));
     if (existing) { existing.aliasRepoRels.push("__singular_worktree__"); singularDeduplicated = true; }
   }
-  return {plan: [...byCanonical.values()], singularDeduplicated};
+  return {plan: [...byIdentity.values()], singularDeduplicated};
 }
 
 function normalizeWorkspaceDisposalResult(plan: WorkspaceDisposalPlanEntry[], result: ArchiveWorkspaceDisposalResult): {removed: Set<string>; failures: Map<string, unknown>} {
@@ -134,7 +138,8 @@ export async function disposeArchivedWorktree(store: TaskStore, task: Task): Pro
   if (!task.worktree) return {refusedLive: false};
   const settings = await store.getSettings();
   const canonical = await canonicalizeWorktreePath(task.worktree);
-  if (canonical === await canonicalizeWorktreePath(store.rootDir)) return {refusedLive: false};
+  /* FNXC:PathIdentity 2026-10-07-18:06: Any spelling of the project root is the root; archive must never hand it to a worktree disposer. */
+  if (isSamePath(canonical, store.rootDir)) return {refusedLive: false};
   const reservation = await acquireWorktreePathReservation({canonicalPath: canonical, worktreesDir: resolveArchiveWorktreesDir(store, settings.worktreesDir), rootDir: store.rootDir});
   try {
     const disposer = getArchiveWorktreeDisposer(store);
