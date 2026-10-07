@@ -66,6 +66,60 @@ describe("evaluateBashContainment — denies the escalation chain", () => {
   });
 });
 
+/*
+FNXC:BashContainment 2026-10-07-17:57:
+The floor must deny the same targets in every path spelling native to the host OS.
+Windows spellings (backslash, mixed separators, quoted, drive-letter case, %VAR%, $env:VAR, $USERPROFILE, MSYS /c/...) are exercised with an injected Windows home so the suite proves them on every CI platform.
+*/
+describe("evaluateBashContainment — Windows path spellings", () => {
+  const homeDir = "C:\\Users\\Alice";
+  const denied: Array<[string, string]> = [
+    ["cat C:\\Users\\Alice\\.fusion\\settings.json", "fusion-global-dir"],
+    ['cat "C:\\Users\\Alice\\.fusion\\settings.json"', "fusion-global-dir"],
+    ["type c:\\users\\ALICE\\.fusion\\settings.json", "fusion-global-dir"],
+    ["Get-Content C:/Users/Alice\\.fusion/settings.json", "fusion-global-dir"],
+    ["cmd /c type %USERPROFILE%\\.fusion\\settings.json", "fusion-global-dir"],
+    ["type %HOMEDRIVE%%HOMEPATH%\\.fusion\\settings.json", "fusion-global-dir"],
+    ['cat "$USERPROFILE\\.fusion\\settings.json"', "fusion-global-dir"],
+    ["Get-Content $env:USERPROFILE\\.fusion\\settings.json", "fusion-global-dir"],
+    ["Get-Content ${env:USERPROFILE}\\.fusion\\settings.json", "fusion-global-dir"],
+    ["cat /c/Users/Alice/.fusion/settings.json", "fusion-global-dir"],
+    ["type D:\\Users\\Bob\\.fusion\\settings.json", "fusion-global-dir"],
+    ["type .fusion\\settings.json", "fusion-settings-file"],
+    ['cat "$USERPROFILE\\.ssh\\id_rsa"', "credential-store"],
+    ["type C:\\Users\\Alice\\.aws\\credentials", "credential-store"],
+    ["type %USERPROFILE%\\.npmrc", "credential-store"],
+    ["type $env:USERPROFILE\\.config\\gh\\hosts.yml", "credential-store"],
+    ["type C:\\Users\\Alice\\.docker\\config.json", "credential-store"],
+    ["dir C:\\Users\\Alice\\.gnupg", "credential-store"],
+    ["type C:\\Users\\Alice\\.kube\\config", "credential-store"],
+    ["type C:\\Users\\Alice\\.netrc", "credential-store"],
+  ];
+  for (const [command, rule] of denied) {
+    it(`denies: ${command}`, () => {
+      const verdict = evaluateBashContainment(command, { homeDir });
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.rule).toBe(rule);
+    });
+  }
+
+  it("still folds POSIX escape tricks when the home is a Windows path", () => {
+    expect(evaluateBashContainment("cat ~/.fus\\ion/settings.json", { homeDir }).allowed).toBe(false);
+  });
+
+  const allowed = [
+    "type C:\\Users\\Alice\\project\\README.md",
+    "cat .fusion\\tasks\\FN-1\\PROMPT.md",
+    "dir C:\\work\\repo",
+    "printf 'a\\nb'",
+  ];
+  for (const command of allowed) {
+    it(`allows: ${command}`, () => {
+      expect(evaluateBashContainment(command, { homeDir })).toEqual({ allowed: true });
+    });
+  }
+});
+
 describe("evaluateBashContainment — normal work is unaffected", () => {
   const allowed = [
     "git status",
@@ -121,6 +175,23 @@ describe("wrapToolsWithBashContainment", () => {
     expect(executed).toBe(false);
     expect(result.isError).toBe(true);
     expect(result.error).toContain("privilege-escalation containment");
+  });
+
+  it("blocks a native Windows backslash path before the underlying tool runs", async () => {
+    let executed = false;
+    const [wrapped] = wrapToolsWithBashContainment([
+      makeBashTool(async () => {
+        executed = true;
+        return { ok: true };
+      }) as never,
+    ]);
+    const result = (await (wrapped.execute as (...args: unknown[]) => Promise<unknown>)(
+      "call-win",
+      { command: 'powershell -c "Get-Content C:\\Users\\Someone\\.fusion\\settings.json"' },
+      undefined,
+    )) as { isError?: boolean };
+    expect(executed).toBe(false);
+    expect(result.isError).toBe(true);
   });
 
   it("passes allowed commands through untouched", async () => {
