@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import type { Server } from "node:http";
+import http, { type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -887,5 +888,167 @@ describe("LocalRuntimeManager", () => {
       startupFailure: { phase: "create-store", attempts: 1, message: "boom", name: "Error", platform: process.platform },
     });
     expect(manager.getStatus().startupFailure?.stack).toBeTruthy();
+  });
+
+  /*
+   * C-040: the production createDashboardServerDefault path must bind loopback only, whatever the
+   * daemon-token environment says; the embedded server is never meant to be reachable off-host.
+   */
+  it.each([
+    ["without a daemon token", undefined],
+    ["with a daemon token", "desktop-token"],
+  ])("createDashboardServerDefault listens on 127.0.0.1 only %s", async (_label, token) => {
+    const previousToken = process.env.FUSION_DAEMON_TOKEN;
+    if (token === undefined) delete process.env.FUSION_DAEMON_TOKEN;
+    else process.env.FUSION_DAEMON_TOKEN = token;
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    let realServer: Server | undefined;
+    engineMocks.createServer.mockReturnValueOnce({
+      listen: vi.fn((...args: unknown[]) => {
+        realServer = http.createServer();
+        realServer.listen(...(args as Parameters<Server["listen"]>));
+        return realServer;
+      }),
+    });
+    const manager = new LocalRuntimeManager({ rootDir: "/repo", createStore: async () => store, startupRetries: 1 });
+
+    try {
+      const status = await manager.startLocal();
+      const address = realServer?.address() as AddressInfo;
+      expect(address.address).toBe("127.0.0.1");
+      expect(status.baseUrl).toBe(`http://127.0.0.1:${address.port}`);
+    } finally {
+      await manager.stopLocal();
+      if (previousToken === undefined) delete process.env.FUSION_DAEMON_TOKEN;
+      else process.env.FUSION_DAEMON_TOKEN = previousToken;
+    }
+  });
+
+  /*
+   * C-042: Node's server.close() waits for every open connection. The dashboard holds SSE streams and
+   * WebSocket upgrades for as long as the window is connected, so stop must drain them and still reach
+   * engine cleanup and backend shutdown in bounded time.
+   */
+  it.each(["sse", "websocket"] as const)("stopLocal reaches cleanup and backend shutdown while a %s connection is held open", async (kind) => {
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    const cleanup = vi.fn(async () => undefined);
+    const backendShutdown = vi.fn(async () => undefined);
+    const realServer = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("data: hello\n\n");
+    });
+    realServer.on("upgrade", (_req, socket) => {
+      socket.on("error", () => undefined);
+      socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+    });
+    const manager = new LocalRuntimeManager({
+      rootDir: "/repo",
+      createStore: async () => ({ ...store, __backendShutdown: backendShutdown }),
+      createDashboardServer: async () => {
+        realServer.listen(0, "127.0.0.1");
+        return { server: realServer, cleanup };
+      },
+      serverDrainGraceMs: 20,
+    });
+    const { port } = await manager.startLocal();
+
+    await new Promise<void>((resolve, reject) => {
+      if (kind === "sse") {
+        http.get({ host: "127.0.0.1", port, path: "/api/events" }, (res) => {
+          res.on("data", () => undefined);
+          res.on("error", () => undefined);
+          resolve();
+        }).on("error", reject);
+        return;
+      }
+      const req = http.request({ host: "127.0.0.1", port, path: "/api/ws", headers: { Connection: "Upgrade", Upgrade: "websocket" } });
+      req.on("upgrade", (_res, socket) => {
+        socket.on("error", () => undefined);
+        resolve();
+      });
+      req.on("error", reject);
+      req.end();
+    });
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      manager.stopLocal().then(() => "stopped" as const),
+      new Promise<"hung">((resolve) => {
+        timer = setTimeout(() => resolve("hung"), 3_000);
+      }),
+    ]);
+    clearTimeout(timer);
+
+    expect(outcome).toBe("stopped");
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(backendShutdown).toHaveBeenCalledTimes(1);
+    expect(realServer.listening).toBe(false);
+  });
+
+  /*
+   * C-042: a start issued while a stop is still draining must not build a second store, plugin loader
+   * and server beside the runtime that is still shutting down.
+   */
+  it("startLocal waits for an in-flight stop to settle before booting a new runtime", async () => {
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => {
+      releaseCleanup = resolve;
+    });
+    const cleanup = vi.fn(() => cleanupGate);
+    const createStore = vi.fn(async () => store);
+    const manager = new LocalRuntimeManager({
+      rootDir: "/repo",
+      createStore,
+      createDashboardServer: async () => {
+        const server = new FakeServer(4545);
+        setTimeout(() => server.emit("listening"), 0);
+        return { server: server as unknown as Server, cleanup };
+      },
+    });
+    await manager.startLocal();
+
+    const stopping = manager.stopLocal();
+    const restarting = manager.startLocal();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(createStore).toHaveBeenCalledTimes(1);
+
+    releaseCleanup();
+    await stopping;
+    await expect(restarting).resolves.toMatchObject({ state: "running" });
+    expect(createStore).toHaveBeenCalledTimes(2);
+  });
+
+  /*
+   * C-041: quit during a slow embedded start must not report "stopped" while the startup keeps
+   * running and later publishes a runtime nobody will ever stop.
+   */
+  it("stopLocal during an in-flight start waits for the start and then tears it down", async () => {
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    let releaseServer!: () => void;
+    const serverGate = new Promise<void>((resolve) => {
+      releaseServer = resolve;
+    });
+    const cleanup = vi.fn(async () => undefined);
+    const manager = new LocalRuntimeManager({
+      rootDir: "/repo",
+      createStore: async () => store,
+      createDashboardServer: async () => {
+        await serverGate;
+        const server = new FakeServer(4545);
+        setTimeout(() => server.emit("listening"), 0);
+        return { server: server as unknown as Server, cleanup };
+      },
+    });
+
+    const starting = manager.startLocal();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const stopping = manager.stopLocal();
+    releaseServer();
+    await starting;
+    await stopping;
+
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(manager.getStatus()).toEqual({ source: "none", state: "stopped" });
   });
 });
