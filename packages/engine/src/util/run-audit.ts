@@ -41,8 +41,87 @@
  * This ensures manual/non-run paths are unaffected by audit instrumentation.
  */
 
+import { constants as osConstants } from "node:os";
 import type { TaskStore, RunAuditEventInput } from "@fusion/core";
 import { emitBoundedRunAudit, emitBoundedRunAuditWithOutcome, type BoundedRunAuditResult } from "./emit-bounded-run-audit.js";
+
+/** Metadata keys whose values are free-form diagnostics: error text, process output, command lines. */
+const RUN_AUDIT_PROSE_KEYS: ReadonlySet<string> = new Set([
+  "error",
+  "errorMessage",
+  "errorText",
+  "message",
+  "stderr",
+  "stderrPreview",
+  "stderrExcerpt",
+  "stdout",
+  "stdoutPreview",
+  "stdoutExcerpt",
+  "output",
+  "command",
+  "commandLine",
+]);
+const RUN_AUDIT_ERROR_KEYS: ReadonlySet<string> = new Set(["error", "errorMessage", "errorText", "message"]);
+/** Keys that must hold a fixed outcome: an enum token or plain fixed-vocabulary prose. */
+const RUN_AUDIT_FIXED_TOKEN_KEYS: ReadonlySet<string> = new Set(["reason"]);
+const RUN_AUDIT_FIXED_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/;
+/** Words, ids and durations only: quotes, colons, slashes, `@` and `=` mark embedded error text, paths, URLs or credentials. */
+const RUN_AUDIT_FIXED_VOCABULARY = /^[A-Za-z0-9][A-Za-z0-9 _.,()-]{0,119}$/;
+const RUN_AUDIT_MAX_DEPTH = 8;
+const ERRNO_CANDIDATE = /\bE[A-Z][A-Z0-9]{1,15}\b/g;
+
+function isErrnoCode(code: string): boolean {
+  return Object.prototype.hasOwnProperty.call(osConstants.errno, code) || code === "ENOTFOUND";
+}
+
+/** The errno code (ENOENT, EBUSY, ...) carried by an error object or named in error text, if any. */
+export function errnoCodeOf(value: unknown): string | undefined {
+  const code = (value as { code?: unknown } | null | undefined)?.code;
+  if (typeof code === "string" && isErrnoCode(code)) return code;
+  const text = value instanceof Error ? value.message : typeof value === "string" ? value : "";
+  for (const match of text.matchAll(ERRNO_CANDIDATE)) {
+    if (isErrnoCode(match[0])) return match[0];
+  }
+  return undefined;
+}
+
+/**
+ * Reduce run-audit metadata to ids, counts and fixed outcomes.
+ *
+ * FNXC:RunAudit 2026-10-07-20:12:
+ * Emitters across the engine (merge cleanup, push, worktree removal, message delivery, stale-assignment reconciliation, sandbox) put raw errors, stderr previews and dynamically built prose reasons into audit metadata, and the auditor forwarded them unchanged; transport diagnostics carry remote URLs with credentials.
+ * Every RunAuditor write passes through this one seam: prose-valued diagnostic keys are dropped at any depth, an error's errno code survives as `errorCode`, a `reason` that is neither an enum token nor plain fixed-vocabulary prose (embedded error text, quotes, paths, URLs) is dropped, and `redactedFields` names what was removed.
+ * Diagnostic prose belongs in task and engine logs, never in durable run-audit rows. Booleans, numbers and null under a diagnostic key are kept as flags/counts.
+ */
+export function sanitizeRunAuditMetadata(metadata: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!metadata) return {};
+  const redacted = new Set<string>();
+  const visit = (value: unknown, depth: number): unknown => {
+    if (depth > RUN_AUDIT_MAX_DEPTH || value === null || typeof value !== "object") return value;
+    if (Array.isArray(value)) return value.map((entry) => visit(entry, depth + 1));
+    if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return value;
+    const out: Record<string, unknown> = {};
+    let errorCode: string | undefined;
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      const prose = typeof entry === "string" || (entry !== null && typeof entry === "object");
+      if (RUN_AUDIT_PROSE_KEYS.has(key) && prose) {
+        redacted.add(key);
+        if (RUN_AUDIT_ERROR_KEYS.has(key)) errorCode ??= errnoCodeOf(entry);
+        continue;
+      }
+      if (RUN_AUDIT_FIXED_TOKEN_KEYS.has(key) && typeof entry === "string" && !RUN_AUDIT_FIXED_TOKEN.test(entry) && !RUN_AUDIT_FIXED_VOCABULARY.test(entry)) {
+        redacted.add(key);
+        continue;
+      }
+      out[key] = visit(entry, depth + 1);
+    }
+    if (errorCode && out.errorCode === undefined && out.code === undefined) out.errorCode = errorCode;
+    return out;
+  };
+  const sanitized = visit(metadata, 0) as Record<string, unknown>;
+  if (redacted.size > 0) sanitized.redactedFields = [...redacted].sort();
+  return sanitized;
+}
 
 /** Structured context for a run correlation ID. */
 export interface EngineRunContext {
@@ -1243,7 +1322,7 @@ export function createRunAuditor(store: TaskStore, context: EngineRunContext | n
           phase: context.phase,
           ...(context.source ? { source: context.source } : {}),
           ...(context.taskLineageId ? { taskLineageId: context.taskLineageId } : {}),
-          ...input.metadata,
+          ...sanitizeRunAuditMetadata(input.metadata),
         },
       };
       await emitBoundedRunAudit(store, eventInput);
@@ -1268,7 +1347,7 @@ export function createRunAuditor(store: TaskStore, context: EngineRunContext | n
           phase: context.phase,
           ...(context.source ? { source: context.source } : {}),
           ...(context.taskLineageId ? { taskLineageId: context.taskLineageId } : {}),
-          ...input.metadata,
+          ...sanitizeRunAuditMetadata(input.metadata),
         },
       };
       await emitBoundedRunAudit(store, eventInput);
@@ -1294,7 +1373,7 @@ export function createRunAuditor(store: TaskStore, context: EngineRunContext | n
           phase: context.phase,
           ...(context.source ? { source: context.source } : {}),
           ...(context.taskLineageId ? { taskLineageId: context.taskLineageId } : {}),
-          ...input.metadata,
+          ...sanitizeRunAuditMetadata(input.metadata),
         },
       } as RunAuditEventInput);
     },
@@ -1311,7 +1390,7 @@ export function createRunAuditor(store: TaskStore, context: EngineRunContext | n
           phase: context.phase,
           ...(context.source ? { source: context.source } : {}),
           ...(context.taskLineageId ? { taskLineageId: context.taskLineageId } : {}),
-          ...input.metadata,
+          ...sanitizeRunAuditMetadata(input.metadata),
         },
       };
       await emitBoundedRunAudit(store, eventInput);
@@ -1329,7 +1408,7 @@ export function createRunAuditor(store: TaskStore, context: EngineRunContext | n
           phase: context.phase,
           ...(context.source ? { source: context.source } : {}),
           ...(context.taskLineageId ? { taskLineageId: context.taskLineageId } : {}),
-          ...input.metadata,
+          ...sanitizeRunAuditMetadata(input.metadata),
         },
       };
       await emitBoundedRunAudit(store, eventInput);

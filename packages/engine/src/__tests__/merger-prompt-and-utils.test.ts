@@ -637,10 +637,12 @@ describe("push-after-merge", () => {
         metadata: expect.objectContaining({
           outcome: "failed",
           remote: "origin",
-          stderrPreview: expect.stringContaining("permission denied"),
+          redactedFields: expect.arrayContaining(["stderrPreview"]),
         }),
       }),
     );
+    // Push stderr can carry credential-bearing remote URLs: it stays in the task log, never in run-audit.
+    expect(JSON.stringify(store.recordRunAuditEvent.mock.calls)).not.toContain("permission denied");
     expect(store.logEntry).toHaveBeenCalledWith(
       "FN-050",
       expect.stringContaining("Push to remote failed after merge"),

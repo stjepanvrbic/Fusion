@@ -419,7 +419,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
     expect(existsSync(failing)).toBe(true);
     expect(existsSync(succeeding)).toBe(false);
     expect(sweepAudits(audits)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ metadata: expect.objectContaining({ path: canonicalFailing, success: false, reason: "fs-rm-failed", error: expect.stringContaining("simulated tempdir rm failure"), attempts, residual: true, registrationRetained: true }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ path: canonicalFailing, success: false, reason: "fs-rm-failed", redactedFields: expect.arrayContaining(["error"]), attempts, residual: true, registrationRetained: true }) }),
       expect.objectContaining({ metadata: expect.objectContaining({ path: expect.stringContaining("succeeding"), success: true, reason: "stale" }) }),
     ]));
     expect(childState.execCalls.filter((command) => command === "git worktree prune")).toHaveLength(2);

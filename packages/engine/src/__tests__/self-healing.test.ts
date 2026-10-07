@@ -7322,7 +7322,8 @@ describe("SelfHealingManager", () => {
         target: "FN-9999",
         metadata: expect.objectContaining({
           code: "merge-blocker",
-          reason,
+          // The blocker text embeds raw failure prose; run-audit keeps only the fixed code.
+          redactedFields: expect.arrayContaining(["reason"]),
           repetitionCount: 3,
           threshold: 3,
         }),
