@@ -15,7 +15,6 @@ import { fileURLToPath } from "node:url";
 const ENGINE_SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const ALLOWLIST: Record<string, string> = {
-  "agent-heartbeat.ts": "heartbeat acquisition rebounds; owned by the heartbeat-liveness change",
   "agent-tools.ts": "agent/operator tool moves; owned by the cli-and-agent-boundary change",
   "project/mesh-lease-manager.ts": "cross-node lease recovery rebound; needs mesh ownership semantics before it can stay in place",
   // `deps.moveTask` here is the graph boundary's own wrapper, not TaskStore.moveTask; it supplies the source.
