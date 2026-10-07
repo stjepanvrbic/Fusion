@@ -19,6 +19,8 @@ interface Generation {
   readonly epoch: number;
   readonly id: number;
   readonly leases: Set<EmbeddedRuntimeLease>;
+  /** postmaster.pid `pid:start-timestamp`, or null until a registrant could read it. */
+  postmasterIdentity: string | null;
   latestRegistration: number;
   pendingOwnerStop: (() => Promise<void>) | null;
   stopCompletion: Promise<void> | null;
@@ -48,10 +50,17 @@ const leaseMetadata = new WeakMap<EmbeddedRuntimeLease, LeaseMetadata>();
 let registrationSequence = 0;
 let registryEpoch = 0;
 
-/** Register a booted embedded lifecycle and return its release-only lease. */
+/**
+ * Register a booted embedded lifecycle and return its release-only lease.
+ *
+ * FNXC:PostgresBackup 2026-10-07-19:31:
+ * The postmaster becomes discoverable (postmaster.pid) before its owner finishes startup, so a joiner can register first.
+ * A late owner registration must adopt the existing same-postmaster generation and its joiner leases; replacing it orphaned those leases and let the owner's stop terminate PostgreSQL beneath live stores.
+ * A new generation is created only on proven process replacement: a different postmaster identity, or (identity unknown) a second owner for a generation that already has a live owner.
+ */
 export function registerEmbeddedRuntimeUrl(
   url: string,
-  options: { ownsProcess: boolean },
+  options: { ownsProcess: boolean; postmasterIdentity?: string | null },
 ): EmbeddedRuntimeLease {
   let generation = generationsByUrl.get(url);
   if (generation?.stopping) {
@@ -60,9 +69,8 @@ export function registerEmbeddedRuntimeUrl(
     }
     throw new EmbeddedRuntimeStoppingError(url, generation.stopCompletion);
   }
-  // FNXC:PostgresBackup 2026-07-16-12:40: An owner started a new postmaster,
-  // so URL reuse must create a new generation rather than retain stale leases.
-  if (!generation || options.ownsProcess) {
+  const identity = options.postmasterIdentity ?? null;
+  if (!generation || isProvenProcessReplacement(generation, identity, options.ownsProcess)) {
     const id = (nextGenerationByUrl.get(url) ?? 0) + 1;
     nextGenerationByUrl.set(url, id);
     generation = {
@@ -70,12 +78,15 @@ export function registerEmbeddedRuntimeUrl(
       epoch: registryEpoch,
       id,
       leases: new Set(),
+      postmasterIdentity: identity,
       latestRegistration: 0,
       pendingOwnerStop: null,
       stopCompletion: null,
       stopping: false,
     };
     generationsByUrl.set(url, generation);
+  } else if (generation.postmasterIdentity === null && identity !== null) {
+    generation.postmasterIdentity = identity;
   }
 
   const lease = {} as EmbeddedRuntimeLease;
@@ -88,6 +99,21 @@ export function registerEmbeddedRuntimeUrl(
     ownsProcess: options.ownsProcess,
   });
   return lease;
+}
+
+function isProvenProcessReplacement(
+  generation: Generation,
+  identity: string | null,
+  ownsProcess: boolean,
+): boolean {
+  if (identity !== null && generation.postmasterIdentity !== null) {
+    return identity !== generation.postmasterIdentity;
+  }
+  if (!ownsProcess) return false;
+  for (const lease of generation.leases) {
+    if (leaseMetadata.get(lease)?.ownsProcess) return true;
+  }
+  return false;
 }
 
 /**

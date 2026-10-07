@@ -1234,6 +1234,25 @@ export function readPidFromPostmasterPid(dataDir: string): number | null {
   }
 }
 
+/**
+ * Identify the postmaster recorded in postmaster.pid as `pid:start-timestamp`, or null.
+ *
+ * FNXC:PostgresBackup 2026-10-07-19:31:
+ * The process-local runtime registry keys lease generations by the actual postmaster, not the URL alone.
+ * PostgreSQL writes both fields itself on every start path (ordinary and elevated Windows), so owners and joiners read the same identity, and a restart on a reused port yields a different one.
+ */
+export function readPostmasterIdentity(dataDir: string): string | null {
+  try {
+    const lines = readFileSync(join(dataDir, "postmaster.pid"), "utf-8").split("\n");
+    const pid = parseInt((lines[0] ?? "").trim(), 10);
+    const startedAt = (lines[2] ?? "").trim();
+    if (!Number.isFinite(pid) || pid <= 0 || !/^\d+$/.test(startedAt)) return null;
+    return `${pid}:${startedAt}`;
+  } catch {
+    return null;
+  }
+}
+
 /*
 FNXC:PostgresEmbedded 2026-07-23-11:50:
 Issue #2411 (stale-pid gap): a hard host crash (SIGKILL, power loss) leaves
@@ -1528,6 +1547,11 @@ export class EmbeddedPostgresLifecycle {
   /** True when this lifecycle started the postmaster rather than joining it. */
   getOwnsProcess(): boolean {
     return this.ownsProcess;
+  }
+
+  /** Identity of the postmaster this lifecycle started or joined; see {@link readPostmasterIdentity}. */
+  getPostmasterIdentity(): string | null {
+    return readPostmasterIdentity(this.options.dataDir);
   }
 
   /** True when the embedded postgres process is currently running. */

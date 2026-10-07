@@ -44,6 +44,7 @@ import {
   isDataDirInitialized,
   isWindowsElevatedAdmin,
   readPidFromPostmasterPid,
+  readPostmasterIdentity,
   normalizeMacosEmbeddedPostgresDylibSymlinks,
   readPortFromPostmasterPid,
   __setEmbeddedPostgresCtorForTests,
@@ -66,6 +67,12 @@ import {
   embeddedPostgresRuntimeBinRoot,
   type EmbeddedLifecycleOptions,
 } from "../../postgres/embedded-lifecycle.js";
+import {
+  clearActiveEmbeddedRuntimeUrl,
+  getActiveEmbeddedRuntimeUrl,
+  registerEmbeddedRuntimeUrl,
+  releaseEmbeddedRuntimeLease,
+} from "../../postgres/active-backend-registry.js";
 
 const testRequire = createRequire(import.meta.url);
 
@@ -1593,6 +1600,94 @@ describe("embedded-lifecycle: stale postmaster.pid recovery (issue #2411)", () =
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
+});
+
+describe("embedded-lifecycle: postmaster identity for runtime lease generations", () => {
+  const startedAt = "1784424901";
+  function writePidFile(dataDir: string, port: number): void {
+    writeFileSync(
+      join(dataDir, "postmaster.pid"),
+      [String(process.pid), dataDir, startedAt, String(port), "/tmp", "localhost", "79484 2", "ready"].join("\n") + "\n",
+    );
+  }
+
+  afterEach(() => {
+    clearActiveEmbeddedRuntimeUrl();
+  });
+
+  it("reads pid and start timestamp, and rejects partial files", () => {
+    const dataDir = makeDataDir();
+    try {
+      writePidFile(dataDir, 55450);
+      expect(readPostmasterIdentity(dataDir)).toBe(`${process.pid}:${startedAt}`);
+      writeFileSync(join(dataDir, "postmaster.pid"), `${process.pid}\n${dataDir}\n`);
+      expect(readPostmasterIdentity(dataDir)).toBeNull();
+      rmSync(join(dataDir, "postmaster.pid"));
+      expect(readPostmasterIdentity(dataDir)).toBeNull();
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["ordinary", "elevated-windows"] as const)(
+    "a joiner registered before the %s owner shares the owner's generation and defers its stop",
+    async (startPath) => {
+      const dataDir = makeDataDir();
+      writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+      const port = 55451;
+      class PidWritingEmbeddedPostgres {
+        initialise = vi.fn(async () => {});
+        start = vi.fn(async () => { writePidFile(dataDir, port); });
+        stop = vi.fn(async () => {});
+      }
+      __setEmbeddedPostgresCtorForTests(PidWritingEmbeddedPostgres as never);
+      if (startPath === "elevated-windows") {
+        __setWindowsElevatedAdminForTests(true);
+        __setWindowsEmbeddedPostgresNativeRootForTests("/test/embedded-postgres/native");
+        __setWindowsLauncherForTests(async () => {
+          writePidFile(dataDir, port);
+          return {
+            postgresPid: process.pid,
+            stop: vi.fn(async () => {}),
+            stopMonitoring: vi.fn(),
+            stopWrapperOnly: vi.fn(async () => {}),
+          };
+        });
+      } else {
+        __setWindowsElevatedAdminForTests(false);
+      }
+      vi.spyOn(EmbeddedPostgresLifecycle.prototype, "ensureDatabase").mockResolvedValue(undefined);
+      vi.spyOn(EmbeddedPostgresLifecycle.prototype as never, "ensureJoinedDatabase").mockResolvedValue(undefined as never);
+      const owner = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), port, startTimeoutMs: 0 });
+      const joiner = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), startTimeoutMs: 0 });
+      tracked.push({ lifecycle: joiner, dataDir }, { lifecycle: owner, dataDir });
+      try {
+        const ownerBackend = await owner.start();
+        const joinerBackend = await joiner.start();
+        expect(owner.getOwnsProcess()).toBe(true);
+        expect(joiner.getOwnsProcess()).toBe(false);
+        expect(joiner.getPostmasterIdentity()).toBe(owner.getPostmasterIdentity());
+        expect(owner.getPostmasterIdentity()).toBe(`${process.pid}:${startedAt}`);
+
+        const stopOwner = vi.fn(async () => undefined);
+        const joinerLease = registerEmbeddedRuntimeUrl(joinerBackend.runtimeUrl!, {
+          ownsProcess: false,
+          postmasterIdentity: joiner.getPostmasterIdentity(),
+        });
+        const ownerLease = registerEmbeddedRuntimeUrl(ownerBackend.runtimeUrl!, {
+          ownsProcess: true,
+          postmasterIdentity: owner.getPostmasterIdentity(),
+        });
+        await releaseEmbeddedRuntimeLease(ownerLease, { stopOwner });
+        expect(stopOwner).not.toHaveBeenCalled();
+        expect(getActiveEmbeddedRuntimeUrl()).toBe(ownerBackend.runtimeUrl);
+        await releaseEmbeddedRuntimeLease(joinerLease);
+        expect(stopOwner).toHaveBeenCalledOnce();
+      } finally {
+        vi.restoreAllMocks();
+      }
+    },
+  );
 });
 
 describe("embedded-lifecycle: postmaster.pid join safety", () => {

@@ -88,6 +88,7 @@ type EmbeddedLifecycleLike = {
   start(): Promise<ResolvedBackend>;
   stop(): Promise<void>;
   getOwnsProcess(): boolean;
+  getPostmasterIdentity(): string | null;
 };
 
 const log = createLogger("startup-factory");
@@ -487,6 +488,7 @@ async function bootSchemaBackendOnce(
         embeddedOwnsProcess = embeddedLifecycle.getOwnsProcess();
         embeddedRuntimeLease = registerEmbeddedRuntimeUrl(embeddedRuntimeUrl, {
           ownsProcess: embeddedOwnsProcess,
+          postmasterIdentity: embeddedLifecycle.getPostmasterIdentity(),
         });
       }
     } catch (error) {
