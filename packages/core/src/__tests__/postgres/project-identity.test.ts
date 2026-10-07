@@ -15,6 +15,8 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { eq } from "drizzle-orm";
 import * as schema from "../../postgres/schema/index.js";
+import { TaskStore } from "../../store.js";
+import { LEGACY_ADOPTION_DRAINED_META_KEY } from "../../task-store/lifecycle-ops.js";
 import {
   createTaskStoreForTest,
   PG_AVAILABLE,
@@ -55,8 +57,32 @@ pgDescribe("project-identity async (PostgreSQL integration)", () => {
     const rows = await h.adminDb
       .select()
       .from(schema.project.projectMeta);
-    const keys = rows.map((r) => r.key).sort();
-    expect(keys).toEqual(["projectCreatedAt", "projectId"]);
+    const identityRows = rows.filter((r) => r.key === "projectId" || r.key === "projectCreatedAt");
+    expect(Object.fromEntries(identityRows.map((r) => [r.key, r.value]))).toEqual({
+      projectId: written.id,
+      projectCreatedAt: written.createdAt,
+    });
+  });
+
+  /*
+  FNXC:LegacyAdoption 2026-10-07-22:40:
+  project.__meta is a shared per-project key/value table: store open records the legacy-adoption drained marker there, and identity writes its own keys beside it. Each writer must upsert only its own key.
+  */
+  it("keeps the identity and the legacy-adoption drained marker side by side in __meta", async () => {
+    h = await createTaskStoreForTest({ prefix: "pid_async" });
+    const markerRow = async () =>
+      (await h!.adminDb.select().from(schema.project.projectMeta).where(eq(schema.project.projectMeta.key, LEGACY_ADOPTION_DRAINED_META_KEY)))[0];
+    const markerBefore = await markerRow();
+    expect(markerBefore?.value).toEqual(expect.any(String));
+
+    const written = { id: "proj_0123456789abcdef", createdAt: "2026-01-01T00:00:00.000Z" };
+    await writeProjectIdentityAsync(h.layer, written);
+    expect(await markerRow()).toEqual(markerBefore);
+
+    // A later store open re-checks the marker and must leave the identity intact.
+    await new TaskStore(h.rootDir, undefined, { asyncLayer: h.layer }).init();
+    await expect(readProjectIdentityAsync(h.layer)).resolves.toEqual(written);
+    expect(await markerRow()).toEqual(markerBefore);
   });
 
   it("overwrites the same id idempotently", async () => {
