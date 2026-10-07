@@ -104,9 +104,15 @@ pgDescribe("TaskStore workflow-step-result reset fence", () => {
     expect(fresh?.approvedPlanFingerprint).toBeUndefined();
   });
 
-  it("shows updateTaskAtomic is deliberately not serialized with Reset's advisory transaction", async () => {
+  /*
+  FNXC:TaskRowConcurrency 2026-10-07-21:40:
+  This was a negative control proving updateTaskAtomic did NOT contend with Reset's advisory lock. The generic task-row
+  writers now take that same per-task lock, so the atomic write waits for Reset to commit and then re-runs its updater on
+  the published row, where the attempt it targeted no longer exists.
+  */
+  it("serializes updateTaskAtomic behind Reset's advisory transaction and recomputes on the published row", async () => {
     const store = h.store();
-    const task = await store.createTask({ description: "in-process atomic negative control" });
+    const task = await store.createTask({ description: "atomic update serialized behind reset" });
     await store.updateTask(task.id, { workflowStepResults: [pending("code-review", "attempt-a")] });
 
     let signalResetLock!: () => void;
@@ -123,15 +129,24 @@ pgDescribe("TaskStore workflow-step-result reset fence", () => {
       await resetLockHeld;
       let signalAtomicWrite!: () => void;
       const atomicEntered = new Promise<void>((resolve) => { signalAtomicWrite = resolve; });
+      let updaterRuns = 0;
+      let settled = false;
       const atomic = store.updateTaskAtomic(task.id, (current) => {
+        updaterRuns++;
         signalAtomicWrite();
         return replaceAttempt(current, "code-review", "attempt-a", terminal("code-review", "attempt-a"));
+      }).then((result) => {
+        settled = true;
+        return result;
       });
 
       await atomicEntered;
-      await atomic;
+      for (let index = 0; index < 5; index++) await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
       releaseReset();
       await reset;
+      await atomic;
+      expect(updaterRuns).toBe(2);
     } finally {
       restoreHook();
     }
