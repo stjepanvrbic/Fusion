@@ -812,6 +812,26 @@ describe("POST /plugins/:id/disable", () => {
     expect(res.status).toBe(200);
     expect(pluginStore.disablePlugin).toHaveBeenCalledWith("test-plugin");
     expect(pluginLoader.stopPlugin).toHaveBeenCalledWith("test-plugin");
+    expect((pluginStore.disablePlugin as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
+      .toBeLessThan((pluginLoader.stopPlugin as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]);
+  });
+
+  it("stops through the engine's loader when an engine owns the project", async () => {
+    (pluginStore.disablePlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...FAKE_PLUGIN, enabled: false });
+    const engineLoader = createMockPluginLoader();
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, {
+      pluginStore,
+      pluginLoader,
+      engine: { getTaskStore: () => store, getPluginRunner: () => ({ getLoader: () => engineLoader }) } as any,
+    }));
+
+    const res = await REQUEST(app, "POST", "/api/plugins/test-plugin/disable", {});
+
+    expect(res.status).toBe(200);
+    expect(engineLoader.stopPlugin).toHaveBeenCalledWith("test-plugin");
+    expect(pluginLoader.stopPlugin).not.toHaveBeenCalled();
   });
 
   it("supports body-based projectId scoping", async () => {
@@ -850,7 +870,7 @@ describe("POST /plugins/:id/reload", () => {
 
   beforeEach(() => {
     pluginStore = createMockPluginStore();
-    pluginLoader = createMockPluginLoader();
+    pluginLoader = createMockPluginLoader({ isPluginLoaded: vi.fn().mockReturnValue(true) });
     pluginRunner = {
       getPluginRoutes: vi.fn().mockReturnValue([]),
       reloadPlugin: vi.fn().mockResolvedValue(undefined),
@@ -897,16 +917,30 @@ describe("POST /plugins/:id/reload", () => {
     expect(res.status).toBe(404);
   });
 
-  it("returns 400 when plugin is not started", async () => {
+  it("returns 400 when the loader does not hold the plugin, whatever the persisted state", async () => {
+    (pluginLoader.isPluginLoaded as ReturnType<typeof vi.fn>).mockReturnValue(false);
     (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ...FAKE_PLUGIN,
-      state: "installed",
+      state: "started",
     });
 
     const res = await REQUEST(buildApp(), "POST", "/api/plugins/test-plugin/reload", {});
 
     expect(res.status).toBe(400);
     expect(res.body.error).toContain("Use enable instead");
+    expect(pluginLoader.reloadPlugin).not.toHaveBeenCalled();
+  });
+
+  it("reloads a plugin the loader holds even when its persisted state is error", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...FAKE_PLUGIN, state: "error", error: "onTaskMoved failed: boom" })
+      .mockResolvedValueOnce({ ...FAKE_PLUGIN, state: "started" });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins/test-plugin/reload", {});
+
+    expect(res.status).toBe(200);
+    expect(pluginLoader.reloadPlugin).toHaveBeenCalledWith("test-plugin");
+    expect(res.body.state).toBe("started");
   });
 
   it("uses the scoped loader when the host runner is unavailable", async () => {
@@ -932,6 +966,56 @@ describe("POST /plugins/:id/reload", () => {
 
     expect(res.status).toBe(500);
     expect(res.body.error).toContain("Reload failed: boom");
+  });
+});
+
+describe("POST /plugins/:id/rescan", () => {
+  let store: TaskStore;
+  let pluginStore: PluginStore;
+  let pluginLoader: PluginLoader;
+
+  beforeEach(() => {
+    pluginStore = createMockPluginStore();
+    pluginLoader = createMockPluginLoader({ isPluginLoaded: vi.fn().mockReturnValue(false) });
+    store = createMockTaskStore({ getPluginStore: vi.fn().mockReturnValue(pluginStore) });
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, { pluginStore, pluginLoader }));
+    return app;
+  }
+
+  it("re-imports through the gated reload when the loader holds the plugin, even in error state", async () => {
+    (pluginLoader.isPluginLoaded as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FAKE_PLUGIN, state: "error" });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins/test-plugin/rescan", {});
+
+    expect(res.status).toBe(200);
+    expect(pluginLoader.reloadPlugin).toHaveBeenCalledWith("test-plugin");
+    expect(pluginLoader.loadPlugin).not.toHaveBeenCalled();
+  });
+
+  it("loads through the gated load when the plugin is enabled but not held", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FAKE_PLUGIN, state: "started" });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins/test-plugin/rescan", {});
+
+    expect(res.status).toBe(200);
+    expect(pluginLoader.loadPlugin).toHaveBeenCalledWith("test-plugin");
+    expect(pluginLoader.reloadPlugin).not.toHaveBeenCalled();
+  });
+
+  it("imports nothing for a disabled plugin the loader does not hold", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FAKE_PLUGIN, enabled: false, state: "stopped" });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins/test-plugin/rescan", {});
+
+    expect(res.status).toBe(200);
+    expect(pluginLoader.loadPlugin).not.toHaveBeenCalled();
+    expect(pluginLoader.reloadPlugin).not.toHaveBeenCalled();
   });
 });
 
@@ -1307,14 +1391,56 @@ describe("DELETE /plugins/:id", () => {
     expect(pluginStore.unregisterPlugin).toHaveBeenCalledWith("test-plugin");
   });
 
-  it("stops plugin before unregistering", async () => {
+  it("unregisters before stopping so the loader unloads the uninstalled plugin everywhere", async () => {
     (pluginStore.unregisterPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce(FAKE_PLUGIN);
 
     await REQUEST(buildApp(), "DELETE", "/api/plugins/test-plugin");
 
-    // Should stop first, then unregister
     expect(pluginLoader.stopPlugin).toHaveBeenCalledWith("test-plugin");
     expect(pluginStore.unregisterPlugin).toHaveBeenCalledWith("test-plugin");
+    expect((pluginStore.unregisterPlugin as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
+      .toBeLessThan((pluginLoader.stopPlugin as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]);
+  });
+
+  it("stops through the engine's loader, not the host loader, when an engine owns the project", async () => {
+    (pluginStore.unregisterPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce(FAKE_PLUGIN);
+    const engineLoader = createMockPluginLoader();
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, {
+      pluginStore,
+      pluginLoader,
+      engine: { getTaskStore: () => store, getPluginRunner: () => ({ getLoader: () => engineLoader }) } as any,
+    }));
+
+    const res = await REQUEST(app, "DELETE", "/api/plugins/test-plugin");
+
+    expect(res.status).toBe(204);
+    expect(engineLoader.stopPlugin).toHaveBeenCalledWith("test-plugin");
+    expect(pluginLoader.stopPlugin).not.toHaveBeenCalled();
+  });
+
+  it("stops through the project's own loader for a non-launch project", async () => {
+    const scopedPluginStore = createMockPluginStore({ listPlugins: vi.fn().mockResolvedValue([]) });
+    (scopedPluginStore.unregisterPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce(FAKE_PLUGIN);
+    const scopedStore = createMockTaskStore({
+      getPluginStore: vi.fn().mockReturnValue(scopedPluginStore),
+      on: vi.fn(),
+      off: vi.fn(),
+    });
+    mockGetOrCreateProjectStore.mockResolvedValue(scopedStore);
+    const stopSpy = vi.spyOn(PluginLoader.prototype, "stopPlugin").mockResolvedValue(undefined);
+
+    try {
+      const res = await REQUEST(buildApp(), "DELETE", "/api/plugins/test-plugin?projectId=proj_scoped");
+
+      expect(res.status).toBe(204);
+      expect(stopSpy).toHaveBeenCalledWith("test-plugin");
+      expect(stopSpy.mock.contexts[0]).not.toBe(pluginLoader);
+      expect(pluginLoader.stopPlugin).not.toHaveBeenCalled();
+    } finally {
+      stopSpy.mockRestore();
+    }
   });
 
   it("supports query-based projectId scoping", async () => {

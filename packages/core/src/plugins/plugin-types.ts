@@ -1207,6 +1207,24 @@ export interface FusionPlugin {
   executorRuntimeEnv?: PluginExecutorRuntimeEnvHook;
 }
 
+/**
+ * FNXC:PluginHooks 2026-10-07-18:01:
+ * Hooks whose declared signature ends in `ctx: PluginContext`. The loader appends a per-plugin context to these when the caller passes raw event arguments.
+ * `satisfies` forces every new key of `FusionPlugin["hooks"]` to be classified here, so a ctx-taking hook cannot ship without loader support.
+ */
+export const PLUGIN_HOOK_RECEIVES_CONTEXT = {
+  onLoad: true,
+  onUnload: true,
+  onTaskCreated: true,
+  onTaskMoved: true,
+  onTaskCompleted: true,
+  onError: true,
+  onAgentRunStart: true,
+  onAgentRunEnd: true,
+  onSchemaInit: false,
+  onPostgresSchemaInit: false,
+} as const satisfies Record<keyof FusionPlugin["hooks"], boolean>;
+
 // ── Plugin Installation ───────────────────────────────────────────────
 
 /**
@@ -1226,7 +1244,10 @@ export interface PluginInstallation {
   state: PluginState;
   settings: Record<string, unknown>;
   settingsSchema?: Record<string, PluginSettingSchema>;
-  /** Last error message (if state is "error") */
+  /**
+   * Last error message.
+   * FNXC:PluginLoader 2026-10-07-18:01: With state "error" this is the load/unload failure. With state "started" it is the most recent hook failure; the plugin stays loaded and serving.
+   */
   error?: string;
   dependencies?: string[];
   aiScanOnLoad?: boolean;

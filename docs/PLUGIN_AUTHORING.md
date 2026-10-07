@@ -348,6 +348,8 @@ const plugin: FusionPlugin = {
 | `onTaskMoved` | `(task: Task, fromColumn: string, toColumn: string, ctx: PluginContext) => Promise<void> \| void` | Task moved between columns |
 | `onTaskCompleted` | `(task: Task, ctx: PluginContext) => Promise<void> \| void` | Task reached "done" |
 | `onError` | `(error: Error, ctx: PluginContext) => Promise<void> \| void` | Error occurred in plugin execution |
+| `onAgentRunStart` | `(taskId: string, ctx: PluginContext) => Promise<void> \| void` | An agent session begins running for a task |
+| `onAgentRunEnd` | `(taskId: string, ctx: PluginContext) => Promise<void> \| void` | An agent session for a task ends |
 | `onPostgresSchemaInit` | `() => PluginPostgresSchemaDefinition` | Before `onLoad`; Fusion validates and applies the declarative plan with a short-lived migration connection |
 | `onSchemaInit` (legacy) | `(db: Database) => Promise<void> \| void` | SQLite-only compatibility declaration; unsupported for third-party plugins in the PostgreSQL runtime |
 | `executorRuntimeEnv` | `(taskCtx: ExecutorRuntimeTaskContext, ctx: PluginContext) => Promise<ExecutorRuntimeEnvContribution> \| ExecutorRuntimeEnvContribution` | Before executor-spawned task commands run, to contribute task-scoped env and PATH prepends |
@@ -356,8 +358,10 @@ const plugin: FusionPlugin = {
 
 - **Single-load lifecycle**: For one project in one Fusion process, Fusion invokes `onLoad` exactly once for each intentional load lifecycle, including when the host and engine bootstrap concurrently. Plugin authors do not need process-local locking to defend against an accidental second host/engine startup load. Explicit enable→load and `reloadPlugin` are new lifecycles and can invoke `onLoad` again after unload; request-scoped temporary loaders for *another* project root may also load and then stop a plugin while discovering skills. Keep registration idempotent where inexpensive so these intentional lifecycles remain safe.
 - **Context parity**: `onUnload` receives the same `PluginContext` shape as `onLoad`.
-- **Timeout**: 5 seconds per invocation (logged and skipped if exceeded)
-- **Error Isolation**: Hook failures never block other hooks or abort startup
+- **Timeout**: Each plugin's hook invocation has its own bound: 5 seconds for event hooks and `onUnload`, 30 seconds for the initial `onLoad`, and the reload timeout (5 seconds by default) for `onLoad` during reload. A timed-out hook is logged and later plugins still receive the event; its late result is ignored.
+- **Failed or timed-out `onLoad`**: Fusion calls `onUnload` on that same instance so partial setup (timers, subscriptions, child processes) is torn down, then parks the plugin in `error`. If a timed-out `onLoad` finishes later, Fusion calls `onUnload` again. Make `onUnload` safe to call on a partially initialized instance and safe to call twice.
+- **Error Isolation**: Hook failures never block other hooks or abort startup. A failing event hook does not stop the plugin: it stays `started` and keeps serving tools, routes, and prompt contributions, and the failure is recorded in the plugin's `error` field.
+- **Security scan**: With `aiScanOnLoad` enabled, the scan gates every import of plugin code: initial load, reload, and Rescan. A `blocked`, `error`, or `unavailable` verdict on reload or Rescan unloads the running instance and parks the plugin in `error`.
 - **Optional**: Only define the hooks you need
 - **Schema preflight**: `onPostgresSchemaInit` is evaluated and validated before the plugin is marked started or `onLoad` runs. An invalid or SQLite-only third-party schema fails without leaving `onLoad` subscriptions or timers behind.
 - **No privileged handle**: The hook returns data and receives no database object. Fusion alone opens the short-lived migration connection; ordinary plugin hooks and routes continue to use the project-bound forced-RLS runtime role.
