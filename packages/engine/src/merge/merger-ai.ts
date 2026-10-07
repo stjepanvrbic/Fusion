@@ -303,6 +303,64 @@ function listAiMergeWorktreeCandidates(taskId: string, projectRootDir: string, s
   return candidates;
 }
 
+/*
+FNXC:Workspace 2026-10-07-20:40:
+Fresh and recovered clean-room candidates share one landing step, so recovery cannot weaken landing authority or skip
+publication. For a workspace repository it persists the durable land intent before the shared ref can move, so a later
+reconciler can settle an interrupted remote advance without re-squashing, then carries the repo lease fence and the task
+dispatch fence into the ref advance, which publishes the remote integration ref.
+*/
+async function recordWorkspaceLandIntentForCandidate(
+  ctx: LandRepoContext,
+  repoRootDir: string,
+  integrationBranch: string,
+  tipSha: string,
+  squashSha: string,
+): Promise<{ remote: string; fenceRefName: string; fenceRefSha: string } | undefined> {
+  if (!ctx.workspaceLand) return undefined;
+  ctx.workspaceLand.assertLive();
+  const { repoRelPath, remote } = ctx.workspaceLand;
+  const handle = ctx.workspaceLand.getHandle();
+  if (!handle.fenceRefName || !handle.fenceRefSha) {
+    throw new Error(`Workspace land lease ${handle.leaseKey} is missing its fence pin`);
+  }
+  const { store } = ctx;
+  await store.recordWorkspaceLandIntent({
+    handle,
+    taskId: ctx.taskId,
+    repoRelPath,
+    remoteUrl: await git(["remote", "get-url", remote], repoRootDir),
+    integrationRef: `refs/heads/${integrationBranch}`,
+    intendedSha: squashSha,
+    expectedTip: tipSha,
+  });
+  return { remote, fenceRefName: handle.fenceRefName, fenceRefSha: handle.fenceRefSha };
+}
+
+async function landApprovedCandidate(
+  ctx: LandRepoContext,
+  repoRootDir: string,
+  mergeRoot: string,
+  integrationBranch: string,
+  tipSha: string,
+  squashSha: string,
+): Promise<LandResult> {
+  const workspaceFence = await recordWorkspaceLandIntentForCandidate(ctx, repoRootDir, integrationBranch, tipSha, squashSha);
+  ctx.workspaceLand?.assertLive();
+  return await landSquash({
+    projectRootDir: repoRootDir, mergeRoot, integrationBranch, tipSha, squashSha, taskId: ctx.taskId, audit: ctx.audit,
+    resolveConflicts: ctx.stashResolveAgent,
+    allowDirtyLocalCheckoutSync: ctx.allowDirtyLocalCheckoutSync === true,
+    signal: ctx.signal,
+    workspaceFence,
+    workspaceDispatchFence: ctx.workspaceDispatchFence,
+    assertMergeGateStillOpen: () => assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel),
+    onWorkspaceRepublish: async (observedTargetSha) => {
+      await ctx.log(`AI merge (workspace): re-observed remote ${workspaceFence?.remote ?? "target"} at ${short(observedTargetSha ?? "absent")} before publishing ${integrationBranch}`);
+    },
+  });
+}
+
 async function recoverApprovedPreexistingAiMergeWorktree(
   repoRootDir: string,
   branch: string,
@@ -363,19 +421,7 @@ async function recoverApprovedPreexistingAiMergeWorktree(
   if (!selected.alreadyLanded) {
     if (!task) throw new Error(`AI merge task ${taskId} disappeared before recovery squash gates`);
     await enforceAiMergeSquashGates({ store, task, taskId, mergeRoot: selected.mergeRoot, branch, tipSha: selected.tipSha, squashSha: selected.squashSha, audit, log, repoRel: ctx.repoRel, repoKeys: ctx.repoKeys });
-    const land = await landSquash({
-      projectRootDir: repoRootDir,
-      mergeRoot: selected.mergeRoot,
-      integrationBranch,
-      tipSha: selected.tipSha,
-      squashSha: selected.squashSha,
-      taskId,
-      audit,
-      resolveConflicts: stashResolveAgent,
-      allowDirtyLocalCheckoutSync,
-      signal,
-      assertMergeGateStillOpen: () => assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel),
-    });
+    const land = await landApprovedCandidate(ctx, repoRootDir, selected.mergeRoot, integrationBranch, selected.tipSha, selected.squashSha);
     if (land.outcome !== "advanced") return null;
     await store.updateTask(taskId, { aiMergeReviewReconciliation: null });
     await log(`AI merge: recovered approved pre-existing clean-room commit ${short(selected.squashSha)} before pruning`);
@@ -383,6 +429,23 @@ async function recoverApprovedPreexistingAiMergeWorktree(
     return { outcome: "landed", squashSha: selected.squashSha, sourceSha: state.sourceSha, localSync: land.localSync, tipSha: selected.tipSha, integrationBranch, dependencySyncDecision: "recovered-no-new-sync" };
   }
 
+  // A locally landed candidate still owes its remote publication; the fenced push is idempotent when it already arrived.
+  const workspaceFence = await recordWorkspaceLandIntentForCandidate(ctx, repoRootDir, integrationBranch, selected.tipSha, selected.squashSha);
+  if (workspaceFence) {
+    assertMergeGenerationOwned(signal, taskId);
+    await assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel);
+    ctx.workspaceLand?.assertLive();
+    await publishWorkspaceIntegrationRef({
+      cwd: selected.mergeRoot,
+      remote: workspaceFence.remote,
+      sourceSha: selected.squashSha,
+      targetRef: `refs/heads/${integrationBranch}`,
+      expectedTargetSha: selected.tipSha,
+      fenceRefName: workspaceFence.fenceRefName,
+      fenceRefSha: workspaceFence.fenceRefSha,
+      ...(ctx.workspaceDispatchFence ? { additionalFenceRefs: [ctx.workspaceDispatchFence] } : {}),
+    });
+  }
   await store.updateTask(taskId, { aiMergeReviewReconciliation: null });
   await log(`AI merge: recovered already-landed clean-room commit ${short(selected.squashSha)} before pruning`);
   return { outcome: "landed", squashSha: selected.squashSha, sourceSha: state.sourceSha, localSync: "skipped-other-branch", tipSha: selected.tipSha, integrationBranch, dependencySyncDecision: "recovered-no-new-sync" };
@@ -1319,44 +1382,10 @@ export async function landOneRepo(
       if (!freshTask) throw new Error(`AI merge task ${taskId} disappeared before squash gates`);
       await enforceAiMergeSquashGates({ store, task: freshTask, taskId, mergeRoot, branch, tipSha, squashSha, audit, log, repoRel: ctx.repoRel, repoKeys: ctx.repoKeys });
 
-      // FNXC:Workspace 2026-08-15-08:36: Persist the recovery intent before the shared ref can
-      // move. A later reconciler can then settle an interrupted remote advance without re-squashing.
-      let workspaceFence: { remote: string; fenceRefName: string; fenceRefSha: string } | undefined;
-      if (ctx.workspaceLand) {
-        ctx.workspaceLand.assertLive();
-        const { repoRelPath, remote } = ctx.workspaceLand;
-        const handle = ctx.workspaceLand.getHandle();
-        if (!handle.fenceRefName || !handle.fenceRefSha) {
-          throw new Error(`Workspace land lease ${handle.leaseKey} is missing its fence pin`);
-        }
-        await store.recordWorkspaceLandIntent({
-          handle,
-          taskId,
-          repoRelPath,
-          remoteUrl: await git(["remote", "get-url", remote], repoRootDir),
-          integrationRef: `refs/heads/${integrationBranch}`,
-          intendedSha: squashSha,
-          expectedTip: tipSha,
-        });
-        workspaceFence = { remote, fenceRefName: handle.fenceRefName, fenceRefSha: handle.fenceRefSha };
-      }
-
       // 4 + 5. Land the squash on the target branch and sync the user's
       //        checkout (AI reconciles a conflicting restore).
-      ctx.workspaceLand?.assertLive();
       await setStatus("landing");
-      const landed = await landSquash({
-        projectRootDir: repoRootDir, mergeRoot, integrationBranch, tipSha, squashSha, taskId, audit,
-        resolveConflicts: stashResolveAgent,
-        allowDirtyLocalCheckoutSync: ctx.allowDirtyLocalCheckoutSync === true,
-        signal,
-        workspaceFence,
-        workspaceDispatchFence: ctx.workspaceDispatchFence,
-        assertMergeGateStillOpen: () => assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel),
-        onWorkspaceRepublish: async (observedTargetSha) => {
-          await log(`AI merge (workspace): re-observed remote ${workspaceFence?.remote ?? "target"} at ${short(observedTargetSha ?? "absent")} before publishing ${integrationBranch}`);
-        },
-      });
+      const landed = await landApprovedCandidate(ctx, repoRootDir, mergeRoot, integrationBranch, tipSha, squashSha);
       if (landed.outcome === "concurrent") {
         if (advanceRetries < MAX_CONCURRENT_ADVANCE_RETRIES) {
           advanceRetries++;

@@ -25,7 +25,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { EventEmitter } from "node:events";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { saveWorkspaceConfig, type Task, type TaskStore, type WorkspaceLeaseHandle } from "@fusion/core";
 import { createSharedPgTaskStoreTestHarness, pgDescribe, type SharedPgTaskStoreHarness } from "../../../core/src/__test-utils__/pg-test-harness.js";
@@ -33,6 +33,7 @@ import { landSquash, landWorkspaceTask, WorkspaceMergeDispatchSupersededError, W
 import { WorkspaceEnvironmentError } from "../merge/workspace-integration-target.js";
 import { ensureTenancyFenceRef, mergeDispatchFenceRef, WorkspaceFenceRefError } from "../merge/workspace-fence-ref.js";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
+import { resolveAiMergeRoot } from "../merge/merger-ai-worktree.js";
 import { createWorkspaceFixture, hasGit, type WorkspaceFixture } from "./_workspace-fixture.js";
 
 const describeIfGit = hasGit ? describe : describe.skip;
@@ -614,6 +615,71 @@ describeIfGit("landWorkspaceTask — per-repo land lease (Phase C U3, KTD4)", ()
     for (const repoRel of fx.repos) {
       expect(fx.git(repoRel, `git ls-remote origin ${dispatchRef}`)).toMatch(/^[0-9a-f]{40,64}\s/);
     }
+  });
+
+  /*
+  FNXC:Workspace 2026-10-07-20:40:
+  Recovery of an approved pre-existing clean-room candidate must keep every landing obligation of a fresh candidate:
+  the durable land intent, the lease and dispatch fences, and publication to the remote integration ref.
+  It used to call landSquash bare, advancing only the local ref and reporting the repository landed.
+  */
+  it("lands a recovered approved clean-room candidate through the fenced land intent and remote publication", async () => {
+    fx = await createWorkspaceFixture(["repo-a"]);
+    const repoRel = "repo-a";
+    const taskId = "FN-9061";
+    const remote = path.join(fx.rootDir, `${repoRel}.git`);
+    execSync(`git init --bare ${remote}`, { stdio: "pipe" });
+    fx.git(repoRel, `git remote add origin ${remote}`);
+    fx.git(repoRel, "git push -u origin main");
+    addRepoBranchWithEdit(fx, repoRel, taskId, "recovered candidate\n");
+    const repoDir = fx.repoPath(repoRel);
+    const tipSha = fx.git(repoRel, "git rev-parse main");
+    const sourceSha = fx.git(repoRel, `git rev-parse ${BRANCH}`);
+    const cleanRoom = mkdtempSync(path.join(resolveAiMergeRoot(repoDir), `fusion-ai-merge-${taskId.toLowerCase()}-`));
+    fx.git(repoRel, `git worktree add --detach ${cleanRoom} ${tipSha}`);
+    configureIdentity(cleanRoom);
+    execSync(`git merge --squash ${BRANCH}`, { cwd: cleanRoom, stdio: "pipe" });
+    execSync(`git commit -q -m "feat(${taskId}): recovered" -m "Fusion-Task-Id: ${taskId}"`, { cwd: cleanRoom, stdio: "pipe" });
+    const squashSha = execSync("git rev-parse HEAD", { cwd: cleanRoom, encoding: "utf8" }).trim();
+    const task = makeTask(taskId, { [repoRel]: { worktreePath: repoDir, branch: BRANCH } });
+    task.aiMergeReviewReconciliation = {
+      sourceSha, integrationTipSha: tipSha, candidateSha: squashSha,
+      candidateTreeSha: execSync("git rev-parse HEAD^{tree}", { cwd: cleanRoom, encoding: "utf8" }).trim(),
+      findings: [], consecutiveCleanApprovals: 2, correctivePasses: 0,
+    } as Task["aiMergeReviewReconciliation"];
+    const store = createStore(task);
+    let token = 0n;
+    Object.assign(store, {
+      acquireWorkspaceLease: vi.fn(async (input: any) => ({
+        outcome: "acquired",
+        handle: { leaseKey: input.leaseKey, kind: input.kind, owner: input.owner, fenceToken: ++token },
+      })),
+      recordWorkspaceLeaseFenceRef: vi.fn(async (input: any) => ({
+        ...input.handle, fenceRefName: input.fenceRefName, fenceRefSha: input.fenceRefSha,
+      })),
+      releaseWorkspaceLease: vi.fn().mockResolvedValue(true),
+      recordWorkspaceLandIntent: vi.fn().mockResolvedValue({ outcome: "valid" }),
+      resolveWorkspaceLandIntent: vi.fn(async (input: any) => {
+        await input.persistLandedSha();
+        return { outcome: "resolved" };
+      }),
+    });
+    const mergeAgent = vi.fn(async () => { throw new Error("recovery must not re-merge"); });
+
+    const result = await landWorkspaceTask(store, task, fx.rootDir, {
+      workspaceDispatchFence: {
+        leaseKey: `merge-dispatch:${taskId}`, kind: "merge-dispatch" as const,
+        owner: { taskId, nodeId: "node-a", incarnationId: "inc-a" }, fenceToken: ++token,
+      },
+    }, { mergeAgent, reviewAgent: approveReviewAgent });
+
+    expect(result.allLanded).toBe(true);
+    expect(mergeAgent).not.toHaveBeenCalled();
+    expect((store as any).recordWorkspaceLandIntent).toHaveBeenCalledWith(expect.objectContaining({
+      repoRelPath: repoRel, intendedSha: squashSha, expectedTip: tipSha,
+    }));
+    expect(fx.git(repoRel, "git ls-remote origin refs/heads/main").split(/\s+/)[0]).toBe(squashSha);
+    expect(fx.git(repoRel, "git rev-parse main")).toBe(squashSha);
   });
 
   it("does not finalize after a dispatch lease expires following a successful workspace push", async () => {
