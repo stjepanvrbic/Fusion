@@ -228,7 +228,17 @@ describe("MasterKeyManager", () => {
     await expect(new MasterKeyManager({ globalDir, keytarModule: failing, platform: "linux" }).getBackend()).resolves.toBe("missing");
   });
 
-  it("restricts the Windows key file to the current user before publishing it", async () => {
+  /*
+  FNXC:SecretsMasterKey 2026-10-07-19:55:
+  The Windows grant names exactly the current user: `DOMAIN\\user` when the session reports a domain, the bare account name otherwise.
+  The environment is pinned per case so the assertion is exact on every host; CI Linux runners have no USERDOMAIN.
+  */
+  it.each([
+    { name: "a domain account", env: { USERDOMAIN: "CONTOSO", USERNAME: "operator" }, principal: () => "CONTOSO\\operator" },
+    { name: "an account without a reported domain", env: { USERDOMAIN: "", USERNAME: "" }, principal: () => userInfo().username },
+  ])("restricts the Windows key file to only $name before publishing it", async ({ env, principal }) => {
+    vi.stubEnv("USERDOMAIN", env.USERDOMAIN);
+    vi.stubEnv("USERNAME", env.USERNAME);
     const calls: string[][] = [];
     const manager = new MasterKeyManager({
       globalDir,
@@ -240,15 +250,18 @@ describe("MasterKeyManager", () => {
       },
     });
 
-    const key = await manager.getOrCreateKey();
-    expect(key).toHaveLength(32);
-    expect(calls).toHaveLength(1);
-    const [target, ...flags] = calls[0];
-    expect(target).not.toBe(join(globalDir, MASTER_KEY_FILENAME));
-    expect(target.startsWith(join(globalDir, MASTER_KEY_FILENAME))).toBe(true);
-    expect(flags.slice(0, 3)).toEqual(["/inheritance:r", "/grant:r", flags[2]]);
-    expect(flags[2].toLowerCase()).toMatch(new RegExp(`\\\\${userInfo().username.toLowerCase()}:f$`));
-    expect(keyDirEntries(globalDir)).toEqual([MASTER_KEY_FILENAME]);
+    try {
+      const key = await manager.getOrCreateKey();
+      expect(key).toHaveLength(32);
+      expect(calls).toHaveLength(1);
+      const [target, ...flags] = calls[0];
+      expect(target).not.toBe(join(globalDir, MASTER_KEY_FILENAME));
+      expect(target.startsWith(join(globalDir, MASTER_KEY_FILENAME))).toBe(true);
+      expect(flags).toEqual(["/inheritance:r", "/grant:r", `${principal()}:F`]);
+      expect(keyDirEntries(globalDir)).toEqual([MASTER_KEY_FILENAME]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("publishes no Windows key file when the ACL cannot be applied", async () => {
