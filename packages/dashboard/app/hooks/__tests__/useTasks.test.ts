@@ -3029,36 +3029,63 @@ describe("useTasks", () => {
     });
   });
 
+  /*
+  FNXC:WorkflowColumns 2026-10-07-17:59:
+  task:merged carries the server's resolved completion column; the client keeps it instead of forcing "done", and reconciles it with the same freshness rules as task:updated.
+  */
   describe("SSE event: task:merged", () => {
-    it("ensures column is always done after merge", async () => {
-      const initialTask = createMockTask({
-        id: "FN-001",
-        column: "in-review" as Column,
-      });
-      mockFetchTasks.mockResolvedValueOnce([initialTask]);
+    async function renderWith(task: Task) {
+      mockFetchTasks.mockResolvedValueOnce([task]);
+      const hook = renderHook(() => useTasks());
+      await waitFor(() => expect(hook.result.current.tasks[0]?.column).toBe(task.column));
+      return hook;
+    }
 
-      const { result } = renderHook(() => useTasks());
+    const mergeEvent = (task: Task) => ({ task, branch: "fusion/fn-001", merged: true, worktreeRemoved: true, branchDeleted: true });
 
-      await waitFor(() => {
-        expect(result.current.tasks[0].column).toBe("in-review");
-      });
-
-      const mergeResult = {
-        task: createMockTask({
-          id: "FN-001",
-          column: "in-review" as Column, // might have stale column
-        }),
-        branch: "fusion/fn-001",
-        merged: true,
-        worktreeRemoved: true,
-        branchDeleted: true,
-      };
+    it.each(["done", "shipped"])("keeps the server's completion column %s", async (completionColumn) => {
+      const { result } = await renderWith(createMockTask({
+        id: "FN-001", column: "in-review" as Column, updatedAt: "2026-01-01T00:00:00Z", columnMovedAt: "2026-01-01T00:00:00Z",
+      }));
 
       act(() => {
-        MockEventSource.instances[0]._emit("task:merged", mergeResult);
+        MockEventSource.instances[0]._emit("task:merged", mergeEvent(createMockTask({
+          id: "FN-001", column: completionColumn as Column, updatedAt: "2026-01-02T00:00:00Z", columnMovedAt: "2026-01-02T00:00:00Z",
+        })));
       });
 
-      expect(result.current.tasks[0].column).toBe("done");
+      expect(result.current.tasks[0].column).toBe(completionColumn);
+    });
+
+    it("does not roll a newer custom completion move back with an older merge snapshot", async () => {
+      const { result } = await renderWith(createMockTask({
+        id: "FN-001", column: "in-review" as Column, updatedAt: "2026-01-01T00:00:00Z", columnMovedAt: "2026-01-01T00:00:00Z",
+      }));
+
+      act(() => {
+        MockEventSource.instances[0]._emit("task:moved", {
+          task: createMockTask({ id: "FN-001", column: "shipped" as Column, updatedAt: "2026-01-03T00:00:00Z", columnMovedAt: "2026-01-03T00:00:00Z" }),
+          from: "in-review",
+          to: "shipped",
+        });
+      });
+      act(() => {
+        MockEventSource.instances[0]._emit("task:merged", mergeEvent(createMockTask({
+          id: "FN-001", column: "in-review" as Column, updatedAt: "2026-01-02T00:00:00Z", columnMovedAt: "2026-01-01T00:00:00Z",
+        })));
+      });
+
+      expect(result.current.tasks[0].column).toBe("shipped");
+    });
+
+    it("adds a merged task that was not on the board in its server column", async () => {
+      const { result } = await renderWith(createMockTask({ id: "FN-000", column: "todo" as Column }));
+
+      act(() => {
+        MockEventSource.instances[0]._emit("task:merged", mergeEvent(createMockTask({ id: "FN-001", column: "shipped" as Column })));
+      });
+
+      expect(result.current.tasks.find((task) => task.id === "FN-001")?.column).toBe("shipped");
     });
   });
 

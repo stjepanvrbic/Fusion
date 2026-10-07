@@ -18,7 +18,8 @@
  *     dropping-and-logging invalid values without aborting.
  */
 
-import { writeFile, readFile, rename } from "node:fs/promises";
+import { writeFile, readFile, rename, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import type { Settings, GlobalSettings, ProjectSettings } from "../types.js";
 import { TaskStore } from "../store.js";
 import {
@@ -494,7 +495,13 @@ export async function readExportFile(filePath: string): Promise<SettingsExportDa
  * @param data - Export data to write
  */
 export async function writeExportFile(filePath: string, data: SettingsExportData): Promise<void> {
-  const tmpPath = filePath + ".tmp";
-  await writeFile(tmpPath, JSON.stringify(data, null, 2));
-  await rename(tmpPath, filePath);
+  // FNXC:SettingsPersistence 2026-10-07-17:59: a per-writer temp name keeps concurrent exports from consuming each other's temp file.
+  const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmpPath, JSON.stringify(data, null, 2));
+    await rename(tmpPath, filePath);
+  } catch (error) {
+    await unlink(tmpPath).catch(() => undefined);
+    throw error;
+  }
 }

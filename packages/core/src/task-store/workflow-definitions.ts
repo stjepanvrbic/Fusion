@@ -30,7 +30,7 @@ import {resolveColumnCapacity, resolveCapacityPoolId} from "../workflows/workflo
 import {readTaskRow as readTaskRowAsync} from "./async/async-persistence.js";
 import { projectOwnershipPartition, projectScopeFor, taskProjectScope } from "../postgres/data-layer.js";
 import { getInReviewDurationEvents as getInReviewDurationEventsAsync, getTaskMergedTaskIds as getTaskMergedTaskIdsAsync } from "./async/async-audit.js";
-import { readProjectConfig, writeProjectConfig } from "./async/async-settings.js";
+import { readProjectConfig, setProjectConfigCounters } from "./async/async-settings.js";
 import { compactTaskActivityLog } from "./comments.js";
 import { type TaskRow } from "./persistence.js";
 import { ActivityLogEntry, AgentLogEntry, ArchivedTaskEntry, DEFAULT_SETTINGS, Settings } from "../types.js";
@@ -257,9 +257,8 @@ export async function nextWorkflowDefinitionIdAsyncImpl(store: TaskStore): Promi
   ]);
   const counter = configRow.nextWorkflowDefinitionId ?? 1;
   const next = Math.max(counter, maxWorkflowDefinitionSequence(workflows.map(({ id }) => id)) + 1);
-  await writeProjectConfig(layer, configRow.settings ?? {}, {
-    nextWorkflowDefinitionId: next + 1,
-  });
+  // FNXC:SettingsPersistence 2026-10-07-17:59: bump only the counter so a settings write committed after the read above survives.
+  await setProjectConfigCounters(layer, { nextWorkflowDefinitionId: next + 1 });
   return `WF-${String(next).padStart(3, "0")}`;
 }
 

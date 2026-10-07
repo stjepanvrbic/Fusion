@@ -19,7 +19,7 @@ import {isBuiltinWorkflowId} from "../workflows/builtin-workflows.js";
 import {fromJson} from "../db/db.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import * as schema from "../postgres/schema/index.js";
-import {readProjectConfig, writeProjectConfig} from "../task-store/async/async-settings.js";
+import {readProjectConfig, setProjectConfigCounters} from "../task-store/async/async-settings.js";
 import {and, eq, inArray} from "drizzle-orm";
 import {projectScopeFor, type AsyncDataLayer} from "../postgres/data-layer.js";
 
@@ -30,7 +30,7 @@ export async function createWorkflowStepImpl(store: TaskStore, input: import("..
        * P1 fix: no backendMode branch existed, so workflow-step creation threw
        * in PG mode (store.db on the counter read + workflow_steps INSERT). In
        * backend mode, read the counter via readProjectConfig, insert the row
-       * via Drizzle, and bump the counter via writeProjectConfig.
+       * via Drizzle, and bump the counter via setProjectConfigCounters.
        */
       /*
       FNXC:SqliteDualPathCleanup 2026-07-26-13:35:
@@ -92,10 +92,10 @@ export async function createWorkflowStepImpl(store: TaskStore, input: import("..
         updatedAt: step.updatedAt,
       });
       /*
-      FNXC:SqliteDualPathCleanup 2026-07-26-15:00:
-      writeProjectConfig replaces the settings jsonb wholesale — pass the existing settings so bumping nextWorkflowStepId cannot wipe project config to {}.
+      FNXC:SettingsPersistence 2026-10-07-17:59:
+      Bump only the counter. Rewriting the settings read above reverted any settings write that committed between that read and this write.
       */
-      await writeProjectConfig(layer, (configRow.settings ?? {}) as Record<string, unknown>, { nextWorkflowStepId: nextWsId + 1 });
+      await setProjectConfigCounters(layer, { nextWorkflowStepId: nextWsId + 1 });
       store.workflowStepsCache = null;
       return step;
 });

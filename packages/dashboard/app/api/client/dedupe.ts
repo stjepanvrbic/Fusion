@@ -28,6 +28,8 @@ interface InFlightEntry<T> {
   reject: (err: unknown) => void;
   /** Once resolved or rejected, further fetches must not write to external. */
   done: boolean;
+  /** Generation of the inner fetch allowed to settle `external`; bumped by every forceFresh. */
+  owner: number;
 }
 
 const inFlight = new Map<string, InFlightEntry<unknown>>();
@@ -52,18 +54,23 @@ function makeEntry<T>(): InFlightEntry<T> {
     resolve = res;
     reject = rej;
   });
-  return { external, resolve, reject, done: false };
+  return { external, resolve, reject, done: false, owner: 0 };
 }
 
+/*
+FNXC:DashboardFetchDedupe 2026-10-07-17:59:
+Only the newest inner fetch may settle the shared external promise. With a shared `done` flag alone, a superseded pre-mutation fetch that finished first resolved every caller, including the forceFresh caller, with stale data, and its rejection failed them all.
+*/
 function attachInnerToEntry<T>(entry: InFlightEntry<T>, inner: Promise<T>): void {
+  const generation = ++entry.owner;
   inner.then(
     (value) => {
-      if (entry.done) return;
+      if (entry.done || entry.owner !== generation) return;
       entry.done = true;
       entry.resolve(value);
     },
     (err) => {
-      if (entry.done) return;
+      if (entry.done || entry.owner !== generation) return;
       entry.done = true;
       entry.reject(err);
     },
@@ -83,9 +90,8 @@ export function dedupe<T>(
       return existing.external;
     }
     // forceFresh with an existing in-flight: start a new inner fetch and
-    // redirect existing.external to its result. The old inner fetch's
-    // eventual resolution is discarded by the `done` guard in
-    // attachInnerToEntry.
+    // redirect existing.external to its result. The old inner fetch loses
+    // ownership, so its eventual success or failure is discarded.
     attachInnerToEntry(existing, fn());
     return existing.external;
   }

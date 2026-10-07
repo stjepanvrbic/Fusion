@@ -1,7 +1,9 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("keytar", () => {
@@ -17,6 +19,48 @@ import {
 } from "../secrets/master-key.js";
 
 type MutableKeytar = KeytarLike & { writes: number; stored: string | null };
+
+const execFileAsync = promisify(execFile);
+
+const unavailableKeychain: KeytarLike = {
+  async getPassword() {
+    throw new Error("keychain unavailable");
+  },
+  async setPassword() {
+    throw new Error("keychain unavailable");
+  },
+  async deletePassword() {
+    throw new Error("keychain unavailable");
+  },
+};
+
+/** Principals named in an icacls listing, e.g. `DOMAIN\user` from `DOMAIN\user:(F)`. */
+async function listAclPrincipals(path: string): Promise<string[]> {
+  const { stdout } = await execFileAsync("icacls", [path], { windowsHide: true });
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => (line.startsWith(path) ? line.slice(path.length) : line).trim())
+    .filter((line) => line.includes(":("))
+    .map((line) => line.slice(0, line.indexOf(":(")).toLowerCase());
+}
+
+/*
+FNXC:SecretsMasterKey 2026-10-07-17:59:
+The file-backed master key must be readable only by its owner, enforced with the platform's own mechanism: POSIX mode 0600, or a Windows ACL that names only the current user.
+*/
+async function expectOwnerOnly(path: string): Promise<void> {
+  if (process.platform === "win32") {
+    const principals = await listAclPrincipals(path);
+    expect(principals.length).toBeGreaterThan(0);
+    for (const principal of principals) expect(principal.endsWith(`\\${userInfo().username.toLowerCase()}`)).toBe(true);
+    return;
+  }
+  expect((await fs.stat(path)).mode & 0o777).toBe(0o600);
+}
+
+function keyDirEntries(dir: string): string[] {
+  return readdirSync(dir).sort();
+}
 
 function createKeytar(initial?: Buffer): MutableKeytar {
   let stored = initial ? initial.toString("base64") : null;
@@ -82,7 +126,8 @@ describe("MasterKeyManager", () => {
     const keyPath = join(globalDir, MASTER_KEY_FILENAME);
     const fileStat = await fs.stat(keyPath);
     expect(fileStat.size).toBe(32);
-    expect(fileStat.mode & 0o777).toBe(0o600);
+    await expectOwnerOnly(keyPath);
+    expect(keyDirEntries(globalDir)).toEqual([MASTER_KEY_FILENAME]);
     await expect(manager.getBackend()).resolves.toBe("file");
   });
 
@@ -170,6 +215,7 @@ describe("MasterKeyManager", () => {
     const manager = new MasterKeyManager({
       globalDir,
       keytarModule: failing,
+      platform: "linux",
       fsModule: {
         ...fs,
         stat: async (path) => ({ ...(await fs.stat(path)), mode: 0o644 }),
@@ -177,6 +223,71 @@ describe("MasterKeyManager", () => {
     });
 
     await expect(manager.getOrCreateKey()).rejects.toBeInstanceOf(MasterKeyPermissionError);
+    // A key whose protection failed is never published, so the next read cannot silently accept it.
+    expect(keyDirEntries(globalDir)).toEqual([]);
+    await expect(new MasterKeyManager({ globalDir, keytarModule: failing, platform: "linux" }).getBackend()).resolves.toBe("missing");
+  });
+
+  it("restricts the Windows key file to the current user before publishing it", async () => {
+    const calls: string[][] = [];
+    const manager = new MasterKeyManager({
+      globalDir,
+      keytarModule: unavailableKeychain,
+      platform: "win32",
+      windowsAclRunner: async (args) => {
+        calls.push(args);
+        return { exitCode: 0, stderr: "" };
+      },
+    });
+
+    const key = await manager.getOrCreateKey();
+    expect(key).toHaveLength(32);
+    expect(calls).toHaveLength(1);
+    const [target, ...flags] = calls[0];
+    expect(target).not.toBe(join(globalDir, MASTER_KEY_FILENAME));
+    expect(target.startsWith(join(globalDir, MASTER_KEY_FILENAME))).toBe(true);
+    expect(flags.slice(0, 3)).toEqual(["/inheritance:r", "/grant:r", flags[2]]);
+    expect(flags[2].toLowerCase()).toMatch(new RegExp(`\\\\${userInfo().username.toLowerCase()}:f$`));
+    expect(keyDirEntries(globalDir)).toEqual([MASTER_KEY_FILENAME]);
+  });
+
+  it("publishes no Windows key file when the ACL cannot be applied", async () => {
+    const manager = new MasterKeyManager({
+      globalDir,
+      keytarModule: unavailableKeychain,
+      platform: "win32",
+      windowsAclRunner: async () => ({ exitCode: 5, stderr: "Access is denied." }),
+    });
+
+    await expect(manager.getOrCreateKey()).rejects.toBeInstanceOf(MasterKeyPermissionError);
+    expect(keyDirEntries(globalDir)).toEqual([]);
+  });
+
+  it("keeps the existing file key when rotation cannot protect the replacement", async () => {
+    const existing = Buffer.alloc(32, 3);
+    writeFileSync(join(globalDir, MASTER_KEY_FILENAME), existing);
+    const manager = new MasterKeyManager({
+      globalDir,
+      keytarModule: unavailableKeychain,
+      platform: "win32",
+      windowsAclRunner: async () => ({ exitCode: 5, stderr: "Access is denied." }),
+    });
+
+    await expect(manager.rotateKey()).rejects.toBeInstanceOf(MasterKeyPermissionError);
+    expect((await fs.readFile(join(globalDir, MASTER_KEY_FILENAME))).equals(existing)).toBe(true);
+    expect(keyDirEntries(globalDir)).toEqual([MASTER_KEY_FILENAME]);
+  });
+
+  it("rotates a file key into an owner-only file", async () => {
+    const manager = new MasterKeyManager({ globalDir, keytarModule: unavailableKeychain });
+    const before = await manager.getOrCreateKey();
+
+    const rotated = await manager.rotateKey();
+
+    expect(rotated.equals(before)).toBe(false);
+    expect((await fs.readFile(join(globalDir, MASTER_KEY_FILENAME))).equals(rotated)).toBe(true);
+    await expectOwnerOnly(join(globalDir, MASTER_KEY_FILENAME));
+    expect(keyDirEntries(globalDir)).toEqual([MASTER_KEY_FILENAME]);
   });
 
   it("rotates key and persists to active backend", async () => {
@@ -217,7 +328,7 @@ describe("MasterKeyManager", () => {
 
     const key = await manager.getOrCreateKey();
     expect(key).toHaveLength(32);
-    await expect(fs.stat(join(globalDir, MASTER_KEY_FILENAME))).resolves.toBeTruthy();
+    await expectOwnerOnly(join(globalDir, MASTER_KEY_FILENAME));
     await expect(manager.getBackend()).resolves.toBe("file");
   });
 });

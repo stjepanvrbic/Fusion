@@ -1426,9 +1426,7 @@ describe("SettingsModal", () => {
           undefined,
         );
       });
-      expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
-        expect.not.objectContaining({ researchGlobalDefaults: expect.anything() }),
-      );
+      expect(mockUpdateGlobalSettings).not.toHaveBeenCalled();
     });
 
     it("blocks save and shows inline error for invalid research limits", async () => {

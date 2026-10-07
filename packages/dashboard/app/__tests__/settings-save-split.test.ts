@@ -14,8 +14,9 @@
  * so it stays honest about which keys land in which scope.
  */
 import { describe, it, expect } from "vitest";
-import { isGlobalSettingsKey, isProjectSettingsKey } from "@fusion/core";
-import { resolveScopedMcpSettings, splitSettingsSave, MODEL_LANE_KEYS } from "../components/settings/save-split";
+import { GLOBAL_SETTINGS_KEYS, isGlobalSettingsKey, isProjectSettingsKey } from "@fusion/core";
+import { GLOBAL_SECTION_KEYS, resolveScopedMcpSettings, splitSettingsSave, MODEL_LANE_KEYS } from "../components/settings/save-split";
+import { SETTINGS_SECTION_METADATA } from "../../src/shared/settings-sections";
 
 // Sanity-anchor the scope of the concrete keys this test relies on, so the
 // assertions below remain meaningful if core's catalog ever shifts.
@@ -78,6 +79,45 @@ describe("resolveScopedMcpSettings", () => {
       global: { mcpServers: { enabled: true, servers: [globalServer] } },
       project: {},
     } as never)).toBeUndefined();
+  });
+});
+
+describe("project-scoped sections never write global settings", () => {
+  const projectSectionsWithoutGlobalAllowlist = SETTINGS_SECTION_METADATA
+    .filter((section) => section.scope === "project" && !GLOBAL_SECTION_KEYS[section.id])
+    .map((section) => section.id);
+
+  it("covers the Merge section, which renders the dual-scope testMode toggle", () => {
+    expect(isGlobalSettingsKey("testMode")).toBe(true);
+    expect(isProjectSettingsKey("testMode")).toBe(true);
+    expect(projectSectionsWithoutGlobalAllowlist).toContain("merge");
+  });
+
+  it.each(projectSectionsWithoutGlobalAllowlist)("section %s emits no global patch for any changed global key", (activeSection) => {
+    const payload = Object.fromEntries(GLOBAL_SETTINGS_KEYS.map((key) => [key, `changed-${key}`]));
+    const { globalPatch } = splitSettingsSave({
+      payload,
+      initialValues: {} as never,
+      initialScopedValues: { global: {}, project: {} } as never,
+      activeSection,
+    });
+    expect(globalPatch).toEqual({});
+  });
+
+  it.each([
+    { name: "enable with global unset", global: {}, project: {}, merged: {}, next: true, expected: true },
+    { name: "disable an explicit project override", global: {}, project: { testMode: true }, merged: { testMode: true }, next: false, expected: false },
+    { name: "clear an explicit project override", global: {}, project: { testMode: true }, merged: { testMode: true }, next: undefined, expected: null },
+    { name: "override a conflicting global value", global: { testMode: true }, project: {}, merged: { testMode: true }, next: false, expected: false },
+  ])("Merge testMode edits reach only the project patch: $name", ({ global, project, merged, next, expected }) => {
+    const { globalPatch, projectPatch } = splitSettingsSave({
+      payload: { testMode: next },
+      initialValues: merged as never,
+      initialScopedValues: { global, project } as never,
+      activeSection: "merge",
+    });
+    expect(globalPatch).toEqual({});
+    expect(projectPatch).toEqual({ testMode: expected });
   });
 });
 

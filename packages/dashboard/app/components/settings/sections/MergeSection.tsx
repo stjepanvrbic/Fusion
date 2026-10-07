@@ -72,7 +72,7 @@ Most of this section deliberately keeps its bespoke markup, because Merge is not
 - `mergeIntegrationWorktree` renders a live warning banner adjacent to its control that the shared primitive has no slot for, and its rich multi-fragment help rules out a single-string descriptor `help`; same for `mergeConflictStrategy`, `postMergeAuditMode`, `commitAuthorName`, and `commitAuthorEmail`.
 - `integrationBranch` and the push remote/branch pair are custom dropdown+Custom…-escape-hatch widgets, not plain selects.
 - `planApprovalMode` keeps its `data-testid="plan-approval-mode-select"`, which the primitives have no slot for and MergeSection.legacy-automerge-cleanup.test.tsx reads.
-- `testMode` is declared in BOTH `DEFAULT_GLOBAL_SETTINGS` and `DEFAULT_PROJECT_SETTINGS`, so its scope is ambiguous and no badge can be stamped honestly.
+- `testMode` is declared in BOTH `DEFAULT_GLOBAL_SETTINGS` and `DEFAULT_PROJECT_SETTINGS`; this row edits only the project override (FNXC:SettingsScope 2026-10-07-17:59: the save split refuses global keys from project sections, so it cannot flip global test mode or the startup database).
 - The legacy auto-merge stamp cleanup panel is a report-and-trigger card, not a setting.
 */
 export interface MergeSectionProps extends SectionBaseProps {
