@@ -1193,6 +1193,42 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
     }
   }
 
+  /*
+  FNXC:PostMergeRecovery 2026-10-07-05:29:
+  KB-003: a workspace member's forced per-repository path bypasses pinned reclaim and would otherwise
+  "resume" into a half-deleted (`.git`-less) or unregistered folder left by a partially failed removal.
+  Preserve such residue aside (never delete it) under the configured worktrees recovery root, then
+  fall through to fresh creation at the same path. Active sessions and paths outside the configured
+  worktrees directory are never moved.
+  */
+  if (opts.forceWorktreePath && workspaceContext && task.worktree && isResume && backend.kind !== "worktrunk") {
+    const forcedClassification = await classifyTaskWorktree(rootDir, worktreePath);
+    if (
+      !forcedClassification.ok
+      && (forcedClassification.classification === "incomplete" || forcedClassification.classification === "unregistered")
+      && !activeSessionRegistry.isPathActive(worktreePath)
+      && isInsideWorktreesDir(rootDir, worktreePath, settings, workspaceContext)
+    ) {
+      const canonicalWorktreesRoot = await realpath(resolveWorktreesDir(rootDir, settings, workspaceContext));
+      const recoveryRoot = await ensureContainedDirectory(canonicalWorktreesRoot, WORKTREE_RECOVERY_DIRNAME);
+      const recoveryWorktrees = await ensureContainedDirectory(recoveryRoot, "worktrees");
+      const preservedPath = join(recoveryWorktrees, `${task.id.toLowerCase()}-${randomUUID()}`);
+      await renameWorktreeDirectory(worktreePath, preservedPath);
+      try {
+        await store.logEntry(
+          task.id,
+          `Preserved unusable workspace checkout ${worktreePath} (${forcedClassification.classification}) before recreation`,
+          preservedPath,
+          runContext,
+        );
+      } catch (error) {
+        logger?.warn(`${task.id}: failed to log preserved workspace checkout ${preservedPath}: ${formatError(error).message}`);
+      }
+      await prunePreservedOrphanDirectories(recoveryWorktrees, logger);
+      isResume = false;
+    }
+  }
+
   if (task.worktree && isResume) {
     // FNXC:EngineDiagnostics 2026-08-03-05:54: resume reuses the pinned path — expected, not a default-visible event.
     if (logger?.debug) logger.debug(`Reusing existing worktree: ${worktreePath}`);

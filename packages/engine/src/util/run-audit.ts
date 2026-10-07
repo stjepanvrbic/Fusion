@@ -188,6 +188,12 @@ export type GitMutationType =
   | "worktree:post-landing-ignored-content-discarded"
   | "worktree:removal-discarded-regenerable-content"
   | "worktree:removal-preserved"
+  /*
+  FNXC:WorktreeCleanup 2026-10-07-05:29:
+  KB-003 records a post-landing checkout that git left half-deleted and unregistered (Windows file
+  locks). Metadata is ids/fixed outcomes only and the emit is best-effort.
+  */
+  | "worktree:removal-partial"
   | "worktree:active-session-reconciled"
   | "worktree:stale-lock-detected"
   | "worktree:stale-lock-recovered"

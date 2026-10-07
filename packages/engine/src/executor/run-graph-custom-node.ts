@@ -5,8 +5,10 @@
  * Executes a single graph custom/skill/script/CLI/await-input node with column-agent
  * adoption, worktree ensure, and unattended env wiring.
  */
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import type {
   AgentStore,
   ResolvedTaskOutputLanguage,
@@ -51,6 +53,27 @@ import {
 } from "../worktree/worktree-dependency-install.js";
 import { resolveContentReviewInputProof } from "../worktree/review-diff-fingerprint.js";
 import { closeFusionBrowserSession } from "../agent-browser-lifecycle.js";
+import { classifyTaskWorktree } from "../worktree/worktree-pool.js";
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * FNXC:PostMergeRecovery 2026-10-07-05:29:
+ * Proves a freshly re-acquired post-merge checkout contains the landed commit. Uses async execFile
+ * (never execSync) and treats any git failure as "not proven".
+ */
+async function checkoutContainsCommit(worktreePath: string, commitSha: string): Promise<boolean> {
+  try {
+    await execFileAsync("git", ["merge-base", "--is-ancestor", commitSha, "HEAD"], {
+      cwd: worktreePath,
+      timeout: 30_000,
+      windowsHide: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const WORKFLOW_THINKING_LEVEL_SET: ReadonlySet<string> = new Set(THINKING_LEVELS);
 const WORKFLOW_STEP_NOT_RUN_REASON_SET: ReadonlySet<string> = new Set(WORKFLOW_STEP_NOT_RUN_REASONS);
@@ -520,15 +543,88 @@ export async function runGraphCustomNode(
       return { outcome: "failure", value: "workspace-plan-review-script-readonly-required" };
     }
 
+    /*
+    FNXC:PostMergeRecovery 2026-10-07-05:29:
+    KB-001 stayed in In Review forever: post-landing cleanup left `.fusion/worktrees/kb-001` half-deleted,
+    `.git`-less and unregistered (Windows file lock), the folder still passed `existsSync`, and every
+    post-merge-verification recheck died in the session-start guard with "incomplete worktree".
+    For post-merge nodes on LANDED cards only (`mergeDetails.mergeConfirmed`), an absent, `.git`-less,
+    unregistered, or otherwise unusable recorded checkout is treated as missing and a fresh checkout is
+    acquired at the integration branch, which contains the landed commit. Acquisition's pinned orphan
+    preservation moves the residue into `.fusion/recovery/worktrees/` (the operator's manual repair).
+    Every recovery owner (auto-merge finalization, project-engine merge-gate pump, self-healing
+    rechecks, manual reconcile, dashboard restart-stage) dispatches the gate through this seam, so no
+    separate self-healing sweep is added; it would be a second writer of the worktree pointer.
+    Pre-merge review nodes keep the fail-fast contract: a vanished implementation checkout is never
+    silently replaced for ordinary review. Plan Review keeps its own re-acquisition rule.
+    Operator-supplied branches are never deleted or moved by this re-acquisition: the native backend
+    attaches an existing operator branch on a bare-branch collision, and the executor's branch-conflict
+    recovery deletes only `isFusionDeletableBranch` branches, so no extra guard is needed here.
+    Every failure (acquisition error such as a Windows EPERM rename, missing landed commit) is a plain
+    recoverable node failure that the rejected-gate recheck backoff retries; it never loops or hangs.
+    */
+    const isPostMergePhaseNode = (graphContext?.[WORKFLOW_OPTIONAL_GROUP_PHASE_CONTEXT_KEY] ?? cfg.phase) === "post-merge";
+    let isLandedPostMergeNode = false;
+    if (isPostMergePhaseNode) {
+      const landedSnapshot = executionTarget === live ? await deps.store.getTask(live.id) : executionTarget;
+      if (landedSnapshot?.mergeDetails?.mergeConfirmed === true) {
+        isLandedPostMergeNode = true;
+        executionTarget = landedSnapshot;
+      }
+    }
+    const reacquireLandedPostMergeCheckout = async (
+      target: TaskDetail,
+      detail: string,
+    ): Promise<{ task: TaskDetail } | { failure: WorkflowNodeResult }> => {
+      await deps.store.logEntry(
+        live.id,
+        `Workflow node '${node.id}' found ${detail} after landing; acquiring a fresh checkout at the integration branch`,
+        undefined,
+        deps.getRunContextFor(live.id),
+      );
+      try {
+        const acquired = await deps.ensureGraphCustomNodeWorktree(target, settings, node.id) as TaskDetail;
+        return { task: acquired };
+      } catch (error) {
+        await deps.store.logEntry(
+          live.id,
+          `Workflow node '${node.id}' could not acquire a post-merge checkout; the gate will be rechecked later`,
+          error instanceof Error ? error.message : String(error),
+          deps.getRunContextFor(live.id),
+        );
+        return { failure: { outcome: "failure", value: "post-merge-checkout-unavailable" } };
+      }
+    };
+
     if (workspaceConfig?.repos.length) {
       // Always re-read and acquire from the configured set. Repository scope remains durable review
       // evidence, but is no longer an admission request or a way to narrow task provisioning.
       executionTarget = await deps.store.getTask(live.id);
-      const missingRepository = workspaceConfig.repos.find((repository) => {
+      let missingRepository = workspaceConfig.repos.find((repository) => {
         const path = executionTarget.workspaceWorktrees?.[repository]?.worktreePath;
         return typeof path !== "string" || !existsSync(path);
       });
-      if (missingRepository) {
+      let unusableRepository: { repository: string; classification: string } | undefined;
+      if (!missingRepository && isLandedPostMergeNode) {
+        for (const repository of workspaceConfig.repos) {
+          const path = executionTarget.workspaceWorktrees?.[repository]?.worktreePath;
+          if (typeof path !== "string") continue;
+          const state = await classifyTaskWorktree(join(deps.rootDir, repository), path);
+          if (!state.ok) {
+            unusableRepository = { repository, classification: state.classification };
+            missingRepository = repository;
+            break;
+          }
+        }
+      }
+      if (unusableRepository) {
+        const reacquired = await reacquireLandedPostMergeCheckout(
+          executionTarget,
+          `workspace checkout '${unusableRepository.repository}' unusable (${unusableRepository.classification})`,
+        );
+        if ("failure" in reacquired) return reacquired.failure;
+        executionTarget = reacquired.task;
+      } else if (missingRepository) {
         await deps.store.logEntry(
           live.id,
           `Workflow node '${node.id}' is acquiring configured workspace checkout '${missingRepository}'`,
@@ -536,6 +632,41 @@ export async function runGraphCustomNode(
           deps.getRunContextFor(live.id),
         );
         executionTarget = await deps.ensureGraphCustomNodeWorktree(executionTarget, settings, node.id);
+      }
+    } else if (!workspaceConfig && isLandedPostMergeNode) {
+      /*
+      FNXC:PostMergeRecovery 2026-10-07-05:58:
+      Truthful post-landing cleanup now clears the pointer after a partial removal, so a landed card
+      usually reaches this node with NO recorded worktree. That case must take the same integration-branch
+      acquisition and landed-commit proof as an unusable recorded pointer; a stale dependency start
+      branch must never become the post-merge verification base.
+      */
+      const recordedState = executionTarget.worktree
+        ? await classifyTaskWorktree(deps.rootDir, executionTarget.worktree)
+        : { ok: false as const, classification: "missing", reason: "no recorded worktree" };
+      if (!recordedState.ok) {
+        const reacquired = await reacquireLandedPostMergeCheckout(
+          // Clearing the pointer, session and start branch pins acquisition to the integration branch.
+          { ...executionTarget, worktree: undefined, sessionFile: undefined, executionStartBranch: undefined } as TaskDetail,
+          executionTarget.worktree
+            ? `recorded worktree ${executionTarget.worktree} unusable (${recordedState.classification}: ${recordedState.reason})`
+            : "no recorded worktree",
+        );
+        if ("failure" in reacquired) return reacquired.failure;
+        executionTarget = reacquired.task;
+        if (!executionTarget?.worktree) {
+          return { outcome: "failure", value: "post-merge-checkout-unavailable" };
+        }
+        const landedCommit = executionTarget.mergeDetails?.commitSha;
+        if (landedCommit && !await checkoutContainsCommit(executionTarget.worktree, landedCommit)) {
+          await deps.store.logEntry(
+            live.id,
+            `Workflow node '${node.id}' re-acquired ${executionTarget.worktree}, but it does not contain landed commit ${landedCommit}; the gate will be rechecked later`,
+            undefined,
+            deps.getRunContextFor(live.id),
+          );
+          return { outcome: "failure", value: "post-merge-checkout-missing-landed-commit" };
+        }
       }
     } else if (!workspaceConfig) {
       const recordedWorktreeMissing = Boolean(executionTarget.worktree) && !existsSync(executionTarget.worktree!);
@@ -800,7 +931,7 @@ export async function runGraphCustomNode(
       description: typeof cfg.description === "string" ? cfg.description : "",
       mode,
       // FNXC:ReviewRecovery 2026-10-04-02:24: Preserve the enclosing gate phase so post-merge evidence cannot reuse a pre-merge content-only verdict.
-      phase: (graphContext?.[WORKFLOW_OPTIONAL_GROUP_PHASE_CONTEXT_KEY] ?? cfg.phase) === "post-merge" ? "post-merge" : "pre-merge",
+      phase: isPostMergePhaseNode ? "post-merge" : "pre-merge",
       gateMode: node.kind === "gate" || cfg.gateMode === "gate" ? "gate" : "advisory",
       prompt,
       toolMode: cfg.toolMode === "coding" ? "coding" : "readonly",

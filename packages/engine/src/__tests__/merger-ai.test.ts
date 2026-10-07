@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterAll } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
@@ -1146,6 +1146,47 @@ describe("runAiMerge", () => {
     expect(readFileSync(join(worktree, "wip.txt"), "utf-8")).toBe("must survive\n");
     expect(logs.some((line) => line.includes(`Post-landing worktree cleanup preserved ${worktree}: deliverable`))).toBe(true);
     expect(logs.some((line) => /post-landing finalization failed/i.test(line))).toBe(false);
+    // Genuine preservation keeps the branch: git refuses to delete a branch checked out by a live worktree.
+    expect(branchExists(dir, branch)).toBe(true);
+  });
+
+  /*
+  FNXC:WorktreeCleanup 2026-10-07-05:29:
+  KB-003: a removal that git only partly completes (Windows file lock; reproduced on POSIX with a
+  non-writable tracked directory) unregisters the checkout. Finalization must still reach done, report
+  the truthful cleanup outcome, clear the pointer and delete the landed Fusion branch.
+  */
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("reports a partially failed post-landing removal truthfully and still finalizes", async () => {
+    const branch = "fusion/fn-1";
+    const { dir } = initRepoWithBranch({ branch });
+    const worktree = mkdtempSync(join(tmpdir(), "fusion-kb-003-partial-"));
+    rmSync(worktree, RM);
+    tracked.add(worktree);
+    git(dir, `worktree add -q ${JSON.stringify(worktree)} ${branch}`);
+    mkdirSync(join(worktree, "locked"), { recursive: true });
+    writeFileSync(join(worktree, "locked", "file.txt"), "tracked\n");
+    git(worktree, "add -A");
+    git(worktree, "commit -q -m 'feat: locked dir'");
+    const locked = join(worktree, "locked");
+    chmodSync(locked, 0o555);
+    const { store, task, logs } = makeStore(dir, { branch, worktree });
+
+    try {
+      const result = await runAiMerge(store, dir, "FN-1", { manual: true }, {
+        mergeAgent: realMergeAgent(branch),
+        reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+      });
+
+      expect(result.merged).toBe(true);
+      expect(task.column).toBe("done");
+      expect(task.worktree).toBeNull();
+      expect(result.worktreeRemoved).toBe(!existsSync(worktree));
+      expect(git(dir, "worktree list --porcelain")).not.toContain(worktree);
+      expect(branchExists(dir, branch)).toBe(false);
+      expect(logs.some((line) => line.includes("Post-landing worktree cleanup preserved"))).toBe(false);
+    } finally {
+      try { chmodSync(locked, 0o755); } catch { /* residue already removed */ }
+    }
   });
 
   it("short-circuits a zero-commits-ahead branch before the clean-room/merge-agent churn (empty-branch wedge)", async () => {

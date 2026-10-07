@@ -16,6 +16,8 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { TaskDetail } from "@fusion/core";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
+import { classifyTaskWorktree } from "../worktree/worktree-pool.js";
+import { WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY, WORKFLOW_OPTIONAL_GROUP_PHASE_CONTEXT_KEY } from "../workflows/workflow-graph-executor.js";
 import {
   createMockStore,
   mockedExecSync,
@@ -132,6 +134,147 @@ describe("every workflow node runs in the task worktree, never the shared checko
 
     expect(captured.worktreePath).toBe(`${ROOT}/.fusion/worktrees/fn-1403`);
     expect(captured.boundary).toMatchObject({ kind: "workspace-task-dir", writableRoot: `${ROOT}/.fusion/worktrees/fn-1403`, projectRoot: ROOT });
+    expect(acquireSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+/*
+FNXC:PostMergeRecovery 2026-10-07-05:29:
+KB-003 invariant: a post-merge node on a LANDED card treats an absent, `.git`-less, or unregistered
+recorded checkout as missing and re-acquires a fresh checkout at the integration branch. Healthy
+checkouts are reused, unlanded cards and pre-merge nodes keep the fail-fast recorded path.
+*/
+describe("landed post-merge nodes re-acquire an unusable recorded worktree", () => {
+  const POST_MERGE_GATE = {
+    id: "post-merge-verification-inner",
+    kind: "prompt",
+    config: { name: "Post-merge verification", prompt: "Verify the landed result.", toolMode: "readonly" },
+  };
+  const POST_MERGE_CONTEXT = {
+    [WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY]: "post-merge-verification",
+    [WORKFLOW_OPTIONAL_GROUP_PHASE_CONTEXT_KEY]: "post-merge",
+  };
+  const recorded = `${ROOT}/.fusion/worktrees/fn-1403`;
+  const acquiredPath = `${ROOT}/.fusion/worktrees/fn-1403-fresh`;
+  const landed = { mergeConfirmed: true, commitSha: "abc123" };
+
+  beforeEach(() => {
+    resetExecutorMocks();
+    mockedExecSync.mockReturnValue("" as any);
+    mockedExistsSync.mockReturnValue(true);
+    vi.mocked(classifyTaskWorktree).mockReset();
+    vi.mocked(classifyTaskWorktree).mockResolvedValue({ ok: true });
+  });
+
+  function harness(task: TaskDetail, acquired: TaskDetail = makeTask({ worktree: acquiredPath, branch: "fusion/fn-1403", mergeDetails: landed } as any)) {
+    const store = createMockStore();
+    const executor = new TaskExecutor(store, ROOT);
+    const acquireSpy = vi.spyOn(executor as any, "ensureGraphCustomNodeWorktree").mockResolvedValue(acquired);
+    const captured: { worktreePath?: string } = {};
+    vi.spyOn(executor as any, "executeWorkflowStep").mockImplementation(async (...args: any[]) => {
+      captured.worktreePath = args[2];
+      return { success: true, output: '{"verdict":"APPROVE"}' };
+    });
+    store.getTask.mockResolvedValue(task as any);
+    return { store, executor, acquireSpy, captured };
+  }
+
+  it.each([
+    ["incomplete", "missing .git metadata"],
+    ["unregistered", "not registered in git worktree list"],
+    ["missing", "worktree directory does not exist"],
+  ] as const)("re-acquires a %s recorded worktree at the integration branch", async (classification, reason) => {
+    const live = makeTask({ column: "in-review", worktree: recorded, branch: "fusion/fn-1403", executionStartBranch: "fusion/fn-1000", sessionFile: "/s.json", mergeDetails: landed } as any);
+    const { executor, acquireSpy, captured } = harness(live);
+    vi.mocked(classifyTaskWorktree).mockResolvedValueOnce({ ok: false, classification, reason });
+
+    const result = await (executor as any).runGraphCustomNode(POST_MERGE_GATE, live, {}, undefined, POST_MERGE_CONTEXT);
+
+    expect(acquireSpy).toHaveBeenCalledTimes(1);
+    expect(acquireSpy.mock.calls[0]![0]).toMatchObject({ id: "FN-1403", worktree: undefined, sessionFile: undefined, executionStartBranch: undefined });
+    expect(captured.worktreePath).toBe(acquiredPath);
+    expect(result.outcome).toBe("success");
+  });
+
+  it("acquires at the integration branch when cleanup already cleared the pointer", async () => {
+    const live = makeTask({ column: "in-review", worktree: undefined, branch: "fusion/fn-1403", executionStartBranch: "fusion/fn-1000", mergeDetails: landed } as any);
+    const { executor, acquireSpy, captured } = harness(live);
+
+    const result = await (executor as any).runGraphCustomNode(POST_MERGE_GATE, live, {}, undefined, POST_MERGE_CONTEXT);
+
+    expect(acquireSpy).toHaveBeenCalledTimes(1);
+    expect(acquireSpy.mock.calls[0]![0]).toMatchObject({ id: "FN-1403", worktree: undefined, executionStartBranch: undefined });
+    expect(captured.worktreePath).toBe(acquiredPath);
+    expect(result.outcome).toBe("success");
+  });
+
+  it("honours the node's own post-merge phase without graph context", async () => {
+    const live = makeTask({ column: "in-review", worktree: recorded, mergeDetails: landed } as any);
+    const { executor, acquireSpy } = harness(live);
+    vi.mocked(classifyTaskWorktree).mockResolvedValueOnce({ ok: false, classification: "incomplete", reason: "missing .git metadata" });
+
+    await (executor as any).runGraphCustomNode({ ...POST_MERGE_GATE, config: { ...POST_MERGE_GATE.config, phase: "post-merge" } }, live, {}, undefined, undefined);
+
+    expect(acquireSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses a healthy recorded worktree without acquisition", async () => {
+    const live = makeTask({ column: "in-review", worktree: recorded, mergeDetails: landed } as any);
+    const { executor, acquireSpy, captured } = harness(live);
+
+    await (executor as any).runGraphCustomNode(POST_MERGE_GATE, live, {}, undefined, POST_MERGE_CONTEXT);
+
+    expect(acquireSpy).not.toHaveBeenCalled();
+    expect(captured.worktreePath).toBe(recorded);
+  });
+
+  it("keeps the recorded path when the card has not landed", async () => {
+    const live = makeTask({ column: "in-review", worktree: recorded, mergeDetails: { mergeConfirmed: false } } as any);
+    const { executor, acquireSpy, captured } = harness(live);
+    vi.mocked(classifyTaskWorktree).mockResolvedValue({ ok: false, classification: "incomplete", reason: "missing .git metadata" });
+
+    await (executor as any).runGraphCustomNode(POST_MERGE_GATE, live, {}, undefined, POST_MERGE_CONTEXT);
+
+    expect(acquireSpy).not.toHaveBeenCalled();
+    expect(captured.worktreePath).toBe(recorded);
+  });
+
+  it("keeps a pre-merge gate on its recorded path even when the checkout is unusable", async () => {
+    const live = makeTask({ column: "in-review", worktree: recorded, mergeDetails: landed } as any);
+    const { executor, acquireSpy, captured } = harness(live);
+    vi.mocked(classifyTaskWorktree).mockResolvedValue({ ok: false, classification: "incomplete", reason: "missing .git metadata" });
+
+    await (executor as any).runGraphCustomNode(CUSTOM_READONLY_GATE, live, {}, undefined, undefined);
+
+    expect(acquireSpy).not.toHaveBeenCalled();
+    expect(captured.worktreePath).toBe(recorded);
+  });
+
+  it("returns a recoverable failure instead of throwing when acquisition fails", async () => {
+    const live = makeTask({ column: "in-review", worktree: recorded, mergeDetails: landed } as any);
+    const { executor, acquireSpy, captured } = harness(live);
+    acquireSpy.mockRejectedValue(Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" }));
+    vi.mocked(classifyTaskWorktree).mockResolvedValueOnce({ ok: false, classification: "incomplete", reason: "missing .git metadata" });
+
+    const result = await (executor as any).runGraphCustomNode(POST_MERGE_GATE, live, {}, undefined, POST_MERGE_CONTEXT);
+
+    expect(result).toEqual({ outcome: "failure", value: "post-merge-checkout-unavailable" });
+    expect(captured.worktreePath).toBeUndefined();
+  });
+
+  it("re-acquires a workspace post-merge node when one configured child is unusable", async () => {
+    const child = `${ROOT}/.fusion/worktrees/fn-1403/apps/web`;
+    const live = makeTask({
+      column: "in-review",
+      mergeDetails: landed,
+      workspaceWorktrees: { "apps/web": { worktreePath: child, branch: "fusion/fn-1403-apps-web" } },
+    } as any);
+    const { executor, acquireSpy } = harness(live, live);
+    (executor as any).workspaceConfig = { repos: ["apps/web"] };
+    vi.mocked(classifyTaskWorktree).mockResolvedValueOnce({ ok: false, classification: "incomplete", reason: "missing .git metadata" });
+
+    await (executor as any).runGraphCustomNode(POST_MERGE_GATE, live, {}, undefined, POST_MERGE_CONTEXT);
+
     expect(acquireSpy).toHaveBeenCalledTimes(1);
   });
 });

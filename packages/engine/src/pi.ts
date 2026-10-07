@@ -1723,7 +1723,12 @@ async function isCompleteGitWorktree(worktreePath: string): Promise<boolean> {
   }
 }
 
-async function assertValidWorktreeSession(cwd: string, projectRoot: string): Promise<void> {
+/**
+ * FNXC:PostMergeRecovery 2026-10-07-05:29:
+ * Exported (behavior unchanged) so the KB-003 symptom test can assert a re-acquired post-merge checkout
+ * passes the exact session-start guard that refused KB-001's half-deleted worktree.
+ */
+export async function assertValidWorktreeSession(cwd: string, projectRoot: string): Promise<void> {
   if (!existsSync(cwd)) {
     throw new Error(`Refusing to start coding agent in missing worktree: ${cwd}`);
   }

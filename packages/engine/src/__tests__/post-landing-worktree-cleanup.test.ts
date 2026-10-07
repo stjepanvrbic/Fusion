@@ -4,6 +4,8 @@ const {
   existsSyncMock,
   rmdirSyncMock,
   removeWorktreeMock,
+  classifyTaskWorktreeMock,
+  pruneWorktreeAdminEntriesMock,
   ActiveSessionWorktreeRemovalErrorMock,
 } = vi.hoisted(() => {
   class ActiveSessionWorktreeRemovalErrorMock extends Error {
@@ -16,9 +18,19 @@ const {
     existsSyncMock: vi.fn(),
     rmdirSyncMock: vi.fn(),
     removeWorktreeMock: vi.fn(),
+    classifyTaskWorktreeMock: vi.fn(),
+    pruneWorktreeAdminEntriesMock: vi.fn(),
     ActiveSessionWorktreeRemovalErrorMock,
   };
 });
+
+vi.mock("../worktree/worktree-pool.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../worktree/worktree-pool.js")>()),
+  classifyTaskWorktree: classifyTaskWorktreeMock,
+}));
+vi.mock("../worktree/worktree-prune.js", () => ({
+  pruneWorktreeAdminEntries: pruneWorktreeAdminEntriesMock,
+}));
 
 vi.mock("node:fs", () => ({ existsSync: existsSyncMock, rmdirSync: rmdirSyncMock }));
 vi.mock("../worktree/worktree-backend.js", () => ({
@@ -107,6 +119,18 @@ function createStore(options: { withSettings?: boolean } = {}) {
   };
 }
 
+/*
+FNXC:WorktreeCleanup 2026-10-07-05:29:
+KB-003 cleanup classifies the checkout before and after git removal. Module-wide defaults keep the
+existing FN-251 cases on a usable registered checkout; partial-removal cases override the probe.
+*/
+beforeEach(() => {
+  classifyTaskWorktreeMock.mockReset();
+  classifyTaskWorktreeMock.mockResolvedValue({ ok: true });
+  pruneWorktreeAdminEntriesMock.mockReset();
+  pruneWorktreeAdminEntriesMock.mockResolvedValue(undefined);
+});
+
 describe("cleanupLandedTaskWorktree", () => {
   beforeEach(() => {
     existsSyncMock.mockReset();
@@ -114,6 +138,139 @@ describe("cleanupLandedTaskWorktree", () => {
     rmdirSyncMock.mockReset();
     removeWorktreeMock.mockReset();
     removeWorktreeMock.mockResolvedValue({ removed: true, classification: "removed" });
+  });
+
+  describe("truthful outcomes for unusable checkouts (KB-003)", () => {
+    const worktreePath = "/repo/.worktrees/fn-251";
+    const gitFailure = Object.assign(new Error("Command failed: git worktree remove\nerror: failed to delete '/repo/.worktrees/fn-251': Directory not empty"), { code: 255 });
+
+    function run(store: unknown, extra: Record<string, unknown> = {}) {
+      return cleanupLandedTaskWorktree({
+        store: store as never,
+        taskId: "FN-251",
+        worktreePath,
+        rootDir: "/repo",
+        landedSha: "abc123",
+        source: "ai-merge-finalize",
+        ...extra,
+      });
+    }
+
+    function loggedText(logEntry: ReturnType<typeof vi.fn>): string {
+      return logEntry.mock.calls.map((call) => call.join(" ")).join("\n");
+    }
+
+    it("deletes the residue git left after unregistering during this call and reports removed", async () => {
+      const { store, updateTask, logEntry } = createStore();
+      classifyTaskWorktreeMock
+        .mockResolvedValueOnce({ ok: true })
+        .mockResolvedValueOnce({ ok: false, classification: "incomplete", reason: "missing .git metadata" });
+      removeWorktreeMock.mockRejectedValueOnce(gitFailure);
+      const removeResidualDirectory = vi.fn().mockResolvedValue({ removed: true });
+
+      await expect(run(store, { removeResidualDirectory })).resolves.toEqual({ outcome: "removed", removed: true });
+
+      expect(removeResidualDirectory).toHaveBeenCalledWith(worktreePath);
+      expect(pruneWorktreeAdminEntriesMock).toHaveBeenCalled();
+      expect(updateTask).toHaveBeenCalledWith("FN-251", { worktree: null });
+      expect(loggedText(logEntry)).not.toContain("cleanup preserved");
+      expect(loggedText(logEntry)).toContain("residual files deleted");
+    });
+
+    it("reports partially-removed and clears the pointer when residue cannot be deleted", async () => {
+      const { store, updateTask, logEntry } = createStore();
+      classifyTaskWorktreeMock
+        .mockResolvedValueOnce({ ok: true })
+        .mockResolvedValueOnce({ ok: false, classification: "unregistered", reason: "not registered in git worktree list" });
+      removeWorktreeMock.mockRejectedValueOnce(gitFailure);
+      const removeResidualDirectory = vi.fn().mockResolvedValue({ removed: false });
+
+      await expect(run(store, { removeResidualDirectory })).resolves.toEqual({ outcome: "partially-removed", removed: false });
+
+      expect(updateTask).toHaveBeenCalledWith("FN-251", { worktree: null });
+      expect(loggedText(logEntry)).toContain("partially removed");
+      expect(loggedText(logEntry)).toContain("residual files remain");
+      expect(loggedText(logEntry)).not.toContain("cleanup preserved");
+    });
+
+    it("never deletes a checkout that was already unusable before cleanup ran", async () => {
+      const { store, updateTask, logEntry } = createStore();
+      classifyTaskWorktreeMock.mockResolvedValueOnce({ ok: false, classification: "unregistered", reason: "not registered in git worktree list" });
+      const removeResidualDirectory = vi.fn().mockResolvedValue({ removed: true });
+
+      await expect(run(store, { removeResidualDirectory })).resolves.toEqual({ outcome: "residual-unusable", removed: false });
+
+      expect(removeWorktreeMock).not.toHaveBeenCalled();
+      expect(removeResidualDirectory).not.toHaveBeenCalled();
+      expect(updateTask).toHaveBeenCalledWith("FN-251", { worktree: null });
+      expect(loggedText(logEntry)).toContain("already unusable (unregistered)");
+    });
+
+    it("reports removed when git failed but the checkout is gone", async () => {
+      const { store, updateTask } = createStore();
+      classifyTaskWorktreeMock
+        .mockResolvedValueOnce({ ok: true })
+        .mockResolvedValueOnce({ ok: false, classification: "missing", reason: "worktree directory does not exist" });
+      removeWorktreeMock.mockRejectedValueOnce(gitFailure);
+
+      await expect(run(store)).resolves.toEqual({ outcome: "removed", removed: true });
+      expect(updateTask).toHaveBeenCalledWith("FN-251", { worktree: null });
+    });
+
+    it("keeps preserved-deliverable when a usable checkout really remains", async () => {
+      const { store, updateTask } = createStore();
+      removeWorktreeMock.mockRejectedValueOnce(new Error(`preserving ${worktreePath}: uncommitted or ignored content present`));
+      const removeResidualDirectory = vi.fn();
+
+      await expect(run(store, { removeResidualDirectory })).resolves.toEqual({
+        outcome: "preserved-deliverable",
+        removed: false,
+        preservedReason: "deliverable",
+      });
+      expect(removeResidualDirectory).not.toHaveBeenCalled();
+      expect(updateTask).not.toHaveBeenCalled();
+    });
+
+    it("keeps a generic git failure preserved when the post-probe still finds a usable checkout", async () => {
+      const { store, updateTask } = createStore();
+      removeWorktreeMock.mockRejectedValueOnce(gitFailure);
+
+      await expect(run(store)).resolves.toEqual(expect.objectContaining({ outcome: "preserved-deliverable", removed: false }));
+      expect(classifyTaskWorktreeMock).toHaveBeenCalledTimes(2);
+      expect(updateTask).not.toHaveBeenCalled();
+    });
+
+    it("fails closed on a repo-root pointer without deleting anything", async () => {
+      const { store, updateTask } = createStore();
+      classifyTaskWorktreeMock.mockResolvedValueOnce({ ok: false, classification: "repo-root", reason: "worktree path is the project root, not a task worktree" });
+      const removeResidualDirectory = vi.fn();
+
+      await expect(run(store, { removeResidualDirectory })).resolves.toEqual({
+        outcome: "preserved-unverifiable",
+        removed: false,
+        preservedReason: "unverifiable",
+      });
+      expect(removeWorktreeMock).not.toHaveBeenCalled();
+      expect(removeResidualDirectory).not.toHaveBeenCalled();
+      expect(updateTask).not.toHaveBeenCalled();
+    });
+
+    it("emits a bounded partial-removal audit whose sink failures cannot change the outcome", async () => {
+      const { store } = createStore();
+      classifyTaskWorktreeMock
+        .mockResolvedValueOnce({ ok: true })
+        .mockResolvedValueOnce({ ok: false, classification: "incomplete", reason: "missing .git metadata" });
+      removeWorktreeMock.mockRejectedValueOnce(gitFailure);
+      const audit = { git: vi.fn().mockRejectedValue(new Error("audit sink down")) };
+
+      await expect(run(store, { audit, removeResidualDirectory: vi.fn().mockResolvedValue({ removed: false }) }))
+        .resolves.toEqual({ outcome: "partially-removed", removed: false });
+      expect(audit.git).toHaveBeenCalledWith({
+        type: "worktree:removal-partial",
+        target: worktreePath,
+        metadata: { taskId: "FN-251", source: "ai-merge-finalize", classification: "incomplete", phase: "during-removal", residual: true },
+      });
+    });
   });
 
   it.each([
@@ -484,6 +641,57 @@ describe("cleanupLandedWorkspaceTaskWorktrees", () => {
     ]));
     expect(rmdirSyncMock).not.toHaveBeenCalled();
     expect(logEntry).toHaveBeenCalledWith("FN-268", "Post-landing worktree cleanup preserved", expect.stringContaining("deliverable"));
+  });
+
+  it("settles a half-deleted child instead of reporting it preserved, keeping the task directory beside a deliverable one", async () => {
+    const { store, logEntry } = createStore();
+    const task = workspaceTask({
+      api: { worktreePath: "/workspace/.fusion/worktrees/fn-268/api", branch: "fusion/fn-268" },
+      web: { worktreePath: "/workspace/.fusion/worktrees/fn-268/web", branch: "fusion/fn-268" },
+    });
+    classifyTaskWorktreeMock
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: false, classification: "incomplete", reason: "missing .git metadata" })
+      .mockResolvedValueOnce({ ok: true });
+    removeWorktreeMock.mockRejectedValueOnce(new Error("error: failed to delete '/workspace/.fusion/worktrees/fn-268/api': Directory not empty"));
+    removeWorktreeMock.mockRejectedValueOnce(new Error("preserving /workspace/.fusion/worktrees/fn-268/web: uncommitted content present"));
+
+    const result = await cleanupLandedWorkspaceTaskWorktrees({
+      store: store as never,
+      task,
+      workspaceRootDir: "/workspace",
+      source: "workspace-finalize",
+      removeResidualDirectory: vi.fn().mockResolvedValue({ removed: false }),
+    });
+
+    expect(result.preserved).toEqual([expect.objectContaining({ repoRel: "web", reason: "deliverable" })]);
+    expect(result.removedRepoRels).toEqual([]);
+    expect(result.taskDirectoryRemoved).toBe(false);
+    expect(rmdirSyncMock).not.toHaveBeenCalled();
+    expect(logEntry).toHaveBeenCalledWith("FN-268", "Post-landing worktree cleanup partially removed", expect.stringContaining("fn-268/api"));
+    expect(logEntry).not.toHaveBeenCalledWith("FN-268", "Post-landing worktree cleanup preserved", expect.stringContaining("fn-268/api"));
+  });
+
+  it("settles a lone half-deleted child and attempts the empty-shell task directory removal", async () => {
+    const { store } = createStore();
+    const task = workspaceTask({ api: { worktreePath: "/workspace/.fusion/worktrees/fn-268/api", branch: "fusion/fn-268" } });
+    classifyTaskWorktreeMock
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: false, classification: "unregistered", reason: "not registered in git worktree list" });
+    removeWorktreeMock.mockRejectedValueOnce(new Error("error: failed to delete '/workspace/.fusion/worktrees/fn-268/api'"));
+    rmdirSyncMock.mockImplementation(() => { throw Object.assign(new Error("ENOTEMPTY"), { code: "ENOTEMPTY" }); });
+
+    const result = await cleanupLandedWorkspaceTaskWorktrees({
+      store: store as never,
+      task,
+      workspaceRootDir: "/workspace",
+      source: "workspace-finalize",
+      removeResidualDirectory: vi.fn().mockResolvedValue({ removed: false }),
+    });
+
+    expect(result.preserved).toEqual([]);
+    expect(result.taskDirectoryRemoved).toBe(false);
+    expect(rmdirSyncMock).toHaveBeenCalled();
   });
 
   it("settles absent paths and removes a duplicate recorded path only once", async () => {
