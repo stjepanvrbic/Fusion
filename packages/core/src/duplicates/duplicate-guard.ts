@@ -238,7 +238,8 @@ export async function reconcileDeterministicDuplicate(
     that is the one that explains what went wrong.
     */
     try {
-      await store.moveTask(args.createdTask.id, await resolveArchiveTargetForTask(store, args.createdTask.id));
+      // FNXC:LifecycleContainment 2026-10-07-21:40: an automatic intake-to-archive move names its source; guards still apply, as they did when the source was absent.
+      await store.moveTask(args.createdTask.id, await resolveArchiveTargetForTask(store, args.createdTask.id), { moveSource: "engine", bypassGuards: false });
     } catch (moveError) {
       try {
         await store.updateTask(args.createdTask.id, {

@@ -1394,11 +1394,6 @@
       "reason": "reviewed public TaskStore operation; not a durable writer reached by this merge frontier"
     },
     {
-      "method": "getChangedTaskColumns",
-      "kind": "non-writer",
-      "reason": "reviewed public TaskStore operation; not a durable writer reached by this merge frontier"
-    },
-    {
       "method": "getCompletionHandoffAcceptedMarker",
       "kind": "non-writer",
       "reason": "reviewed public TaskStore operation; not a durable writer reached by this merge frontier"
@@ -3867,7 +3862,7 @@
     },
     {
       "callSiteId": "packages/engine/src/agent-tools.ts::createTaskRetryTool::store.moveTask::#1",
-      "callSiteFingerprint": "store.moveTask(params.id,retryTarget)",
+      "callSiteFingerprint": "store.moveTask(params.id,retryTarget,{moveSource})",
       "file": "packages/engine/src/agent-tools.ts",
       "enclosingSymbolPath": "createTaskRetryTool",
       "writer": "store.moveTask",

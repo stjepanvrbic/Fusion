@@ -258,6 +258,51 @@ export async function readAgent(
   return mergeAgentRow(row);
 }
 
+/**
+ * FNXC:AgentRowConcurrency 2026-10-07-21:40:
+ * Read an agent row and hold its row lock until `tx` ends, so a read-merge-write of the agent cannot interleave with any
+ * other UPDATE of that row from another process.
+ */
+export async function readAgentForUpdate(
+  tx: DbTransaction,
+  agentId: string,
+  projectId?: string,
+): Promise<Agent | null> {
+  const rows = await tx
+    .select(agentColumns)
+    .from(schema.project.agents)
+    .where(and(
+      eq(schema.project.agents.id, agentId),
+      projectScopeFor(schema.project.agents.projectId, projectId),
+    ))
+    .for("update");
+  const row = rows[0] as AgentRow | undefined;
+  return row ? mergeAgentRow(row) : null;
+}
+
+/**
+ * FNXC:AgentRowConcurrency 2026-10-07-21:40:
+ * A heartbeat changes only its timestamps. Writing those two columns, rather than upserting the heartbeat's whole agent
+ * snapshot, cannot restore state, runtime configuration or task ownership another process changed meanwhile, and cannot
+ * resurrect a deleted agent. Returns whether a row matched.
+ */
+export async function touchAgentHeartbeat(
+  handle: QueryHandle,
+  agentId: string,
+  timestamp: string,
+  projectId?: string,
+): Promise<boolean> {
+  const rows = await handle
+    .update(schema.project.agents)
+    .set({ lastHeartbeatAt: timestamp, updatedAt: timestamp })
+    .where(and(
+      eq(schema.project.agents.id, agentId),
+      projectScopeFor(schema.project.agents.projectId, projectId),
+    ))
+    .returning({ id: schema.project.agents.id });
+  return rows.length > 0;
+}
+
 /** Merge an agent row's indexed columns + jsonb data column into an Agent. */
 export function mergeAgentRow(row: AgentRow): Agent {
   const data = (row.data ?? {}) as Partial<Agent>;

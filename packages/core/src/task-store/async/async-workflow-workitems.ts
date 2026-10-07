@@ -39,6 +39,7 @@ import type {
 } from "../../types.js";
 import type { WorkflowWorkItemRow } from "../row-types.js";
 import { isPlanReviewSatisfied } from "../../planner/plan-approval.js";
+import { acquireTaskAdvisoryXactLock } from "../task-advisory-lock.js";
 
 /**
  * FNXC:TaskStoreWorkflowWorkItems 2026-06-24-08:35:
@@ -72,6 +73,12 @@ export class ActiveTaskContinuationError extends Error {
  * mutex, and SERIALIZABLE isolation respectively change valid multi-item
  * behavior, fail across processes, or require retries. PostgreSQL releases the
  * advisory transaction lock on commit/rollback; no migration is required.
+ *
+ * FNXC:TaskRowConcurrency 2026-10-07-21:40:
+ * This used a separate two-int advisory key from `acquireTaskAdvisoryXactLock`, so a workflow
+ * writer and a task-row writer of the same task never serialized, and a transaction taking both
+ * in opposite orders could deadlock. Both now take the one per-task key; PostgreSQL advisory locks
+ * are re-entrant within a transaction, so callers that hold both acquire it twice harmlessly.
  */
 export async function withTaskWorkflowSerialization<T>(
   tx: DbTransaction,
@@ -79,7 +86,7 @@ export async function withTaskWorkflowSerialization<T>(
   taskId: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${projectId ?? ""}), hashtext(${taskId}))`);
+  await acquireTaskAdvisoryXactLock(tx, projectId, taskId);
   return fn();
 }
 

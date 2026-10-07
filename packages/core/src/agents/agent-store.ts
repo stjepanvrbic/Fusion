@@ -8,7 +8,8 @@
  * edited as normal project files.
  */
 
-import { mkdir, readFile, writeFile, readdir, unlink, rename, access, appendFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, unlink, access, appendFile } from "node:fs/promises";
+import { renameWithTransientRetry } from "../fs/rename-with-transient-retry.js";
 import { constants as fsConstants, type FSWatcher } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID, randomBytes, createHash } from "node:crypto";
@@ -66,7 +67,8 @@ import { assertImplementationTaskBindAllowed, evaluateImplementationTaskBind, is
 import { normalizeAgentPermissionPolicy } from "./agent-permission-policy.js";
 import { normalizeAgentRoles } from "../types/agents/agents.js";
 import { Database } from "../db/db.js";
-import type { AsyncDataLayer } from "../postgres/data-layer.js";
+import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
+import { AgentWriteConflictError, rebaseAgentOnto } from "./agent-row-merge.js";
 import { appendAgentActivityEvent } from "../task-store/async/async-agent-activity.js";
 import { resolveAgentActivityAttribution } from "../task-store/agent-activity-outbox.js";
 import * as postgresSchema from "../postgres/schema/index.js";
@@ -84,6 +86,8 @@ import {
   mergeAgentRow,
   writeAgent as writeAgentAsync,
   readAgent as readAgentAsync,
+  readAgentForUpdate,
+  touchAgentHeartbeat,
   listAgentRows as listAgentRowsAsync,
   findAgentRowsByName as findAgentRowsByNameAsync,
   deleteAgent as deleteAgentAsync,
@@ -127,6 +131,9 @@ import {
 } from "./memory-agent-defaults.js";
 
 const agentStoreLog = createLogger("agent-store");
+
+/** Attempts of one agent mutation before a persistent cross-process conflict is surfaced to the caller. */
+const AGENT_MUTATION_MAX_ATTEMPTS = 5;
 
 /*
 FNXC:WorkflowAgentIdentities 2026-08-08-06:11:
@@ -649,7 +656,20 @@ export class AgentStore extends EventEmitter {
         heartbeatProcedurePath: newRelPath,
         updatedAt: new Date().toISOString(),
       };
-      await this.writeAgent(updated);
+      /*
+      FNXC:AgentRowConcurrency 2026-10-07-21:40:
+      The listed snapshot may be stale by now; merge-write it so another process's state or config change survives. An
+      agent changed or deleted concurrently keeps its default path and is migrated on the next startup.
+      */
+      try {
+        await this.writeAgent(updated, undefined, agent);
+      } catch (error) {
+        agentStoreLog.warn("heartbeat procedure path migration skipped an agent that changed concurrently", {
+          agentId: agent.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
       migratedCount += 1;
     }
 
@@ -1204,7 +1224,7 @@ export class AgentStore extends EventEmitter {
       const resolvedPath = join(bundleDir, filePath);
       const tempPath = `${resolvedPath}.tmp.${Date.now()}`;
       await writeFile(tempPath, content, "utf-8");
-      await rename(tempPath, resolvedPath);
+      await renameWithTransientRetry(tempPath, resolvedPath);
     });
   }
 
@@ -1315,7 +1335,7 @@ export class AgentStore extends EventEmitter {
    * @throws Error if agent not found
    */
   async updateAgent(agentId: string, updates: AgentUpdateInput): Promise<Agent> {
-    return this.withLock(agentId, async () => {
+    return this.withAgentMutation(agentId, async () => {
       const agent = await this.getAgent(agentId);
       if (!agent) {
         throw new Error(`Agent ${agentId} not found`);
@@ -1363,9 +1383,10 @@ export class AgentStore extends EventEmitter {
         ...("heartbeatProcedurePath" in updates && { heartbeatProcedurePath: updates.heartbeatProcedurePath }),
       };
 
-      await this.writeAgent(updated);
-
+      // FNXC:AgentRowConcurrency 2026-10-07-21:40: the revision records this update's own change, taken before the write rebases `updated` onto other writers' fields.
       const afterSnapshot = agentToConfigSnapshot(updated);
+      await this.writeAgent(updated, undefined, agent);
+
       const diffs = diffConfigSnapshots(beforeSnapshot, afterSnapshot);
 
       if (diffs.length > 0) {
@@ -1414,7 +1435,7 @@ export class AgentStore extends EventEmitter {
    * Roll back agent to a previous configuration revision.
    */
   async rollbackConfig(agentId: string, revisionId: string): Promise<{ agent: Agent; revision: AgentConfigRevision }> {
-    return this.withLock(agentId, async () => {
+    return this.withAgentMutation(agentId, async () => {
       const agent = await this.getAgent(agentId);
       if (!agent) {
         throw new Error(`Agent ${agentId} not found`);
@@ -1442,12 +1463,13 @@ export class AgentStore extends EventEmitter {
         updatedAt,
       };
 
-      await this.writeAgent(restoredAgent);
+      const restoredSnapshot = agentToConfigSnapshot(restoredAgent);
+      await this.writeAgent(restoredAgent, undefined, agent);
 
       const rollbackRevision = this.createConfigRevision({
         agentId,
         before: beforeSnapshot,
-        after: agentToConfigSnapshot(restoredAgent),
+        after: restoredSnapshot,
         source: "rollback",
         rollbackToRevisionId: revisionId,
         createdAt: updatedAt,
@@ -1472,7 +1494,7 @@ export class AgentStore extends EventEmitter {
    * @throws Error if transition is invalid or agent not found
    */
   async updateAgentState(agentId: string, newState: AgentState): Promise<Agent> {
-    return this.withLock(agentId, async () => {
+    return this.withAgentMutation(agentId, async () => {
       const agent = await this.getAgent(agentId);
       if (!agent) {
         throw new Error(`Agent ${agentId} not found`);
@@ -1510,7 +1532,7 @@ export class AgentStore extends EventEmitter {
         updatedAt: new Date().toISOString(),
       };
 
-      await this.writeAgent(updated);
+      await this.writeAgent(updated, undefined, agent);
       this.emit("agent:stateChanged", agentId, currentState, newState);
       /*
       FNXC:AgentActivityStream 2026-08-14-19:18:
@@ -1600,7 +1622,7 @@ export class AgentStore extends EventEmitter {
   }
 
   async syncExecutionTaskLink(agentId: string, taskId: string | undefined): Promise<Agent> {
-    return this.withLock(agentId, async () => {
+    return this.withAgentMutation(agentId, async () => {
       const agent = await this.getAgent(agentId);
       if (!agent) {
         throw new Error(`Agent ${agentId} not found`);
@@ -1612,7 +1634,7 @@ export class AgentStore extends EventEmitter {
         updatedAt: new Date().toISOString(),
       };
 
-      await this.writeAgent(updated);
+      await this.writeAgent(updated, undefined, agent);
       this.emit("agent:updated", updated);
       return updated;
     });
@@ -2149,7 +2171,7 @@ export class AgentStore extends EventEmitter {
    * @throws Error if agent not found
    */
   async resetBudgetUsage(agentId: string): Promise<void> {
-    await this.withLock(agentId, async () => {
+    await this.withAgentMutation(agentId, async () => {
       const agent = await this.getAgent(agentId);
       if (!agent) {
         throw new Error(`Agent ${agentId} not found`);
@@ -2167,7 +2189,7 @@ export class AgentStore extends EventEmitter {
         updatedAt: budgetResetAt,
       };
 
-      await this.writeAgent(updated);
+      await this.writeAgent(updated, undefined, agent);
       this.emit("agent:updated", updated);
     });
   }
@@ -2617,12 +2639,12 @@ export class AgentStore extends EventEmitter {
 
       // Update agent's lastHeartbeatAt if status is ok
       if (status === "ok") {
-        const updated: Agent = {
-          ...agent,
-          lastHeartbeatAt: event.timestamp,
-          updatedAt: event.timestamp,
-        };
-        await this.writeAgent(updated);
+        /*
+        FNXC:AgentRowConcurrency 2026-10-07-21:40:
+        A heartbeat writes only its timestamps. Upserting the snapshot read above restored any pause, runtime toggle or task
+        link another process committed in the meantime.
+        */
+        await touchAgentHeartbeat(this.asyncLayer!.db, agentId, event.timestamp, this.workflowProjectId);
       }
 
       /*
@@ -3512,12 +3534,46 @@ export class AgentStore extends EventEmitter {
     };
   }
 
-  private async writeAgent(agent: Agent, executor?: QueryHandle): Promise<void> {
+  /**
+   * FNXC:AgentRowConcurrency 2026-10-07-21:40:
+   * With `baseline` (the agent `agent` was built from), the write locks the row, rebases `agent` onto it in place so
+   * fields another process changed survive, and refuses a concurrently deleted agent instead of resurrecting it.
+   * Without it the call is a create/provisioning upsert under its caller's own serialization.
+   */
+  private async writeAgent(agent: Agent, executor?: QueryHandle, baseline?: Agent): Promise<void> {
     // FNXC:SqliteFinalRemoval 2026-06-25-23:40:
     // Backend mode: delegate to async Drizzle writeAgent helper.
-        await writeAgentAsync(executor ?? this.asyncLayer!.db, agent, this.asyncLayer!.projectId);
-    return;
-}
+    const layer = this.asyncLayer!;
+    if (!baseline) {
+      await writeAgentAsync(executor ?? layer.db, agent, layer.projectId);
+      return;
+    }
+    const mergeWrite = async (tx: DbTransaction): Promise<void> => {
+      const liveRaw = await readAgentForUpdate(tx, agent.id, this.workflowProjectId);
+      if (!liveRaw) throw new Error(`Agent ${agent.id} not found`);
+      rebaseAgentOnto(agent, baseline, this.parseAgent(liveRaw));
+      await writeAgentAsync(tx, agent, layer.projectId);
+    };
+    if (executor) await mergeWrite(executor as DbTransaction);
+    else await layer.transactionImmediate(mergeWrite);
+  }
+
+  /**
+   * Run an agent read-modify-write under the in-process agent lock, re-running it from a fresh read when another
+   * process changed a field it writes (see {@link rebaseAgentOnto}).
+   */
+  private async withAgentMutation<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
+    return this.withLock(agentId, async () => {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await fn();
+        } catch (error) {
+          if (error instanceof AgentWriteConflictError && attempt < AGENT_MUTATION_MAX_ATTEMPTS) continue;
+          throw error;
+        }
+      }
+    });
+  }
 
   /**
    * FN-7723: build the change-detection snapshot for an agent.

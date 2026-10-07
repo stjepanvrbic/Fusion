@@ -2149,7 +2149,7 @@ describe("POST /tasks/:id/spec/revise", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "operator" });
   });
 
   it("allows spec revision for task already in triage", async () => {
@@ -2205,7 +2205,7 @@ describe("POST /tasks/:id/spec/revise", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "operator" });
     expect(store.updateTask).toHaveBeenCalledWith("FN-001", { status: "needs-replan" });
   });
 
@@ -2225,7 +2225,7 @@ describe("POST /tasks/:id/spec/revise", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "operator" });
   });
 
   it("returns 400 when feedback is missing", async () => {
@@ -2822,7 +2822,7 @@ describe("POST /tasks/:id/approve-plan", () => {
 
     expect(res.status).toBe(200);
     expect(store.logEntry).toHaveBeenCalledWith("FN-001", "Plan approved by user");
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "operator" });
     /*
     FNXC:SpecLockApproval 2026-08-15-05:10:
     A readable PROMPT.md is now mandatory at approval (unreadable is a 409), so the persisted
@@ -2901,7 +2901,7 @@ describe("POST /tasks/:id/approve-plan", () => {
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/approve-plan");
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "operator" });
   });
 
   // Passthrough: an ordinary manual-approval hold (no awaitingApprovalReason)
@@ -2922,7 +2922,7 @@ describe("POST /tasks/:id/approve-plan", () => {
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/approve-plan");
 
     expect(res.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "operator" });
   });
 
   /*

@@ -56,6 +56,28 @@ export interface CapacityFacts {
   occupants: number;
 }
 
+/*
+FNXC:LifecycleContainment 2026-10-07-21:40:
+An absent moveSource is ambiguous: it is both the legacy spelling of an internal engine move and the route operator surfaces
+(CLI and chat retry, dashboard rebound, respecify and approval routes) took to keep guards without the "user" hard-cancel
+semantics. Lifecycle containment governs automatic moves only, so the direction policy has to know which one it is looking
+at. "operator" names the operator case explicitly. It resolves to the same emitted source, guards and side effects as an
+absent source did, and it is exempt from the direction policy like "user". Once every caller names its source, an absent
+source is treated as "engine" by resolveDirectionPolicySource.
+*/
+export type RequestedMoveSource = "user" | "engine" | "scheduler" | "operator";
+export type ResolvedMoveSource = "user" | "engine" | "scheduler";
+
+/** The source recorded and emitted for a move: an operator or absent source is recorded as "engine", as before. */
+export function resolveMoveSource(requested: RequestedMoveSource | undefined): ResolvedMoveSource {
+  return requested === undefined || requested === "operator" ? "engine" : requested;
+}
+
+/** The source the lifecycle-direction postcondition judges; undefined means the move is exempt. */
+export function resolveDirectionPolicySource(requested: RequestedMoveSource | undefined): ResolvedMoveSource | undefined {
+  return requested === "operator" ? undefined : requested;
+}
+
 /** Input to the shared invariant policy. `mergeBlockerReason` is the caller's
  *  already-resolved blocker string (or null when clear / not enforced for this
  *  move); the policy never re-derives it (that needs the task, which is the
@@ -65,8 +87,8 @@ export interface TransitionInvariantInput {
   from: TransitionColumnFacts;
   to: TransitionColumnFacts;
   mergeBlockerReason: string | null;
-  /** Raw caller option: optionless dashboard moves are deliberately exempt. */
-  moveSource?: "user" | "engine" | "scheduler";
+  /** Source the direction policy judges, from {@link resolveDirectionPolicySource}; undefined is exempt. */
+  moveSource?: ResolvedMoveSource;
   /** Registered explanation for a remaining legal engine backward move. */
   lifecycleReason?: string;
 }

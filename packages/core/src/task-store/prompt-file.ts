@@ -1,5 +1,6 @@
 import {randomUUID} from "node:crypto";
-import {mkdir, rename, unlink, writeFile} from "node:fs/promises";
+import {mkdir, unlink, writeFile} from "node:fs/promises";
+import {renameWithTransientRetry} from "../fs/rename-with-transient-retry.js";
 import {dirname, join} from "node:path";
 
 /*
@@ -12,7 +13,7 @@ export async function writePromptFileAtomic(promptPath: string, content: string)
   await mkdir(parentDir, {recursive: true});
   await writeFile(tmpPath, content);
   try {
-    await rename(tmpPath, promptPath);
+    await renameWithTransientRetry(tmpPath, promptPath);
   } catch (error) {
     try {
       await unlink(tmpPath);

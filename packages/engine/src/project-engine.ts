@@ -5812,7 +5812,12 @@ export class ProjectEngine {
                 verificationFailureCount: nextBounces,
               });
               /* FNXC:WorkflowResolvedColumns 2026-07-30-21:40: census-invisible moveTask DESTINATION — a call argument, not a comparison. */
-              await store.moveTask(taskId, await resolveWipTargetForTask(store, taskId));
+              /*
+              FNXC:LifecycleContainment 2026-10-07-21:40:
+              A failed merge verification is a verification revision with pending remediation, which may return the card to
+              WIP. The move names its engine source and that reason; guards still apply, as they did before.
+              */
+              await store.moveTask(taskId, await resolveWipTargetForTask(store, taskId), { moveSource: "engine", lifecycleReason: "verification-failure-remediation", bypassGuards: false });
               await store.logEntry(
                 taskId,
                 `Deterministic ${failedKind} verification failed (${nextBounces}/${cap}) — moved back to in-progress with status=merging-fix for remediation`,

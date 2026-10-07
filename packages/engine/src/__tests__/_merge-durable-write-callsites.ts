@@ -532,7 +532,6 @@ const NON_WRITER_REASONS: Record<string, string> = Object.fromEntries([
   "getBranchGroupBySource",
   "getBranchProgressByTask",
   "getBuiltInWorkflowTemplate",
-  "getChangedTaskColumns",
   "getCompletionHandoffAcceptedMarker",
   "getDatabase",
   "getDatabaseHealth",

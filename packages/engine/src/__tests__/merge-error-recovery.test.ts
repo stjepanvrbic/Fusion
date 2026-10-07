@@ -1263,7 +1263,7 @@ describe("ProjectEngine merge error recovery", () => {
       error: null,
       verificationFailureCount: 1,
     });
-    expect(store.moveTask).toHaveBeenCalledWith(TASK_ID, "in-progress");
+    expect(store.moveTask).toHaveBeenCalledWith(TASK_ID, "in-progress", { moveSource: "engine", lifecycleReason: "verification-failure-remediation", bypassGuards: false });
     expect(store.logEntry).toHaveBeenCalledWith(
       TASK_ID,
       "Deterministic test verification failed (1/3) — moved back to in-progress with status=merging-fix for remediation",
@@ -1317,7 +1317,7 @@ describe("ProjectEngine merge error recovery", () => {
       error: null,
       verificationFailureCount: 2,
     });
-    expect(store.moveTask).toHaveBeenCalledWith(TASK_ID, "in-progress");
+    expect(store.moveTask).toHaveBeenCalledWith(TASK_ID, "in-progress", { moveSource: "engine", lifecycleReason: "verification-failure-remediation", bypassGuards: false });
   });
 
 

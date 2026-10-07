@@ -33,6 +33,8 @@ import {
   type TransitionColumnFacts,
   evaluateCapacityRejection,
   evaluateTransitionInvariants,
+  resolveDirectionPolicySource,
+  resolveMoveSource,
 } from "../workflows/workflow-transition-policy.js";
 import {type DefaultWorkflowMoveContext, applyDefaultWorkflowMoveEffects, isReopenIntoPlanning} from "../workflows/default-workflow-hooks.js";
 import {columnsWithFlag, resolveLifecycleColumns, resolveReviewColumns, toTaskMoveLanes} from "../workflows/workflow-lifecycle-traits.js";
@@ -47,7 +49,8 @@ import {recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
 import {getTaskMergeBlocker} from "../merge/task-merge.js";
 import {resolveRequiredPreMergeStepIds} from "../merge/required-pre-merge-steps.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
-import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction, upsertTaskRowInTransaction} from "./async/async-persistence.js";
+import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction} from "./async/async-persistence.js";
+import {mergeWriteTaskRowInTransaction} from "./task-row-merge.js";
 import {disposeTaskBeforeMove} from "../tasks/task-move-disposer.js";
 import {resolveTaskSymbolsForTask} from "../tasks/task-symbol-resolution.js";
 
@@ -114,6 +117,7 @@ async function resolveWorkflowIrForSelectedWorkflowId(store: TaskStore, workflow
   }
 }
 import {enqueueMergeQueueInTransaction, dequeueMergeQueueOnColumnExitInTransaction} from "./async/async-merge-coordination.js";
+import { publishCommittedTaskJson } from "./task-row-mappers.js";
 
 /*
 FNXC:WorkflowCapacity 2026-07-28-16:10 (PR #2499 review — split capacity snapshot):
@@ -425,7 +429,8 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
     FNXC:TaskMovement 2026-06-22-18:20:
     Public moveTask calls without an explicit source keep the legacy emitted source of "engine", but they do not inherit workflow guard bypass. Engine, scheduler, handoff, and recovery call sites opt into bypass semantics with an explicit moveSource or skipMergeBlocker.
     */
-    const moveSource = options?.moveSource ?? "engine";
+    // FNXC:LifecycleContainment 2026-10-07-21:40: an "operator" source is recorded and emitted as "engine", exactly as an absent source was.
+    const moveSource = resolveMoveSource(options?.moveSource);
 
     // ── U4: flag-gated workflow-resolved transition path (KTD-8) ─────────────
     // Flag OFF (default): the legacy `VALID_TRANSITIONS` / inline-side-effect
@@ -739,13 +744,17 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         resolved `moveSource`. An absent option remains an operator-compatible,
         fail-open legacy route; explicit engine/scheduler movers are covered by
         the move-reason census and forbidden-path tests.
+
+        FNXC:LifecycleContainment 2026-10-07-21:40:
+        Operator surfaces now say "operator", which is exempt like "user". resolveDirectionPolicySource is the single place
+        that decides which requested sources the containment policy judges.
         */
         const decision = evaluateTransitionInvariants({
           taskId: id,
           from: fromFacts,
           to: toFacts,
           mergeBlockerReason,
-          moveSource: options?.moveSource,
+          moveSource: resolveDirectionPolicySource(options?.moveSource),
           lifecycleReason: options?.lifecycleReason,
         });
         if (!decision.allow) {
@@ -1220,7 +1229,12 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
       // Upsert the task row (update column + all mutated fields).
       // FNXC:MultiProjectIsolation 2026-07-10: pass the bound projectId (stamped
       // on insert, preserved on update) so partitioning survives moves.
-      await upsertTaskRowInTransaction(tx, task as unknown as Record<string, unknown>, context, layer.projectId);
+      /*
+      FNXC:TaskRowConcurrency 2026-10-07-21:40:
+      The move held a snapshot across awaits before this transaction; a full-row upsert wrote every column of it back over
+      whatever another process committed meanwhile. Merge-write it against its read baseline under the advisory lock above.
+      */
+      await mergeWriteTaskRowInTransaction(store, tx, task, context, layer.projectId);
 
       // U4 (flag-ON) parity with the SQLite branch below: write the
       // crash-safe transitionPending marker in the SAME transaction as the
@@ -1348,7 +1362,7 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
       });
     }
 
-    await store.writeTaskJsonFile(dir, task);
+    await publishCommittedTaskJson(store, dir, task);
 
     /*
     FNXC:MissionSymbolAdmission 2026-07-19-22:04:
@@ -1432,22 +1446,41 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
     pre-implementation lane is hold when one exists and intake otherwise.
     */
     if (fromColumn === (moveLifecycle?.review ?? "in-review") && toColumn === (moveLifecycle?.hold ?? moveLifecycle?.intake ?? "todo") && moveSource === "user") {
-      const handoffAccepted = await store.getCompletionHandoffAcceptedMarker(id);
-      const mergeRequest = await store.getMergeRequestRecordAsync(id);
-      if (handoffAccepted && mergeRequest && mergeRequest.state !== "succeeded" && mergeRequest.state !== "cancelled") {
-        if (mergeRequest.state === "queued" || mergeRequest.state === "running" || mergeRequest.state === "retrying" || mergeRequest.state === "manual-required") {
-          await store.transitionMergeRequestState(id, "cancelled", {
-            attemptCount: mergeRequest.attemptCount,
-            lastError: mergeRequest.lastError ?? "cancelled-by-user-hard-cancel",
+      /*
+      FNXC:WorkflowTaskCancellation 2026-10-07-21:40:
+      The move is committed by now, so this merge cleanup is best-effort like the continuation cleanup below. Two of these
+      calls were fire-and-forget: a rejection became an unhandled rejection, which the process supervisor treats as fatal,
+      and an awaited failure rejected a move that had already landed. Each step is awaited and logged on failure.
+      */
+      const hardCancelCleanup = async (phase: string, step: () => Promise<unknown>): Promise<void> => {
+        try {
+          await step();
+        } catch (err) {
+          storeLog.warn("Operator hard-cancel merge cleanup failed (degraded)", {
+            phase,
+            taskId: id,
+            error: err instanceof Error ? err.message : String(err),
           });
         }
-      }
-      void store.cancelActiveWorkflowWorkItemsForTask(id, {
+      };
+      await hardCancelCleanup("moveTaskInternal:cancel-merge-request", async () => {
+        const handoffAccepted = await store.getCompletionHandoffAcceptedMarker(id);
+        const mergeRequest = await store.getMergeRequestRecordAsync(id);
+        if (handoffAccepted && mergeRequest && mergeRequest.state !== "succeeded" && mergeRequest.state !== "cancelled") {
+          if (mergeRequest.state === "queued" || mergeRequest.state === "running" || mergeRequest.state === "retrying" || mergeRequest.state === "manual-required") {
+            await store.transitionMergeRequestState(id, "cancelled", {
+              attemptCount: mergeRequest.attemptCount,
+              lastError: mergeRequest.lastError ?? "cancelled-by-user-hard-cancel",
+            });
+          }
+        }
+      });
+      await hardCancelCleanup("moveTaskInternal:cancel-merge-work-items", () => store.cancelActiveWorkflowWorkItemsForTask(id, {
         kinds: ["merge", "manual-hold"],
         now: movedAt,
         lastError: "cancelled-by-user-hard-cancel",
-      });
-      void store.clearCompletionHandoffAcceptedMarker(id);
+      }));
+      await hardCancelCleanup("moveTaskInternal:clear-handoff-marker", () => store.clearCompletionHandoffAcceptedMarker(id));
     }
     if (toColumn === (moveLifecycle?.hold ?? moveLifecycle?.intake ?? "todo") && moveSource === "user" && (fromIsImplementation || fromColumn === (moveLifecycle?.review ?? "in-review"))) {
       // FNXC:WorkflowTaskCancellation 2026-07-21-11:51:
