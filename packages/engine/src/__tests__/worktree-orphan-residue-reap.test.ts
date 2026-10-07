@@ -6,6 +6,10 @@ The startup reaper now reclaims such residue only when ownership and abandonment
 git: it sits directly under a worktrees root inside the project, has no `.git`, is not registered, is
 old enough not to be a checkout mid-creation, carries no secret material, and NO task row (any column,
 archived, or soft-deleted) references it. Real filesystem and real git; the store is a double.
+
+FNXC:WorktreeOrphanReap 2026-10-07-19:23:
+Abandonment is not disposability: the folder must also carry the marker a deletion-authorized removal wrote when it could not finish.
+The fixture marks residue by default so each guard below is tested on its own; the unmarked cases prove preservation.
 */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -13,6 +17,7 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { reapOrphanWorktrees, ORPHAN_RESIDUE_MIN_AGE_MS } from "../worktree/worktree-pool.js";
+import { CHECKOUT_REMOVAL_RESIDUE_MARKER } from "../worktree/remove-checkout.js";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
 
 const tracked: string[] = [];
@@ -31,11 +36,12 @@ function project(): string {
   return root;
 }
 
-/** A half-deleted checkout: files left behind, no `.git`, aged past the creation window. */
-function residue(root: string, name = "fn-x", ageMs = ORPHAN_RESIDUE_MIN_AGE_MS + 60_000): string {
+/** A half-deleted checkout: files left behind, no `.git`, aged past the creation window, marked by the removal unless `marked` is false. */
+function residue(root: string, name = "fn-x", ageMs = ORPHAN_RESIDUE_MIN_AGE_MS + 60_000, marked = true): string {
   const dir = join(root, ".fusion", "worktrees", name);
   mkdirSync(join(dir, "locked"), { recursive: true });
   writeFileSync(join(dir, "locked", "file.txt"), "left behind\n");
+  if (marked) writeFileSync(join(dir, CHECKOUT_REMOVAL_RESIDUE_MARKER), "{}\n");
   const when = new Date(Date.now() - ageMs);
   utimesSync(dir, when, when);
   return dir;
@@ -55,6 +61,26 @@ describe("reapOrphanWorktrees reclaims unreferenced checkout residue", () => {
 
     expect(existsSync(dir)).toBe(false);
     expect(tasks.listTasks).toHaveBeenCalledWith(expect.objectContaining({ includeArchived: true, includeDeleted: true }));
+  });
+
+  it("preserves an aged unreferenced .git-less folder that no deletion-authorized removal marked", async () => {
+    const root = project();
+    const dir = residue(root, "fn-x", ORPHAN_RESIDUE_MIN_AGE_MS + 60_000, false);
+
+    await expect(reapOrphanWorktrees(root, {}, { store: store() })).resolves.toBe(0);
+    expect(existsSync(join(dir, "locked", "file.txt"))).toBe(true);
+  });
+
+  it.each([
+    ["unmarked", false, 0],
+    ["marked", true, 1],
+  ] as const)("treats a %s dangling-gitdir folder by its removal marker", async (_label, marked, expected) => {
+    const root = project();
+    const dir = residue(root, "fn-dangling", ORPHAN_RESIDUE_MIN_AGE_MS + 60_000, marked);
+    writeFileSync(join(dir, ".git"), `gitdir: ${join(root, ".git", "worktrees", "fn-dangling")}\n`);
+
+    await expect(reapOrphanWorktrees(root, {}, { store: store() })).resolves.toBe(expected);
+    expect(existsSync(join(dir, "locked", "file.txt"))).toBe(!marked);
   });
 
   it.each([

@@ -63,6 +63,9 @@ import { removeWorktree, RemovalReason } from "../worktree/worktree-backend.js";
 import { releasePreExecutionWorktree } from "../executor/release-pre-execution-worktree.js";
 import { cleanupLandedTaskWorktree } from "../merge/post-landing-worktree-cleanup.js";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
+import { isAuthorizedCheckoutResidue } from "../worktree/remove-checkout.js";
+import { installBaselineArchiveWorktreeDisposer } from "../healing/archive-worktree-disposer-install.js";
+import { getArchiveWorktreeDisposer, type TaskStore } from "@fusion/core";
 
 const tracked: string[] = [];
 
@@ -262,5 +265,108 @@ describe("callers clear their worktree pointer after a settled partial removal",
       taskId: "FN-X", source: "ai-merge-finalize", classification: "incomplete", phase: "during-removal", residual: false,
     });
     expect(store.logEntry).toHaveBeenCalledWith("FN-X", "Post-landing worktree cleanup partially removed", expect.stringContaining("residual files deleted"));
+  });
+});
+
+/*
+FNXC:WorktreeCleanup 2026-10-07-19:23:
+Explicit force teardown is deletion authority by itself. A folder that was already `.git`-less or dangling made git exit "is not a working tree" and every force caller (hard cancel, dispose, archive) kept its pointer to unreapable residue.
+Force still never deletes a `.git` directory or a live link, and residue it cannot finish is marked so the startup reaper may reclaim it.
+*/
+describe("force teardown settles pre-existing residue", () => {
+  const forceReasons = [
+    RemovalReason.HardCancel,
+    RemovalReason.ExecutorDispose,
+    RemovalReason.ExecutorTransientRetry,
+    RemovalReason.ExecutorStuckKilled,
+    RemovalReason.WorkspaceAcquireRollback,
+  ];
+
+  for (const reason of forceReasons) {
+    it(`${reason}: removes a folder that was already .git-less before the call`, async () => {
+      const { root, worktree } = fixture();
+      rmSync(join(worktree, ".git"), { force: true });
+      gitScript.onRemove = () => { throw gitFailure(`fatal: '${worktree}' is not a working tree`); };
+
+      const outcome = await removeWorktree({ rootDir: root, worktreePath: worktree, settings: {}, taskId: "FN-X", reason, force: true });
+
+      expect(outcome).toMatchObject({ removed: true, classification: "partially-removed", checkoutState: "incomplete", residualRemoved: true });
+      expect(existsSync(worktree)).toBe(false);
+    });
+  }
+
+  it("removes a dangling-pointer folder under force", async () => {
+    const { root, worktree, adminDir } = fixture();
+    rmSync(adminDir, { recursive: true, force: true });
+    gitScript.onRemove = () => { throw gitFailure(`fatal: '${worktree}' is not a working tree`); };
+
+    const outcome = await removeWorktree({ rootDir: root, worktreePath: worktree, settings: {}, reason: RemovalReason.HardCancel, force: true });
+
+    expect(outcome).toMatchObject({ removed: true, checkoutState: "unregistered", residualRemoved: true });
+    expect(existsSync(worktree)).toBe(false);
+  });
+
+  it("marks residue force teardown could not finish so the reaper may reclaim it", async () => {
+    const { root, worktree } = fixture();
+    rmSync(join(worktree, ".git"), { force: true });
+    gitScript.onRemove = () => { throw gitFailure(`fatal: '${worktree}' is not a working tree`); };
+
+    const outcome = await removeWorktree({
+      rootDir: root, worktreePath: worktree, settings: {}, reason: RemovalReason.ExecutorDispose, force: true,
+      removeCheckoutResidue: async () => ({ removed: false }),
+    });
+
+    expect(outcome).toMatchObject({ removed: true, residualRemoved: false });
+    expect(await isAuthorizedCheckoutResidue(worktree)).toBe(true);
+  });
+
+  it("never deletes an independent repository under force", async () => {
+    const { root, worktree } = fixture();
+    rmSync(join(worktree, ".git"), { force: true });
+    mkdirSync(join(worktree, ".git"));
+    const failure = gitFailure(`fatal: '${worktree}' is not a working tree`);
+    gitScript.onRemove = () => { throw failure; };
+
+    await expect(removeWorktree({ rootDir: root, worktreePath: worktree, settings: {}, reason: RemovalReason.ExecutorDispose, force: true })).rejects.toBe(failure);
+    expect(existsSync(join(worktree, "feature.txt"))).toBe(true);
+  });
+
+  it("archive baseline disposer clears the pointer and removes a .git-less checkout", async () => {
+    const { root, worktree } = fixture();
+    rmSync(join(worktree, ".git"), { force: true });
+    gitScript.onRemove = () => { throw gitFailure(`fatal: '${worktree}' is not a working tree`); };
+    const store = { rootDir: root, getTaskWorkflowSelectionAsync: async () => undefined } as unknown as TaskStore;
+    const unregister = installBaselineArchiveWorktreeDisposer(store, { rootDir: root, getSettings: async () => ({}) });
+    try {
+      const task = { id: "FN-X", column: "done", worktree } as { id: string; column: string; worktree?: string };
+      await getArchiveWorktreeDisposer(store)!(task as never, {} as never);
+      expect(task.worktree).toBeUndefined();
+      expect(existsSync(worktree)).toBe(false);
+    } finally {
+      unregister();
+    }
+  });
+});
+
+describe("unfinished defensive residue carries deletion authority forward", () => {
+  it("marks residue a content-proven removal could not finish", async () => {
+    const { root, worktree, adminDir } = fixture();
+    gitScript.onRemove = () => halfDelete(worktree, adminDir);
+
+    await removeWorktree({
+      rootDir: root, worktreePath: worktree, settings: {}, taskId: "FN-X", reason: RemovalReason.StepSessionCleanup,
+      removeCheckoutResidue: async () => ({ removed: false }),
+    });
+
+    expect(await isAuthorizedCheckoutResidue(worktree)).toBe(true);
+  });
+
+  it("does not mark a checkout that was already unusable before a defensive removal", async () => {
+    const { root, worktree } = fixture();
+    rmSync(join(worktree, ".git"), { force: true });
+    gitScript.onRemove = () => { throw gitFailure(`fatal: '${worktree}' is not a working tree`); };
+
+    await expect(removeWorktree({ rootDir: root, worktreePath: worktree, settings: {}, reason: RemovalReason.SelfHealingReclaim })).rejects.toThrow();
+    expect(await isAuthorizedCheckoutResidue(worktree)).toBe(false);
   });
 });

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { resolve } from "node:path";
 import "./executor-test-helpers.js";
 import { detectNestedWorktreeRoot } from "../worktree/worktree-pool.js";
 import { mockedExecSync, mockedExistsSync, resetExecutorMocks } from "./executor-test-helpers.js";
@@ -18,7 +19,8 @@ describe("detectNestedWorktreeRoot", () => {
     });
 
     const result = await detectNestedWorktreeRoot("/repo", "/repo/.worktrees/gentle-flame/packages/core");
-    expect(result).toEqual({ reanchored: true, root: "/repo/.worktrees/gentle-flame" });
+    // The root is the canonical absolute path: identical on POSIX, drive-qualified on win32.
+    expect(result).toEqual({ reanchored: true, root: resolve("/repo/.worktrees/gentle-flame") });
   });
 
   it("does not re-anchor when git top-level is repo root", async () => {

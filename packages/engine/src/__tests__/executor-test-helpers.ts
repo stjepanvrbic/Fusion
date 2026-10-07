@@ -374,7 +374,11 @@ vi.mock("node:child_process", async () => {
 });
 vi.mock("node:fs", () => ({
   existsSync: vi.fn().mockReturnValue(true),
-  realpathSync: vi.fn((path: string) => path),
+  // `.native` delegates to the mock so core path identity (which uses realpathSync.native) follows per-test realpath stubs.
+  realpathSync: (() => {
+    const realpath = vi.fn((path: string) => path);
+    return Object.assign(realpath, { native: (path: string) => realpath(path) });
+  })(),
   lstatSync: vi.fn(() => ({ isSymbolicLink: () => false, isDirectory: () => true, isFile: () => true })),
   statSync: vi.fn(() => ({ isDirectory: () => true, isFile: () => true })),
   mkdirSync: vi.fn(),

@@ -1,8 +1,8 @@
 import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, lstatSync, readdirSync, readFileSync, rmdirSync, realpathSync, rmSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve, isAbsolute } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, rmdirSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { Settings, TaskStore, WorktrunkSettings, WorkspaceWorktreeContext } from "@fusion/core";
 import { worktreePoolLog } from "../logger.js";
 /*
@@ -16,11 +16,10 @@ import {
   removeWorktree as removeWorktreeViaBackend,
 } from "./worktree-backend.js";
 import { pruneWorktreeAdminEntries } from "./worktree-prune.js";
-import { resolveWorkflowIrForTask, columnsWithFlag, isStrictDescendantPath, WORKSPACE_GROUP_MARKER_FILENAME } from "@fusion/core";
+import { resolveWorkflowIrForTask, columnsWithFlag, isStrictDescendantPath, WORKSPACE_GROUP_MARKER_FILENAME, canonicalizePath as canonicalizePathIdentity, isSamePath, pathIdentityKey } from "@fusion/core";
 import { FINGERPRINT_FILE } from "./secrets-env-writer.js";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
-import { inspectCheckoutGitEntry } from "./remove-checkout.js";
-import { removeDirectoryWithRetry } from "./worktree-removal-retry.js";
+import { isAuthorizedCheckoutResidue, removeAuthorizedCheckoutResidue } from "./remove-checkout.js";
 
 export {
   NativeWorktreeBackend,
@@ -68,36 +67,32 @@ export function clearWorktrunkBinaryCache(): void {
   _worktrunkBinaryCache.clear();
 }
 
+/*
+FNXC:WorktreeLiveness 2026-07-15-11:55:
+On macOS, /tmp is a symlink to /private/tmp. realpathSync of an existing worktrees
+root yields /private/tmp/... while resolve() of a not-yet-created child stays under
+/tmp/... — relative() then looks like a path escape and isInsideConfiguredWorktreesDir
+falsely reports outside_worktrees_dir (restart.integration resumeOrphaned).
+When the leaf is missing, realpath the nearest existing ancestor and rejoin the suffix.
+
+FNXC:PathIdentity 2026-10-07-19:23:
+Two spellings of one directory are one worktree identity on every platform.
+The JS `realpathSync` kept the caller's case, while git prints on-disk case, so a project registered as `C:\users\x` made the registered main checkout look like a different directory: the nested guard refused every creation and a live task worktree read as unregistered and was deleted.
+This delegates to the shared core canonicalizer (`realpathSync.native`, on-disk case); equality and set membership go through `isSamePath` / `pathIdentityKey`, never raw string comparison.
+*/
 export function canonicalizePath(path: string): string {
-  /*
-  FNXC:WorktreeLiveness 2026-07-15-11:55:
-  On macOS, /tmp is a symlink to /private/tmp. realpathSync of an existing worktrees
-  root yields /private/tmp/... while resolve() of a not-yet-created child stays under
-  /tmp/... — relative() then looks like a path escape and isInsideConfiguredWorktreesDir
-  falsely reports outside_worktrees_dir (restart.integration resumeOrphaned).
-  When the leaf is missing, realpath the nearest existing ancestor and rejoin the suffix.
-  */
-  try {
-    return realpathSync(path);
-  } catch {
-    let dir = resolve(path);
-    const suffix: string[] = [];
-    while (true) {
-      try {
-        return resolve(realpathSync(dir), ...suffix.reverse());
-      } catch {
-        const parent = dirname(dir);
-        if (parent === dir) break;
-        suffix.push(basename(dir));
-        dir = parent;
-      }
-    }
-    return resolve(path);
-  }
+  return canonicalizePathIdentity(path);
 }
 
 export function isRepoRootPath(rootDir: string, candidate: string): boolean {
-  return canonicalizePath(rootDir) === canonicalizePath(candidate);
+  return isSamePath(rootDir, candidate);
+}
+
+/** Identity keys for a set of paths; compare with `pathIdentityKey(candidate)`. */
+function identityKeys(paths: Iterable<string>): Set<string> {
+  const keys = new Set<string>();
+  for (const path of paths) keys.add(pathIdentityKey(path));
+  return keys;
 }
 
 function getExecStdout(result: unknown): string {
@@ -179,7 +174,25 @@ export async function isGitRepository(dir: string): Promise<boolean> {
   return (await detectGitRepository(dir)).status === "repo";
 }
 
+/**
+ * `git worktree list` could not run, so registration is unknown.
+ * Distinct from an empty list: callers must never read it as "unregistered".
+ */
+export class WorktreeRegistrationUnknownError extends Error {
+  constructor(public readonly rootDir: string, cause: unknown) {
+    super(`unable to list registered worktrees for ${rootDir}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "WorktreeRegistrationUnknownError";
+  }
+}
+
+/*
+FNXC:WorktreeLiveness 2026-10-07-19:23:
+Registration is tri-state: registered, unregistered, or unknown.
+A failed `git worktree list` (timeout, index or config lock, dubious ownership, AV-slowed git) used to return an empty list, so creation `rm -rf`ed a live worktree as "not registered" and post-landing cleanup cleared live pointers.
+The probe now throws `WorktreeRegistrationUnknownError`; every derived lister propagates it and no caller may act destructively on it.
+*/
 export async function describeRegisteredWorktrees(rootDir: string): Promise<{ rawOutput: string; canonicalized: string[] }> {
+  let stdout: string;
   try {
     const result = await execAsync("git worktree list --porcelain", {
       cwd: rootDir,
@@ -187,21 +200,21 @@ export async function describeRegisteredWorktrees(rootDir: string): Promise<{ ra
       timeout: 10_000,
       maxBuffer: 10 * 1024 * 1024,
     });
-    const stdout = getExecStdout(result);
-
-    const canonicalized: string[] = [];
-    for (const line of stdout.split("\n")) {
-      if (line.startsWith("worktree ")) {
-        canonicalized.push(canonicalizePath(line.slice("worktree ".length)));
-      }
-    }
-
-    return { rawOutput: stdout, canonicalized };
+    stdout = getExecStdout(result);
   } catch (err: unknown) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    worktreePoolLog.warn(`[worktree-pool] Failed to list registered worktrees: ${errorMessage}`);
-    return { rawOutput: "", canonicalized: [] };
+    const error = new WorktreeRegistrationUnknownError(rootDir, err);
+    worktreePoolLog.warn(`[worktree-pool] ${error.message}`);
+    throw error;
   }
+
+  const canonicalized: string[] = [];
+  for (const line of stdout.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      canonicalized.push(canonicalizePath(line.slice("worktree ".length).trim()));
+    }
+  }
+
+  return { rawOutput: stdout, canonicalized };
 }
 
 export async function getRegisteredWorktreePaths(rootDir: string): Promise<Set<string>> {
@@ -251,8 +264,9 @@ export async function getRegisteredWorktreeBranches(rootDir: string): Promise<Ar
   return entries;
 }
 
+/** Throws `WorktreeRegistrationUnknownError` when registration cannot be read. */
 export async function isRegisteredGitWorktree(rootDir: string, worktreePath: string): Promise<boolean> {
-  return (await getRegisteredWorktreePaths(rootDir)).has(canonicalizePath(worktreePath));
+  return identityKeys(await getRegisteredWorktreePaths(rootDir)).has(pathIdentityKey(worktreePath));
 }
 
 export function hasRequiredWorktreeFiles(worktreePath: string): boolean {
@@ -306,7 +320,11 @@ export async function isInsideGitWorkTree(worktreePath: string): Promise<boolean
   }
 }
 
-export type TaskWorktreeClassification = "missing" | "incomplete" | "repo-root" | "unregistered" | "outside-work-tree";
+/**
+ * `registration-unknown`: the checkout carries `.git` but `git worktree list` failed, so registration is unproven either way.
+ * It is never residue and never authorizes deletion or pointer clearing.
+ */
+export type TaskWorktreeClassification = "missing" | "incomplete" | "repo-root" | "unregistered" | "registration-unknown" | "outside-work-tree";
 
 export type TaskWorktreeClassificationResult =
   | { ok: true }
@@ -350,11 +368,11 @@ export async function detectNestedWorktreeRoot(
   }
 
   const canonicalTopLevel = canonicalizePath(topLevelRaw);
-  if (canonicalTopLevel === canonicalWorktreePath) {
+  if (isSamePath(canonicalTopLevel, canonicalWorktreePath)) {
     return { reanchored: false, reason: "already_at_toplevel" };
   }
 
-  if (canonicalTopLevel === canonicalRootDir) {
+  if (isSamePath(canonicalTopLevel, canonicalRootDir)) {
     return { reanchored: false, reason: "toplevel_is_repo_root" };
   }
 
@@ -368,7 +386,13 @@ export async function detectNestedWorktreeRoot(
     return { reanchored: false, reason: "not_nested_under_toplevel" };
   }
 
-  if (!await isRegisteredGitWorktree(rootDir, canonicalTopLevel)) {
+  let topLevelRegistered: boolean;
+  try {
+    topLevelRegistered = await isRegisteredGitWorktree(rootDir, canonicalTopLevel);
+  } catch (error) {
+    return { reanchored: false, reason: `registration_probe_failed:${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (!topLevelRegistered) {
     return { reanchored: false, reason: "toplevel_not_registered_worktree" };
   }
 
@@ -394,7 +418,14 @@ export async function classifyTaskWorktree(rootDir: string, worktreePath: string
   if (!hasRequiredWorktreeFiles(worktreePath)) {
     return { ok: false, classification: "incomplete", reason: "missing .git metadata" };
   }
-  if (!await isRegisteredGitWorktree(rootDir, worktreePath)) {
+  let registered: boolean;
+  try {
+    registered = await isRegisteredGitWorktree(rootDir, worktreePath);
+  } catch (error) {
+    if (!(error instanceof WorktreeRegistrationUnknownError)) throw error;
+    return { ok: false, classification: "registration-unknown", reason: error.message };
+  }
+  if (!registered) {
     return { ok: false, classification: "unregistered", reason: "not registered in git worktree list" };
   }
   if (!await isInsideGitWorkTree(worktreePath)) {
@@ -542,8 +573,15 @@ export async function scanIdleWorktrees(
   ))).filter((dir): dir is string => dir !== null);
   if (dirs.length === 0) return [];
 
-  const registeredWorktrees = await getRegisteredWorktreePaths(rootDir);
-  const registeredDirs = dirs.filter((dir) => registeredWorktrees.has(resolve(dir)));
+  let registeredWorktrees: Set<string>;
+  try {
+    registeredWorktrees = identityKeys(await getRegisteredWorktreePaths(rootDir));
+  } catch (error) {
+    // Unknown registration proves nothing idle; reclaim waits for a readable probe.
+    if (error instanceof WorktreeRegistrationUnknownError) return [];
+    throw error;
+  }
+  const registeredDirs = dirs.filter((dir) => registeredWorktrees.has(pathIdentityKey(dir)));
 
   // Find worktree paths assigned to non-done tasks (active worktrees)
   const tasks = await store.listTasks({ slim: true, includeArchived: false, startupMemo: true });
@@ -575,8 +613,8 @@ export async function scanIdleWorktrees(
   const isUnfinished = (task: { id: string; column: string }) =>
     completeByTaskId.get(task.id)?.has(task.column) !== true;
   for (const task of tasks) {
-    if (task.worktree && isUnfinished(task) && registeredWorktrees.has(resolve(task.worktree))) {
-      activeWorktrees.add(resolve(task.worktree));
+    if (task.worktree && isUnfinished(task) && registeredWorktrees.has(pathIdentityKey(task.worktree))) {
+      activeWorktrees.add(pathIdentityKey(task.worktree));
     } else if (task.worktree && isUnfinished(task)) {
       worktreePoolLog.debug(`Ignoring task ${task.id} worktree metadata because it is not a registered git worktree: ${task.worktree}`);
     }
@@ -585,7 +623,7 @@ export async function scanIdleWorktrees(
   // Return registered worktrees on disk that are NOT active. Unregistered
   // directories are intentionally excluded here so recycle mode never adds a
   // broken directory to the warm pool; cleanup handles those separately.
-  const idle = registeredDirs.filter((dir) => !activeWorktrees.has(resolve(dir)));
+  const idle = registeredDirs.filter((dir) => !activeWorktrees.has(pathIdentityKey(dir)));
   if (!options?.isPathLive) return idle;
   const liveness = await Promise.all(idle.map(async (dir) => ({ dir, live: await options.isPathLive!(dir) })));
   return liveness.filter(({ live }) => !live).map(({ dir }) => dir);
@@ -614,8 +652,15 @@ export async function cleanupOrphanedWorktrees(
     return 0;
   }
   const scanRoots = resolveWorktreesDirScanRoots(rootDir, settings);
+  let registeredWorktrees: Set<string>;
+  try {
+    registeredWorktrees = identityKeys(await getRegisteredWorktreePaths(rootDir));
+  } catch (error) {
+    if (!(error instanceof WorktreeRegistrationUnknownError)) throw error;
+    worktreePoolLog.warn(`cleanupOrphanedWorktrees: skipped — ${error.message}`);
+    return 0;
+  }
   const orphaned = await scanIdleWorktrees(rootDir, store, settings);
-  const registeredWorktrees = await getRegisteredWorktreePaths(rootDir);
 
   const dirs: string[] = [];
   for (const worktreesDir of scanRoots) {
@@ -633,13 +678,13 @@ export async function cleanupOrphanedWorktrees(
   const ownedDirs = (await Promise.all(dirs.map(async (dir) =>
     (await isReclaimableWorktreeCandidate(dir, { rootDir })) ? dir : null,
   ))).filter((dir): dir is string => dir !== null);
-  const unregistered = ownedDirs.filter((dir) => !registeredWorktrees.has(resolve(dir)));
-  const candidates = [...new Map([...orphaned, ...unregistered].map((path) => [resolve(path), path])).values()];
+  const unregistered = ownedDirs.filter((dir) => !registeredWorktrees.has(pathIdentityKey(dir)));
+  const candidates = [...new Map([...orphaned, ...unregistered].map((path) => [pathIdentityKey(path), path])).values()];
   let cleaned = 0;
 
   for (const worktreePath of candidates) {
     try {
-      if (registeredWorktrees.has(resolve(worktreePath))) {
+      if (registeredWorktrees.has(pathIdentityKey(worktreePath))) {
         await removeWorktreeViaBackend({
           rootDir,
           worktreePath,
@@ -767,9 +812,9 @@ async function listReferencedWorktreePaths(store: Pick<TaskStore, "listTasks">):
   const tasks = await store.listTasks({ slim: true, includeArchived: true, includeDeleted: true });
   const referenced = new Set<string>();
   for (const task of tasks) {
-    if (task.worktree) referenced.add(canonicalizePath(task.worktree));
+    if (task.worktree) referenced.add(pathIdentityKey(task.worktree));
     for (const entry of Object.values(task.workspaceWorktrees ?? {})) {
-      if (entry?.worktreePath) referenced.add(canonicalizePath(entry.worktreePath));
+      if (entry?.worktreePath) referenced.add(pathIdentityKey(entry.worktreePath));
     }
   }
   return referenced;
@@ -784,6 +829,10 @@ worktrees root that is itself inside this project (a shared external root may ho
 folders), no `.git` entry, not registered, no workspace marker, no secret material, no live session,
 older than ORPHAN_RESIDUE_MIN_AGE_MS, and no task row in any column — archived and soft-deleted rows
 included — naming it as its worktree or a workspace member path. Any unreadable proof fails closed.
+
+FNXC:WorktreeOrphanReap 2026-10-07-19:23:
+Abandonment is not disposability. A folder is deleted only when it also carries the residue marker written by a removal that held deletion authority (see `CHECKOUT_REMOVAL_RESIDUE_MARKER`).
+A `.git`-less folder post-landing cleanup reported as already unusable, or an operator's copy without `.git`, carries no marker and is preserved.
 */
 async function reapUnreferencedCheckoutResidue(
   projectRoot: string,
@@ -809,7 +858,8 @@ async function reapUnreferencedCheckoutResidue(
     const canonicalFull = canonicalizePath(resolvedFull);
     if (!isStrictDescendantPath(canonicalProjectRoot, canonicalizePath(scanRoot))) continue;
     if (!isInsideWorktreesDir(projectRoot, resolvedFull, settings)) continue;
-    if (registered.has(resolvedFull) || registered.has(canonicalFull) || referenced.has(canonicalFull)) continue;
+    const identity = pathIdentityKey(resolvedFull);
+    if (registered.has(identity) || referenced.has(identity)) continue;
     if (activeSessionRegistry.isPathActive(resolvedFull) || activeSessionRegistry.isPathActive(canonicalFull)) continue;
     if (existsSync(join(resolvedFull, WORKSPACE_GROUP_MARKER_FILENAME))) continue;
     if (hasSensitiveWorktreeArtifacts(resolvedFull, settings?.secretsEnv?.filename)) {
@@ -823,12 +873,14 @@ async function reapUnreferencedCheckoutResidue(
       continue;
     }
     if (!(ageMs >= ORPHAN_RESIDUE_MIN_AGE_MS)) continue;
-    // Re-prove immediately before deletion: a `.git` written since the scan means a live checkout.
-    if (await inspectCheckoutGitEntry(resolvedFull) !== "absent") continue;
-
-    const removal = await removeDirectoryWithRetry({ path: resolvedFull, rm });
+    // Re-prove immediately before deletion: a `.git` written since the scan means a live checkout, and only marker-authorized residue may go.
+    if (!await isAuthorizedCheckoutResidue(resolvedFull)) {
+      worktreePoolLog.debug(`reapOrphanWorktrees: preserving residue ${name} (no deletion authority recorded by a removal)`);
+      continue;
+    }
+    const removal = await removeAuthorizedCheckoutResidue(resolvedFull, { source: "pool-reap-checkout-residue" });
     if (!removal.removed) {
-      worktreePoolLog.warn(`reapOrphanWorktrees: failed to remove checkout residue ${name} — ${removal.lastError ?? "unknown error"}`);
+      worktreePoolLog.warn(`reapOrphanWorktrees: failed to remove checkout residue ${name}`);
       continue;
     }
     await pruneWorktreeAdminEntries({
@@ -884,8 +936,15 @@ export async function reapOrphanWorktrees(
   ))).filter((entry): entry is OrphanDirEntry => entry !== null);
   if (entries.length === 0 && (residueCandidates.length === 0 || !options.store)) return 0;
 
-  // Get the set of paths registered with git
-  const registered = await getRegisteredWorktreePaths(projectRoot);
+  let registered: Set<string>;
+  try {
+    registered = identityKeys(await getRegisteredWorktreePaths(projectRoot));
+  } catch (error) {
+    // Every deletion below is gated on "not registered"; an unknown list can prove none of them.
+    if (!(error instanceof WorktreeRegistrationUnknownError)) throw error;
+    worktreePoolLog.warn(`reapOrphanWorktrees: skipped — ${error.message}`);
+    return 0;
+  }
 
   let removed = await reapUnreferencedCheckoutResidue(projectRoot, residueCandidates, registered, settings, options);
   for (const { name, fullPath } of entries) {
@@ -899,7 +958,7 @@ export async function reapOrphanWorktrees(
     }
 
     // Skip registered worktrees — those are managed by the normal lifecycle
-    if (registered.has(resolvedFull)) {
+    if (registered.has(pathIdentityKey(resolvedFull))) {
       continue;
     }
 
@@ -931,13 +990,18 @@ export async function reapOrphanWorktrees(
       continue;
     }
 
-    // This directory is on disk but has no valid .git entry, no sensitive artifacts, and is not a
-    // registered worktree — it is a half-initialized / leaked orphan. Remove its proven contents.
-    try {
-      rmSync(resolvedFull, { recursive: true, force: true });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      worktreePoolLog.warn(`reapOrphanWorktrees: failed to remove ${name} — ${msg}`);
+    /*
+    FNXC:WorktreeOrphanReap 2026-10-07-19:23:
+    A dangling `.git` proves the admin entry is gone, not that the files are disposable: a checkout whose entry was pruned while it held uncommitted work looks the same.
+    Only residue a deletion-authorized removal marked is removed; anything else is preserved for the operator.
+    */
+    if (!await isAuthorizedCheckoutResidue(resolvedFull)) {
+      worktreePoolLog.warn(`reapOrphanWorktrees: preserving ${name} (dangling .git pointer, no deletion authority recorded by a removal)`);
+      continue;
+    }
+    const removal = await removeAuthorizedCheckoutResidue(resolvedFull, { source: "pool-reap-orphan" });
+    if (!removal.removed) {
+      worktreePoolLog.warn(`reapOrphanWorktrees: failed to remove ${name}`);
       continue;
     }
     await pruneWorktreeAdminEntries({

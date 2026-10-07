@@ -61,10 +61,25 @@ import {
 } from "./worktree-dependency-install.js";
 import { getConfiguredWorktreeInitCommand } from "./dependency-bootstrap-inference.js";
 import { removeDirectoryWithRetry, retryTransientFilesystemOperation } from "./worktree-removal-retry.js";
-import { inspectCheckoutGitEntry, recordCheckoutRemovalPartial } from "./remove-checkout.js";
+import { isAuthorizedCheckoutResidue, recordCheckoutRemovalPartial, removeAuthorizedCheckoutResidue } from "./remove-checkout.js";
 
 const execAsync = bindPosixShell(promisify(exec));
 const PRESERVED_ORPHAN_RETENTION_COUNT = 10;
+
+/**
+ * Operator-actionable refusal for an unusable checkout that could be neither preserved aside nor proven disposable.
+ * Keeps the original errno `code` so callers' transient-failure classification is unchanged.
+ */
+function unpreservableCheckoutError(path: string, classification: string, preserveError: unknown): Error {
+  const code = (preserveError as NodeJS.ErrnoException | undefined)?.code;
+  const error = new Error(
+    `Cannot move unusable checkout ${path} (${classification}) aside${code ? ` (${code})` : ""}; its contents were never proven disposable, so it was not deleted. `
+      + "Close programs using that folder (terminals, editors, file explorers) and retry, or move it yourself.",
+    { cause: preserveError },
+  ) as NodeJS.ErrnoException;
+  if (code) error.code = code;
+  return error;
+}
 /** Errno codes a lingering handle produces on a rename-aside; EXDEV is deliberately excluded. */
 const TRANSIENT_RENAME_ASIDE_CODES = new Set(["EPERM", "EACCES", "EBUSY", "ENOTEMPTY"]);
 
@@ -424,6 +439,10 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
   retried; it keeps its cross-device fallback). If preservation still fails, a folder that is
   filesystem-proven residue (`.git` absent or a dangling `gitdir:` pointer) is deleted so recreation can
   proceed; anything else (a live link, an independent repository, an unreadable `.git`) keeps the error.
+
+  FNXC:TaskPinnedWorktrees 2026-10-07-19:23:
+  Failed preservation never grants deletion authority. A `.git`-less or dangling folder can still hold uncommitted work (an admin entry pruned by a crash, archive and restore, or `git worktree prune`), and an editor or terminal holding it open is exactly what makes the rename fail.
+  The fallback deletes only residue a deletion-authorized removal marked; otherwise acquisition fails with an operator-actionable error naming the folder, and retries preserve it once the holder closes.
   */
   const renameAsideWithRetry = async (from: string, to: string): Promise<void> => {
     const result = await retryTransientFilesystemOperation({
@@ -440,9 +459,12 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
     preserveError: unknown,
   ): Promise<boolean> => {
     if (!isTransientRenameAsideError(preserveError)) return false;
-    const state = await inspectCheckoutGitEntry(residuePath);
-    if (state !== "absent" && state !== "dangling") return false;
-    const removal = await removeDirectoryWithRetry({ path: residuePath, rm, sleep: opts.filesystemRetrySleep });
+    if (!await isAuthorizedCheckoutResidue(residuePath)) return false;
+    const removal = await removeAuthorizedCheckoutResidue(
+      residuePath,
+      { taskId: task.id, source },
+      (path) => removeDirectoryWithRetry({ path, rm, sleep: opts.filesystemRetrySleep }),
+    );
     await recordCheckoutRemovalPartial(audit, residuePath, {
       taskId: task.id, source, classification, phase: "pre-existing", residual: !removal.removed,
     });
@@ -1163,7 +1185,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
               }
             } catch (preserveError) {
               const residueClassification = classification.ok ? "unknown" : classification.classification;
-              if (!await deleteUnpreservableResidue(pinnedPath, residueClassification, "pinned-acquire", preserveError)) throw preserveError;
+              if (!await deleteUnpreservableResidue(pinnedPath, residueClassification, "pinned-acquire", preserveError)) throw unpreservableCheckoutError(pinnedPath, residueClassification, preserveError);
               preserved = false;
             }
             if (preserved) {
@@ -1282,7 +1304,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
       try {
         await renameAsideWithRetry(worktreePath, preservedPath);
       } catch (preserveError) {
-        if (!await deleteUnpreservableResidue(worktreePath, forcedClassification.classification, "workspace-acquire", preserveError)) throw preserveError;
+        if (!await deleteUnpreservableResidue(worktreePath, forcedClassification.classification, "workspace-acquire", preserveError)) throw unpreservableCheckoutError(worktreePath, forcedClassification.classification, preserveError);
         preserved = false;
       }
       if (preserved) {

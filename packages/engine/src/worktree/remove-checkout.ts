@@ -18,7 +18,7 @@ Deletion authority is narrow and filesystem-proven:
 The proof uses only async, bounded filesystem reads: no git subprocess, so a transient
 `git worktree list` failure can never masquerade as "unregistered" and authorize deletion.
 */
-import { lstat, readFile, rm } from "node:fs/promises";
+import { lstat, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { RunAuditor } from "../util/run-audit.js";
 import type { TaskWorktreeClassificationResult } from "./worktree-pool.js";
@@ -80,6 +80,74 @@ export async function inspectCheckoutGitEntry(worktreePath: string): Promise<Che
   } catch (error) {
     return errnoCode(error) === "ENOENT" ? "dangling" : "unknown";
   }
+}
+
+/*
+FNXC:WorktreeCleanup 2026-10-07-19:23:
+Deletion authority must survive a failed deletion. When a removal that held authority (content-proven clean, or explicit force) leaves residue it could not delete, it writes this marker into the residue.
+Later sweeps (startup reaper, pinned and workspace acquisition, creation) delete `.git`-less or dangling residue only when the marker is present.
+Unmarked residue, including folders post-landing cleanup reported as already unusable, is preserved: missing `.git` proves unusability, never that the files are disposable.
+*/
+export const CHECKOUT_REMOVAL_RESIDUE_MARKER = ".fusion-removal-residue";
+
+/** Best-effort: a marker that cannot be written leaves the residue preserved, which is the safe failure. */
+export async function markAuthorizedCheckoutResidue(
+  worktreePath: string,
+  metadata: { taskId?: string; source: string },
+): Promise<boolean> {
+  try {
+    await writeFile(
+      join(worktreePath, CHECKOUT_REMOVAL_RESIDUE_MARKER),
+      `${JSON.stringify({ ...metadata, markedAt: new Date().toISOString() })}\n`,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True only for residue a deletion-authorized removal left behind: marker present and no live `.git`. */
+export async function isAuthorizedCheckoutResidue(worktreePath: string): Promise<boolean> {
+  const state = await inspectCheckoutGitEntry(worktreePath);
+  if (state !== "absent" && state !== "dangling") return false;
+  try {
+    return (await lstat(join(worktreePath, CHECKOUT_REMOVAL_RESIDUE_MARKER))).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Deletes marker-authorized residue with the bounded retry.
+ * A partial failure re-writes the marker, because the deletion may have removed it while other files survived.
+ */
+export async function removeAuthorizedCheckoutResidue(
+  worktreePath: string,
+  metadata: { taskId?: string; source: string },
+  remover: CheckoutResidueRemover = defaultCheckoutResidueRemover,
+): Promise<{ removed: boolean }> {
+  if (!await isAuthorizedCheckoutResidue(worktreePath)) return { removed: false };
+  const result = await remover(worktreePath).catch(() => ({ removed: false }));
+  if (!result.removed && await inspectCheckoutGitEntry(worktreePath) !== "missing") {
+    await markAuthorizedCheckoutResidue(worktreePath, metadata);
+  }
+  return { removed: result.removed };
+}
+
+/**
+ * Rolls back a checkout directory THIS call created (a failed `git worktree add` or identity-guard install).
+ * Creation is deletion authority, so the bounded retry runs and surviving residue is marked; callers must never pass a path that existed before their create attempt.
+ */
+export async function rollbackCreatedCheckout(
+  worktreePath: string,
+  metadata: { taskId?: string; source: string },
+  remover: CheckoutResidueRemover = defaultCheckoutResidueRemover,
+): Promise<boolean> {
+  const result = await remover(worktreePath).catch(() => ({ removed: false }));
+  if (!result.removed && await inspectCheckoutGitEntry(worktreePath) !== "missing") {
+    await markAuthorizedCheckoutResidue(worktreePath, metadata);
+  }
+  return result.removed;
 }
 
 /** Residue whose deletion is filesystem-proven safe: no live checkout link and no independent repository. */
@@ -152,8 +220,11 @@ export type FailedCheckoutRemovalSettlement =
 export async function settleFailedCheckoutRemoval(input: {
   rootDir: string;
   worktreePath: string;
-  /** The caller proved the checkout usable immediately before this removal attempt. */
-  usableBefore: boolean;
+  /**
+   * This removal held deletion authority: the caller proved the checkout usable and content-clean immediately before it, or it is an explicit force teardown.
+   * Without it, residue is reported and preserved, never deleted.
+   */
+  deletionAuthorized: boolean;
   taskId?: string;
   source: string;
   pruneReason: string;
@@ -184,8 +255,10 @@ export async function settleFailedCheckoutRemoval(input: {
     return { outcome: "removed" };
   }
   if (!isCheckoutResidue(after)) return { outcome: "unresolved" };
+  // The classifier and the filesystem must agree that nothing live remains before a pointer is cleared or anything is deleted.
+  if (!isProvenResidue(fsState)) return { outcome: "unresolved" };
 
-  if (!input.usableBefore) {
+  if (!input.deletionAuthorized) {
     await pruneCheckoutAdminBestEffort(rootDir, worktreePath, audit, input.pruneReason);
     await recordCheckoutRemovalPartial(audit, worktreePath, {
       taskId: input.taskId, source: input.source, classification: after.classification, phase: "during-removal", residual: true,
@@ -193,11 +266,11 @@ export async function settleFailedCheckoutRemoval(input: {
     return { outcome: "residual-unusable", classification: after.classification };
   }
 
-  // The classifier and the filesystem must agree that nothing live remains before anything is deleted.
-  if (!isProvenResidue(fsState)) return { outcome: "unresolved" };
-
   const residual = await (input.removeResidue ?? defaultCheckoutResidueRemover)(worktreePath)
     .catch(() => ({ removed: false }));
+  if (!residual.removed && await inspectCheckoutGitEntry(worktreePath) !== "missing") {
+    await markAuthorizedCheckoutResidue(worktreePath, { taskId: input.taskId, source: input.source });
+  }
   await pruneCheckoutAdminBestEffort(rootDir, worktreePath, audit, input.pruneReason);
   await recordCheckoutRemovalPartial(audit, worktreePath, {
     taskId: input.taskId, source: input.source, classification: after.classification, phase: "during-removal", residual: !residual.removed,

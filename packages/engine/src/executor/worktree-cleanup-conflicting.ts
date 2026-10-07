@@ -6,7 +6,7 @@
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { removeAuthorizedCheckoutResidue } from "../worktree/remove-checkout.js";
 import { isFusionDeletableBranch, type Settings, type Task } from "@fusion/core";
 import {
   isInsideWorktreesDir,
@@ -166,13 +166,19 @@ export async function cleanupConflictingWorktree(
         executorLog.warn(`${taskId}: git worktree prune failed during stale-path cleanup of ${worktreePath}: ${pruneMsg}`);
       }
       // An orphan directory ("is not a working tree") won't be removed by prune — git
-      // doesn't track it. Force-remove the leftover dir so the colliding name is free.
-      if (existsSync(worktreePath)) {
-        try {
-          await rm(worktreePath, { recursive: true, force: true });
-        } catch (rmErr: unknown) {
-          const rmMsg = rmErr instanceof Error ? rmErr.message : String(rmErr);
-          executorLog.warn(`${taskId}: failed to remove orphan worktree directory ${worktreePath}: ${rmMsg}`);
+      // doesn't track it.
+      /*
+      FNXC:WorktreeCleanup 2026-10-07-19:23:
+      Pruning frees the branch; the leftover folder is deleted only when it is residue a deletion-authorized removal marked.
+      An unmarked orphan may hold uncommitted work whose admin entry was pruned, so it is preserved and reported rather than `rm -rf`ed.
+      */
+      let orphanDirectory: "absent" | "removed" | "preserved" = existsSync(worktreePath) ? "preserved" : "absent";
+      if (orphanDirectory === "preserved") {
+        const residue = await removeAuthorizedCheckoutResidue(worktreePath, { taskId, source: "conflicting-worktree-cleanup" });
+        if (residue.removed) {
+          orphanDirectory = "removed";
+        } else {
+          executorLog.warn(`${taskId}: preserved orphan worktree directory ${worktreePath} (no deletion authority recorded by a removal)`);
         }
       }
       if (task && isFusionDeletableBranch(task, branch)) {
@@ -185,7 +191,9 @@ export async function cleanupConflictingWorktree(
       }
       await deps.store.logEntry(
         taskId,
-        `Cleaned up stale conflicting worktree (no live worktree at path — pruned admin entry and removed orphan directory)`,
+        orphanDirectory === "preserved"
+          ? `Cleaned up stale conflicting worktree (no live worktree at path — pruned admin entry; preserved unproven orphan directory)`
+          : `Cleaned up stale conflicting worktree (no live worktree at path — pruned admin entry and removed orphan directory)`,
         worktreePath,
       );
       return true;

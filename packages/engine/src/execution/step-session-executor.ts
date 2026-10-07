@@ -16,7 +16,7 @@ import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
 import { existsSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { rollbackCreatedCheckout } from "../worktree/remove-checkout.js";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { AgentHeartbeatRun, AgentStore, MessageStore, PermanentAgentGatingContext, ProviderInstanceRef, ResolvedMcpServerDefinition, TaskDetail, Settings, SteeringComment, TaskStore, TaskStep } from "@fusion/core";
 import { isFastExecutionMode, isValidProviderInstanceId, resolvePersistAgentThinkingLog, resolveExecutorFallbackModel, resolveTrailingVerificationStepIndex, resolveAuthoredStepHeadingOffset, matchStepHeadings } from "@fusion/core";
@@ -2031,6 +2031,12 @@ Follow instructions precisely and avoid unrelated changes.`,
 
     stepExecLog.log(`Creating worktree for step ${stepIndex}: ${worktreePath} (branch: ${branchName})`);
 
+    /*
+    FNXC:StepSessionWorktree 2026-10-07-19:23:
+    Only a directory this call created is rolled back. `git worktree add` refuses an existing path, and the old catch then `rm -rf`ed whatever was there, including a previous step checkout with uncommitted work.
+    Rollback uses the bounded Windows retry and marks surviving residue so a later sweep may finish it.
+    */
+    const existedBefore = existsSync(worktreePath);
     try {
       await execAsync(
         `git worktree add -b "${branchName}" "${worktreePath}" HEAD`,
@@ -2039,9 +2045,8 @@ Follow instructions precisely and avoid unrelated changes.`,
     } catch (err) {
       // Remove any partial directory left behind so the invariant holds:
       // "if .worktrees/<slug> exists on disk, it is a fully registered git worktree."
-      try {
-        await rm(worktreePath, { recursive: true, force: true });
-      } catch {
+      if (!existedBefore && existsSync(worktreePath)
+        && !await rollbackCreatedCheckout(worktreePath, { taskId: taskDetail.id, source: "step-session-create-failed" })) {
         // best-effort cleanup; log but don't mask the original error
         stepExecLog.log(`Warning: failed to remove partial worktree directory after creation failure: ${worktreePath}`);
       }
@@ -2067,9 +2072,7 @@ Follow instructions precisely and avoid unrelated changes.`,
         commitAuthorEmail: settings.commitAuthorEmail,
       });
     } catch (err) {
-      try {
-        await rm(worktreePath, { recursive: true, force: true });
-      } catch {
+      if (!await rollbackCreatedCheckout(worktreePath, { taskId: taskDetail.id, source: "step-session-guard-failed" })) {
         stepExecLog.log(`Warning: failed to remove worktree after identity-guard install failure: ${worktreePath}`);
       }
       await pruneWorktreeAdminEntries({

@@ -11,6 +11,7 @@ import type { MergeWriteFence } from "./merge-write-fence.js";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
 import { canonicalizePath, classifyTaskWorktree, type TaskWorktreeClassificationResult } from "../worktree/worktree-pool.js";
 import {
+  inspectCheckoutGitEntry,
   isCheckoutResidue,
   pruneCheckoutAdminBestEffort,
   recordCheckoutRemovalPartial,
@@ -209,7 +210,15 @@ async function cleanupLandedWorktreePath(params: {
     if (before.classification === "missing") {
       return { kind: "settled", outcome: "nothing-to-remove", removed: false };
     }
-    if (isCheckoutResidue(before)) {
+    /*
+    FNXC:WorktreeCleanup 2026-10-07-19:23:
+    A classifier "unregistered" verdict is residue only when the filesystem agrees (`.git` absent or a dangling `gitdir:`).
+    A `.git` link that still resolves, or an unknown registration probe, falls through to `removeWorktree`, which re-probes; clearing the pointer on a transient `git worktree list` failure leaked a live checkout.
+    */
+    const fsState = isCheckoutResidue(before) ? await inspectCheckoutGitEntry(worktreePath) : undefined;
+    const fsAgreesResidue = fsState === "absent" || fsState === "dangling" || fsState === "missing";
+    const reprobeByRemoval = (isCheckoutResidue(before) && !fsAgreesResidue) || before.classification === "registration-unknown";
+    if (isCheckoutResidue(before) && fsAgreesResidue) {
       await pruneCheckoutAdminBestEffort(rootDir, worktreePath, input.audit, POST_LANDING_PRUNE_REASON);
       await recordCheckoutRemovalPartial(input.audit, worktreePath, {
         taskId, source: input.source, classification: before.classification, phase: "pre-existing", residual: true,
@@ -221,10 +230,12 @@ async function cleanupLandedWorktreePath(params: {
       );
       return { kind: "settled", outcome: "residual-unusable", removed: false };
     }
-    // repo-root / outside-work-tree: fail closed, never delete what cannot be proven a task checkout.
-    const preserved = { kind: "preserved" as const, outcome: "preserved-unverifiable" as const, reason: "unverifiable" };
-    await recordPreservedOutcome(logInput, worktreePath, { outcome: preserved.outcome, preservedReason: preserved.reason });
-    return preserved;
+    if (!reprobeByRemoval) {
+      // repo-root / outside-work-tree: fail closed, never delete what cannot be proven a task checkout.
+      const preserved = { kind: "preserved" as const, outcome: "preserved-unverifiable" as const, reason: "unverifiable" };
+      await recordPreservedOutcome(logInput, worktreePath, { outcome: preserved.outcome, preservedReason: preserved.reason });
+      return preserved;
+    }
   }
 
   const recordPartialRemoval = async (
@@ -287,7 +298,7 @@ async function cleanupLandedWorktreePath(params: {
       const settled = await recordSettlement(await settleFailedCheckoutRemoval({
         rootDir,
         worktreePath,
-        usableBefore: before?.ok === true,
+        deletionAuthorized: before?.ok === true,
         taskId,
         source: input.source,
         pruneReason: POST_LANDING_PRUNE_REASON,

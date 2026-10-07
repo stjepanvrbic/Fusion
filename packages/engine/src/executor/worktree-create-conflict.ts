@@ -6,7 +6,7 @@
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { readdir, rmdir } from "node:fs/promises";
 import type { Settings } from "@fusion/core";
 import { installTaskWorktreeIdentityGuard } from "../worktree/worktree-hooks.js";
 import { isInsideWorktreesDir } from "../worktree/worktree-pool.js";
@@ -14,6 +14,7 @@ import { inspectBranchConflict } from "../execution/branch-conflicts.js";
 import { resolveIntegrationBranch } from "../merge/integration-branch.js";
 import { executorLog } from "../logger.js";
 import { extractWorktreeConflictInfo } from "./worktree-conflict-info.js";
+import { removeAuthorizedCheckoutResidue, rollbackCreatedCheckout } from "../worktree/remove-checkout.js";
 import { assertWorktreePathNotNested, isRegisteredWorktree, NonRetryableWorktreeError } from "./worktree-registry-helpers.js";
 
 const execAsync = promisify(exec);
@@ -85,7 +86,15 @@ export async function tryCreateWorktree(
   // and confuse every tool that walks git state.
   await assertWorktreePathNotNested(deps.rootDir, deps.store, path, taskId);
 
-  const installGuardOrCleanup = async () => {
+  /*
+  FNXC:WorktreeCreation 2026-10-07-19:23:
+  A directory this call created is deleted through the bounded Windows retry, and residue that survives is marked so a later sweep may finish it.
+  A directory that pre-existed is deleted only when empty or marker-authorized residue; anything else is never proven disposable and is reported instead of `rm -rf`ed.
+  */
+  const removeCreatedCheckout = (): Promise<boolean> =>
+    rollbackCreatedCheckout(path, { taskId, source: "worktree-create-rollback" });
+
+  const installGuardOrCleanup = async (createdByThisCall: boolean) => {
     try {
       await installTaskWorktreeIdentityGuard({
         worktreePath: path,
@@ -99,32 +108,23 @@ export async function tryCreateWorktree(
         commitAuthorEmail: settings.commitAuthorEmail,
       });
     } catch (error) {
-      try {
-        await rm(path, { recursive: true, force: true });
-      } catch {
+      // An already-registered checkout may hold agent work; only a checkout this call created is rolled back.
+      if (createdByThisCall && !await removeCreatedCheckout()) {
         executorLog.log(`Warning: failed to remove worktree after identity-guard install failure: ${path}`);
       }
       throw error;
     }
   };
 
-  // If directory exists but is not a registered worktree, remove it first
+  // If directory exists but is not a registered worktree, remove it first.
+  // A registration probe that cannot run throws WorktreeRegistrationUnknownError: never read as "unregistered".
   if (existsSync(path)) {
     const isRegistered = await isRegisteredWorktree(deps.rootDir, path);
     if (!isRegistered) {
-      await deps.store.logEntry(
-        taskId,
-        `Removing existing directory (not a registered worktree): ${path}`,
-      );
-      try {
-        await rm(path, { recursive: true, force: true });
-      } catch (e: unknown) {
-        const eMessage = e instanceof Error ? e.message : String(e);
-        throw new Error(`Failed to remove existing directory ${path}: ${eMessage}`);
-      }
+      await removePreexistingUnregisteredDirectory(deps, path, taskId);
     } else {
       executorLog.debug(`Worktree already exists: ${path}`);
-      await installGuardOrCleanup();
+      await installGuardOrCleanup(false);
       return { path, branch };
     }
   }
@@ -138,9 +138,7 @@ export async function tryCreateWorktree(
     } catch (err) {
       // Remove any partial directory left behind so the invariant holds:
       // "if .worktrees/<slug> exists on disk, it is a fully registered git worktree."
-      try {
-        await rm(path, { recursive: true, force: true });
-      } catch {
+      if (existsSync(path) && !await removeCreatedCheckout()) {
         // best-effort cleanup; log but don't mask the original error
         executorLog.log(`Warning: failed to remove partial worktree directory after creation failure: ${path}`);
       }
@@ -154,9 +152,7 @@ export async function tryCreateWorktree(
     } catch (err) {
       // Remove any partial directory left behind so the invariant holds:
       // "if .worktrees/<slug> exists on disk, it is a fully registered git worktree."
-      try {
-        await rm(path, { recursive: true, force: true });
-      } catch {
+      if (existsSync(path) && !await removeCreatedCheckout()) {
         // best-effort cleanup; log but don't mask the original error
         executorLog.log(`Warning: failed to remove partial worktree directory after creation failure: ${path}`);
       }
@@ -172,7 +168,7 @@ export async function tryCreateWorktree(
     if (attemptNumber > 0) {
       await deps.store.logEntry(taskId, `Worktree created on attempt ${attemptNumber + 1}`, path);
     }
-    await installGuardOrCleanup();
+    await installGuardOrCleanup(true);
     return { path, branch };
   } catch (initialError: unknown) {
     const conflictInfo = extractWorktreeConflictInfo(initialError);
@@ -183,7 +179,7 @@ export async function tryCreateWorktree(
       if (recovered) {
         await createWithBranch(branch);
         executorLog.log(`Worktree created after stale lock recovery: ${path}`);
-        await installGuardOrCleanup();
+        await installGuardOrCleanup(true);
         return { path, branch };
       }
     }
@@ -194,7 +190,7 @@ export async function tryCreateWorktree(
       if (recovered) {
         await createWithBranch(branch);
         executorLog.log(`Worktree created after stale registration recovery: ${path}`);
-        await installGuardOrCleanup();
+        await installGuardOrCleanup(true);
         return { path, branch };
       }
     }
@@ -254,7 +250,7 @@ export async function tryCreateWorktree(
     try {
       await createFromExistingBranch();
       executorLog.log(`Worktree created from existing branch: ${path}`);
-      await installGuardOrCleanup();
+      await installGuardOrCleanup(true);
       return { path, branch };
     } catch (fallbackError: unknown) {
       const fallbackErrorMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
@@ -266,7 +262,7 @@ export async function tryCreateWorktree(
         if (recovered) {
           await createFromExistingBranch();
           executorLog.log(`Worktree created from existing branch after stale lock recovery: ${path}`);
-          await installGuardOrCleanup();
+          await installGuardOrCleanup(true);
           return { path, branch };
         }
       }
@@ -277,7 +273,7 @@ export async function tryCreateWorktree(
         if (recovered) {
           await createFromExistingBranch();
           executorLog.log(`Worktree created from existing branch after stale registration recovery: ${path}`);
-          await installGuardOrCleanup();
+          await installGuardOrCleanup(true);
           return { path, branch };
         }
       }
@@ -448,3 +444,34 @@ export async function handleWorktreeConflict(
   return null;
 }
 
+/**
+ * Deletes a pre-existing directory at the creation path only when nothing in it can be lost: it is empty, or it is residue a deletion-authorized removal marked.
+ * Otherwise creation stops with an actionable error; the folder is the operator's to inspect.
+ */
+async function removePreexistingUnregisteredDirectory(
+  deps: Pick<WorktreeCreateConflictDeps, "store">,
+  path: string,
+  taskId: string,
+): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await readdir(path);
+  } catch (e: unknown) {
+    throw new Error(`Failed to inspect existing directory ${path}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (entries.length === 0) {
+    await deps.store.logEntry(taskId, `Removing existing empty directory (not a registered worktree): ${path}`);
+    await rmdir(path);
+    return;
+  }
+  const residue = await removeAuthorizedCheckoutResidue(path, { taskId, source: "worktree-create-preexisting" });
+  if (residue.removed) {
+    await deps.store.logEntry(taskId, `Removed marked checkout residue (not a registered worktree): ${path}`);
+    return;
+  }
+  await deps.store.logEntry(taskId, `Preserved existing directory (not a registered worktree): ${path}`);
+  throw new NonRetryableWorktreeError(
+    `Refusing to delete existing directory ${path}: it is not a registered worktree and its contents were never proven disposable. `
+      + "Move or delete it, then retry the task.",
+  );
+}
