@@ -25,9 +25,17 @@ test("architecture self-healing section documents already-merged review recovery
 });
 
 test("task lifecycle docs describe preserved failed review state plus already-landed auto-finalization", () => {
+  /*
+  FNXC:TestInfrastructure 2026-10-07-18:04:
+  FN-9512 narrowed the preserved state to non-recoverable merge errors: recoverable stale-proof and fast-path exhaustion now reseed the merger in place instead of parking a manual failure.
+  */
   assert.ok(
-    taskManagementDoc.includes("This state is intentionally preserved by recovery (not auto-bounced to `todo`)."),
+    taskManagementDoc.includes("If merge/finalization hits a non-recoverable error, tasks can remain in `in-review` with `status: \"failed\"` for explicit follow-up."),
     "Expected task-management docs to preserve failed in-review tasks",
+  );
+  assert.ok(
+    taskManagementDoc.includes("reseed the normal merger in place; they are not converted to a manual failure."),
+    "Expected task-management docs to keep recoverable merge states on the merger",
   );
 
   assert.match(
