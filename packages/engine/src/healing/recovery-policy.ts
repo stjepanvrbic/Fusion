@@ -18,7 +18,10 @@
  * - ±10% jitter to avoid thundering-herd effects.
  * - Recovery metadata (`recoveryRetryCount`, `nextRecoveryAt`) is persisted on the task
  *   so retries survive engine restarts.
- * - Exhausted retry budgets escalate to a real failure (task marked failed or error set).
+ * - An exhausted ladder escalates. The first escalation in an episode is one fresh-session
+ *   reseed; the next exhaustion parks the card visibly (status failed, audited). The counter
+ *   is never reset by escalation, so the episode stays bounded until an operator retry or
+ *   completion clears it.
  *
  * **Not retried via this policy:**
  * - FNXC:ProviderRateLimitIsolation 2026-07-21-18:00: usage-limit errors
@@ -43,6 +46,13 @@ export const MAX_DELAY_MS = 300_000;
 /** Backoff multiplier (2x exponential). */
 export const BACKOFF_MULTIPLIER = 2;
 
+/**
+ * FNXC:RecoveryOwnership 2026-10-07-18:04:
+ * Fresh-session reseeds an owner may spend per recovery episode before it must park visibly.
+ * FN-9512 reset the counter on every escalation, so a deterministic failure re-armed the ladder forever.
+ */
+export const MAX_RECOVERY_RESEEDS = 1;
+
 // ── Types ────────────────────────────────────────────────────────────
 
 export interface RecoveryState {
@@ -51,6 +61,9 @@ export interface RecoveryState {
 }
 
 export type RecoveryDisposition = "retry" | "escalate";
+
+/** What an owner does with an exhausted ladder: spend a reseed, or park terminally. */
+export type RecoveryEscalation = "reseed" | "park";
 
 interface RecoveryDecisionBase {
   /** Updated recovery state to persist on the task. */
@@ -61,9 +74,11 @@ interface RecoveryDecisionBase {
 
 export interface RecoveryRetryDecision extends RecoveryDecisionBase {
   disposition: "retry";
-  /** Whether the task should be retried (moved back to todo/triage). */
+  /** Whether the task should be retried in its current lifecycle role. */
   shouldRetry: true;
   exhausted: false;
+  /** 1-based attempt within the current ladder, for operator-facing `attempt/max` copy. */
+  attempt: number;
 }
 
 export interface RecoveryEscalationDecision extends RecoveryDecisionBase {
@@ -71,6 +86,10 @@ export interface RecoveryEscalationDecision extends RecoveryDecisionBase {
   shouldRetry: false;
   /** The bounded retry owner must hand this failure to an operator-visible escalation. */
   exhausted: true;
+  /** `reseed` spends the episode's fresh-session reseed; `park` is the terminal, visible stop. */
+  escalation: RecoveryEscalation;
+  /** Recovery actions already spent in this episode (retries plus reseeds). */
+  attempts: number;
 }
 
 /**
@@ -82,6 +101,8 @@ export type RecoveryDecision = RecoveryRetryDecision | RecoveryEscalationDecisio
 export interface RecoveryPolicyOptions {
   /** Override the default budget for a recovery owner. */
   maxRetries?: number;
+  /** Reseeds allowed per episode before parking; defaults to `MAX_RECOVERY_RESEEDS`. */
+  reseedBudget?: number;
 }
 
 // ── Decision function ────────────────────────────────────────────────
@@ -101,27 +122,39 @@ export function computeRecoveryDecision(
   options: RecoveryPolicyOptions = {},
 ): RecoveryDecision {
   const maxRetries = options.maxRetries ?? MAX_RECOVERY_RETRIES;
-  const currentCount = currentState.recoveryRetryCount ?? 0;
-  const nextCount = currentCount + 1;
+  const reseedBudget = Math.max(0, options.reseedBudget ?? MAX_RECOVERY_RESEEDS);
+  const currentCount = Math.max(0, currentState.recoveryRetryCount ?? 0);
+  /*
+  FNXC:RecoveryOwnership 2026-10-07-18:04:
+  `recoveryRetryCount` counts every recovery action in the episode: each ladder holds `maxRetries`
+  retries followed by one reseed slot. The final ladder has no reseed slot, so the owner parks.
+  The FN-9512 escalation still never reads as a silent pause, but it is now bounded: an exhausted
+  owner either spends its single reseed or reports a terminal, operator-visible park.
+  */
+  const ladderLength = maxRetries + 1;
+  const totalActions = (reseedBudget + 1) * ladderLength - 1;
+  const ladderPosition = currentCount % ladderLength;
 
-  if (nextCount > maxRetries) {
-    /*
-    FNXC:RecoveryOwnership 2026-10-06-15:14:
-    FN-9512 requires every bounded recovery owner to surface exhaustion as an
-    explicit escalation, rather than leaving a card in an indistinguishable pause.
-    */
+  if (currentCount >= totalActions || ladderPosition === maxRetries) {
+    const escalation: RecoveryEscalation = currentCount >= totalActions ? "park" : "reseed";
     return {
       disposition: "escalate",
       shouldRetry: false,
       exhausted: true,
-      nextState: { recoveryRetryCount: undefined, nextRecoveryAt: undefined },
+      escalation,
+      attempts: currentCount,
+      nextState: {
+        recoveryRetryCount: escalation === "reseed" ? currentCount + 1 : currentCount,
+        nextRecoveryAt: undefined,
+      },
       delayMs: 0,
     };
   }
 
+  const attempt = ladderPosition + 1;
   // Exponential backoff: base × 2^(attempt-1), capped at max
   const rawDelay = Math.min(
-    BASE_DELAY_MS * BACKOFF_MULTIPLIER ** (nextCount - 1),
+    BASE_DELAY_MS * BACKOFF_MULTIPLIER ** (attempt - 1),
     MAX_DELAY_MS,
   );
 
@@ -135,12 +168,24 @@ export function computeRecoveryDecision(
     disposition: "retry",
     shouldRetry: true,
     exhausted: false,
+    attempt,
     nextState: {
-      recoveryRetryCount: nextCount,
+      recoveryRetryCount: currentCount + 1,
       nextRecoveryAt,
     },
     delayMs,
   };
+}
+
+/**
+ * FNXC:RecoveryOwnership 2026-10-07-18:04:
+ * True when the persisted counter says the owner already spent the episode's reseed and parked.
+ * Automatic re-entry points (restart recovery, unpause resume) use it to keep a terminal park parked.
+ */
+export function isRecoveryEpisodeParked(state: RecoveryState, options: RecoveryPolicyOptions = {}): boolean {
+  if (!state.recoveryRetryCount) return false;
+  const decision = computeRecoveryDecision(state, options);
+  return decision.disposition === "escalate" && decision.escalation === "park";
 }
 
 /**

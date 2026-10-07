@@ -57,6 +57,7 @@ import { checkAndRecordUnplannedExecutionBlock, runHoldReleaseSweep, isUnplanned
 import { evaluateParkedAgentTaskLink } from "./agents/task-agent-sync.js";
 import { decideMissionSymbolAdmission, resolveMissionFeatureForTask } from "./missions/mission-symbol-admission.js";
 import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES } from "./healing/recovery-policy.js";
+import { parkExhaustedRecovery, recordRecoveryEscalation } from "./healing/recovery-exhaustion.js";
 
 const SYMBOL_LOCK_LEASE_MS = 10 * 60_000;
 
@@ -2850,25 +2851,46 @@ export class Scheduler {
               recoveryRetryCount: task.recoveryRetryCount,
               nextRecoveryAt: task.nextRecoveryAt,
             });
-            if (!decision.shouldRetry) {
+            if (decision.disposition === "escalate") {
               /*
               FNXC:RecoveryOwnership 2026-10-06-15:28:
               An unreadable planning artifact needs a fresh role-owned replan, not a failed
-              card. Reset only the bounded cadence and preserve the current lane so triage
-              can recreate the specification through its normal lifecycle fence.
+              card. Preserve the current lane so triage can recreate the specification
+              through its normal lifecycle fence.
+
+              FNXC:RecoveryOwnership 2026-10-07-18:04:
+              That replan is spent once per episode and the counter is kept, which restores the
+              FN-8704 note above: the next exhaustion parks the card failed, so a broken task dir
+              cannot re-enter needs-replan with a null deadline forever.
               */
-              const message = `Filesystem validation exhausted its retry cadence; scheduling a fresh in-place replan.`;
+              if (decision.escalation === "park") {
+                await parkExhaustedRecovery(this.store, task, {
+                  owner: "scheduler-filesystem-validation",
+                  attempts: decision.attempts,
+                  detail: `filesystem validation failed (${validation.reason})`,
+                  agentId: "scheduler",
+                });
+                return null;
+              }
+              const message = `Filesystem validation exhausted its retry cadence; scheduling one fresh in-place replan (the next exhaustion parks the task).`;
               await this.store.updateTask(task.id, {
                 status: "needs-replan",
                 error: null,
-                recoveryRetryCount: null,
+                recoveryRetryCount: decision.nextState.recoveryRetryCount,
                 recoveryDisposition: "escalated-reseed",
                 nextRecoveryAt: null,
               });
               await this.store.logEntry(task.id, message, validation.reason);
+              await recordRecoveryEscalation(this.store, task.id, {
+                owner: "scheduler-filesystem-validation",
+                outcome: "reseeded",
+                attempts: decision.nextState.recoveryRetryCount ?? decision.attempts,
+                column: task.column,
+                agentId: "scheduler",
+              });
               return null;
             }
-            const attempt = decision.nextState.recoveryRetryCount ?? MAX_RECOVERY_RETRIES;
+            const attempt = decision.attempt;
             await this.store.updateTask(task.id, {
               status: "needs-replan",
               error: null,

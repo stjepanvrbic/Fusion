@@ -4659,9 +4659,11 @@ describe("taskCreate tool model inheritance", () => {
 
       try {
         await new TriageProcessor(store, root, { onSpecifyComplete }).specifyTask(task);
+        // FNXC:RecoveryOwnership 2026-10-07-18:04: the episode's single reseed keeps the counter (3 -> 4); it no longer resets the budget.
         expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
           error: null,
-          recoveryRetryCount: null,
+          recoveryRetryCount: 4,
+          recoveryDisposition: "escalated-reseed",
           nextRecoveryAt: null,
         }));
         expect(onSpecifyComplete).not.toHaveBeenCalled();
@@ -5213,12 +5215,44 @@ describe("taskCreate tool model inheritance", () => {
 
       await processor.specifyTask(task);
 
+      // FNXC:RecoveryOwnership 2026-10-07-18:04: the episode's single reseed keeps the counter (3 -> 4); it no longer resets the budget.
       expect(store.updateTask).toHaveBeenCalledWith("FN-201", expect.objectContaining({
         error: null,
-        recoveryRetryCount: null,
+        recoveryRetryCount: 4,
+        recoveryDisposition: "escalated-reseed",
         nextRecoveryAt: null,
       }));
       expect(onSpecifyError).not.toHaveBeenCalled();
+    });
+
+    it("parks triage visibly when transient retries exhaust again after the episode reseed", async () => {
+      const task = {
+        id: "FN-201-PARK",
+        description: "Test triage task",
+        column: "triage",
+        recoveryRetryCount: 7, // ladder, reseed, ladder all spent
+        dependencies: [],
+        steps: [],
+        currentStep: 0,
+        log: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      } as unknown as Task;
+      const store = createMockStore({
+        getTask: vi.fn().mockResolvedValue({ ...task, attachments: [] }),
+      });
+      const processor = new TriageProcessor(store, "/test/root", { pollIntervalMs: 100_000 });
+      mockCreateFnAgent.mockRejectedValue(new Error("connection reset"));
+
+      await processor.specifyTask(task);
+
+      expect(store.updateTask).toHaveBeenCalledWith("FN-201-PARK", expect.objectContaining({
+        status: "failed",
+        error: expect.stringContaining("connection reset"),
+        recoveryRetryCount: 7,
+        nextRecoveryAt: null,
+      }));
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-201-PARK", expect.objectContaining({ recoveryDisposition: "escalated-reseed" }));
     });
 
     it("parks missing provider credentials instead of making triage immediately claimable again", async () => {
@@ -5394,9 +5428,11 @@ describe("taskCreate tool model inheritance", () => {
       const processor = new TriageProcessor(store, "/test/root", { pollIntervalMs: 100_000 });
       await processor.specifyTask(task);
 
+      // FNXC:RecoveryOwnership 2026-10-07-18:04: the episode's single reseed keeps the counter (3 -> 4).
       expect(store.updateTask).toHaveBeenCalledWith("FN-7961-DETERMINISTIC", expect.objectContaining({
         error: null,
-        recoveryRetryCount: null,
+        recoveryRetryCount: 4,
+        recoveryDisposition: "escalated-reseed",
         nextRecoveryAt: null,
       }));
       expect(store.updateTask).not.toHaveBeenCalledWith("FN-7961-DETERMINISTIC", expect.objectContaining({ status: "failed" }));
@@ -5508,9 +5544,11 @@ describe("taskCreate tool model inheritance", () => {
       const processor = new TriageProcessor(store, "/test/root", { pollIntervalMs: 100_000 });
       await processor.specifyTask(task);
 
+      // FNXC:RecoveryOwnership 2026-10-07-18:04: the episode's single reseed keeps the counter (3 -> 4).
       expect(store.updateTask).toHaveBeenCalledWith("FN-7961-TRANSIENT", expect.objectContaining({
         error: null,
-        recoveryRetryCount: null,
+        recoveryRetryCount: 4,
+        recoveryDisposition: "escalated-reseed",
         nextRecoveryAt: null,
       }));
       expect(store.updateTask).not.toHaveBeenCalledWith("FN-7961-TRANSIENT", expect.objectContaining({ status: "failed" }));
@@ -5582,15 +5620,47 @@ describe("taskCreate tool model inheritance", () => {
       const processor = new TriageProcessor(store, "/test/root", { pollIntervalMs: 100_000 });
       await processor.specifyTask(task);
 
+      // FNXC:RecoveryOwnership 2026-10-07-18:04: the first exhaustion spends the episode's single reseed and keeps the counter.
       const reseedWrite = store.updateTask.mock.calls.find(
-        ([id, patch]) => id === "FN-GENERIC-EXHAUSTED" && patch?.recoveryRetryCount === null,
+        ([id, patch]) => id === "FN-GENERIC-EXHAUSTED" && patch?.recoveryRetryCount === 4,
       );
-      expect(reseedWrite, "an exhausted budget must return to triage's replan owner").toBeDefined();
-      expect(reseedWrite?.[1]).toMatchObject({ error: null, nextRecoveryAt: null });
+      expect(reseedWrite, "an exhausted budget must return to triage's replan owner once").toBeDefined();
+      expect(reseedWrite?.[1]).toMatchObject({ error: null, nextRecoveryAt: null, recoveryDisposition: "escalated-reseed" });
       expect(store.updateTask).not.toHaveBeenCalledWith(
         "FN-GENERIC-EXHAUSTED",
         expect.objectContaining({ status: "failed" }),
       );
+    });
+
+    it("parks an unclassified planning failure when the budget exhausts again after the reseed", async () => {
+      const task = {
+        id: "FN-GENERIC-PARK",
+        title: "Generic planning failure",
+        description: "Unclassified planning failure must park once the episode is spent",
+        column: "triage",
+        status: "planning",
+        recoveryRetryCount: 7,
+        dependencies: [],
+        steps: [],
+        currentStep: 0,
+        log: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      } as unknown as Task;
+      const store = createMockStore({
+        getTask: vi.fn().mockResolvedValue({ ...task, attachments: [] }),
+      });
+      mockCreateFnAgent.mockRejectedValue(new Error("kaboom: something nobody classified"));
+
+      const processor = new TriageProcessor(store, "/test/root", { pollIntervalMs: 100_000 });
+      await processor.specifyTask(task);
+
+      expect(store.updateTask).toHaveBeenCalledWith("FN-GENERIC-PARK", expect.objectContaining({
+        status: "failed",
+        error: expect.stringContaining("kaboom: something nobody classified"),
+        recoveryRetryCount: 7,
+        nextRecoveryAt: null,
+      }));
     });
 
     it("does not overwrite an existing title during terminal fallback exhaustion", async () => {

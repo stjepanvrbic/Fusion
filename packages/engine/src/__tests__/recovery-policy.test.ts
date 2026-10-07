@@ -6,6 +6,7 @@ import {
   BASE_DELAY_MS,
   MAX_DELAY_MS,
   BACKOFF_MULTIPLIER,
+  MAX_RECOVERY_RESEEDS,
 } from "../healing/recovery-policy.js";
 
 describe("computeRecoveryDecision", () => {
@@ -34,16 +35,42 @@ describe("computeRecoveryDecision", () => {
     expect(d3.nextState.recoveryRetryCount).toBe(3);
   });
 
-  it("exhausts after MAX_RECOVERY_RETRIES attempts", () => {
+  it("spends the episode reseed after MAX_RECOVERY_RETRIES attempts without resetting the counter", () => {
     const decision = computeRecoveryDecision({
       recoveryRetryCount: MAX_RECOVERY_RETRIES,
     });
     expect(decision.disposition).toBe("escalate");
     expect(decision.shouldRetry).toBe(false);
     expect(decision.exhausted).toBe(true);
-    expect(decision.nextState.recoveryRetryCount).toBeUndefined();
+    if (decision.disposition !== "escalate") throw new Error("expected escalation");
+    expect(decision.escalation).toBe("reseed");
+    expect(decision.nextState.recoveryRetryCount).toBe(MAX_RECOVERY_RETRIES + 1);
     expect(decision.nextState.nextRecoveryAt).toBeUndefined();
     expect(decision.delayMs).toBe(0);
+  });
+
+  it("bounds the whole episode: ladder, one reseed, ladder, then a terminal park", () => {
+    const outcomes: string[] = [];
+    let count: number | undefined;
+    for (let step = 0; step < 20; step++) {
+      const decision = computeRecoveryDecision({ recoveryRetryCount: count });
+      outcomes.push(decision.disposition === "retry" ? `retry${decision.attempt}` : decision.escalation);
+      if (decision.disposition === "escalate" && decision.escalation === "park") {
+        // A parked episode stays parked: re-evaluating the persisted state never re-arms the ladder.
+        expect(computeRecoveryDecision(decision.nextState).disposition).toBe("escalate");
+        break;
+      }
+      count = decision.nextState.recoveryRetryCount;
+    }
+    expect(MAX_RECOVERY_RESEEDS).toBe(1);
+    expect(outcomes).toEqual(["retry1", "retry2", "retry3", "reseed", "retry1", "retry2", "retry3", "park"]);
+  });
+
+  it("restarts the backoff ladder after a reseed", () => {
+    const decision = computeRecoveryDecision({ recoveryRetryCount: MAX_RECOVERY_RETRIES + 1 });
+    if (decision.disposition !== "retry") throw new Error("expected retry");
+    expect(decision.attempt).toBe(1);
+    expect(decision.delayMs).toBeLessThanOrEqual(BASE_DELAY_MS * 1.1);
   });
 
   it("honors an owner-specific bounded retry budget", () => {
@@ -52,12 +79,21 @@ describe("computeRecoveryDecision", () => {
     expect(decision.exhausted).toBe(true);
   });
 
-  it("also exhausts when count exceeds max (overflow safety)", () => {
+  it("parks immediately on exhaustion when the owner has no reseed budget", () => {
+    const decision = computeRecoveryDecision({ recoveryRetryCount: 3 }, { maxRetries: 3, reseedBudget: 0 });
+    if (decision.disposition !== "escalate") throw new Error("expected escalation");
+    expect(decision.escalation).toBe("park");
+    expect(decision.nextState.recoveryRetryCount).toBe(3);
+  });
+
+  it("parks when count exceeds the episode budget (overflow safety)", () => {
     const decision = computeRecoveryDecision({
       recoveryRetryCount: 999,
     });
     expect(decision.shouldRetry).toBe(false);
     expect(decision.exhausted).toBe(true);
+    if (decision.disposition !== "escalate") throw new Error("expected escalation");
+    expect(decision.escalation).toBe("park");
   });
 
   it("uses exponential backoff with increasing delays", () => {
@@ -120,12 +156,12 @@ describe("computeRecoveryDecision", () => {
     expect(decision.nextState.recoveryRetryCount).toBe(1);
   });
 
-  it("clears recovery metadata when exhausted", () => {
+  it("clears the recovery deadline but keeps the episode count when exhausted", () => {
     const decision = computeRecoveryDecision({
       recoveryRetryCount: MAX_RECOVERY_RETRIES,
       nextRecoveryAt: new Date().toISOString(),
     });
-    expect(decision.nextState.recoveryRetryCount).toBeUndefined();
+    expect(decision.nextState.recoveryRetryCount).toBe(MAX_RECOVERY_RETRIES + 1);
     expect(decision.nextState.nextRecoveryAt).toBeUndefined();
   });
 });

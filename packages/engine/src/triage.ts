@@ -235,7 +235,8 @@ import {
 } from "./errors/usage-limit-detector.js";
 import { isOperatorActionableAgentError, isTransientError, isSilentTransientError } from "./errors/transient-error-detector.js";
 import { withRateLimitRetry } from "./errors/rate-limit-retry.js";
-import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES } from "./healing/recovery-policy.js";
+import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES, type RecoveryEscalationDecision } from "./healing/recovery-policy.js";
+import { formatRecoveryExhaustedError, recordRecoveryEscalation, type RecoveryOwner } from "./healing/recovery-exhaustion.js";
 import type { StuckTaskDetector } from "./healing/stuck-task-detector.js";
 /*
 */
@@ -3956,7 +3957,7 @@ export class TriageProcessor {
             });
 
             if (decision.shouldRetry) {
-              const retryMessage = `${failure} — retry ${decision.nextState.recoveryRetryCount}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)}.`;
+              const retryMessage = `${failure} — retry ${decision.attempt}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)}.`;
               planLog.warn(`${task.id} ${retryMessage}`);
               await this.store.logEntry(task.id, retryMessage);
               await this.updatePlanningStateIfStillCurrent(task, {
@@ -3974,16 +3975,11 @@ export class TriageProcessor {
             A failed card has no automatic planning claimant, whereas needs-replan is consumed
             by triage under the planning lifecycle lock on the next admission pass.
             */
-            const escalationMessage = `${failure} exhausted its retry cadence; scheduling a fresh planning replan.`;
-            planLog.warn(`${task.id} clean planning attempt retry budget escalated to replan`);
-            await this.store.logEntry(task.id, escalationMessage);
-            await this.updatePlanningStateIfStillCurrent(task, {
-              status: await this.resolvePlanningRetryHoldStatus(task, written),
-              error: null,
-              recoveryRetryCount: null,
-              recoveryDisposition: "escalated-reseed",
-              nextRecoveryAt: null,
-              planningFailure: null,
+            planLog.warn(`${task.id} clean planning attempt retry budget escalated (${decision.escalation})`);
+            /* FNXC:RecoveryOwnership 2026-10-07-18:04: the persisted transport marker is the episode's diagnosis; it survives the reseed so a later park names the real cause instead of an unchanged-PROMPT verdict. */
+            await this.escalateExhaustedPlanningRecovery(task, decision, {
+              failure,
+              written,
             });
             return;
           }
@@ -3996,7 +3992,7 @@ export class TriageProcessor {
             });
 
             if (decision.shouldRetry) {
-              const attempt = decision.nextState.recoveryRetryCount;
+              const attempt = decision.attempt;
               const delay = formatDelay(decision.delayMs);
               const retryMessage =
                 `Generated plan failed deterministic validation (${deterministicSpecFailure}) — retry ${attempt}/${MAX_RECOVERY_RETRIES} in ${delay}.`;
@@ -4016,18 +4012,12 @@ export class TriageProcessor {
               return;
             }
 
-            const escalationMessage =
-              `Specification validation exhausted its retry cadence; scheduling a fresh planning replan.`;
             planLog.log(
-              `${task.id} deterministic spec validation exhausted its retry cadence`,
+              `${task.id} deterministic spec validation exhausted its retry cadence (${decision.escalation})`,
             );
-            await this.store.logEntry(task.id, escalationMessage);
-            await this.updatePlanningStateIfStillCurrent(task, {
-              status: await this.resolvePlanningRetryHoldStatus(task, written),
-              error: null,
-              recoveryRetryCount: null,
-              recoveryDisposition: "escalated-reseed",
-              nextRecoveryAt: null,
+            await this.escalateExhaustedPlanningRecovery(task, decision, {
+              failure: `Generated plan failed deterministic validation (${deterministicSpecFailure})`,
+              written,
             });
             return;
           }
@@ -4269,7 +4259,7 @@ export class TriageProcessor {
             },
           });
           if (decision.shouldRetry) {
-            const retryMessage = `${failureMessage} — retry ${decision.nextState.recoveryRetryCount}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)}.`;
+            const retryMessage = `${failureMessage} — retry ${decision.attempt}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)}.`;
             planLog.warn(`${task.id} ${retryMessage}`);
             await this.store.logEntry(task.id, retryMessage).catch(() => undefined);
             const retryHoldStatus = await this.resolvePlanningRetryHoldStatus(task);
@@ -4302,7 +4292,7 @@ export class TriageProcessor {
           });
 
           if (decision.shouldRetry) {
-            const attempt = decision.nextState.recoveryRetryCount;
+            const attempt = decision.attempt;
             const delay = formatDelay(decision.delayMs);
             // Silent transient errors (e.g., "request was aborted") are noisy — skip logging
             if (!isSilentTransientError(errorMessage)) {
@@ -4324,14 +4314,9 @@ export class TriageProcessor {
             return;
           }
 
-          planLog.warn(`⚡ ${task.id} transient error retry cadence exhausted; scheduling a fresh replan`);
-          await this.store.logEntry(task.id, "Transient planning recovery exhausted its retry cadence; scheduling a fresh replan.").catch(() => undefined);
-          await this.updatePlanningStateIfStillCurrent(task, {
-            status: await this.resolvePlanningRetryHoldStatus(task),
-            error: null,
-            recoveryRetryCount: null,
-            recoveryDisposition: "escalated-reseed",
-            nextRecoveryAt: null,
+          planLog.warn(`⚡ ${task.id} transient error retry cadence exhausted (${decision.escalation})`);
+          await this.escalateExhaustedPlanningRecovery(task, decision, {
+            failure: `Transient planning error: ${errorMessage}`,
           });
           return;
         }
@@ -4370,7 +4355,7 @@ export class TriageProcessor {
         }
 
         if (genericDecision.shouldRetry) {
-          const attempt = genericDecision.nextState.recoveryRetryCount;
+          const attempt = genericDecision.attempt;
           const delay = formatDelay(genericDecision.delayMs);
           planLog.warn(`⚡ ${task.id} planning failed — retry ${attempt}/${MAX_RECOVERY_RETRIES} in ${delay}: ${errorMessage}`);
           await this.store.logEntry(
@@ -4400,17 +4385,12 @@ export class TriageProcessor {
         Unknown planning faults still belong to triage after their bounded verification cadence.
         Reset to the existing replan admission state instead of leaving a failed row with no worker.
         */
-        planLog.warn(`⚡ ${task.id} planning retries exhausted; scheduling a fresh replan`);
-        await this.store.logEntry(task.id, "Planning recovery exhausted its retry cadence; scheduling a fresh replan.").catch(() => undefined);
-        await this.updatePlanningStateIfStillCurrent(task, {
-          status: await this.resolvePlanningRetryHoldStatus(task),
-          error: null,
-          recoveryRetryCount: null,
-          recoveryDisposition: "escalated-reseed",
-          nextRecoveryAt: null,
+        planLog.warn(`⚡ ${task.id} planning retries exhausted (${genericDecision.escalation})`);
+        await this.escalateExhaustedPlanningRecovery(task, genericDecision, {
+          failure: `Specification failed: ${errorMessage}`,
         }).catch((restoreErr: unknown) => {
           const msg = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
-          planLog.warn(`${task.id}: failed to schedule fresh planning replan: ${msg}`);
+          planLog.warn(`${task.id}: failed to escalate exhausted planning recovery: ${msg}`);
         });
       }
     } finally {
@@ -4987,6 +4967,68 @@ export class TriageProcessor {
     }
   }
 
+  /**
+   * FNXC:RecoveryOwnership 2026-10-07-18:04:
+   * Shared exhaustion owner for every planning recovery ladder. FN-9512 answered every exhaustion
+   * by clearing the counter and re-admitting the card, so a deterministic planning failure started a
+   * new AI planning session every few minutes forever. The first exhaustion in an episode still
+   * schedules one fresh planning pass, but keeps the counter; the next exhaustion parks the card
+   * `failed` in its planning lane with the cause and an audit row. A clean planning success clears
+   * the counter, which is what ends the episode.
+   */
+  private async escalateExhaustedPlanningRecovery(
+    task: Task,
+    decision: RecoveryEscalationDecision,
+    input: {
+      failure: string;
+      written?: string;
+      owner?: RecoveryOwner;
+      reseedStatus?: string;
+      reseedUpdates?: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    const owner = input.owner ?? "triage-planning";
+    if (decision.escalation === "park") {
+      const error = formatRecoveryExhaustedError(decision.attempts, input.failure);
+      planLog.warn(`${task.id} planning recovery exhausted after its reseed — parking for an operator`);
+      await this.store.logEntry(task.id, error).catch(() => undefined);
+      const persisted = await this.updatePlanningStateIfStillCurrent(task, () => ({
+        status: "failed",
+        error,
+        recoveryRetryCount: decision.attempts,
+        recoveryDisposition: null,
+        nextRecoveryAt: null,
+      }));
+      if (!persisted) return;
+      await recordRecoveryEscalation(this.store, task.id, {
+        owner, outcome: "parked", attempts: decision.attempts, column: task.column, agentId: "triage",
+      });
+      await this.backfillBlankTitleAfterTerminalTriageFailure(task);
+      return;
+    }
+    await this.store.logEntry(
+      task.id,
+      `${input.failure} exhausted its retry cadence; scheduling one fresh planning pass (the next exhaustion parks the task).`,
+    ).catch(() => undefined);
+    const status = input.reseedStatus ?? await this.resolvePlanningRetryHoldStatus(task, input.written);
+    const persisted = await this.updatePlanningStateIfStillCurrent(task, () => ({
+      ...(input.reseedUpdates ?? {}),
+      status,
+      error: null,
+      recoveryRetryCount: decision.nextState.recoveryRetryCount,
+      recoveryDisposition: "escalated-reseed" as const,
+      nextRecoveryAt: null,
+    }));
+    if (!persisted) return;
+    await recordRecoveryEscalation(this.store, task.id, {
+      owner,
+      outcome: "reseeded",
+      attempts: decision.nextState.recoveryRetryCount ?? decision.attempts,
+      column: task.column,
+      agentId: "triage",
+    });
+  }
+
   /*
   FNXC:WorkflowArtifacts 2026-07-21-17:00:
   Planning cannot release a task unless authoritative TaskStore read-back proves
@@ -5004,7 +5046,7 @@ export class TriageProcessor {
       recoveryRetryCount: live.recoveryRetryCount ?? task.recoveryRetryCount,
       nextRecoveryAt: live.nextRecoveryAt ?? task.nextRecoveryAt,
     });
-    const attempt = decision.nextState.recoveryRetryCount ?? MAX_RECOVERY_RETRIES;
+    const attempt = decision.disposition === "retry" ? decision.attempt : MAX_RECOVERY_RETRIES;
     const auditor = createRunAuditor(this.store, {
       taskId: task.id,
       agentId: task.assignedAgentId ?? "triage",
@@ -5020,7 +5062,7 @@ export class TriageProcessor {
         artifactKeys: ["PROMPT.md"],
         owner: "planning",
         source: "planning-release",
-        action: decision.shouldRetry ? "replan" : "escalated-replan",
+        action: decision.disposition === "retry" ? "replan" : decision.escalation === "reseed" ? "escalated-replan" : "parked",
         attempt,
         maxAttempts: MAX_RECOVERY_RETRIES,
       },
@@ -5044,14 +5086,10 @@ export class TriageProcessor {
     bounded read-back cadence is spent, retain the planning role and request a fresh plan so the
     triage owner can recreate the authoritative artifact without an operator rescue.
     */
-    const message = `PROMPT.md remained missing after ${MAX_RECOVERY_RETRIES} automatic planning retries; escalating to a fresh planning pass.`;
-    await this.store.logEntry(task.id, message);
-    await this.updatePlanningStateIfStillCurrent(task, {
-      status: "needs-replan",
-      error: null,
-      recoveryRetryCount: null,
-      recoveryDisposition: "escalated-reseed",
-      nextRecoveryAt: null,
+    await this.escalateExhaustedPlanningRecovery(task, decision, {
+      failure: `PROMPT.md remained missing after ${MAX_RECOVERY_RETRIES} automatic planning retries`,
+      owner: "triage-missing-prompt",
+      reseedStatus: "needs-replan",
     });
     return true;
   }
