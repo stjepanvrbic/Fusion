@@ -1,3 +1,4 @@
+import type { RequestedMoveSource, ResolvedMoveSource } from "./workflows/workflow-transition-policy.js";
 import { EventEmitter } from "node:events";
 import type { TaskMoveLanes } from "./workflows/workflow-lifecycle-traits.js";
 import { TaskLaneCache } from "./task-lane-cache.js";
@@ -344,7 +345,11 @@ export interface MoveTaskOptions {
    */
   preservePause?: boolean;
   allocateWorktree?: (reservedNames: Set<string>) => string | null;
-  moveSource?: "user" | "engine" | "scheduler";
+  /**
+   * Who initiated the move. "operator" is a human action from a non-drag surface: guards apply, the "user" hard-cancel
+   * semantics do not, and lifecycle containment does not treat it as automatic. See {@link RequestedMoveSource}.
+   */
+  moveSource?: RequestedMoveSource;
   /** Registered reason from ENGINE_BACKWARD_MOVE_REASONS for a backward engine move. */
   lifecycleReason?: string;
   workflowMoveActor?: WorkflowMovePolicyInput["actor"];
@@ -1951,12 +1956,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public async __invokeHandoffMergeQueueFailureInjectorForTesting(taskId: string): Promise<void> {
     await this.handoffMergeQueueFailureInjectorForTesting?.(taskId);
   }
-  public resolveWorkflowMoveActor( moveSource: NonNullable<MoveTaskOptions["moveSource"]>, internal: MoveTaskInternalOptions, options?: MoveTaskOptions, ): WorkflowMovePolicyInput["actor"] {    return resolveWorkflowMoveActorImpl(this, moveSource, internal, options);
+  public resolveWorkflowMoveActor( moveSource: ResolvedMoveSource, internal: MoveTaskInternalOptions, options?: MoveTaskOptions, ): WorkflowMovePolicyInput["actor"] {    return resolveWorkflowMoveActorImpl(this, moveSource, internal, options);
   }
-  public resolveWorkflowBypassGuards( moveSource: NonNullable<MoveTaskOptions["moveSource"]>, options?: MoveTaskOptions, ): boolean {
+  public resolveWorkflowBypassGuards( moveSource: ResolvedMoveSource, options?: MoveTaskOptions, ): boolean {
     return resolveWorkflowBypassGuardsImpl(this, moveSource, options);
   }
-  public shouldSkipWorkflowMovePolicies(params: { fromColumn: string; toColumn: string; moveSource: NonNullable<MoveTaskOptions["moveSource"]>; bypassGuards: boolean; options?: MoveTaskOptions; }): boolean {    return shouldSkipWorkflowMovePoliciesImpl(this, params);
+  public shouldSkipWorkflowMovePolicies(params: { fromColumn: string; toColumn: string; moveSource: ResolvedMoveSource; bypassGuards: boolean; options?: MoveTaskOptions; }): boolean {    return shouldSkipWorkflowMovePoliciesImpl(this, params);
   }
   public async prepareWorkflowMovePolicyPreflight( id: string, toColumn: ColumnId, options: MoveTaskOptions | undefined, internal: MoveTaskInternalOptions, ): Promise<MoveTaskInternalOptions["movePolicyPreflight"]> {
     return prepareWorkflowMovePolicyPreflightImpl(this, id, toColumn, options, internal);

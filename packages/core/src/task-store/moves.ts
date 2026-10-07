@@ -33,6 +33,8 @@ import {
   type TransitionColumnFacts,
   evaluateCapacityRejection,
   evaluateTransitionInvariants,
+  resolveDirectionPolicySource,
+  resolveMoveSource,
 } from "../workflows/workflow-transition-policy.js";
 import {type DefaultWorkflowMoveContext, applyDefaultWorkflowMoveEffects, isReopenIntoPlanning} from "../workflows/default-workflow-hooks.js";
 import {columnsWithFlag, resolveLifecycleColumns, resolveReviewColumns, toTaskMoveLanes} from "../workflows/workflow-lifecycle-traits.js";
@@ -427,7 +429,8 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
     FNXC:TaskMovement 2026-06-22-18:20:
     Public moveTask calls without an explicit source keep the legacy emitted source of "engine", but they do not inherit workflow guard bypass. Engine, scheduler, handoff, and recovery call sites opt into bypass semantics with an explicit moveSource or skipMergeBlocker.
     */
-    const moveSource = options?.moveSource ?? "engine";
+    // FNXC:LifecycleContainment 2026-10-07-21:40: an "operator" source is recorded and emitted as "engine", exactly as an absent source was.
+    const moveSource = resolveMoveSource(options?.moveSource);
 
     // ── U4: flag-gated workflow-resolved transition path (KTD-8) ─────────────
     // Flag OFF (default): the legacy `VALID_TRANSITIONS` / inline-side-effect
@@ -741,13 +744,17 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         resolved `moveSource`. An absent option remains an operator-compatible,
         fail-open legacy route; explicit engine/scheduler movers are covered by
         the move-reason census and forbidden-path tests.
+
+        FNXC:LifecycleContainment 2026-10-07-21:40:
+        Operator surfaces now say "operator", which is exempt like "user". resolveDirectionPolicySource is the single place
+        that decides which requested sources the containment policy judges.
         */
         const decision = evaluateTransitionInvariants({
           taskId: id,
           from: fromFacts,
           to: toFacts,
           mergeBlockerReason,
-          moveSource: options?.moveSource,
+          moveSource: resolveDirectionPolicySource(options?.moveSource),
           lifecycleReason: options?.lifecycleReason,
         });
         if (!decision.allow) {

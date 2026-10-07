@@ -8,6 +8,7 @@
  * instance as its first parameter and performs byte-identical work.
  */
 
+import type { ResolvedMoveSource } from "../workflows/workflow-transition-policy.js";
 import { TaskStore } from "../store.js";
 import { filterTasksByBranchGroup } from "../branch/branch-assignment.js";
 import { BUILTIN_WORKFLOW_SETTINGS } from "../workflows/builtin-workflow-settings.js";
@@ -686,7 +687,7 @@ export async function getTasksByAssignedAgentImpl(store: TaskStore,
 }
 
 export function resolveWorkflowMoveActorImpl(store: TaskStore,
-    moveSource: NonNullable<MoveTaskOptions["moveSource"]>,
+    moveSource: ResolvedMoveSource,
     internal: MoveTaskInternalOptions,
     options?: MoveTaskOptions,
   ): WorkflowMovePolicyInput["actor"] {

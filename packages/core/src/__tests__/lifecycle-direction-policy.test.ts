@@ -9,7 +9,7 @@ import {
   isSanctionedEngineBackwardMove,
   type LifecycleRole,
 } from "../workflows/workflow-lifecycle-direction.js";
-import { evaluateLifecycleDirectionPostcondition } from "../workflows/workflow-transition-policy.js";
+import { evaluateLifecycleDirectionPostcondition, resolveDirectionPolicySource, resolveMoveSource } from "../workflows/workflow-transition-policy.js";
 
 const policyInput = (fromFlags: object, toFlags: object, options: Partial<{ moveSource: "user" | "engine" | "scheduler"; lifecycleReason: string }> = {}) => ({
   taskId: "FN-207",
@@ -91,6 +91,27 @@ describe("workflow lifecycle direction", () => {
     }))).toBeNull();
     expect(evaluateLifecycleDirectionPostcondition(policyInput({ mergeBlocker: true }, { hold: true }))).toBeNull();
     expect(evaluateLifecycleDirectionPostcondition(policyInput({}, { hold: true }, { moveSource: "engine" }))).toBeNull();
+  });
+
+  /*
+  FNXC:LifecycleContainment 2026-10-07-21:40:
+  Operator surfaces name their moves "operator": recorded and emitted as "engine" exactly like the legacy absent source,
+  and exempt from the automatic-move direction policy like "user". Explicit engine and scheduler sources stay judged.
+  */
+  it("resolves operator moves to the legacy emitted source and exempts them from the direction policy", () => {
+    expect(resolveMoveSource("operator")).toBe("engine");
+    expect(resolveMoveSource(undefined)).toBe("engine");
+    expect(resolveMoveSource("user")).toBe("user");
+    expect(resolveMoveSource("scheduler")).toBe("scheduler");
+
+    const backwardFromWip = (requested: Parameters<typeof resolveDirectionPolicySource>[0]) =>
+      evaluateLifecycleDirectionPostcondition(policyInput({ countsTowardWip: true }, { hold: true }, {
+        moveSource: resolveDirectionPolicySource(requested),
+      }));
+    expect(backwardFromWip("operator")).toBeNull();
+    expect(backwardFromWip("user")).toBeNull();
+    expect(backwardFromWip("engine")?.messageKey).toBe("transition.rejected.forbiddenLifecyclePath");
+    expect(backwardFromWip("scheduler")?.messageKey).toBe("transition.rejected.forbiddenLifecyclePath");
   });
 
   it("admits every retained reason only for its declared role pairs", () => {

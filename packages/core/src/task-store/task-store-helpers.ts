@@ -10,6 +10,7 @@
  * Renamed from project-store-ops0.ts (domain: task-store helper ops).
  */
 
+import type { ResolvedMoveSource } from "../workflows/workflow-transition-policy.js";
 import { TaskStore } from "../store.js";
 import {
   isBuiltinWorkflowEnabled,
@@ -111,7 +112,7 @@ export function areAllDependenciesDoneImpl(
 const LEGACY_SATISFIED_COLUMNS: ReadonlySet<string> = new Set(["done", "archived"]);
 
 export function resolveWorkflowBypassGuardsImpl(store: TaskStore,
-    moveSource: NonNullable<MoveTaskOptions["moveSource"]>,
+    moveSource: ResolvedMoveSource,
     options?: MoveTaskOptions,
   ): boolean {
   /*
@@ -162,7 +163,7 @@ export function shouldSkipWorkflowMovePoliciesImpl(store: TaskStore,
 params: {
     fromColumn: string;
     toColumn: string;
-    moveSource: NonNullable<MoveTaskOptions["moveSource"]>;
+    moveSource: ResolvedMoveSource;
     bypassGuards: boolean;
     options?: MoveTaskOptions;
   }): boolean {

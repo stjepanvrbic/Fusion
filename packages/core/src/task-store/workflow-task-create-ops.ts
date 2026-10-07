@@ -8,6 +8,7 @@
  * behavior-preserving refactor. Each function receives the TaskStore
  * instance as its first parameter and performs byte-identical work.
  */
+import { resolveMoveSource } from "../workflows/workflow-transition-policy.js";
 import {TaskStore} from "../store.js";
 import {resolveEntryColumnId} from "../workflows/workflow-reconciliation.js";
 import {resolveWorkflowIrForTask} from "../workflows/workflow-ir-resolver.js";
@@ -372,7 +373,7 @@ export async function getTaskColumnsImpl(store: TaskStore, ids: string[]): Promi
 
 export async function prepareWorkflowMovePolicyPreflightImpl(store: TaskStore, id: string, toColumn: ColumnId, options: MoveTaskOptions | undefined, internal: MoveTaskInternalOptions,): Promise<MoveTaskInternalOptions["movePolicyPreflight"]> {
     const task = await store.readTaskForMove(id);
-    const moveSource = options?.moveSource ?? "engine";
+    const moveSource = resolveMoveSource(options?.moveSource);
     /*
     FNXC:WorkflowColumns 2026-07-30-04:00 (U12 — flipped ATOMICALLY with moves.ts):
     The compatibility-flag gate is DELETED. This preflight computes the `movePolicyPreflight` that
