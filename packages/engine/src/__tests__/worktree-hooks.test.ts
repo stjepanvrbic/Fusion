@@ -178,8 +178,10 @@ describe("worktree-hooks", () => {
     expect((await readFile(taskIdPath, "utf-8")).trim()).toBe("FN-1");
     await access(preCommitPath);
     await access(commitMsgPath);
-    expect((await stat(preCommitPath)).mode & 0o777).toBe(0o755);
-    expect((await stat(commitMsgPath)).mode & 0o777).toBe(0o755);
+    // FNXC:TestInfraWindows 2026-10-07-18:04: NTFS has no POSIX mode bits; Node reports 0o666 for a writable file and Git for Windows runs hooks through sh without an exec bit.
+    const expectedHookMode = process.platform === "win32" ? 0o666 : 0o755;
+    expect((await stat(preCommitPath)).mode & 0o777).toBe(expectedHookMode);
+    expect((await stat(commitMsgPath)).mode & 0o777).toBe(expectedHookMode);
     expect(await readFile(commitMsgPath, "utf-8")).toContain('git interpret-trailers');
   });
 

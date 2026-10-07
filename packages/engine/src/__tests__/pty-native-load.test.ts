@@ -18,11 +18,13 @@ describe("node-pty host platform prebuild", () => {
     pty = undefined;
   });
 
-  it("loads the host pty.node without an install-time compile", async () => {
+  it("loads the host native PTY binary without an install-time compile", async () => {
     const testRequire = createRequire(import.meta.url);
     const umbrellaRequire = createRequire(testRequire.resolve("node-pty"));
     const platformEntry = umbrellaRequire.resolve(packageName);
-    const ptyNode = join(dirname(dirname(platformEntry)), "prebuilds", `${platform}-${arch}`, "pty.node");
+    // FNXC:TestInfraWindows 2026-10-07-18:04: the win32 prebuild ships ConPTY's conpty.node; POSIX prebuilds ship pty.node.
+    const nativeBinary = platform === "win32" ? "conpty.node" : "pty.node";
+    const ptyNode = join(dirname(dirname(platformEntry)), "prebuilds", `${platform}-${arch}`, nativeBinary);
     expect(() => accessSync(ptyNode)).not.toThrow();
 
     const module = await loadPtyModule();

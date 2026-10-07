@@ -4,6 +4,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runBenchmark } from "../experiment/benchmark-runner.js";
 
+// FNXC:TestInfraWindows 2026-10-07-18:04: the runner spawns with shell:true, so quote the node path; on Windows it contains a space ("C:\Program Files\...") and cmd.exe would run "C:\Program".
+const NODE = `"${process.execPath}"`;
+
 describe("runBenchmark", () => {
   const tempFiles: string[] = [];
 
@@ -22,7 +25,7 @@ describe("runBenchmark", () => {
 
   it("runs command successfully", async () => {
     const result = await runBenchmark({
-      command: `${process.execPath} -e \"console.log('METRIC accuracy=0.91')\"`,
+      command: `${NODE} -e \"console.log('METRIC accuracy=0.91')\"`,
       cwd: process.cwd(),
     });
 
@@ -34,7 +37,7 @@ describe("runBenchmark", () => {
 
   it("times out long-running process", async () => {
     const result = await runBenchmark({
-      command: `${process.execPath} -e \"setTimeout(() => console.log('done'), 2000)\"`,
+      command: `${NODE} -e \"setTimeout(() => console.log('done'), 2000)\"`,
       cwd: process.cwd(),
       timeoutMs: 100,
     });
@@ -45,7 +48,7 @@ describe("runBenchmark", () => {
 
   it("truncates oversized stdout and writes full output to temp file", async () => {
     const result = await runBenchmark({
-      command: `${process.execPath} -e \"process.stdout.write('x'.repeat(2048))\"`,
+      command: `${NODE} -e \"process.stdout.write('x'.repeat(2048))\"`,
       cwd: process.cwd(),
       maxBufferBytes: 256,
       sessionId: "EXP-1",
@@ -64,7 +67,7 @@ describe("runBenchmark", () => {
   it("supports abort signal", async () => {
     const controller = new AbortController();
     const runPromise = runBenchmark({
-      command: `${process.execPath} -e \"setInterval(() => process.stdout.write('tick\\n'), 50)\"`,
+      command: `${NODE} -e \"setInterval(() => process.stdout.write('tick\\n'), 50)\"`,
       cwd: process.cwd(),
       abortSignal: controller.signal,
     });
@@ -81,7 +84,7 @@ describe("runBenchmark", () => {
     const onProgress = vi.fn();
 
     const promise = runBenchmark({
-      command: `${process.execPath} -e \"let i=0; const t=setInterval(()=>{console.log(i++); if(i===5){clearInterval(t); process.exit(0);} }, 50)\"`,
+      command: `${NODE} -e \"let i=0; const t=setInterval(()=>{console.log(i++); if(i===5){clearInterval(t); process.exit(0);} }, 50)\"`,
       cwd: process.cwd(),
       onProgress,
     });

@@ -88,10 +88,12 @@ describe("hook-scripts", () => {
       expect(existsSync(result.notifyScriptPath)).toBe(true);
 
       // Owner-executable bit set on both files.
+      // FNXC:TestInfraWindows 2026-10-07-18:04: NTFS reports no POSIX exec bit, so Windows has no owner-exec bit to assert.
+      const expectedOwnerExec = process.platform === "win32" ? 0 : 0o100;
       const hookMode = statSync(result.hookScriptPath).mode;
       const notifyMode = statSync(result.notifyScriptPath).mode;
-      expect(hookMode & 0o100).toBe(0o100);
-      expect(notifyMode & 0o100).toBe(0o100);
+      expect(hookMode & 0o100).toBe(expectedOwnerExec);
+      expect(notifyMode & 0o100).toBe(expectedOwnerExec);
 
       const hookContent = await readFile(result.hookScriptPath, "utf8");
       expect(hookContent).toContain(opts.endpointUrl);
