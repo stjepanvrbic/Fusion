@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   existsSyncMock,
@@ -7,6 +7,7 @@ const {
   classifyTaskWorktreeMock,
   pruneWorktreeAdminEntriesMock,
   ActiveSessionWorktreeRemovalErrorMock,
+  canonicalizeOverride,
 } = vi.hoisted(() => {
   class ActiveSessionWorktreeRemovalErrorMock extends Error {
     constructor() {
@@ -21,13 +22,19 @@ const {
     classifyTaskWorktreeMock: vi.fn(),
     pruneWorktreeAdminEntriesMock: vi.fn(),
     ActiveSessionWorktreeRemovalErrorMock,
+    // Lets a test give canonicalizePath a distinct result without losing the real implementation elsewhere.
+    canonicalizeOverride: { fn: undefined as ((path: string) => string) | undefined },
   };
 });
 
-vi.mock("../worktree/worktree-pool.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../worktree/worktree-pool.js")>()),
-  classifyTaskWorktree: classifyTaskWorktreeMock,
-}));
+vi.mock("../worktree/worktree-pool.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../worktree/worktree-pool.js")>();
+  return {
+    ...actual,
+    classifyTaskWorktree: classifyTaskWorktreeMock,
+    canonicalizePath: (path: string) => canonicalizeOverride.fn?.(path) ?? actual.canonicalizePath(path),
+  };
+});
 vi.mock("../worktree/worktree-prune.js", () => ({
   pruneWorktreeAdminEntries: pruneWorktreeAdminEntriesMock,
 }));
@@ -39,6 +46,7 @@ vi.mock("../worktree/worktree-backend.js", () => ({
   removeWorktree: removeWorktreeMock,
 }));
 
+import { activeSessionRegistry } from "../agents/active-session-registry.js";
 import { finalizeProvenAutoMergeTask } from "../merge/auto-merge-finalization.js";
 import { cleanupLandedTaskWorktree, cleanupLandedWorkspaceTaskWorktrees } from "../merge/post-landing-worktree-cleanup.js";
 
@@ -364,6 +372,107 @@ describe("cleanupLandedTaskWorktree", () => {
     expect(removeWorktreeMock).toHaveBeenCalledOnce();
     expect(updateTask).toHaveBeenCalledTimes(2);
     expect(updateTask).toHaveBeenLastCalledWith("FN-251", { worktree: null });
+  });
+
+  /*
+  FNXC:WorktreeCleanup 2026-10-07-13:33:
+  KB-005 regression: KB-003's live-session short-circuit returned before removeWorktree, silently dropping the
+  `worktree:removal-refused-active-session` audit that pipeline S10 requires. These cases use the real
+  registry so the short-circuit (not a mocked removeWorktree refusal) is what is exercised.
+  */
+  describe("active-session refusal audit (KB-005)", () => {
+    const worktreePath = "/repo/.worktrees/fn-251";
+    const canonicalPath = "/canonical/repo/.worktrees/fn-251";
+    const registration = { taskId: "FN-251", kind: "executor" as const, ownerKey: "kb-005-test" };
+    const refusalAudit = {
+      type: "worktree:removal-refused-active-session",
+      target: worktreePath,
+      metadata: { taskId: "FN-251", reason: "completion-landed-cleanup", kind: "executor" },
+    };
+    const preserved = { outcome: "preserved-active-session", removed: false, preservedReason: "active-session" };
+
+    afterEach(() => {
+      activeSessionRegistry.unregisterPath(worktreePath);
+      activeSessionRegistry.unregisterPath(canonicalPath);
+      canonicalizeOverride.fn = undefined;
+    });
+
+    function run(store: unknown, audit?: { git: ReturnType<typeof vi.fn> }) {
+      return cleanupLandedTaskWorktree({
+        store: store as never,
+        taskId: "FN-251",
+        worktreePath,
+        rootDir: "/repo",
+        source: "ai-merge-finalize",
+        ...(audit ? { audit: audit as never } : {}),
+      });
+    }
+
+    function expectPreservedWithoutGitWork(updateTask: ReturnType<typeof vi.fn>, logEntry: ReturnType<typeof vi.fn>) {
+      expect(removeWorktreeMock).not.toHaveBeenCalled();
+      expect(updateTask).not.toHaveBeenCalled();
+      expect(logEntry).toHaveBeenCalledWith(
+        "FN-251",
+        "Post-landing worktree cleanup preserved",
+        expect.stringContaining(`${worktreePath}: active-session`),
+      );
+    }
+
+    it("audits the refusal when the session is registered under the raw path", async () => {
+      const { store, updateTask, logEntry } = createStore();
+      const audit = { git: vi.fn().mockResolvedValue(undefined) };
+      activeSessionRegistry.registerPath(worktreePath, registration);
+
+      await expect(run(store, audit)).resolves.toEqual(preserved);
+
+      expect(audit.git).toHaveBeenCalledOnce();
+      expect(audit.git).toHaveBeenCalledWith(refusalAudit);
+      expectPreservedWithoutGitWork(updateTask, logEntry);
+    });
+
+    it("audits the refusal when the session is registered only under the canonical path", async () => {
+      const { store, updateTask, logEntry } = createStore();
+      const audit = { git: vi.fn().mockResolvedValue(undefined) };
+      canonicalizeOverride.fn = (path) => (path === worktreePath ? canonicalPath : path);
+      activeSessionRegistry.registerPath(canonicalPath, { ...registration, kind: "merger" as never });
+
+      await expect(run(store, audit)).resolves.toEqual(preserved);
+
+      expect(audit.git).toHaveBeenCalledOnce();
+      expect(audit.git).toHaveBeenCalledWith({ ...refusalAudit, metadata: { ...refusalAudit.metadata, kind: "merger" } });
+      expectPreservedWithoutGitWork(updateTask, logEntry);
+    });
+
+    it("keeps the same outcome when the audit sink rejects", async () => {
+      const { store, updateTask, logEntry } = createStore();
+      const audit = { git: vi.fn().mockRejectedValue(new Error("audit sink down")) };
+      activeSessionRegistry.registerPath(worktreePath, registration);
+
+      await expect(run(store, audit)).resolves.toEqual(preserved);
+
+      expect(audit.git).toHaveBeenCalledWith(refusalAudit);
+      expectPreservedWithoutGitWork(updateTask, logEntry);
+    });
+
+    it("keeps the same outcome when no auditor is supplied", async () => {
+      const { store, updateTask, logEntry } = createStore();
+      activeSessionRegistry.registerPath(worktreePath, registration);
+
+      await expect(run(store)).resolves.toEqual(preserved);
+
+      expectPreservedWithoutGitWork(updateTask, logEntry);
+    });
+
+    it("emits no refusal audit when no session owns the checkout", async () => {
+      const { store, updateTask } = createStore();
+      const audit = { git: vi.fn().mockResolvedValue(undefined) };
+
+      await expect(run(store, audit)).resolves.toEqual({ outcome: "removed", removed: true });
+
+      expect(removeWorktreeMock).toHaveBeenCalledOnce();
+      expect(updateTask).toHaveBeenCalledWith("FN-251", { worktree: null });
+      expect(audit.git).not.toHaveBeenCalledWith(expect.objectContaining({ type: "worktree:removal-refused-active-session" }));
+    });
   });
 
   it("keeps an active-session worktree while recording the preservation", async () => {

@@ -155,6 +155,36 @@ async function recordPartialRemovalAudit(
   }
 }
 
+/*
+FNXC:WorktreeCleanup 2026-10-07-13:33:
+KB-005 — the KB-003 live-session short-circuit in cleanupLandedTaskWorktree bypassed removeWorktree, which
+was the sole writer of the `worktree:removal-refused-active-session` audit for this path. The refusal must
+stay audited (pipeline S10 invariant "cleanup refusal is audited"), with the same metadata shape as
+removeWorktree: owning session taskId, removal reason, and session kind. The session may be registered under
+the raw or the canonical path (Windows / macOS `/private` aliasing), so both forms are looked up.
+Audit persistence is best-effort: a missing, throwing, or rejecting sink never changes the cleanup outcome.
+*/
+async function recordActiveSessionRefusalAudit(
+  input: Pick<CleanupLandedTaskWorktreeInput, "audit" | "taskId">,
+  worktreePath: string,
+): Promise<void> {
+  try {
+    const record = activeSessionRegistry.lookupByPath(worktreePath)
+      ?? activeSessionRegistry.lookupByPath(canonicalizePath(worktreePath));
+    await input.audit?.git({
+      type: "worktree:removal-refused-active-session",
+      target: worktreePath,
+      metadata: {
+        taskId: record?.taskId ?? input.taskId,
+        reason: RemovalReason.CompletionLandedCleanup,
+        kind: record?.kind ?? "unknown",
+      },
+    });
+  } catch {
+    // Audit persistence must not change worktree cleanup outcomes.
+  }
+}
+
 const defaultResidualRemover: LandedWorktreeResidualRemover = (worktreePath) =>
   removeDirectoryWithRetry({ path: worktreePath, rm });
 
@@ -344,6 +374,7 @@ export async function cleanupLandedTaskWorktree(
   // A live session owns the checkout: preserve it before any probe or git work touches the path.
   if (activeSessionRegistry.isPathActive(worktreePath) || activeSessionRegistry.isPathActive(canonicalizePath(worktreePath))) {
     const result = { outcome: "preserved-active-session" as const, preservedReason: "active-session" };
+    await recordActiveSessionRefusalAudit(input, worktreePath);
     await recordPreservedOutcome(input, worktreePath, result);
     return { ...result, removed: false };
   }

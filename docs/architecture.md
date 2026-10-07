@@ -661,7 +661,7 @@ Recognized configured wrapper prefixes are probed only after their host launcher
     | `residual-unusable` | The checkout was already `.git`-less or unregistered before cleanup ran. Nothing is deleted; the pointer is cleared and acquisition's orphan preservation owns the residue | Continues with a durable task-log reason |
     | `preserved-deliverable` | Modified tracked or untracked non-ignored content is retained | Continues with a durable task-log reason |
     | `preserved-unverifiable` | Status evidence cannot be read, so the checkout is retained | Continues with a durable task-log reason |
-    | `preserved-active-session` | A live session owns the checkout, so it is retained | Continues with a durable task-log reason |
+    | `preserved-active-session` | A live session owns the checkout, so it is retained and `worktree:removal-refused-active-session` is audited (best-effort) | Continues with a durable task-log reason |
 
     The three preserved outcomes never reclassify a durable landing as a merge failure or block completion, because doing so would strand already-shipped work in review.
     - KB-003: git continues deleting a worktree's admin entry after its work-tree deletion fails, so a non-forced `git worktree remove` can exit non-zero while leaving a half-deleted, unregistered folder. Cleanup therefore classifies the checkout before and after removal and reports `preserved-*` only while a usable, registered checkout really remains. Residual files are deleted (bounded `removeDirectoryWithRetry`) only when this call's own removal crossed git's deletion boundary; when they are gone the outcome is `removed`. `worktree:removal-partial` records the half-deleted state with ids and fixed outcomes only.

@@ -38,6 +38,9 @@ FN-9397 reconciles the closure after triage imports the graph executor for held-
 
 FNXC:MergeReliability 2026-10-01-22:44:
 FN-9446 reconciles the finalization-owned post-merge gate reseed. Its continuation insert is guarded by the captured task update timestamp and workflow selection, and merge finalization wraps the reseed in its finalization fence; its subsequent log follows only that accepted claim. The two call sites are therefore checkpoint-covered, not pending or an invented out-of-frontier exclusion.
+
+FNXC:MergeReliability 2026-10-07-13:37:
+KB-005 reconciles the four durable logs KB-003 added: the post-merge input-wait log and the two `reacquireLandedPostMergeCheckout` logs in `runGraphCustomNode`, plus the desktop-artifact cleanup log in `acquireTaskWorktree`. All four are `out-of-frontier`: no merge-module code reaches `runGraphCustomNode`, and `acquireTaskWorktree` is called only by the soft-deprecated legacy `aiMergeTask`, so neither function has a call edge from `runAiMerge`, `landWorkspaceTask`, or `landOneRepo`. Every row in both modules is out of frontier, so verdicts carried forward by id stay true after the KB-003 ordinal shifts.
 -->
 
 <!--
@@ -45,7 +48,7 @@ FNXC:MergeReliability 2026-09-25-10:56:
 The structural reconciler owns module and call-site discovery, while reviewers own lifecycle verdicts. A newly derived writer receives a deterministic pending classification; a new merger call edge to an existing entry requires reviewers to revisit its out-of-frontier verdict rather than treating closure membership as proof.
 -->
 
-The manifest is final and keyed by AST-derived call-site id and argument-shape fingerprint. It contains 426 derived call sites across the 337-module pinned closure: 361 scanned-but-off-path rows are explicitly `out-of-frontier`, including the 22 graph-execution, admission, and IR-pin writes exposed by the held-planning import path. Of the 65 frontier rows, 52 are `already-fenced`, 8 are `benign-unfenced`, and 5 remain `unresolved`. This includes the transient-status leaf, locally fence-wrapped workspace-finalization logs, and the checkpointed post-merge gate reseed. Unresolved direct-body surfaces remain explicitly unresolved because the real exported body cannot yet isolate every call site without test-only production exports. Each `must-be-fenced` or unresolved surface needs the follow-up below.
+The manifest is final and keyed by AST-derived call-site id and argument-shape fingerprint. It contains 430 derived call sites across the 337-module pinned closure: 365 scanned-but-off-path rows are explicitly `out-of-frontier`, including the 22 graph-execution, admission, and IR-pin writes exposed by the held-planning import path and the four KB-003 post-merge re-acquisition and acquisition logs. Of the 65 frontier rows, 52 are `already-fenced`, 8 are `benign-unfenced`, and 5 remain `unresolved`. This includes the transient-status leaf, locally fence-wrapped workspace-finalization logs, and the checkpointed post-merge gate reseed. Unresolved direct-body surfaces remain explicitly unresolved because the real exported body cannot yet isolate every call site without test-only production exports. Each `must-be-fenced` or unresolved surface needs the follow-up below.
 
 | call site | writer | Axis 1 | final | Layer B evidence | proof | follow-up |
 | --- | --- | --- | --- | --- | --- | --- |
