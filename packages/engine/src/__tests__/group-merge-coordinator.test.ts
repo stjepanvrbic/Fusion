@@ -355,6 +355,99 @@ describe("promoteBranchGroup", () => {
     ]));
   });
 
+  /*
+  FNXC:BranchGroupPromotion 2026-10-07-19:05:
+  Direct-mode promotion must never check out or merge in the project root. A conflicting promotion previously left the
+  operator's checkout on the integration branch mid-merge, and a dirty root on another branch blocked promotion forever.
+  */
+  const promoteDirect = (rootDir: string, readGroup: () => any, writeGroup: (patch: any) => any) => promoteBranchGroup({
+    rootDir,
+    groupId: readGroup().id,
+    settings: { autoMerge: true, globalPause: false, enginePaused: false, mergeStrategy: "direct", baseBranch: "main" },
+    store: {
+      getBranchGroup: () => readGroup(),
+      listTasksByBranchGroup: async () => [landedMember("FN-A", readGroup().branchName)],
+      updateBranchGroup: (_id: string, patch: any) => writeGroup(patch),
+    } as any,
+  });
+  const rootState = (rootDir: string) => ({
+    branch: git(rootDir, "git branch --show-current"),
+    head: git(rootDir, "git rev-parse HEAD"),
+    status: git(rootDir, "git status --porcelain"),
+  });
+
+  it("leaves the project checkout untouched when the direct promotion conflicts", async () => {
+    const rootDir = makeRepo();
+    execSync("git checkout -b fusion/groups/planning-x", { cwd: rootDir });
+    writeFileSync(join(rootDir, "a.txt"), "group\n");
+    execSync("git commit -am group", { cwd: rootDir });
+    execSync("git checkout main", { cwd: rootDir });
+    writeFileSync(join(rootDir, "a.txt"), "main\n");
+    execSync("git commit -am main-change", { cwd: rootDir });
+    const before = rootState(rootDir);
+    let group = makeGroup();
+
+    await expect(promoteDirect(rootDir, () => group, (patch) => (group = { ...group, ...patch }))).rejects.toThrow();
+
+    expect(rootState(rootDir)).toEqual(before);
+    expect(() => execSync("git rev-parse -q --verify MERGE_HEAD", { cwd: rootDir, stdio: "pipe" })).toThrow();
+    expect(git(rootDir, "git rev-parse main")).toBe(before.head);
+    expect(group.status).not.toBe("finalized");
+  });
+
+  it("promotes while the project checkout is dirty on another branch, leaving that checkout as it was", async () => {
+    const rootDir = makeRepo();
+    execSync("git checkout -b fusion/groups/planning-x", { cwd: rootDir });
+    writeFileSync(join(rootDir, "group.txt"), "promoted\n");
+    execSync("git add group.txt", { cwd: rootDir });
+    execSync("git commit -m group", { cwd: rootDir });
+    execSync("git checkout -b operator-work main", { cwd: rootDir });
+    writeFileSync(join(rootDir, "a.txt"), "operator base\n");
+    execSync("git commit -am operator-base", { cwd: rootDir });
+    writeFileSync(join(rootDir, "a.txt"), "operator edit\n");
+    const before = rootState(rootDir);
+    let group = makeGroup();
+
+    await expect(promoteDirect(rootDir, () => group, (patch) => (group = { ...group, ...patch })))
+      .resolves.toMatchObject({ promoted: true, reason: "promoted" });
+
+    expect(rootState(rootDir)).toEqual(before);
+    expect(git(rootDir, "git show main:group.txt")).toBe("promoted");
+    expect(git(rootDir, "git worktree list --porcelain").match(/^worktree /gm)).toHaveLength(1);
+  });
+
+  it("refuses without touching the integration checkout when its local edits would be overwritten", async () => {
+    const rootDir = makeRepo();
+    execSync("git checkout -b fusion/groups/planning-x", { cwd: rootDir });
+    writeFileSync(join(rootDir, "a.txt"), "group\n");
+    execSync("git commit -am group", { cwd: rootDir });
+    execSync("git checkout main", { cwd: rootDir });
+    writeFileSync(join(rootDir, "a.txt"), "operator edit\n");
+    const before = rootState(rootDir);
+    let group = makeGroup();
+
+    await expect(promoteDirect(rootDir, () => group, (patch) => (group = { ...group, ...patch }))).rejects.toThrow(/was not changed/);
+
+    expect(rootState(rootDir)).toEqual(before);
+    expect(group.status).not.toBe("finalized");
+  });
+
+  it("brings a clean project checkout that is on the integration branch forward with the promotion", async () => {
+    const rootDir = makeRepo();
+    execSync("git checkout -b fusion/groups/planning-x", { cwd: rootDir });
+    writeFileSync(join(rootDir, "group.txt"), "promoted\n");
+    execSync("git add group.txt", { cwd: rootDir });
+    execSync("git commit -m group", { cwd: rootDir });
+    execSync("git checkout main", { cwd: rootDir });
+    let group = makeGroup();
+
+    await expect(promoteDirect(rootDir, () => group, (patch) => (group = { ...group, ...patch })))
+      .resolves.toMatchObject({ promoted: true });
+
+    expect(rootState(rootDir)).toMatchObject({ branch: "main", head: git(rootDir, "git rev-parse main"), status: "" });
+    expect(git(rootDir, "git show HEAD:group.txt")).toBe("promoted");
+  });
+
   it("merges group branch once and finalizes group when complete and eligible", async () => {
     const rootDir = makeRepo();
     execSync("git checkout -b fusion/groups/planning-x", { cwd: rootDir });
