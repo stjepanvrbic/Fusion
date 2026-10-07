@@ -47,6 +47,7 @@
     "packages/engine/src/cli-agent/runtime.ts",
     "packages/engine/src/cli-agent/session-manager.ts",
     "packages/engine/src/cli-agent/state-machine.ts",
+    "packages/engine/src/cli-agent/task-session.ts",
     "packages/engine/src/cli-agent/telemetry-hub.ts",
     "packages/engine/src/cli-runtime/claude-acp-enable.ts",
     "packages/engine/src/cli-runtime/pty-native.ts",
