@@ -70,8 +70,11 @@ describe("engine lifecycle move reason census", () => {
      * exhausted transient execution reseed, and exhausted branch-conflict reseed. Each first
      * fences durable state, clears only automatic recovery metadata, and returns to its resolved
      * current-lifecycle lane rather than introducing a direct terminal or backward move.
+     *
+     * FNXC:WorktreeAcquisition 2026-10-07-19:51:
+     * Heartbeat worktree-acquisition recovery no longer moves the card (lifecycle containment), which removes its three rebound moves: the base-refresh refusal, the in-budget retry, and the exhausted park.
      */
-    expect(count).toBe(54);
+    expect(count).toBe(51);
   });
 
   it("requires direct backward-target moves to carry a registered reason", () => {
