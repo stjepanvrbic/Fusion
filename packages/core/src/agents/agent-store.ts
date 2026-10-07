@@ -8,7 +8,8 @@
  * edited as normal project files.
  */
 
-import { mkdir, readFile, writeFile, readdir, unlink, rename, access, appendFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, unlink, access, appendFile } from "node:fs/promises";
+import { renameWithTransientRetry } from "../fs/rename-with-transient-retry.js";
 import { constants as fsConstants, type FSWatcher } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID, randomBytes, createHash } from "node:crypto";
@@ -1223,7 +1224,7 @@ export class AgentStore extends EventEmitter {
       const resolvedPath = join(bundleDir, filePath);
       const tempPath = `${resolvedPath}.tmp.${Date.now()}`;
       await writeFile(tempPath, content, "utf-8");
-      await rename(tempPath, resolvedPath);
+      await renameWithTransientRetry(tempPath, resolvedPath);
     });
   }
 

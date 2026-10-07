@@ -44,6 +44,7 @@ import {getAllDocuments as getAllDocumentsAsync} from "../task-store/async/async
 import {recordGoalCitations as recordGoalCitationsAsync} from "../task-store/async/async-events.js";
 import type { WorkflowWorkItemRow } from "../task-store/row-types.js";
 import { projectScopeFor, type DbTransaction } from "../postgres/data-layer.js";
+import { publishCommittedTaskJson } from "./task-row-mappers.js";
 
 export async function recordGoalCitationsImpl(store: TaskStore, inputs: GoalCitationInput[]): Promise<GoalCitation[]> {
         const layer = store.asyncLayer!;
@@ -165,7 +166,7 @@ export async function atomicWriteTaskJsonImpl2(
       }
       await options?.withinTransaction?.(tx);
     });
-    await store.writeTaskJsonFile(dir, task);
+    await publishCommittedTaskJson(store, dir, task);
     return;
 }
 

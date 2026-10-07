@@ -18,7 +18,8 @@ import {TaskStore, storeLog} from "../store.js";
 import {TaskDeletedError, TaskNotFoundError} from "./errors.js";
 import type {LegacyAutoMergeStampReconcileResult} from "../store.js";
 import {randomUUID} from "node:crypto";
-import {mkdir, readFile, writeFile, rename, unlink} from "node:fs/promises";
+import {mkdir, readFile, writeFile, unlink} from "node:fs/promises";
+import {renameWithTransientRetry} from "../fs/rename-with-transient-retry.js";
 import {join} from "node:path";
 import {existsSync} from "node:fs";
 import { getTaskActivityLogEntryLimit } from "./comments.js";
@@ -63,6 +64,7 @@ import { TaskAtomicPersistGuardRefusedError, type TaskAtomicPersistFence } from 
 import { rememberTaskRowBaseline, taskRowBaselineOf, TaskWriteConflictError } from "./task-row-merge.js";
 import { STALE_REVIEW_CALLBACK_WAIVER_ACTOR, STALE_REVIEW_CALLBACK_WAIVER_POLICY_VERSION, STALE_REVIEW_CALLBACK_WAIVER_REASON, type StaleReviewCallbackWaiverReceipt } from "../merge/pre-merge-approval.js";
 import { deriveStaleReviewCallbackAttemptId } from "../workflows/workflow-step-results.js";
+import { publishCommittedTaskJson } from "./task-row-mappers.js";
 
 export function getTaskSelectClauseWithActivityLogLimitImpl(store: TaskStore, limit: number): string {
     const columns = [
@@ -183,7 +185,7 @@ export async function writeConfigImpl(store: TaskStore, config: BoardConfig, opt
     try {
       const tmpPath = store.configPath + ".tmp";
       await writeFile(tmpPath, store.serializeConfigForDisk(config));
-      await rename(tmpPath, store.configPath);
+      await renameWithTransientRetry(tmpPath, store.configPath);
     } catch (err) {
       // Best-effort: SQLite is the primary store
       storeLog.warn("Backward-compat config.json sync failed after config write", {
@@ -373,7 +375,7 @@ export async function renewCheckoutLeaseImpl(store: TaskStore, taskId: string, u
       throw new Error(`Task ${taskId} not found`);
     }
     const current = store.rowToTask(store.pgRowToTaskRow(outcome.current));
-    await store.writeTaskJsonFile(dir, current);
+    await publishCommittedTaskJson(store, dir, current);
     if (store.isWatching) {
       store.taskCache.set(taskId, { ...current });
     }
@@ -495,7 +497,7 @@ export async function updateWorkflowStepResultsFencedImpl(
     });
 
     if (outcome.applied) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -592,7 +594,7 @@ export async function issueStaleReviewCallbackWaiverImpl(
       return { applied: true, task: store.rowToTask(store.pgRowToTaskRow(updatedRow)), receipt };
     });
     if (outcome.applied) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -637,7 +639,7 @@ export async function updateWorkflowStepResultsWithLogFencedImpl(
     });
 
     if (outcome.applied) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -729,7 +731,7 @@ export async function linkTaskRecommendationImpl(
     });
 
     if (!updated.archived) {
-      await store.writeTaskJsonFile(store.taskDir(id), updated.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), updated.task);
       if (store.isWatching) store.taskCache.set(id, { ...updated.task });
     }
     store.emitTaskLifecycleEventSafely("task:updated", [updated.task]);
@@ -879,7 +881,7 @@ export async function mergeWorkspaceWorktreeEntryImpl(
     });
 
     if (outcome.mutated) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -958,7 +960,7 @@ export async function updateTaskRepositoryScopeImpl(
       if (!updatedRow) throw new TaskNotFoundError(id);
       return store.rowToTask(store.pgRowToTaskRow(updatedRow));
     });
-    await store.writeTaskJsonFile(store.taskDir(id), outcome);
+    await publishCommittedTaskJson(store, store.taskDir(id), outcome);
     if (store.isWatching) store.taskCache.set(id, { ...outcome });
     store.emitTaskLifecycleEventSafely("task:updated", [outcome]);
     return outcome;
@@ -998,7 +1000,7 @@ export async function updateWorkspaceReviewStateImpl(
       return { task: store.rowToTask(store.pgRowToTaskRow(updatedRow)), updated: true };
     });
     if (outcome.updated) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -1063,7 +1065,7 @@ export async function publishWorkspaceCodeReviewEvidenceImpl(
     });
 
     if (outcome.published) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }

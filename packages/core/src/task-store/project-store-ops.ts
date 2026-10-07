@@ -51,6 +51,7 @@ import {recordRunAuditEvent as recordRunAuditEventAsync} from "../postgres/data-
 import {listGoalCitations as listGoalCitationsAsync} from "./async/async-events.js";
 import type {RunAuditEventRow} from "../task-store/row-types.js";
 import { DuplicateWorkflowSelectionError, resolveDuplicateTargetWorkflowId } from "./duplicate-workflow-selection.js";
+import { publishCommittedTaskJson } from "./task-row-mappers.js";
 
 export async function getOrCreateForProjectImpl(store: typeof TaskStore, projectId?: string, centralCore?: CentralCore, globalSettingsDir?: string, asyncLayer?: AsyncDataLayer, consumerId?: string,): Promise<TaskStore> {
     if (!asyncLayer) {
@@ -356,7 +357,7 @@ export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: st
         timestamp: auditInput?.timestamp,
       });
     }
-    await store.writeTaskJsonFile(dir, task);
+    await publishCommittedTaskJson(store, dir, task);
     return;
 }
 

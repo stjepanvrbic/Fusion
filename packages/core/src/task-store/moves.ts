@@ -115,6 +115,7 @@ async function resolveWorkflowIrForSelectedWorkflowId(store: TaskStore, workflow
   }
 }
 import {enqueueMergeQueueInTransaction, dequeueMergeQueueOnColumnExitInTransaction} from "./async/async-merge-coordination.js";
+import { publishCommittedTaskJson } from "./task-row-mappers.js";
 
 /*
 FNXC:WorkflowCapacity 2026-07-28-16:10 (PR #2499 review — split capacity snapshot):
@@ -1354,7 +1355,7 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
       });
     }
 
-    await store.writeTaskJsonFile(dir, task);
+    await publishCommittedTaskJson(store, dir, task);
 
     /*
     FNXC:MissionSymbolAdmission 2026-07-19-22:04:

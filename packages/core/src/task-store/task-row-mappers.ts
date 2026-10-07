@@ -9,10 +9,11 @@
  * FNXC:CodeOrganization 2026-07-16-12:00:
  * Renamed from remaining-ops-3.ts (domain name: row mappers + persist select).
  */
-import {TaskStore} from "../store.js";
+import {TaskStore, storeLog} from "../store.js";
 import {TaskDeletedError} from "./errors.js";
 import {randomUUID} from "node:crypto";
-import {mkdir, writeFile, rename, unlink} from "node:fs/promises";
+import {mkdir, writeFile, unlink} from "node:fs/promises";
+import {renameWithTransientRetry} from "../fs/rename-with-transient-retry.js";
 import {join} from "node:path";
 import type {Task, RunAuditEvent, MergeQueueEntry, MergeRequestRecord, CompletionHandoffMarker, WorkflowWorkItem, PrEntity, PrConflictState, PrChecksRollup, PrReviewDecision} from "../types.js";
 import "../builtin-traits.js";
@@ -106,7 +107,7 @@ export async function writeTaskJsonFileImpl(store: TaskStore, dir: string, task:
     await mkdir(dir, { recursive: true });
     await writeFile(tmpPath, JSON.stringify(task));
     try {
-      await rename(tmpPath, taskJsonPath);
+      await renameWithTransientRetry(tmpPath, taskJsonPath);
     } catch (err) {
       // Best-effort cleanup of our tmp on rename failure so we don't leave
       // orphaned `task.json.*.tmp` files behind.
@@ -118,6 +119,24 @@ export async function writeTaskJsonFileImpl(store: TaskStore, dir: string, task:
       throw err;
     }
   }
+
+/**
+ * FNXC:WindowsAtomicWrites 2026-10-07-21:40:
+ * Publish the task.json mirror of a task row that has already committed. PostgreSQL is authoritative, so a mirror failure
+ * that survives the rename retry is logged and the mutation still reports success and emits its event; throwing here told
+ * the caller a landed change had failed and skipped the cache refresh and `task:updated`.
+ */
+export async function publishCommittedTaskJson(store: TaskStore, dir: string, task: Task): Promise<void> {
+  try {
+    await store.writeTaskJsonFile(dir, task);
+  } catch (error) {
+    storeLog.warn("task.json mirror write failed after the task row committed (degraded)", {
+      phase: "publish-committed-task-json",
+      taskId: task.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
 
 export function rowToPrEntityImpl(store: TaskStore, row: PrEntityRow): PrEntity {
     return {

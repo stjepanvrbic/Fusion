@@ -26,6 +26,7 @@ import { resolveArchivedLanes } from "../project-lane-vocabulary.js";
 import { buildTaskLogReadOnlyMessage, buildTaskNotFoundMessage } from "./task-log-write-refusal.js";
 import * as schema from "../postgres/schema/index.js";
 import { observeOverlapWaitTransitionInTransaction } from "./overlap-wait-ops.js";
+import { publishCommittedTaskJson } from "./task-row-mappers.js";
 
 export async function runPluginColumnTransitionHooksImpl(store: TaskStore, taskId: string, workflowIr: WorkflowIr, fromColumn: string, toColumn: string,): Promise<void> {
     const registry = getTraitRegistry();
@@ -161,7 +162,7 @@ export async function logEntryOnceImpl(
     return { appended: true, row: updated[0]! };
   });
   const task = store.rowToTask(store.pgRowToTaskRow(result.row as unknown as Record<string, unknown>));
-  await store.writeTaskJsonFile(store.taskDir(id), task);
+  await publishCommittedTaskJson(store, store.taskDir(id), task);
   if (store.isWatching) store.taskCache.set(id, { ...task });
   return result.appended;
 }
@@ -251,7 +252,7 @@ export async function transitionQueuedEpisodeImpl(
     return { appended, task: updated[0]! };
   });
   const task = store.rowToTask(store.pgRowToTaskRow(result.task as unknown as Record<string, unknown>));
-  await store.writeTaskJsonFile(store.taskDir(id), task);
+  await publishCommittedTaskJson(store, store.taskDir(id), task);
   if (store.isWatching) store.taskCache.set(id, { ...task });
   store.emitTaskLifecycleEventSafely("task:updated", [task]);
   return { appended: result.appended, task };
@@ -468,7 +469,7 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
 
       if (updatedRow) {
         const current = store.rowToTask(store.pgRowToTaskRow(updatedRow));
-        await store.writeTaskJsonFile(store.taskDir(id), current);
+        await publishCommittedTaskJson(store, store.taskDir(id), current);
         if (store.isWatching) {
           store.taskCache.set(id, { ...current });
         }
