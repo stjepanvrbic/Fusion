@@ -42,7 +42,7 @@ import type {
 } from "./plugin-types.js";
 import type { LoadedPluginSchemaContract } from "../postgres/plugin-schema-hook.js";
 import type { WorkflowExtensionContribution } from "../workflows/workflow-extension-types.js";
-import { normalizePluginUiContributionDefinition, validatePluginManifest } from "./plugin-types.js";
+import { normalizePluginUiContributionDefinition, PLUGIN_HOOK_RECEIVES_CONTEXT, validatePluginManifest } from "./plugin-types.js";
 import { createLogger } from "../process/logger.js";
 import { getCreateAiSessionFactory, getCreateInteractiveAiSessionFactory } from "../ai/ai-engine-loader.js";
 import { scanPluginSecurity } from "./plugin-security-scan.js";
@@ -169,7 +169,22 @@ export interface PluginLoaderOptions {
    * or persist runtime state. Isolated loaders own only private instances.
    */
   lifecycleScope?: "shared" | "isolated";
+  /**
+   * FNXC:PluginHooks 2026-10-07-18:01:
+   * Per-plugin bound for each dispatched hook (task, agent-run, and error hooks). A hanging plugin delays later plugins by at most this bound and never blocks their delivery.
+   */
+  hookTimeoutMs?: number;
+  /**
+   * FNXC:PluginLoader 2026-10-07-18:01:
+   * Bound for an initial onLoad. Dashboard, serve, daemon, desktop, and engine init await loadAllPlugins, so an unbounded onLoad would block startup.
+   */
+  onLoadTimeoutMs?: number;
 }
+
+const DEFAULT_HOOK_TIMEOUT_MS = 5_000;
+const DEFAULT_ON_LOAD_TIMEOUT_MS = 30_000;
+const DEFAULT_ON_UNLOAD_TIMEOUT_MS = 5_000;
+const REJECTING_SCAN_VERDICTS = new Set(["blocked", "error", "unavailable"]);
 
 /**
  * Event emitted when a plugin is loaded and started.
@@ -230,8 +245,11 @@ export class PluginLoader extends EventEmitter<{
   /** Cache of dynamically imported modules */
   private loadedModules: Map<string, unknown> = new Map();
 
-  /** Absolute plugin package roots keyed by plugin id. */
-  private pluginRoots: Map<string, string> = new Map();
+  /**
+   * Resolved plugin entry paths keyed by plugin id, kept in step with `plugins`.
+   * FNXC:PluginLoader 2026-10-07-18:01: stopPlugin resolves the lifecycle key from here when the store record is already gone (uninstall), so an uninstalled plugin is still unloaded.
+   */
+  private pluginEntryPaths: Map<string, string> = new Map();
   private pluginSchemaContracts: Map<string, LoadedPluginSchemaContract> = new Map();
 
   /*
@@ -391,6 +409,17 @@ export class PluginLoader extends EventEmitter<{
     // Skip already loaded plugins
     if (this.plugins.has(pluginId)) {
       this.log.log(`Plugin already loaded: ${pluginId}`);
+      /*
+      FNXC:PluginLoader 2026-10-07-18:01:
+      Enable and rescan call loadPlugin on a plugin that may already be loaded. Persisted state must say so, or a stale "error" row survives every recovery action the dashboard offers.
+      */
+      if (installation.state !== "started") {
+        try {
+          await this.updatePluginState(pluginId, "started");
+        } catch (err) {
+          this.log.warn(`Failed to reconcile persisted state for loaded plugin ${pluginId}:`, err);
+        }
+      }
       return this.plugins.get(pluginId)!;
     }
 
@@ -433,7 +462,7 @@ export class PluginLoader extends EventEmitter<{
   private adoptProcessLoadedPlugin(pluginId: string, pluginPath: string, plugin: FusionPlugin): FusionPlugin {
     plugin.state = "started";
     this.plugins.set(pluginId, plugin);
-    this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+    this.pluginEntryPaths.set(pluginId, pluginPath);
     this.emit("plugin:loaded", { pluginId, plugin });
     return plugin;
   }
@@ -444,17 +473,7 @@ export class PluginLoader extends EventEmitter<{
     pluginPath: string,
   ): Promise<FusionPlugin> {
     try {
-      if (installation.aiScanOnLoad) {
-        const scanResult = await scanPluginSecurity({ pluginId, pluginPath });
-        await this.options.pluginStore.updatePlugin(pluginId, { lastSecurityScan: scanResult });
-
-        if (["blocked", "error", "unavailable"].includes(scanResult.verdict)) {
-          const errorMessage = `Security scan ${scanResult.verdict}: ${scanResult.summary}`;
-          await this.updatePluginState(pluginId, "error", errorMessage);
-          this.emit("plugin:error", { pluginId, error: new Error(errorMessage) });
-          throw new Error(errorMessage);
-        }
-      }
+      await this.runPreImportSecurityGate(pluginId, installation, pluginPath);
 
       // Dynamic import the plugin - always bypass cache to get fresh code
       // Our loadedModules cache is cleared on stop, but Node.js ESM cache persists
@@ -501,30 +520,11 @@ export class PluginLoader extends EventEmitter<{
       // Update plugin state locally and store
       plugin.state = "started";
       this.plugins.set(pluginId, plugin);
-      this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+      this.pluginEntryPaths.set(pluginId, pluginPath);
       if (schemaContract) this.pluginSchemaContracts.set(pluginId, schemaContract);
 
-      // Call onLoad hook
-      const ctx = await this.createContext(plugin);
-      try {
-        await this.safeCallHook(plugin, "onLoad", [ctx]);
-      } catch (loadErr) {
-        // onLoad failed - clean up and propagate error
-        this.plugins.delete(pluginId);
-        this.pluginRoots.delete(pluginId);
-        this.pluginSchemaContracts.delete(pluginId);
-        const errorMsg = loadErr instanceof Error ? loadErr.message : String(loadErr);
-        await this.updatePluginState(
-          pluginId,
-          "error",
-          `onLoad failed: ${errorMsg}`,
-        );
-        this.emit("plugin:error", {
-          pluginId,
-          error: loadErr instanceof Error ? loadErr : new Error(errorMsg),
-        });
-        throw loadErr;
-      }
+      // A failed or timed-out onLoad has already been unloaded; the outer catch clears maps and persists the error once.
+      await this.startInstance(plugin, this.options.onLoadTimeoutMs ?? DEFAULT_ON_LOAD_TIMEOUT_MS, "onLoad");
 
       this.recordActivationEvent(pluginId, plugin);
       this.emit("plugin:loaded", { pluginId, plugin });
@@ -533,7 +533,7 @@ export class PluginLoader extends EventEmitter<{
       // Ensure plugin is removed from loaded map on any failure
       // (it may have been added above before the onLoad hook)
       this.plugins.delete(pluginId);
-      this.pluginRoots.delete(pluginId);
+      this.pluginEntryPaths.delete(pluginId);
       this.pluginSchemaContracts.delete(pluginId);
 
       // Error isolation: set error state but don't crash
@@ -550,6 +550,74 @@ export class PluginLoader extends EventEmitter<{
       });
 
       throw err;
+    }
+  }
+
+  /**
+   * FNXC:PluginSecurityScan 2026-10-07-18:01:
+   * One pre-import gate for every path that executes plugin code from disk: initial load, reload, and dashboard rescan, which delegates to those two.
+   * A blocked, error, or unavailable verdict rejects before any import. The scanner reads package files, so it receives the package root, not the entry file.
+   */
+  private async runPreImportSecurityGate(
+    pluginId: string,
+    installation: PluginInstallation,
+    pluginPath: string,
+  ): Promise<void> {
+    if (!installation.aiScanOnLoad) return;
+    const scanResult = await scanPluginSecurity({ pluginId, pluginPath: await this.resolveScanRoot(pluginPath) });
+    await this.options.pluginStore.updatePlugin(pluginId, { lastSecurityScan: scanResult });
+    if (REJECTING_SCAN_VERDICTS.has(scanResult.verdict)) {
+      throw Object.assign(new Error(`Security scan ${scanResult.verdict}: ${scanResult.summary}`), {
+        code: "PLUGIN_SECURITY_SCAN_REJECTED",
+      });
+    }
+  }
+
+  private async resolveScanRoot(pluginPath: string): Promise<string> {
+    try {
+      if ((await stat(pluginPath)).isDirectory()) return pluginPath;
+    } catch {
+      // A missing entry still scans its would-be package root; the import step reports the missing file.
+    }
+    return resolvePluginRootFromEntryPath(pluginPath);
+  }
+
+  /**
+   * FNXC:PluginLoader 2026-10-07-18:01:
+   * Run onLoad under a bound. On failure or timeout, call onUnload on that same instance so partial side effects (timers, subscriptions, child processes) do not leak.
+   * A timed-out onLoad that settles later is unloaded again, so at most one live instance exists per lifecycle key.
+   */
+  private async startInstance(plugin: FusionPlugin, timeoutMs: number, label: string): Promise<void> {
+    const pluginId = plugin.manifest.id;
+    const ctx = await this.createContext(plugin);
+    const onLoad = this.safeCallHook(plugin, "onLoad", [ctx]);
+    let settled = false;
+    const observed = onLoad.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await this.withTimeout(onLoad, timeoutMs, `${label} timeout for ${pluginId}`);
+    } catch (err) {
+      await this.unloadInstanceBestEffort(plugin);
+      if (!settled) {
+        void observed.then(async () => {
+          this.log.warn(`${label} for ${pluginId} settled after its timeout; unloading the late instance`);
+          await this.unloadInstanceBestEffort(plugin);
+        });
+      }
+      throw err;
+    }
+  }
+
+  private async unloadInstanceBestEffort(plugin: FusionPlugin, timeoutMs = DEFAULT_ON_UNLOAD_TIMEOUT_MS): Promise<void> {
+    const pluginId = plugin.manifest.id;
+    try {
+      const ctx = await this.createContext(plugin);
+      await this.withTimeout(
+        this.safeCallHook(plugin, "onUnload", [ctx]),
+        timeoutMs,
+        `onUnload timeout for ${pluginId}`,
+      );
+    } catch (err) {
+      this.log.warn(`onUnload for ${pluginId} timed out or failed:`, err);
     }
   }
 
@@ -704,7 +772,15 @@ export class PluginLoader extends EventEmitter<{
     const precedingLifecycle = processLifecycle?.promise;
 
     const reload = this.enqueueProcessLifecycleOperation(lifecycleKey, async () => {
-      await precedingLifecycle;
+      /*
+      FNXC:PluginLoader 2026-10-07-18:01:
+      A failed predecessor must not fail this reload: a rolled-back reload leaves the old instance running, and a failed initial load leaves nothing loaded, which reloadPluginFresh reports itself.
+      */
+      try {
+        await precedingLifecycle;
+      } catch {
+        // Outcome is re-derived from the owner's map below.
+      }
       const owner = processLifecycle?.owner ?? this;
       const plugin = await owner.reloadPluginFresh(pluginId, installation, pluginPath, options);
       if (processLifecycle) {
@@ -723,6 +799,8 @@ export class PluginLoader extends EventEmitter<{
           processLifecycle.promise = Promise.resolve(restored);
           this.synchronizeProcessPlugin(processLifecycle, pluginId, pluginPath, restored);
         } else {
+          // The owner dropped the plugin (scan rejection or failed rollback); no adopter may keep serving it.
+          this.discardParticipantViews(processLifecycle, pluginId, pluginPath);
           PluginLoader.processPluginLifecycles.delete(lifecycleKey);
         }
       }
@@ -735,6 +813,9 @@ export class PluginLoader extends EventEmitter<{
   A process lifecycle is shared by host and engine loaders, not merely its
   initial onLoad promise. Stop and reload must update every adopter so no
   loader retains an old active instance after another surface changes it.
+
+  FNXC:PluginLoader 2026-10-07-18:01:
+  Adopters also emit the matching loader event, because each engine PluginRunner invalidates its tool, route, and runtime caches only from its own loader's events.
   */
   private synchronizeProcessPlugin(
     lifecycle: ProcessPluginLifecycle,
@@ -745,8 +826,26 @@ export class PluginLoader extends EventEmitter<{
     for (const loader of lifecycle.participants) {
       if (loader === lifecycle.owner) continue;
       loader.plugins.set(pluginId, plugin);
-      loader.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+      loader.pluginEntryPaths.set(pluginId, pluginPath);
       loader.pluginSchemaContracts.delete(pluginId);
+      loader.emit("plugin:reloaded", { pluginId, plugin });
+    }
+  }
+
+  private discardParticipantViews(lifecycle: ProcessPluginLifecycle, pluginId: string, pluginPath: string): void {
+    for (const loader of lifecycle.participants) {
+      if (loader === lifecycle.owner) continue;
+      loader.releaseProcessPluginView(pluginId, pluginPath);
+    }
+  }
+
+  /** Drop this loader's view of a plugin whose instance another loader owns, announcing it when the view existed. */
+  private releaseProcessPluginView(pluginId: string, pluginPath: string): void {
+    const held = this.plugins.has(pluginId);
+    this.discardProcessPlugin(pluginId, pluginPath);
+    if (held) {
+      this.emit("plugin:unloaded", { pluginId });
+      this.emit("plugin:stopped", pluginId);
     }
   }
 
@@ -784,18 +883,25 @@ export class PluginLoader extends EventEmitter<{
 
     this.log.log(`Reloading plugin: ${pluginId}`);
 
-    // Call onUnload with timeout
+    /*
+    FNXC:PluginSecurityScan 2026-10-07-18:01:
+    Reload and rescan re-import code from disk, so they pass the same gate as the initial load before anything is imported.
+    A rejection fails closed: the running instance is unloaded and the plugin parks in error, because the package on disk no longer passes the gate the operator enabled.
+    */
     try {
-      const ctx = await this.createContext(oldPlugin);
-      await this.withTimeout(
-        this.safeCallHook(oldPlugin, "onUnload", [ctx]),
-        timeoutMs,
-        `onUnload timeout for ${pluginId}`,
-      );
-    } catch (err) {
-      this.log.warn(`onUnload for ${pluginId} timed out or failed:`, err);
-      // Continue with reload despite onUnload issues
+      await this.runPreImportSecurityGate(pluginId, installation, pluginPath);
+    } catch (scanErr) {
+      await this.unloadInstanceBestEffort(oldPlugin, timeoutMs);
+      this.discardProcessPlugin(pluginId, pluginPath);
+      const errorMsg = scanErr instanceof Error ? scanErr.message : String(scanErr);
+      await this.updatePluginState(pluginId, "error", errorMsg);
+      this.emit("plugin:unloaded", { pluginId });
+      this.emit("plugin:error", { pluginId, error: scanErr instanceof Error ? scanErr : new Error(errorMsg) });
+      throw scanErr;
     }
+
+    // Unload the old instance; reload continues even when its onUnload fails or times out.
+    await this.unloadInstanceBestEffort(oldPlugin, timeoutMs);
 
     // Remove old module from cache
     this.invalidateModuleCache(pluginPath);
@@ -824,22 +930,20 @@ export class PluginLoader extends EventEmitter<{
 
       // Replace in plugins map
       this.plugins.set(pluginId, newPlugin);
-      this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+      this.pluginEntryPaths.set(pluginId, pluginPath);
       if (schemaContract) this.pluginSchemaContracts.set(pluginId, schemaContract);
       else this.pluginSchemaContracts.delete(pluginId);
 
-      // Create fresh context and call onLoad
-      const ctx = await this.createContext(newPlugin);
-      await this.withTimeout(
-        this.safeCallHook(newPlugin, "onLoad", [ctx]),
-        timeoutMs,
-        `onLoad timeout for ${pluginId}`,
-      );
+      // A failed or timed-out new onLoad receives onUnload before rollback reactivates the old instance.
+      await this.startInstance(newPlugin, timeoutMs, "onLoad");
 
       await this.refreshPersistedManifestMetadata(installation, newPlugin.manifest);
 
-      // State is already "started", no need to update store
-      // (avoiding started -> started transition which is disallowed)
+      /*
+      FNXC:PluginLoader 2026-10-07-18:01:
+      A loaded plugin may carry a stale persisted "error", for example from an old hook failure. A successful reload persists "started"; the store treats started -> started as an idempotent no-op.
+      */
+      await this.updatePluginState(pluginId, "started");
 
       this.log.log(`Plugin ${pluginId} reloaded successfully`);
 
@@ -853,17 +957,12 @@ export class PluginLoader extends EventEmitter<{
       try {
         // Restore old plugin
         this.plugins.set(pluginId, snapshot);
-        this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+        this.pluginEntryPaths.set(pluginId, pluginPath);
         if (oldSchemaContract) this.pluginSchemaContracts.set(pluginId, oldSchemaContract);
         else this.pluginSchemaContracts.delete(pluginId);
 
         // Attempt to reactivate old plugin
-        const ctx = await this.createContext(snapshot);
-        await this.withTimeout(
-          this.safeCallHook(snapshot, "onLoad", [ctx]),
-          timeoutMs,
-          `Rollback onLoad timeout for ${pluginId}`,
-        );
+        await this.startInstance(snapshot, timeoutMs, "Rollback onLoad");
 
         // Update store state back to started
         await this.updatePluginState(pluginId, "started");
@@ -877,7 +976,7 @@ export class PluginLoader extends EventEmitter<{
         );
 
         this.plugins.delete(pluginId);
-        this.pluginRoots.delete(pluginId);
+        this.pluginEntryPaths.delete(pluginId);
         this.pluginSchemaContracts.delete(pluginId);
 
         const originalError = err instanceof Error ? err.message : String(err);
@@ -890,6 +989,7 @@ export class PluginLoader extends EventEmitter<{
           combinedError,
         );
 
+        this.emit("plugin:unloaded", { pluginId });
         this.emit("plugin:error", {
           pluginId,
           error: new Error(combinedError),
@@ -1071,68 +1171,86 @@ export class PluginLoader extends EventEmitter<{
    * Stop and unload a single plugin.
    */
   async stopPlugin(pluginId: string): Promise<void> {
-    let installation: PluginInstallation;
-    try {
-      installation = await this.options.pluginStore.getPlugin(pluginId);
-    } catch {
+    const target = await this.resolveStopTarget(pluginId);
+    if (!target) {
       this.log.log(`Plugin not loaded: ${pluginId}`);
       return;
     }
-    const pluginPath = this.resolvePluginPath(installation.path);
+    const { pluginPath, persistState, processWide } = target;
     if (this.options.lifecycleScope === "isolated") {
-      await this.stopPluginFresh(pluginId, pluginPath);
+      await this.stopPluginFresh(pluginId, pluginPath, persistState);
       return;
     }
     const lifecycleKey = this.getProcessLifecycleKey(pluginId, pluginPath);
     const processLifecycle = PluginLoader.processPluginLifecycles.get(lifecycleKey);
     if (!processLifecycle) {
-      await this.stopPluginFresh(pluginId, pluginPath);
+      await this.stopPluginFresh(pluginId, pluginPath, persistState);
       return;
     }
 
+    /*
+    FNXC:PluginLoader 2026-10-07-18:01:
+    Capture the predecessor before enqueueing. A later reload replaces processLifecycle.promise with its own operation, which is queued behind this stop; reading it at execution time made the stop await its own successor and deadlocked the plugin's queue.
+    */
+    const precedingLifecycle = processLifecycle.promise;
     await this.enqueueProcessLifecycleOperation(lifecycleKey, async () => {
       try {
-        await processLifecycle.promise;
+        await precedingLifecycle;
       } catch {
         // A rejected load has already cleaned its local state.
       }
-      if (processLifecycle.owner !== this) {
+      if (processLifecycle.owner !== this && !processWide) {
         // Participants adopted the owner's instance; stopping one only detaches
         // that view and must not unload or persist state for the shared owner.
         processLifecycle.participants.delete(this);
-        this.discardProcessPlugin(pluginId, pluginPath);
+        this.releaseProcessPluginView(pluginId, pluginPath);
         return;
       }
-      await processLifecycle.owner.stopPluginFresh(pluginId, pluginPath);
-      for (const loader of processLifecycle.participants) {
-        if (loader === processLifecycle.owner) continue;
-        loader.discardProcessPlugin(pluginId, pluginPath);
-      }
+      await processLifecycle.owner.stopPluginFresh(pluginId, pluginPath, persistState);
+      this.discardParticipantViews(processLifecycle, pluginId, pluginPath);
       if (PluginLoader.processPluginLifecycles.get(lifecycleKey) === processLifecycle) {
         PluginLoader.processPluginLifecycles.delete(lifecycleKey);
       }
     });
   }
 
-  private async stopPluginFresh(pluginId: string, pluginPath: string): Promise<void> {
+  /**
+   * FNXC:PluginLoader 2026-10-07-18:01:
+   * A stop of a plugin that is disabled or uninstalled for this project is process-wide: the owner unloads and every adopter drops its view, whichever loader asked.
+   * A stop of a still-enabled plugin from an adopter (engine shutdown) keeps detaching only that view.
+   * An uninstall deletes the store record before the runner's stop runs, so the entry path falls back to this loader's in-memory map and nothing is persisted for the missing record.
+   */
+  private async resolveStopTarget(
+    pluginId: string,
+  ): Promise<{ pluginPath: string; persistState: boolean; processWide: boolean } | null> {
+    try {
+      const installation = await this.options.pluginStore.getPlugin(pluginId);
+      return {
+        pluginPath: this.resolvePluginPath(installation.path),
+        persistState: true,
+        processWide: !installation.enabled,
+      };
+    } catch (err) {
+      const pluginPath = this.pluginEntryPaths.get(pluginId);
+      if (!pluginPath) return null;
+      return {
+        pluginPath,
+        persistState: false,
+        processWide: (err as { code?: string }).code === "ENOENT",
+      };
+    }
+  }
+
+  private async stopPluginFresh(pluginId: string, pluginPath: string, persistState = true): Promise<void> {
     const plugin = this.plugins.get(pluginId);
     if (!plugin) {
       this.log.log(`Plugin not loaded: ${pluginId}`);
       return;
     }
 
-    try {
-      const ctx = await this.createContext(plugin);
-      await this.withTimeout(
-        this.safeCallHook(plugin, "onUnload", [ctx]),
-        5000,
-        `onUnload timeout for ${pluginId}`,
-      );
-    } catch (err) {
-      this.log.error(`Error in onUnload for ${pluginId}:`, err);
-    }
+    await this.unloadInstanceBestEffort(plugin);
 
-    await this.updatePluginState(pluginId, "stopped");
+    if (persistState) await this.updatePluginState(pluginId, "stopped");
     this.discardProcessPlugin(pluginId, pluginPath);
     this.emit("plugin:unloaded", { pluginId });
     this.emit("plugin:stopped", pluginId);
@@ -1140,7 +1258,7 @@ export class PluginLoader extends EventEmitter<{
 
   private discardProcessPlugin(pluginId: string, pluginPath: string): void {
     this.plugins.delete(pluginId);
-    this.pluginRoots.delete(pluginId);
+    this.pluginEntryPaths.delete(pluginId);
     this.pluginSchemaContracts.delete(pluginId);
     this.invalidateModuleCache(pluginPath);
   }
@@ -1189,43 +1307,60 @@ export class PluginLoader extends EventEmitter<{
     hookName: keyof FusionPlugin["hooks"],
     ...args: unknown[]
   ): Promise<void> {
+    /*
+    FNXC:PluginHooks 2026-10-07-18:01:
+    Each plugin's hook, and its onError follow-up, runs under its own bound. A hanging plugin delays later plugins by at most that bound and never stops them receiving the event; a late settlement is ignored.
+    */
+    const timeoutMs = this.options.hookTimeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS;
     for (const [pluginId, plugin] of this.plugins) {
       const hook = plugin.hooks[hookName];
       if (!hook) continue;
 
       try {
-        await this.safeCallHook(plugin, hookName, args);
+        await this.withTimeout(
+          this.safeCallHook(plugin, hookName, args),
+          timeoutMs,
+          `${hookName} hook for ${pluginId} timed out after ${timeoutMs}ms`,
+        );
       } catch (err) {
         this.log.error(
           `Error in ${hookName} hook for ${pluginId}:`,
           err,
         );
 
-        // Update plugin state to error
-        try {
-          await this.updatePluginState(
-            pluginId,
-            "error",
-            err instanceof Error ? err.message : String(err),
-          );
-          plugin.state = "error";
-        } catch {
-          // Non-fatal
-        }
+        await this.recordHookFailure(pluginId, hookName, err);
 
         // Call onError hook if available
         if (hookName !== "onError" && plugin.hooks.onError) {
           try {
             const ctx = await this.createContext(plugin);
-            await plugin.hooks.onError(
-              err instanceof Error ? err : new Error(String(err)),
-              ctx,
+            await this.withTimeout(
+              this.safeCallHook(plugin, "onError", [err instanceof Error ? err : new Error(String(err)), ctx]),
+              timeoutMs,
+              `onError hook for ${pluginId} timed out after ${timeoutMs}ms`,
             );
           } catch {
             // Non-fatal
           }
         }
       }
+    }
+  }
+
+  /**
+   * FNXC:PluginLoader 2026-10-07-18:01:
+   * A hook failure is health information, not a lifecycle change: the plugin stays loaded and keeps serving tools, routes, runtimes, and prompt contributions.
+   * Persist the failure in the record's error field while keeping state "started", so state keeps meaning "is it loaded" and reload, enable, and rescan act on the truth.
+   */
+  private async recordHookFailure(pluginId: string, hookName: string, err: unknown): Promise<void> {
+    try {
+      await this.updatePluginState(
+        pluginId,
+        "started",
+        `${hookName} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } catch {
+      // Non-fatal: health bookkeeping must not break dispatch to later plugins.
     }
   }
 
@@ -1249,19 +1384,18 @@ export class PluginLoader extends EventEmitter<{
     hookName: keyof FusionPlugin["hooks"],
     args: unknown[],
   ): Promise<unknown[]> {
-    if (!this.isTaskLifecycleHook(hookName) || this.hasPluginContext(args.at(-1))) {
+    if (PLUGIN_HOOK_RECEIVES_CONTEXT[hookName] !== true || this.hasPluginContext(args.at(-1))) {
       return args;
     }
 
     /*
     FNXC:PluginHooks 2026-07-01-13:36:
     Runtime task lifecycle hooks are invoked from fire-and-forget TaskStore event bridges, but the public hook contract still requires a per-plugin PluginContext. Append the context in PluginLoader so all runtime callers keep the fast raw event-argument path while plugins consistently receive taskStore, settings, logger, and emitEvent.
+
+    FNXC:PluginHooks 2026-10-07-18:01:
+    The executor dispatches onAgentRunStart/onAgentRunEnd with only a task id. Every hook classified in PLUGIN_HOOK_RECEIVES_CONTEXT gets the context it declares, not only the three task hooks.
     */
     return [...args, await this.createContext(plugin)];
-  }
-
-  private isTaskLifecycleHook(hookName: keyof FusionPlugin["hooks"]): boolean {
-    return hookName === "onTaskCreated" || hookName === "onTaskMoved" || hookName === "onTaskCompleted";
   }
 
   private hasPluginContext(value: unknown): value is PluginContext {
@@ -1579,12 +1713,17 @@ export class PluginLoader extends EventEmitter<{
    * FNXC:PluginSkills 2026-07-12-00:00:
    * Plugin skill body resolution must honor skillFiles relative to the plugin package, so each contribution exposes the absolute pluginRoot alongside the SDK skill data. This is additive for old consumers and lets dashboard/session callers use the shared traversal-guarded resolver instead of guessing from the skill name.
    */
+  private getPluginRoot(pluginId: string): string | undefined {
+    const entryPath = this.pluginEntryPaths.get(pluginId);
+    return entryPath ? resolvePluginRootFromEntryPath(entryPath) : undefined;
+  }
+
   getPluginSkills(): Array<{ pluginId: string; skill: PluginSkillContribution; pluginRoot?: string }> {
     const skills: Array<{ pluginId: string; skill: PluginSkillContribution; pluginRoot?: string }> = [];
     for (const [pluginId, plugin] of this.plugins) {
       if (plugin.skills) {
         for (const skill of plugin.skills) {
-          skills.push({ pluginId, skill, pluginRoot: this.pluginRoots.get(pluginId) });
+          skills.push({ pluginId, skill, pluginRoot: this.getPluginRoot(pluginId) });
         }
       }
     }
