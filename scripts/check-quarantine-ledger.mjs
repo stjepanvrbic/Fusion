@@ -224,7 +224,8 @@ export function findLockstepViolations({ rootDir, ledger, packageConfigs = disco
     }
 
     const packageMatch = /^packages\/([^/]+)\/(.+)$/.exec(file);
-    const config = packageMatch ? path.join("packages", packageMatch[1], "vitest.config.ts") : null;
+    // FNXC:QuarantineLockstep 2026-10-07-18:03: the lookup key must use the same forward-slash form as the map keys; native path.join gave `packages\x\vitest.config.ts` on Windows, so every entry read as unmapped.
+    const config = packageMatch ? path.posix.join("packages", packageMatch[1], "vitest.config.ts") : null;
     if (config == null || !configExcludes.has(config)) {
       violations.push({ kind: "unmapped-entry", file, config: config ?? undefined, detail: "ledger file has no package Vitest config" });
       continue;
