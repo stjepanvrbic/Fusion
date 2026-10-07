@@ -380,12 +380,12 @@ async function recoverApprovedPreexistingAiMergeWorktree(
     await store.updateTask(taskId, { aiMergeReviewReconciliation: null });
     await log(`AI merge: recovered approved pre-existing clean-room commit ${short(selected.squashSha)} before pruning`);
     await audit.git({ type: "merge:ai-landed", target: integrationBranch, metadata: { taskId, landedSha: selected.squashSha, source: "pre-prune-clean-room-recovery", mergeRoot: selected.mergeRoot } }).catch(() => undefined);
-    return { outcome: "landed", squashSha: selected.squashSha, localSync: land.localSync, tipSha: selected.tipSha, integrationBranch, dependencySyncDecision: "recovered-no-new-sync" };
+    return { outcome: "landed", squashSha: selected.squashSha, sourceSha: state.sourceSha, localSync: land.localSync, tipSha: selected.tipSha, integrationBranch, dependencySyncDecision: "recovered-no-new-sync" };
   }
 
   await store.updateTask(taskId, { aiMergeReviewReconciliation: null });
   await log(`AI merge: recovered already-landed clean-room commit ${short(selected.squashSha)} before pruning`);
-  return { outcome: "landed", squashSha: selected.squashSha, localSync: "skipped-other-branch", tipSha: selected.tipSha, integrationBranch, dependencySyncDecision: "recovered-no-new-sync" };
+  return { outcome: "landed", squashSha: selected.squashSha, sourceSha: state.sourceSha, localSync: "skipped-other-branch", tipSha: selected.tipSha, integrationBranch, dependencySyncDecision: "recovered-no-new-sync" };
 }
 
 export {
@@ -1044,6 +1044,8 @@ export type LandOneRepoResult =
       /** The squash landed; the local integration ref now points at `squashSha`. */
       outcome: "landed";
       squashSha: string;
+      /** Task-branch SHA the approved squash was reviewed from; finalization deletes the branch only at this tip. */
+      sourceSha: string;
       localSync: LocalSyncOutcome;
       tipSha: string;
       integrationBranch: string;
@@ -1366,7 +1368,7 @@ export async function landOneRepo(
       /* FNXC:AIMergeReviewReconciliation 2026-08-20-22:27: once the exact confirmed candidate lands, clear its findings, confirmation count, and corrective budget together so completed work cannot be revived. */
       await store.updateTask(taskId, { aiMergeReviewReconciliation: null });
       await log(`AI merge: advanced ${integrationBranch} → ${short(squashSha)} (local checkout: ${landed.localSync})`);
-      return { outcome: "landed", squashSha, localSync: landed.localSync, tipSha, integrationBranch, dependencySyncDecision };
+      return { outcome: "landed", squashSha, sourceSha: reviewResult.sourceSha, localSync: landed.localSync, tipSha, integrationBranch, dependencySyncDecision };
     } finally {
       for (const registeredPath of registeredMergePaths) {
         activeSessionRegistry.unregisterPath(registeredPath);
@@ -2149,10 +2151,12 @@ export async function runAiMerge(
 
   let finalized: MergeResult;
   try {
-    finalized = await finalizeMerged(store, projectRootDir, taskId, task, branch, integrationBranch, landResult.squashSha, audit, log, { empty: false }, mergeTarget, groupRouting, options.syncGroupPr, fence, options.graphOwnedPostMergeTraversal === true, publishLanding);
+    finalized = await finalizeMerged(store, projectRootDir, taskId, task, branch, integrationBranch, landResult.squashSha, audit, log, { empty: false, expectedBranchTipSha: landResult.sourceSha }, mergeTarget, groupRouting, options.syncGroupPr, fence, options.graphOwnedPostMergeTraversal === true, publishLanding);
   } catch (error: unknown) {
     const failure = getErrorMessage(error);
-    const landingMessage = `AI merge: landed ${short(landResult.squashSha)} on ${integrationBranch}, but post-landing finalization failed: ${failure}. The landing is durable; a retry will finalize without re-merging.`;
+    const landingMessage = error instanceof RecordedMergeBranchTipChangedError
+      ? `AI merge: landed ${short(landResult.squashSha)} on ${integrationBranch}, but ${branch} gained commits after the reviewed squash; the branch and its checkout were kept and the next merge pass lands the new commits.`
+      : `AI merge: landed ${short(landResult.squashSha)} on ${integrationBranch}, but post-landing finalization failed: ${failure}. The landing is durable; a retry will finalize without re-merging.`;
     /*
     FNXC:AIMerge 2026-08-28-09:29:
     Process logging remains outside the write fence so an orphaned merge body still leaves a
@@ -3475,7 +3479,7 @@ async function mergeAndReview(input: {
   mergeAgent: (cwd: string, prompt: string) => Promise<void>; reviewAgent: (cwd: string, prompt: string) => Promise<string>;
   audit: RunAuditor; log: (message: string) => Promise<void>; setStatus: (status: string | null) => Promise<unknown>; store: TaskStore;
   signal?: AbortSignal; initialPriorReasons?: string[];
-}): Promise<{ squashSha: string | null; priorReasons: string[] }> {
+}): Promise<{ squashSha: string | null; sourceSha: string; priorReasons: string[] }> {
   const { mergeRoot, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, taskId, maxPasses, mergeAgent, reviewAgent, audit, log, setStatus, store, signal } = input;
   const current = await store.getTask(taskId);
   const sourceSha = await git(["rev-parse", "--verify", branch], mergeRoot);
@@ -3529,7 +3533,7 @@ async function mergeAndReview(input: {
       const task = await store.getTask(taskId);
       await mergeAgent(mergeRoot, buildMergePrompt({ taskId, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, correctiveReasons: actionable.map((finding) => `[${finding.id}] ${finding.text}`), userComments: selectUserCommentsForAgentContext(task) }));
       let candidateSha = await git(["rev-parse", "HEAD"], mergeRoot);
-      if (candidateSha === tipSha && state.findings.length === 0) return { squashSha: null, priorReasons: [] };
+      if (candidateSha === tipSha && state.findings.length === 0) return { squashSha: null, sourceSha: state.sourceSha, priorReasons: [] };
       if (candidateSha !== tipSha) { await ensureCommitTaskMetadata(mergeRoot, taskId, includeTaskId, trailers); candidateSha = await git(["rev-parse", "HEAD"], mergeRoot); }
       state = { ...state, candidateSha, candidateTreeSha: await git(["rev-parse", `${candidateSha}^{tree}`], mergeRoot), consecutiveCleanApprovals: 0 };
       await persistState(persistedState, state);
@@ -3627,7 +3631,7 @@ async function mergeAndReview(input: {
           : `AI merge review (pass ${approvalNumber}): approved squash ${candidateSha}${suffixes.length ? ` — ${suffixes.join("; ")}` : ""}`);
         if (state.consecutiveCleanApprovals >= 2) {
           await assertCurrentEpisodeIdentity();
-          return { squashSha: candidateSha === tipSha ? null : candidateSha, priorReasons: [] };
+          return { squashSha: candidateSha === tipSha ? null : candidateSha, sourceSha: state.sourceSha, priorReasons: [] };
         }
         continue; // Direct confirmation review of exactly the same candidate; no merge agent and no budget spend.
       }
@@ -3643,7 +3647,7 @@ async function mergeAndReview(input: {
     }
     if (verdict.verdict === "reject" && verdict.severity === "advisory" && stillPresent.length === 0) {
       await log(`AI merge: landing with unresolved advisory concern(s): ${verdict.reasons.join("; ")}`);
-      return { squashSha: candidateSha === tipSha ? null : candidateSha, priorReasons: [] };
+      return { squashSha: candidateSha === tipSha ? null : candidateSha, sourceSha: state.sourceSha, priorReasons: [] };
     }
     if (stillPresent.length === 0) {
       state = { ...state, terminal: true }; await persistState(persistedState, state);
@@ -4003,6 +4007,18 @@ async function finalizeMerged(
   completion; a preserved checkout therefore records its reason and never stops finalization. Git
   cannot delete a branch checked out by a worktree, so cleanup must resolve before the branch delete.
   */
+  /*
+  FNXC:AIMerge 2026-10-07-20:10:
+  Fresh landings now pin the source SHA the approved squash was reviewed from, like recorded-landing recovery.
+  If the task branch moved past that pin, the newer commits are not on the integration branch: keep the checkout and
+  the branch, record only the reviewed tip as landed, and let the next merge pass land the rest.
+  */
+  if (opts.expectedBranchTipSha && branch !== integrationBranch) {
+    const liveTip = await git(["rev-parse", "--verify", `refs/heads/${branch}`], projectRootDir).catch(() => "");
+    if (liveTip && liveTip !== opts.expectedBranchTipSha) {
+      throw new RecordedMergeBranchTipChangedError(branch, opts.expectedBranchTipSha);
+    }
+  }
   const cleanup = await cleanupLandedTaskWorktree({
     store,
     taskId,
@@ -4018,7 +4034,16 @@ async function finalizeMerged(
 
   if (!opts.expectedBranchTipSha) await deleteBranchNormally();
 
-  if (opts.expectedBranchTipSha && branch !== integrationBranch && isFusionDeletableBranch(task, branch)) {
+  /*
+  FNXC:AIMerge 2026-10-07-20:10:
+  `update-ref -d` deletes a branch even while a worktree has it checked out, which `branch -D` refuses.
+  A checkout preserved by post-landing cleanup keeps its branch, exactly as the force-delete path behaved.
+  */
+  const branchCheckedOut = opts.expectedBranchTipSha
+    ? (await git(["worktree", "list", "--porcelain"], projectRootDir).catch(() => ""))
+      .split(/\r?\n/).includes(`branch refs/heads/${branch}`)
+    : false;
+  if (opts.expectedBranchTipSha && !branchCheckedOut && branch !== integrationBranch && isFusionDeletableBranch(task, branch)) {
     fence?.assertOwned("finalization");
     const deletedAtExpectedTip = await gitOk([
       "update-ref",

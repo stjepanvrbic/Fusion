@@ -574,6 +574,52 @@ describe("runAiMerge", () => {
     expect(logs).toContainEqual(expect.stringContaining("advanced after its recorded landing was proven"));
   });
 
+  /*
+  FNXC:AIMerge 2026-10-07-20:10:
+  A fresh landing records the source SHA the approved squash was reviewed from and deletes the task branch only at
+  that tip. A commit added to the branch after review must stay reachable and must never be recorded as landed.
+  */
+  it("preserves commits added to the task branch after the reviewed squash landed, then lands them next pass", async () => {
+    const branch = "fusion/fn-1";
+    const { dir } = initRepoWithBranch({ branch });
+    const reviewedTip = git(dir, `rev-parse ${branch}`);
+    const { store, task } = makeStore(dir);
+    let advancedTip = "";
+    const baseUpdate = store.updateTask.getMockImplementation();
+    store.updateTask.mockImplementation(async (id: string, patch: Record<string, unknown>) => {
+      if (!advancedTip && "aiMergeReviewReconciliation" in patch && patch.aiMergeReviewReconciliation === null) {
+        git(dir, `checkout -q ${branch}`);
+        writeFileSync(join(dir, "after-review.txt"), "work added after review\n");
+        git(dir, "add after-review.txt");
+        git(dir, "commit -q -m 'feat: after review'");
+        advancedTip = git(dir, "rev-parse HEAD");
+        git(dir, "checkout -q main");
+      }
+      return baseUpdate(id, patch);
+    });
+
+    await expect(runAiMerge(store, dir, "FN-1", { manual: true }, {
+      mergeAgent: realMergeAgent(branch),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    })).rejects.toThrow(/changed after its recorded landing/);
+
+    expect(advancedTip).not.toBe("");
+    expect(task.mergeDetails?.landedBranchTipSha).toBe(reviewedTip);
+    expect(branchExists(dir, branch)).toBe(true);
+    expect(git(dir, `rev-parse ${branch}`)).toBe(advancedTip);
+    expect(() => git(dir, "show main:after-review.txt")).toThrow();
+
+    task.column = "in-review";
+    task.status = null;
+    const followUp = await runAiMerge(store, dir, "FN-1", { manual: true }, {
+      mergeAgent: realMergeAgent(branch),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    });
+    expect(followUp.merged).toBe(true);
+    expect(git(dir, "show main:after-review.txt")).toBe("work added after review");
+    expect(task.mergeDetails?.landedBranchTipSha).toBe(advancedTip);
+  });
+
   it.each([
     "no mergeDetails",
     "missing commitSha",
