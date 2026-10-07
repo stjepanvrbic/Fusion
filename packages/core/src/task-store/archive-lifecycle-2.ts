@@ -12,7 +12,8 @@ import { resolveWorkflowIrForTask } from "../workflows/workflow-ir-resolver.js";
 import { toTaskMoveLanes } from "../workflows/workflow-lifecycle-traits.js";
 import {getFeatureByTaskId as getMissionFeatureByTaskId, unlinkFeatureFromTaskId as unlinkMissionFeatureFromTaskId, recordGeneratedFixOperatorStop} from "../async-stores/async-mission-store-queries.js";
 import {TaskHasDependentsError, TaskHasLineageChildrenError, TaskNotFoundError, TaskSelfDeleteError} from "./errors.js";
-import {access, mkdir} from "node:fs/promises";
+import {access, mkdir, rm} from "node:fs/promises";
+import {getErrorMessage} from "../process/error-message.js";
 import {join} from "node:path";
 import {and, eq, inArray, sql} from "drizzle-orm";
 import * as schema from "../postgres/schema/index.js";
@@ -603,10 +604,7 @@ export async function archiveTaskBackendImpl(store: TaskStore, id: string, optio
       if (workspace.refusedLive || singular.refusedLive) {
         storeLog.warn("archive-cleanup-suppressed-live-task", {taskId: id, refusedBy: workspace.refusedLive ? "workspace" : "singular"});
       } else {
-        await store.cleanupBranchForTask(task);
-        const { rm } = await import("node:fs/promises");
-        await rm(dir, { recursive: true, force: true });
-        if (store.isWatching) store.taskCache.delete(id);
+        await runPostCommitArchiveCleanup(store, task, dir);
       }
     }
 
@@ -859,6 +857,25 @@ export async function restoreFromArchiveImpl(store: TaskStore, entry: import("..
 
     return restoredTask;
   }
+
+/**
+ * FNXC:ArchiveCleanup 2026-10-07-18:55:
+ * Branch and task-directory cleanup run after the archive committed, so a failure here must never surface the committed archive as failed.
+ * The directory removal retries Windows-transient EBUSY/EPERM/ENOTEMPTY (a held agent log, editor or AV scan); residue is then logged and left, because the orphan task-dir reconcile preserves archived IDs.
+ */
+async function runPostCommitArchiveCleanup(store: TaskStore, task: Task, dir: string): Promise<void> {
+  try {
+    await store.cleanupBranchForTask(task);
+  } catch (error) {
+    storeLog.warn("archive-branch-cleanup-failed", {taskId: task.id, error: getErrorMessage(error)});
+  }
+  try {
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (error) {
+    storeLog.warn("archive-task-dir-cleanup-failed", {taskId: task.id, taskDir: dir, error: getErrorMessage(error)});
+  }
+  if (store.isWatching) store.taskCache.delete(task.id);
+}
 
 /**
  * Publish the task-directory files an archive snapshot carries: PROMPT.md (byte-for-byte, File Scope sanitized) and the attachments directory.
