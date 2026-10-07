@@ -173,6 +173,7 @@ Cross-package automated tests now lock:
 
 @fusion/desktop: no workspace package dependencies
 @fusion/mobile:  no workspace package dependencies
+@fusion/dashboard (devDep) ──▶ @fusion/mobile (client bundle only)
 ```
 
 Concrete references:
@@ -182,6 +183,7 @@ Concrete references:
 - `@fusion/plugin-sdk` declares a peer dependency on `@fusion/core` (`packages/plugin-sdk/package.json`)
 - `@fusion/desktop` embeds dashboard assets at build time via script (`packages/desktop/scripts/build.ts`) but does not declare workspace deps in `package.json`
 - `@fusion/mobile` triggers dashboard build/sync via scripts (`packages/mobile/package.json`) but does not declare workspace deps in `package.json`
+- `@fusion/dashboard` has a workspace development dependency on `@fusion/mobile`: the client entry lazily imports `@fusion/mobile/bootstrap` inside a Capacitor WebView, so only the built client bundle contains it and runtime/desktop dependency walks never include Capacitor
 
 ---
 

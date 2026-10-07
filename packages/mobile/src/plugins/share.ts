@@ -1,5 +1,5 @@
 import { Capacitor } from "@capacitor/core";
-import { EventEmitter } from "node:events";
+import { BrowserEventEmitter } from "./event-emitter.js";
 
 export interface ShareTaskPayload {
   id: string;
@@ -29,7 +29,7 @@ type ShareCapacitorResult = {
   activityType?: string;
 };
 
-export class ShareManager extends EventEmitter {
+export class ShareManager extends BrowserEventEmitter {
   private readonly deepLinkBaseUrl: string;
   private initialized = false;
   private sharePlugin: SharePlugin["Share"] | null = null;

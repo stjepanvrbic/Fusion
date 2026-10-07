@@ -66,6 +66,19 @@ Connection Manager supports:
 
 Activation updates `activeProfileId` and stamps `lastUsedAt` on the selected profile.
 
+## Mobile packaged startup and handoff
+
+The Android/iOS app is the dashboard bundle running in a Capacitor WebView. Before React mounts, the client entry (`packages/dashboard/app/nativeShellStartup.ts`) detects the native runtime and runs `bootstrapMobileShell` from `@fusion/mobile/bootstrap`:
+
+- installs `window.fusionShell`, starts Android Back routing, and marks the host as `mobile-shell`
+- with no saved active profile, the dashboard mounts and shows native-shell onboarding
+- with a saved active profile, the WebView navigates to that server with the shell launch parameters and the profile token (`token`), and the bundled dashboard is not mounted
+- choosing a server later in onboarding or the Connection Manager hands off again
+
+Automatic handoff happens once per app session. If the server fails to load, Capacitor loads `errorPath` (the bundled app); that page, or Back from the server, stays on the bundled dashboard, whose error page offers **Manage Connection**.
+
+Saved servers are arbitrary hosts, so `capacitor.config.ts` sets `server.allowNavigation: ["*"]`. iOS injects the plugin bridge into every page it allows, so the bootstrap opens links to any origin other than the current page or a saved server outside the WebView.
+
 ## Desktop remote handoff behavior
 
 Desktop shell stores shell settings separately from Fusion project/global settings.

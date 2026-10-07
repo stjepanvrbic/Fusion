@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { Preferences } from "@capacitor/preferences";
 import type { ShellConnectionProfile, ShellConnectionProfileInput } from "../types.js";
 
@@ -32,9 +31,26 @@ function normalizeUrl(serverUrl: string): string {
   return normalized;
 }
 
+/*
+FNXC:MobileShell 2026-10-07-19:30:
+Profile ids are minted inside the packaged WebView, which has no `node:crypto`.
+The id only needs to be deterministic and well spread (collisions are resolved by ensureUniqueId), so a 53-bit string hash replaces SHA-1; ids already persisted keep their stored value.
+*/
+function hash53Hex(input: string): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let index = 0; index < input.length; index += 1) {
+    const code = input.charCodeAt(index);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(14, "0");
+}
+
 function deterministicBaseId(name: string, serverUrl: string): string {
-  const hash = createHash("sha1").update(`${name}|${serverUrl}`).digest("hex").slice(0, 10);
-  return `profile_${hash}`;
+  return `profile_${hash53Hex(`${name}|${serverUrl}`).slice(-10)}`;
 }
 
 function ensureUniqueName(name: string, profiles: ShellConnectionProfile[], skipId?: string): string {

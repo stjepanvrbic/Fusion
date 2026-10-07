@@ -7,7 +7,6 @@ import {
   type PushNotificationManagerOptions,
 } from "./plugins/push-notifications.js";
 import { ShareManager, type ShareManagerOptions } from "./plugins/share.js";
-import { MobileNativeShellBridge } from "./plugins/native-shell.js";
 
 export { DeepLinkManager } from "./plugins/deep-links.js";
 export type {
@@ -27,6 +26,16 @@ export {
   MobileNativeShellBridge,
 } from "./plugins/native-shell.js";
 export { buildMobileShellHandoff } from "./plugins/shell-handoff.js";
+export {
+  bootstrapMobileShell,
+  MOBILE_SHELL_HANDOFF_MARKER_KEY,
+  MOBILE_SHELL_HOST_CONTEXT_KEY,
+} from "./bootstrap.js";
+export type {
+  MobileShellBootstrapOptions,
+  MobileShellBootstrapResult,
+  MobileShellDashboardReason,
+} from "./bootstrap.js";
 export { QrScanner, parseQrConnectionPayload } from "./plugins/qr-scanner.js";
 export {
   loadShellProfiles,
@@ -80,15 +89,6 @@ async function initializeManager(manager: LifecycleManager): Promise<void> {
   if (typeof manager.start === "function") {
     await manager.start();
   }
-}
-
-export function installMobileShellBridge(
-  target: Window & typeof globalThis = window,
-): MobileNativeShellBridge {
-  const bridge = new MobileNativeShellBridge();
-  (target as Window & { fusionShell?: MobileNativeShellBridge }).fusionShell = bridge;
-  void bridge.initializeNativeBackButton();
-  return bridge;
 }
 
 export async function initializePlugins(
