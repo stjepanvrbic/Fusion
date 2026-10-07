@@ -873,6 +873,15 @@ export {
   type WorktreePathReservationOptions,
 } from "./tasks/worktree-path-reservation.js";
 export {
+  canonicalizePath,
+  isPathInside,
+  isSamePath,
+  normalizeAbsolutePath,
+  pathIdentityKey,
+  stripWin32NamespacePrefix,
+  type PathIdentityOptions,
+} from "./fs/path-identity.js";
+export {
   setRunningAgentCountSource,
   getRunningAgentCountSource,
   deriveRunningAgentCounts,
