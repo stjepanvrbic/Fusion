@@ -16,6 +16,7 @@ import { resolveProject, createLocalStore, closeProjectStore, type ProjectContex
 import { promptOutputStream, result as outputResult } from "../output.js";
 import { findNodeByNameOrId } from "./node.js";
 import { retryOnLock, LockRetryExhaustedError } from "../lock-retry.js";
+import { MANUAL_RETRY_MOVE_PROVENANCE } from "../manual-retry.js";
 
 const STEP_STATUSES: StepStatus[] = ["pending", "in-progress", "done", "skipped"];
 let archiveForceOverride = false;
@@ -1824,7 +1825,7 @@ export async function runTaskRetry(id: string, projectName?: string) {
         ...autoPauseClearPatch,
         ...buildManualRetryResetPatch({ resetMergeRetries: true }),
       }));
-      await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { preserveProgress: true }));
+      await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { preserveProgress: true, workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE }));
       await retryBoardCall(context, id, "log entry", () => context.store.logEntry(id, `Retry requested from CLI (unusable worktree session-start recovery → todo, preserving progress${retryLogSuffix})`));
 
       console.log();
@@ -1837,13 +1838,14 @@ export async function runTaskRetry(id: string, projectName?: string) {
     // and merge failures (all steps done).
     if (isInReviewRetry) {
       if (isExecutionFailureInReview || isDeadlockAutoPauseRecovery) {
-        await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { preserveProgress: true }));
+        // FNXC:TaskRetry 2026-10-07-17:57: fenced reset first, then move (see the generic branch below).
         await retryBoardCall(context, id, "update task", () => applyRetryReset({
           status: null,
           error: null,
           ...autoPauseClearPatch,
           ...buildManualRetryResetPatch({ resetMergeRetries: isDeadlockAutoPauseRecovery }),
         }));
+        await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { preserveProgress: true, workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE }));
         await retryBoardCall(context, id, "log entry", () => context.store.logEntry(
           id,
           isInReviewExecutionStall
@@ -1871,9 +1873,13 @@ export async function runTaskRetry(id: string, projectName?: string) {
       return;
     }
 
-    // Move to the hold column before applying retry resets. `moveTask` reads from the
-    // store's durable index and may overwrite task.json-only updates, so apply the
-    // manual retry reset patch after the move to make the cleared counters stick.
+    /*
+    FNXC:TaskRetry 2026-10-07-17:57:
+    A manual retry either fully resets or fully refuses, and never leaves a half-applied state.
+    The fenced reset compares the live row with the pre-retry snapshot, and reopening into planning clears `worktree` (and `branch` from review), so a reset applied after the move was always refused as "superseded" after the card had already moved.
+    Apply the reset to the unmoved row first, then move; the store is the single durable index, so the move no longer overwrites the reset.
+    Retry moves carry no moveSource (a user source would park the card userPaused) and explicit manual-retry provenance.
+    */
     /*
     FNXC:WorkflowLifecycleColumns 2026-07-31-12:30 (PR #2752 review — greptile P1):
     THE FOURTH TARGET, and the one that matters most.
@@ -1884,8 +1890,6 @@ export async function runTaskRetry(id: string, projectName?: string) {
     crashing. Found by review, not by me, and not by any tool: the census counts comparisons and sees
     none of these, and a same-file grep for the double-quoted form reports clean.
     */
-    await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never));
-
     // Clear failure state and stale branch refs so retry can choose a fresh base.
     await retryBoardCall(context, id, "update task", () => applyRetryReset({
       status: null,
@@ -1897,6 +1901,7 @@ export async function runTaskRetry(id: string, projectName?: string) {
       ...autoPauseClearPatch,
       ...buildManualRetryResetPatch({ resetMergeRetries: true }),
     }));
+    await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE }));
 
     // Log the retry action
     await retryBoardCall(context, id, "log entry", () => context.store.logEntry(

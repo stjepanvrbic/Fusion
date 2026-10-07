@@ -1,3 +1,4 @@
+import { buildSkillInstallInvocation } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import type { ApiRoutesContext } from "./types.js";
 
@@ -195,7 +196,7 @@ export function registerAgentSkillsRoutes(ctx: ApiRoutesContext): void {
    * Body: { source: string; skill?: string }
    * Query: projectId (optional) for multi-project context
    * Response: { success: true }
-   * Error: 400 { error: string; code: "invalid_body"|"invalid_source" }
+   * Error: 400 { error: string; code: "invalid_body"|"invalid_source"|"invalid_skill" }
    * Error: 502 { error: string; code: "spawn_error"|"install_failed"|"install_timeout" }
    */
   router.post("/skills/install", async (req, res) => {
@@ -214,15 +215,25 @@ export function registerAgentSkillsRoutes(ctx: ApiRoutesContext): void {
         return;
       }
 
+      if (skill !== undefined && typeof skill !== "string") {
+        res.status(400).json({ error: "skill must be a string", code: "invalid_body" });
+        return;
+      }
+
+      /*
+      FNXC:SkillInstall 2026-10-07-17:57:
+      This route is reachable unauthenticated when no daemon token is set, so both fields are validated against the shared install grammar before the adapter runs.
+      */
       const normalizedSource = source.trim();
-      if (!/^[^/]+\/[^/]+$/.test(normalizedSource)) {
-        res.status(400).json({ error: "Invalid source format. Use owner/repo.", code: "invalid_source" });
+      const invocation = buildSkillInstallInvocation({ source: normalizedSource, skill });
+      if (!invocation.ok) {
+        res.status(400).json({ error: invocation.error, code: invocation.code });
         return;
       }
 
       const result = await skillsAdapter.installSkill({
         source: normalizedSource,
-        skill: typeof skill === "string" ? skill : undefined,
+        skill,
         cwd: scopedStore.getRootDir(),
       });
 

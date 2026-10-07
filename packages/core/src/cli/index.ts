@@ -9,3 +9,4 @@ export * from "./fn-binary.js";
 export * from "./gh-cli.js";
 export * from "./git-binary.js";
 export * from "./git-cli-status.js";
+export * from "./skill-install-command.js";

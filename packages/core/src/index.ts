@@ -1528,6 +1528,15 @@ export {
   type StructuredGhError,
 } from "./cli/gh-cli.js";
 export {
+  SKILL_INSTALL_NAME_PATTERN,
+  SKILL_INSTALL_SOURCE_PATTERN,
+  buildSkillInstallInvocation,
+  isValidSkillInstallName,
+  isValidSkillInstallSource,
+  type SkillInstallInvocation,
+  type SkillInstallInvocationInput,
+} from "./cli/skill-install-command.js";
+export {
   DEFAULT_GIT_CLI_STATUS_TIMEOUT_MS,
   GIT_INSTALL_URL,
   probeGitCliStatus,

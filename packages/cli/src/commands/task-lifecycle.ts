@@ -17,7 +17,7 @@ import { createHash } from "node:crypto";
 import { exec } from "node:child_process";
 import * as childProcess from "node:child_process";
 import { mkdir, realpath, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 const execAsync = promisify(exec);
 // `execFile` is resolved lazily through the namespace import so test mocks that
@@ -350,10 +350,23 @@ function scheduleRetainedRefreshReconciliation(root: string, path: string, reser
   timer.unref?.();
 }
 
+/*
+FNXC:PullRequestFreshness 2026-10-07-17:57:
+The git registration and the directory of a refresh worktree are removed together.
+Git prints worktree paths with forward slashes (`C:/Users/...`) while ours come from `join()` (`C:\Users\...`), so an exact string compare never matched on Windows: `git worktree remove` was skipped, only the directory was deleted, and the stale registration kept holding the branch.
+Compare canonical paths: realpath when the path exists, then resolve (which also normalizes separators and the drive), case-folded on win32.
+*/
+async function canonicalWorktreePath(path: string): Promise<string> {
+  const canonical = resolve(await realpath(path).catch(() => path));
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+
 async function removeRefreshWorktree(root: string, path: string): Promise<Error | undefined> {
   try {
-    const registered = parseWorktreeBranches(await gitStdout(root, ["worktree", "list", "--porcelain"]))
-      .some((entry) => entry.path === path);
+    const target = await canonicalWorktreePath(path);
+    const entries = parseWorktreeBranches(await gitStdout(root, ["worktree", "list", "--porcelain"]));
+    const registered = (await Promise.all(entries.map((entry) => canonicalWorktreePath(entry.path))))
+      .some((candidate) => candidate === target);
     if (registered) {
       await execFileAsync("git", ["worktree", "remove", "--force", path], { cwd: root, timeout: 60_000 });
     }

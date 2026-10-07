@@ -707,16 +707,44 @@ describe("createSkillsAdapter - installSkill", () => {
     const result = await adapter.installSkill(input);
 
     expect(result).toEqual({ success: true });
+    // win32 runs the npx shim through cmd.exe with validated tokens; POSIX spawns npx directly.
+    const win32 = process.platform === "win32";
     expect(superviseSpawnMock).toHaveBeenCalledWith(
-      "npx",
-      expectedArgs,
+      win32 ? (process.env.ComSpec ?? "cmd.exe") : "npx",
+      win32 ? ["/d", "/s", "/c", "npx", ...expectedArgs] : expectedArgs,
       expect.objectContaining({
         cwd: "/tmp/project",
-        shell: true,
         stdio: ["ignore", "pipe", "pipe"],
         maxLifetimeMs: 60_000,
       }),
     );
+    expect(superviseSpawnMock.mock.calls[0]?.[2]).not.toHaveProperty("shell");
+  });
+
+  /*
+  FNXC:SkillInstall 2026-10-07-17:57:
+  Installation parameters are data, never shell syntax: metacharacters in either field are refused before any process starts.
+  */
+  it.each([
+    [{ source: "owner/repo&echo INJECTED" }, "invalid_source"],
+    [{ source: "a/b;id" }, "invalid_source"],
+    [{ source: "owner/repo|calc" }, "invalid_source"],
+    [{ source: "owner/re po" }, "invalid_source"],
+    [{ source: "owner/repo", skill: "demo & echo FUSION_MARKER & rem" }, "invalid_skill"],
+    [{ source: "owner/repo", skill: "x|calc" }, "invalid_skill"],
+    [{ source: "owner/repo", skill: "x^&calc" }, "invalid_skill"],
+    [{ source: "owner/repo", skill: "%PATH%" }, "invalid_skill"],
+    [{ source: "owner/repo", skill: "\"quoted\"" }, "invalid_skill"],
+  ])("refuses %j with %s without spawning", async (input, code) => {
+    const superviseSpawnMock = vi.fn();
+    const adapter = createSkillsAdapter({
+      packageManager: { resolve: vi.fn().mockResolvedValue({ skills: [] }) },
+      getSettingsPath: vi.fn().mockReturnValue("/tmp/settings.json"),
+      superviseSpawn: superviseSpawnMock as never,
+    });
+    const result = await adapter.installSkill({ ...input, cwd: "/tmp/project" });
+    expect(result).toMatchObject({ code });
+    expect(superviseSpawnMock).not.toHaveBeenCalled();
   });
 
   it("returns install_failed when the installer exits non-zero", async () => {

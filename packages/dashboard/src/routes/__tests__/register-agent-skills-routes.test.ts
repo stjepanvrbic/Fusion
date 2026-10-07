@@ -231,6 +231,30 @@ describe("register-agent-skills-routes", () => {
     expect(skillsAdapter.installSkill).not.toHaveBeenCalled();
   });
 
+  /*
+  FNXC:SkillInstall 2026-10-07-17:57:
+  The install route is reachable unauthenticated when no daemon token is set, so shell metacharacters in either field are refused before the adapter runs.
+  */
+  it.each([
+    [{ source: "owner/repo&echo INJECTED" }, "invalid_source"],
+    [{ source: "a/b;id" }, "invalid_source"],
+    [{ source: "owner/repo", skill: "demo & echo FUSION_MARKER & rem" }, "invalid_skill"],
+    [{ source: "owner/repo", skill: "%PATH%" }, "invalid_skill"],
+    [{ source: "owner/repo", skill: 42 }, "invalid_body"],
+  ])("POST /api/skills/install refuses %j with 400 %s", async (body, code) => {
+    const skillsAdapter = createMockSkillsAdapter();
+    const res = await request(
+      app(skillsAdapter),
+      "POST",
+      "/api/skills/install",
+      JSON.stringify(body),
+      { "Content-Type": "application/json" },
+    );
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code });
+    expect(skillsAdapter.installSkill).not.toHaveBeenCalled();
+  });
+
   it("POST /api/skills/install returns 404 without a skills adapter", async () => {
     const res = await request(
       app(undefined),

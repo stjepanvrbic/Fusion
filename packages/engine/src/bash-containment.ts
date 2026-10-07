@@ -31,6 +31,9 @@ the cost of the KNOWN escalation chain and creates an audit-visible denial;
 real containment requires OS-level isolation (separate user / sandbox),
 which is out of scope here. Deny messages are deliberately explicit so a
 probing agent's attempts are visible in session logs.
+
+FNXC:BashContainment 2026-10-07-17:57:
+Win32 has no kernel sandbox backend, so this floor must hold for native Windows spellings too: backslash and mixed separators, quoted paths, any drive-letter case, %USERPROFILE%, %HOMEDRIVE%%HOMEPATH%, $USERPROFILE, $env:USERPROFILE and MSYS /c/... home paths.
 */
 
 export interface BashContainmentVerdict {
@@ -87,30 +90,82 @@ function escapeRegExp(value: string): string {
 }
 
 const HOME_DIR = homedir();
-const HOME_PATTERN = new RegExp(escapeRegExp(HOME_DIR), "gi");
+
+export interface BashContainmentOptions {
+  /** Home directory folded to `~`; defaults to the current user's home. Tests inject a Windows home to prove Windows spellings on any host. */
+  homeDir?: string;
+}
+
+/*
+FNXC:BashContainment 2026-10-07-17:57:
+Windows home-variable spellings fold to `~` so `%USERPROFILE%\.fusion`, `$env:USERPROFILE\.ssh` and `%HOMEDRIVE%%HOMEPATH%\.aws` hit the same rules as `~/.fusion`.
+Applied to the lowercased command; drive+path pairs fold before the lone path variable so no drive letter is left in front of `~`.
+*/
+const HOME_VARIABLE_PATTERNS: readonly RegExp[] = [
+  /%homedrive%%homepath%/g,
+  /\$\{?env:homedrive\}?\$\{?env:homepath\}?/g,
+  /\$\{?homedrive\}?\$\{?homepath\}?/g,
+  /%userprofile%|%homepath%|%home%/g,
+  /\$\{?env:(?:userprofile|homepath|home)\}?/g,
+  /\$\{?(?:userprofile|homepath)\}?(?![a-z0-9_])/g,
+  /\$\{home\}|\$home(?![a-z0-9_])/g,
+];
+
+/** Every forward-slash spelling of `homeDir` (native or drive-letter, plus MSYS `/c/...`), lowercased, longest first. */
+function homeSpellings(homeDir: string): string[] {
+  const forward = homeDir.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  if (!forward || forward === "/") return [];
+  const spellings = new Set<string>([forward]);
+  const drive = /^([a-z]):(\/.*)$/.exec(forward);
+  if (drive) spellings.add(`/${drive[1]}${drive[2]}`);
+  return [...spellings].sort((a, b) => b.length - a.length);
+}
+
+function foldHome(lowercased: string, homeDir: string): string {
+  let folded = lowercased;
+  for (const pattern of HOME_VARIABLE_PATTERNS) folded = folded.replace(pattern, "~");
+  for (const spelling of homeSpellings(homeDir)) {
+    folded = folded.replace(new RegExp(`${escapeRegExp(spelling)}(?=/|\\s|$)`, "g"), "~");
+  }
+  return folded;
+}
 
 /**
  * FNXC:BashContainment 2026-07-26-12:40:
  * Normalization defeats quote-splitting and $HOME spellings only. Keep this
  * pure and dependency-free so it is trivially unit-testable.
+ *
+ * FNXC:BashContainment 2026-10-07-17:57:
+ * This is the POSIX-escape spelling: backslashes are shell escapes and are removed (`.fus\ion` becomes `.fusion`).
+ * evaluateBashContainment also checks the Windows-separator spelling, because stripping backslashes alone collapsed `C:\Users\x\.fusion` into an unmatchable `c:usersx.fusion`.
  */
-export function normalizeBashCommandForContainment(command: string): string {
-  let normalized = command.replace(/["'\\]/g, "");
-  normalized = normalized.replace(/\$\{home\}/gi, "~").replace(/\$home\b/gi, "~");
-  if (HOME_DIR && HOME_DIR !== "/") {
-    normalized = normalized.replace(HOME_PATTERN, "~");
-  }
-  return normalized.toLowerCase();
+export function normalizeBashCommandForContainment(command: string, options: BashContainmentOptions = {}): string {
+  const unquoted = command.replace(/["']/g, "").toLowerCase();
+  return foldHome(unquoted.replace(/\\/g, ""), options.homeDir ?? HOME_DIR);
+}
+
+/**
+ * FNXC:BashContainment 2026-10-07-17:57:
+ * The Windows-separator spelling: backslashes are path separators (cmd.exe, PowerShell, quoted Git Bash operands) and separator runs collapse to one `/`.
+ * The floor denies the same target in every path spelling native to the host OS, so both spellings are checked and either match denies.
+ */
+function normalizeWindowsSeparatorsForContainment(command: string, homeDir: string): string {
+  const unquoted = command.replace(/["']/g, "").toLowerCase();
+  return foldHome(unquoted.replace(/[\\/]+/g, "/"), homeDir);
 }
 
 /** Evaluate the unconditional containment floor for one bash command string. */
-export function evaluateBashContainment(command: string): BashContainmentVerdict {
+export function evaluateBashContainment(command: string, options: BashContainmentOptions = {}): BashContainmentVerdict {
   if (typeof command !== "string" || command.trim() === "") {
     return { allowed: true };
   }
-  const normalized = normalizeBashCommandForContainment(command);
+  const homeDir = options.homeDir ?? HOME_DIR;
+  const spellings = [
+    normalizeBashCommandForContainment(command, { homeDir }),
+    normalizeWindowsSeparatorsForContainment(command, homeDir),
+  ];
   for (const rule of RULES) {
-    if (rule.pattern.test(normalized)) {
+    if (spellings.some((spelling) => rule.pattern.test(spelling))) {
       return { allowed: false, rule: rule.id, reason: rule.reason };
     }
   }
