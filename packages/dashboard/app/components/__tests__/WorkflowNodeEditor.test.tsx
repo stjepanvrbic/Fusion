@@ -4516,6 +4516,7 @@ describe("WorkflowNodeEditor simplified view modes", () => {
     KB-060: the canvas shell renders before the load effect fills nodes/edges, and the toolbar's openAddStep captures the append edge at click time.
     A click in that window captures a null edge and lands the pick free-floating (measured with a probe; Full Suite run 37744337717 hit it on the fragment sibling).
     Awaiting def()'s only gate card proves the hydrated graph is committed before the click.
+    FNXC:WorkflowSimpleView 2026-10-08-16:22: KB-084 moved the append-edge resolution to pick time in the product, so this wait is now a precondition, not the fix.
     */
     await screen.findByTestId("wf-simple-node-gate");
     /*
@@ -4577,6 +4578,7 @@ describe("WorkflowNodeEditor simplified view modes", () => {
     KB-060: Full Suite run 37744337717 saved this pick unspliced (merge→end kept) because the toolbar was clicked after the canvas shell rendered but before the load effect filled nodes/edges.
     openAddStep captures the append edge at click time, so it captured null and the fragment landed free-floating.
     Awaiting def()'s only gate card (the fragment's gate does not exist yet) proves the hydrated graph is committed before the click.
+    FNXC:WorkflowSimpleView 2026-10-08-16:22: KB-084 moved the append-edge resolution to pick time in the product, so this wait is now a precondition, not the fix.
     */
     await screen.findByTestId("wf-simple-node-gate");
 
@@ -4604,6 +4606,82 @@ describe("WorkflowNodeEditor simplified view modes", () => {
     expect(ir.edges.some((e) => e.from === "merge" && e.to === "end")).toBe(false);
     expect(ir.edges.some((e) => e.from === "merge" && e.to === insertedGate!.id)).toBe(true);
     expect(ir.edges.some((e) => e.from === insertedGate!.id && e.to === "end")).toBe(true);
+  });
+
+  /*
+  FNXC:WorkflowSimpleView 2026-10-08-16:22:
+  KB-084: a toolbar Add-step opened before the graph hydrates must still splice the pick before `end` on every pick path (palette, fragment, optional group).
+  Seam: fetchWorkflows is held on a deferred promise; a MutationObserver clicks the toolbar button in the microtask after the commit that first renders it, before the passive load effect fills nodes/edges.
+  The `nodeCardsAtClick` flag proves the click hit the pre-hydration window, so this cannot silently degrade into a hydrated-graph test.
+  The mobile canvas pill shares the same openAddStep handler but needs a workflow-list click before it mounts, so only the desktop toolbar is driven here.
+  */
+  it.each([
+    {
+      path: "palette",
+      pickTestId: "wf-add-step-script-script",
+      findInserted: (nodes: Array<{ id: string; kind: string }>) => nodes.find((n) => n.kind === "script"),
+    },
+    {
+      path: "fragment",
+      pickTestId: "wf-add-step-fragment-WF-FRAG",
+      findInserted: (nodes: Array<{ id: string; kind: string }>) => nodes.find((n) => n.kind === "gate" && n.id !== "lint"),
+    },
+    {
+      path: "optional group",
+      pickTestId: "wf-add-step-tpl-tpl-sec-optional-group",
+      findInserted: (nodes: Array<{ id: string; kind: string }>) => nodes.find((n) => n.kind === "optional-group"),
+    },
+  ])("splices a $path pick opened from the toolbar before the graph hydrated", async ({ pickTestId, findInserted }) => {
+    vi.mocked(fetchWorkflowStepTemplates).mockResolvedValue({
+      templates: [{ id: "tpl-sec", name: "Security review", prompt: "Review security", defaultOn: true }],
+    });
+    vi.mocked(updateWorkflow).mockImplementation(async (_id, updates) => ({ ...def(), ...(updates as object) }));
+    let resolveWorkflows!: (value: WorkflowDefinition[]) => void;
+    const pendingWorkflows = new Promise<WorkflowDefinition[]>((resolve) => {
+      resolveWorkflows = resolve;
+    });
+    vi.mocked(fetchWorkflows).mockReturnValueOnce(pendingWorkflows);
+    vi.mocked(fetchWorkflows).mockResolvedValue([def(), fragmentDef()]);
+
+    let clicked = false;
+    let nodeCardsAtClick: boolean | null = null;
+    const observer = new MutationObserver(() => {
+      if (clicked) return;
+      const button = document.querySelector<HTMLElement>('[data-testid="wf-simple-toolbar-add-step"]');
+      if (!button) return;
+      clicked = true;
+      observer.disconnect();
+      nodeCardsAtClick = document.querySelector('[data-testid^="wf-simple-node-"]') !== null;
+      fireEvent.click(button);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    try {
+      render(<WorkflowNodeEditor isOpen onClose={() => {}} addToast={() => {}} />);
+      // Resolve outside act(): act() would drain render + passive effects in one synchronous batch, closing the window before the observer microtask runs.
+      // findByTestId runs with the act environment disabled, so React commits through the real scheduler and the load effect runs after the observer.
+      resolveWorkflows([def(), fragmentDef()]);
+
+      const dialog = await screen.findByTestId("floating-window-workflow-add-step");
+      await screen.findByTestId("wf-simple-node-gate");
+      expect(clicked).toBe(true);
+      expect(nodeCardsAtClick).toBe(false);
+
+      fireEvent.click(await within(dialog).findByTestId(pickTestId));
+      await waitFor(() => expect(screen.queryByTestId("floating-window-workflow-add-step")).not.toBeInTheDocument());
+
+      fireEvent.click(screen.getByText("Save").closest("button")!);
+      await waitFor(() => expect(updateWorkflow).toHaveBeenCalledTimes(1));
+      const [, updates] = vi.mocked(updateWorkflow).mock.calls[0];
+      const ir = (updates as { ir: { nodes: Array<{ id: string; kind: string }>; edges: Array<{ from: string; to: string }> } }).ir;
+      const inserted = findInserted(ir.nodes);
+      expect(inserted).toBeDefined();
+      expect(ir.edges.some((e) => e.from === "merge" && e.to === "end")).toBe(false);
+      expect(ir.edges.some((e) => e.from === "merge" && e.to === inserted!.id)).toBe(true);
+      expect(ir.edges.some((e) => e.from === inserted!.id && e.to === "end")).toBe(true);
+    } finally {
+      observer.disconnect();
+    }
   });
 
   it("defaults the mobile graph tab to the simplified canvas with a list fallback", async () => {

@@ -1723,11 +1723,14 @@ function InnerEditor({
   (the "+ Add step" pill), which prefers the unambiguous edge into `end` and
   falls back to the classic free-floating addNode. `insideContainer` hides
   container kinds from the dialog because containers cannot nest.
+
+  FNXC:WorkflowSimpleView 2026-10-08-16:22:
+  KB-084: the target is an explicit intent. `mode: "edge"` (the per-edge "+") carries the clicked edge id.
+  `mode: "append"` (toolbar button and canvas pill) never carries a captured edge id; the edge into `end` is resolved from live nodes/edges at pick time by resolveAddStepEdgeId.
   */
-  const [addStepTarget, setAddStepTarget] = useState<{
-    edgeId: string | null;
-    insideContainer: boolean;
-  } | null>(null);
+  const [addStepTarget, setAddStepTarget] = useState<
+    { mode: "append"; insideContainer: false } | { mode: "edge"; edgeId: string; insideContainer: boolean } | null
+  >(null);
 
   const openInsertOnEdge = useCallback(
     (edgeId: string) => {
@@ -1736,15 +1739,30 @@ function InnerEditor({
       const source = edge ? nodes.find((n) => n.id === edge.source) : undefined;
       const target = edge ? nodes.find((n) => n.id === edge.target) : undefined;
       const insideContainer = !!source?.parentId && source.parentId === target?.parentId;
-      setAddStepTarget({ edgeId, insideContainer });
+      setAddStepTarget({ mode: "edge", edgeId, insideContainer });
     },
     [isBuiltin, edges, nodes],
   );
 
   const openAddStep = useCallback(() => {
     if (isBuiltin) return;
-    setAddStepTarget({ edgeId: findAppendEdgeId(nodes, edges), insideContainer: false });
-  }, [isBuiltin, nodes, edges]);
+    setAddStepTarget({ mode: "append", insideContainer: false });
+  }, [isBuiltin]);
+
+  /*
+  FNXC:WorkflowSimpleView 2026-10-08-16:22:
+  KB-084: append targets are resolved at pick time, not open time.
+  The toolbar renders before the load effect hydrates nodes/edges, and the graph may change while the dialog is open, so an open-time capture was null or stale and the pick landed free-floating (KB-060 / flake register entry 36, cdc5b7f90).
+  Edge "+" targets keep their explicit id; null means free placement (no target, or no unambiguous edge into `end`).
+  */
+  const resolveAddStepEdgeId = useCallback(
+    (target: typeof addStepTarget): string | null => {
+      if (!target) return null;
+      if (target.mode === "edge") return target.edgeId;
+      return findAppendEdgeId(nodes, edges);
+    },
+    [nodes, edges],
+  );
 
   const containerChildLabelFor = useCallback(
     (kind: WorkflowEditorNodeKind) =>
@@ -1760,8 +1778,9 @@ function InnerEditor({
    *  the edge disappeared, e.g. deleted while the dialog was open). */
   const insertFromAddStep = useCallback(
     (kind: WorkflowEditorNodeKind, label: string, presetConfig?: Record<string, unknown>) => {
-      if (addStepTarget?.edgeId) {
-        const result = insertNodeOnEdge(nodes, edges, addStepTarget.edgeId, {
+      const targetEdgeId = resolveAddStepEdgeId(addStepTarget);
+      if (targetEdgeId) {
+        const result = insertNodeOnEdge(nodes, edges, targetEdgeId, {
           kind,
           label,
           presetConfig,
@@ -1779,7 +1798,7 @@ function InnerEditor({
       addNode(kind, label, presetConfig);
       setAddStepTarget(null);
     },
-    [addStepTarget, nodes, edges, setNodes, setEdges, addNode, containerChildLabelFor],
+    [addStepTarget, resolveAddStepEdgeId, nodes, edges, setNodes, setEdges, addNode, containerChildLabelFor],
   );
 
   const handleAddStepPalettePick = useCallback(
@@ -5671,11 +5690,11 @@ function InnerEditor({
           templateConflict={templateConflict}
           onPickPalette={handleAddStepPalettePick}
           onPickFragment={(fragment) => {
-            if (handleInsertFragment(fragment, addStepTarget?.edgeId)) setAddStepTarget(null);
+            if (handleInsertFragment(fragment, resolveAddStepEdgeId(addStepTarget))) setAddStepTarget(null);
           }}
           onPickStepTemplate={handleAddStepTemplatePick}
           onPickStepTemplateAsOptionalGroup={(tpl) => {
-            handleInsertStepTemplateAsOptionalGroup(tpl, addStepTarget?.edgeId);
+            handleInsertStepTemplateAsOptionalGroup(tpl, resolveAddStepEdgeId(addStepTarget));
             setAddStepTarget(null);
           }}
         />

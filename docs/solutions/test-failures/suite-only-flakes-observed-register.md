@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 32, 33, 35, 36, 37, and 38): ten **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, 18, and 27 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **22 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **9 active observation records** (entries 2, 13, 20, 21, 25, 32, 33, 35, and 37): eight **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, 18, 27, 36, and 38 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **22 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -437,7 +437,8 @@ No timeout, retry, or assertion changed, and the file is not quarantined because
 
 ### 36. WorkflowNodeEditor edge-targeted fragment pick splice
 
-- **Status:** Active first sighting — recorded 2026-10-08, attributed by KB-060; deterministic test repair landed, with a second sighting requiring file-level quarantine.
+- **Status:** Closed 2026-10-08 — structurally resolved on first sighting by KB-084 (product fix); no quarantine.
+- **Root cause and fix:** the toolbar Add-step captured the append edge when the dialog opened, so an open inside the hydration window captured a null edge. KB-084 resolves the edge from the live graph at pick time on the palette, fragment, and optional-group paths, with pre-hydration regressions for all three.
 - **File:** `packages/dashboard/app/components/__tests__/WorkflowNodeEditor.test.tsx`
 - **Exact test:** `WorkflowNodeEditor simplified view modes > splices an edge-targeted fragment pick into the targeted edge`.
 - **Observed tree/SHA:** fork Full Suite (non-blocking) run [37744337717](https://github.com/stjepanvrbic/Fusion/actions/runs/37744337717/job/113202144603) at `74d0bdf8af314543008f0d169c28a6493d76203a` (Linux, `ubuntu-latest`), job `Test shard 4/4` (`113202144603`), command `@fusion/dashboard run test:quality:app:components-b`, project `dashboard-app-quality-components-b`. That commit (KB-036) changed no file named for `WorkflowNodeEditor`; its dashboard changes are `file-service.ts` and four tests under `packages/dashboard/src/__tests__/`. The same shard passed in the Full Suite runs for `70d326790` (37741630295), `0b74a0c2c` (37742189681), and `668244c5e` (37742324890).

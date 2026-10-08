@@ -230,6 +230,12 @@ FNXC:TestFlakeRegister 2026-10-08-08:50:
 KB-052 closed entry 27 in place on its first sighting with a product fix: embedded PostgreSQL no longer joins a
 dead in-process postmaster. The active inventory drops entry 27 and the stated count drops to 11 at merge; the record keeps
 its evidence and diagnosis in the active section, like closed entry 18.
+
+FNXC:TestFlakeRegister 2026-10-08-16:22:
+KB-084 closed entry 36 in place on its first sighting with a product fix: the toolbar Add-step now resolves the append
+edge at pick time instead of capturing it when the dialog opens. The active inventory drops entry 36 and the stated count
+drops by one; the record keeps its evidence in place, like closed entry 27.
+KB-085 had already closed entry 38 in place without syncing this inventory or the intro count, so KB-084 drops it too.
 */
 /*
 FNXC:TestFlakeRegister 2026-10-08-01:13:
@@ -281,15 +287,7 @@ test("observed-flake register active count, escalation state, and owners stay sy
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
     {
-      heading: "36. WorkflowNodeEditor edge-targeted fragment pick splice",
-      status: "Active first sighting — recorded 2026-10-08, attributed by KB-060; deterministic test repair landed, with a second sighting requiring file-level quarantine.",
-    },
-    {
       heading: "37. SQLite-to-PostgreSQL migrator transient SQLite open failure",
-      status: "Active first sighting — recorded 2026-10-08, unattributed.",
-    },
-    {
-      heading: "38. ModelOnboardingModal GitHub Copilot device-code panel clipboard auto-copy",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
   ]);
