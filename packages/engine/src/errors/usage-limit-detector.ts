@@ -52,6 +52,24 @@ export function isUsageLimitError(errorMessage: string): boolean {
   return USAGE_LIMIT_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
+/*
+FNXC:ExternalBlockAutoResume 2026-10-08-08:29:
+The usage-limit family mixes two conditions with different recovery owners: a rate limit or overload clears by waiting, while an
+exhausted quota, billing problem, or credit balance needs an operator. Providers answer an exhausted quota with HTTP 429 as well,
+so a billing signal decides the class whenever it is present.
+*/
+const BILLING_OR_QUOTA_PATTERNS: RegExp[] = [
+  /quota/i,
+  /billing/i,
+  /\bcredit/i,
+  /insufficient.*(quota|credit|balance|fund)/i,
+];
+
+/** A usage-limit error caused by quota, billing, or credit exhaustion rather than a transient rate limit. */
+export function isBillingOrQuotaError(errorMessage: string): boolean {
+  return BILLING_OR_QUOTA_PATTERNS.some((pattern) => pattern.test(errorMessage));
+}
+
 /**
  * Lightweight coordinator that agents call when they detect usage-limit errors.
  * It parks only the task that reached the unavailable provider. A provider-local

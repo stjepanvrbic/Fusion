@@ -54,9 +54,9 @@
  */
 
 import type { Settings, Task } from "@fusion/core";
-import { allowsAutoMergeProcessing, isTaskBlockedOnApproval } from "@fusion/core";
+import { allowsAutoMergeProcessing, isTaskBlockedOnApproval, isTaskExternallyBlocked } from "@fusion/core";
 
-export type OverseerHumanControlWithholdReason = "user-paused" | "approval-blocked" | "auto-merge-off-human-review";
+export type OverseerHumanControlWithholdReason = "user-paused" | "approval-blocked" | "external-block" | "auto-merge-off-human-review";
 
 export interface OverseerHumanControlDecision {
   /** `true` when the overseer must take NO action of any kind for this task. */
@@ -66,7 +66,7 @@ export interface OverseerHumanControlDecision {
 }
 
 /** The minimal task shape the predicate needs — narrowed for testability and to keep the module engine-local/pure. */
-export type OverseerHumanControlTask = Pick<Task, "userPaused" | "paused" | "pausedReason" | "status" | "autoMerge" | "prInfo" | "prInfos">;
+export type OverseerHumanControlTask = Pick<Task, "userPaused" | "paused" | "pausedReason" | "status" | "autoMerge" | "prInfo" | "prInfos"> & Partial<Pick<Task, "externalBlock">>;
 
 /** The minimal settings shape the predicate needs (forwarded to `allowsAutoMergeProcessing`). */
 export type OverseerHumanControlSettings = Pick<Settings, "autoMerge">;
@@ -92,6 +92,16 @@ export function evaluateOverseerHumanControl(
 
   if (isTaskBlockedOnApproval(task)) {
     return { withhold: true, reason: "approval-blocked" };
+  }
+
+  /*
+  FNXC:PlannerOverseer 2026-10-08-08:29:
+  A card frozen on an external obstacle (durable FN-209 marker) is not running: only operator Retry or its own automatic resume moves it.
+  Steering, retrying, or fixing it spends the bounded recovery budget on a card with no session; the live incident injected a "blocked"
+  steering comment every minute until the budget was gone. Withheld with a fixed reason and deduped like the other reasons.
+  */
+  if (isTaskExternallyBlocked(task)) {
+    return { withhold: true, reason: "external-block" };
   }
 
   const isUserPaused =

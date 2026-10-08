@@ -8990,13 +8990,15 @@ export default interface Resources {
       "executorModel": "Executor Model",
       "expand": "Expand",
       "externalBlock": {
+        "autoResumeScheduled": "Automatic retry {{attempt}}/{{budget}} at {{time}}",
         "explain": "Explain this error",
         "explainPrompt": "Explain this error {{error}} and how to resolve it.",
         "genericMessage": "External obstacle requires operator action",
         "resuming": "Resuming…",
         "retry": "Retry",
         "title": "Blocked",
-        "unknownCode": "UNCLASSIFIED"
+        "unknownCode": "UNCLASSIFIED",
+        "waitingForSlot": "Waiting for a free agent slot…"
       },
       "fanoutBlocks": "Blocks",
       "fanoutBottleneck": "Overlap bottleneck",

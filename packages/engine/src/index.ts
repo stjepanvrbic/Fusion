@@ -210,6 +210,12 @@ export {
   type WorkflowGraphExecutorResult,
 } from "./workflows/workflow-graph-executor.js";
 export {
+  requestExternalBlockResume,
+  type ExternalBlockLifecycleStore,
+  type ExternalBlockResumeRequestResult,
+  type ExternalBlockResumeTrigger,
+} from "./external-block/external-block-lifecycle.js";
+export {
   runSplitJoin,
   type WorkflowBranchPersistence,
   type WorkflowBranchProgress,

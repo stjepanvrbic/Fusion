@@ -33,6 +33,7 @@ import {
   type ProjectCapacityHolders,
 } from "./concurrency/concurrency.js";
 import { planTaskWorktreePath, resolveTaskWorkingBranch } from "./worktree/worktree-names.js";
+import { resumeDueExternalBlocks } from "./external-block/external-block-lifecycle.js";
 import { schedulerLog } from "./logger.js";
 import { emitBoundedRunAudit } from "./util/emit-bounded-run-audit.js";
 import { createRepeatSuppressedLog } from "./util/repeat-suppressed-log.js";
@@ -2307,6 +2308,17 @@ export class Scheduler {
         schedulerLog.log("Engine pause cleared — scheduling resumed");
       }
       this.wasEnginePaused = false;
+
+      /*
+      FNXC:ExternalBlockAutoResume 2026-10-08-08:29:
+      Due automatic resumes of transient (rate-limit) freezes are requested here, after both pause gates, so a paused engine never resumes
+      frozen work. A request only publishes an admission-gated continuation; the card waits for a running-agent slot like any other lane.
+      */
+      try {
+        await resumeDueExternalBlocks({ store: this.store, tasks });
+      } catch (error) {
+        schedulerLog.warn(`External-block automatic resume sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
 
       const heartbeatIntervalMs = Math.max(1, settings.pollIntervalMs ?? 15_000);
       if (Date.now() - this.lastHeartbeatWriteMs >= heartbeatIntervalMs) {

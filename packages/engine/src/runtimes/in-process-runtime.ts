@@ -27,10 +27,12 @@ import {
   isEphemeralAgent,
   isPlanReviewSatisfied,
   isTaskBlockedOnApproval,
+  isTaskExternallyBlocked,
   resolveWorkflowIrForTask,
   resolveTaskLifecycleColumns,
   resolveLifecycleColumns,
 } from "@fusion/core";
+import { clearExternalBlockForAdmittedResume, isExternalBlockResumeWorkItem } from "../external-block/external-block-lifecycle.js";
 import { Scheduler } from "../scheduler.js";
 import { registerDefaultAgentPluginRunner, unregisterDefaultAgentPluginRunner } from "../pi.js";
 import type { PrMonitor, PrComment } from "../merge/pr-monitor.js";
@@ -255,6 +257,17 @@ export function resolvePlanningContinuationCandidate(
   */
   if (isTaskBlockedOnApproval(task)) {
     return { kind: "skip", item, reason: "awaiting-approval" };
+  }
+  /*
+  FNXC:ExternalBlockResume 2026-10-08-08:29:
+  A frozen card keeps its pause fence until admission grants its resumed run a slot. Its own resume continuation (operator Retry or a
+  due automatic resume, recorded as `resumeRequest`) is therefore actionable despite the pause; every other continuation of a frozen card
+  stays skipped as paused.
+  */
+  if (isTaskExternallyBlocked(task)) {
+    return task.externalBlock?.resumeRequest && isExternalBlockResumeWorkItem(item)
+      ? { kind: "actionable", item, task }
+      : { kind: "skip", item, reason: "paused" };
   }
   if (task.paused === true || task.userPaused === true) {
     return { kind: "skip", item, reason: "paused" };
@@ -968,8 +981,22 @@ export interface PlanningContinuationRunInput {
  */
 export function createPlanningContinuationRun(input: PlanningContinuationRunInput): (task: Task, item: WorkflowWorkItem) => Promise<void> {
   return async (task, item) => {
-    await input.execute(task).catch((error) => {
-      input.onError?.(task, item, error);
+    /*
+    FNXC:ExternalBlockResume 2026-10-08-08:29:
+    An admitted external-block resume clears the freeze here, inside the coordinator reservation that bridges it to the live row, and runs
+    the cleared task. Ordinary continuations keep calling execute() in the same tick as the run.
+    */
+    let runTask = task;
+    if (isTaskExternallyBlocked(task) && isExternalBlockResumeWorkItem(item)) {
+      const cleared = await clearExternalBlockForAdmittedResume({ store: input.store, taskId: task.id, nodeId: item.nodeId });
+      if (!cleared) {
+        await settlePlanningContinuationDispatch({ store: input.store, taskId: task.id, itemId: item.id, kick: input.kick });
+        return;
+      }
+      runTask = cleared;
+    }
+    await input.execute(runTask).catch((error) => {
+      input.onError?.(runTask, item, error);
     });
     await settlePlanningContinuationDispatch({ store: input.store, taskId: task.id, itemId: item.id, kick: input.kick });
   };

@@ -11,6 +11,7 @@ function task(overrides: Partial<OverseerHumanControlTask> = {}): OverseerHumanC
     paused: undefined,
     pausedReason: undefined,
     status: undefined,
+    externalBlock: undefined,
     autoMerge: undefined,
     prInfo: undefined,
     prInfos: undefined,
@@ -23,6 +24,29 @@ function settings(overrides: Partial<OverseerHumanControlSettings> = {}): Overse
 }
 
 describe("evaluateOverseerHumanControl", () => {
+  /*
+  FNXC:PlannerOverseer 2026-10-08-08:29:
+  A card frozen on an external obstacle is not running; steering it only spends the bounded recovery budget (the live incident injected a
+  "blocked" steering comment every minute). The durable FN-209 marker withholds oversight with a fixed reason; status text alone does not.
+  */
+  it("withholds with reason external-block for a frozen external-block park", () => {
+    const frozen = task({
+      status: "blocked",
+      paused: true,
+      pausedReason: "external-block",
+      externalBlock: {
+        origin: "model-provider",
+        code: "RATE_LIMIT",
+        message: "429 rate_limit_error",
+        source: "session-failure",
+        blockedAt: "2026-10-08T07:27:00.000Z",
+        resume: { column: "in-progress", currentStep: 0 },
+      },
+    });
+    expect(evaluateOverseerHumanControl(frozen, settings())).toEqual({ withhold: true, reason: "external-block" });
+    expect(evaluateOverseerHumanControl(task({ status: "blocked" }), settings())).toEqual({ withhold: false });
+  });
+
   it("withholds with reason user-paused when task.userPaused is true", () => {
     const decision = evaluateOverseerHumanControl(task({ userPaused: true }), settings());
     expect(decision).toEqual({ withhold: true, reason: "user-paused" });

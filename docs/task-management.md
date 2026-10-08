@@ -1000,6 +1000,8 @@ In **Settings → Models → Project**, choose whether AI-authored task plans, t
 
 Read that mailbox explanation before acting. After the stated unblock condition is met, use **Retry**. Retry resumes the recorded interrupted workflow node; it does not reset steps, delete `PROMPT.md`, replan, or replace the task worktree and branch. Repeated Retry requests are refused while the resume continuation is already pending.
 
+A Blocked card does not use one of the project's running-agent slots, so other work keeps running while it waits; it still counts toward **Max Worktrees** because it keeps its worktree. After Retry the card shows **Waiting for a free agent slot…** until a slot opens, then resumes. A provider rate limit retries automatically after 5, 15, 30, 60, 120, and 120 minutes, at most six times, and the card shows when the next automatic retry runs. Retry still works at any time and resets that automatic budget. Billing, quota, credential, disk, and network blocks wait for you.
+
 ## Reconciling review tasks with a cleaned-up branch
 
 `absent-branch-landed-reconciliation` — an in-review task whose branch was cleaned up can be completed only when an ownership-anchored commit exists on its base branch and the task is not paused, executing, or holding a fresh checkout lease. `fn task reconcile <id>` uses the same liveness and compare-and-set fence as the automatic self-healing sweep; it never fabricates review approval.

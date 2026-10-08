@@ -8664,7 +8664,9 @@
       "explain": "이 오류 설명",
       "explainPrompt": "이 오류 {{error}}의 원인과 해결 방법을 설명해 주세요.",
       "resuming": "재개 중…",
-      "retry": "다시 시도"
+      "retry": "다시 시도",
+      "autoResumeScheduled": "자동 재시도 {{attempt}}/{{budget}} · {{time}}",
+      "waitingForSlot": "사용 가능한 에이전트 슬롯 대기 중…"
     },
     "branch": "브랜치",
     "branchMetadata": "브랜치 메타데이터",

@@ -119,6 +119,11 @@ async function createPrompt(root: string) {
 
 afterEach(() => vi.restoreAllMocks());
 
+/*
+FNXC:ExternalBlockResume 2026-10-08-08:29:
+A frozen card holds no running-agent slot, so Retry publishes the resume continuation and records the request while the freeze stays
+raised; project admission clears the freeze when it grants the resumed run a slot (covered in the engine's admission tests).
+*/
 describe("external-block Retry", () => {
   it("resumes the recorded node without changing completed work or implementation artifacts", async () => {
     const root = await mkdtemp(join(tmpdir(), "fusion-external-block-resume-"));
@@ -139,11 +144,13 @@ describe("external-block Retry", () => {
       branch: before.branch,
       baseCommitSha: before.baseCommitSha,
       workflowStepResults: before.workflowStepResults,
-      paused: false,
-      externalBlock: null,
+      // Still frozen and holding no running-agent slot until admission grants the resumed run one.
+      status: "blocked",
+      paused: true,
+      externalBlockAutoResumeCount: 0,
+      externalBlock: { ...before.externalBlock, resumeRequest: { requestedAt: expect.any(String), trigger: "operator" } },
     });
-    expect(row.status).toBeNull();
-    expect(row.error).toBeNull();
+    expect(response.body).toMatchObject({ id: "FN-209", status: "blocked" });
     await expect(readFile(promptPath, "utf8")).resolves.toBe("# Existing approved plan\n");
     expect(items).toEqual([
       expect.objectContaining({
@@ -161,11 +168,10 @@ describe("external-block Retry", () => {
       branch: expect.anything(),
       workflowStepResults: expect.anything(),
     }));
-    expect(store.logEntry).toHaveBeenCalledWith("FN-209", expect.stringContaining("resuming workflow at implement"));
-    expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
-      mutationType: "task:external-block-cleared",
-      metadata: expect.objectContaining({ code: "ENOSPC", resumeNodeId: "implement" }),
-    }));
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "FN-209",
+      "External block Retry requested; resuming workflow at implement when a running-agent slot is free",
+    );
     expect(JSON.stringify(vi.mocked(store.recordRunAuditEvent).mock.calls)).not.toContain("no space left on device");
   });
 
@@ -193,8 +199,15 @@ describe("external-block Retry", () => {
     const duplicate = await performRequest(app, "POST", "/api/tasks/FN-209/retry");
 
     expect(duplicate.status).toBe(409);
-    expect(JSON.stringify(duplicate.body)).toContain("already resumed");
+    expect(JSON.stringify(duplicate.body)).toContain("already been requested");
     expect(items).toHaveLength(1);
+    expect(store.replaceActiveTaskWorkflowContinuation).toHaveBeenCalledOnce();
+
+    // Once admission cleared the freeze, a late click still cannot replay the resumed step.
+    Object.assign(row, { status: null, paused: false, externalBlock: undefined });
+    const late = await performRequest(app, "POST", "/api/tasks/FN-209/retry");
+    expect(late.status).toBe(409);
+    expect(JSON.stringify(late.body)).toContain("already resumed");
     expect(store.replaceActiveTaskWorkflowContinuation).toHaveBeenCalledOnce();
   });
 

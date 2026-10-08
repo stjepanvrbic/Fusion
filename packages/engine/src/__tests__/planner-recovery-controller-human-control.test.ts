@@ -142,6 +142,40 @@ describe("PlannerRecoveryController — human-control guard (FN-7514)", () => {
     }
   });
 
+  /*
+  FNXC:PlannerOverseer 2026-10-08-08:29:
+  A frozen external-block park never receives steering, retries, or fixes on any watched stage, and the withheld audit is emitted once
+  per freeze rather than every poll.
+  */
+  it("withholds every action for an externally frozen card and records the withheld reason once", async () => {
+    const handlers = allHandlers();
+    const frozen = task({
+      column: "in-progress",
+      status: "blocked",
+      paused: true,
+      pausedReason: "external-block",
+      externalBlock: {
+        origin: "model-provider",
+        code: "RATE_LIMIT",
+        message: "429 rate_limit_error",
+        source: "session-failure",
+        blockedAt: "2026-10-08T07:27:00.000Z",
+        resume: { column: "in-progress", currentStep: 0 },
+      },
+    });
+    for (const stage of WATCHED_STAGES) {
+      const controller = makeController(observation({ stage, signal: "blocked" }), handlers);
+      for (let poll = 0; poll < 3; poll += 1) expect(await controller.tick(frozen)).toBeNull();
+    }
+    expect(handlers.injectGuidance).not.toHaveBeenCalled();
+    expect(handlers.retryStep).not.toHaveBeenCalled();
+    expect(handlers.requestTargetedFix).not.toHaveBeenCalled();
+    expect(handlers.requestConfirmation).not.toHaveBeenCalled();
+    // One controller per stage, each polled three times: deduped to one withheld record per controller.
+    expect(handlers.recordHumanControlWithheld).toHaveBeenCalledTimes(WATCHED_STAGES.length);
+    expect(handlers.recordHumanControlWithheld.mock.calls.every(([, decision]) => decision.reason === "external-block")).toBe(true);
+  });
+
   it("does NOT re-emit recordHumanControlWithheld on repeated ticks for the same still-withheld reason", async () => {
     const handlers = allHandlers();
     const controller = makeController(observation({ stage: "merger" }), handlers);

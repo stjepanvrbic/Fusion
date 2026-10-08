@@ -8756,7 +8756,9 @@
       "explain": "Explain this error",
       "explainPrompt": "Explain this error {{error}} and how to resolve it.",
       "resuming": "Resuming…",
-      "retry": "Retry"
+      "retry": "Retry",
+      "autoResumeScheduled": "Automatic retry {{attempt}}/{{budget}} at {{time}}",
+      "waitingForSlot": "Waiting for a free agent slot…"
     },
     "planApproval": {
       "approve": "Approve",

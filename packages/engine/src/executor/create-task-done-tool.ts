@@ -16,7 +16,6 @@
 import { Type } from "@earendil-works/pi-ai";
 import type { Settings, Task, TaskDetail, TaskRecommendation, TaskStore } from "@fusion/core";
 import {
-  buildTaskExternalBlockPatch,
   buildTaskExternalBlockReport,
   isTaskNotFoundError,
   parseNoOpCompletionMarker,
@@ -39,6 +38,7 @@ import { emitBoundedRunAudit } from "./emit-bounded-run-audit.js";
 import { executorLog } from "../logger.js";
 import { resolveReboundColumnFor } from "./lifecycle-columns.js";
 import { evaluateTaskDoneRefusal } from "./task-done-refusal.js";
+import { parkTaskOnExternalObstacle } from "../external-block/external-block-lifecycle.js";
 import { skipBypassTaintUpdateForRefusal } from "./completion-predicates.js";
 import { MAX_TASK_DONE_REQUEUE_RETRIES } from "./task-done-refusal-handler.js";
 import { validateCompletionRecommendations } from "./validate-completion-recommendations.js";
@@ -254,32 +254,21 @@ export function createTaskDoneTool(
                 branch: blockedTask.branch,
               },
             };
-            await store.updateTask(taskId, buildTaskExternalBlockPatch(externalBlock), deps.getRunContextFor(taskId));
-            await store.logEntry(
-              taskId,
-              `External obstacle frozen (${externalBlock.origin}/${externalBlock.code}); resources and execution progress retained for Retry`,
-              undefined,
-              deps.getRunContextFor(taskId),
-            );
-            await emitBoundedRunAudit(deps.store, {
-              taskId,
-              agentId: "executor",
-              runId: generateSyntheticRunId("external-block", taskId),
-              domain: "database",
-              mutationType: "task:external-block-parked",
-              target: taskId,
-              metadata: {
-                taskId,
-                origin: externalBlock.origin,
-                code: externalBlock.code,
-                source: externalBlock.source,
-                column: blockedTask.column,
-                resumeNodeId: externalBlock.resume.nodeId,
-              },
+            await parkTaskOnExternalObstacle({
+              store,
+              task: blockedTask,
+              externalBlock,
+              runContext: deps.getRunContextFor(taskId),
+              writeRunContext: deps.getRunContextFor(taskId),
+              logMessage: `External obstacle frozen (${externalBlock.origin}/${externalBlock.code}); worktree and execution progress retained for Retry`,
             });
             await deps.persistTokenUsage(taskId);
+            /*
+            FNXC:ExternalBlock 2026-10-08-08:29:
+            A frozen card releases its running-agent slot; its worktree, branch, and file-scope lease stay retained for the resume.
+            */
             return {
-              content: [{ type: "text" as const, text: "Task frozen as Blocked for human action. Column, completed steps, worktree, branch, capacity slot, and file-scope lease are retained; Retry will resume the interrupted workflow node." }],
+              content: [{ type: "text" as const, text: "Task frozen as Blocked for human action. Column, completed steps, worktree, branch, and file-scope lease are retained; the running-agent slot is released. Retry will resume the interrupted workflow node once a slot is free." }],
               details: {},
             };
           }

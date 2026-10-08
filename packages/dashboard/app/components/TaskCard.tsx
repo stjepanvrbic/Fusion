@@ -624,6 +624,14 @@ export function ExternalBlockNotice({ task, variant, onOpenChatWithPrefill, onRe
   const code = block.code.trim() || t("tasks.externalBlock.unknownCode", "UNCLASSIFIED");
   const message = block.message.trim() || t("tasks.externalBlock.genericMessage", "External obstacle requires operator action");
   const error = `${code}: ${message}`;
+  /*
+  FNXC:ExternalBlockUx 2026-10-08-08:29:
+  A requested resume waits for a running-agent slot while the card stays frozen, so Retry turns into a disabled waiting state rather than a
+  second request. A scheduled automatic resume of a rate-limit freeze is announced; Retry stays available to resume sooner.
+  */
+  const resumeQueued = Boolean(block.resumeRequest);
+  const autoResume = resumeQueued ? undefined : block.autoResume;
+  const autoResumeTime = autoResume ? new Date(autoResume.resumeAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
   const stop = (event: React.SyntheticEvent) => event.stopPropagation();
   const explain = (event: React.MouseEvent<HTMLButtonElement>) => {
     stop(event);
@@ -631,7 +639,7 @@ export function ExternalBlockNotice({ task, variant, onOpenChatWithPrefill, onRe
   };
   const retry = async (event: React.MouseEvent<HTMLButtonElement>) => {
     stop(event);
-    if (!onRetryTask || isResuming) return;
+    if (!onRetryTask || isResuming || resumeQueued) return;
     setIsResuming(true);
     try {
       await onRetryTask(task.id);
@@ -645,6 +653,15 @@ export function ExternalBlockNotice({ task, variant, onOpenChatWithPrefill, onRe
     <div className={`external-block-notice external-block-notice--${variant}`} role="alert" data-testid={`external-block-${variant}-${task.id}`}>
       <strong className="external-block-notice__title">{t("tasks.externalBlock.title", "Blocked")}</strong>
       <span className="external-block-notice__reason">{error}</span>
+      {autoResume && (
+        <span className="external-block-notice__reason">
+          {t("tasks.externalBlock.autoResumeScheduled", "Automatic retry {{attempt}}/{{budget}} at {{time}}", {
+            attempt: autoResume.attempt,
+            budget: autoResume.budget,
+            time: autoResumeTime,
+          })}
+        </span>
+      )}
       {(onOpenChatWithPrefill || onRetryTask) && (
         <span className="external-block-notice__actions">
           {onOpenChatWithPrefill && (
@@ -653,9 +670,11 @@ export function ExternalBlockNotice({ task, variant, onOpenChatWithPrefill, onRe
             </button>
           )}
           {onRetryTask && (
-            <button type="button" className="btn" onClick={(event) => void retry(event)} disabled={isResuming}>
+            <button type="button" className="btn" onClick={(event) => void retry(event)} disabled={isResuming || resumeQueued}>
               <RotateCw aria-hidden="true" />
-              {isResuming ? t("tasks.externalBlock.resuming", "Resuming…") : t("tasks.externalBlock.retry", "Retry")}
+              {resumeQueued
+                ? t("tasks.externalBlock.waitingForSlot", "Waiting for a free agent slot…")
+                : isResuming ? t("tasks.externalBlock.resuming", "Resuming…") : t("tasks.externalBlock.retry", "Retry")}
             </button>
           )}
         </span>
@@ -1035,6 +1054,8 @@ function areTaskCardPropsEqual(previous: TaskCardProps, next: TaskCardProps): bo
     previousTask.externalBlock?.blockedAt === nextTask.externalBlock?.blockedAt &&
     previousTask.externalBlock?.code === nextTask.externalBlock?.code &&
     previousTask.externalBlock?.message === nextTask.externalBlock?.message &&
+    previousTask.externalBlock?.resumeRequest?.requestedAt === nextTask.externalBlock?.resumeRequest?.requestedAt &&
+    previousTask.externalBlock?.autoResume?.resumeAt === nextTask.externalBlock?.autoResume?.resumeAt &&
     previousTask.size === nextTask.size &&
     previousTask.blockedBy === nextTask.blockedBy &&
     previousTask.overlapBlockedBy === nextTask.overlapBlockedBy &&
