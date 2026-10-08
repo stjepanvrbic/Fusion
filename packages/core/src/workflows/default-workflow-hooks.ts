@@ -73,6 +73,13 @@ export interface DefaultWorkflowMoveContext {
     preserveResumeState?: boolean;
     preserveProgress?: boolean;
     preserveWorktree?: boolean;
+    /**
+     * Keep an existing park across a reopen into a planning lane.
+     *
+     * FNXC:WorkflowLifecycle 2026-10-08-01:40:
+     * KB-013 made operator-pause preservation structural (see `holdsOperatorPause`): a non-user move never clears an operator pause whether or not this is set.
+     * This option is now only needed to keep an ENGINE-owned park (a `pausedReason`/`pausedByAgentId` park with no `userPaused`) across a reopen. It never sets a pause.
+     */
     preservePause?: boolean;
   };
   /**
@@ -142,6 +149,23 @@ function inRole(
 // These mirror the inline flag-off mutations in store.ts exactly. They run as
 // the resolved onEnter/onExit hook bodies for the default workflow's traits.
 
+/**
+ * True when the task holds an OPERATOR pause (the user pause).
+ *
+ * FNXC:WorkflowLifecycle 2026-10-08-01:40:
+ * KB-013 requirement: a non-user move never clears the user pause; only a user move or an explicit unpause (`pauseTask(id, false)`) does.
+ * Before this, every engine reopen into a planning lane wiped the pause unless the caller remembered `preservePause`, so a recovery sweep or requeue un-parked a card the operator stopped and the scheduler restarted it.
+ * An operator pause is `userPaused === true` (set by every operator pause surface: dashboard, mission routes, CLI, extension), or the legacy shape `paused === true` with neither `pausedReason` nor `pausedByAgentId` (a bare `pauseTask(id, true)`), mirroring the engine overseer's user-pause heuristic.
+ * A park carrying a reason or agent and no `userPaused` is engine-owned and keeps its prior reopen-clears semantics.
+ * Every pause-clear gate in this file reads this one predicate; do not re-derive it inline.
+ */
+export function holdsOperatorPause(
+  task: Pick<Task, "paused" | "userPaused" | "pausedReason" | "pausedByAgentId">,
+): boolean {
+  if (task.userPaused === true) return true;
+  return task.paused === true && !task.pausedReason && !task.pausedByAgentId;
+}
+
 /** `timing` trait (in-progress): accumulate active ms on exit, stamp timing on
  *  entry.
  *
@@ -192,7 +216,14 @@ export function applyTimingEffects(ctx: DefaultWorkflowMoveContext): void {
     task.cumulativeActiveMs ??= 0;
     if (!task.firstExecutionAt) task.firstExecutionAt = task.columnMovedAt;
     if (!task.executionStartedAt) task.executionStartedAt = task.columnMovedAt;
-    task.userPaused = undefined;
+    /*
+    FNXC:WorkflowLifecycle 2026-10-08-01:40:
+    KB-013: WIP entry used to clear `userPaused` for every source. A non-user WIP entry (scheduler dispatch race, engine resume) must never lift an operator pause, or the card runs work the operator stopped.
+    A user move into WIP still clears it (the drag IS the operator resuming), as does a WIP entry of a card without an operator pause.
+    */
+    if (ctx.moveSource === "user" || !holdsOperatorPause(task)) {
+      task.userPaused = undefined;
+    }
   }
 }
 
@@ -254,17 +285,24 @@ export function applyResetOnEntryEffects(ctx: DefaultWorkflowMoveContext): void 
   FNXC:WorkflowLifecycle 2026-07-12-09:05:
   Pause-bounce loop (observed on FN-7851, 2026-07-12): a user pause of an in-progress task hard-cancels the session and the executor teardown re-queues the row to todo. This reopen block unconditionally wiped `paused`/`pausedByAgentId`/`pausedReason`, so the pause NEVER survived its own teardown — the graph-failure classifier then saw an unpaused row, misread the abort as engine-internal, and auto-continued the session (and after the retry budget, the scheduler re-dispatched the unpaused todo row). `preservePause` lets the pause-caused teardown move keep the park; the scheduler skips paused/userPaused todo rows until an explicit unpause.
   `userPaused` promotion for user-source moves is unchanged; preservePause only prevents CLEARING an existing park, never sets one.
+
+  FNXC:WorkflowLifecycle 2026-10-08-01:40:
+  KB-013 makes operator-pause preservation structural: a non-user move (engine, scheduler, operator, absent source — all resolve to non-"user") never clears an operator pause, whatever options the caller passes. Only a user move or an explicit unpause lifts it.
+  The whole park is kept (`paused`, `pausedByAgentId`, `pausedReason`, `userPaused`); every non-pause reopen effect still runs. `preservePause` remains for keeping an ENGINE-owned park, which a non-user reopen otherwise still clears exactly as before.
+  `keepPause` is computed before any mutation so the predicate reads the pre-move park.
   */
+  const keepPause =
+    options.preservePause === true || (moveSource !== "user" && holdsOperatorPause(task));
   if (!options.preserveStatus) {
     task.status = undefined;
     task.error = undefined;
-    if (!options.preservePause) {
+    if (!keepPause) {
       task.pausedReason = undefined;
     }
   }
   task.blockedBy = undefined;
   task.overlapBlockedBy = undefined;
-  if (!options.preservePause) {
+  if (!keepPause) {
     task.paused = undefined;
     task.pausedByAgentId = undefined;
   }
@@ -282,7 +320,7 @@ export function applyResetOnEntryEffects(ctx: DefaultWorkflowMoveContext): void 
     : "todo";
   if (moveSource === "user" && toColumn === holdLane) {
     task.userPaused = true;
-  } else if (!options.preservePause) {
+  } else if (!keepPause) {
     task.userPaused = undefined;
   }
 

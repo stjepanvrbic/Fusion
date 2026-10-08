@@ -342,6 +342,14 @@ export interface MoveTaskOptions {
    * pause teardown so a user pause survives its own hard-cancel re-queue and
    * the row stays parked until an explicit unpause (FN-7851 pause-bounce loop).
    * Never SETS a pause — only prevents the reopen block from clearing one.
+   *
+   * FNXC:WorkflowLifecycle 2026-10-08-01:40:
+   * KB-013 made operator-pause preservation structural: a non-user move never
+   * clears an operator pause (`userPaused`, or a bare reason-less agent-less
+   * `paused`) whether or not this is passed; only a user move or an explicit
+   * `pauseTask(id, false)` lifts it. This option is now only needed to keep an
+   * ENGINE-owned park (a reason/agent park without `userPaused`) across a reopen.
+   * Do not add it to callers to protect operator pauses.
    */
   preservePause?: boolean;
   allocateWorktree?: (reservedNames: Set<string>) => string | null;

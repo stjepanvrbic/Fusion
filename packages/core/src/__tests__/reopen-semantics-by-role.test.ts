@@ -211,6 +211,70 @@ describe("a reopen is decided by lifecycle ROLE, not by the default lineage's na
   });
 });
 
+/*
+KB-013: the operator-pause rule is keyed on lifecycle ROLE like every other reopen effect, so a
+renamed board and a no-basis (v1) board must preserve the pause on non-user moves exactly as the
+default lineage does.
+*/
+describe("an operator pause survives non-user reopens on every lineage (KB-013)", () => {
+  beforeEach(() => {
+    __resetTraitRegistryForTests();
+    __resetDefaultWorkflowHooksForTests();
+    registerBuiltinTraits();
+    registerDefaultWorkflowHooks();
+  });
+
+  function applyPaused(ir: WorkflowIr | undefined, fromColumn: string, toColumn: string, overrides = {}) {
+    const ctx = makeCtx(ir, fromColumn, toColumn, overrides);
+    ctx.task.paused = true;
+    ctx.task.userPaused = true;
+    applyDefaultWorkflowMoveEffects(ctx);
+    return ctx.task;
+  }
+
+  it("keeps it on an engine building -> queued (hold) on a renamed board", () => {
+    const task = applyPaused(RENAMED_IR, "building", "queued");
+    expect(task.paused).toBe(true);
+    expect(task.userPaused).toBe(true);
+    expect(task.status).toBeUndefined();
+  });
+
+  it("keeps it on an engine checking -> backlog (intake) on a renamed board", () => {
+    const task = applyPaused(RENAMED_IR, "checking", "backlog");
+    expect(task.paused).toBe(true);
+    expect(task.userPaused).toBe(true);
+    expect(task.workflowStepResults).toBeUndefined();
+  });
+
+  it("keeps it on a scheduler queued -> building (wip) entry on a renamed board", () => {
+    const task = applyPaused(RENAMED_IR, "queued", "building", { moveSource: "scheduler" as const });
+    expect(task.userPaused).toBe(true);
+  });
+
+  it("a user building -> queued still parks on a renamed board", () => {
+    const task = applyPaused(RENAMED_IR, "building", "queued", { moveSource: "user" as const });
+    expect(task.userPaused).toBe(true);
+    expect(task.paused).toBeUndefined();
+  });
+
+  it("a user building -> backlog lifts it on a renamed board", () => {
+    const task = applyPaused(RENAMED_IR, "building", "backlog", { moveSource: "user" as const });
+    expect(task.userPaused).toBeUndefined();
+    expect(task.paused).toBeUndefined();
+  });
+
+  it("behaves the same with no lifecycle basis (legacy names)", () => {
+    for (const [from, to] of [["in-progress", "todo"], ["in-review", "triage"], ["done", "todo"]] as const) {
+      const task = applyPaused(undefined, from, to);
+      expect(task.paused).toBe(true);
+      expect(task.userPaused).toBe(true);
+    }
+    const userHold = applyPaused(undefined, "in-progress", "todo", { moveSource: "user" as const });
+    expect(userHold.userPaused).toBe(true);
+    expect(userHold.paused).toBeUndefined();
+  });
+});
+
 describe("no column vocabulary is the only case a legacy name is legitimate", () => {
   beforeEach(() => {
     __resetTraitRegistryForTests();

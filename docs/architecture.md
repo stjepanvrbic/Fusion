@@ -1412,7 +1412,7 @@ those readers to a purpose-built workflow run-state signal is a deferred post-cu
 ### User cancel via move-to-todo
 - `TaskStore.moveTask()` accepts `moveSource: "user" | "engine"` (default `"engine"`) and emits `task:moved` with `source` so listeners can distinguish manual moves from engine rebounds.
 - Manual `in-progress → todo` moves (dashboard route `/tasks/:id/move` with `moveSource: "user"`) atomically set `task.userPaused = true`; engine/default rebounds do not.
-- Any move to `in-progress` clears `task.userPaused` in the same store write so explicit redispatch resumes normally.
+- A **user** move to `in-progress` clears `task.userPaused` in the same store write so explicit redispatch resumes normally. A non-user (engine, scheduler, operator, or source-less) move into the WIP lane never lifts an operator pause (KB-013).
 - `TaskExecutor` treats manual `in-progress → todo` as hard cancel: it marks the task as user-canceled, aborts active session types before dispose/termination, and suppresses preserve-resume auto-bounces while logging `Execution canceled by user — leaving task in todo`.
 - Scheduler dispatch loop skips `todo` tasks with `userPaused === true` (queues with a user-paused reason) until a user explicitly moves the task back to `in-progress`.
 
@@ -2360,6 +2360,8 @@ Plan Review borrows the shared `recoveryRetryCount` transient-triage budget for 
 ## Lifecycle invariants
 
 This section preserves the detailed lifecycle/self-healing contracts that were formerly in `AGENTS.md`.
+
+- **Operator pause survives non-user moves (KB-013)**: a move that is not `moveSource: "user"` (after `resolveMoveSource`, so engine, scheduler, operator, and an absent source all count as non-user) never clears an operator pause. An operator pause is `userPaused === true`, or `paused === true` with no `pausedReason` and no `pausedByAgentId` (`holdsOperatorPause` in `packages/core/src/workflows/default-workflow-hooks.ts`). When it holds, the reopen-into-planning and WIP-entry hooks keep `paused`, `pausedByAgentId`, `pausedReason`, and `userPaused`; the other reopen clears still run, and a non-user move never sets a pause. Only a user move (drag) or an explicit unpause (`pauseTask(id, false)`) lifts it. Engine-owned parks (a `pausedReason` with no `userPaused`) keep the prior reopen-clears semantics, and `preservePause` still keeps one across a reopen; callers no longer need `preservePause` to protect an operator pause.
 
 - **Planning-recovery no-regression (FN-7977/FN-8361)**: a provider, model-selection, transport, or deterministic planning failure may only mutate a task after re-reading its live row and proving it remains in the planning stage. Execution/terminal columns, a worktree, or materialized steps prove advancement; stale triage recovery must leave that column, status, worktree, step progress, and `PROMPT.md` untouched. Patch writes use `updateTaskAtomic`; recovery releases use `moveTaskIf` and recovery duplicate deletion uses `deleteTaskIf`, each read-predicate-mutating under one task lock. A predicate skip is normal scheduler advancement and short-circuits the remaining recovery body. A genuine Plan Review `REVISE` remains a separate, explicit replan signal.
 - **Orphan `fusion/*` branches**: branches with zero unique commits vs `main` are pruned by `cleanupOrphanedBranches` (`branch:orphan-prune`). Branches with unique commits are not auto-rescued; operators inspect and clean them manually via standard git tooling (`git branch -D`, `git worktree remove`, etc.).

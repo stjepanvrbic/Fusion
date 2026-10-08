@@ -16,6 +16,7 @@ import { registerBuiltinTraits } from "../workflows/builtin-traits.js";
 import {
   __resetDefaultWorkflowHooksForTests,
   applyDefaultWorkflowMoveEffects,
+  holdsOperatorPause,
   registerDefaultWorkflowHooks,
   type DefaultWorkflowMoveContext,
 } from "../workflows/default-workflow-hooks.js";
@@ -121,7 +122,7 @@ describe("default-workflow-hooks registry wiring", () => {
     expect(ctx.task.nextRecoveryAt).toBe("2026-08-21T16:07:00.000Z");
   });
 
-  it("preservePause never SETS a pause on an unpaused reopen, and default reopen still clears one", () => {
+  it("preservePause never SETS a pause on an unpaused reopen, and default reopen still clears an engine-owned park", () => {
     registerDefaultWorkflowHooks();
     // preservePause on an unpaused task: nothing appears.
     const unpausedCtx = makeCtx({ fromColumn: "in-progress", toColumn: "todo", moveSource: "engine", options: { preservePause: true } });
@@ -129,15 +130,173 @@ describe("default-workflow-hooks registry wiring", () => {
     expect(unpausedCtx.task.paused).toBeUndefined();
     expect(unpausedCtx.task.userPaused).toBeUndefined();
 
-    // Default (no preservePause) engine reopen still clears an existing pause.
+    // Default (no preservePause) engine reopen still clears an ENGINE-owned park
+    // (agent + reason, no userPaused); KB-013 leaves engine-park semantics unchanged.
     const defaultCtx = makeCtx({ fromColumn: "in-progress", toColumn: "todo", moveSource: "engine" });
     defaultCtx.task.paused = true;
     defaultCtx.task.pausedByAgentId = "agent-1";
-    defaultCtx.task.pausedReason = "operator pause";
+    defaultCtx.task.pausedReason = "awaiting-approval";
     applyDefaultWorkflowMoveEffects(defaultCtx);
     expect(defaultCtx.task.paused).toBeUndefined();
     expect(defaultCtx.task.pausedByAgentId).toBeUndefined();
     expect(defaultCtx.task.pausedReason).toBeUndefined();
+
+    // The operator-pause shape on the same engine reopen is preserved (KB-013).
+    const operatorCtx = makeCtx({ fromColumn: "in-progress", toColumn: "todo", moveSource: "engine" });
+    operatorCtx.task.paused = true;
+    operatorCtx.task.userPaused = true;
+    applyDefaultWorkflowMoveEffects(operatorCtx);
+    expect(operatorCtx.task.paused).toBe(true);
+    expect(operatorCtx.task.userPaused).toBe(true);
+  });
+});
+
+/*
+KB-013: a non-user move never clears an operator pause; only a user move or an
+explicit unpause does. Engine-owned parks keep their reopen-clears semantics.
+*/
+describe("operator pause survives non-user moves (KB-013)", () => {
+  beforeEach(() => {
+    __resetTraitRegistryForTests();
+    __resetDefaultWorkflowHooksForTests();
+    registerBuiltinTraits();
+    registerDefaultWorkflowHooks();
+  });
+
+  type PauseState = Partial<Pick<Task, "paused" | "userPaused" | "pausedReason" | "pausedByAgentId">>;
+
+  function run(
+    state: PauseState,
+    overrides: Partial<DefaultWorkflowMoveContext>,
+  ): Task {
+    const ctx = makeCtx(overrides);
+    Object.assign(ctx.task, state, { status: "failed", error: "boom" });
+    applyDefaultWorkflowMoveEffects(ctx);
+    return ctx.task;
+  }
+
+  const NON_USER_SOURCES = ["engine", "scheduler"] as const;
+  const REOPENS = [
+    ["in-progress", "todo"],
+    ["in-review", "todo"],
+    ["done", "todo"],
+    ["in-progress", "triage"],
+    ["in-review", "triage"],
+    ["done", "triage"],
+  ] as const;
+
+  for (const source of NON_USER_SOURCES) {
+    for (const [from, to] of REOPENS) {
+      it(`${source} ${from} -> ${to} keeps an operator pause and still clears status/error`, () => {
+        const task = run(
+          { paused: true, userPaused: true },
+          { fromColumn: from, toColumn: to, moveSource: source },
+        );
+        expect(task.paused).toBe(true);
+        expect(task.userPaused).toBe(true);
+        expect(task.pausedReason).toBeUndefined();
+        expect(task.pausedByAgentId).toBeUndefined();
+        expect(task.status).toBeUndefined();
+        expect(task.error).toBeUndefined();
+        // The scheduler's parked predicate stays true.
+        expect(Boolean(task.paused || task.userPaused)).toBe(true);
+      });
+    }
+  }
+
+  it("keeps a userPaused-only (hold-lane drag) park on an engine reopen", () => {
+    const task = run({ userPaused: true }, { fromColumn: "in-review", toColumn: "todo", moveSource: "engine" });
+    expect(task.userPaused).toBe(true);
+    expect(task.paused).toBeUndefined();
+  });
+
+  it("keeps the legacy bare pause (paused, no reason, no agent) on an engine reopen", () => {
+    const task = run({ paused: true }, { fromColumn: "in-progress", toColumn: "triage", moveSource: "engine" });
+    expect(task.paused).toBe(true);
+  });
+
+  it("keeps an operator pause carrying an engine reason, including the reason", () => {
+    const task = run(
+      { paused: true, userPaused: true, pausedReason: "in-review-stall-deadlock" },
+      { fromColumn: "in-review", toColumn: "todo", moveSource: "engine" },
+    );
+    expect(task.paused).toBe(true);
+    expect(task.userPaused).toBe(true);
+    expect(task.pausedReason).toBe("in-review-stall-deadlock");
+  });
+
+  it("still clears an engine-owned park on an engine reopen, and keeps it with preservePause", () => {
+    const cleared = run(
+      { paused: true, pausedReason: "branch-conflict-unrecoverable" },
+      { fromColumn: "in-review", toColumn: "todo", moveSource: "engine" },
+    );
+    expect(cleared.paused).toBeUndefined();
+    expect(cleared.pausedReason).toBeUndefined();
+
+    const kept = run(
+      { paused: true, pausedReason: "branch-conflict-unrecoverable" },
+      { fromColumn: "in-review", toColumn: "todo", moveSource: "engine", options: { preservePause: true } },
+    );
+    expect(kept.paused).toBe(true);
+    expect(kept.pausedReason).toBe("branch-conflict-unrecoverable");
+  });
+
+  it("still clears an agent approval park on an engine reopen", () => {
+    const task = run(
+      { paused: true, pausedByAgentId: "agent-7", pausedReason: "awaiting-approval" },
+      { fromColumn: "in-progress", toColumn: "todo", moveSource: "engine" },
+    );
+    expect(task.paused).toBeUndefined();
+    expect(task.pausedByAgentId).toBeUndefined();
+    expect(task.pausedReason).toBeUndefined();
+  });
+
+  it("never sets a pause on an unpaused engine reopen", () => {
+    const task = run({}, { fromColumn: "in-progress", toColumn: "todo", moveSource: "engine" });
+    expect(task.paused).toBeUndefined();
+    expect(task.userPaused).toBeUndefined();
+  });
+
+  it("a user reopen to hold re-parks; a user reopen to intake clears all four fields", () => {
+    const held = run(
+      { paused: true, userPaused: true, pausedByAgentId: "agent-1", pausedReason: "x" },
+      { fromColumn: "in-progress", toColumn: "todo", moveSource: "user" },
+    );
+    expect(held.userPaused).toBe(true);
+    expect(held.paused).toBeUndefined();
+    expect(held.pausedByAgentId).toBeUndefined();
+    expect(held.pausedReason).toBeUndefined();
+
+    const intake = run(
+      { paused: true, userPaused: true, pausedByAgentId: "agent-1", pausedReason: "x" },
+      { fromColumn: "in-progress", toColumn: "triage", moveSource: "user" },
+    );
+    expect(intake.userPaused).toBeUndefined();
+    expect(intake.paused).toBeUndefined();
+    expect(intake.pausedByAgentId).toBeUndefined();
+    expect(intake.pausedReason).toBeUndefined();
+  });
+
+  it("WIP entry keeps userPaused for non-user sources and clears it for a user move", () => {
+    for (const source of NON_USER_SOURCES) {
+      for (const from of ["todo", "in-review"]) {
+        const task = run({ userPaused: true }, { fromColumn: from, toColumn: "in-progress", moveSource: source });
+        expect(task.userPaused).toBe(true);
+      }
+    }
+    for (const from of ["todo", "in-review"]) {
+      const task = run({ userPaused: true }, { fromColumn: from, toColumn: "in-progress", moveSource: "user" });
+      expect(task.userPaused).toBeUndefined();
+    }
+  });
+
+  it("holdsOperatorPause classifies the pause shapes", () => {
+    expect(holdsOperatorPause({ userPaused: true })).toBe(true);
+    expect(holdsOperatorPause({ paused: true })).toBe(true);
+    expect(holdsOperatorPause({ paused: true, userPaused: true, pausedReason: "r" })).toBe(true);
+    expect(holdsOperatorPause({ paused: true, pausedReason: "r" })).toBe(false);
+    expect(holdsOperatorPause({ paused: true, pausedByAgentId: "a" })).toBe(false);
+    expect(holdsOperatorPause({})).toBe(false);
   });
 });
 
