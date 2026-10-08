@@ -275,6 +275,14 @@ User `moveTask(in-progress → todo)` is a hard cancel: abort active sessions/su
 
 Use `superviseSpawn(...)` from `@fusion/core` for managed child processes; do not use raw detached `spawn`/`nohup` patterns unless explicitly allowlisted. `eslint.config.mjs` + `scripts/check-no-nohup.mjs` enforce this.
 
+#### Never use position-based `git stash`
+
+<!--
+FNXC:WorktreeStashIsolation 2026-10-08-08:29:
+On 2026-10-08 the KB-008 agent and a sibling session pushed and popped stash entries at the same moment in sibling worktrees. Each popped the other's entry: the agent's engine edits vanished, and foreign CLI changes appeared in its tree, one of them as an unresolved conflict.
+-->
+Never use position-based `git stash` (pop, `stash@{N}`) in engine/CLI code or in agent sessions — the stash list is shared across all worktrees and the primary checkout. Use `packages/engine/src/merge/tagged-stash.ts` (unique label → SHA → `stash apply <sha>` → SHA-verified drop) or a temporary WIP commit. `packages/engine/src/__tests__/no-bare-git-stash.test.ts` enforces this for `packages/engine/src` and `packages/cli/src`.
+
 ### Git Conventions
 
 - Commit prefixes: `feat(FN-XXX):`, `fix(FN-XXX):`, `test(FN-XXX):`

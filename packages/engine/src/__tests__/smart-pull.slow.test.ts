@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
 import { smartPull, type SmartPullAuditEvent } from "../merge/smart-pull.js";
+import { armSiblingStashRace, stashEntries } from "./_sibling-stash-race.js";
 
 function git(cwd: string, cmd: string): string {
   return execSync(cmd, { cwd, stdio: "pipe" }).toString("utf-8").trim();
@@ -115,6 +116,35 @@ describe("smartPull", () => {
     expect(types).toContain("stash:push");
     expect(types).toContain("pull:fast-forward");
     expect(types.some((t) => t === "stash:pop" || t === "stash:pop-conflict")).toBe(true);
+  });
+
+  /*
+  FNXC:WorktreeStashIsolation 2026-10-08-08:29:
+  KB-008 regression: a sibling worktree pushes a stash during `git pull --ff-only` (post-merge hook). The former `rev-parse stash@{0}` + bare pop restored the sibling's entry here and stranded ours.
+  */
+  it("stash-and-ff restores only its own edits when a sibling pushes a stash during the pull", async () => {
+    advanceUpstream(fx, "v2\n", "advance");
+    const race = armSiblingStashRace(fx.cloneA, fx.root);
+    writeFileSync(join(fx.cloneA, "mydraft.txt"), "local draft\n");
+
+    const result = await smartPull({
+      worktreePath: fx.cloneA,
+      integrationBranch: "main",
+      mode: "stash-and-ff",
+      taskId: "FN-TEST-RACE",
+    });
+
+    expect(race.fired()).toBe(true);
+    const foreignSha = race.foreignSha();
+    expect(foreignSha).toBeTruthy();
+    expect(result.kind).toBe("stash-pull-pop");
+    if (result.kind === "stash-pull-pop") {
+      expect(result.stashLabel.startsWith("fusion-auto-stash-FN-TEST-RACE:")).toBe(true);
+      expect(result.stashSha).not.toBe(foreignSha);
+    }
+    expect(readFileSync(join(fx.cloneA, "mydraft.txt"), "utf-8")).toBe("local draft\n");
+    expect(existsSync(join(fx.cloneA, "foreign.txt"))).toBe(false);
+    expect(stashEntries(fx.cloneA).map((e) => e.sha)).toEqual([foreignSha]);
   });
 
   it("ff-only: skips dirty worktree and reports reason without modifying HEAD", async () => {

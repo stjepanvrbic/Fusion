@@ -40,6 +40,7 @@ import { WorkflowGraphTaskRunner } from "../workflows/workflow-graph-task-runner
 import { getBuiltinWorkflow } from "@fusion/core";
 import { resolveAiMergeRootPath, resolveLegacyAiMergeRootPath } from "../worktree/worktree-paths.js";
 import { withBranchWriteProvenance } from "./branch-write-provenance-store-stub.js";
+import { armSiblingStashRace, stashEntries } from "./_sibling-stash-race.js";
 
 const RM = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as const;
 const tracked = new Set<string>();
@@ -1914,6 +1915,34 @@ describe("landSquash (advance + local-checkout sync)", () => {
     expect(readFileSync(join(dir, "mydraft.txt"), "utf-8")).toContain("local draft");
   });
 
+  /*
+  FNXC:WorktreeStashIsolation 2026-10-08-08:29:
+  KB-008 regression: a sibling worktree pushes a stash between Fusion's push and its restore. A position-based pop restores the foreign entry here and strands ours; the SHA-addressed restore must not.
+  */
+  it("restores only its own edits when a sibling worktree pushes a stash mid-sync", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+    const scratch = mkdtempSync(join(tmpdir(), "fusion-ai-merge-sibling-"));
+    tracked.add(scratch);
+    const { tipSha, squashSha } = makeDescendantSquash(dir, () => writeFileSync(join(dir, "landed.txt"), "landed\n"));
+    const race = armSiblingStashRace(dir, scratch);
+    writeFileSync(join(dir, "mydraft.txt"), "local draft\n");
+
+    const res = await landSquash({ projectRootDir: dir, mergeRoot: dir, integrationBranch: "main", tipSha, squashSha, taskId: "FN-1", audit: auditStub(), allowDirtyLocalCheckoutSync: true });
+
+    expect(race.fired()).toBe(true);
+    const foreignSha = race.foreignSha();
+    expect(foreignSha).toBeTruthy();
+    expect(res).toEqual({ outcome: "advanced", localSync: "stash-ff-restore" });
+    expect(readFileSync(join(dir, "mydraft.txt"), "utf-8")).toBe("local draft\n");
+    expect(existsSync(join(dir, "foreign.txt"))).toBe(false);
+    const entries = stashEntries(dir);
+    expect(entries.map((e) => e.sha)).toEqual([foreignSha]);
+    expect(entries.some((e) => e.subject.includes("fusion-merger-autostash:FN-1:ai-local-sync:"))).toBe(false);
+    // The sibling's work is still recoverable by SHA.
+    git(race.sibling, `stash apply ${foreignSha}`);
+    expect(readFileSync(join(race.sibling, "foreign.txt"), "utf-8")).toBe("foreign session work\n");
+  });
+
   it("invokes the AI resolver when restoring the stash conflicts, then lands resolved when explicitly allowed", async () => {
     const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
     const { tipSha, squashSha } = makeDescendantSquash(dir, () => writeFileSync(join(dir, "base.txt"), "base\nlanded-upstream\n"));
@@ -1928,5 +1957,7 @@ describe("landSquash (advance + local-checkout sync)", () => {
     expect(resolver).toHaveBeenCalled();
     expect(res.localSync).toBe("stash-ff-airesolved");
     expect(git(dir, "rev-parse main")).toBe(squashSha);
+    // The original pre-merge edits are retained as a backup entry.
+    expect(stashEntries(dir).some((e) => e.subject.includes("fusion-merger-autostash:FN-1:ai-local-sync:"))).toBe(true);
   });
 });

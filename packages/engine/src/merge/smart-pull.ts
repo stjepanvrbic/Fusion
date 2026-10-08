@@ -1,5 +1,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import {
+  applyStashBySha,
+  dropStashBySha,
+  makeUniqueStashLabel,
+  pushTaggedStash,
+  TaggedStashUnresolvedError,
+} from "./tagged-stash.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -52,19 +59,6 @@ function commandError(err: unknown): string {
 
 function isConflictMessage(message: string): boolean {
   return message.includes("CONFLICT") || message.includes("Merge conflict") || message.includes("could not apply");
-}
-
-async function findStashRefBySha(sha: string, cwd: string): Promise<string | null> {
-  try {
-    const output = await runGit(["stash", "list", "--format=%H|%gd"], cwd, 5_000);
-    for (const line of output.split("\n")) {
-      const [entrySha, ref] = line.trim().split("|");
-      if (entrySha === sha && ref) return ref;
-    }
-  } catch {
-    // best-effort
-  }
-  return null;
 }
 
 async function listConflictedFiles(cwd: string): Promise<string[]> {
@@ -132,15 +126,25 @@ export async function smartPull(input: SmartPullInput): Promise<SmartPullResult>
   }
 
   // stash-and-ff path
-  const stashLabel = `fusion-auto-stash-${taskId ?? Date.now()}`;
-  let stashOutput: string;
+  /*
+  FNXC:WorktreeStashIsolation 2026-10-08-08:29:
+  The stash list is shared by every worktree of the repository. A `rev-parse stash@{0}` + bare `stash pop`
+  round-trip restored a sibling session's entry whenever it pushed during our pull (KB-008). The entry is now
+  pushed under a unique `fusion-auto-stash-` label, resolved to its SHA by that label, restored with
+  `stash apply <sha>`, and dropped by SHA only after a clean restore; a failed restore keeps the entry.
+  */
+  const stashLabel = makeUniqueStashLabel(`fusion-auto-stash-${taskId ?? "manual"}`);
+  let handle: { sha: string; label: string } | null;
   try {
-    stashOutput = await runGit(["stash", "push", "--include-untracked", "-m", stashLabel], worktreePath, 15_000);
+    handle = await pushTaggedStash(worktreePath, stashLabel, { includeUntracked: true, timeoutMs: 15_000 });
   } catch (err: unknown) {
+    if (err instanceof TaggedStashUnresolvedError) {
+      return { kind: "failed", fromSha, stage: "stash", error: err.message, stashLabel };
+    }
     return { kind: "failed", fromSha, stage: "stash", error: commandError(err) };
   }
 
-  if (stashOutput.includes("No local changes to save")) {
+  if (!handle) {
     // race: tree went clean between hasLocalChanges and stash push
     await runGit(["pull", "--ff-only"], worktreePath, 30_000);
     const toSha = await headSha(worktreePath);
@@ -151,11 +155,18 @@ export async function smartPull(input: SmartPullInput): Promise<SmartPullResult>
     return { kind: "clean-pull", fromSha, toSha };
   }
 
-  const stashSha = (await runGit(["rev-parse", "stash@{0}"], worktreePath, 5_000)).trim();
+  const stashSha = handle.sha;
   await emitSafe({
     mutationType: "stash:push",
     metadata: { taskId, worktreePath, stashSha, stashLabel, untrackedIncluded: true },
   });
+
+  /** Apply our entry by SHA; drop it only after a clean restore. */
+  const restore = async () => {
+    const applied = await applyStashBySha(worktreePath, stashSha, { timeoutMs: 20_000 });
+    if (applied.ok) await dropStashBySha(worktreePath, stashSha);
+    return applied;
+  };
 
   try {
     await runGit(["pull", "--ff-only"], worktreePath, 30_000);
@@ -165,12 +176,9 @@ export async function smartPull(input: SmartPullInput): Promise<SmartPullResult>
       mutationType: "pull:fast-forward",
       metadata: { taskId, worktreePath, integrationBranch, fromSha, toSha: fromSha, succeeded: false, error: pullMessage },
     });
-    try {
-      await runGit(["stash", "pop"], worktreePath, 20_000);
-    } catch (popErr: unknown) {
-      const popMessage = commandError(popErr);
-      const stashRef = await findStashRefBySha(stashSha, worktreePath);
-      if (isConflictMessage(popMessage) || stashRef) {
+    const restored = await restore();
+    if (!restored.ok) {
+      if (restored.conflicted || isConflictMessage(restored.error)) {
         const conflictedFiles = await listConflictedFiles(worktreePath);
         await emitSafe({
           mutationType: "stash:pop-conflict",
@@ -179,7 +187,7 @@ export async function smartPull(input: SmartPullInput): Promise<SmartPullResult>
         const toSha = await headSha(worktreePath);
         return { kind: "stash-pop-conflict", fromSha, toSha, stashSha, stashLabel, conflictedFiles };
       }
-      return { kind: "failed", fromSha, stage: "pop", error: popMessage, stashSha, stashLabel };
+      return { kind: "failed", fromSha, stage: "pop", error: restored.error, stashSha, stashLabel };
     }
     return { kind: "failed", fromSha, stage: "pull", error: pullMessage, stashSha, stashLabel };
   }
@@ -190,24 +198,19 @@ export async function smartPull(input: SmartPullInput): Promise<SmartPullResult>
     metadata: { taskId, worktreePath, integrationBranch, fromSha, toSha, succeeded: true },
   });
 
-  try {
-    await runGit(["stash", "pop"], worktreePath, 20_000);
+  const restored = await restore();
+  if (restored.ok) {
     await emitSafe({
       mutationType: "stash:pop",
       metadata: { taskId, worktreePath, stashSha, stashLabel },
     });
     return { kind: "stash-pull-pop", fromSha, toSha, stashSha, stashLabel };
-  } catch (popErr: unknown) {
-    const popMessage = commandError(popErr);
-    const stashRef = await findStashRefBySha(stashSha, worktreePath);
-    if (!isConflictMessage(popMessage) && !stashRef) {
-      throw popErr;
-    }
-    const conflictedFiles = await listConflictedFiles(worktreePath);
-    await emitSafe({
-      mutationType: "stash:pop-conflict",
-      metadata: { taskId, worktreePath, stashSha, stashLabel, conflictedFiles, advice: "Resolve conflicts, then drop stash when complete." },
-    });
-    return { kind: "stash-pop-conflict", fromSha, toSha, stashSha, stashLabel, conflictedFiles };
   }
+  // Apply failed or conflicted: the entry is retained (apply never drops).
+  const conflictedFiles = await listConflictedFiles(worktreePath);
+  await emitSafe({
+    mutationType: "stash:pop-conflict",
+    metadata: { taskId, worktreePath, stashSha, stashLabel, conflictedFiles, advice: "Resolve conflicts, then drop stash when complete." },
+  });
+  return { kind: "stash-pop-conflict", fromSha, toSha, stashSha, stashLabel, conflictedFiles };
 }

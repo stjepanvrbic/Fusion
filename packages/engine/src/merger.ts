@@ -3,6 +3,7 @@ import { execSync, exec } from "node:child_process";
 import { bindPosixShell, withPosixShell } from "@fusion/core";
 import * as childProcess from "node:child_process";
 import { promisify } from "node:util";
+import { dropStashBySha } from "./merge/tagged-stash.js";
 import { IDENTITY_GUARD_BYPASS_ENV } from "./worktree/worktree-hooks.js";
 import { mergeEffectiveSettings } from "./project/effective-settings.js";
 import { buildUserCommentsPromptSection, selectUserCommentsForAgentContext } from "./agents/agent-user-comments.js";
@@ -2291,82 +2292,28 @@ export class AutostashCreationFailedError extends Error {
   }
 }
 
-/** Resolve the autostash SHA back to its current `stash@{N}` ref so we can
- *  drop it. Stash positions shift when other stashes are pushed, so we
- *  can't cache the original ref. Returns null if the stash is no longer
- *  in the reflog (already dropped). */
-async function findStashRefBySha(rootDir: string, sha: string): Promise<string | null> {
-  try {
-    const { stdout } = await execAsync(
-      `git stash list --format="%H %gd"`,
-      { cwd: rootDir, encoding: "utf-8" },
-    );
-    for (const line of String(stdout).split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const [entrySha, ref] = trimmed.split(/\s+/);
-      if (entrySha === sha && ref) return ref;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/** Drop an autostash by SHA, defending against the TOCTOU race where another
- *  process pushes a stash between our `findStashRefBySha` and the actual
- *  `git stash drop stash@{N}` (drop only takes positional refs, so the index
- *  is what git uses — not our SHA). Without this guard we silently drop
- *  someone else's stash while leaving ours behind, and the task log lies
- *  about a clean restore.
+/** Drop an autostash by SHA. Delegates to the shared SHA-addressed helper in
+ *  `merge/tagged-stash.ts`, which re-verifies that the positional ref still
+ *  points at our SHA before the drop (drop only takes positional refs) and
+ *  then checks git's drop report, re-storing any foreign entry that a
+ *  concurrent push shifted under the ref. Returns whether the drop landed
+ *  cleanly so callers can surface failure to the task feed.
  *
- *  Strategy: re-resolve ref → SHA, verify the ref still points at our SHA
- *  with `git rev-parse`, then drop. If the SHA at the ref drifted (race),
- *  retry up to 5x. Returns whether the drop landed cleanly so callers can
- *  surface failure to the task feed. */
+ *  FNXC:WorktreeStashIsolation 2026-10-08-08:29:
+ *  The stash list is shared by every worktree of the repository (KB-008 incident), so the former private
+ *  rev-parse-then-drop loop still had a window in which a sibling push made it drop a foreign entry.
+ *  Post-drop verification closes it; the exported signature, return shape and log messages are unchanged. */
 export async function dropAutostashBySha(
   rootDir: string,
   taskId: string,
   sha: string,
 ): Promise<{ dropped: boolean; reason?: string }> {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const ref = await findStashRefBySha(rootDir, sha);
-    if (!ref) {
-      mergerLog.debug(`${taskId}: autostash ${sha.slice(0, 7)} no longer in stash list (already dropped)`);
-      return { dropped: true };
-    }
-
-    // Defend against the index-shift race: confirm the ref still resolves to
-    // our SHA before dropping. If another process pushed a stash, ref now
-    // points at theirs — back off and re-resolve.
-    let refSha = "";
-    try {
-      const { stdout } = await execAsync(`git rev-parse ${ref}`, { cwd: rootDir, encoding: "utf-8" });
-      refSha = String(stdout).trim();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      mergerLog.warn(`${taskId}: rev-parse ${ref} failed (${msg}) on drop attempt ${attempt + 1} — retrying`);
-      continue;
-    }
-    if (refSha !== sha) {
-      mergerLog.debug(`${taskId}: autostash ${sha.slice(0, 7)} shifted off ${ref} (now ${refSha.slice(0, 7)}); re-resolving`);
-      continue;
-    }
-
-    try {
-      await execAsync(`git stash drop ${ref}`, { cwd: rootDir });
-      return { dropped: true };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // Final attempt: surface the failure. Earlier attempts get retried.
-      if (attempt === 4) {
-        mergerLog.warn(`${taskId}: failed to drop autostash ${ref} after ${attempt + 1} attempts (${msg}) — stash will linger in stash list`);
-        return { dropped: false, reason: msg };
-      }
-      mergerLog.warn(`${taskId}: drop ${ref} attempt ${attempt + 1} failed (${msg}) — retrying`);
-    }
-  }
-  return { dropped: false, reason: "exhausted retry attempts" };
+  return dropStashBySha(rootDir, sha, {
+    log: {
+      debug: (message) => mergerLog.debug(`${taskId}: ${message}`),
+      warn: (message) => mergerLog.warn(`${taskId}: ${message}`),
+    },
+  });
 }
 
 /** True when the stash still holds work not present on HEAD. An unprovable
@@ -2525,7 +2472,7 @@ Before the merge ran, the developer had uncommitted local changes in their worki
 
 ## Your job
 Edit the conflicted files in place to remove every conflict marker (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`) and produce a coherent merged result that:
-- Preserves the developer's intended uncommitted changes (the "Updated upstream" / branch-side, depending on which side the stash pop wrote)
+- Preserves the developer's intended uncommitted changes (the "Updated upstream" / branch-side, depending on which side the stash apply wrote)
 - Layers them onto the merged HEAD content (the other side)
 
 ## Rules

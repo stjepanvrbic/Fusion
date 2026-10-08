@@ -1109,11 +1109,14 @@ describe("aiMergeTask autostash cleanup", () => {
       if (cmdStr.includes("git status -z --porcelain")) return " M file.txt\0" as any;
       if (cmdStr.includes("git stash create")) return stashSha as any;
       if (cmdStr.includes("git stash store")) return "" as any;
-      if (cmdStr.includes('git stash list --format="%H %gd"')) return dropped ? "" : `${stashSha} stash@{0}`;
+      // SHA-addressed drop (merge/tagged-stash.ts) lists via execFile with a tab-separated format.
+      if (cmdStr.includes("git stash list --format=%H%x09%gd%x09%gs")) {
+        return dropped ? "" : `${stashSha}\tstash@{0}\tfusion-merger-autostash:FN-050:1`;
+      }
       if (cmdStr.includes("git rev-parse stash@{0}")) return stashSha as any;
       if (cmdStr.includes("git stash drop stash@{0}")) {
         dropped = true;
-        return "" as any;
+        return `Dropped stash@{0} (${stashSha})` as any;
       }
       if (cmdStr.includes("git stash apply")) return "" as any;
       if (cmdStr.includes("rev-parse --verify")) return Buffer.from("abc123");

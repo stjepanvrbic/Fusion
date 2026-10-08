@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 
 import type {
   ExperimentRunRecordPayload,
@@ -6,7 +10,7 @@ import type {
   ExperimentSessionRecord,
 } from "@fusion/core";
 
-import type { GitOps } from "../experiment/git-ops.js";
+import { defaultGitOps, type GitOps } from "../experiment/git-ops.js";
 import {
   commitKept,
   ExperimentRevertConflictError,
@@ -50,8 +54,8 @@ function createGitMock(): GitOps {
     add: vi.fn(),
     commit: vi.fn(),
     resetHard: vi.fn(),
-    stashPush: vi.fn(),
-    stashPop: vi.fn(),
+    stashSave: vi.fn(),
+    stashRestore: vi.fn(),
     statusPorcelain: vi.fn(),
     mergeBase: vi.fn(),
     branchExists: vi.fn(),
@@ -92,17 +96,18 @@ describe("git policy", () => {
       baselineCommit: "base-sha",
     });
 
-    expect(git.stashPush).not.toHaveBeenCalled();
+    expect(git.stashSave).not.toHaveBeenCalled();
     expect(git.resetHard).toHaveBeenCalledWith("base-sha");
     expect(result).toEqual({ revertedTo: "base-sha", preservedPaths: [] });
   });
 
-  it("revertDiscarded with preserved path stashes then pops", async () => {
+  it("revertDiscarded with preserved path saves then restores by SHA handle", async () => {
     const git = createGitMock();
     vi.mocked(git.statusPorcelain).mockResolvedValue(
       " M autoresearch.jsonl\n M src/file.ts",
     );
-    vi.mocked(git.stashPush).mockResolvedValue("stash@{0}");
+    const handle = { sha: "a".repeat(40), label: "experiment-preserve-EXP-001:1-abcd" };
+    vi.mocked(git.stashSave).mockResolvedValue(handle);
 
     await revertDiscarded({
       session: baseSession,
@@ -111,16 +116,17 @@ describe("git policy", () => {
     });
 
     expect(git.add).toHaveBeenCalledWith(["autoresearch.jsonl"]);
-    expect(git.stashPush).toHaveBeenCalledOnce();
+    expect(git.stashSave).toHaveBeenCalledOnce();
+    expect(vi.mocked(git.stashSave).mock.calls[0]![0]).toMatch(/^experiment-preserve-EXP-001:/);
     expect(git.resetHard).toHaveBeenCalledWith("base-sha");
-    expect(git.stashPop).toHaveBeenCalledWith("stash@{0}");
+    expect(git.stashRestore).toHaveBeenCalledWith(handle);
   });
 
-  it("rethrow stash pop conflicts as ExperimentRevertConflictError", async () => {
+  it("rethrow stash restore conflicts as ExperimentRevertConflictError", async () => {
     const git = createGitMock();
     vi.mocked(git.statusPorcelain).mockResolvedValue(" M autoresearch.md");
-    vi.mocked(git.stashPush).mockResolvedValue("stash@{1}");
-    vi.mocked(git.stashPop).mockRejectedValue(new Error("conflict"));
+    vi.mocked(git.stashSave).mockResolvedValue({ sha: "b".repeat(40), label: "experiment-preserve-EXP-001:2-ef01" });
+    vi.mocked(git.stashRestore).mockRejectedValue(new Error("conflict"));
 
     await expect(
       revertDiscarded({
@@ -143,5 +149,56 @@ describe("git policy", () => {
 
     expect(git.add).not.toHaveBeenCalled();
     expect(result.preservedPaths).toEqual([]);
+  });
+});
+
+/*
+FNXC:WorktreeStashIsolation 2026-10-08-08:29:
+KB-008 regression for the experiment revert: a sibling worktree of the same repository pushes a stash between revertDiscarded's save and restore.
+The former positional `stash@{N}` pop restored the sibling's entry here.
+*/
+describe("revertDiscarded with defaultGitOps (real git, shared stash list)", () => {
+  function git(cwd: string, args: string[]): string {
+    return execFileSync("git", args, { cwd, stdio: "pipe" }).toString("utf-8").trim();
+  }
+
+  it("restores only its own preserved artifacts when a sibling pushes a stash mid-revert", async () => {
+    const root = mkdtempSync(join(process.env.FUSION_TEST_WORKER_ROOT ?? tmpdir(), "experiment-stash-"));
+    try {
+      const primary = join(root, "primary");
+      const sibling = join(root, "sibling");
+      execFileSync("git", ["init", "-b", "main", primary], { stdio: "pipe" });
+      git(primary, ["config", "user.email", "test@example.com"]);
+      git(primary, ["config", "user.name", "Test"]);
+      writeFileSync(join(primary, "autoresearch.md"), "notes v1\n");
+      writeFileSync(join(primary, "src.txt"), "code v1\n");
+      git(primary, ["add", "-A"]);
+      git(primary, ["commit", "-m", "base"]);
+      const baseline = git(primary, ["rev-parse", "HEAD"]);
+      git(primary, ["worktree", "add", "-b", "sib", sibling]);
+      writeFileSync(join(primary, "autoresearch.md"), "notes v2\n");
+
+      const real = defaultGitOps(primary);
+      let foreignSha = "";
+      const ops: GitOps = {
+        ...real,
+        async resetHard(ref: string) {
+          await real.resetHard(ref);
+          // Interleave: the sibling stashes after our save, before our restore.
+          writeFileSync(join(sibling, "foreign.txt"), "foreign work\n");
+          git(sibling, ["stash", "push", "--include-untracked", "-m", "foreign-session"]);
+          foreignSha = git(sibling, ["rev-parse", "refs/stash"]);
+        },
+      };
+
+      const result = await revertDiscarded({ session: baseSession, git: ops, baselineCommit: baseline });
+
+      expect(result.preservedPaths).toEqual(["autoresearch.md"]);
+      expect(readFileSync(join(primary, "autoresearch.md"), "utf-8")).toBe("notes v2\n");
+      expect(existsSync(join(primary, "foreign.txt"))).toBe(false);
+      expect(git(primary, ["stash", "list", "--format=%H"]).split("\n").filter(Boolean)).toEqual([foreignSha]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

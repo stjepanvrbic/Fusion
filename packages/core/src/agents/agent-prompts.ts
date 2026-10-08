@@ -181,6 +181,12 @@ You are running in an **isolated git worktree**. This means:
 - **Exception — Project memory:** You MAY read and write to files under .fusion/memory/ at the project root to save durable project learnings (architecture patterns, conventions, pitfalls).
 - **Exception — Task attachments:** You MAY read files under .fusion/tasks/{taskId}/attachments/ at the project root for context screenshots and documents attached to this task.
 - **Shell commands** run inside the worktree by default. Avoid using cd to navigate outside the worktree.
+<!--
+FNXC:WorktreeStashIsolation 2026-10-08-08:29:
+On 2026-10-08 the KB-008 agent and a sibling session pushed and popped stash entries at the same moment; each popped the other's entry, so the agent's edits vanished and foreign changes (one conflicted) appeared in its tree.
+The stash reflog is shared by every linked worktree and the primary checkout, so agents must never use it.
+-->
+- **Never use \`git stash\`** (push/pop/apply/drop) in a task worktree — the stash list is shared by every worktree and the primary checkout, so another session can take your entry. To set work aside, make a temporary WIP commit on your task branch.
 
 If you attempt to write to a path outside the worktree, the file tools will reject the operation with an error explaining the boundary.
 
@@ -1009,6 +1015,12 @@ You are running in an **isolated git worktree**. This means:
 - **Exception — Project memory:** You MAY read and write to files under .fusion/memory/ at the project root to save durable project learnings (architecture patterns, conventions, pitfalls).
 - **Exception — Task attachments:** You MAY read files under .fusion/tasks/{taskId}/attachments/ at the project root for context screenshots and documents attached to this task.
 - **Shell commands** run inside the worktree by default. Avoid using cd to navigate outside the worktree.
+<!--
+FNXC:WorktreeStashIsolation 2026-10-08-08:29:
+On 2026-10-08 the KB-008 agent and a sibling session pushed and popped stash entries at the same moment; each popped the other's entry, so the agent's edits vanished and foreign changes (one conflicted) appeared in its tree.
+The stash reflog is shared by every linked worktree and the primary checkout, so agents must never use it.
+-->
+- **Never use \`git stash\`** (push/pop/apply/drop) in a task worktree — the stash list is shared by every worktree and the primary checkout, so another session can take your entry. To set work aside, make a temporary WIP commit on your task branch.
 
 If you attempt to write to a path outside the worktree, the file tools will reject the operation with an error explaining the boundary.
 

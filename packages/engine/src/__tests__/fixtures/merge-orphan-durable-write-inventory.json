@@ -206,6 +206,7 @@
     "packages/engine/src/merge/recover-confirmed-merge-push.ts",
     "packages/engine/src/merge/stale-content-park.ts",
     "packages/engine/src/merge/stale-content-review-reroute.ts",
+    "packages/engine/src/merge/tagged-stash.ts",
     "packages/engine/src/merge/workspace-fence-ref.ts",
     "packages/engine/src/merge/workspace-integration-target.ts",
     "packages/engine/src/merge/workspace-land-failure.ts",

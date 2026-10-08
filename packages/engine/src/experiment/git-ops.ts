@@ -2,6 +2,12 @@ import { commitIdentityArgs, resolveCommitIdentity } from "../git-identity.js";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import {
+  applyStashBySha,
+  dropStashBySha,
+  pushTaggedStash,
+  type TaggedStashHandle,
+} from "../merge/tagged-stash.js";
+import {
   ExperimentFinalizeBranchExistsError,
   ExperimentFinalizeCherryPickConflictError,
   ExperimentFinalizeMergeBaseError,
@@ -11,13 +17,21 @@ const execAsync = promisify(exec);
 const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 10 * 1024 * 1024;
 
+export type StashHandle = TaggedStashHandle;
+
 export interface GitOps {
   head(): Promise<string>;
   add(paths: string[]): Promise<void>;
   commit(message: string): Promise<string>;
   resetHard(ref: string): Promise<void>;
-  stashPush(message: string): Promise<string | null>;
-  stashPop(ref: string): Promise<void>;
+  /**
+   * Set aside the working-tree changes under a unique label; null when there is nothing to save.
+   * FNXC:WorktreeStashIsolation 2026-10-08-08:29: the stash list is shared by every worktree of the
+   * repository (KB-008), so entries are addressed by SHA, never by `stash@{N}` position.
+   */
+  stashSave(label: string): Promise<StashHandle | null>;
+  /** Re-apply a saved entry by SHA, then drop it by SHA. Throws (and keeps the entry) when the apply fails. */
+  stashRestore(handle: StashHandle): Promise<void>;
   statusPorcelain(): Promise<string>;
   mergeBase(refA: string, refB: string): Promise<string>;
   branchExists(name: string): Promise<boolean>;
@@ -28,7 +42,7 @@ export interface GitOps {
   deleteBranch(name: string, opts?: { force?: boolean }): Promise<void>;
 }
 
-async function runGit(cwd: string, args: string[]): Promise<string> {
+async function runGit(cwd: string, args: string[], opts: { keepLeadingWhitespace?: boolean } = {}): Promise<string> {
   const command = `git ${args.join(" ")}`;
   try {
     const { stdout } = await execAsync(command, {
@@ -36,7 +50,7 @@ async function runGit(cwd: string, args: string[]): Promise<string> {
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: GIT_MAX_BUFFER,
     });
-    return stdout.trim();
+    return opts.keepLeadingWhitespace ? stdout.trimEnd() : stdout.trim();
   } catch (error) {
     const err = error as Error & { stderr?: string; stdout?: string };
     const stderr = err.stderr?.trim();
@@ -63,19 +77,20 @@ export function defaultGitOps(cwd: string): GitOps {
     async resetHard(ref: string) {
       await runGit(cwd, ["reset", "--hard", ref]);
     },
-    async stashPush(message: string) {
-      const output = await runGit(cwd, ["stash", "push", "-m", JSON.stringify(message)]);
-      if (output.includes("No local changes to save")) {
-        return null;
-      }
-      const match = output.match(/(stash@\{\d+\})/);
-      return match?.[1] ?? "stash@{0}";
+    async stashSave(label: string) {
+      return await pushTaggedStash(cwd, label, { timeoutMs: GIT_TIMEOUT_MS });
     },
-    async stashPop(ref: string) {
-      await runGit(cwd, ["stash", "pop", ref]);
+    async stashRestore(handle: StashHandle) {
+      const applied = await applyStashBySha(cwd, handle.sha, { timeoutMs: GIT_TIMEOUT_MS });
+      if (!applied.ok) {
+        throw new Error(`Git stash apply failed for ${handle.sha} (${handle.label}); entry kept: ${applied.error}`);
+      }
+      await dropStashBySha(cwd, handle.sha);
     },
     async statusPorcelain() {
-      return await runGit(cwd, ["status", "--porcelain"]);
+      // FNXC:ExperimentRevert 2026-10-08-08:29: porcelain lines start with a status column that may be a
+      // space (" M path"); trimming the leading whitespace corrupted the first line and revertDiscarded missed it.
+      return await runGit(cwd, ["status", "--porcelain"], { keepLeadingWhitespace: true });
     },
     async mergeBase(refA: string, refB: string) {
       try {

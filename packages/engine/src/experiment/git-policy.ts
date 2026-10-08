@@ -4,7 +4,8 @@ import type {
   ExperimentSessionRecord,
 } from "@fusion/core";
 
-import type { GitOps } from "./git-ops.js";
+import { makeUniqueStashLabel } from "../merge/tagged-stash.js";
+import type { GitOps, StashHandle } from "./git-ops.js";
 
 export const AUTORESEARCH_PRESERVED_PATHS = [
   "autoresearch.jsonl",
@@ -60,17 +61,19 @@ export async function revertDiscarded(opts: {
     .filter(Boolean)
     .filter((pathname) => isPreservedAutoresearchPath(pathname));
 
-  let stashRef: string | null = null;
+  // FNXC:WorktreeStashIsolation 2026-10-08-08:29: unique label + SHA handle — the stash list is shared
+  // across worktrees, so a positional `stash@{N}` could restore another session's entry (KB-008).
+  let stash: StashHandle | null = null;
   if (preservedPaths.length > 0) {
     await opts.git.add(preservedPaths);
-    stashRef = await opts.git.stashPush(`experiment-preserve-${opts.session.id}`);
+    stash = await opts.git.stashSave(makeUniqueStashLabel(`experiment-preserve-${opts.session.id}`));
   }
 
   await opts.git.resetHard(opts.baselineCommit);
 
-  if (stashRef) {
+  if (stash) {
     try {
-      await opts.git.stashPop(stashRef);
+      await opts.git.stashRestore(stash);
     } catch (error) {
       throw new ExperimentRevertConflictError(
         `Failed to restore preserved autoresearch artifacts for ${opts.session.id}`,

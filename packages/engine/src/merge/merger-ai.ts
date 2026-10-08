@@ -108,6 +108,13 @@ import { emitBoundedRunAudit, type RunAuditSinkHost } from "../util/emit-bounded
 import { deriveExecutorSignalMemory, evaluateNoOpFinalizeExecutorVeto } from "../overseer/overseer-noop-finalize-veto.js";
 import { createLogger } from "../logger.js";
 import {
+  applyStashBySha,
+  dropStashBySha,
+  pushTaggedStash,
+  TaggedStashUnresolvedError,
+  type TaggedStashHandle,
+} from "./tagged-stash.js";
+import {
   buildAutostashLabel,
   captureSingleCommitLandedMetadata,
   isNonFastForwardPushError,
@@ -881,14 +888,32 @@ export async function landSquash(input: {
   Retention is still deliberate — only a stash whose content is provably already
   on HEAD is ever dropped.
   */
-  const stashed = dirty
-    ? await gitOk(
-        ["stash", "push", "--include-untracked", "-m", buildAutostashLabel(taskId, "ai-local-sync", Date.now())],
-        projectRootDir,
-      )
-    : false;
+  /*
+  FNXC:WorktreeStashIsolation 2026-10-08-08:29:
+  The stash list is shared by every worktree of this repository and by operator sessions. The former bare
+  `stash pop` took whatever entry was newest, so a sibling worktree pushing during our fast-forward (KB-008)
+  made us restore its edits here and strand ours. The entry is now resolved to its SHA by its unique label,
+  restored with `stash apply <sha>`, and dropped only after a clean restore via a SHA-verified drop.
+  */
+  let stash: TaggedStashHandle | null = null;
+  let stashUnaddressable = false;
+  let stashUnstashable = false;
+  if (dirty) {
+    const stashLabel = buildAutostashLabel(taskId, "ai-local-sync", Date.now());
+    try {
+      stash = await pushTaggedStash(projectRootDir, stashLabel, { includeUntracked: true });
+    } catch (err: unknown) {
+      if (err instanceof TaggedStashUnresolvedError) {
+        // The entry exists but cannot be addressed safely: restore nothing.
+        stashUnaddressable = true;
+        aiMergeLog.warn(`${taskId}: stashed your local changes as "${stashLabel}" but could not resolve that entry to a single SHA; Fusion will not restore it automatically. Find it with \`git stash list\` and re-apply with \`git stash apply <sha>\`.`);
+      } else {
+        stashUnstashable = true;
+      }
+    }
+  }
 
-  if (dirty && !stashed) {
+  if (stashUnstashable) {
     // The dirty state couldn't be stashed (e.g. untracked/tracked collision or a
     // stash hook failure). Don't risk `merge --ff-only` aborting/clobbering:
     // advance the ref atomically and leave the user's working tree as-is.
@@ -910,22 +935,47 @@ export async function landSquash(input: {
     return { outcome: "advanced", localSync: "skipped-dirty-unstashable" };
   }
 
+  /** Re-apply the user's entry by SHA; drop it only after a clean restore. */
+  const restoreOwnStash = async (handle: TaggedStashHandle) => {
+    const applied = await applyStashBySha(projectRootDir, handle.sha);
+    if (applied.ok) {
+      const drop = await dropStashBySha(projectRootDir, handle.sha, {
+        log: { debug: (m) => aiMergeLog.log(`${taskId}: ${m}`), warn: (m) => aiMergeLog.warn(`${taskId}: ${m}`) },
+      });
+      if (!drop.dropped) {
+        aiMergeLog.warn(`${taskId}: restored your local changes but could not drop stash ${handle.sha.slice(0, 7)} (${drop.reason ?? "unknown"}); it is a redundant backup and will be reclaimed.`);
+      }
+    }
+    return applied;
+  };
+
   // Fast-forward the checkout (and the branch ref) to the squash.
   assertMergeGenerationOwned(signal, taskId);
   await assertMergeGateStillOpen?.();
   await advanceSharedWorkspaceRef();
   if (!(await gitOk(["merge", "--ff-only", squashSha], projectRootDir))) {
-    if (stashed) await gitOk(["stash", "pop"], projectRootDir); // restore the user's edits
+    if (stash) {
+      // restore the user's edits; on failure the entry is kept for manual recovery
+      const restored = await restoreOwnStash(stash);
+      if (!restored.ok) {
+        aiMergeLog.warn(`${taskId}: could not restore your local changes after an aborted fast-forward; they are preserved in stash ${stash.sha.slice(0, 7)} — re-apply with \`git stash apply ${stash.sha}\`.`);
+      }
+    }
     return { outcome: "concurrent", localSync: "skipped-other-branch" };
   }
 
-  if (!stashed) {
+  if (stashUnaddressable) {
+    await emit("stash-ff-conflict", { stashUnaddressable: true });
+    return { outcome: "advanced", localSync: "stash-ff-conflict" };
+  }
+
+  if (!stash) {
     await emit("ff");
     return { outcome: "advanced", localSync: "ff" };
   }
 
   // Re-apply the user's stashed edits onto the new tip.
-  if (await gitOk(["stash", "pop"], projectRootDir)) {
+  if ((await restoreOwnStash(stash)).ok) {
     await emit("stash-ff-restore");
     return { outcome: "advanced", localSync: "stash-ff-restore" };
   }
@@ -943,15 +993,15 @@ export async function landSquash(input: {
       await gitOk(["reset"], projectRootDir); // unstage → reads as the user's uncommitted edits
       // Keep the stash as a recovery backup (do NOT drop it): if the AI
       // resolution discarded any of the user's intent, their original pre-merge
-      // edits remain recoverable via `git stash`. Honors "never destroy work".
-      aiMergeLog.log(`${taskId}: reconciled your local edits with the new tip; original pre-merge edits also kept in a stash as a backup (\`git stash list\`).`);
-      await emit("stash-ff-airesolved", { conflicted, stashRetained: true });
+      // edits remain recoverable via `git stash apply <sha>`. Honors "never destroy work".
+      aiMergeLog.log(`${taskId}: reconciled your local edits with the new tip; original pre-merge edits also kept as a backup in stash ${stash.sha.slice(0, 7)} (\`git stash apply ${stash.sha}\`).`);
+      await emit("stash-ff-airesolved", { conflicted, stashRetained: true, stashSha: stash.sha });
       return { outcome: "advanced", localSync: "stash-ff-airesolved" };
     }
   }
 
-  aiMergeLog.warn(`${taskId}: restoring your local changes onto the new tip conflicted and could not be auto-resolved. Your work is preserved in the stash (\`git stash list\`); re-apply with \`git stash pop\` and resolve manually.`);
-  await emit("stash-ff-conflict");
+  aiMergeLog.warn(`${taskId}: restoring your local changes onto the new tip conflicted and could not be auto-resolved. Your work is preserved in stash ${stash.sha.slice(0, 7)}; resolve the conflicts in your working tree, or reset it and re-apply with \`git stash apply ${stash.sha}\`.`);
+  await emit("stash-ff-conflict", { stashSha: stash.sha });
   return { outcome: "advanced", localSync: "stash-ff-conflict" };
 }
 
