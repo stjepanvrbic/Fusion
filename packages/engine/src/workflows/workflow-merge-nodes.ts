@@ -1,6 +1,7 @@
 import type { TaskDetail } from "@fusion/core";
 import type { MergePrimitiveResult, WorkflowPrimitiveContext, WorkflowRuntimePrimitives } from "../execution/runtime-primitives.js";
 import type { WorkflowNodeResult } from "./workflow-graph-executor.js";
+import { isEngineShutdownError } from "../merge/engine-shutdown-error.js";
 
 /** A legacy graph value retained to classify stranded rows created before FN-9345. */
 export const MERGE_BOUNDARY_UNPROVEN_VALUE = "merge-boundary-unproven";
@@ -14,19 +15,34 @@ export const PRESERVED_MERGE_FAILURE_REASONS = new Set(["implementation-incomple
 export const MERGE_FILE_SCOPE_VIOLATION_VALUE = "file-scope-violation";
 
 /**
+ * FNXC:MergeRestartDeferral 2026-10-08-06:10:
+ * The merge request was rejected because the engine is stopping or not yet started. Not a merge outcome:
+ * the graph failure handler leaves the card untouched so the restarted engine re-dispatches its merge.
+ */
+export const MERGE_ENGINE_SHUTDOWN_VALUE = "engine-shutdown";
+
+/**
  * FNXC:FileScopeInvariant 2026-10-08-05:09:
  * A merge-requester rejection that no retry can change must leave the merge node as a typed failure, not an exception.
  * An exception spends the graph's per-node retries, and each retry re-runs the full AI merge. KB-008 re-ran it behind the concurrency cap until the 30-minute primitive timeout, then once more through the bounded auto-merge retry, before it was parked.
  * The refusal text rides on the node's `:error` key so the terminal park can name it. Any other rejection returns undefined and keeps its exception path.
+ *
+ * FNXC:MergeRestartDeferral 2026-10-08-06:10:
+ * An engine shutdown rejection is typed the same way: re-requesting inside a stopping engine is refused again, so per-node retries only burn time.
+ * It classifies by the error name, never by message text.
  */
 export function classifyMergeRequesterRejection(
   error: unknown,
   nodeId: string,
 ): { outcome: "failure"; value: string; data: { status: "failed"; reason: string }; contextPatch: Record<string, unknown> } | undefined {
-  if (!(error instanceof Error) || error.name !== "FileScopeViolationError") return undefined;
+  if (!(error instanceof Error)) return undefined;
+  const value = error.name === "FileScopeViolationError"
+    ? MERGE_FILE_SCOPE_VIOLATION_VALUE
+    : isEngineShutdownError(error) ? MERGE_ENGINE_SHUTDOWN_VALUE : undefined;
+  if (!value) return undefined;
   return {
     outcome: "failure",
-    value: MERGE_FILE_SCOPE_VIOLATION_VALUE,
+    value,
     data: { status: "failed", reason: error.message },
     contextPatch: { [`node:${nodeId}:error`]: error.message },
   };
@@ -73,7 +89,7 @@ export function classifyMergePrimitiveResult(
   classified as-is for already persisted unsafe rows; only a newly observed gap
   uses the recovery token.
   */
-  if (value === MERGE_BOUNDARY_RECOVERY_VALUE || value === MERGE_BOUNDARY_UNPROVEN_VALUE || value === MERGE_FILE_SCOPE_VIOLATION_VALUE) {
+  if (value === MERGE_BOUNDARY_RECOVERY_VALUE || value === MERGE_BOUNDARY_UNPROVEN_VALUE || value === MERGE_FILE_SCOPE_VIOLATION_VALUE || value === MERGE_ENGINE_SHUTDOWN_VALUE) {
     return { outcome: "failure", value };
   }
   if (data?.status === "merged") {

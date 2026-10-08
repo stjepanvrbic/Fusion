@@ -1644,6 +1644,155 @@ describe("ProjectEngine shutdown merge handling", () => {
     expect(privateEngine.mergeQueue).toHaveLength(0);
     expect(mocks.runAiMerge).toHaveBeenCalledTimes(mergeCallsBeforeRequeue);
   });
+
+  /*
+  FNXC:MergeRestartDeferral 2026-10-08-06:10:
+  A restart is never a merge failure. Every rejection ProjectEngine issues because it is stopping or not yet started carries the
+  `EngineShutdownError` name, so the graph and its bounded retry can leave the card untouched instead of parking it
+  `AUTO_MERGE_RETRY_REJECTED:` (KB-020, KB-024). Refusals while the engine is running keep the generic error.
+  */
+  function holdMergeUntilAbort(): void {
+    mocks.runAiMerge.mockImplementationOnce(async (...args: unknown[]) => {
+      const options = args[3] as { signal?: AbortSignal } | undefined;
+      await new Promise<never>((_, reject) => {
+        options?.signal?.addEventListener("abort", () => {
+          const abortError = new Error("merge aborted");
+          abortError.name = "MergeAbortedError";
+          reject(abortError);
+        }, { once: true });
+      });
+    });
+  }
+
+  it("rejects active and queued merge waiters with a typed shutdown error on stop", async () => {
+    const engine = createEngine();
+    await engine.start();
+    holdMergeUntilAbort();
+
+    const settle = (pending: Promise<unknown>) => pending.then(() => undefined, (err: unknown) => err as Error);
+    const active = settle(engine.onMerge("FN-active"));
+    const queued = settle(engine.onMerge("FN-queued"));
+    await vi.waitFor(() => {
+      expect(mocks.runAiMerge).toHaveBeenCalledTimes(1);
+    });
+
+    await engine.stop();
+
+    for (const pending of [active, queued]) {
+      const error = await pending;
+      expect(error?.name).toBe("EngineShutdownError");
+      expect(error?.message).toContain("Engine shutting down");
+    }
+  });
+
+  it("rejects a capacity-deferred merge waiter with a typed shutdown error on stop", async () => {
+    const engine = createEngine();
+    await engine.start();
+    const reject = vi.fn();
+    const privateEngine = engine as unknown as {
+      capacityDeferredMerges: Map<string, unknown>;
+      capacityDeferredMergeTaskIds: Set<string>;
+    };
+    const timer = setTimeout(() => undefined, 60_000);
+    privateEngine.capacityDeferredMerges.set("FN-deferred", {
+      timer,
+      resolvers: [{ resolve: vi.fn(), reject }],
+      generation: 0,
+      manual: true,
+    });
+    privateEngine.capacityDeferredMergeTaskIds.add("FN-deferred");
+
+    await engine.stop();
+    clearTimeout(timer);
+
+    expect(reject).toHaveBeenCalledTimes(1);
+    expect((reject.mock.calls[0]?.[0] as Error).name).toBe("EngineShutdownError");
+    expect((reject.mock.calls[0]?.[0] as Error).message).toContain("deferred merge for FN-deferred aborted");
+  });
+
+  it("rejects a merge requested before start or after stop with a typed shutdown error", async () => {
+    const engine = createEngine();
+
+    const beforeStart = await engine.onMerge("FN-early").then(() => undefined, (err: unknown) => err as Error);
+    expect(beforeStart?.name).toBe("EngineShutdownError");
+    expect(beforeStart?.message).toContain("Merge enqueue rejected for FN-early");
+
+    await engine.start();
+    await engine.stop();
+
+    const afterStop = await engine.onMerge("FN-late").then(() => undefined, (err: unknown) => err as Error);
+    expect(afterStop?.name).toBe("EngineShutdownError");
+    expect(afterStop?.message).toContain("Merge enqueue rejected for FN-late");
+    expect(mocks.runAiMerge).not.toHaveBeenCalled();
+  });
+
+  it("keeps the generic rejection for an enqueue refused while the engine is running", async () => {
+    const engine = createEngine();
+    await engine.start();
+    vi.spyOn(engine as unknown as { internalEnqueueMerge: (taskId: string) => boolean }, "internalEnqueueMerge").mockReturnValue(false);
+
+    const error = await engine.onMerge("FN-refused").then(() => undefined, (err: unknown) => err as Error);
+
+    expect(error?.name).toBe("Error");
+    expect(error?.message).toContain("Merge enqueue rejected for FN-refused");
+    await engine.stop();
+  });
+
+  /*
+  FNXC:MergeRestartDeferral 2026-10-08-06:10:
+  The other half of the invariant: the card a shutdown left untouched must be picked up again. A restarted engine's startup merge
+  sweep admits an approved review card with no status whose active continuation is at its merge node, and runs the merge.
+  */
+  it("re-dispatches an approved review card interrupted by a restart to its merge on the next engine start", async () => {
+    const shared = createMockStore({ ...baseSettings, autoMerge: true });
+    const card = {
+      id: "FN-restart",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      error: null,
+      steps: [{ name: "Implement", status: "done" }],
+      enabledWorkflowSteps: [],
+      updatedAt: new Date().toISOString(),
+    };
+    shared.store.getTask.mockImplementation(async (id: string) => (id === card.id ? { ...card } : null) as never);
+    shared.store.listTasks.mockImplementation(async () => [{ ...card }]);
+    Object.assign(shared.store, {
+      getTaskWorkflowSelection: () => undefined,
+      getTaskWorkflowSelectionAsync: async () => undefined,
+      listWorkflowWorkItemsForTask: vi.fn(async (taskId: string) => [
+        { id: `${taskId}-wi`, taskId, nodeId: "merge-attempt", kind: "task", state: "held" },
+      ]),
+    });
+    mocks.currentStore = shared.store;
+
+    const first = createEngine();
+    await first.start();
+    holdMergeUntilAbort();
+    const interrupted = first.requestInterpreterMerge(card.id).then(() => undefined, (err: unknown) => err as Error);
+    await vi.waitFor(() => {
+      expect(mocks.runAiMerge).toHaveBeenCalledTimes(1);
+    });
+    await first.stop();
+    const shutdown = await interrupted;
+    expect(shutdown?.name).toBe("EngineShutdownError");
+    const parked = shared.store.updateTask.mock.calls.filter((call: unknown[]) => {
+      const patch = call[1] as Record<string, unknown> | undefined;
+      return call[0] === card.id && (patch?.status === "failed" || typeof patch?.mergeRetries === "number");
+    });
+    expect(parked).toEqual([]);
+
+    mocks.runAiMerge.mockReset();
+    mocks.runAiMerge.mockResolvedValue({ merged: true, task: { ...card } } as never);
+    const second = createEngine();
+    await second.start();
+
+    await vi.waitFor(() => {
+      expect(mocks.runAiMerge).toHaveBeenCalledWith(expect.anything(), expect.any(String), card.id, expect.anything());
+    });
+    await second.stop();
+  });
 });
 
 describe("ProjectEngine manual merge plumbing", () => {

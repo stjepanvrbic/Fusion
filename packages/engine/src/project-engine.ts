@@ -73,6 +73,7 @@ import {
 } from "@fusion/core";
 import { assemblePlannerOverseerRuntimeSnapshot } from "./overseer/planner-overseer-runtime-snapshot.js";
 import { activeSessionRegistry, executingTaskLock } from "./agents/active-session-registry.js";
+import { createEngineShutdownError } from "./merge/engine-shutdown-error.js";
 import { isTaskExecutionLive } from "./merge/merge-execution-exclusion.js";
 import { isMergeActiveStatus } from "./merge/merge-active-status.js";
 import { isPostMergeGateRecoveryDue, resumeMissingPostMergeGate } from "./merge/post-merge-gate-reseed.js";
@@ -1959,7 +1960,7 @@ export class ProjectEngine {
     for (const [taskId, deferred] of this.capacityDeferredMerges) {
       clearTimeout(deferred.timer);
       for (const resolver of deferred.resolvers) {
-        resolver.reject(new Error(`Engine shutting down — deferred merge for ${taskId} aborted`));
+        resolver.reject(createEngineShutdownError(`Engine shutting down — deferred merge for ${taskId} aborted`));
       }
     }
     this.capacityDeferredMerges.clear();
@@ -2009,10 +2010,14 @@ export class ProjectEngine {
       this.activeMergeSession = null;
     }
 
-    // Reject any pending manual merge promises (every waiter per task)
+    /*
+    FNXC:MergeRestartDeferral 2026-10-08-06:10:
+    Reject every pending merge waiter with the typed shutdown error. A restart is never a merge failure: the graph merge node and its
+    bounded retry classify on this name and leave the card untouched for the restarted engine instead of parking it `failed`.
+    */
     for (const [taskId, resolvers] of this.manualMergeResolvers) {
       for (const resolver of resolvers) {
-        resolver.reject(new Error(`Engine shutting down — merge for ${taskId} aborted`));
+        resolver.reject(createEngineShutdownError(`Engine shutting down — merge for ${taskId} aborted`));
       }
     }
     this.manualMergeResolvers.clear();
@@ -3018,7 +3023,18 @@ export class ProjectEngine {
 
       if (!this.internalEnqueueMerge(taskId)) {
         this.removeMergeResolver(taskId, resolver);
-        resolver.reject(new Error(`Merge enqueue rejected for ${taskId}`));
+        /*
+        FNXC:MergeRestartDeferral 2026-10-08-06:10:
+        A refusal because the engine is stopping or not yet started is the restart window, not a merge failure, so it carries the typed shutdown error.
+        Any other refusal keeps the generic error and its existing park.
+        */
+        if (this.shuttingDown || !this.started) {
+          resolver.reject(createEngineShutdownError(
+            `Merge enqueue rejected for ${taskId}: engine is ${this.shuttingDown ? "shutting down" : "not started"}`,
+          ));
+        } else {
+          resolver.reject(new Error(`Merge enqueue rejected for ${taskId}`));
+        }
       }
     });
   }
@@ -4706,7 +4722,7 @@ export class ProjectEngine {
             // Re-queue after the poll interval so we retry once the other merge finishes
             setTimeout(() => {
               if (this.shuttingDown) {
-                for (const r of stashedResolvers) r.reject(new Error("Engine shutting down"));
+                for (const r of stashedResolvers) r.reject(createEngineShutdownError(`Engine shutting down — merge for ${taskId} aborted`));
                 return;
               }
               for (const r of stashedResolvers) this.addMergeResolver(taskId, r);
@@ -4932,7 +4948,7 @@ export class ProjectEngine {
               this.capacityDeferredMerges.delete(taskId);
               this.capacityDeferredMergeTaskIds.delete(taskId);
               if (this.shuttingDown || deferred.generation !== this.startupGeneration) {
-                for (const resolver of deferred.resolvers) resolver.reject(new Error("Engine shutting down"));
+                for (const resolver of deferred.resolvers) resolver.reject(createEngineShutdownError(`Engine shutting down — deferred merge for ${taskId} aborted`));
                 return;
               }
               for (const resolver of deferred.resolvers) this.addMergeResolver(taskId, resolver);
