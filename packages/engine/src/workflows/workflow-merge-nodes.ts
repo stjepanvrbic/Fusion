@@ -10,6 +10,28 @@ export const MERGE_BOUNDARY_RECOVERY_VALUE = "merge-boundary-evidence-recovery";
 
 export const PRESERVED_MERGE_FAILURE_REASONS = new Set(["implementation-incomplete", "merge-unavailable", "workspace-review-required"]);
 
+/** The squash file-scope invariant refused the approved candidate; terminal, see {@link classifyMergeRequesterRejection}. */
+export const MERGE_FILE_SCOPE_VIOLATION_VALUE = "file-scope-violation";
+
+/**
+ * FNXC:FileScopeInvariant 2026-10-08-05:09:
+ * A merge-requester rejection that no retry can change must leave the merge node as a typed failure, not an exception.
+ * An exception spends the graph's per-node retries, and each retry re-runs the full AI merge. KB-008 re-ran it behind the concurrency cap until the 30-minute primitive timeout, then once more through the bounded auto-merge retry, before it was parked.
+ * The refusal text rides on the node's `:error` key so the terminal park can name it. Any other rejection returns undefined and keeps its exception path.
+ */
+export function classifyMergeRequesterRejection(
+  error: unknown,
+  nodeId: string,
+): { outcome: "failure"; value: string; data: { status: "failed"; reason: string }; contextPatch: Record<string, unknown> } | undefined {
+  if (!(error instanceof Error) || error.name !== "FileScopeViolationError") return undefined;
+  return {
+    outcome: "failure",
+    value: MERGE_FILE_SCOPE_VIOLATION_VALUE,
+    data: { status: "failed", reason: error.message },
+    contextPatch: { [`node:${nodeId}:error`]: error.message },
+  };
+}
+
 export interface WorkflowMergeNodeDeps {
   primitives: Pick<WorkflowRuntimePrimitives, "requestMerge" | "audit">;
 }
@@ -51,7 +73,7 @@ export function classifyMergePrimitiveResult(
   classified as-is for already persisted unsafe rows; only a newly observed gap
   uses the recovery token.
   */
-  if (value === MERGE_BOUNDARY_RECOVERY_VALUE || value === MERGE_BOUNDARY_UNPROVEN_VALUE) {
+  if (value === MERGE_BOUNDARY_RECOVERY_VALUE || value === MERGE_BOUNDARY_UNPROVEN_VALUE || value === MERGE_FILE_SCOPE_VIOLATION_VALUE) {
     return { outcome: "failure", value };
   }
   if (data?.status === "merged") {
@@ -96,8 +118,9 @@ function classifyMergeFailure(reason: string): WorkflowNodeResult {
   if (PRESERVED_MERGE_FAILURE_REASONS.has(normalized)) {
     return { outcome: "failure", value: normalized };
   }
-  if (normalized.includes("file scope") || normalized.includes("filescope")) {
-    return { outcome: "failure", value: "file-scope-violation" };
+  /* FNXC:FileScopeInvariant 2026-10-08-05:09: the invariant's own message says "File-scope invariant violation", and its staged-file list can name a path such as `branch-conflicts.ts`. Match the hyphenated form before the conflict heuristic below can turn the refusal into a manual-required hold. */
+  if (normalized.includes("file scope") || normalized.includes("file-scope") || normalized.includes("filescope")) {
+    return { outcome: "failure", value: MERGE_FILE_SCOPE_VIOLATION_VALUE };
   }
   if (normalized.includes("already") && (normalized.includes("main") || normalized.includes("merged") || normalized.includes("landed"))) {
     return { outcome: "success", value: "already-landed" };

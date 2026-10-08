@@ -20,7 +20,7 @@ import {
 } from "../workflows/workflow-node-handlers.js";
 import { graphActiveContextKey } from "./task-predicates.js";
 import { WorkflowReviewService } from "../workflows/workflow-review-service.js";
-import { MERGE_BOUNDARY_UNPROVEN_VALUE } from "../workflows/workflow-merge-nodes.js";
+import { classifyMergeRequesterRejection, MERGE_BOUNDARY_UNPROVEN_VALUE } from "../workflows/workflow-merge-nodes.js";
 import { SESSION_CONTENTION_HOLD_VALUE } from "../workflows/workflow-graph-executor.js";
 import { isSessionContentionError } from "../errors/transient-error-patterns.js";
 import { mergeEffectiveSettings } from "../project/effective-settings.js";
@@ -312,7 +312,15 @@ export function createAuthoritativeWorkflowSeams(
           signal.addEventListener("abort", onGraphAbort, { once: true });
         });
         try {
-          const result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal, graphOwnedPostMergeTraversal: true }), timeout, cancelled]);
+          let result: Awaited<ReturnType<NonNullable<typeof deps.mergeRequester>>> | "timeout" | "cancelled";
+          try {
+            result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal, graphOwnedPostMergeTraversal: true }), timeout, cancelled]);
+          } catch (error) {
+            // The legacy seam has no node context; it always runs as the `merge` seam node.
+            const terminalRefusal = classifyMergeRequesterRejection(error, "merge");
+            if (terminalRefusal) return { outcome: terminalRefusal.outcome, value: terminalRefusal.value, contextPatch: terminalRefusal.contextPatch };
+            throw error;
+          }
           if (result === "cancelled") {
             executorLog.warn(`${mergeTask.id}: graph merge seam cancelled by graph abort`);
             return { outcome: "failure", value: "merge-cancelled" };

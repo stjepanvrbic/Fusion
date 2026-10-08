@@ -1307,7 +1307,9 @@ export async function handleGraphFailure(
         return;
       }
       if (mergeGraphFailure && isTerminalMergeGraphFailureValue(failureValue) && !(await resolveTerminalColumnsFor(deps.store, live.id)).includes(live.column)) {
-        const message = `Workflow graph terminal merge failure at node '${failedNode ?? "unknown"}' (${failureValue}) — operator action required`;
+        /* FNXC:FileScopeInvariant 2026-10-08-05:09: the parked card's error must say why the merge cannot land, so append the failing node's recorded refusal text when it left one. */
+        const recordedRefusal = failedNode ? result.context?.[`node:${failedNode}:error`] : undefined;
+        const message = `Workflow graph terminal merge failure at node '${failedNode ?? "unknown"}' (${failureValue}) — operator action required${typeof recordedRefusal === "string" && recordedRefusal.trim() ? `: ${recordedRefusal.trim()}` : ""}`;
         executorLog.warn(`${task.id}: ${message}`);
         await deps.store.logEntry(task.id, message, undefined, deps.getRunContextFor(task.id));
         const outcome = live.status == null && live.error == null ? "parked" as const : "already-terminal" as const;
