@@ -64,6 +64,20 @@ export function shouldClearOrphanedMergeStamp(
 }
 
 /**
+ * True when a merge-confirmed task still carries a merge-active stamp.
+ *
+ * FNXC:PostMergeRecovery 2026-10-08-08:14:
+ * A confirmed landing is not an in-flight merge. Once `mergeConfirmed` is durable the merger has nothing left that the stamp coordinates, so a leftover `landing`/`merging`/`reviewing` status is residue.
+ * Left in place it counts the card as a live capacity holder, which hid its runnable post-merge gate from continuation admission (KB-032, KB-036).
+ * The finalizer's post-merge deferral and self-healing's stale-stamp sweep clear exactly this shape and nothing else; `shouldClearOrphanedMergeStamp` keeps excluding it because abort-path owners never touch confirmed finalization.
+ */
+export function isConfirmedLandingMergeStamp(
+  task: Pick<Task, "status" | "mergeDetails">,
+): boolean {
+  return isMergeActiveStatus(task.status) && task.mergeDetails?.mergeConfirmed === true;
+}
+
+/**
  * True when `task` carries a merge-active stamp that no live merger owns.
  *
  * Deliberately conservative — a task is stale only when EVERY check passes:

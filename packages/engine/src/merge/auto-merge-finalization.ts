@@ -17,6 +17,7 @@ import { cleanupLandedTaskWorktree } from "./post-landing-worktree-cleanup.js";
 import type { MergeWriteFence } from "./merge-write-fence.js";
 import { isPostMergeGateRecoveryDue, resumeMissingPostMergeGate } from "./post-merge-gate-reseed.js";
 import { recoverConfirmedMergePush } from "./recover-confirmed-merge-push.js";
+import { isConfirmedLandingMergeStamp } from "./merge-active-status.js";
 
 /*
 FNXC:WorkflowMergeFinalization 2026-07-19-07:20 (U7 / R2/R3/KTD-1):
@@ -82,6 +83,8 @@ export interface AutoMergeFinalizationResult {
   postMergeEvidenceBlocked?: boolean;
   /** True when this invocation installed the missing graph-owned post-merge continuation. */
   resumedPostMergeEvidence?: boolean;
+  /** True when this post-merge deferral is identical to the one already reported for the task; callers skip their task-log line. */
+  repeatedDeferral?: boolean;
 }
 
 export interface FinalizeProvenAutoMergeTaskOptions {
@@ -228,6 +231,69 @@ function buildFinalizationMergeDetails(task: Task, result?: MergeResult): NonNul
   };
 }
 
+/**
+ * FNXC:PostMergeRecovery 2026-10-08-08:35:
+ * The finalizer runs on every merge-pump pass (~16 s), every self-healing sweep, and every graph re-entry, and each deferral used to write the same task-log lines again (108 identical pairs on KB-032 in four minutes).
+ * Report a post-merge deferral once per gate, landed commit, and blocker through the durable `mergeDetails.postMergeDeferral` marker, claimed under a locked re-read so concurrent callers and restarts agree.
+ * A changed blocker or a fresh gate resume reports again; the run-audit row stays per pass.
+ * Returns true when this deferral repeats the one already reported.
+ */
+async function claimPostMergeDeferralReport(
+  store: TaskStore,
+  taskId: string,
+  report: { gateId: string; blocker: string; resumed: boolean },
+  fence: MergeWriteFence | undefined,
+): Promise<boolean> {
+  const isReported = (live: Task) => {
+    const marker = live.mergeDetails?.postMergeDeferral;
+    return marker?.gateId === report.gateId && marker.blocker === report.blocker
+      && marker.commitSha === (live.mergeDetails?.commitSha ?? null);
+  };
+  let claimed = false;
+  const claim = () => store.updateTaskAtomic(taskId, (live) => {
+    if (!live.mergeDetails || (!report.resumed && isReported(live))) return null;
+    claimed = true;
+    return {
+      mergeDetails: {
+        ...live.mergeDetails,
+        postMergeDeferral: {
+          gateId: report.gateId,
+          commitSha: live.mergeDetails.commitSha ?? null,
+          blocker: report.blocker,
+          recordedAt: new Date().toISOString(),
+        },
+      },
+    };
+  });
+  if (fence) await fence.write("finalization", claim);
+  else await claim();
+  return !claimed;
+}
+
+/** Clears a merge-active stamp left on a confirmed landing and logs it once; true when this call cleared it. */
+async function clearConfirmedLandingMergeStamp(
+  store: TaskStore,
+  task: Task,
+  gateId: string,
+  fence: MergeWriteFence | undefined,
+): Promise<boolean> {
+  if (!isConfirmedLandingMergeStamp(task)) return false;
+  let clearedStatus: string | undefined;
+  const clear = () => store.updateTaskAtomic(task.id, (live) => {
+    if (!isConfirmedLandingMergeStamp(live)) return null;
+    clearedStatus = live.status ?? undefined;
+    return { status: null };
+  });
+  if (fence) await fence.write("finalization", clear);
+  else await clear();
+  if (!clearedStatus) return false;
+  const message = `[post-merge] Landing is complete; cleared leftover '${clearedStatus}' merge activity so '${gateId}' can run. Merge proof and verification evidence are unchanged.`;
+  const record = () => store.logEntry(task.id, message).catch(() => undefined);
+  if (fence) await fence.write("log", record);
+  else await record();
+  return true;
+}
+
 function hasDurableMergeProof(task: Task, result?: MergeResult): boolean {
   return task.mergeDetails?.mergeConfirmed === true || result?.mergeConfirmed === true;
 }
@@ -283,6 +349,15 @@ export async function finalizeProvenAutoMergeTask({
   }
   const evidenceDecision = await getRequiredPostMergeEvidenceDecision(store, latest);
   if (evidenceDecision.outcome !== "finalizable") {
+    /*
+    FNXC:PostMergeRecovery 2026-10-08-08:35:
+    A confirmed landing is not an in-flight merge. This deferral is the one seam every finalizer caller shares (merger, merge-pump fast path, workflow graph, self-healing), so it owns the leftover merge-active stamp.
+    KB-032 and KB-036 kept `landing` here; the stamp counted them as live capacity holders, which kept their runnable post-merge gate out of continuation admission for hours.
+    Clear only the status, under the caller's finalization fence and a locked re-read; column, error, merge proof, and gate evidence stay exactly as they are.
+    */
+    if (await clearConfirmedLandingMergeStamp(store, latest, evidenceDecision.gateId, fence)) {
+      latest = await store.getTask(taskId).catch(() => latest);
+    }
     const evidenceBlocker = await getRequiredPostMergeEvidenceBlocker(store, latest)
       ?? `required post-merge evidence gate '${evidenceDecision.gateId}' is not approved`;
     /*
@@ -302,12 +377,18 @@ export async function finalizeProvenAutoMergeTask({
       auditAgentId,
       auditPhase,
     });
-    await log?.(`Auto-merge finalization deferred for ${taskId}: ${evidenceBlocker}`);
+    const repeatedDeferral = await claimPostMergeDeferralReport(store, taskId, {
+      gateId: evidenceDecision.gateId,
+      blocker: evidenceBlocker,
+      resumed: resumeResult?.outcome === "resumed",
+    }, fence);
+    if (!repeatedDeferral) await log?.(`Auto-merge finalization deferred for ${taskId}: ${evidenceBlocker}`);
     return {
       outcome: "blocked",
       task: latest,
       previousColumn: latest.column,
       reason: evidenceBlocker,
+      repeatedDeferral: repeatedDeferral || undefined,
       /*
       FNXC:PostMergeEvidenceOrdering 2026-09-25-20:05:
       Only an absent result can be claimed by the active graph traversal. A pending or terminal

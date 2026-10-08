@@ -4621,10 +4621,6 @@ export class ProjectEngine {
               runtimeLog.log(
                 `Auto-merge: ${taskId} already has mergeConfirmed — refreshing row and finalizing to done`,
               );
-              await store.logEntry(
-                taskId,
-                "Merge already confirmed; refreshing row and completing task (recovered from post-merge state inconsistency)",
-              );
               const auditor = createRunAuditor(store, {
                 runId: generateSyntheticRunId("merger-fast-path-finalize", taskId),
                 agentId: "merger",
@@ -4654,20 +4650,31 @@ export class ProjectEngine {
                 source: "merge-confirmed-fast-path",
                 log: (message) => runtimeLog.warn(message),
               });
+              /*
+              FNXC:PostMergeRecovery 2026-10-08-08:35:
+              The merge sweep re-admits a landed card every poll, so this path used to write two task-log lines per ~16 s pass while a post-merge gate waited (KB-032: 108 pairs).
+              A deferral writes one line, and an unchanged deferral (`repeatedDeferral`) writes none; the "refreshing row" line is written only when completion actually happens.
+              */
               if (finalization.outcome === "blocked") {
                 runtimeLog.warn(
                   `Auto-merge: ${taskId} merge-confirmed finalize blocked — ${finalization.reason ?? "unknown"}`,
                 );
-                await store.logEntry(
-                  taskId,
-                  finalization.resumedPostMergeEvidence
-                    ? `Merge confirmed; resumed graph-owned post-merge verification — ${finalization.reason}.`
-                    : finalization.deferredPostMergeEvidence
-                      ? `Merge confirmed; awaiting graph-owned post-merge verification — ${finalization.reason}.`
-                      : `Merge confirmed finalization blocked — ${finalization.reason ?? "unknown"}.`,
-                );
+                if (!finalization.repeatedDeferral) {
+                  await store.logEntry(
+                    taskId,
+                    finalization.resumedPostMergeEvidence
+                      ? `Merge confirmed; resumed graph-owned post-merge verification — ${finalization.reason}.`
+                      : finalization.deferredPostMergeEvidence
+                        ? `Merge confirmed; awaiting graph-owned post-merge verification — ${finalization.reason}.`
+                        : `Merge confirmed finalization blocked — ${finalization.reason ?? "unknown"}.`,
+                  );
+                }
                 continue;
               }
+              await store.logEntry(
+                taskId,
+                "Merge already confirmed; refreshing row and completing task (recovered from post-merge state inconsistency)",
+              );
               const mergedTask = finalization.task ?? (await store.getTask(taskId).catch(() => null)) ?? task;
               store.emit("task:merged", {
                 task: mergedTask,

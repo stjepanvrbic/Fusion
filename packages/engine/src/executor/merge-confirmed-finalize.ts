@@ -29,12 +29,11 @@ export async function finalizeMergeConfirmedWorkflowGraphTask(
   const live = await deps.store.getTask(taskId).catch(() => null);
   if (!live || live.mergeDetails?.mergeConfirmed !== true || live.column === await resolveCompleteColumnFor(deps.store, live.id)) return false;
 
-  await deps.store.logEntry(
-    taskId,
-    `Workflow graph observed confirmed merge while task was '${live.column}' — finalizing to done (${reason})`,
-    undefined,
-    deps.getRunContextFor(taskId),
-  );
+  /*
+  FNXC:PostMergeRecovery 2026-10-08-08:35:
+  Graph re-entry can reach this finalizer on every dispatch of a landed card. The observation line is written after finalization so an unchanged post-merge deferral (`repeatedDeferral`) adds no task-log lines.
+  */
+  const observed = `Workflow graph observed confirmed merge while task was '${live.column}' — finalizing to done (${reason})`;
   const finalization = await finalizeProvenAutoMergeTask({
     store: deps.store,
     taskId,
@@ -60,14 +59,19 @@ export async function finalizeMergeConfirmedWorkflowGraphTask(
     source: "workflow-graph-merge-finalize",
     log: (message) => executorLog.warn(message),
   });
+  if (finalization.outcome !== "blocked" || !finalization.repeatedDeferral) {
+    await deps.store.logEntry(taskId, observed, undefined, deps.getRunContextFor(taskId));
+  }
   if (finalization.outcome === "blocked") {
     executorLog.warn(`${taskId}: workflow graph merge-confirmed finalization blocked — ${finalization.reason ?? "unknown"}`);
-    await deps.store.logEntry(
-      taskId,
-      `Workflow graph merge-confirmed finalization blocked — ${finalization.reason ?? "unknown"}`,
-      undefined,
-      deps.getRunContextFor(taskId),
-    );
+    if (!finalization.repeatedDeferral) {
+      await deps.store.logEntry(
+        taskId,
+        `Workflow graph merge-confirmed finalization blocked — ${finalization.reason ?? "unknown"}`,
+        undefined,
+        deps.getRunContextFor(taskId),
+      );
+    }
     /*
     FNXC:MergeBlockerReasons 2026-08-26-11:40:
     Ask the CONDITION, not the sentence.
