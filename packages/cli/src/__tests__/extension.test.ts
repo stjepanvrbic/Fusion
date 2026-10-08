@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -107,7 +107,8 @@ describe("fn_task_logs_read extension payload bounds", () => {
   });
 
   it("uses the shared bounded builder for oversized default-preview pages", async () => {
-    const cwd = "/fn-253-extension-log-reader";
+    // FNXC:CliTests 2026-10-08-14:45: KB-061 — getStore looks up resolveProjectRoot(cwd) = resolve(cwd); key the injected cache the same way so win32 (drive letter) still hits it instead of booting embedded PostgreSQL.
+    const cwd = resolve("/fn-253-extension-log-reader");
     const entries = Array.from({ length: 100 }, (_, index) => ({
       taskId: "FN-253",
       timestamp: "2026-08-29T00:00:00.000Z",
@@ -115,8 +116,9 @@ describe("fn_task_logs_read extension payload bounds", () => {
       type: "tool_result" as const,
       detail: "x".repeat(4_096),
     }));
+    const getAgentLogs = vi.fn().mockResolvedValue(entries);
     __setCachedStoreForTesting(cwd, {
-      getAgentLogs: vi.fn().mockResolvedValue(entries),
+      getAgentLogs,
       getAgentLogCount: vi.fn().mockResolvedValue(entries.length),
     } as unknown as TaskStore);
 
@@ -129,6 +131,7 @@ describe("fn_task_logs_read extension payload bounds", () => {
     expect(text.length).toBeLessThanOrEqual(12_000);
     expect(text).toContain("Detail preview truncated:");
     expect(text).toContain("smaller limit, offset, or type filter");
+    expect(getAgentLogs).toHaveBeenCalled();
   });
 });
 

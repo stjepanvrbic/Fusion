@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { COMPUTER_COMMAND_SURFACE } from "../computer/contract.js";
@@ -21,6 +21,14 @@ function findShippedSkillMarkdown(root: string): string[] {
 }
 
 /**
+ * FNXC:CliTests 2026-10-08-14:45:
+ * KB-061: discovered paths and relative() results use the platform separator; normalize to `/` before matching the POSIX-shaped filters and literals so win32 discovers the same skills.
+ */
+function toPosixPath(path: string): string {
+  return path.split(sep).join("/");
+}
+
+/**
  * FNXC:ComputerUseSkill 2026-08-13-23:35:
  * The original stub-only ratchet let sibling shipped skills reintroduce static computer commands and
  * flags that drift from the installed binary. Discover every bundled SKILL.md so the binary remains
@@ -29,7 +37,7 @@ function findShippedSkillMarkdown(root: string): string[] {
 function readShippedSkills(): Array<{ path: string; content: string }> {
   return skillRoots
     .flatMap(findShippedSkillMarkdown)
-    .filter((path) => path.includes("/skill/") || /\/plugins\/[^/]+\/src\/skills\//.test(path))
+    .filter((path) => toPosixPath(path).includes("/skill/") || /\/plugins\/[^/]+\/src\/skills\//.test(toPosixPath(path)))
     .sort()
     .map((path) => ({ path, content: readFileSync(path, "utf8") }));
 }
@@ -51,14 +59,14 @@ describe("computer-use shipped skill", () => {
 
   it("keeps computer commands out of every other shipped skill", () => {
     const skills = readShippedSkills();
-    const skillPaths = skills.map(({ path }) => relative(repoRoot, path));
+    const skillPaths = skills.map(({ path }) => toPosixPath(relative(repoRoot, path)));
     expect(skillPaths).not.toHaveLength(0);
     expect(skillPaths).toContain("packages/cli/skill/computer-use/SKILL.md");
     expect(skillPaths).toContain("packages/cli/skill/fusion/SKILL.md");
 
     for (const { path, content } of skills) {
       if (path === computerUseSkillPath) continue;
-      expect(content, relative(repoRoot, path)).not.toMatch(/fn computer [a-z-]+/);
+      expect(content, toPosixPath(relative(repoRoot, path))).not.toMatch(/fn computer [a-z-]+/);
     }
   });
 });

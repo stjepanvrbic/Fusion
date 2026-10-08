@@ -1,7 +1,7 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { platform, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 type Listener = (...args: any[]) => void;
@@ -138,6 +138,9 @@ const mocks = vi.hoisted(() => {
     }),
   };
 
+  const realPlatform = { value: "" as NodeJS.Platform };
+  const platform = vi.fn(() => realPlatform.value);
+
   const existingPaths = new Set<string>();
   const existsSync = vi.fn((path: string) => existingPaths.has(path));
 
@@ -146,6 +149,8 @@ const mocks = vi.hoisted(() => {
   return {
     state,
     createMockChild,
+    realPlatform,
+    platform,
     store,
     backendShutdown,
     createTaskStoreForBackend,
@@ -176,6 +181,17 @@ vi.mock("node:child_process", () => ({
   spawn: mocks.spawn,
 }));
 
+/*
+FNXC:CliTests 2026-10-08-14:55:
+KB-061: runDesktop appends Windows-only Electron GPU/sandbox flags when os.platform() is win32.
+The platform is mockable so expected argument arrays follow the host by default and both branches are pinned explicitly on every CI platform.
+*/
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  mocks.realPlatform.value = actual.platform();
+  return { ...actual, platform: mocks.platform };
+});
+
 vi.mock("node:fs", () => ({
   existsSync: mocks.existsSync,
 }));
@@ -204,6 +220,29 @@ vi.mock("@fusion/dashboard", () => ({
 
 import { runDesktop } from "../desktop.js";
 
+const WINDOWS_GPU_FLAGS = [
+  "--disable-gpu",
+  "--disable-gpu-compositing",
+  "--disable-gpu-sandbox",
+  "--disable-software-rasterizer",
+  "--no-sandbox",
+];
+
+/** Mirrors the runDesktop Electron argument contract for the (possibly pinned) host platform. */
+function expectedElectronArgs(entry: string, options: { dev?: boolean; platform?: NodeJS.Platform } = {}): string[] {
+  const hostPlatform = options.platform ?? platform();
+  return [
+    "--enable-source-maps",
+    entry,
+    ...(hostPlatform === "win32" ? WINDOWS_GPU_FLAGS : []),
+    ...(options.dev ? ["--dev"] : []),
+  ];
+}
+
+// FNXC:CliTests 2026-10-08-14:55: KB-061 — the product joins onto process.cwd(), so the fixture cwd is an absolute resolve() path (drive-qualified on win32).
+const repo = resolve("/repo");
+const devDesktopEntry = join(repo, "packages", "desktop", "dist", "main.js");
+
 describe("runDesktop", () => {
   const originalCwd = process.cwd;
   const originalExit = process.exit;
@@ -212,8 +251,13 @@ describe("runDesktop", () => {
   const originalDesktopEntry = process.env.FUSION_DESKTOP_ENTRY;
   const packagedDesktopEntry = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "dist", "desktop", "main.js");
 
+  // FNXC:CliTests 2026-10-08-14:55: KB-061 — a test that fails before Electron exits leaks runDesktop signal listeners; remove them so later call counts stay per-test.
+  let signalListenersBefore: Record<"SIGINT" | "SIGTERM", ReturnType<typeof process.listeners>> = { SIGINT: [], SIGTERM: [] };
+
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.platform.mockImplementation(() => mocks.realPlatform.value);
+    signalListenersBefore = { SIGINT: process.listeners("SIGINT"), SIGTERM: process.listeners("SIGTERM") };
 
     process.env.FUSION_ELECTRON_BINARY = "electron-bin";
     delete process.env.FUSION_DESKTOP_ENTRY;
@@ -235,11 +279,16 @@ describe("runDesktop", () => {
       callback?.();
     });
 
-    vi.spyOn(process, "cwd").mockReturnValue("/repo");
+    vi.spyOn(process, "cwd").mockReturnValue(repo);
     process.exit = vi.fn() as never;
   });
 
   afterEach(() => {
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      for (const listener of process.listeners(signal)) {
+        if (!signalListenersBefore[signal].includes(listener)) process.off(signal, listener);
+      }
+    }
     vi.restoreAllMocks();
     process.cwd = originalCwd;
     process.exit = originalExit;
@@ -268,10 +317,10 @@ describe("runDesktop", () => {
       expect.arrayContaining(["--filter", "@fusion/desktop", "build"]),
       expect.anything(),
     );
-    expect(mocks.createTaskStoreForBackend).toHaveBeenCalledWith({ rootDir: "/repo" });
+    expect(mocks.createTaskStoreForBackend).toHaveBeenCalledWith({ rootDir: repo });
     expect(mocks.store.updateSettings).toHaveBeenCalledWith({ enginePaused: true });
     expect(mocks.ensureCwdProjectRegistered).toHaveBeenCalledWith(
-      expect.objectContaining({ cwd: "/repo", central: mocks.centralCore, autoRegister: true }),
+      expect.objectContaining({ cwd: repo, central: mocks.centralCore, autoRegister: true }),
     );
     expect(mocks.projectEngineManagerCtor).toHaveBeenCalledWith(mocks.centralCore);
     expect(mocks.engineManager.startAll).toHaveBeenCalled();
@@ -289,9 +338,9 @@ describe("runDesktop", () => {
     // In production mode (not dev), renderer uses embedded assets, so no FUSION_DASHBOARD_URL
     expect(mocks.spawn).toHaveBeenCalledWith(
       "electron-bin",
-      ["--enable-source-maps", packagedDesktopEntry],
+      expectedElectronArgs(packagedDesktopEntry),
       expect.objectContaining({
-        cwd: "/repo",
+        cwd: repo,
         env: expect.objectContaining({
           // No FUSION_DASHBOARD_URL in production
           FUSION_SERVER_PORT: "4545",
@@ -305,7 +354,7 @@ describe("runDesktop", () => {
 
   it("supports --dev mode by skipping build and pointing at Vite URL", async () => {
     process.env.FUSION_DASHBOARD_URL = "http://localhost:5173";
-    mocks.existingPaths.add("/repo/packages/desktop/dist/main.js");
+    mocks.existingPaths.add(devDesktopEntry);
 
     await runDesktop({ dev: true });
 
@@ -314,7 +363,7 @@ describe("runDesktop", () => {
 
     expect(mocks.spawn).toHaveBeenCalledWith(
       "electron-bin",
-      ["--enable-source-maps", "/repo/packages/desktop/dist/main.js", "--dev"],
+      expectedElectronArgs(devDesktopEntry, { dev: true }),
       expect.objectContaining({
         env: expect.objectContaining({
           NODE_ENV: "development",
@@ -349,7 +398,7 @@ describe("runDesktop", () => {
     expect(spawnedCommands).not.toContain("pnpm --filter @fusion/desktop build");
     expect(mocks.spawn).toHaveBeenCalledWith(
       "electron-bin",
-      ["--enable-source-maps", packagedDesktopEntry],
+      expectedElectronArgs(packagedDesktopEntry),
       expect.objectContaining({ cwd }),
     );
     expect(mocks.createServer).toHaveBeenCalledWith(
@@ -380,16 +429,43 @@ describe("runDesktop", () => {
   });
 
   it("uses packaged assets even when cwd is an actual Fusion source checkout unless --dev is explicit", async () => {
-    mocks.existingPaths.add("/repo/packages/desktop/dist/main.js");
+    mocks.existingPaths.add(devDesktopEntry);
 
     await runDesktop();
 
     expect(mocks.spawn).toHaveBeenCalledWith(
       "electron-bin",
-      ["--enable-source-maps", packagedDesktopEntry],
-      expect.objectContaining({ cwd: "/repo" }),
+      expectedElectronArgs(packagedDesktopEntry),
+      expect.objectContaining({ cwd: repo }),
     );
 
+    mocks.state.electronChild.emit("exit", 0);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  it.each([
+    { pinned: "win32" as const, gpuFlags: WINDOWS_GPU_FLAGS },
+    { pinned: "linux" as const, gpuFlags: [] as string[] },
+  ])("launches Electron with the exact $pinned argument array (packaged and --dev)", async ({ pinned, gpuFlags }) => {
+    mocks.platform.mockReturnValue(pinned);
+    mocks.existingPaths.add(devDesktopEntry);
+
+    await runDesktop();
+    expect(mocks.spawn).toHaveBeenLastCalledWith(
+      "electron-bin",
+      ["--enable-source-maps", packagedDesktopEntry, ...gpuFlags],
+      expect.objectContaining({ cwd: repo }),
+    );
+    mocks.state.electronChild.emit("exit", 0);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    mocks.state.electronChild = mocks.createMockChild();
+    await runDesktop({ dev: true });
+    expect(mocks.spawn).toHaveBeenLastCalledWith(
+      "electron-bin",
+      ["--enable-source-maps", devDesktopEntry, ...gpuFlags, "--dev"],
+      expect.objectContaining({ cwd: repo }),
+    );
     mocks.state.electronChild.emit("exit", 0);
     await new Promise((resolve) => setTimeout(resolve, 0));
   });

@@ -4,8 +4,8 @@ import {
   mkdirSync,
   readFileSync,
   readlinkSync,
-  rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -91,7 +91,7 @@ describe("installShippedSkillIntoProject", () => {
         mkdirSync(join(projectPath, ".claude", "skills"), { recursive: true });
         symlinkSync(stale, target, "dir");
         expect(installShippedSkillIntoProject(projectPath, skillName, { source, enabled: true }).outcome).toBe("replaced");
-        rmSync(target);
+        unlinkSync(target);
         mkdirSync(target, { recursive: true });
         writeFileSync(join(target, "SKILL.md"), "# prior copy");
         expect(installShippedSkillIntoProject(projectPath, skillName, { source, enabled: true }).outcome).toBe("replaced");

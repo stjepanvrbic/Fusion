@@ -15,7 +15,9 @@ vi.mock("node:fs", async (importOriginal) => {
       if (manifestOverrides.has(pathString)) {
         return true;
       }
-      if (pathString.endsWith("/package.json") && !pathString.includes("fn-scaffold-version-")) {
+      // FNXC:CliTests 2026-10-08-14:45: KB-061 — the product builds manifest paths with resolve(), so win32 paths use backslashes; normalize before the suffix filter.
+      const normalized = pathString.replace(/\\/g, "/");
+      if (normalized.endsWith("/package.json") && !normalized.includes("fn-scaffold-version-")) {
         return false;
       }
       return actual.existsSync(path);

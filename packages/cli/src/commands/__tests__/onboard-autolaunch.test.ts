@@ -1,3 +1,4 @@
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -205,7 +206,8 @@ describe("maybeAutoLaunchOnboarding", () => {
       centralDbPath: "/virtual/fusion-central.db",
       isTTY: true,
       // No SQLite file, but the Postgres data directory is present.
-      pathExists: (candidate: string) => candidate === "/virtual/embedded-postgres",
+      // FNXC:CliTests 2026-10-08-14:50: KB-061 — the product probes join(dirname(centralDbPath), "embedded-postgres").
+      pathExists: (candidate: string) => candidate === join(dirname("/virtual/fusion-central.db"), "embedded-postgres"),
       cliOnboardingCompleted: false,
       runOnboard,
     });

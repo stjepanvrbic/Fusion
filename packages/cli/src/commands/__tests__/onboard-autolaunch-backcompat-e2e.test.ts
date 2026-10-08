@@ -1,4 +1,8 @@
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// FNXC:CliTests 2026-10-08-14:50: KB-061 — maybeAutoLaunchOnboarding builds probe paths with join(), so expectations use join() too (backslashes on win32).
+const demoProjectDbPath = join("/workspace/demo", ".fusion", "fusion.db");
 
 import { maybeAutoLaunchOnboarding } from "../onboard-autolaunch.js";
 
@@ -10,7 +14,7 @@ describe("maybeAutoLaunchOnboarding backward-compat e2e guard", () => {
   it("does not prompt onboarded interactive users with central and project DB present", async () => {
     const runOnboard = vi.fn();
     const pathExists = vi.fn((path: string) =>
-      path === "/virtual/central.db" || path.endsWith("/.fusion/fusion.db"),
+      path === "/virtual/central.db" || path.endsWith(join(".fusion", "fusion.db")),
     );
 
     await expect(
@@ -146,7 +150,7 @@ describe("maybeAutoLaunchOnboarding backward-compat e2e guard", () => {
   it("derives projectInitialized from cwd/pathExists seam without real filesystem", async () => {
     const runOnboard = vi.fn();
     const pathExists = vi.fn((path: string) =>
-      path === "/virtual/central.db" || path === "/workspace/demo/.fusion/fusion.db",
+      path === "/virtual/central.db" || path === demoProjectDbPath,
     );
 
     await expect(
@@ -162,7 +166,7 @@ describe("maybeAutoLaunchOnboarding backward-compat e2e guard", () => {
       }),
     ).resolves.toBeUndefined();
 
-    expect(pathExists).toHaveBeenCalledWith("/workspace/demo/.fusion/fusion.db");
+    expect(pathExists).toHaveBeenCalledWith(demoProjectDbPath);
     expect(runOnboard).not.toHaveBeenCalled();
   });
 });

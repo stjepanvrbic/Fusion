@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -101,7 +102,7 @@ describe("onboard autolaunch backward-compat guard", () => {
 
   it("derives projectInitialized from cwd/pathExists seam", async () => {
     const runOnboard = vi.fn();
-    const pathExists = vi.fn((path: string) => path.endsWith(".fusion/fusion.db"));
+    const pathExists = vi.fn((path: string) => path.endsWith(join(".fusion", "fusion.db")));
 
     await maybeAutoLaunchOnboarding({
       command: "task",
@@ -115,7 +116,7 @@ describe("onboard autolaunch backward-compat guard", () => {
     });
 
     expect(pathExists).toHaveBeenCalledWith("/virtual/central.db");
-    expect(pathExists).toHaveBeenCalledWith("/workspace/demo/.fusion/fusion.db");
+    expect(pathExists).toHaveBeenCalledWith(join("/workspace/demo", ".fusion", "fusion.db"));
     expect(runOnboard).toHaveBeenCalledTimes(1);
   });
 

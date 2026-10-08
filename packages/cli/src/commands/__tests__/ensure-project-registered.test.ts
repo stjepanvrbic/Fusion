@@ -2,8 +2,21 @@ import { mkdtempSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CentralCore, readProjectIdentity } from "@fusion/core";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import {
+  pgDescribe,
+  createTaskStoreForTest,
+  type PgTestHarness,
+} from "../../../../core/src/__test-utils__/pg-test-harness.js";
 import { ensureCwdProjectRegistered } from "../ensure-project-registered.js";
+
+/*
+FNXC:CliTests 2026-10-08-15:15:
+KB-061: each test used to boot a real embedded PostgreSQL through `new CentralCore(globalDir)`, and that per-test startup exceeds the 5 s budget on Windows.
+Following the FN-8077 precedent (project-context.test.ts), CentralCore runs on the shared external PG harness (`asyncLayer: h.layer`).
+Embedded-PostgreSQL lifecycle behavior is covered by core tests (KB-052); this file covers registration behavior only.
+Projects registered by a test are unregistered before the CentralCore closes, so tests sharing the harness database never see each other's rows.
+*/
 
 const tempPaths: string[] = [];
 
@@ -13,19 +26,60 @@ function makeTempDir(prefix: string): string {
   return path;
 }
 
-afterEach(() => {
-  for (const path of tempPaths.splice(0)) {
-    rmSync(path, { recursive: true, force: true });
-  }
-  vi.restoreAllMocks();
-});
+pgDescribe("ensureCwdProjectRegistered", () => {
+  let h: PgTestHarness;
+  let previousDatabaseUrl: string | undefined;
+  const centrals: CentralCore[] = [];
 
-describe("ensureCwdProjectRegistered", () => {
+  /** CentralCore bound to the external harness; closed (after project cleanup) in afterEach. */
+  function makeCentral(globalDir: string): CentralCore {
+    const central = new CentralCore(globalDir, { asyncLayer: h.layer });
+    centrals.push(central);
+    return central;
+  }
+
+  beforeAll(async () => {
+    h = await createTaskStoreForTest({ prefix: "fusion_cli_ensure_registered" });
+  });
+
+  afterAll(async () => {
+    await h.teardown();
+  });
+
+  beforeEach(() => {
+    previousDatabaseUrl = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = h.testUrl;
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    try {
+      for (const central of centrals.splice(0)) {
+        try {
+          for (const project of await central.listProjects()) {
+            await central.unregisterProject(project.id);
+          }
+        } finally {
+          await central.close();
+        }
+      }
+    } finally {
+      if (previousDatabaseUrl === undefined) {
+        delete process.env.DATABASE_URL;
+      } else {
+        process.env.DATABASE_URL = previousDatabaseUrl;
+      }
+      for (const path of tempPaths.splice(0)) {
+        rmSync(path, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("returns existing registered project without writing files", async () => {
     const globalDir = makeTempDir("fn-4266-global-");
     const cwd = makeTempDir("fn-4266-project-");
 
-    const central = new CentralCore(globalDir);
+    const central = makeCentral(globalDir);
     await central.init();
     const existing = await central.registerProject({
       name: "existing-project",
@@ -48,15 +102,13 @@ describe("ensureCwdProjectRegistered", () => {
     expect(readProjectIdentity(cwd)?.id).toBe(existing.id);
     expect(registerSpy).not.toHaveBeenCalled();
     expect(updateSpy).not.toHaveBeenCalled();
-
-    await central.close();
   });
 
   it("auto-registers unregistered project when enabled and persists identity", async () => {
     const globalDir = makeTempDir("fn-4266-global-");
     const cwd = makeTempDir("fn-4266-project-");
 
-    const central = new CentralCore(globalDir);
+    const central = makeCentral(globalDir);
     await central.init();
 
     const ensureSpy = vi.spyOn(central, "ensureProjectForPath");
@@ -81,15 +133,13 @@ describe("ensureCwdProjectRegistered", () => {
     );
     expect(updateSpy).toHaveBeenCalledWith(expect.any(String), { status: "active" });
     expect(readProjectIdentity(cwd)?.id).toBe(result?.id);
-
-    await central.close();
   });
 
   it("reattaches using stored identity when central row was wiped", async () => {
     const globalDir = makeTempDir("fn-4266-global-");
     const cwd = makeTempDir("fn-4266-project-");
 
-    const central = new CentralCore(globalDir);
+    const central = makeCentral(globalDir);
     await central.init();
 
     const first = await ensureCwdProjectRegistered({
@@ -110,15 +160,13 @@ describe("ensureCwdProjectRegistered", () => {
     });
 
     expect(second?.id).toBe(first?.id);
-
-    await central.close();
   });
 
   it("returns null and does not write when autoRegister is false", async () => {
     const globalDir = makeTempDir("fn-4266-global-");
     const cwd = makeTempDir("fn-4266-project-");
 
-    const central = new CentralCore(globalDir);
+    const central = makeCentral(globalDir);
     await central.init();
 
     const ensureSpy = vi.spyOn(central, "ensureProjectForPath");
@@ -133,15 +181,13 @@ describe("ensureCwdProjectRegistered", () => {
     expect(result).toBeNull();
     expect(existsSync(join(cwd, ".fusion"))).toBe(false);
     expect(ensureSpy).not.toHaveBeenCalled();
-
-    await central.close();
   });
 
   it("returns null and logs error when registration throws", async () => {
     const globalDir = makeTempDir("fn-4266-global-");
     const cwd = makeTempDir("fn-4266-project-");
 
-    const central = new CentralCore(globalDir);
+    const central = makeCentral(globalDir);
     await central.init();
 
     vi.spyOn(central, "ensureProjectForPath").mockRejectedValueOnce(new Error("boom"));
@@ -159,7 +205,5 @@ describe("ensureCwdProjectRegistered", () => {
       expect.stringContaining("[serve] Failed to auto-register current project: boom"),
     );
     expect(readProjectIdentity(cwd)).toBeNull();
-
-    await central.close();
   });
 });

@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 vi.mock("@fusion/core", async () => {
   const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
@@ -29,14 +29,32 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-function makeFixture(head = "fusion/fn-refresh-fixture"): { root: string; remote: string; integration: string; head: string } {
-  const root = mkdtempSync(join(tmpdir(), "fusion-pr-refresh-"));
-  fixtures.push(root);
+/*
+FNXC:CliTests 2026-10-08-15:30:
+KB-061: every case used to build its own ~25-spawn git fixture (bare remote, two clones, commits, pushes), and on Windows process spawn cost alone pushed cases past vitest's 5 s default.
+The base fixture is now built ONCE per file as a template and each case gets a recursive copy, so per-case cost is one copy plus the git work the case itself asserts on.
+Copies are isolated: each clone's origin URL is rewritten to the copy's own bare remote, so a case can never touch the template or another case's remote.
+Background gc/maintenance is disabled in the template repositories so no git call forks maintenance work.
+*/
+const TEMPLATE_HEAD = "fusion/fn-refresh-fixture";
+let templateRoot = "";
+
+/** Forward-slash path git accepts on every platform and that appears verbatim in .git/config. */
+function gitUrl(path: string): string {
+  return path.split(sep).join("/");
+}
+
+function buildTemplate(): string {
+  const root = mkdtempSync(join(tmpdir(), "fusion-pr-refresh-template-"));
   const remote = join(root, "remote.git");
   const project = join(root, "project");
   const integration = join(root, "integration");
   git(root, "init", "--bare", remote);
-  git(root, "clone", remote, project);
+  git(remote, "config", "gc.auto", "0");
+  git(remote, "config", "maintenance.auto", "false");
+  git(root, "clone", gitUrl(remote), project);
+  git(project, "config", "gc.auto", "0");
+  git(project, "config", "maintenance.auto", "false");
   git(project, "config", "user.email", "test@example.com");
   git(project, "config", "user.name", "Fusion Test");
   writeFileSync(join(project, "base.txt"), "base\n");
@@ -44,13 +62,15 @@ function makeFixture(head = "fusion/fn-refresh-fixture"): { root: string; remote
   git(project, "commit", "-m", "base");
   git(project, "branch", "-M", "main");
   git(project, "push", "-u", "origin", "main");
-  git(project, "checkout", "-b", head);
+  git(project, "checkout", "-b", TEMPLATE_HEAD);
   writeFileSync(join(project, "feature.txt"), "feature\n");
   git(project, "add", "feature.txt");
   git(project, "commit", "-m", "feature");
   git(project, "checkout", "main");
 
-  git(root, "clone", remote, integration);
+  git(root, "clone", gitUrl(remote), integration);
+  git(integration, "config", "gc.auto", "0");
+  git(integration, "config", "maintenance.auto", "false");
   git(integration, "config", "user.email", "test@example.com");
   git(integration, "config", "user.name", "Fusion Test");
   git(integration, "checkout", "main");
@@ -58,6 +78,37 @@ function makeFixture(head = "fusion/fn-refresh-fixture"): { root: string; remote
   git(integration, "add", "sentinel.txt");
   git(integration, "commit", "-m", "security sentinel");
   git(integration, "push", "origin", "main");
+  return root;
+}
+
+beforeAll(() => {
+  templateRoot = buildTemplate();
+});
+
+afterAll(() => {
+  if (templateRoot) rmSync(templateRoot, { recursive: true, force: true });
+});
+
+/** Re-point a copied clone's origin at the copy's own bare remote (no git spawn). */
+function repointOrigin(cloneDir: string, fromRemote: string, toRemote: string): void {
+  const configPath = join(cloneDir, ".git", "config");
+  const config = readFileSync(configPath, "utf8");
+  const from = `url = ${gitUrl(fromRemote)}`;
+  if (!config.includes(from)) throw new Error(`fixture clone ${cloneDir} does not point at the template remote`);
+  writeFileSync(configPath, config.split(from).join(`url = ${gitUrl(toRemote)}`));
+}
+
+function makeFixture(head = TEMPLATE_HEAD): { root: string; remote: string; integration: string; head: string } {
+  const root = mkdtempSync(join(tmpdir(), "fusion-pr-refresh-"));
+  fixtures.push(root);
+  cpSync(templateRoot, root, { recursive: true });
+  const remote = join(root, "remote.git");
+  const project = join(root, "project");
+  const integration = join(root, "integration");
+  const templateRemote = join(templateRoot, "remote.git");
+  repointOrigin(project, templateRemote, remote);
+  repointOrigin(integration, templateRemote, remote);
+  if (head !== TEMPLATE_HEAD) git(project, "branch", "-m", TEMPLATE_HEAD, head);
 
   return { root: project, remote, integration, head };
 }
@@ -153,7 +204,11 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(git(root, "worktree", "list", "--porcelain")).not.toContain("/.fusion/worktrees/pr-refresh-");
   });
 
-  it("materializes a remote-only head and refuses a missing head without GitHub boundaries", async () => {
+  /*
+  FNXC:CliTests 2026-10-08-15:30:
+  KB-061: the remote-only and missing-head scenarios are independent, so each owns its case and fixture; every assertion is preserved.
+  */
+  it("materializes a remote-only head without GitHub boundaries", async () => {
     const remoteOnly = makeFixture("fusion/fn-8838-remote-only");
     git(remoteOnly.root, "push", "origin", remoteOnly.head);
     git(remoteOnly.root, "branch", "-D", remoteOnly.head);
@@ -164,7 +219,9 @@ describe("refreshAutomatedPrHead local git fixture", () => {
       targetBranch: "main",
     })).resolves.toEqual(expect.objectContaining({ refreshed: true }));
     assertPublishedSentinel(remoteOnly.remote, remoteOnly.head);
+  });
 
+  it("refuses a missing head without GitHub boundaries", async () => {
     const missing = makeFixture("fusion/fn-8838-missing");
     await expect(refreshAutomatedPrHead({
       projectRoot: missing.root,
@@ -248,11 +305,17 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(groupGithub.createPr).toHaveBeenCalledTimes(1);
   });
 
-  it("refreshes the workflow PR node create and merge boundaries before GitHub sees the head", async () => {
-    const workflowFixture = makeFixture("fusion/fn-8838-workflow");
-    const workflowGithub = {
+  /*
+  FNXC:CliTests 2026-10-08-15:45:
+  KB-061: each create+merge case ran two full product refresh cycles (~3-5 s on Windows) against vitest's 5 s default.
+  Each boundary now owns its case. A merge case starts from the state its create boundary leaves behind: the PR exists and the head branch is on origin.
+  It is seeded with a plain push of the un-rebased head, which is stricter than the create-time refresh because the merge boundary must still rebase it onto both sentinels.
+  Every original assertion is preserved.
+  */
+  function makeWorkflowGithub(fixture: ReturnType<typeof makeFixture>) {
+    return {
       createPr: vi.fn(async () => {
-        assertPublishedSentinel(workflowFixture.remote, workflowFixture.head);
+        assertPublishedSentinel(fixture.remote, fixture.head);
         return { number: 2, url: "https://example.test/pr/2", status: "open" as const };
       }),
       getPrStatus: vi.fn(async () => ({ number: 2, url: "https://example.test/pr/2", status: "open" as const })),
@@ -262,15 +325,39 @@ describe("refreshAutomatedPrHead local git fixture", () => {
       getViewerLogin: vi.fn(),
       getPrReviewThreadsDetailed: vi.fn(),
     };
-    const workflowOps = createPrNodeGithubOps(workflowGithub as never);
-    const task = { id: "FN-8838-WORKFLOW", title: "fixture", description: "fixture", worktree: workflowFixture.root };
-    const entity = { id: "pr-fixture", sourceId: task.id, repo: "fixture-owner/fixture-repo", headBranch: workflowFixture.head, baseBranch: "main", prNumber: 2, headOid: "old" };
-    await workflowOps.createPr({ task, entity } as never);
+  }
 
-    writeFileSync(join(workflowFixture.integration, "merge-sentinel.txt"), "late integration security fix\n");
-    git(workflowFixture.integration, "add", "merge-sentinel.txt");
-    git(workflowFixture.integration, "commit", "-m", "merge sentinel");
-    git(workflowFixture.integration, "push", "origin", "main");
+  function makeWorkflowTask(fixture: ReturnType<typeof makeFixture>) {
+    const task = { id: "FN-8838-WORKFLOW", title: "fixture", description: "fixture", worktree: fixture.root };
+    const entity = { id: "pr-fixture", sourceId: task.id, repo: "fixture-owner/fixture-repo", headBranch: fixture.head, baseBranch: "main", prNumber: 2, headOid: "old" };
+    return { task, entity };
+  }
+
+  /** Land a later integration commit on origin/main that the merge boundary must incorporate. */
+  function pushMergeSentinel(fixture: ReturnType<typeof makeFixture>, sentinel: string, message: string): void {
+    writeFileSync(join(fixture.integration, sentinel), "late integration security fix\n");
+    git(fixture.integration, "add", sentinel);
+    git(fixture.integration, "commit", "-m", message);
+    git(fixture.integration, "push", "origin", "main");
+  }
+
+  it("refreshes the workflow PR node create boundary before GitHub sees the head", async () => {
+    const workflowFixture = makeFixture("fusion/fn-8838-workflow");
+    const workflowGithub = makeWorkflowGithub(workflowFixture);
+    const workflowOps = createPrNodeGithubOps(workflowGithub as never);
+    const { task, entity } = makeWorkflowTask(workflowFixture);
+    await workflowOps.createPr({ task, entity } as never);
+    expect(workflowGithub.createPr).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes the workflow PR node merge boundary before GitHub sees the head", async () => {
+    const workflowFixture = makeFixture("fusion/fn-8838-workflow");
+    git(workflowFixture.root, "push", "origin", workflowFixture.head);
+    const workflowGithub = makeWorkflowGithub(workflowFixture);
+    const workflowOps = createPrNodeGithubOps(workflowGithub as never);
+    const { task, entity } = makeWorkflowTask(workflowFixture);
+
+    pushMergeSentinel(workflowFixture, "merge-sentinel.txt", "merge sentinel");
     workflowGithub.mergePr.mockImplementation(async () => {
       assertPublishedSentinel(workflowFixture.remote, workflowFixture.head, "merge-sentinel.txt");
       return { number: 2, url: "https://example.test/pr/2", status: "merged" as const };
@@ -281,9 +368,9 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(persisted).toHaveLength(1);
   });
 
-  it("refreshes the PR-merge lifecycle create and merge boundaries before GitHub sees the head", async () => {
+  function makeLifecycleFixture() {
     const lifecycleFixture = makeFixture("fusion/fn-8838-lifecycle");
-    const lifecycleTask = {
+    const lifecycleTask: Record<string, unknown> & { id: string } = {
       id: "FN-8838-LIFECYCLE",
       title: "fixture",
       description: "fixture",
@@ -291,7 +378,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
       worktree: lifecycleFixture.root,
       column: "in-review",
     };
-    let lifecycleMergeReady = false;
+    const merge = { ready: false };
     const lifecycleGithub = {
       findPrForBranch: vi.fn(async () => null),
       createPr: vi.fn(async () => {
@@ -302,11 +389,16 @@ describe("refreshAutomatedPrHead local git fixture", () => {
         prInfo: { number: 3, url: "https://example.test/pr/3", status: "open" as const },
         reviewDecision: null,
         checks: [],
-        mergeReady: lifecycleMergeReady,
-        blockingReasons: lifecycleMergeReady ? [] : ["checks pending"],
+        mergeReady: merge.ready,
+        blockingReasons: merge.ready ? [] : ["checks pending"],
       })),
       mergePr: vi.fn(async () => ({ number: 3, url: "https://example.test/pr/3", status: "merged" as const })),
     };
+    return { lifecycleFixture, lifecycleTask, lifecycleGithub, merge };
+  }
+
+  it("refreshes the PR-merge lifecycle create boundary before GitHub sees the head", async () => {
+    const { lifecycleFixture, lifecycleTask, lifecycleGithub } = makeLifecycleFixture();
     const lifecycleResult = await processPullRequestMergeTask(
       makeLifecycleStore(lifecycleTask) as never,
       lifecycleFixture.root,
@@ -316,12 +408,16 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     );
     expect(lifecycleResult).toBe("waiting");
     expect(lifecycleGithub.createPr).toHaveBeenCalledTimes(1);
+  });
 
-    writeFileSync(join(lifecycleFixture.integration, "lifecycle-merge-sentinel.txt"), "late integration security fix\n");
-    git(lifecycleFixture.integration, "add", "lifecycle-merge-sentinel.txt");
-    git(lifecycleFixture.integration, "commit", "-m", "lifecycle merge sentinel");
-    git(lifecycleFixture.integration, "push", "origin", "main");
-    lifecycleMergeReady = true;
+  it("refreshes the PR-merge lifecycle merge boundary before GitHub sees the head", async () => {
+    const { lifecycleFixture, lifecycleTask, lifecycleGithub, merge } = makeLifecycleFixture();
+    // Post-create state: the PR recorded by updatePrInfo and the head published on origin.
+    git(lifecycleFixture.root, "push", "origin", lifecycleFixture.head);
+    lifecycleTask.prInfo = { number: 3, url: "https://example.test/pr/3", status: "open" };
+
+    pushMergeSentinel(lifecycleFixture, "lifecycle-merge-sentinel.txt", "lifecycle merge sentinel");
+    merge.ready = true;
     lifecycleGithub.mergePr.mockImplementation(async () => {
       assertPublishedSentinel(lifecycleFixture.remote, lifecycleFixture.head, "lifecycle-merge-sentinel.txt");
       return { number: 3, url: "https://example.test/pr/3", status: "merged" as const };
@@ -337,7 +433,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(lifecycleGithub.mergePr).toHaveBeenCalledTimes(1);
   });
 
-  it("refreshes shared-group creation and merge boundaries before GitHub sees either head", async () => {
+  function makeSharedGroupFixture() {
     const fixture = makeFixture("fusion/groups/fn-8838-refresh");
     const task = {
       id: "FN-8838-GROUP",
@@ -348,7 +444,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
       column: "in-review",
       branchContext: { assignmentMode: "shared", groupId: "BG-8838", source: "planning" },
     };
-    const group = {
+    const group: Record<string, unknown> = {
       id: "BG-8838",
       sourceType: "planning",
       sourceId: "P-8838",
@@ -358,7 +454,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
-    let mergeReady = false;
+    const merge = { ready: false };
     const store = {
       ...makeLifecycleStore(task),
       getBranchGroup: async () => group,
@@ -374,20 +470,27 @@ describe("refreshAutomatedPrHead local git fixture", () => {
         prInfo: { number: 4, url: "https://example.test/pr/4", status: "open" as const },
         reviewDecision: "APPROVED" as const,
         checks: [],
-        mergeReady,
-        blockingReasons: mergeReady ? [] : ["checks pending"],
+        mergeReady: merge.ready,
+        blockingReasons: merge.ready ? [] : ["checks pending"],
       })),
       mergePr: vi.fn(async () => ({ number: 4, url: "https://example.test/pr/4", status: "merged" as const })),
     };
+    return { fixture, task, store, github, merge, group };
+  }
 
+  it("refreshes the shared-group creation boundary before GitHub sees the head", async () => {
+    const { fixture, task, store, github } = makeSharedGroupFixture();
     await expect(processPullRequestMergeTask(store as never, fixture.root, task.id, github as never, () => undefined)).resolves.toBe("waiting");
     expect(github.createPr).toHaveBeenCalledTimes(1);
+  });
 
-    writeFileSync(join(fixture.integration, "group-merge-sentinel.txt"), "late integration security fix\n");
-    git(fixture.integration, "add", "group-merge-sentinel.txt");
-    git(fixture.integration, "commit", "-m", "group merge sentinel");
-    git(fixture.integration, "push", "origin", "main");
-    mergeReady = true;
+  it("refreshes the shared-group merge boundary before GitHub sees the head", async () => {
+    const { fixture, task, store, github, merge, group } = makeSharedGroupFixture();
+    // Post-create state: the group head is published on origin and the group records its PR (what updateBranchGroup persists after creation).
+    git(fixture.root, "push", "origin", fixture.head);
+    Object.assign(group, { prNumber: 4, prUrl: "https://example.test/pr/4", prState: "open" });
+    pushMergeSentinel(fixture, "group-merge-sentinel.txt", "group merge sentinel");
+    merge.ready = true;
     github.mergePr.mockImplementation(async () => {
       assertPublishedSentinel(fixture.remote, fixture.head, "group-merge-sentinel.txt");
       return { number: 4, url: "https://example.test/pr/4", status: "merged" as const };

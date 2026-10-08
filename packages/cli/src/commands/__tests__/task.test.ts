@@ -264,6 +264,7 @@ vi.mock("../../project-context.js", () => {
 });
 
 import { createInterface } from "node:readline/promises";
+import { join } from "node:path";
 import { TaskStore, CentralCore, extractIntentSignature, findNearDuplicates, MAX_TASK_MESSAGE_LENGTH, runDeterministicDuplicateGuard, reconcileDeterministicDuplicate, TaskIsLiveError } from "@fusion/core";
 import { watchFile, unwatchFile, statSync, existsSync, readFileSync } from "node:fs";
 import { exec } from "node:child_process";
@@ -1099,7 +1100,8 @@ describe("project-aware task command behavior", () => {
     const promise = runTaskLogs("FN-001", { follow: true }, "demo-project");
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(vi.mocked(watchFile)).toHaveBeenCalledWith(
-      expect.stringContaining("/resolved/project/.fusion/tasks/FN-001/agent.log"),
+      // FNXC:CliTests 2026-10-08-14:50: KB-061 — runTaskLogs builds the log path with join(), so the expectation does too.
+      expect.stringContaining(join("/resolved/project", ".fusion", "tasks", "FN-001", "agent.log")),
       expect.objectContaining({ interval: 1000 }),
       expect.any(Function),
     );

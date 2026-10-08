@@ -83,6 +83,11 @@ describe("node-pty standalone assets", () => {
     expect(resolveBundledWindowsNativeRequest("./prebuilds/win32-x64/conpty_console_list.node", parent.filename, nativeDir))
       .toBe(conptyListPath);
     expect(resolveBundledWindowsNativeRequest("./prebuilds/win32-x64/../outside.node", parent.filename, nativeDir)).toBeNull();
+    // FNXC:Terminal 2026-10-08-14:40: KB-061 — backslash and mixed-separator escapes must be refused on every platform.
+    expect(resolveBundledWindowsNativeRequest("./prebuilds/win32-x64/..\\outside.node", parent.filename, nativeDir)).toBeNull();
+    expect(resolveBundledWindowsNativeRequest(".\\prebuilds\\win32-x64\\..\\..\\x.node", parent.filename, nativeDir)).toBeNull();
+    expect(resolveBundledWindowsNativeRequest(".\\prebuilds\\win32-x64\\conpty.node", parent.filename, nativeDir))
+      .toBe(conptyPath);
     expect(resolveBundledWindowsNativeRequest("./prebuilds/win32-x64/conpty.node", "/app/node-pty/lib/utils.js", nativeDir)).toBeNull();
 
     const loaded: string[] = [];

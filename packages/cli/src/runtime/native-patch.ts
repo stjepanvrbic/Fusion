@@ -13,7 +13,7 @@
  * temp directory (on macOS/Linux) so node-pty can find the native assets.
  */
 
-import { join, basename, dirname, normalize, relative } from "node:path";
+import { join, basename, dirname, isAbsolute, normalize, relative, sep } from "node:path";
 import { existsSync, cpSync, mkdirSync, symlinkSync, rmSync, lstatSync, readlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -92,6 +92,11 @@ function cleanupStaleBunfsLinks(): void {
  * Windows. The platform package calls CommonJS `require()` with this relative
  * probe, so redirecting that one probe to the staged directory preserves its
  * normal `conpty.node` loading and adjacent DLL lookup.
+ *
+ * FNXC:Terminal 2026-10-08-14:40:
+ * KB-061: the redirected probe must never resolve outside the staged directory on any platform.
+ * The earlier check compared against a two-backslash prefix on win32, so `relative()`'s `..\outside.node` escaped containment.
+ * Containment now uses the shared `rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)` idiom.
  */
 export function resolveBundledWindowsNativeRequest(
   request: string,
@@ -107,9 +112,9 @@ export function resolveBundledWindowsNativeRequest(
   const requestedAsset = normalizedRequest.slice(expectedPrefix.length);
   const candidate = normalize(join(nativeDir, requestedAsset));
   const candidateRelative = relative(nativeDir, candidate);
-  return requestedAsset && candidateRelative !== ".." && !candidateRelative.startsWith(`..${process.platform === "win32" ? "\\\\" : "/"}`)
-    ? candidate
-    : null;
+  const escapesNativeDir =
+    candidateRelative === ".." || candidateRelative.startsWith(`..${sep}`) || isAbsolute(candidateRelative);
+  return requestedAsset && !escapesNativeDir ? candidate : null;
 }
 
 /*
