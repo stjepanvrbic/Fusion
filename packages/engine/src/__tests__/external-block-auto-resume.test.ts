@@ -250,6 +250,77 @@ describe("rate-limit freeze automatic resume", () => {
   });
 });
 
+/*
+FNXC:WorktreeCapacity 2026-10-08-18:22:
+KB-092 audit verdict: the synchronous operator-Retry resume is an audited admission owner. It builds its ceilings only via
+projectCapacityAdmissionLimits, so worktrees-off constructs no worktree ceiling there and other frozen checkouts can never hold the Retry;
+worktrees-on (explicit or omitted) still counts them, with the resuming card's own checkout discounted.
+*/
+describe("synchronous operator Retry honors the worktree capacity mode", () => {
+  const OTHER_FROZEN = ["KB-010", "KB-011", "KB-012"];
+
+  /** One running card, three other frozen checkout holders, and the frozen card the operator retries. */
+  async function frozenBoard(settings: Record<string, unknown>) {
+    const env = createStore([card("KB-001"), ...OTHER_FROZEN.map((id) => card(id)), card("KB-020")]);
+    for (const id of [...OTHER_FROZEN, "KB-020"]) await park(env, id, "RATE_LIMIT");
+    env.store.getSettings.mockResolvedValue(settings as never);
+    const holders = await projectCapacityHoldersFromStore(env.store as never, [...env.rows.values()]);
+    expect(holders.runningTaskIds).toEqual(["KB-001"]);
+    expect([...holders.checkoutOnlyHolderTaskIds].sort()).toEqual([...OTHER_FROZEN, "KB-020"]);
+    return env;
+  }
+
+  async function expectUnfrozen(env: ReturnType<typeof createStore>) {
+    const resumed = env.rows.get("KB-020")!;
+    expect(resumed.externalBlock).toBeUndefined();
+    expect((await projectCapacityHoldersFromStore(env.store as never, [resumed])).runningTaskIds).toEqual(["KB-020"]);
+    expect(projectAdmissionCoordinator.inspectProjectStateForTests("/project").reservedCount).toBe(0);
+  }
+
+  function expectQueued(env: ReturnType<typeof createStore>) {
+    const queued = env.rows.get("KB-020")!;
+    expect(queued.status).toBe("blocked");
+    expect(queued.externalBlock?.resumeRequest?.trigger).toBe("operator");
+    expect(isRunningAgentTask(queued)).toBe(false);
+    expect(projectAdmissionCoordinator.inspectProjectStateForTests("/project").reservedCount).toBe(0);
+  }
+
+  it("never lets frozen checkouts bind when worktrees are off, even under a tiny maxWorktrees", async () => {
+    const env = await frozenBoard({ maxConcurrent: 6, maxWorktrees: 1, worktreeLimitEnabled: false });
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-020", trigger: "operator" })).toMatchObject({ kind: "requested" });
+    await expectUnfrozen(env);
+  });
+
+  it("keeps the same Retry queued when worktrees are on and the worktree ceiling is saturated", async () => {
+    // running 1 + other frozen checkouts 3 = 4 occupied; the resuming card reuses its own checkout, so maxWorktrees 4 binds.
+    const env = await frozenBoard({ maxConcurrent: 6, maxWorktrees: 4, worktreeLimitEnabled: true });
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-020", trigger: "operator" })).toMatchObject({ kind: "requested" });
+    expectQueued(env);
+  });
+
+  it("binds on the worktree dimension: one more worktree lets the same Retry unfreeze", async () => {
+    const env = await frozenBoard({ maxConcurrent: 6, maxWorktrees: 5, worktreeLimitEnabled: true });
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-020", trigger: "operator" })).toMatchObject({ kind: "requested" });
+    await expectUnfrozen(env);
+  });
+
+  it("treats an omitted worktreeLimitEnabled as on", async () => {
+    const env = await frozenBoard({ maxConcurrent: 6, maxWorktrees: 4 });
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-020", trigger: "operator" })).toMatchObject({ kind: "requested" });
+    expectQueued(env);
+  });
+
+  it("unfreezes an operator takeover of a pending automatic resume when worktrees are off", async () => {
+    const env = await frozenBoard({ maxConcurrent: 6, maxWorktrees: 1, worktreeLimitEnabled: false });
+    vi.setSystemTime(Date.parse(env.rows.get("KB-020")!.externalBlock!.autoResume!.resumeAt));
+    expect(await resumeDueExternalBlocks({ store: env.store as never, tasks: [env.rows.get("KB-020")!] })).toEqual(["KB-020"]);
+    // Automatic resumes never admit synchronously.
+    expect(env.rows.get("KB-020")!.externalBlock?.resumeRequest?.trigger).toBe("automatic");
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-020", trigger: "operator" })).toMatchObject({ kind: "requested" });
+    await expectUnfrozen(env);
+  });
+});
+
 describe("a resumed frozen card re-enters through project admission", () => {
   it("offers the resume continuation only once a resume was requested", async () => {
     const env = createStore([card("KB-050")]);
