@@ -60,9 +60,15 @@ describe("searchWithQmd routes through the hardened default executor (unit)", ()
     tempDirs.push(rootDir);
     mkdirSync(join(rootDir, ".fusion", "memory"), { recursive: true });
 
-    const { QmdMemoryBackend } = await import("../memory/memory-backend.js");
+    const { QmdMemoryBackend, refreshQmdProjectMemoryIndex } = await import("../memory/memory-backend.js");
     const backend = new QmdMemoryBackend();
     const results = await backend.search(rootDir, { query: "unit-test-query", limit: 5 });
+    /*
+    FNXC:ProjectMemory 2026-10-07-23:34:
+    The search also schedules a fire-and-forget index refresh whose children run with the project root as their working directory.
+    Joining that in-flight refresh before cleanup keeps Windows from refusing to delete a directory a live child still uses.
+    */
+    await refreshQmdProjectMemoryIndex(rootDir);
 
     expect(Array.isArray(results)).toBe(true);
     // Both the collection-add and the qmd search calls must go through the mocked
@@ -93,6 +99,7 @@ describe("qmd search does not keep a short-lived caller alive (symptom)", () => 
     // models a qmd child that keeps running past searchWithQmd's own 4s internal
     // timeout kill attempt, so only a properly unref'd child+stdio (not a merely
     // "timed-out" JS promise) lets the caller process exit promptly.
+    // FNXC:ProjectMemory 2026-10-08-01:40: the stub leaves the project root before sleeping. It outlives the test by design, and on Windows a live process's working directory cannot be deleted, so cleanup failed while the modeled symptom (a long-lived child holding the caller's pipes) never needed the directory.
     const stubPath = join(stubDir, "qmd");
     writeFileSync(
       stubPath,
@@ -101,7 +108,7 @@ describe("qmd search does not keep a short-lived caller alive (symptom)", () => 
         "trap '' TERM",
         'case "$1" in',
         "  search)",
-        "    sleep 8",
+        "    cd / && sleep 8",
         "    echo '[]'",
         "    ;;",
         "  *)",

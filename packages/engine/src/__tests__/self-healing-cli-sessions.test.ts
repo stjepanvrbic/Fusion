@@ -11,7 +11,7 @@
  * heavy git/FS dependencies mocked.
  */
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
@@ -146,6 +146,37 @@ describe("self-healing idle-worktree sweeps skip resume-eligible CLI session wor
 
     expect(scanSpy).toHaveBeenCalledTimes(1);
     expect(removeSpy.mock.calls.map((call) => (call[0] as { worktreePath: string }).worktreePath)).toEqual([freePath]);
+  });
+
+  /*
+  FNXC:PreReleaseWorktreeLiveness 2026-10-07-23:34:
+  A metadata-free checkout matches its task by path identity, not by raw spelling.
+  Scan roots are canonicalized (8.3 short names expanded, on-disk case, junctions resolved), so a candidate or recorded worktree spelled any other way must still resolve to its task and stay protected.
+  */
+  it("matches a live checkout to its task whatever spelling names the candidate or the recorded worktree", async () => {
+    const legacyLivePath = makeLinkedWorktree("fn-9380");
+    const alias = `${rootDir}-alias`;
+    symlinkSync(rootDir, alias, "junction");
+    try {
+      const spellings = [
+        join(alias, ".worktrees", "fn-9380"),
+        ...(process.platform === "win32" ? [legacyLivePath.toUpperCase(), legacyLivePath.toLowerCase()] : []),
+      ];
+      const store = createStore({ recycleWorktrees: false });
+      (store as any).listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([{
+        state: "running", leaseOwner: "executor:FN-9380", leaseExpiresAt: null,
+      }]);
+      const manager = new SelfHealingManager(store, { rootDir });
+
+      for (const spelling of spellings) {
+        (store as any).listTasks.mockResolvedValue([{ id: "FN-9380", column: "todo", worktree: undefined, branch: undefined }]);
+        await expect((manager as any).isCandidateWorktreeLive(spelling, { recycleWorktrees: false })).resolves.toBe(true);
+        (store as any).listTasks.mockResolvedValue([{ id: "FN-9380", column: "todo", worktree: spelling, branch: "fusion/fn-9380" }]);
+        await expect((manager as any).isCandidateWorktreeLive(legacyLivePath, { recycleWorktrees: false })).resolves.toBe(true);
+      }
+    } finally {
+      rmSync(alias, { recursive: true, force: true });
+    }
   });
 
   it("enforceWorktreeCap skips a worktree backing a live (active-session) executor session", async () => {

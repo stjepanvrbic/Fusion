@@ -5446,21 +5446,17 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
   a layout migration must not make a live review invisible to either branch or idle-worktree sweeps.
   Re-check every candidate after Git inspection and immediately before deletion because a session can claim it while inspection awaits.
   Unreadable reservation state is a destructive-decision fence; readable dead, foreign, or mismatched records are not.
+
+  FNXC:PreReleaseWorktreeLiveness 2026-10-07-23:34:
+  Match the candidate to its task by path identity. Scan roots are canonicalized natively (8.3 short names expanded, on-disk case), so a raw string comparison against a plainly realpath'd candidate missed a live checkout on Windows and left it reclaimable.
   */
   private async isCandidateWorktreeLive(candidatePath: string, settings: Settings): Promise<boolean> {
     try {
       const tasks = await this.store.listTasks({ slim: true, includeArchived: false, startupMemo: true });
-      let canonicalCandidate = resolve(candidatePath);
-      try { canonicalCandidate = realpathSync(canonicalCandidate); } catch {}
+      const canonicalCandidate = canonicalizePath(candidatePath);
       const scanRoots = resolveWorktreesDirScanRoots(this.options.rootDir, settings);
-      const task = tasks.find((entry) => {
-        let canonicalRecordedWorktree = entry.worktree ? resolve(entry.worktree) : null;
-        if (canonicalRecordedWorktree) {
-          try { canonicalRecordedWorktree = realpathSync(canonicalRecordedWorktree); } catch {}
-        }
-        return canonicalRecordedWorktree === canonicalCandidate
-          || scanRoots.some((root) => join(resolve(root), entry.id.toLowerCase()) === canonicalCandidate);
-      });
+      const task = tasks.find((entry) => (entry.worktree ? isSamePath(entry.worktree, canonicalCandidate) : false)
+        || scanRoots.some((root) => isSamePath(join(root, entry.id.toLowerCase()), canonicalCandidate)));
       return task ? Boolean(await this.preReleaseWorktreeLiveness(task, canonicalCandidate, settings)) : false;
     } catch (error) {
       log.warn(`[self-healing] refusing idle worktree reclaim because task liveness is unreadable: ${String(error)}`);

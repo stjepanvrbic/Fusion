@@ -13,7 +13,7 @@ The fixture marks residue by default so each guard below is tested on its own; t
 */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { reapOrphanWorktrees, ORPHAN_RESIDUE_MIN_AGE_MS } from "../worktree/worktree-pool.js";
@@ -122,6 +122,26 @@ describe("reapOrphanWorktrees reclaims unreferenced checkout residue", () => {
     await expect(reapOrphanWorktrees(root, {}, { store: store() })).resolves.toBe(0);
     expect(existsSync(join(secret, ".env"))).toBe(true);
     expect(existsSync(live)).toBe(true);
+  });
+
+  /*
+  FNXC:ActiveSessionRegistry 2026-10-07-23:34:
+  The reaper canonicalizes its candidates, so a live session registered under another spelling of the same checkout (a junction or symlink alias, an 8.3 short name, another letter case on Windows) must still protect it.
+  */
+  it("keeps residue bound to a live session registered under another spelling of the checkout", async () => {
+    const root = project();
+    const live = residue(root, "fn-live");
+    const alias = `${root}-alias`;
+    symlinkSync(root, alias, "junction");
+    tracked.push(alias);
+    const spellings = [join(alias, ".fusion", "worktrees", "fn-live"), ...(process.platform === "win32" ? [live.toUpperCase()] : [])];
+
+    for (const spelling of spellings) {
+      activeSessionRegistry.clear();
+      activeSessionRegistry.registerPath(spelling, { taskId: "FN-LIVE", kind: "executor", ownerKey: "executor:FN-LIVE" });
+      await expect(reapOrphanWorktrees(root, {}, { store: store() })).resolves.toBe(0);
+      expect(existsSync(join(live, "locked", "file.txt"))).toBe(true);
+    }
   });
 
   it("never reclaims .git-less folders under a worktrees root outside the project", async () => {
