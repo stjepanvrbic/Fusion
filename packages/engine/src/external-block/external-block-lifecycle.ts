@@ -26,6 +26,12 @@ import {
   type TaskStore,
   type WorkflowWorkItem,
 } from "@fusion/core";
+import {
+  projectAdmissionCoordinator,
+  projectCapacityAdmissionLimits,
+  projectCapacityHoldersFromStore,
+  type ProjectCapacityHolders,
+} from "../concurrency/concurrency.js";
 import { emitBoundedRunAudit } from "../util/emit-bounded-run-audit.js";
 import { generateSyntheticRunId } from "../util/run-audit.js";
 import { resolveColumnResumeNode } from "../workflows/workflow-graph-executor.js";
@@ -38,7 +44,7 @@ type TaskUpdates = Parameters<TaskStore["updateTask"]>[1];
 
 export type ExternalBlockLifecycleStore = Pick<
   TaskStore,
-  "getTask" | "updateTask" | "logEntry" | "withPlanningLifecycleLock" | "replaceActiveTaskWorkflowContinuation"
+  "getTask" | "updateTask" | "logEntry" | "withPlanningLifecycleLock" | "replaceActiveTaskWorkflowContinuation" | "getSettings" | "listTasks" | "getRootDir"
 > & Partial<Pick<TaskStore, "recordRunAuditEvent" | "getTaskWorkflowSelectionAsync" | "getTaskWorkflowSelection" | "getWorkflowDefinition">> & {
   listWorkflowWorkItemsForTask(taskId: string): Promise<WorkflowWorkItem[]>;
 };
@@ -177,8 +183,10 @@ export async function requestExternalBlockResume(input: {
         externalBlockAutoResumeCount: 0,
       });
       await store.logEntry(taskId, "External block Retry took over the pending automatic resume; automatic-resume budget cleared");
+      const nodeId = pendingResumeNodeId(existingItems) ?? externalBlock.resume.nodeId ?? "";
+      await admitOperatorResumeNow(store, taskId, nodeId);
       const updated = await store.getTask(taskId);
-      return { kind: "requested", task: updated, nodeId: pendingResumeNodeId(existingItems) ?? externalBlock.resume.nodeId ?? "" } as const;
+      return { kind: "requested", task: updated, nodeId } as const;
     }
 
     const spent = Math.max(0, Math.floor(task.externalBlockAutoResumeCount ?? 0));
@@ -246,9 +254,45 @@ export async function requestExternalBlockResume(input: {
         },
       });
     }
+    if (trigger === "operator") await admitOperatorResumeNow(store, taskId, resumeNode.id);
     const updated = await store.getTask(taskId);
     return { kind: "requested", task: updated, nodeId: resumeNode.id } as const;
   });
+}
+
+/*
+FNXC:ExternalBlockResume 2026-10-08-12:10:
+An operator who presses Retry while a running-agent slot is free expects the card unfrozen when the request returns (pipeline smoke S21
+pins this). So operator Retry admits synchronously: it reserves the slot through the project admission coordinator, clears the freeze,
+then hands the slot to the now-live WIP row by releasing the reservation, the same transfer every lane uses. When the cap is full, or
+the cleared card would not count as a running agent (so releasing the reservation would leave the slot unaccounted), the request stays
+queued and the continuation's own admission clears the freeze later. Automatic resumes always take the queued path.
+*/
+async function admitOperatorResumeNow(store: ExternalBlockLifecycleStore, taskId: string, nodeId: string): Promise<boolean> {
+  const task = await store.getTask(taskId);
+  if (!task || !isTaskExternallyBlocked(task)) return false;
+  const unfrozen = { ...task, ...buildTaskExternalBlockClearPatch() } as Task;
+  const asLive = await projectCapacityHoldersFromStore(store as never, [unfrozen]);
+  if (!asLive.runningTaskIds.includes(taskId)) return false;
+  const projectId = store.getRootDir();
+  if (projectAdmissionCoordinator.holdsReservation(projectId, taskId)) return false;
+  const settings = await store.getSettings();
+  let holders: Promise<ProjectCapacityHolders> | undefined;
+  const getHolders = () => holders ??= (async () =>
+    projectCapacityHoldersFromStore(store as never, await store.listTasks({ slim: false, includeArchived: false })))();
+  const reserved = await projectAdmissionCoordinator.reserveIfAvailable({
+    projectId,
+    taskId,
+    ...projectCapacityAdmissionLimits(settings, getHolders),
+  });
+  if (!reserved) return false;
+  try {
+    await clearExternalBlockForAdmittedResume({ store, taskId, nodeId, lockHeld: true });
+  } finally {
+    // The cleared row is now a durable WIP holder, so the bridging reservation is released like every other lane's handoff.
+    projectAdmissionCoordinator.releaseReservation(taskId);
+  }
+  return true;
 }
 
 function pendingResumeNodeId(items: readonly WorkflowWorkItem[]): string | undefined {
@@ -263,9 +307,11 @@ export async function clearExternalBlockForAdmittedResume(input: {
   store: Pick<TaskStore, "getTask" | "updateTask" | "logEntry" | "withPlanningLifecycleLock"> & Partial<Pick<TaskStore, "recordRunAuditEvent">>;
   taskId: string;
   nodeId: string;
+  /** The caller already holds the task's planning lifecycle lock (operator Retry admitting synchronously). */
+  lockHeld?: boolean;
 }): Promise<Task | null> {
   const { store, taskId, nodeId } = input;
-  return store.withPlanningLifecycleLock(taskId, async () => {
+  return runUnderPlanningLock(input.lockHeld === true, store, taskId, async () => {
     const task = await store.getTask(taskId);
     if (!task) return null;
     if (!isTaskExternallyBlocked(task) || !task.externalBlock) return task;
@@ -296,6 +342,15 @@ export async function clearExternalBlockForAdmittedResume(input: {
     });
     return await store.getTask(taskId);
   });
+}
+
+function runUnderPlanningLock<T>(
+  lockHeld: boolean,
+  store: Pick<TaskStore, "withPlanningLifecycleLock">,
+  taskId: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  return lockHeld ? work() : store.withPlanningLifecycleLock(taskId, work);
 }
 
 /**

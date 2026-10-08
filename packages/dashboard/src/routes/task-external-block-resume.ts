@@ -16,6 +16,10 @@ cannot replay or discard the interrupted step.
 FNXC:ExternalBlockResume 2026-10-08-08:29:
 Operator Retry delegates to the engine's single resume owner. A frozen card holds no running-agent slot, so Retry records the request and
 the card stays frozen until project admission grants its resumed run a slot; Retry also clears the automatic-resume budget.
+
+FNXC:ExternalBlockResume 2026-10-08-12:10:
+With a free running-agent slot the engine admits the Retry synchronously, so the card is unfrozen in the response; only a full cap leaves
+it queued behind admission.
 */
 export async function resumeExternallyBlockedTask(params: {
   store: TaskStore;
