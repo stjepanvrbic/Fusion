@@ -18,7 +18,8 @@ const adapter: ComputerAdapter = {
   click: async (x) => ({ action: "click", app: x.app, snapshotId: x.snapshotId, elementIndex: 7, fromElementIndex: null, toElementIndex: null, performed: true, snapshotConsumed: false }), "set-value": async () => { throw new Error("unused"); }, "type-text": async () => { throw new Error("unused"); }, "press-key": async () => { throw new Error("unused"); }, hotkey: async () => { throw new Error("unused"); }, scroll: async () => { throw new Error("unused"); }, drag: async () => { throw new Error("unused"); },
 };
 describe("computer commands", () => {
-  it("emits one JSON envelope and persists a snapshot", async () => { const output: string[] = []; const root = await import("node:fs/promises").then((fs) => fs.mkdtemp("/tmp/fusion-computer-")); try { expect(await runComputer(["get-app-state", "--app", "App", "--no-screenshot", "--json"], { adapter, projectRoot: root, stdout: (x) => output.push(x) })).toBe(0); const envelope = JSON.parse(output[0]); expect(envelope).toMatchObject({ schemaVersion: 1, ok: true, command: "computer.get-app-state" }); expect(envelope.result.snapshot.snapshotId).toMatch(/^cs_/); } finally { await (await import("node:fs/promises")).rm(root, { recursive: true, force: true }); } });
+  // FNXC:ComputerUse 2026-10-08-19:14: temp roots must come from os.tmpdir(); a hard-coded POSIX tmp-root prefix does not exist on win32 (KB-094).
+  it("emits one JSON envelope and persists a snapshot", async () => { const output: string[] = []; const root = await mkdtemp(join(tmpdir(), "fusion-computer-envelope-")); try { expect(await runComputer(["get-app-state", "--app", "App", "--no-screenshot", "--json"], { adapter, projectRoot: root, stdout: (x) => output.push(x) })).toBe(0); const envelope = JSON.parse(output[0]); expect(envelope).toMatchObject({ schemaVersion: 1, ok: true, command: "computer.get-app-state" }); expect(envelope.result.snapshot.snapshotId).toMatch(/^cs_/); } finally { await rm(root, { recursive: true, force: true }); } });
   it("keeps snapshots project-local when capture and replay use different directories", async () => {
     const root = await mkdtemp(join(tmpdir(), "fusion-computer-project-"));
     const nested = join(root, "pkg");
@@ -116,7 +117,7 @@ describe("computer commands", () => {
   });
 
   it("uses the snapshot replay path for element-scoped typing", async () => {
-    const root = await import("node:fs/promises").then((fs) => fs.mkdtemp("/tmp/fusion-computer-"));
+    const root = await mkdtemp(join(tmpdir(), "fusion-computer-typing-"));
     let resolved = 0;
     let typed = 0;
     const replayAdapter: ComputerAdapter = { ...adapter,
@@ -127,7 +128,7 @@ describe("computer commands", () => {
       await runComputer(["get-app-state", "--app", "App", "--no-screenshot", "--json"], { adapter: replayAdapter, projectRoot: root, clock: { now: () => new Date(0) }, stdout: () => undefined });
       expect(await runComputer(["type-text", "--app", "App", "--element-index", "7", "--text", "safe", "--json"], { adapter: replayAdapter, projectRoot: root, clock: { now: () => new Date(0) }, stdout: () => undefined })).toBe(0);
       expect(resolved).toBe(1); expect(typed).toBe(1);
-    } finally { await (await import("node:fs/promises")).rm(root, { recursive: true, force: true }); }
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
   it("accepts complete coordinate drag without a snapshot", async () => {
     let input: Parameters<ComputerAdapter["drag"]>[0] | undefined;
@@ -152,7 +153,7 @@ describe("computer commands", () => {
   });
   it("enforces snapshot → act → snapshot and re-arms after a fresh capture", async () => {
     const output: string[] = [];
-    const root = await import("node:fs/promises").then((fs) => fs.mkdtemp("/tmp/fusion-computer-"));
+    const root = await mkdtemp(join(tmpdir(), "fusion-computer-rearm-"));
     const clock = { now: () => new Date(0) };
     const run = async (args: string[]) => {
       output.length = 0;
@@ -168,11 +169,11 @@ describe("computer commands", () => {
       expect(stale.envelope.error.remediation).toContain("fn computer get-app-state");
       await run(["get-app-state", "--app", "App", "--no-screenshot"]);
       expect((await run(["click", "--app", "App", "--element-index", "7"])).code).toBe(0);
-    } finally { await (await import("node:fs/promises")).rm(root, { recursive: true, force: true }); }
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   it("consumes a captured app pointer after every action form", async () => {
-    const root = await import("node:fs/promises").then((fs) => fs.mkdtemp("/tmp/fusion-computer-"));
+    const root = await mkdtemp(join(tmpdir(), "fusion-computer-pointer-"));
     const clock = { now: () => new Date(0) };
     const action = (name: string, input: { app: typeof app; snapshotId?: string | null; element?: { element: { index: number } }; from?: { element: { index: number } }; to?: { element: { index: number } } }) => ({ action: name, app: input.app, snapshotId: input.snapshotId ?? null, elementIndex: input.element?.element.index ?? null, fromElementIndex: input.from?.element.index ?? null, toElementIndex: input.to?.element.index ?? null, performed: true as const, snapshotConsumed: false });
     const actions: ComputerAdapter = { ...adapter,
@@ -195,11 +196,11 @@ describe("computer commands", () => {
         expect(await runComputer(["click", "--app", "App", "--element-index", "7", "--json"], { adapter: actions, projectRoot: root, clock, stdout: (text) => output.push(text) })).toBe(1);
         expect(JSON.parse(output[0]!).error.details.reason).toBe("consumed-by-action");
       }
-    } finally { await (await import("node:fs/promises")).rm(root, { recursive: true, force: true }); }
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   it("consumes after targetless actions but not after failed actions or reads", async () => {
-    const root = await import("node:fs/promises").then((fs) => fs.mkdtemp("/tmp/fusion-computer-"));
+    const root = await mkdtemp(join(tmpdir(), "fusion-computer-targetless-"));
     const clock = { now: () => new Date(0) };
     let failClick = true;
     const resilientAdapter: ComputerAdapter = { ...adapter,
@@ -219,7 +220,7 @@ describe("computer commands", () => {
         expect(await run(args)).toBe(0);
         expect(await run(["click", "--app", "App", "--element-index", "7"])).toBe(1);
       }
-    } finally { await (await import("node:fs/promises")).rm(root, { recursive: true, force: true }); }
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   it("holds the command fence through consumption and makes a re-capture wait", async () => {
