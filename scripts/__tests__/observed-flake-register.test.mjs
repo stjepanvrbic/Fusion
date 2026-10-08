@@ -203,6 +203,10 @@ test("observed-flake register active count, escalation state, and owners stay sy
       heading: "26. Planning Mode mobile Other-input availability",
       status: "Active first sighting — recorded 2026-10-07, unattributed.",
     },
+    {
+      heading: "27. ensureCwdProjectRegistered embedded PostgreSQL startup cascade",
+      status: "Active first sighting — recorded 2026-10-07, unattributed.",
+    },
   ]);
 });
 
