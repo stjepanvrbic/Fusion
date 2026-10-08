@@ -211,6 +211,10 @@ test("observed-flake register active count, escalation state, and owners stay sy
       heading: "28. TaskExecutor fn_task_done summary persistence implementation session never opened",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
+    {
+      heading: "29. MissionManager reconcile control switch-window cases",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+    },
   ]);
 });
 

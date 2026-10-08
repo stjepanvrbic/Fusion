@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **8 active observation records** (entries 2, 13, 20, 21, 25, 26, 27, and 28), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **9 active observation records** (entries 2, 13, 20, 21, 25, 26, 27, 28, and 29), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -366,6 +366,18 @@ The same shard also reported a failure in `merge-orphan-durable-write-inventory-
 No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the engine vitest config.
 
 The executor lifecycle changed shortly before this sighting. Audit PR #32 (`9cf9144d6`, recovery ownership) made executor retries stay in their lane and re-dispatch through a guarded in-place timer. A session that never opens under load is the shape that change could produce. If this file is sighted again, look at the product code before quarantining: start with the in-place re-dispatch timer and its guard in the executor, and whether `execute` can return or defer re-dispatch before the first implementation session is created.
+
+### 29. MissionManager reconcile control switch-window cases
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/dashboard/app/components/__tests__/MissionManager.reconcile.test.tsx`
+- **Exact tests:** two cases in `MissionManager reconcile control`: `silently discards preview resolution and rejection in the pre-commit switch window` and `refuses a same-batch retained-panel apply click so no write reaches the abandoned mission`.
+- **Observed tree/SHA:** fork Full Suite run [37720328009](https://github.com/stjepanvrbic/Fusion/actions/runs/37720328009) at `9e948d488` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113126258105`), project `dashboard-app-quality-backfill`. That commit changed only this register and its validator. The file passed, with all 176 files in the shard green, in the Full Suite runs for `0bcb53f96` and `c5c3ee4fc`.
+- **Observed frequency:** 1 run, 2 failure entries, one per case.
+
+The first case failed at its second reconcile click with `AssertionError: expected "vi.fn()" to be called 2 times, but got 1 times`, raised by the `waitFor` on `reconcileMission` at line 179. The second case failed with `TestingLibraryElementError: Unable to find an element by: [data-testid="mission-reconcile-apply"]`, raised by the `findByTestId` at line 190 after the first click on the reconcile control. Both are default-timeout Testing Library waits that expired while the rendered `MissionManager` still showed the mission list and had not yet produced the expected reconcile call or panel. This reads the log; no reproduction was attempted, and the log does not show whether the two failures share a cause or whether the component was slow to commit the click or the test shell was starved.
+
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the dashboard vitest config. Before quarantining, look at the product code: both cases exercise the mission-switch window in `MissionManager`, where the reconcile panel is released synchronously on a row event, so check whether the reconcile click can be dropped or the panel withheld when a fetch for the other mission is still pending.
 
 ### Common shape and investigated result
 
