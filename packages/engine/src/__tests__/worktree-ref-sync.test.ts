@@ -129,3 +129,26 @@ describe("syncWorktreeToHead fails closed on an inconclusive dirty-state probe",
     expect(existsSync(join(repo, "landed.txt"))).toBe(true);
   });
 });
+
+describe("syncWorktreeToHead with a nested checkout under the worktree", () => {
+  /*
+  FNXC:MergeAdvanceSync 2026-10-07-23:45:
+  A project root commonly holds Fusion's own task worktrees under `.fusion/worktrees/`. Git lists a nested checkout as one
+  untracked directory entry ending in `/`; it is a separate repository that `reset --hard` never touches, so it is not an
+  operator edit to snapshot. Copying it as a file failed (EISDIR/EPERM), aborted the sync, and left the root showing the
+  landed commit as a staged reversal. Ordinary untracked files are still snapshotted and preserved.
+  */
+  it.each(["stash-and-ff", "ff-only"] as const)("%s: snaps the root forward past a nested worktree entry", async (mode) => {
+    git(repo, "worktree", "add", "-q", "--detach", join(repo, ".fusion", "worktrees", "fn-1"), "HEAD");
+    if (mode === "stash-and-ff") writeFileSync(join(repo, "operator-note.txt"), "keep me\n");
+    advanceRefBehindWorktree();
+
+    const result = await syncWorktreeToHead({ worktreePath: repo, integrationBranch: "main", previousSha, newSha, mode, taskId: "FN-1" });
+
+    expect(result.kind).not.toBe("failed");
+    expect(git(repo, "status", "--porcelain", "--", "landed.txt")).toBe("");
+    expect(readFileSync(join(repo, "landed.txt"), "utf-8")).toBe("landed\n");
+    if (mode === "stash-and-ff") expect(readFileSync(join(repo, "operator-note.txt"), "utf-8")).toBe("keep me\n");
+    expect(existsSync(join(repo, ".fusion", "worktrees", "fn-1", ".git"))).toBe(true);
+  });
+});
