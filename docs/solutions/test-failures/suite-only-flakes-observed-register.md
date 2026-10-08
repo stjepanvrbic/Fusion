@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 29, 30, 31, 32, 33, and 34), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **17 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **13 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, 34, 35, and 36), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **18 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -337,18 +337,6 @@ No timeout, retry, or assertion changed, and the file is not quarantined because
 
 The subprocess-guard line deserves a product look. It means a real PostgreSQL child reached a CLI unit test that does not obviously need one, and a startup that outlives its test left a stale port recorded as a joined instance for later cases. Start with how the embedded PostgreSQL startup records and joins an existing instance for a shared data directory, and whether `CentralCore` initialization in this file should use an in-memory or harness-provided store.
 
-### 29. MissionManager reconcile control switch-window cases
-
-- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
-- **File:** `packages/dashboard/app/components/__tests__/MissionManager.reconcile.test.tsx`
-- **Exact tests:** two cases in `MissionManager reconcile control`: `silently discards preview resolution and rejection in the pre-commit switch window` and `refuses a same-batch retained-panel apply click so no write reaches the abandoned mission`.
-- **Observed tree/SHA:** fork Full Suite run [37720328009](https://github.com/stjepanvrbic/Fusion/actions/runs/37720328009) at `9e948d488` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113126258105`), project `dashboard-app-quality-backfill`. That commit changed only this register and its validator. The file passed, with all 176 files in the shard green, in the Full Suite runs for `0bcb53f96` and `c5c3ee4fc`.
-- **Observed frequency:** 1 run, 2 failure entries, one per case.
-
-The first case failed at its second reconcile click with `AssertionError: expected "vi.fn()" to be called 2 times, but got 1 times`, raised by the `waitFor` on `reconcileMission` at line 179. The second case failed with `TestingLibraryElementError: Unable to find an element by: [data-testid="mission-reconcile-apply"]`, raised by the `findByTestId` at line 190 after the first click on the reconcile control. Both are default-timeout Testing Library waits that expired while the rendered `MissionManager` still showed the mission list and had not yet produced the expected reconcile call or panel. This reads the log; no reproduction was attempted, and the log does not show whether the two failures share a cause or whether the component was slow to commit the click or the test shell was starved.
-
-No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the dashboard vitest config. Before quarantining, look at the product code: both cases exercise the mission-switch window in `MissionManager`, where the reconcile panel is released synchronously on a row event, so check whether the reconcile click can be dropped or the panel withheld when a fetch for the other mission is still pending.
-
 ### 30. Instance-scoped OAuth refresh hanging-request bound
 
 - **Status:** Active first sighting — recorded 2026-10-08, unattributed.
@@ -436,6 +424,48 @@ This shares a mechanism with entry 32 (`SystemControlsArea`, PR 50), where the t
 
 No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. A fix should wait on the subscription itself, by asserting on `mockSubscribeSse` inside `waitFor` as the case at line 183 already does, rather than reading it once.
 
+### 35. Durable agent Activity analytics heartbeat session count and usage-event identity
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/core/src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts`
+- **Exact tests:** two cases in `durable agent Activity analytics`: `turns a production durable no-task heartbeat into Activity sessions and tool usage` and `sums CLI and agent sessions, honors the range, and isolates the bound project`.
+- **Observed tree/SHA:** fork Full Suite (non-blocking) run [37742324890](https://github.com/stjepanvrbic/Fusion/actions/runs/37742324890) at `668244c5ed0e2b23eee7e0c9814d82a0f5e3587e`, job `Windows tests` (`113195659917`), `@fusion/core`. The Windows lane flagged the file as outside its known-failing list. The same file is not excluded on Linux, and no Linux shard of that run failed it. The file was never in the Windows ledger, and the KB-035 commit did not touch the core entries.
+- **Observed frequency:** 2 failures in the 4 cases of the file, both assertion or query failures, not timeouts. The file did not appear among the unexpected failures of Windows runs 37720328009, 37720611351, 37735335086, or 37744337717 (`74d0bdf8a`), so it failed in 1 of 5 recent Windows runs.
+
+The first case ran the production heartbeat to `completed` (the log shows one tool call), then failed `expect(activity.sessions).toBeGreaterThan(0)` with `expected 0 to be greater than 0` at test line 129. The second case failed at its first statement, the insert into `project.usage_events` at line 145, with `duplicate key value violates unique constraint "usage_events_pkey"` and `Key (project_id, id)=(durable-project, 2) already exists`. That column is `generatedAlwaysAsIdentity` and the insert supplies no id, so the identity counter had handed out an id that a row for the same project already held.
+
+Hypothesis, not measured: both failures are one defect in the usage-event identity state of the shared database. A pre-existing row at id 2 for `durable-project` would explain the rejected insert, and a rejected or misattributed heartbeat write would explain zero sessions. The first case's log shows no insert error, so the link between the two is unproven. The `Windows tests` job connects to the runner's PostgreSQL service on port 5432, a path the Linux lanes do not use, so a runner-specific database state is also possible.
+
+| run | result |
+|---|---|
+| Full Suite 37742324890 (`668244c5e`), Windows `@fusion/core` | **failed** (both cases) |
+| Full Suite 37744337717 (`74d0bdf8a`), Windows `@fusion/core` | not among the unexpected failures |
+| `pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts --reporter=dot` with `FUSION_PG_TEST_URL_BASE=postgresql://postgres:postgres@localhost:55432`, local Windows, `c89b0ea0b` plus the quarantine commit | passed, 4 tests |
+
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the core vitest config. Before quarantining, check whether the harness database for these cases can carry rows from an earlier case or a prior run, and whether the heartbeat's usage-event write can be rejected without failing the heartbeat.
+
+### 36. WorkflowNodeEditor edge-targeted fragment pick splice
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/dashboard/app/components/__tests__/WorkflowNodeEditor.test.tsx`
+- **Exact test:** `WorkflowNodeEditor simplified view modes > splices an edge-targeted fragment pick into the targeted edge`.
+- **Observed tree/SHA:** fork Full Suite (non-blocking) run [37744337717](https://github.com/stjepanvrbic/Fusion/actions/runs/37744337717/job/113202144603) at `74d0bdf8af314543008f0d169c28a6493d76203a` (Linux, `ubuntu-latest`), job `Test shard 4/4` (`113202144603`), command `@fusion/dashboard run test:quality:app:components-b`, project `dashboard-app-quality-components-b`. That commit (KB-036) changed no file named for `WorkflowNodeEditor`; its dashboard changes are `file-service.ts` and four tests under `packages/dashboard/src/__tests__/`. The same shard passed in the Full Suite runs for `70d326790` (37741630295), `0b74a0c2c` (37742189681), and `668244c5e` (37742324890).
+- **Observed frequency:** 1 failure, in a command that reported 1790 tests (1 failed, 1789 passed).
+
+The failure was `AssertionError: expected true to be false // Object.is equality` at `WorkflowNodeEditor.test.tsx:4590`, the assertion that no edge from `merge` to `end` remains after the pick. The line before it, `expect(insertedGate).toBeDefined()`, passed, so the fragment's gate was in the saved IR while the original `merge` to `end` edge had not been removed. `updateWorkflow` had been called exactly once, so the test saved a graph in which the fragment was added but not spliced into the targeted edge.
+
+Hypothesis, not measured: the pick adds the fragment nodes and rewires the targeted edge in separate state updates, and the test saves as soon as the add-step window unmounts, so a starved shard can serialize the intermediate graph. The log does not show the editor state at save time, so this is a reading of the assertion order only.
+
+| run | result |
+|---|---|
+| Full Suite 37741630295 (`70d326790`), shard 4/4 | passed |
+| Full Suite 37742189681 (`0b74a0c2c`), shard 4/4 | passed |
+| Full Suite 37742324890 (`668244c5e`), shard 4/4 | passed |
+| Full Suite 37744337717 (`74d0bdf8a`), shard 4/4 | **failed** (this case) |
+| `pnpm exec vitest run app/components/__tests__/WorkflowNodeEditor.test.tsx --project dashboard-app-quality-components-b --reporter=dot` in `packages/dashboard`, local Windows, `83829b7cf` | passed, 191 tests, 34 s wall |
+
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting and the file carries 190 other cases. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. Before quarantining, read how the add-step fragment pick commits its splice in `WorkflowNodeEditor`, and whether the save handler can read the graph between those updates.
+
 ### Common shape and investigated result
 
 FN-9125 established that former entry 3 was not PostgreSQL-suite-adjacent: `plugin-runner.test.ts` used an in-memory mocked TaskStore and had no PostgreSQL/harness import. FN-9135 did not identify a root cause, but FN-9141's completed shuffled worker-reuse campaign reproduced and structurally fixed the logger mock-history fixture defect; the suite and its renamed-complete-lane dispatch coverage remain active. Entries 2 and 13 remain active, unreproduced PostgreSQL observations; entry 7 was closed on 2026-08-23 when the whole file was quarantined on a second sighting of a different test; entry 14 was closed on 2026-09-09 after deterministic diagnosis showed its assertions encoded FN-217-removed lifecycle behavior (see the archived record below). FN-9146 completed the later A×4/B×3/C×3 campaign without the entry 2 or entry 13 exact identities failing. Entry 1 reproduced under FN-9126 and again under FN-9146's A02–A04 lanes, then FN-9131 attributed the mechanism (harness demand scales with fan-out against a fixed cluster supply; the first test in a file eats the 15s budget) and shipped the structural queueing-admission fix, closing the record on 2026-09-12. The golden-template/advisory-lock lifecycle and schema-applier's inline baseline path are concrete architecture facts, not a demonstrated cause of these assertions. Core policy forbids inline PG quarantine: FN-9146's retained evidence for entries 2 and 13 is durable, but FN-9146 was archived on 2026-09-03 without a named successor, so those records are presently unowned; the next sighting follows normal escalation from an unowned state. entry 7 was closed on 2026-08-23 (see above). No source or fan-out change is justified before a diagnostic names a causal lifecycle seam. Entry 13 is a further unreproduced instance of that same 15s setup-hook mode, narrowed to the capped four-fork gate lane on a cold cluster. Entry 6 instead records a merge-gate eviction after a loaded-lane setup-hook timeout; `FNXC:PgTestTemplateDb 2026-07-19-17:20` and `FNXC:PgTestWorkerCap 2026-07-18-18:00` are already-landed mitigations for that mode, not new diagnoses to re-open. The Planning Mode entries are separate frontend timing observations.
@@ -520,6 +550,29 @@ Both failures sit in the step where a click on a radio or on Next must commit a 
 No timeout, retry, or assertion changed. The whole file is excluded from the dashboard projects. It is not in the thin merge gate, so no gate eviction was needed.
 
 This is the third quarantine in the Planning Mode subsystem after entries 22 and 23, plus closed entries 4, 5, 8, and 10. The AGENTS.md repeated-quarantine rule treats that as a product-race smell. Before the deletion deadline, inspect how `QuestionForm` in `PlanningModeModal` commits the Other selection and the Next submission after a radio change, and whether that state is set asynchronously. No product code changed in this quarantine.
+
+<!--
+FNXC:TestFlakeRegister 2026-10-08-08:41:
+Entry 29 recorded a second Full Suite sighting on the fork: the same two switch-window cases failed again on shard 3. Quarantine is file-level, so the whole file is excluded through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
+-->
+### 29. MissionManager reconcile control switch-window cases
+
+- **Status:** Closed — quarantined 2026-10-08 after a second Full Suite sighting; deletion deadline 2026-10-22.
+- **File:** `packages/dashboard/app/components/__tests__/MissionManager.reconcile.test.tsx`
+- **Exact tests:** two cases in `MissionManager reconcile control`: `silently discards preview resolution and rejection in the pre-commit switch window` and `refuses a same-batch retained-panel apply click so no write reaches the abandoned mission`.
+- **Observed trees/SHAs:** fork Full Suite runs [37720328009](https://github.com/stjepanvrbic/Fusion/actions/runs/37720328009) at `9e948d488` (job `113126258105`) and [37742324890](https://github.com/stjepanvrbic/Fusion/actions/runs/37742324890) at `668244c5e` (job `113195660160`), both Linux `ubuntu-latest`, job `Test shard 3/4`, project `dashboard-app-quality-backfill`.
+- **Observed frequency:** 2 runs, the same 2 cases each time. The file passed, with every other file in the shard green, in the Full Suite runs for `0bcb53f96` and `c5c3ee4fc`.
+
+| case | failure, identical in both runs |
+|---|---|
+| `silently discards preview resolution and rejection in the pre-commit switch window` | `AssertionError: expected "vi.fn()" to be called 2 times, but got 1 times` at `MissionManager.reconcile.test.tsx:179`, the `waitFor` on `reconcileMission` after the second reconcile click |
+| `refuses a same-batch retained-panel apply click so no write reaches the abandoned mission` | `TestingLibraryElementError: Unable to find an element by: [data-testid="mission-reconcile-apply"]` at `MissionManager.reconcile.test.tsx:190`, the `findByTestId` after the first click on the reconcile control |
+
+Both are default-timeout Testing Library waits that expired while the rendered `MissionManager` still showed the mission list. The two cases exercise the mission-switch window, where the reconcile panel is released synchronously on a row event. No reproduction was attempted, and the logs do not show whether the two failures share a cause or whether the component was slow to commit the click.
+
+No timeout, retry, or assertion changed. The whole file is excluded from the dashboard projects. It is not in the thin merge gate, so no gate eviction was needed.
+
+Before the deletion deadline, inspect how `MissionManager` releases the reconcile panel and handles a reconcile click while a fetch for another mission is still pending. No product code changed in this quarantine.
 
 <!--
 FNXC:TestFlakeRegister 2026-10-08-04:50:

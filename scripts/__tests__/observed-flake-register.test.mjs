@@ -176,11 +176,26 @@ Entry 26 was sighted a second time on the fork's Full Suite (desktop row after t
 ratchet moves it to the archive. The archived record must keep both run identifiers and the unchanged assertion
 text so a rescue starts from the Planning Mode product code rather than a timeout.
 
+FNXC:TestFlakeRegister 2026-10-08-08:41:
+Entry 29 was sighted a second time on the fork's Full Suite (the same two switch-window cases), so the deletion
+ratchet moves it to the archive. The archived record must keep both run identifiers and both unchanged assertion
+messages so a rescue starts from MissionManager's reconcile panel release rather than a timeout.
+
 FNXC:TestFlakeRegister 2026-10-08-08:12:
 Entries 33 and 34 record first sightings from the fork's Full Suite: an AutomationStore due-run claim that
 straddled a cron minute edge, and an AgentDetailView log-stream subscription read before its effect flushed.
 Both stay active first sightings with their mechanisms marked unmeasured, so a second appearance follows the
 file-level quarantine rule instead of a timeout, retry, or weakened assertion.
+
+FNXC:TestFlakeRegister 2026-10-08-08:41:
+Entry 35 records a first sighting from the fork's Windows lane: two assertion or query failures in the durable agent
+Activity analytics file, which is outside the Windows ledger and passes on Linux. The mechanism is marked unmeasured,
+so a second appearance follows the file-level quarantine rule instead of a timeout, retry, or weakened assertion.
+
+FNXC:TestFlakeRegister 2026-10-08-09:04:
+Entry 36 records a first sighting from the fork's Full Suite: a WorkflowNodeEditor edge-targeted fragment pick saved a
+graph that still held the original edge. The commit under test did not touch the editor and the mechanism is unmeasured,
+so a second appearance follows the file-level quarantine rule instead of a timeout, retry, or weakened assertion.
 */
 test("observed-flake register active count, escalation state, and owners stay synchronized", () => {
   const register = readFileSync(registerPath, "utf8");
@@ -220,10 +235,6 @@ test("observed-flake register active count, escalation state, and owners stay sy
       status: "Active first sighting — recorded 2026-10-07, unattributed.",
     },
     {
-      heading: "29. MissionManager reconcile control switch-window cases",
-      status: "Active first sighting — recorded 2026-10-08, unattributed.",
-    },
-    {
       heading: "30. Instance-scoped OAuth refresh hanging-request bound",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
@@ -241,6 +252,14 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "34. AgentDetailView log history SSE suspend and reopen subscription",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+    },
+    {
+      heading: "35. Durable agent Activity analytics heartbeat session count and usage-event identity",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+    },
+    {
+      heading: "36. WorkflowNodeEditor edge-targeted fragment pick splice",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
   ]);
@@ -339,6 +358,29 @@ test("archived Planning Mode ui-interactions quarantine retains both-sighting ev
     "deletion deadline 2026-10-22",
   ]) {
     assert.ok(entry.includes(evidence), `Archived Planning Mode ui-interactions entry is missing ${evidence}`);
+  }
+  assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
+});
+
+test("archived MissionManager reconcile quarantine retains both-sighting evidence", () => {
+  const register = readFileSync(registerPath, "utf8");
+  const archive = register.match(/## Archive — closed records\n([\s\S]*)$/)?.[1];
+  assert.ok(archive, "Expected an Archive — closed records section");
+  const entry = archive.match(/^### 29\. MissionManager reconcile control switch-window cases\n([\s\S]*?)(?=^### |(?![\s\S]))/m)?.[1];
+  assert.ok(entry, "Expected archived MissionManager reconcile quarantine entry");
+
+  for (const evidence of [
+    "packages/dashboard/app/components/__tests__/MissionManager.reconcile.test.tsx",
+    "silently discards preview resolution and rejection in the pre-commit switch window",
+    "refuses a same-batch retained-panel apply click so no write reaches the abandoned mission",
+    "37720328009",
+    "37742324890",
+    'expected "vi.fn()" to be called 2 times, but got 1 times',
+    'Unable to find an element by: [data-testid="mission-reconcile-apply"]',
+    "quarantined 2026-10-08",
+    "deletion deadline 2026-10-22",
+  ]) {
+    assert.ok(entry.includes(evidence), `Archived MissionManager reconcile entry is missing ${evidence}`);
   }
   assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
 });
