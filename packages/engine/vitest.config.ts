@@ -398,8 +398,10 @@ export default defineConfig({
             inMemoryDb. These tests exercise the SQLite Database class being deleted in this feature.
             Quarantined on sight per AGENTS.md; mirrored in scripts/lib/test-quarantine.json.
             */
-            // SQLite-path gate test evicted + quarantined (see engine-core comment + ledger).
-            "src/__tests__/agent-activity-writers.test.ts",
+            /*
+            FNXC:AgentActivityStream 2026-10-08-00:26:
+            agent-activity-writers.test.ts is rescued into engine-default (not re-admitted to engine-core). Its sightings were cross-test leakage: executors left subscribed to the shared PostgreSQL store acted on the next test's KB-001, plus a completion fixture that predated the confirmed-merge finalizer. The file now detaches per-test store listeners; the exclude and ledger row were removed in lockstep.
+            */
             /*
             FNXC:ExecutorPauseResumeQuarantine 2026-10-05-17:10:
             FN-9510's second full-suite sighting again observed zero agent creations only under
