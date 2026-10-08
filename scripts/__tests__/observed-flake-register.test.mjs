@@ -191,6 +191,11 @@ FNXC:TestFlakeRegister 2026-10-08-08:41:
 Entry 35 records a first sighting from the fork's Windows lane: two assertion or query failures in the durable agent
 Activity analytics file, which is outside the Windows ledger and passes on Linux. The mechanism is marked unmeasured,
 so a second appearance follows the file-level quarantine rule instead of a timeout, retry, or weakened assertion.
+
+FNXC:TestFlakeRegister 2026-10-08-09:04:
+Entry 36 records a first sighting from the fork's Full Suite: a WorkflowNodeEditor edge-targeted fragment pick saved a
+graph that still held the original edge. The commit under test did not touch the editor and the mechanism is unmeasured,
+so a second appearance follows the file-level quarantine rule instead of a timeout, retry, or weakened assertion.
 */
 test("observed-flake register active count, escalation state, and owners stay synchronized", () => {
   const register = readFileSync(registerPath, "utf8");
@@ -251,6 +256,10 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "35. Durable agent Activity analytics heartbeat session count and usage-event identity",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+    },
+    {
+      heading: "36. WorkflowNodeEditor edge-targeted fragment pick splice",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
   ]);

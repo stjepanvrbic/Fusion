@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, 34, and 35), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **18 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **13 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, 34, 35, and 36), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **18 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -430,7 +430,7 @@ No timeout, retry, or assertion changed, and the file is not quarantined because
 - **File:** `packages/core/src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts`
 - **Exact tests:** two cases in `durable agent Activity analytics`: `turns a production durable no-task heartbeat into Activity sessions and tool usage` and `sums CLI and agent sessions, honors the range, and isolates the bound project`.
 - **Observed tree/SHA:** fork Full Suite (non-blocking) run [37742324890](https://github.com/stjepanvrbic/Fusion/actions/runs/37742324890) at `668244c5ed0e2b23eee7e0c9814d82a0f5e3587e`, job `Windows tests` (`113195659917`), `@fusion/core`. The Windows lane flagged the file as outside its known-failing list. The same file is not excluded on Linux, and no Linux shard of that run failed it. The file was never in the Windows ledger, and the KB-035 commit did not touch the core entries.
-- **Observed frequency:** 2 failures in the 4 cases of the file, both assertion or query failures, not timeouts. The file did not appear among the unexpected failures of Windows runs 37720328009, 37720611351, or 37735335086.
+- **Observed frequency:** 2 failures in the 4 cases of the file, both assertion or query failures, not timeouts. The file did not appear among the unexpected failures of Windows runs 37720328009, 37720611351, 37735335086, or 37744337717 (`74d0bdf8a`), so it failed in 1 of 5 recent Windows runs.
 
 The first case ran the production heartbeat to `completed` (the log shows one tool call), then failed `expect(activity.sessions).toBeGreaterThan(0)` with `expected 0 to be greater than 0` at test line 129. The second case failed at its first statement, the insert into `project.usage_events` at line 145, with `duplicate key value violates unique constraint "usage_events_pkey"` and `Key (project_id, id)=(durable-project, 2) already exists`. That column is `generatedAlwaysAsIdentity` and the insert supplies no id, so the identity counter had handed out an id that a row for the same project already held.
 
@@ -439,9 +439,32 @@ Hypothesis, not measured: both failures are one defect in the usage-event identi
 | run | result |
 |---|---|
 | Full Suite 37742324890 (`668244c5e`), Windows `@fusion/core` | **failed** (both cases) |
+| Full Suite 37744337717 (`74d0bdf8a`), Windows `@fusion/core` | not among the unexpected failures |
 | `pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts --reporter=dot` with `FUSION_PG_TEST_URL_BASE=postgresql://postgres:postgres@localhost:55432`, local Windows, `c89b0ea0b` plus the quarantine commit | passed, 4 tests |
 
 No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the core vitest config. Before quarantining, check whether the harness database for these cases can carry rows from an earlier case or a prior run, and whether the heartbeat's usage-event write can be rejected without failing the heartbeat.
+
+### 36. WorkflowNodeEditor edge-targeted fragment pick splice
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/dashboard/app/components/__tests__/WorkflowNodeEditor.test.tsx`
+- **Exact test:** `WorkflowNodeEditor simplified view modes > splices an edge-targeted fragment pick into the targeted edge`.
+- **Observed tree/SHA:** fork Full Suite (non-blocking) run [37744337717](https://github.com/stjepanvrbic/Fusion/actions/runs/37744337717/job/113202144603) at `74d0bdf8af314543008f0d169c28a6493d76203a` (Linux, `ubuntu-latest`), job `Test shard 4/4` (`113202144603`), command `@fusion/dashboard run test:quality:app:components-b`, project `dashboard-app-quality-components-b`. That commit (KB-036) changed no file named for `WorkflowNodeEditor`; its dashboard changes are `file-service.ts` and four tests under `packages/dashboard/src/__tests__/`. The same shard passed in the Full Suite runs for `70d326790` (37741630295), `0b74a0c2c` (37742189681), and `668244c5e` (37742324890).
+- **Observed frequency:** 1 failure, in a command that reported 1790 tests (1 failed, 1789 passed).
+
+The failure was `AssertionError: expected true to be false // Object.is equality` at `WorkflowNodeEditor.test.tsx:4590`, the assertion that no edge from `merge` to `end` remains after the pick. The line before it, `expect(insertedGate).toBeDefined()`, passed, so the fragment's gate was in the saved IR while the original `merge` to `end` edge had not been removed. `updateWorkflow` had been called exactly once, so the test saved a graph in which the fragment was added but not spliced into the targeted edge.
+
+Hypothesis, not measured: the pick adds the fragment nodes and rewires the targeted edge in separate state updates, and the test saves as soon as the add-step window unmounts, so a starved shard can serialize the intermediate graph. The log does not show the editor state at save time, so this is a reading of the assertion order only.
+
+| run | result |
+|---|---|
+| Full Suite 37741630295 (`70d326790`), shard 4/4 | passed |
+| Full Suite 37742189681 (`0b74a0c2c`), shard 4/4 | passed |
+| Full Suite 37742324890 (`668244c5e`), shard 4/4 | passed |
+| Full Suite 37744337717 (`74d0bdf8a`), shard 4/4 | **failed** (this case) |
+| `pnpm exec vitest run app/components/__tests__/WorkflowNodeEditor.test.tsx --project dashboard-app-quality-components-b --reporter=dot` in `packages/dashboard`, local Windows, `83829b7cf` | passed, 191 tests, 34 s wall |
+
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting and the file carries 190 other cases. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. Before quarantining, read how the add-step fragment pick commits its splice in `WorkflowNodeEditor`, and whether the save handler can read the graph between those updates.
 
 ### Common shape and investigated result
 
