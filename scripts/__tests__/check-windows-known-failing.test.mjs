@@ -233,7 +233,7 @@ test("CLI: an unknown --package exits 2 and names every supported package", () =
   for (const key of Object.keys(PACKAGE_DIRS)) assert.ok(run.stderr.includes(key), key);
 });
 
-test("the committed ledger names only existing files and stays at or under its ceiling", () => {
+test("the committed ledger names only existing files and its entry count equals its ceiling", () => {
   const ledger = readKnownFailing();
   assert.ok(Number.isInteger(ledger.ceiling) && ledger.ceiling > 0);
   let total = 0;
@@ -256,6 +256,14 @@ test("the committed ledger names only existing files and stays at or under its c
     }
     total += files.length;
   }
-  assert.ok(total <= ledger.ceiling, `ledger has ${total} entries, above its ceiling of ${ledger.ceiling}; it may only shrink`);
+  /*
+  FNXC:CI 2026-10-08-08:29:
+  KB-053: after a removal the ceiling must equal the entry count, so a shrink can never leave headroom that would let the ledger silently regrow.
+  */
+  assert.equal(
+    total,
+    ledger.ceiling,
+    `ledger has ${total} entries but its ceiling is ${ledger.ceiling}; lower the ceiling to the entry count when removing entries (the ledger may only shrink)`,
+  );
   assert.equal(JSON.parse(readFileSync(path.join(repoRoot, "scripts/lib/windows-known-failing-tests.json"), "utf8")).ceiling, ledger.ceiling);
 });
