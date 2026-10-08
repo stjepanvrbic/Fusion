@@ -215,6 +215,10 @@ assertion message so a rescue starts from MailboxView's load-more handling rathe
 FNXC:TestFlakeRegister 2026-10-08-10:38:
 KB-060 measured entry 36 as a hydration-window race (the toolbar click captured a null append edge before the graph
 loaded) and landed a deterministic test wait. It stays an active first sighting; only the status attribution changes.
+
+FNXC:TestFlakeRegister 2026-10-08-07:19:
+KB-043 recorded the operator-reported transient sqlite-migrator SQLite open failures as active entry 37 (renumbered at merge; main had taken 33 through 36), so the
+pinned active inventory gains that record; the signal-routes teardown flake was already entry 25.
 */
 /*
 FNXC:TestFlakeRegister 2026-10-08-01:13:
@@ -272,6 +276,10 @@ test("observed-flake register active count, escalation state, and owners stay sy
     {
       heading: "36. WorkflowNodeEditor edge-targeted fragment pick splice",
       status: "Active first sighting — recorded 2026-10-08, attributed by KB-060; deterministic test repair landed, with a second sighting requiring file-level quarantine.",
+    },
+    {
+      heading: "37. SQLite-to-PostgreSQL migrator transient SQLite open failure",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
   ]);
 });

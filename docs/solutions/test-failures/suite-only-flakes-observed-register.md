@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **10 active observation records** (entries 2, 13, 20, 21, 25, 27, 32, 33, 35, and 36): nine **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **21 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 27, 32, 33, 35, 36, and 37): ten **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **21 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -45,6 +45,15 @@ loaded 27-worker re-measurement green; merged 2026-08-16 as ae507afc37). No sigh
 the landed fix, the same lie-about-ownership failure FN-9146's note fixed for FN-9146. The
 record stays physically in the active section because the pinned campaign-evidence test reads
 its per-run table in place, mirroring the entry 7 precedent.
+-->
+
+<!--
+FNXC:TestFlakeRegister 2026-10-08-07:19:
+KB-043 recorded the operator-reported pair of transient sqlite-migrator `unable to open database file` failures as entry 33, a single first-sighting record whose next sighting is an immediate file-level quarantine.
+The operator's second listed flake, the register-signal-routes teardown timeout, was already entry 25, so no duplicate line was added.
+
+FNXC:TestFlakeRegister 2026-10-08-13:53:
+The KB-043 record lands as entry 37 because main had already assigned entries 33 through 36 when it merged.
 -->
 
 ## Active observation records
@@ -454,6 +463,18 @@ KB-060 made both edge-targeted splice tests (this fragment case and the `'as opt
 | KB-060, targeted command, 5 runs, plus the whole file, after the repair | 5/5 passed; 191 passed |
 
 No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting and the file carries 190 other cases. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. Before quarantining, check whether the failing click still precedes the `wf-simple-node-gate` wait, and whether the toolbar append edge is still captured at open time.
+
+### 37. SQLite-to-PostgreSQL migrator transient SQLite open failure
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/core/src/__tests__/postgres/sqlite-migrator.test.ts`
+- **Exact test:** `SQLite-to-PostgreSQL migrator` (case and hook not pinned; the operator reported the error, not the failing case).
+- **Observed tree/SHA:** not pinned. The operator reported the two sightings without a run, commit, or host. The failed-job logs of the 54 failed Full Suite runs on the fork from 37669894876 through 37735335086 contain no `unable to open database file` line. The Windows tests job in those logs prints only info lines from this file and no per-file failure text, so a Windows-lane sighting can be neither confirmed nor ruled out from them.
+- **Observed frequency:** 2 transient failures reported by the operator. A rerun of the file alone on local Windows at `70d326790`, against a throwaway PostgreSQL 16 container, passed all 46 tests in 60.4 s.
+
+The error was `unable to open database file`, raised by SQLite when it cannot open a database path. In this file every case opens SQLite in its `beforeEach` through `setupCtx()`, which creates a `fusion-migrate-` directory under the system temp directory and then opens `fusion.db` and `archive.db` there in `buildPopulatedSqliteProject` and `buildPopulatedSqliteArchive`. Several cases also open `new DatabaseSync(sqlitePath)` inline. The same error class was recorded by the FN-6610 engine isolation rescue in `docs/testing.md`, where a redirected temp or `.fusion` parent vanished under package load; that is a known mode, not a diagnosis of these sightings. The file is also listed under `@fusion/core` in `scripts/lib/windows-known-failing-tests.json`, from the ledger's first recording (run 37678193811); ledger membership is a separate mechanism from this register.
+
+The operator designated the two transient observations as this file's single first-sighting record. No timeout, retry, or assertion changed, and the file is not quarantined. The next sighting is an immediate same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the inline `exclude` array of `packages/core/vitest.config.ts`, not another register line. That sighting should pin the run, commit, host OS, and failing case or hook.
 
 ### Common shape and investigated result
 
