@@ -1,9 +1,11 @@
 import { EventEmitter } from "node:events";
-import { fork, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
-  killProcessTree,
+  superviseSpawn,
+  SUPERVISE_NO_LIFETIME_CAP,
+  type SupervisedChild,
   type TaskStore,
   type CentralCore,
 } from "@fusion/core";
@@ -118,9 +120,12 @@ const CHILD_SIGKILL_GRACE_MS = 5_000;
 /** How long to wait for the exit event after a force kill before giving up on observing it. */
 const CHILD_EXIT_AFTER_SIGKILL_MS = 5_000;
 
-/** One forked child and the IPC host bound to it. */
+/** One supervised worker child and the IPC host bound to it. */
 interface ChildGeneration {
   readonly id: number;
+  /** Supervisor handle; its kill reaches the worker's process group (POSIX) or tree (Windows). */
+  readonly supervised: SupervisedChild;
+  /** `supervised.child`, kept for IPC, output draining, and exit observation. */
   readonly child: ChildProcess;
   readonly ipcHost: IpcHost;
   /** Set once the generation's failure was reported or it was retired; later exit/disconnect/heartbeat signals from it are ignored. */
@@ -150,7 +155,12 @@ function hasExited(child: ChildProcess): boolean {
  * Each fork is a generation that reports at most one failure: a crash fires both `exit` and IPC `disconnect`, and missed heartbeats keep firing, but they cost one restart attempt, not several.
  * A child is retired before its replacement starts or stop() returns: its listeners stop forwarding, it gets SIGTERM (a process-tree kill on Windows), and a SIGKILL bound to that child, not to a mutable field, if it ignores the signal. Termination is judged by its exit, not by `child.killed`, which only means a signal was sent.
  * A child whose START_RUNTIME fails is killed rather than left running, and its piped stdout/stderr are drained into the runtime log so a chatty worker cannot block on a full pipe.
- * Spawning through `superviseSpawn` is deferred: its default lifetime cap would kill a long-lived runtime child, and the worker exits on its own when the host's IPC channel closes.
+ *
+ * FNXC:ChildProcessRuntime 2026-10-08-05:13:
+ * The worker is spawned through `superviseSpawn` (AGENTS.md process supervision) with `maxLifetimeMs: SUPERVISE_NO_LIFETIME_CAP`, so no lifetime timer can kill a long-lived runtime.
+ * The spawn matches the former `fork`: the same Node binary, the worker path, piped stdout/stderr plus an IPC channel, and no inherited exec args.
+ * Parent exit, termination signals, and fatal errors now reap the worker's process group (POSIX) or tree (Windows); retirement signals through the supervised handle for the same reach.
+ * The worker's own exit on IPC disconnect remains a backstop.
  *
  * @example
  * ```typescript
@@ -222,7 +232,7 @@ export class ChildProcessRuntime
    *
    * Startup sequence:
    * 1. Set status to "starting"
-   * 2. Fork child process pointing to worker entry point
+   * 2. Spawn the supervised worker child process
    * 3. Set up IPC host with the child process
    * 4. Send START_RUNTIME command with serialized config
    * 5. Wait for OK response or timeout (10s)
@@ -259,15 +269,19 @@ export class ChildProcessRuntime
 
     this.generation += 1;
 
-    runtimeLog.log(`Forking child process: ${workerPath}`);
+    runtimeLog.log(`Spawning supervised child process: ${workerPath}`);
 
-    // Fork child process
-    const child = fork(workerPath, [], {
-      silent: true, // Pipe stdout/stderr
-      execArgv: [], // Don't inherit exec arguments
+    // Equivalent of fork(workerPath, [], { silent: true, execArgv: [] }) under process supervision.
+    const supervised = superviseSpawn(process.execPath, [workerPath], {
+      stdio: ["pipe", "pipe", "pipe", "ipc"],
+      windowsHide: true,
+      // A runtime lives as long as its project; only retirement or parent-death teardown ends it.
+      maxLifetimeMs: SUPERVISE_NO_LIFETIME_CAP,
     });
+    const child = supervised.child;
     const gen: ChildGeneration = {
       id: this.generation,
+      supervised,
       child,
       ipcHost: new IpcHost(child, { commandTimeoutMs: 10000 }),
       settled: false,
@@ -418,14 +432,15 @@ export class ChildProcessRuntime
     if (this.current === gen) this.current = null;
     gen.ipcHost.removeAllListeners();
 
-    const termination = this.terminate(gen.child);
+    const termination = this.terminate(gen);
     this.terminations.add(termination);
     void termination.finally(() => this.terminations.delete(termination));
     return termination;
   }
 
-  /** SIGTERM (a tree kill on Windows), then SIGKILL after a grace period, both bound to this child. */
-  private terminate(child: ChildProcess): Promise<void> {
+  /** SIGTERM, then SIGKILL after a grace period, both through this generation's supervised handle (group kill on POSIX, tree kill on Windows). */
+  private terminate(gen: ChildGeneration): Promise<void> {
+    const { child, supervised } = gen;
     if (hasExited(child)) return Promise.resolve();
 
     return new Promise<void>((resolve) => {
@@ -434,7 +449,7 @@ export class ChildProcessRuntime
         if (hasExited(child)) return finish();
         runtimeLog.warn("Force killing child process");
         try {
-          child.kill("SIGKILL");
+          supervised.kill("SIGKILL");
         } catch {
           // already gone
         }
@@ -453,12 +468,8 @@ export class ChildProcessRuntime
 
       runtimeLog.log("Killing child process");
       try {
-        if (process.platform === "win32") {
-          // Windows has no graceful SIGTERM and `kill` ends only the direct child; take the worker's agents with it.
-          killProcessTree(child);
-        } else {
-          child.kill("SIGTERM");
-        }
+        // The supervisor owns the platform split: a taskkill tree kill on Windows, a process-group signal on POSIX.
+        supervised.kill("SIGTERM");
       } catch {
         // already gone; the exit event or the escalation settles it
       }

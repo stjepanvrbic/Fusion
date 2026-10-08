@@ -960,7 +960,7 @@ Operator setup + troubleshooting guide: **[Remote Access runbook](./remote-acces
 - Orchestration: `ProjectManager` and `HybridExecutor`
 - Runtime implementations:
   - `runtimes/in-process-runtime.ts`
-  - `runtimes/child-process-runtime.ts`
+  - `runtimes/child-process-runtime.ts` (worker spawned through `superviseSpawn` with `SUPERVISE_NO_LIFETIME_CAP`, so parent-death teardown reaps it but no lifetime timer does)
   - `runtimes/remote-node-runtime.ts`
 - IPC protocol/transport:
   - `ipc/ipc-protocol.ts`

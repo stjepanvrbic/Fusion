@@ -10,6 +10,7 @@ import {
   __resetProcessSupervisorForTests,
   __terminateSupervisedChildrenForTests,
   releaseSupervisedChild,
+  SUPERVISE_NO_LIFETIME_CAP,
   superviseSpawn,
 } from "../process/process-supervisor.js";
 import { __setProcessTreeKillLauncherForTests, killProcessTreeByPid } from "../process/windows-launch.js";
@@ -119,7 +120,7 @@ describe("process-supervisor", () => {
       // arm a lifetime timer here: matching the old 5s lifetime with the 5s
       // waitFor windows made the explicit teardown race maxLifetime cleanup
       // under broad-suite load.
-      maxLifetimeMs: Number.POSITIVE_INFINITY,
+      maxLifetimeMs: SUPERVISE_NO_LIFETIME_CAP,
     });
 
     await waitFor(() => Number.parseInt(readFileSync(grandchildPidFile, "utf8"), 10) > 0);
@@ -480,6 +481,84 @@ describe("process-supervisor win32 tree kill", () => {
 
     killProcessTreeByPid(778, "SIGKILL", { sync: true, onSettled: settled });
     expect(settled).toHaveBeenCalledTimes(2);
+  });
+});
+
+/*
+FNXC:ProcessLifecycle 2026-10-08-05:13:
+Long-lived children opt out of the 10-minute default cap with SUPERVISE_NO_LIFETIME_CAP and are still reaped by parent-death teardown; an omitted maxLifetimeMs keeps the default cap.
+The platform is pinned to POSIX and process.kill is faked so the fake pid's group kill never reaches the OS.
+*/
+describe("process-supervisor lifetime cap", () => {
+  let groupKills: Array<{ pid: number; signal: string | number | undefined }> = [];
+
+  function installPosixFake(fake: FakeChild): void {
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    groupKills = [];
+    vi.spyOn(process, "kill").mockImplementation((pid: number, signal?: string | number) => {
+      groupKills.push({ pid, signal });
+      if (pid === -fake.pid && fake.exitCode === null && fake.signalCode === null) {
+        const exitSignal = typeof signal === "string" ? (signal as NodeJS.Signals) : "SIGTERM";
+        fake.signalCode = exitSignal;
+        fake.emit("exit", null, exitSignal);
+        fake.emit("close", null, exitSignal);
+      }
+      return true;
+    });
+  }
+
+  function spawnFake(fake: FakeChild, maxLifetimeMs?: number) {
+    return superviseSpawn(process.execPath, ["worker.js"], {
+      spawnImpl: (() => fake as unknown as ChildProcess) as unknown as typeof nodeSpawn,
+      killGraceMs: 100,
+      ...(maxLifetimeMs === undefined ? {} : { maxLifetimeMs }),
+    });
+  }
+
+  afterEach(() => {
+    __resetProcessSupervisorForTests();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("arms no lifetime timer for SUPERVISE_NO_LIFETIME_CAP, even after 24 hours", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChild();
+    installPosixFake(fake);
+    spawnFake(fake, SUPERVISE_NO_LIFETIME_CAP);
+
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+
+    expect(groupKills).toEqual([]);
+    expect(fake.kill).not.toHaveBeenCalled();
+    expect(__getProcessSupervisorStateForTests().registrySize).toBe(1);
+  });
+
+  it("keeps the 10-minute default cap when maxLifetimeMs is omitted", async () => {
+    vi.useFakeTimers();
+    const fake = new FakeChild();
+    installPosixFake(fake);
+    const supervised = spawnFake(fake);
+
+    await vi.advanceTimersByTimeAsync(599_999);
+    expect(groupKills).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(groupKills).toEqual([{ pid: -4242, signal: "SIGTERM" }]);
+    await expect(supervised.waitExit()).resolves.toEqual({ code: null, signal: "SIGTERM" });
+    expect(__getProcessSupervisorStateForTests().registrySize).toBe(0);
+  });
+
+  it("still reaps a SUPERVISE_NO_LIFETIME_CAP child on parent-death teardown", async () => {
+    const fake = new FakeChild();
+    installPosixFake(fake);
+    const supervised = spawnFake(fake, SUPERVISE_NO_LIFETIME_CAP);
+
+    await __terminateSupervisedChildrenForTests("no-lifetime-cap");
+
+    expect(groupKills).toEqual([{ pid: -4242, signal: "SIGTERM" }]);
+    await expect(supervised.waitExit()).resolves.toEqual({ code: null, signal: "SIGTERM" });
+    expect(__getProcessSupervisorStateForTests().registrySize).toBe(0);
   });
 });
 

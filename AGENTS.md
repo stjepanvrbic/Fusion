@@ -273,7 +273,7 @@ User `moveTask(in-progress → todo)` is a hard cancel: abort active sessions/su
 
 #### Process supervision
 
-Use `superviseSpawn(...)` from `@fusion/core` for managed child processes; do not use raw detached `spawn`/`nohup` patterns unless explicitly allowlisted. `eslint.config.mjs` + `scripts/check-no-nohup.mjs` enforce this.
+Use `superviseSpawn(...)` from `@fusion/core` for managed child processes; do not use raw detached `spawn`/`nohup` patterns unless explicitly allowlisted. `eslint.config.mjs` + `scripts/check-no-nohup.mjs` enforce this. An omitted `maxLifetimeMs` arms a 10-minute cap, so long-lived managed children must pass `maxLifetimeMs: SUPERVISE_NO_LIFETIME_CAP` instead of falling back to a raw `spawn`/`fork` (example: the `ChildProcessRuntime` project worker).
 
 #### Never use position-based `git stash`
 

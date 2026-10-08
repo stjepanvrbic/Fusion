@@ -22,6 +22,15 @@ export const FUSION_NON_RETRYABLE_EXIT_CODE = 87;
 
 const DEFAULT_KILL_GRACE_MS = 2_000;
 const DEFAULT_MAX_LIFETIME_MS = 600_000;
+
+/**
+ * FNXC:ProcessLifecycle 2026-10-08-05:13:
+ * Explicit opt-out of the supervisor's 10-minute default lifetime cap.
+ * Long-lived managed children (the ChildProcessRuntime project worker) must pass `maxLifetimeMs: SUPERVISE_NO_LIFETIME_CAP` instead of spawning raw, because an omitted `maxLifetimeMs` arms the default cap and would SIGTERM them.
+ * Such children arm no lifetime timer but stay registered, so parent exit, termination signals, and fatal errors still tear down their process group (POSIX) or tree (Windows).
+ * The value is `Number.POSITIVE_INFINITY`, which the published plugin SDK shim already treats as "no cap".
+ */
+export const SUPERVISE_NO_LIFETIME_CAP = Number.POSITIVE_INFINITY;
 const MAX_KILL_WAIT_MS = 1_000;
 const DEFAULT_STDIO_RELEASE_GRACE_MS = 1_000;
 /*
@@ -48,6 +57,13 @@ export interface SuperviseSpawnOptions extends Omit<SpawnOptions, "detached"> {
   /**
    * Maximum time a supervised child may live before the supervisor forces it
    * down. The timer is `unref()`'d so it never keeps the parent process alive.
+   *
+   * - `undefined` → the 600 000 ms (10 minute) default cap.
+   * - finite positive → that cap.
+   * - {@link SUPERVISE_NO_LIFETIME_CAP} → no lifetime timer; the preferred explicit opt-out for long-lived children.
+   * - `0`, negative, or other non-finite values → no lifetime timer (legacy behavior, unchanged).
+   *
+   * Every case remains subject to parent-death teardown.
    */
   maxLifetimeMs?: number;
   /**
@@ -438,6 +454,7 @@ export function superviseSpawn(
     log.warn(`spawned child without pid for command=${command}`);
   }
 
+  // Only a finite positive cap arms the timer; SUPERVISE_NO_LIFETIME_CAP (Infinity), 0, and negatives arm none.
   if (Number.isFinite(maxLifetimeMs) && maxLifetimeMs > 0) {
     entry.lifetimeTimer = setTimeout(() => {
       log.warn(`maxLifetime exceeded for pid=${entry.pid ?? "unknown"} after ${maxLifetimeMs}ms`);

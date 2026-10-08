@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import type { CentralCore, Task } from "@fusion/core";
 import { ChildProcessRuntime } from "../child-process-runtime.js";
 import type {
@@ -42,45 +43,58 @@ type MockChildProcess = EventEmitter & {
   send: ReturnType<typeof vi.fn>;
   kill: ReturnType<typeof vi.fn>;
   disconnect: ReturnType<typeof vi.fn>;
-  stdout: EventEmitter;
-  stderr: EventEmitter;
+  stdout: PassThrough;
+  stderr: PassThrough;
+  stdio: Array<PassThrough | null>;
   pid: number;
+  /** `close` was emitted, so the process supervisor deregistered this child. */
+  closed: boolean;
   connected: boolean;
   killed: boolean;
   exitCode: number | null;
   signalCode: string | null;
   sentMessages: CommandMessage[];
-  /** Exit as a real process does: the IPC channel closes, then `exit` fires. */
+  /** Exit as a real process does: the IPC channel closes, then `exit` and `close` fire. */
   exitNow: (code: number | null, signal: string | null) => void;
 };
 
-const forkedChildren: MockChildProcess[] = [];
-/** Forked children that have not exited; the runtime must never hold more than one. */
+const workerChildren: MockChildProcess[] = [];
+/** Worker children that have not exited; the runtime must never hold more than one. */
 const liveChildren = new Set<MockChildProcess>();
 let maxLiveChildren = 0;
-const queuedForkOptions: MockChildOptions[] = [];
+const queuedWorkerOptions: MockChildOptions[] = [];
 
 let nextPid = 5000;
 
 function createMockChildProcess(options: MockChildOptions = {}): MockChildProcess {
   const pingResults = [...(options.pingResults ?? [])];
 
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
   const child = Object.assign(new EventEmitter(), {
-    stdout: new EventEmitter(),
-    stderr: new EventEmitter(),
+    stdout,
+    stderr,
+    // The supervisor may destroy stdio after a kill; stdin and the IPC slot are not streams here.
+    stdio: [null, stdout, stderr, null],
     pid: nextPid++,
+    closed: false,
     exitCode: null as number | null,
     signalCode: null as string | null,
     exitNow: (code: number | null, signal: string | null) => {
-      if (child.exitCode !== null || child.signalCode !== null) return;
-      child.exitCode = code;
-      child.signalCode = signal;
+      if (child.closed) return;
+      if (child.exitCode === null && child.signalCode === null) {
+        child.exitCode = code;
+        child.signalCode = signal;
+      }
       liveChildren.delete(child);
       if (child.connected) {
         child.connected = false;
         child.emit("disconnect");
       }
-      child.emit("exit", code, signal);
+      child.emit("exit", child.exitCode, child.signalCode);
+      // `close` settles the supervisor's waitExit and deregisters the child.
+      child.closed = true;
+      child.emit("close", child.exitCode, child.signalCode);
     },
     send: vi.fn((message: CommandMessage, callback?: (error: Error | null) => void) => {
       child.sentMessages.push(message);
@@ -148,39 +162,47 @@ function createMockChildProcess(options: MockChildOptions = {}): MockChildProces
   return child;
 }
 
-const mockFork = vi.fn(() => {
-  const options = queuedForkOptions.shift() ?? {};
+/** Worker creation through the process supervisor's spawn: `spawn(process.execPath, [workerPath], { stdio: [..., "ipc"] })`. */
+const mockWorkerSpawn = vi.fn((_command: string, _args: string[], _options: { stdio?: unknown[] }) => {
+  const options = queuedWorkerOptions.shift() ?? {};
   const child = createMockChildProcess(options);
-  forkedChildren.push(child);
+  workerChildren.push(child);
   maxLiveChildren = Math.max(maxLiveChildren, liveChildren.size);
   return child;
 });
 
 // taskkill for the Windows tree kill; resolves the target's exit like the real one.
-const mockSpawn = vi.fn((_command: string, args: string[]) => {
+function mockTaskkill(args: string[]) {
   const killer = Object.assign(new EventEmitter(), { unref: vi.fn() });
   const pid = Number(args[1]);
   queueMicrotask(() => {
-    forkedChildren.find((child) => child.pid === pid)?.exitNow(1, null);
+    workerChildren.find((child) => child.pid === pid)?.exitNow(1, null);
     killer.emit("exit", 0);
   });
   return killer;
+}
+
+/** Every `node:child_process` spawn: the supervised worker (IPC stdio) or a taskkill tree kill. */
+const mockSpawn = vi.fn((command: string, args: string[], options: { stdio?: unknown[] } = {}) => {
+  if (command === process.execPath && Array.isArray(options.stdio) && options.stdio.includes("ipc")) {
+    return mockWorkerSpawn(command, args, options);
+  }
+  return mockTaskkill(args);
 });
 
 vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:child_process")>()),
-  fork: (...args: unknown[]) => (mockFork as (...mockArgs: unknown[]) => unknown)(...args),
   spawn: (...args: unknown[]) => (mockSpawn as (...mockArgs: unknown[]) => unknown)(...args),
 }));
 
 function queueChild(options: MockChildOptions = {}): void {
-  queuedForkOptions.push(options);
+  queuedWorkerOptions.push(options);
 }
 
 function getLatestChild(): MockChildProcess {
-  const child = forkedChildren.at(-1);
+  const child = workerChildren.at(-1);
   if (!child) {
-    throw new Error("Expected a forked child process");
+    throw new Error("Expected a spawned worker child process");
   }
   return child;
 }
@@ -220,14 +242,26 @@ describe("ChildProcessRuntime", () => {
   };
 
   beforeEach(() => {
-    mockFork.mockClear();
+    mockWorkerSpawn.mockClear();
     mockSpawn.mockClear();
-    forkedChildren.length = 0;
-    queuedForkOptions.length = 0;
+    workerChildren.length = 0;
+    queuedWorkerOptions.length = 0;
     liveChildren.clear();
     maxLiveChildren = 0;
     // Termination is platform-specific; the default suite asserts the POSIX signals.
     vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    /*
+    FNXC:ChildProcessRuntime 2026-10-08-05:13:
+    The supervised worker is signalled as a POSIX process group (`process.kill(-pgid)`).
+    Route a mock worker's group kill to that mock; never let a fake pid reach the real process.kill.
+    */
+    vi.spyOn(process, "kill").mockImplementation((pid: number, signal?: string | number) => {
+      if (pid < 0) {
+        const worker = workerChildren.find((child) => child.pid === -pid);
+        if (worker && !worker.closed) (worker.kill as (signal?: string | number) => boolean)(signal);
+      }
+      return true;
+    });
 
     const mockCentralCore = {
       getGlobalConcurrencyState: vi.fn().mockResolvedValue({
@@ -248,13 +282,16 @@ describe("ChildProcessRuntime", () => {
     } catch {
       // Ignore cleanup failures
     }
+    // Safety drain: deregister every mock worker from the process supervisor, or its real parent-exit handler would kill their fake pids on the host.
+    for (const child of workerChildren) child.exitNow(0, null);
+    expect(workerChildren.every((child) => child.closed)).toBe(true);
 
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
   describe("startup sequence", () => {
-    it("transitions stopped → starting → active, forks worker path, and sends START_RUNTIME config", async () => {
+    it("transitions stopped → starting → active, spawns the worker under supervision, and sends START_RUNTIME config", async () => {
       queueChild();
 
       const transitions: RuntimeStatus[] = [];
@@ -266,14 +303,17 @@ describe("ChildProcessRuntime", () => {
 
       expect(transitions).toEqual(["starting", "active"]);
       expect(runtime.getStatus()).toBe("active");
-      expect(mockFork).toHaveBeenCalledWith(
-        expect.stringMatching(/child-process-worker\.(ts|js)$/),
-        [],
+      // `detached: true` is set only by superviseSpawn on POSIX, so it proves the worker is supervised.
+      expect(mockWorkerSpawn).toHaveBeenCalledTimes(1);
+      expect(mockWorkerSpawn).toHaveBeenCalledWith(
+        process.execPath,
+        [expect.stringMatching(/child-process-worker\.(ts|js)$/)],
         expect.objectContaining({
-          silent: true,
-          execArgv: [],
+          stdio: ["pipe", "pipe", "pipe", "ipc"],
+          detached: true,
         })
       );
+      expect(mockWorkerSpawn.mock.calls[0]?.[2]).not.toHaveProperty("execArgv");
 
       const startMessages = getMessages(child, START_RUNTIME);
       expect(startMessages).toHaveLength(1);
@@ -568,7 +608,7 @@ describe("ChildProcessRuntime", () => {
       expect(runtimeAny.healthMonitor.getRestartAttempts()).toBe(1);
 
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(mockFork).toHaveBeenCalledTimes(2);
+      expect(mockWorkerSpawn).toHaveBeenCalledTimes(2);
       expect(runtime.getStatus()).toBe("active");
     });
 
@@ -584,12 +624,12 @@ describe("ChildProcessRuntime", () => {
       await vi.advanceTimersByTimeAsync(15_000);
       await vi.advanceTimersByTimeAsync(1_000);
       expect(first.kill).toHaveBeenCalledWith("SIGTERM");
-      expect(mockFork).toHaveBeenCalledTimes(1);
+      expect(mockWorkerSpawn).toHaveBeenCalledTimes(1);
 
       // The replacement forks only after the old child is gone.
       await vi.advanceTimersByTimeAsync(5_000);
       expect(first.signalCode).toBe("SIGKILL");
-      expect(mockFork).toHaveBeenCalledTimes(2);
+      expect(mockWorkerSpawn).toHaveBeenCalledTimes(2);
       const second = getLatestChild();
 
       first.emit("exit", 137, "SIGKILL");
@@ -597,9 +637,11 @@ describe("ChildProcessRuntime", () => {
       await vi.advanceTimersByTimeAsync(20_000);
 
       expect(second.kill).not.toHaveBeenCalled();
-      expect(mockFork).toHaveBeenCalledTimes(2);
+      expect(mockWorkerSpawn).toHaveBeenCalledTimes(2);
       expect(runtime.getStatus()).toBe("active");
       expect(maxLiveChildren).toBe(1);
+      // Every generation, including the restart, is spawned by the supervisor (its own process group).
+      expect(mockWorkerSpawn.mock.calls.every(([, , options]) => (options as { detached?: boolean }).detached === true)).toBe(true);
     });
 
     it("charges one restart attempt for repeated missed heartbeats from the same child", async () => {
@@ -642,7 +684,7 @@ describe("ChildProcessRuntime", () => {
       await runtime.stop();
       await vi.advanceTimersByTimeAsync(20_000);
 
-      expect(mockFork).toHaveBeenCalledTimes(1);
+      expect(mockWorkerSpawn).toHaveBeenCalledTimes(1);
       expect(liveChildren.size).toBe(0);
       expect(runtime.getStatus()).toBe("stopped");
     });
@@ -685,6 +727,13 @@ describe("ChildProcessRuntime", () => {
 
       await runtime.stop();
 
+      expect(mockWorkerSpawn).toHaveBeenCalledWith(
+        process.execPath,
+        [expect.stringMatching(/child-process-worker\.(ts|js)$/)],
+        expect.objectContaining({ stdio: ["pipe", "pipe", "pipe", "ipc"], detached: false }),
+      );
+      const taskkills = mockSpawn.mock.calls.filter(([command]) => command !== process.execPath);
+      expect(taskkills).toHaveLength(1);
       expect(mockSpawn).toHaveBeenCalledWith(
         // Core resolves taskkill under %SystemRoot%\System32 when it is set.
         expect.stringMatching(/(^|[\\/])taskkill(\.exe)?$/i),
@@ -692,6 +741,24 @@ describe("ChildProcessRuntime", () => {
         expect.objectContaining({ shell: false }),
       );
       expect(liveChildren.size).toBe(0);
+    });
+
+    /*
+    FNXC:ChildProcessRuntime 2026-10-08-05:13:
+    The supervised worker opts out of the supervisor's 10-minute default lifetime cap; a healthy runtime must outlive it.
+    */
+    it("never lifetime-kills a healthy supervised worker past the supervisor's 10-minute default", async () => {
+      vi.useFakeTimers();
+      queueChild({ pingResults: Array(200).fill(true) });
+      await runtime.start();
+      const child = getLatestChild();
+
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+
+      expect(child.kill).not.toHaveBeenCalled();
+      expect(liveChildren.size).toBe(1);
+      expect(mockWorkerSpawn).toHaveBeenCalledTimes(1);
+      expect(runtime.getStatus()).toBe("active");
     });
   });
 
