@@ -10,6 +10,7 @@
  */
 import {TaskStore, storeLog, WORKFLOW_COMPILED_STEP_TEMPLATE_PREFIX, WORKFLOW_MOVE_POLICY_TIMEOUT_MS} from "../store.js";
 import { resolveCapacityPoolId } from "../workflows/workflow-capacity.js";
+import { isTaskExternallyBlocked } from "../tasks/task-external-block.js";
 import {resolveWorkflowIntakeFacts} from "./task-creation.js";
 import {TransitionRejectionError} from "./errors.js";
 import * as schema from "../postgres/schema/index.js";
@@ -1017,13 +1018,25 @@ export async function createWorkflowDefinitionImpl(store: TaskStore, input: Work
     });
   }
 
+/*
+FNXC:ExternalBlock 2026-10-08-08:29:
+A card frozen on an external obstacle is not a running agent, so it never occupies a maxConcurrent column budget.
+Same durable-marker predicate as the live running-agent count, so admission and this in-transaction gate agree about which cards hold a slot.
+*/
+function isFrozenCapacityRow(status: string | null, externalBlock: unknown): boolean {
+  return isTaskExternallyBlocked({
+    status: status as Task["status"],
+    externalBlock: externalBlock == null ? undefined : externalBlock as Task["externalBlock"],
+  });
+}
+
 export function countActiveInCapacitySlotSyncImpl(store: TaskStore, params: { targetColumn: string; workflowId: string; countPending: boolean; excludeTaskId: string; }): number {
     const { targetColumn, workflowId, countPending, excludeTaskId } = params;
     // Candidate rows: in the column now, or (optionally) mid-transition into it.
     // LEFT JOIN the selection row so we can scope by effective workflow id in JS.
     const rows = store.db
       .prepare(
-        `SELECT t.id AS id, t."column" AS col, t.transitionPending AS tp, s.workflowId AS wid
+        `SELECT t.id AS id, t."column" AS col, t.transitionPending AS tp, s.workflowId AS wid, t.status AS st, t.externalBlock AS eb
          FROM tasks t
          LEFT JOIN task_workflow_selection s ON s.taskId = t.id
          WHERE t.deletedAt IS NULL
@@ -1035,12 +1048,15 @@ export function countActiveInCapacitySlotSyncImpl(store: TaskStore, params: { ta
         col: string;
         tp: string | null;
         wid: string | null;
+        st: string | null;
+        eb: string | null;
       }>;
 
     let count = 0;
     for (const row of rows) {
       const effectiveWorkflowId = resolveCapacityPoolId(row.wid);
       if (effectiveWorkflowId !== workflowId) continue;
+      if (isFrozenCapacityRow(row.st, row.eb)) continue;
 
       if (row.col === targetColumn) {
         count += 1;
@@ -1069,6 +1085,8 @@ export async function countActiveInCapacitySlotAsyncImpl(store: TaskStore, param
         col: schema.project.tasks.column,
         tp: schema.project.tasks.transitionPending,
         wid: schema.project.taskWorkflowSelection.workflowId,
+        st: schema.project.tasks.status,
+        eb: schema.project.tasks.externalBlock,
       })
       .from(schema.project.tasks)
       .leftJoin(
@@ -1093,6 +1111,7 @@ export async function countActiveInCapacitySlotAsyncImpl(store: TaskStore, param
     for (const row of rows) {
       const effectiveWorkflowId = resolveCapacityPoolId(row.wid);
       if (effectiveWorkflowId !== workflowId) continue;
+      if (isFrozenCapacityRow(row.st, row.eb)) continue;
 
       if (row.col === targetColumn) {
         count += 1;

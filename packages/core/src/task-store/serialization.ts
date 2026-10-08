@@ -128,6 +128,7 @@ export function rowToTask(row: TaskRow): Task {
     recoveryRetryCount: row.recoveryRetryCount ?? undefined,
     recoveryDisposition: (row.recoveryDisposition || undefined) as Task["recoveryDisposition"],
     sessionContentionHoldCount: row.sessionContentionHoldCount ?? undefined,
+    externalBlockAutoResumeCount: row.externalBlockAutoResumeCount ?? undefined,
     sessionContentionWaitReason: row.sessionContentionWaitReason ?? undefined,
     taskDoneRetryCount: row.taskDoneRetryCount ?? undefined,
     // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker; empty/null → undefined (no taint).

@@ -907,6 +907,11 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
       } else if (updates.sessionContentionHoldCount !== undefined) {
         task.sessionContentionHoldCount = updates.sessionContentionHoldCount;
       }
+      if (updates.externalBlockAutoResumeCount === null) {
+        task.externalBlockAutoResumeCount = undefined;
+      } else if (updates.externalBlockAutoResumeCount !== undefined) {
+        task.externalBlockAutoResumeCount = updates.externalBlockAutoResumeCount;
+      }
       if (updates.sessionContentionWaitReason === null) {
         task.sessionContentionWaitReason = undefined;
       } else if (updates.sessionContentionWaitReason !== undefined) {

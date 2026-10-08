@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { Task } from "../types.js";
 import {
+  EXTERNAL_BLOCK_AUTO_RESUME_BUDGET,
   EXTERNAL_BLOCK_PAUSE_REASON,
+  TRANSIENT_EXTERNAL_BLOCK_CODES,
   buildTaskExternalBlockClearPatch,
   buildTaskExternalBlockPatch,
   buildTaskExternalBlockReport,
   formatTaskExternalBlockReason,
   isTaskExternallyBlocked,
+  planExternalBlockAutoResume,
   type TaskExternalBlock,
 } from "../tasks/task-external-block.js";
 
@@ -100,5 +103,36 @@ describe("task external block", () => {
     { code: "", message: "" },
   ])("formats a non-empty reason when fields are empty: %o", ({ code, message }) => {
     expect(formatTaskExternalBlockReason(block({ code, message }))).toMatch(/^BLOCKED: .+\/.+: .+$/);
+  });
+
+  describe("automatic resume policy", () => {
+    const nowMs = Date.parse("2026-10-08T07:27:00.000Z");
+    const minute = 60_000;
+
+    it("treats only the rate-limit code as transient", () => {
+      expect([...TRANSIENT_EXTERNAL_BLOCK_CODES]).toEqual(["RATE_LIMIT"]);
+    });
+
+    it("backs off 5, 15, 30, 60, 120 minutes, then holds at 120 until the budget is spent", () => {
+      const delays: number[] = [];
+      for (let spent = 0; spent < EXTERNAL_BLOCK_AUTO_RESUME_BUDGET; spent += 1) {
+        const plan = planExternalBlockAutoResume({ code: "RATE_LIMIT" }, spent, nowMs);
+        expect(plan).toEqual({
+          attempt: spent + 1,
+          budget: EXTERNAL_BLOCK_AUTO_RESUME_BUDGET,
+          delayMs: expect.any(Number),
+          resumeAt: new Date(nowMs + plan!.delayMs).toISOString(),
+        });
+        delays.push(plan!.delayMs / minute);
+      }
+      expect(EXTERNAL_BLOCK_AUTO_RESUME_BUDGET).toBe(6);
+      expect(delays).toEqual([5, 15, 30, 60, 120, 120]);
+      expect(planExternalBlockAutoResume({ code: "RATE_LIMIT" }, EXTERNAL_BLOCK_AUTO_RESUME_BUDGET, nowMs)).toBeNull();
+      expect(planExternalBlockAutoResume({ code: "RATE_LIMIT" }, undefined, nowMs)?.attempt).toBe(1);
+    });
+
+    it.each(["CREDENTIALS", "USAGE_LIMIT", "ENOSPC", "ECONNRESET", ""])("keeps %s frozen until an operator acts", (code) => {
+      expect(planExternalBlockAutoResume({ code }, 0, nowMs)).toBeNull();
+    });
   });
 });

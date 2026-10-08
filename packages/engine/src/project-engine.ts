@@ -127,10 +127,11 @@ import {
 } from "./merge/pre-merge-gate-reseed.js";
 import { WorkspaceEnvironmentError } from "./merge/workspace-integration-target.js";
 import {
-  formatAdmissionCapacityQueuedReason,
-  persistedTopLevelAgentTaskIdsFromStore,
+  evaluateProjectCapacity,
   projectAdmissionCoordinator,
-  resolveActiveTaskCapacityLimit,
+  projectCapacityAdmissionLimits,
+  projectCapacityHoldersFromStore,
+  type ProjectCapacityHolders,
 } from "./concurrency/concurrency.js";
 import { canStartNextMergeBody } from "./merge/merge-reclaim-policy.js";
 import { clearOwnedMergeStamp } from "./merge/clear-orphaned-merge-stamp.js";
@@ -4862,13 +4863,12 @@ export class ProjectEngine {
             }
             let selected = false;
             const admissionSettings = await store.getSettings();
-            let mergeClaimSnapshot: Promise<{ count: number; ids: string[] }> | undefined;
+            let mergeClaimSnapshot: Promise<ProjectCapacityHolders> | undefined;
             const getMergeClaimSnapshot = () => mergeClaimSnapshot ??= (async () => {
               // Full rows preserve pending optional workflow-step leases, which may be the only
               // live-agent signal for a task while its ordinary status is null.
               const tasks = await store.listTasks({ slim: false, includeArchived: false });
-              const ids = await persistedTopLevelAgentTaskIdsFromStore(store, tasks);
-              return { count: ids.length, ids };
+              return projectCapacityHoldersFromStore(store, tasks);
             })();
             /*
             FNXC:ConcurrencyAdmission 2026-08-01-01:50 (ROOT CAUSE — triage admission died during every merge):
@@ -4890,13 +4890,7 @@ export class ProjectEngine {
             */
             await projectAdmissionCoordinator.admitNext({
               projectId: cwd,
-              maxConcurrent: resolveActiveTaskCapacityLimit({
-                maxConcurrent: admissionSettings.maxConcurrent,
-                maxWorktrees: admissionSettings.maxWorktrees,
-                worktreeLimitEnabled: admissionSettings.worktreeLimitEnabled,
-              }),
-              claimed: async () => (await getMergeClaimSnapshot()).count,
-              claimedTaskIds: async () => (await getMergeClaimSnapshot()).ids,
+              ...projectCapacityAdmissionLimits(admissionSettings, getMergeClaimSnapshot),
               refresh: async () => [{
                 taskId,
                 projectId: cwd,
@@ -4910,25 +4904,19 @@ export class ProjectEngine {
             });
             if (!selected) {
               const snapshot = await getMergeClaimSnapshot();
-              const limit = resolveActiveTaskCapacityLimit({
-                maxConcurrent: admissionSettings.maxConcurrent,
-                maxWorktrees: admissionSettings.maxWorktrees,
-                worktreeLimitEnabled: admissionSettings.worktreeLimitEnabled,
+              const capacity = evaluateProjectCapacity(admissionSettings, {
+                claimed: snapshot.runningTaskIds.length,
+                runningTaskIds: snapshot.runningTaskIds,
+                checkoutOnlyHolderTaskIds: snapshot.checkoutOnlyHolderTaskIds,
               });
-              if (snapshot.count >= limit) {
+              if (capacity.exhausted) {
                 /*
                 FNXC:ConcurrencyAdmission 2026-08-08-04:27:
                 A merge capacity defer used to be invisible because its queue is internal. Persist
                 the shared live-cap reason on the task itself, but only when the fresh serialized
                 snapshot proves exhaustion rather than a higher-priority candidate winning.
                 */
-                const reason = formatAdmissionCapacityQueuedReason({
-                  maxConcurrent: admissionSettings.maxConcurrent,
-                  maxWorktrees: admissionSettings.maxWorktrees,
-                  worktreeLimitEnabled: admissionSettings.worktreeLimitEnabled,
-                  claimed: snapshot.count,
-                  holderTaskIds: snapshot.ids,
-                });
+                const reason = capacity.reason;
                 if (this.capacityDeferredMergeReasons.get(taskId) !== reason) {
                   this.capacityDeferredMergeReasons.set(taskId, reason);
                   await store.logEntry(taskId, reason);

@@ -1316,6 +1316,8 @@ export interface Task {
   recoveryDisposition?: "pending" | "verification-pending" | "escalated-reseed";
   /** FNXC:WorkspaceContention 2026-08-23-06:40: Durable owner-local retry budget for holdForSessionContention; manual retry, clean completion, and exhausted waits reset it. */
   sessionContentionHoldCount?: number;
+  /** FNXC:ExternalBlockAutoResume 2026-10-08-08:29: automatic resumes of transient external-block freezes spent since the last operator Retry; bounds the automatic-resume budget across re-freezes. */
+  externalBlockAutoResumeCount?: number;
   /** Operator-visible bounded reason owned only while holdForSessionContention schedules a retry. */
   sessionContentionWaitReason?: string;
   /** Number of times this task has been requeued after the agent exited without

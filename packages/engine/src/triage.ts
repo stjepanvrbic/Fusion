@@ -201,11 +201,11 @@ import {
   computeTopLevelConcurrencyClaimedFromStore,
   formatAdmissionCapacityQueuedReason,
   dropPreHeldExecutorSlot,
-  persistedTopLevelAgentTaskIdsFromStore,
   projectAdmissionCoordinator,
+  projectCapacityAdmissionLimits,
+  projectCapacityHoldersFromStore,
   registerPreHeldExecutorSlot,
   releasePreHeldAdmissionReservation,
-  resolveActiveTaskCapacityLimit,
   takePreHeldExecutorSlot,
   recoverIdleSemaphoreLeakCandidate,
   type AgentSemaphore,
@@ -2504,11 +2504,17 @@ export class TriageProcessor {
       reuse/cleanup without consuming admission capacity. Every newly admitted planner becomes live
       and spends one slot below, even when it reuses an existing directory.
       */
+      /*
+      FNXC:WorktreeCapacity 2026-10-08-08:29:
+      Frozen external-block parks hold no running-agent slot (`claimed` excludes them) but still occupy their retained checkout, so
+      they count toward the worktree room only.
+      */
+      const boardHolders = await projectCapacityHoldersFromStore(this.store, allTasks);
+      const worktreeClaimed = claimed + boardHolders.checkoutOnlyHolderTaskIds.length;
       const maxWorktrees = resolveWorktreeCapacityLimit(settings);
-      const activeTaskLimit = resolveActiveTaskCapacityLimit(settings);
       const worktreeRoom = maxWorktrees === null
         ? Number.POSITIVE_INFINITY
-        : Math.max(0, maxWorktrees - claimed);
+        : Math.max(0, maxWorktrees - worktreeClaimed);
       const maxToStart = Math.min(projectRoom, worktreeRoom);
 
       if (maxToStart <= 0 && triageTasks.length > 0) {
@@ -2529,7 +2535,8 @@ export class TriageProcessor {
           maxWorktrees: settings.maxWorktrees,
           worktreeLimitEnabled: settings.worktreeLimitEnabled,
           claimed,
-          holderTaskIds: await persistedTopLevelAgentTaskIdsFromStore(this.store, allTasks),
+          holderTaskIds: boardHolders.runningTaskIds,
+          checkoutOnlyHolderTaskIds: boardHolders.checkoutOnlyHolderTaskIds,
         });
         planLog.log(
           `Plan throttled by ${blockedBy}: eligible=${triageTasks.length} [${eligibleIds.join(", ")}], ` +
@@ -2657,7 +2664,7 @@ export class TriageProcessor {
         if (agentBudget <= 0 || worktreeBudget <= 0) break;
         agentBudget -= 1;
         worktreeBudget -= 1;
-        let freshClaimSnapshot: Promise<{ count: number; ids: string[] }> | undefined;
+        let freshClaimSnapshot: Promise<{ count: number; ids: string[]; checkoutOnlyHolderTaskIds: string[] }> | undefined;
         const getFreshClaimSnapshot = () => freshClaimSnapshot ??= (async () => {
           // Full rows are required here: a pending optional workflow-step lease can be the task's
           // only live-agent signal, and slim rows intentionally omit workflowStepResults.
@@ -2667,13 +2674,21 @@ export class TriageProcessor {
             const row = fresh.find((task) => task.id === id);
             if (!row || row.status !== "planning") pending++;
           }
-          const ids = await persistedTopLevelAgentTaskIdsFromStore(this.store, fresh);
-          return { count: ids.length + pending, ids: [...new Set([...ids, ...this.processing])] };
+          const holders = await projectCapacityHoldersFromStore(this.store, fresh);
+          return {
+            count: holders.runningTaskIds.length + pending,
+            ids: [...new Set([...holders.runningTaskIds, ...this.processing])],
+            checkoutOnlyHolderTaskIds: holders.checkoutOnlyHolderTaskIds,
+          };
         })();
         await projectAdmissionCoordinator.admitNext({
           // rootDir is the stable per-project identity held by this processor.
           projectId: this.rootDir,
-          maxConcurrent: activeTaskLimit,
+          ...projectCapacityAdmissionLimits(settings, async () => {
+            const snapshot = await getFreshClaimSnapshot();
+            return { runningTaskIds: snapshot.ids, checkoutOnlyHolderTaskIds: snapshot.checkoutOnlyHolderTaskIds };
+          }),
+          // Planners still in `processing` claim a slot before their row says "planning".
           claimed: async () => (await getFreshClaimSnapshot()).count,
           claimedTaskIds: async () => (await getFreshClaimSnapshot()).ids,
           semaphore: this.options.semaphore,

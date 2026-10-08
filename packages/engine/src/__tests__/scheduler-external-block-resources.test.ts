@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Task } from "@fusion/core";
-import { persistedTopLevelAgentSlots } from "../concurrency/concurrency.js";
+import { persistedTopLevelAgentSlots, projectCapacityHoldersFromStore } from "../concurrency/concurrency.js";
+
+const resolverStore = {
+  getTaskWorkflowSelection: () => undefined,
+  getTaskWorkflowSelectionAsync: async () => undefined,
+} as never;
 import { shouldHoldActiveFileScopeLease } from "../scheduler.js";
 
 function blockedTask(overrides: Partial<Task> = {}): Task {
@@ -49,9 +54,16 @@ describe("external-block resource ownership", () => {
     expect(shouldHoldActiveFileScopeLease({ ...blockedReview, worktree: undefined }, [blockedReview], { isReviewColumn: true })).toBe(false);
   });
 
-  it("keeps the blocked card in maxConcurrent and maxWorktrees holder arithmetic", () => {
+  /*
+  FNXC:ExternalBlock 2026-10-08-08:29:
+  The freeze no longer holds a running-agent slot; only its retained checkout stays in the maxWorktrees population.
+  */
+  it("releases the frozen card's running-agent slot while its checkout stays a worktree holder", async () => {
     const blocked = blockedTask();
-    expect(persistedTopLevelAgentSlots([blocked])).toBe(1);
-    expect(persistedTopLevelAgentSlots([{ ...blocked, status: null, externalBlock: undefined }])).toBe(0);
+    expect(persistedTopLevelAgentSlots([blocked])).toBe(0);
+    const holders = await projectCapacityHoldersFromStore(resolverStore, [blocked]);
+    expect(holders).toEqual({ runningTaskIds: [], checkoutOnlyHolderTaskIds: ["FN-209"] });
+    // Once resumed (marker cleared, unpaused) it is a running WIP holder again.
+    expect(persistedTopLevelAgentSlots([{ ...blocked, status: null, paused: false, externalBlock: undefined }])).toBe(1);
   });
 });

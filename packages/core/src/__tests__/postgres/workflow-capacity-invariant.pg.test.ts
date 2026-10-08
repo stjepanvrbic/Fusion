@@ -47,6 +47,7 @@ radius is reported for an operator decision first.
 
 import { afterEach, beforeEach, expect, it, beforeAll, afterAll } from "vitest";
 import { taskAdvisoryLockKey } from "../../task-store/task-advisory-lock.js";
+import { buildTaskExternalBlockPatch } from "../../tasks/task-external-block.js";
 import {
   pgDescribe,
   createSharedPgTaskStoreTestHarness,
@@ -220,6 +221,38 @@ pgTest("in-transaction column capacity — ground truth (Phase A3)", () => {
       expect(secondColumn).toBe("todo");
     },
   );
+
+  /*
+  FNXC:ExternalBlock 2026-10-08-08:29:
+  A card frozen on an external obstacle sits in the WIP column but is not a running agent, so the in-transaction
+  maxConcurrent column budget must not count it; otherwise admission grants a slot the move is then refused for.
+  */
+  it("a frozen external-block park does not occupy the WIP column budget; an ordinary occupant still does", async () => {
+    const store = h.store();
+    await store.updateSettings({ maxConcurrent: 1 });
+    await assertMovePathLive();
+
+    const holder = await store.createTask({ description: "frozen holder" });
+    await store.moveTask(holder.id, "todo");
+    await store.moveTask(holder.id, "in-progress");
+    await store.updateTask(holder.id, buildTaskExternalBlockPatch({
+      origin: "model-provider",
+      code: "RATE_LIMIT",
+      message: "429 rate_limit_error",
+      source: "session-failure",
+      blockedAt: "2026-10-08T07:27:00.000Z",
+      resume: { column: "in-progress", currentStep: 0, worktree: "/worktrees/frozen" },
+    }));
+
+    const contender = await store.createTask({ description: "ready contender" });
+    await store.moveTask(contender.id, "todo");
+    await expect(store.moveTask(contender.id, "in-progress")).resolves.toMatchObject({ column: "in-progress" });
+
+    const third = await store.createTask({ description: "over the cap" });
+    await store.moveTask(third.id, "todo");
+    const error = await store.moveTask(third.id, "in-progress").then(() => null, (e: unknown) => e as Error);
+    expect((error as unknown as { rejection?: { code?: string } })?.rejection?.code).toBe("capacity-exhausted");
+  });
 
   /*
   FNXC:WorkflowCapacity 2026-07-28-16:10 (PR #2499 review — greptile: split capacity state):

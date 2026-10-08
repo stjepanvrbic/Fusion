@@ -3,6 +3,8 @@ import {
   countRunningAgentTasks,
   deriveRunningAgentCounts,
   enrichRunningAgentTaskShapeFromFlags,
+  holdsWorktreeCapacitySlot,
+  isExternallyFrozenCheckoutHolder,
   isRunningAgentTask,
   isWaitingAgentTask,
 } from "../agents/live-agent-count.js";
@@ -30,23 +32,56 @@ describe("live agent count predicates", () => {
     expect(isRunningAgentTask(task({ column: "in-progress", columnCountsTowardWip: true, userPaused: true }))).toBe(false);
   });
 
-  it("keeps an externally blocked non-terminal card as a holder but never as waiting work", () => {
+  it("never counts an externally frozen card as running or waiting, but keeps its checkout in the worktree population", () => {
     const externalBlock = {
-      origin: "host-environment" as const,
-      code: "ENOSPC",
-      message: "no space left on device, write",
-      source: "agent-declaration" as const,
-      blockedAt: "2026-08-28T04:01:00.000Z",
-      resume: { column: "in-progress", currentStep: 6, worktree: "/worktrees/fn-209", branch: "fusion/fn-209" },
+      origin: "model-provider" as const,
+      code: "RATE_LIMIT",
+      message: "429 rate_limit_error",
+      source: "session-failure" as const,
+      blockedAt: "2026-10-08T07:27:00.000Z",
+      resume: { column: "in-progress", currentStep: 6, worktree: "/worktrees/kb-046", branch: "fusion/kb-046" },
     };
-    const blockedWip = task({ column: "in-progress", columnCountsTowardWip: true, status: "blocked", paused: true, externalBlock });
-    const blockedHold = task({ column: "todo", columnIsIntakeOrHold: true, status: "blocked", paused: true, externalBlock });
+    const frozenWip = task({ column: "in-progress", columnCountsTowardWip: true, status: "blocked", paused: true, externalBlock, worktree: "/worktrees/kb-046" });
+    const frozenReview = task({ column: "in-review", columnIsReviewOrMerge: true, status: "blocked", paused: true, externalBlock, worktree: "/worktrees/kb-046" });
+    const frozenHold = task({ column: "todo", columnIsIntakeOrHold: true, status: "blocked", paused: true, externalBlock });
+    const frozenWithoutCheckout = task({
+      column: "in-progress",
+      columnCountsTowardWip: true,
+      status: "blocked",
+      paused: true,
+      externalBlock: { ...externalBlock, resume: { column: "in-progress", currentStep: 0 } },
+    });
+    const frozenTerminal = task({ column: "done", columnTerminalKind: "complete", status: "blocked", paused: true, externalBlock, worktree: "/worktrees/kb-046" });
 
-    expect(isRunningAgentTask(blockedWip)).toBe(true);
-    expect(isRunningAgentTask(blockedHold)).toBe(true);
-    expect(countRunningAgentTasks([blockedWip, blockedHold])).toBe(2);
-    expect(isWaitingAgentTask(blockedWip)).toBe(false);
-    expect(isWaitingAgentTask(blockedHold)).toBe(false);
+    for (const frozen of [frozenWip, frozenReview, frozenHold, frozenWithoutCheckout, frozenTerminal]) {
+      expect(isRunningAgentTask(frozen)).toBe(false);
+      expect(isWaitingAgentTask(frozen)).toBe(false);
+    }
+    expect(countRunningAgentTasks([frozenWip, frozenReview, frozenHold])).toBe(0);
+
+    // The retained checkout (task worktree or the freeze's resume pointer) still occupies a worktree slot.
+    expect(isExternallyFrozenCheckoutHolder(frozenWip)).toBe(true);
+    expect(isExternallyFrozenCheckoutHolder(frozenReview)).toBe(true);
+    expect(isExternallyFrozenCheckoutHolder(frozenHold)).toBe(true);
+    expect(isExternallyFrozenCheckoutHolder(frozenWithoutCheckout)).toBe(false);
+    expect(isExternallyFrozenCheckoutHolder(frozenTerminal)).toBe(false);
+    for (const frozen of [frozenWip, frozenReview, frozenHold]) expect(holdsWorktreeCapacitySlot(frozen)).toBe(true);
+    expect(holdsWorktreeCapacitySlot(frozenWithoutCheckout)).toBe(false);
+  });
+
+  it("keeps today's counting for running cards and ordinary pauses", () => {
+    const running = task({ column: "in-progress", columnCountsTowardWip: true, worktree: "/worktrees/kb-008" });
+    const userPaused = task({ column: "in-progress", columnCountsTowardWip: true, paused: true, userPaused: true, worktree: "/worktrees/kb-009" });
+    const blockedTextOnly = task({ column: "in-progress", columnCountsTowardWip: true, status: "blocked", worktree: "/worktrees/kb-010" });
+
+    expect(isRunningAgentTask(running)).toBe(true);
+    expect(holdsWorktreeCapacitySlot(running)).toBe(true);
+    expect(isExternallyFrozenCheckoutHolder(running)).toBe(false);
+    expect(isRunningAgentTask(userPaused)).toBe(false);
+    expect(holdsWorktreeCapacitySlot(userPaused)).toBe(false);
+    // A "blocked" status without the durable FN-209 marker is not a freeze: it stays an unpaused WIP holder.
+    expect(isRunningAgentTask(blockedTextOnly)).toBe(true);
+    expect(isExternallyFrozenCheckoutHolder(blockedTextOnly)).toBe(false);
   });
 
   it("does not count failed WIP (or any failed row) as a live capacity holder", () => {

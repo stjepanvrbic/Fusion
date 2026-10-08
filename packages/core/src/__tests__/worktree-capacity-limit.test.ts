@@ -138,45 +138,17 @@ describe("worktrees-off is structural: no unaudited maxWorktrees bound", () => {
         + "resolved value is non-finite (worktrees-off / unset).",
     },
     /*
-    FNXC:WorktreeCapacity 2026-08-15-22:05:
-    Merge-claim and direct workflow-continuation admission (FN-9059-era) read the shared live-task
-    ceiling through resolveActiveTaskCapacityLimit, which returns plain maxConcurrent when
-    resolveWorktreeCapacityLimit yields null, so OFF mode never binds on worktrees. The alias-hop
-    scan flags the `limit` comparison because the resolver call names maxWorktrees inline.
+    FNXC:WorktreeCapacity 2026-10-08-08:29:
+    The merge-claim and continuation `snapshot.count >= limit` defers and the collapsed `resolveActiveTaskCapacityLimit` ceiling are
+    deleted. Every admission owner builds both ceilings through `projectCapacityAdmissionLimits`, which reads the limit only via
+    resolveEffectiveConcurrency, so OFF mode still constructs no worktree gate.
     */
     {
-      file: "packages/engine/src/project-engine.ts",
-      expr: "if (snapshot.count >= limit) {",
-      reason:
-        "Merge-claim capacity defer: `limit` is resolveActiveTaskCapacityLimit's result, which is "
-        + "maxConcurrent alone when worktrees are OFF — an intentional admission reader of the "
-        + "sanctioned resolver, not a second raw gate.",
-    },
-    {
-      file: "packages/engine/src/runtimes/in-process-runtime.ts",
-      expr: "if (snapshot.count >= limit) {",
-      reason:
-        "Direct workflow-continuation capacity defer: same resolveActiveTaskCapacityLimit alias as "
-        + "the project-engine merge defer; OFF mode resolves to maxConcurrent only.",
-    },
-    {
-      /*
-      FNXC:WorktreeCapacity 2026-08-15-22:05:
-      The discriminator moved from scheduler.ts into the shared concurrency helper
-      (formatAdmissionCapacityQueuedReason) during the admission-reason unification; same audited
-      logic, new home.
-      */
-      file: "packages/engine/src/concurrency/concurrency.ts",
-      expr: "return resolveEffectiveConcurrency(params).effectiveLimit;",
-      reason:
-        "The shared engine admission entry delegates to the canonical core resolver, preserving structural absence in OFF mode.",
-    },
-    {
       file: "packages/engine/src/triage.ts",
-      expr: "Math.max(0, maxWorktrees - claimed)",
+      expr: "Math.max(0, maxWorktrees - worktreeClaimed)",
       reason:
         "Planning admission worktreeRoom from resolveWorktreeCapacityLimit; only evaluated when the "
-        + "resolved limit is non-null.",
+        + "resolved limit is non-null. `worktreeClaimed` adds frozen external-block checkouts to the running claim.",
     },
     {
       file: "packages/engine/src/triage.ts",
@@ -350,19 +322,28 @@ describe("worktrees-off is structural: no unaudited maxWorktrees bound", () => {
     FNXC:WorktreeCapacity 2026-08-03-02:01:
     Scheduler execute admission and triage planning admission both resolve the same limit. A third
     call site is a product change and must be audited here.
+
+    FNXC:WorktreeCapacity 2026-10-08-08:29:
+    The shared builder is now `projectCapacityAdmissionLimits`, which carries both ceilings (running agents, and worktrees including
+    frozen external-block checkouts). The four top-level admission owners must all use it.
     */
     const { execFileSync } = await import("node:child_process");
     const { resolve } = await import("node:path");
     const root = resolve(__dirname, "../../../..");
-    // Admissions now delegate to the core effective-concurrency resolver rather than
-    // constructing partial worktree setting objects at each lane.
     const hits = execFileSync(
       "git",
-      ["grep", "-n", "resolveActiveTaskCapacityLimit(settings)", "--", "packages/engine/src"],
+      ["grep", "-n", "projectCapacityAdmissionLimits(", "--", "packages/engine/src"],
       { cwd: root, encoding: "utf-8" },
     ).split("\n").filter((l) => l && !l.includes("__tests__"));
+    const owners = new Set(hits.map((h) => h.split(":")[0]));
 
-    expect(hits.some((h) => h.includes("packages/engine/src/triage.ts"))).toBe(true);
+    expect([...owners].sort()).toEqual([
+      "packages/engine/src/concurrency/concurrency.ts",
+      "packages/engine/src/project-engine.ts",
+      "packages/engine/src/runtimes/in-process-runtime.ts",
+      "packages/engine/src/scheduler.ts",
+      "packages/engine/src/triage.ts",
+    ]);
   });
 });
 

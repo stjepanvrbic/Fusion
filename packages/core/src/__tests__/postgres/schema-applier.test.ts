@@ -120,6 +120,7 @@ import {
   STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
   PULL_REQUEST_READINESS_VERSION,
   RECOVERY_DISPOSITION_VERSION,
+  EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -180,8 +181,10 @@ describe("schema-applier: immutable migration identities", () => {
     expect(RECOVERY_DISPOSITION_VERSION).toBe("0088");
     expect(Number(PULL_REQUEST_READINESS_VERSION)).toBeGreaterThan(Number(STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION));
     expect(Number(RECOVERY_DISPOSITION_VERSION)).toBeGreaterThan(Number(PULL_REQUEST_READINESS_VERSION));
-    expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(RECOVERY_DISPOSITION_VERSION));
-    expect(SCHEMA_BASELINE_VERSION).toBe("0088");
+    expect(EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION).toBe("0089");
+    expect(Number(EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION)).toBeGreaterThan(Number(RECOVERY_DISPOSITION_VERSION));
+    expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION));
+    expect(SCHEMA_BASELINE_VERSION).toBe("0089");
   });
 
   it("keeps monitor and approval isolation assigned to version 0003", () => {
@@ -2059,6 +2062,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
       PULL_REQUEST_READINESS_VERSION,
       RECOVERY_DISPOSITION_VERSION,
+      EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION,
     ]);
     const readinessMarkerCount = (await ctx.db.execute(sql`
       SELECT count(*)::int AS count
@@ -2073,6 +2077,32 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       WHERE version = ${PULL_REQUEST_READINESS_VERSION}
     `)) as unknown as Array<{ count: number }>;
     expect(rerunMarkerCount).toEqual([{ count: 1 }]);
+  });
+
+  it("applies and records the external-block automatic-resume budget exactly once on an upgraded database", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    await ctx.db.execute(sql.raw(`
+      ALTER TABLE project.tasks DROP COLUMN external_block_auto_resume_count;
+      DELETE FROM public.fusion_schema_migrations WHERE version = '${EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION}';
+    `));
+
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+    const columns = (await ctx.db.execute(sql`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'project'
+        AND table_name = 'tasks'
+        AND column_name = 'external_block_auto_resume_count'
+    `)) as unknown as Array<{ column_name: string; data_type: string }>;
+    expect(columns).toEqual([{ column_name: "external_block_auto_resume_count", data_type: "integer" }]);
+    const marker = (await ctx.db.execute(sql`
+      SELECT count(*)::int AS count
+      FROM public.fusion_schema_migrations
+      WHERE version = ${EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION}
+    `)) as unknown as Array<{ count: number }>;
+    expect(marker).toEqual([{ count: 1 }]);
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
 
   it("applies and records recovery disposition exactly once on an upgraded database", async () => {
@@ -2201,6 +2231,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
       PULL_REQUEST_READINESS_VERSION,
       RECOVERY_DISPOSITION_VERSION,
+      EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION,
     ]);
   });
 
@@ -2438,6 +2469,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
       PULL_REQUEST_READINESS_VERSION,
       RECOVERY_DISPOSITION_VERSION,
+      EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION,
     ]);
   });
 
@@ -2556,6 +2588,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
       PULL_REQUEST_READINESS_VERSION,
       RECOVERY_DISPOSITION_VERSION,
+      EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION,
     ]);
   });
 
@@ -2674,6 +2707,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       STALE_REVIEW_CALLBACK_WAIVER_RECEIPTS_VERSION,
       PULL_REQUEST_READINESS_VERSION,
       RECOVERY_DISPOSITION_VERSION,
+      EXTERNAL_BLOCK_AUTO_RESUME_COUNT_VERSION,
     ]);
   });
 });

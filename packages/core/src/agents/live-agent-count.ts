@@ -3,7 +3,7 @@ import type { TraitFlags } from "../workflows/trait-types.js";
 import type { Task } from "../types.js";
 import type { WorkflowIr } from "../workflows/workflow-ir-types.js";
 import { columnHasFlag } from "../workflows/workflow-lifecycle-traits.js";
-import { isTaskExternallyBlocked } from "../tasks/task-external-block.js";
+import { externalBlockRetainedCheckout, isTaskExternallyBlocked } from "../tasks/task-external-block.js";
 
 export type RunningAgentCountSource = (projectIds: readonly string[]) => Promise<Record<string, number>> | Record<string, number>;
 
@@ -14,7 +14,7 @@ export type ColumnTerminalKind = "none" | "complete" | "archived";
  * The deliberately small, pure shape used by all top-level live-agent counts.
  * Store- and board-backed callers must attach trait-derived fields first.
  */
-export type RunningAgentTaskShape = Pick<Task, "column" | "status" | "paused" | "userPaused" | "sessionFile" | "checkedOutBy"> & Partial<Pick<Task, "workflowStepResults" | "externalBlock">> & {
+export type RunningAgentTaskShape = Pick<Task, "column" | "status" | "paused" | "userPaused" | "sessionFile" | "checkedOutBy"> & Partial<Pick<Task, "workflowStepResults" | "externalBlock" | "worktree">> & {
   columnTerminalKind?: ColumnTerminalKind;
   /** Trait-derived intake/hold membership, used by {@link isWaitingAgentTask}. */
   columnIsIntakeOrHold?: boolean;
@@ -185,12 +185,12 @@ guess, and a wrong guess under-reports the queued total. Fix at the CALLER by pa
 export function isRunningAgentTask(task: RunningAgentTaskShape): boolean {
   if (terminalKind(task) !== "none") return false;
   /*
-  FNXC:ExternalBlock 2026-08-28-04:01:
-  A non-terminal external block deliberately remains a capacity holder even though its durable
-  pause fence prevents execution. Keeping maxConcurrent and maxWorktrees occupied ensures another
-  card cannot take the worktree slot the operator expects Retry to resume onto.
+  FNXC:ExternalBlock 2026-10-08-08:29:
+  A card frozen on an external obstacle is not running, so it never consumes a running-agent (maxConcurrent) slot.
+  Before this, three rate-limited cards held three of six slots for 40 minutes while nothing ran for them, starving review, merge, and post-merge gates.
+  Its retained checkout still counts toward maxWorktrees through `holdsWorktreeCapacitySlot`, and a resume re-enters through project admission.
   */
-  if (isTaskExternallyBlocked(task)) return true;
+  if (isTaskExternallyBlocked(task)) return false;
   if (task.paused || task.userPaused) return false;
   /*
   FNXC:ConcurrencyIndicators 2026-08-01-19:22:
@@ -210,6 +210,25 @@ export function isRunningAgentTask(task: RunningAgentTaskShape): boolean {
   if (hasLiveWorkflowStepLease(task)) return true;
   const isWip = task.columnCountsTowardWip ?? task.column === LEGACY_WIP_COLUMN_ID;
   return isWip;
+}
+
+/**
+ * A non-terminal FN-209 freeze that still holds a checkout: not a running agent, but an occupant of
+ * the worktree population. Identified by the durable external-block marker, never by status text alone.
+ */
+export function isExternallyFrozenCheckoutHolder(task: RunningAgentTaskShape): boolean {
+  if (terminalKind(task) !== "none") return false;
+  if (!isTaskExternallyBlocked(task)) return false;
+  return externalBlockRetainedCheckout(task) !== undefined;
+}
+
+/*
+FNXC:WorktreeCapacity 2026-10-08-08:29:
+The maxWorktrees population is the running-agent population plus frozen external-block parks that retain a checkout.
+With no frozen card the two populations are identical, so admission arithmetic is unchanged for every other board state.
+*/
+export function holdsWorktreeCapacitySlot(task: RunningAgentTaskShape): boolean {
+  return isRunningAgentTask(task) || isExternallyFrozenCheckoutHolder(task);
 }
 
 /** Exact footer waiting membership: unpaused, non-terminal intake/hold work that is not live. */
