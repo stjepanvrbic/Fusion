@@ -18,6 +18,7 @@ import type {
   WorkflowWorkItem,
   WorkflowWorkItemState,
   WorkflowIr,
+  WorkflowSelectionCache,
 } from "@fusion/core";
 import {
   AsyncCentralClaimStore,
@@ -28,6 +29,7 @@ import {
   isTaskBlockedOnApproval,
   resolveWorkflowIrForTask,
   resolveTaskLifecycleColumns,
+  resolveLifecycleColumns,
 } from "@fusion/core";
 import { Scheduler } from "../scheduler.js";
 import { registerDefaultAgentPluginRunner, unregisterDefaultAgentPluginRunner } from "../pi.js";
@@ -75,7 +77,13 @@ import {
   persistedTopLevelAgentTaskIdsFromStore,
   projectAdmissionCoordinator,
   resolveActiveTaskCapacityLimit,
+  type AdmissionCandidate,
+  type AdmissionLane,
 } from "../concurrency/concurrency.js";
+import {
+  resolveContinuationAdmissionLane,
+  resolveContinuationAdmissionLaneForTask,
+} from "../concurrency/continuation-admission-lane.js";
 
 /*
 FNXC:WorkflowResolvedColumns 2026-07-31-14:40 (fleet — long-tail fallback arms):
@@ -225,6 +233,11 @@ export function resolvePlanningContinuationCandidate(
   node) and admission-gated by `admitPlanningContinuation`, which re-checks the real live-task cap.
   A capacity-parked row therefore resumes only when a slot is genuinely free — accepting it here
   cannot reintroduce the over-cap dispatch the suspend exists to prevent.
+
+  FNXC:ConcurrencyAdmission 2026-10-08-06:59:
+  "Admission-gated" alone was not enough: the drain's one-shot admission made continuations visible only to the drain's own pass, and every continuation claimed the execute lane.
+  A slot freed during a scheduler or triage pass therefore went to a new hold-release executor while resumed post-merge verifications, browser verifications, and merges waited for hours.
+  Continuations now also enter every project admission pass through the durable `continuation:<projectId>` provider, and both paths take the lane of the node's lifecycle role (`resolveContinuationAdmissionLane`): review and post-merge work first, execution resumes second, plan review last.
   */
   /*
   FNXC:PlanApprovalHold 2026-07-27-19:30 (U7 / R4):
@@ -572,6 +585,40 @@ export async function drainDuePlanningContinuations(
 
 const planningContinuationRuns = new Set<string>();
 const planningContinuationCapacityReasons = new Map<string, string>();
+/**
+ * Run keys whose card is being offered by its own one-shot admission pass right now. The durable
+ * provider skips them so one card is never offered twice in the same coordinator pass.
+ */
+const continuationOneShotOffers = new Map<string, number>();
+
+function continuationRunKey(projectId: string, taskId: string): string {
+  return `${projectId}:${taskId}`;
+}
+
+/*
+FNXC:ConcurrencyAdmission 2026-10-08-06:59:
+The single ownership path for an admitted continuation, shared by the drain's one-shot admission and the durable provider so the two cannot diverge.
+The run key marks the task as owned for the whole resumed run, and the coordinator reservation is kept until that run settles; releasing earlier recreates the over-cap gap while the task is still canonically inactive.
+A candidate whose run key is already owned is a "duplicate": its start must ACCEPT as a no-op. The coordinator's reservation Set is task-keyed and already holds the running continuation's entry, so declining would make the coordinator's unwind release capacity the live run still owns.
+*/
+function startOwnedContinuationRun(runKey: string, taskId: string, dispatch: () => Promise<void>): "started" | "duplicate" {
+  if (planningContinuationRuns.has(runKey)) return "duplicate";
+  planningContinuationRuns.add(runKey);
+  let run: Promise<void>;
+  try {
+    run = dispatch();
+  } catch (error) {
+    planningContinuationRuns.delete(runKey);
+    throw error;
+  }
+  void run
+    .finally(() => {
+      planningContinuationRuns.delete(runKey);
+      projectAdmissionCoordinator.releaseReservation(taskId);
+    })
+    .catch(() => {});
+  return "started";
+}
 
 export async function admitPlanningContinuation(input: {
   store: TaskStore;
@@ -579,8 +626,10 @@ export async function admitPlanningContinuation(input: {
   task: Task;
   item: WorkflowWorkItem;
   dispatch: () => Promise<void>;
+  /** The continuation's admission lane; resolved from the task's workflow when omitted. */
+  lane?: AdmissionLane;
 }): Promise<boolean> {
-  const runKey = `${input.projectId}:${input.task.id}`;
+  const runKey = continuationRunKey(input.projectId, input.task.id);
   // A task owns one top-level slot regardless of how many durable continuation
   // rows point at it. Treat a duplicate due row as already handled; admitting it
   // would attach two releasers to one task-keyed coordinator reservation.
@@ -611,56 +660,44 @@ export async function admitPlanningContinuation(input: {
     void input.dispatch().catch(() => {});
     return true;
   }
+  const lane = input.lane ?? await resolveContinuationAdmissionLaneForTask(input.store, input.task.id, input.item.nodeId);
   // This snapshot is intentionally created lazily inside the coordinator drain.
   // A prior lane may have been finishing its own handoff before this task's
   // turn; a pre-drain project snapshot can admit into its newly occupied slot.
   let admissionSnapshot: Promise<{ count: number; ids: string[] }> | undefined;
   const getAdmissionSnapshot = () => admissionSnapshot ??= loadClaimSnapshot();
-  await projectAdmissionCoordinator.admitNext({
-    projectId: input.projectId,
-    maxConcurrent: resolveActiveTaskCapacityLimit({
-      maxConcurrent: settings.maxConcurrent,
-      maxWorktrees: settings.maxWorktrees,
-      worktreeLimitEnabled: settings.worktreeLimitEnabled,
-    }),
-    claimed: async () => (await getAdmissionSnapshot()).count,
-    claimedTaskIds: async () => (await getAdmissionSnapshot()).ids,
-    refresh: async () => [{
-      taskId: input.task.id,
+  continuationOneShotOffers.set(runKey, (continuationOneShotOffers.get(runKey) ?? 0) + 1);
+  try {
+    await projectAdmissionCoordinator.admitNext({
       projectId: input.projectId,
-      lane: "execute",
-      createdAt: input.item.createdAt ?? input.task.createdAt,
-      start: async () => {
-        // The preflight above is only a fast path. This serialized check is the
-        // ownership authority when concurrent drains race the same durable row.
-        if (planningContinuationRuns.has(runKey)) {
-          duplicateHandled = true;
-          // The coordinator's task-keyed Set already contains the ORIGINAL
-          // run's reservation. Accept this no-op candidate so its decline path
-          // cannot release capacity owned by that still-running workflow.
-          return true;
-        }
-        selected = true;
-        planningContinuationRuns.add(runKey);
-        // Keep the coordinator reservation for the whole resumed run. The task
-        // can remain canonically inactive until its first workflow node writes a
-        // pending lease; releasing at executor entry recreates the over-cap gap.
-        let run: Promise<void>;
-        try {
-          run = input.dispatch();
-        } catch (error) {
-          planningContinuationRuns.delete(runKey);
-          throw error;
-        }
-        void run
-          .finally(() => {
-            planningContinuationRuns.delete(runKey);
-            projectAdmissionCoordinator.releaseReservation(input.task.id);
-          })
-          .catch(() => {});
-      },
-    }],
-  });
+      maxConcurrent: resolveActiveTaskCapacityLimit({
+        maxConcurrent: settings.maxConcurrent,
+        maxWorktrees: settings.maxWorktrees,
+        worktreeLimitEnabled: settings.worktreeLimitEnabled,
+      }),
+      claimed: async () => (await getAdmissionSnapshot()).count,
+      claimedTaskIds: async () => (await getAdmissionSnapshot()).ids,
+      refresh: async () => [{
+        taskId: input.task.id,
+        projectId: input.projectId,
+        lane,
+        createdAt: input.item.createdAt ?? input.task.createdAt,
+        start: async () => {
+          // The preflight above is only a fast path. This serialized check is the
+          // ownership authority when concurrent drains race the same durable row.
+          if (startOwnedContinuationRun(runKey, input.task.id, input.dispatch) === "duplicate") {
+            duplicateHandled = true;
+            return true;
+          }
+          selected = true;
+        },
+      }],
+    });
+  } finally {
+    const remaining = (continuationOneShotOffers.get(runKey) ?? 1) - 1;
+    if (remaining > 0) continuationOneShotOffers.set(runKey, remaining);
+    else continuationOneShotOffers.delete(runKey);
+  }
   if (selected || duplicateHandled) {
     planningContinuationCapacityReasons.delete(runKey);
     return true;
@@ -691,6 +728,92 @@ export async function admitPlanningContinuation(input: {
     }
   }
   return false;
+}
+
+/** The due-poll query the drain and the admission provider share. */
+function listDueTaskContinuations(store: TaskStore): Promise<WorkflowWorkItem[]> {
+  return store.listDueWorkflowWorkItems({
+    kinds: ["task"], states: ["runnable", "retrying"], limit: DUE_PLANNING_CONTINUATION_BATCH_LIMIT,
+  });
+}
+
+/** Terminal columns for the orphan test: the workflow's own pair plus the legacy pair. */
+function continuationTerminalColumns(lifecycle: { complete?: string; archived?: string } | undefined): ReadonlySet<string> {
+  return new Set([lifecycle?.complete ?? "done", lifecycle?.archived ?? "archived", "done", "archived"]);
+}
+
+/** Everything the continuation admission provider touches, injected for tests. */
+export interface ContinuationAdmissionProviderDeps {
+  store: TaskStore;
+  projectId: string;
+  /** False while the runtime is stopping or the engine is paused: offer nothing. */
+  isDispatchOpen: () => boolean | Promise<boolean>;
+  /** The resumed run, identical to the drain's dispatch body (execute, then settle the work item). */
+  run: (task: Task, item: WorkflowWorkItem) => Promise<void>;
+}
+
+/*
+FNXC:ConcurrencyAdmission 2026-10-08-06:59:
+Waiting workflow continuations must be visible to EVERY project admission pass, not only the continuation drain's own one-shot pass (FN-8453: each pass refreshes every lane's durable candidates).
+Before this provider, a slot freed during a scheduler or triage pass went to whatever that pass could see; resumed post-merge verifications, browser verifications, and merges waited for hours while hold-release executors took each freed slot.
+Discovery and skip rules are the drain's own: the same due query, `resolvePlanningContinuationCandidate` (orphans, approval holds, pauses), one candidate per task, owned run keys and the drain's in-flight one-shot offers excluded, and same-slot handoffs of an already-live task left to the drain because they claim no new slot.
+Refresh is read-only. Orphan cancellation and parked-item deferral stay with the drain so they are written once.
+*/
+/**
+ * The durable admission candidates for due `kind:"task"` continuations of one project, each in the
+ * lane its node's lifecycle role owns and aged by its work item's creation time.
+ */
+export async function listContinuationAdmissionCandidates(deps: ContinuationAdmissionProviderDeps): Promise<AdmissionCandidate[]> {
+  if (!(await deps.isDispatchOpen())) return [];
+  const items = await listDueTaskContinuations(deps.store);
+  const irCache = new Map<string, WorkflowIr>();
+  const selectionCache: WorkflowSelectionCache = new Map();
+  const seen = new Set<string>();
+  const actionable: Array<{ task: Task; item: WorkflowWorkItem; ir: WorkflowIr | undefined }> = [];
+  for (const item of items) {
+    if (seen.has(item.taskId)) continue;
+    const runKey = continuationRunKey(deps.projectId, item.taskId);
+    if (planningContinuationRuns.has(runKey) || continuationOneShotOffers.has(runKey)) continue;
+    let task: Task | undefined;
+    try {
+      task = await deps.store.getTask(item.taskId);
+    } catch {
+      continue;
+    }
+    if (!task) continue;
+    const ir = await resolveWorkflowIrForTask(deps.store, item.taskId, irCache, selectionCache).catch(() => undefined);
+    const terminalColumns = continuationTerminalColumns(ir ? resolveLifecycleColumns(ir) : undefined);
+    const resolved = resolvePlanningContinuationCandidate(item, task, { terminalColumns });
+    if (resolved.kind !== "actionable") continue;
+    seen.add(item.taskId);
+    actionable.push({ task: resolved.task, item: resolved.item, ir });
+  }
+  if (actionable.length === 0) return [];
+  const live = new Set(await persistedTopLevelAgentTaskIdsFromStore(deps.store, actionable.map((entry) => entry.task)));
+  return actionable
+    .filter((entry) => !live.has(entry.task.id))
+    .map(({ task, item, ir }) => ({
+      taskId: task.id,
+      projectId: deps.projectId,
+      lane: resolveContinuationAdmissionLane(ir, item.nodeId),
+      createdAt: item.createdAt ?? task.createdAt,
+      start: async () => {
+        startOwnedContinuationRun(continuationRunKey(deps.projectId, task.id), task.id, () => deps.run(task, item));
+      },
+    }));
+}
+
+/** The coordinator provider id for one project's workflow continuations. */
+export function continuationAdmissionProviderId(projectId: string): string {
+  return `continuation:${projectId}`;
+}
+
+/** Register the durable continuation lane with the project coordinator; returns the unregister. */
+export function registerContinuationAdmissionProvider(deps: ContinuationAdmissionProviderDeps): () => void {
+  return projectAdmissionCoordinator.registerProvider(continuationAdmissionProviderId(deps.projectId), {
+    projectId: deps.projectId,
+    refresh: () => listContinuationAdmissionCandidates(deps),
+  });
 }
 
 /*
@@ -827,24 +950,36 @@ call past that tick and breaks the pinned ordering. Keep this dispatcher exactly
 `releaseFileScopeWaitingContinuations` are exported standalone utilities instead, wired from
 workflows/overlap-plan-revalidation.ts where no such same-tick contract exists.
 */
-export function createPlanningContinuationDispatcher(input: {
+export interface PlanningContinuationRunInput {
   store: TaskStore;
-  projectId: string;
   execute: (task: Task) => Promise<void>;
   kick?: () => void;
   onError?: (task: Task, item: WorkflowWorkItem, error: unknown) => void;
+}
+
+/**
+ * The resumed-run body every admitted continuation executes, whichever pass admitted it: re-enter
+ * the durable graph, then settle the work item. `execute()` is called in the same tick as the run.
+ */
+export function createPlanningContinuationRun(input: PlanningContinuationRunInput): (task: Task, item: WorkflowWorkItem) => Promise<void> {
+  return async (task, item) => {
+    await input.execute(task).catch((error) => {
+      input.onError?.(task, item, error);
+    });
+    await settlePlanningContinuationDispatch({ store: input.store, taskId: task.id, itemId: item.id, kick: input.kick });
+  };
+}
+
+export function createPlanningContinuationDispatcher(input: PlanningContinuationRunInput & {
+  projectId: string;
 }): (task: Task, item: WorkflowWorkItem) => Promise<boolean> {
+  const run = createPlanningContinuationRun(input);
   return (task, item) => admitPlanningContinuation({
     store: input.store,
     projectId: input.projectId,
     task,
     item,
-    dispatch: async () => {
-      await input.execute(task).catch((error) => {
-        input.onError?.(task, item, error);
-      });
-      await settlePlanningContinuationDispatch({ store: input.store, taskId: task.id, itemId: item.id, kick: input.kick });
-    },
+    dispatch: () => run(task, item),
   });
 }
 
@@ -1062,6 +1197,8 @@ export class InProcessRuntime
   private missionAutopilot?: MissionAutopilot;
   private triageProcessor?: TriageProcessor;
   private workflowContinuationTimer?: ReturnType<typeof setInterval>;
+  /** Unregisters this runtime's workflow-continuation lane from the project admission coordinator. */
+  private unregisterContinuationAdmissionProvider?: () => void;
   private workflowContinuationDrainActive = false;
   private workflowContinuationDrainSince = 0;
   private workflowContinuationDrainProgressAt = 0;
@@ -2238,6 +2375,14 @@ export class InProcessRuntime
         this.kickWorkflowContinuationProcessor();
       }, 2_000);
       this.workflowContinuationTimer.unref?.();
+      /* FNXC:ConcurrencyAdmission 2026-10-08-06:59: the continuation lane is registered for exactly as long as the drain runs, so every scheduler, triage, and merge pass sees waiting continuations in their role lanes. */
+      this.unregisterContinuationAdmissionProvider?.();
+      this.unregisterContinuationAdmissionProvider = registerContinuationAdmissionProvider({
+        store: this.taskStore,
+        projectId: this.taskStore.getRootDir(),
+        isDispatchOpen: () => this.isContinuationDispatchOpen(),
+        run: createPlanningContinuationRun(this.continuationRunInput()),
+      });
       this.kickWorkflowContinuationProcessor();
       runtimeLog.log(`InProcessRuntime started for project ${this.config.projectId}`);
     } catch (error) {
@@ -2273,6 +2418,8 @@ export class InProcessRuntime
       clearInterval(this.workflowContinuationTimer);
       this.workflowContinuationTimer = undefined;
     }
+    this.unregisterContinuationAdmissionProvider?.();
+    this.unregisterContinuationAdmissionProvider = undefined;
     const admissionStops: Array<readonly [string, () => void]> = [
       ["self-healing manager", () => this.selfHealingManager?.stop()],
       ["routine scheduler", () => this.routineScheduler?.stop()],
@@ -2341,6 +2488,8 @@ export class InProcessRuntime
         clearInterval(this.workflowContinuationTimer);
         this.workflowContinuationTimer = undefined;
       }
+      this.unregisterContinuationAdmissionProvider?.();
+      this.unregisterContinuationAdmissionProvider = undefined;
       // 2. Stop self-healing manager
       if (this.selfHealingManager) {
         this.selfHealingManager.stop();
@@ -2959,6 +3108,29 @@ export class InProcessRuntime
     this.workflowContinuationDrainPhase = phase;
   }
 
+  /** The resumed-run wiring shared by the drain's dispatcher and the admission provider. */
+  private continuationRunInput(): PlanningContinuationRunInput {
+    return {
+      store: this.taskStore,
+      execute: (task) => this.executor.execute(task),
+      kick: () => this.kickWorkflowContinuationProcessor(),
+      onError: (_task, item, error) => {
+        runtimeLog.error(`Workflow continuation ${item.id} failed:`, error);
+      },
+    };
+  }
+
+  /** The drain's own dispatch gate, applied to admission-provider starts as well. */
+  private async isContinuationDispatchOpen(): Promise<boolean> {
+    if (this.status !== "active") return false;
+    try {
+      const settings = await this.taskStore.getSettings();
+      return settings.globalPause !== true && settings.enginePaused !== true;
+    } catch {
+      return true;
+    }
+  }
+
   private async drainWorkflowContinuations(): Promise<void> {
     if (this.status !== "active") return;
     if (this.workflowContinuationDrainActive) {
@@ -2999,19 +3171,12 @@ export class InProcessRuntime
         /* unreadable settings: proceed as before rather than wedging the pump */
       }
       const dispatch = createPlanningContinuationDispatcher({
-        store: this.taskStore,
+        ...this.continuationRunInput(),
         projectId: this.taskStore.getRootDir(),
-        execute: (task) => this.executor.execute(task),
-        kick: () => this.kickWorkflowContinuationProcessor(),
-        onError: (_task, item, error) => {
-          runtimeLog.error(`Workflow continuation ${item.id} failed:`, error);
-        },
       });
       await drainDuePlanningContinuations({
         listDue: async () => {
-          const items = await this.taskStore.listDueWorkflowWorkItems({
-            kinds: ["task"], states: ["runnable", "retrying"], limit: DUE_PLANNING_CONTINUATION_BATCH_LIMIT,
-          });
+          const items = await listDueTaskContinuations(this.taskStore);
           this.markWorkflowContinuationDrainProgress(drainGeneration, "list-due");
           return items;
         },
@@ -3024,13 +3189,7 @@ export class InProcessRuntime
            existing test relies on. One IR read per due item, and the batch is capped by
            DUE_PLANNING_CONTINUATION_BATCH_LIMIT. */
         resolveTerminalColumns: async (taskId) => {
-          const lifecycle = await resolveTaskLifecycleColumns(this.taskStore, taskId);
-          return new Set([
-            lifecycle?.complete ?? "done",
-            lifecycle?.archived ?? "archived",
-            "done",
-            "archived",
-          ]);
+          return continuationTerminalColumns(await resolveTaskLifecycleColumns(this.taskStore, taskId));
         },
         cancelOrphan: (item, reason) => {
           this.markWorkflowContinuationDrainProgress(drainGeneration, "cancel-orphan");
