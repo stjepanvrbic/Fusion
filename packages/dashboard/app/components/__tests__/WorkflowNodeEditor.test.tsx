@@ -4512,6 +4512,13 @@ describe("WorkflowNodeEditor simplified view modes", () => {
     render(<WorkflowNodeEditor isOpen onClose={() => {}} addToast={() => {}} />);
     await screen.findByTestId("wf-simple-canvas");
     /*
+    FNXC:WorkflowSimpleView 2026-10-08-10:38:
+    KB-060: the canvas shell renders before the load effect fills nodes/edges, and the toolbar's openAddStep captures the append edge at click time.
+    A click in that window captures a null edge and lands the pick free-floating (measured with a probe; Full Suite run 37744337717 hit it on the fragment sibling).
+    Awaiting def()'s only gate card proves the hydrated graph is committed before the click.
+    */
+    await screen.findByTestId("wf-simple-node-gate");
+    /*
     FNXC:WorkflowSimpleView 2026-07-24-01:25:
     Flush pending hydration/layout commits before opening the add-step modal.
     Full-suite run 30077108784 (CI lane load) hit an additive insert — the
@@ -4565,6 +4572,13 @@ describe("WorkflowNodeEditor simplified view modes", () => {
     vi.mocked(updateWorkflow).mockImplementation(async (_id, updates) => ({ ...def(), ...(updates as object) }));
     render(<WorkflowNodeEditor isOpen onClose={() => {}} addToast={() => {}} />);
     await screen.findByTestId("wf-simple-canvas");
+    /*
+    FNXC:WorkflowSimpleView 2026-10-08-10:38:
+    KB-060: Full Suite run 37744337717 saved this pick unspliced (merge→end kept) because the toolbar was clicked after the canvas shell rendered but before the load effect filled nodes/edges.
+    openAddStep captures the append edge at click time, so it captured null and the fragment landed free-floating.
+    Awaiting def()'s only gate card (the fragment's gate does not exist yet) proves the hydrated graph is committed before the click.
+    */
+    await screen.findByTestId("wf-simple-node-gate");
 
     // def() has a single edge into end, so the toolbar add targets that edge.
     fireEvent.click(screen.getByTestId("wf-simple-toolbar-add-step"));

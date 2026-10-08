@@ -422,7 +422,7 @@ No timeout, retry, or assertion changed, and the file is not quarantined because
 
 ### 36. WorkflowNodeEditor edge-targeted fragment pick splice
 
-- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **Status:** Active first sighting — recorded 2026-10-08, attributed by KB-060; deterministic test repair landed, with a second sighting requiring file-level quarantine.
 - **File:** `packages/dashboard/app/components/__tests__/WorkflowNodeEditor.test.tsx`
 - **Exact test:** `WorkflowNodeEditor simplified view modes > splices an edge-targeted fragment pick into the targeted edge`.
 - **Observed tree/SHA:** fork Full Suite (non-blocking) run [37744337717](https://github.com/stjepanvrbic/Fusion/actions/runs/37744337717/job/113202144603) at `74d0bdf8af314543008f0d169c28a6493d76203a` (Linux, `ubuntu-latest`), job `Test shard 4/4` (`113202144603`), command `@fusion/dashboard run test:quality:app:components-b`, project `dashboard-app-quality-components-b`. That commit (KB-036) changed no file named for `WorkflowNodeEditor`; its dashboard changes are `file-service.ts` and four tests under `packages/dashboard/src/__tests__/`. The same shard passed in the Full Suite runs for `70d326790` (37741630295), `0b74a0c2c` (37742189681), and `668244c5e` (37742324890).
@@ -430,7 +430,16 @@ No timeout, retry, or assertion changed, and the file is not quarantined because
 
 The failure was `AssertionError: expected true to be false // Object.is equality` at `WorkflowNodeEditor.test.tsx:4590`, the assertion that no edge from `merge` to `end` remains after the pick. The line before it, `expect(insertedGate).toBeDefined()`, passed, so the fragment's gate was in the saved IR while the original `merge` to `end` edge had not been removed. `updateWorkflow` had been called exactly once, so the test saved a graph in which the fragment was added but not spliced into the targeted edge.
 
-Hypothesis, not measured: the pick adds the fragment nodes and rewires the targeted edge in separate state updates, and the test saves as soon as the add-step window unmounts, so a starved shard can serialize the intermediate graph. The log does not show the editor state at save time, so this is a reading of the assertion order only.
+The first hypothesis recorded here (the pick adds the nodes and rewires the edge in separate state updates) is superseded: `handleInsertFragment` computes the insert and the splice together and sets nodes and edges once.
+
+<!--
+FNXC:TestFlakeRegister 2026-10-08-10:38:
+KB-060 measured the mechanism behind entry 36 and repaired the test deterministically. The record stays an active first sighting because the same run is the only sighting; a second sighting still requires file-level quarantine.
+-->
+
+Measured by KB-060: the toolbar was clicked inside the editor's hydration window. The simplified canvas shell and its toolbar render as soon as the active workflow exists, but the graph's nodes and edges are filled later by the load effect. The toolbar's `openAddStep` captures `findAppendEdgeId(nodes, edges)` at click time, so a click before the load effect has run captures a null edge, and `handleInsertFragment` then lands the fragment free-floating instead of splicing it. A scratch probe (not committed) resolved a deferred `fetchWorkflows` and clicked the toolbar on the first DOM mutation that rendered it: no gate card existed yet, and the saved IR kept `merge` to `end` with both gates present, which is the CI failure exactly. No product file on this path changed between `eaadd153b` (FN-8764, 2026-08-07) and `74d0bdf8a`, so this is a test race, not a splice regression.
+
+KB-060 made both edge-targeted splice tests (this fragment case and the `'as optional group'` sibling) await `wf-simple-node-gate` before clicking, which proves the hydrated graph is committed. Prior same-class history in this file: the optional-group sibling hit the identical symptom in run 30077108784 and got an `act` settle in `cdc5b7f90`, and FN-6726/FN-6744 rescued a components-b-only seam-conflict test with the product-side `canvasNodesMaterializedRef` fix. Three sightings in one subsystem make resolving the toolbar's append edge at pick time, not open time, the recommended product hardening.
 
 | run | result |
 |---|---|
@@ -439,8 +448,12 @@ Hypothesis, not measured: the pick adds the fragment nodes and rewires the targe
 | Full Suite 37742324890 (`668244c5e`), shard 4/4 | passed |
 | Full Suite 37744337717 (`74d0bdf8a`), shard 4/4 | **failed** (this case) |
 | `pnpm exec vitest run app/components/__tests__/WorkflowNodeEditor.test.tsx --project dashboard-app-quality-components-b --reporter=dot` in `packages/dashboard`, local Windows, `83829b7cf` | passed, 191 tests, 34 s wall |
+| KB-060, same command with `-t "splices an edge-targeted"`, local Windows, `bfe6023d4`, 10 runs before the repair | 10/10 passed, 2 tests each |
+| KB-060, `@fusion/dashboard run test:quality:app:components-b`, local Windows, `bfe6023d4` before the repair | passed, 50 files, 1790 tests |
+| KB-060 scratch probe clicking the toolbar before any node card rendered, local Windows, `bfe6023d4` | reproduced: fragment inserted, `merge` to `end` kept |
+| KB-060, targeted command, 5 runs, plus the whole file, after the repair | 5/5 passed; 191 passed |
 
-No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting and the file carries 190 other cases. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. Before quarantining, read how the add-step fragment pick commits its splice in `WorkflowNodeEditor`, and whether the save handler can read the graph between those updates.
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting and the file carries 190 other cases. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. Before quarantining, check whether the failing click still precedes the `wf-simple-node-gate` wait, and whether the toolbar append edge is still captured at open time.
 
 ### Common shape and investigated result
 

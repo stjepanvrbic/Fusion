@@ -211,6 +211,10 @@ FNXC:TestFlakeRegister 2026-10-08-12:03:
 Entry 31 was sighted a second time on the fork's Full Suite (the same parameterized row and assertion on a later commit),
 so the deletion ratchet moves it to the archive. The archived record must keep both run identifiers and the unchanged
 assertion message so a rescue starts from MailboxView's load-more handling rather than from a timeout.
+
+FNXC:TestFlakeRegister 2026-10-08-10:38:
+KB-060 measured entry 36 as a hydration-window race (the toolbar click captured a null append edge before the graph
+loaded) and landed a deterministic test wait. It stays an active first sighting; only the status attribution changes.
 */
 /*
 FNXC:TestFlakeRegister 2026-10-08-01:13:
@@ -267,7 +271,7 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "36. WorkflowNodeEditor edge-targeted fragment pick splice",
-      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+      status: "Active first sighting — recorded 2026-10-08, attributed by KB-060; deterministic test repair landed, with a second sighting requiring file-level quarantine.",
     },
   ]);
 });
