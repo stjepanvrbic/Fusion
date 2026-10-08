@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 26, 27, 29, 30, 31, and 32), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **16 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **10 active observation records** (entries 2, 13, 20, 21, 25, 27, 29, 30, 31, and 32), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **17 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -321,20 +321,6 @@ FN-9506 reproduced the pending-to-resolved transition with a deferred discovery 
 
 The failure was `Hook timed out in 15000ms` in the file's top-level `afterEach`, which tears down every PostgreSQL harness the case opened (`harnesses.pop()?.teardown()`). This is the same 15 s PostgreSQL hook mode recorded for entries 2 and 13, here on teardown rather than setup. The case's assertions passed on every rerun. No timeout, retry, or assertion changed. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`.
 
-### 26. Planning Mode mobile Other-input availability
-
-- **Status:** Active first sighting — recorded 2026-10-07, unattributed.
-- **File:** `packages/dashboard/app/components/__tests__/PlanningModeModal.ui-interactions.test.tsx`
-- **Exact test:** `PlanningModeModal sequential layout > keeps five substantive choices and one Other usable on %s` (the failing row was `mobile`; the CI log prints it as `...usable on mobile`)
-- **Observed tree/SHA:** fork Full Suite run [37702452940](https://github.com/stjepanvrbic/Fusion/actions/runs/37702452940) at `41950446a` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113067879798`), lane `dashboard-app-quality-backfill --shard=3/4`.
-- **Observed frequency:** 1 failure in that lane. No failure of this file appeared in the Full Suite test shards for the neighbouring commits `ab5717807` (run 37702158378) and `0480b153b` (run 37698750646). The `desktop` row of the same `it.each` did not fail, and it never reaches the Other input.
-
-The failure was `TestingLibraryElementError: Unable to find an element by: [data-testid="planning-other-input"]` at `PlanningModeModal.ui-interactions.test.tsx:199`, the `fireEvent.change` that immediately follows `fireEvent.click(screen.getByRole("radio", { name: /other \(write your own\)/i }))`. The synchronous click on the Other radio had not produced the free-text input by the time the next statement ran. The log showed a React `An update to QuestionForm inside a test was not wrapped in act(...)` warning for this case before the failure. The jsdom dump in the log is truncated, so it does not show whether the radio was selected.
-
-No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`.
-
-The Planning Mode subsystem already carries quarantined entries (entry 22 for `PlanningModeModal.planning-flow` and entry 23 for `planning-browser-e2e`) plus closed entries 4, 5, 8, and 10. Under the AGENTS.md rule that a repeated quarantine in one subsystem is a product-race smell, this sighting is a reason to look at the product code before the entry 22 deletion deadline. Start with how `QuestionForm` in `PlanningModeModal` commits the Other selection and renders the Other input after a radio change, and whether that state is set asynchronously.
-
 ### 27. ensureCwdProjectRegistered embedded PostgreSQL startup cascade
 
 - **Status:** Active first sighting — recorded 2026-10-07, unattributed.
@@ -471,6 +457,29 @@ explicit-file diagnostics runnable; timeout, retry, and assertion appeasement re
 FNXC:TestFlakeRegister 2026-10-07-18:04:
 Entries 22 and 23 record same-day second sightings on the fork's Full Suite. Both files are quarantined through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
 -->
+<!--
+FNXC:TestFlakeRegister 2026-10-08-07:20:
+Entry 26 recorded a second Full Suite sighting on the fork: the same parametrized test failed on its desktop row after failing on its mobile row. Quarantine is file-level, so the whole file is excluded through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
+-->
+### 26. Planning Mode sequential layout Other-input and answer submission
+
+- **Status:** Closed — quarantined 2026-10-08 after a second Full Suite sighting; deletion deadline 2026-10-22.
+- **File:** `packages/dashboard/app/components/__tests__/PlanningModeModal.ui-interactions.test.tsx`
+- **Exact test:** `PlanningModeModal sequential layout > keeps five substantive choices and one Other usable on %s`, an `it.each` over `desktop` and `mobile`; the failing row was `mobile` on the first sighting and `desktop` on the second.
+- **Observed trees/SHAs:** fork Full Suite run [37702452940](https://github.com/stjepanvrbic/Fusion/actions/runs/37702452940) at `41950446a` (job `113067879798`) and run [37735335086](https://github.com/stjepanvrbic/Fusion/actions/runs/37735335086) at `90619eba9` (job `113173460540`), both Linux `ubuntu-latest`, job `Test shard 3/4`, project `dashboard-app-quality-backfill`.
+- **Observed frequency:** 2 runs, 1 failing row each. No failure of this file appeared in the Full Suite test shards for the neighbouring commits `ab5717807` (run 37702158378) and `0480b153b` (run 37698750646).
+
+| run | row | result |
+|---|---|---|
+| 37702452940 | `mobile` | `TestingLibraryElementError: Unable to find an element by: [data-testid="planning-other-input"]` at `PlanningModeModal.ui-interactions.test.tsx:199`, the `fireEvent.change` right after the synchronous click on the Other radio; a React `An update to QuestionForm inside a test was not wrapped in act(...)` warning preceded it |
+| 37735335086 | `desktop` | `AssertionError: expected "vi.fn()" to be called with arguments: [ 'session-1', …(2) ]` with `Number of calls: 0` at `PlanningModeModal.ui-interactions.test.tsx:194`, the `waitFor` that follows clicking the fifth-direction radio and then Next |
+
+Both failures sit in the step where a click on a radio or on Next must commit a selection before the next statement runs. The first reads the Other input too early; the second sees no `respondToPlanning` call after Next. The logs do not show whether the radio was selected, and no shard-shaped reproduction was attempted.
+
+No timeout, retry, or assertion changed. The whole file is excluded from the dashboard projects. It is not in the thin merge gate, so no gate eviction was needed.
+
+This is the third quarantine in the Planning Mode subsystem after entries 22 and 23, plus closed entries 4, 5, 8, and 10. The AGENTS.md repeated-quarantine rule treats that as a product-race smell. Before the deletion deadline, inspect how `QuestionForm` in `PlanningModeModal` commits the Other selection and the Next submission after a radio change, and whether that state is set asynchronously. No product code changed in this quarantine.
+
 <!--
 FNXC:TestFlakeRegister 2026-10-08-04:50:
 Entry 28 recorded a second Full Suite sighting on the fork, so the file is quarantined through the dated ledger and the literal engine-default exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.

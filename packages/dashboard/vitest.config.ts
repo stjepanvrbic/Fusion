@@ -370,6 +370,11 @@ const quarantinedDashboardTests: string[] = [
   "app/components/__tests__/PlanningModeModal.planning-flow.test.tsx",
   "src/__tests__/planning-browser-e2e.test.ts",
   /*
+  FNXC:DashboardTestQuarantine 2026-10-08-07:20:
+  Second Full Suite sighting of register entry 26: the same sequential-layout test failed on its mobile row and then its desktop row under shard 3 load. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at how QuestionForm commits the Other and Next selections.
+  */
+  "app/components/__tests__/PlanningModeModal.ui-interactions.test.tsx",
+  /*
   FNXC:DashboardTestQuarantine 2026-07-17-16:50:
   FN-8245 re-admits all three UI files with their ledger rows removed in lockstep.
   QuickEntryBox restores focus from its resolved submit path while isolated jsdom

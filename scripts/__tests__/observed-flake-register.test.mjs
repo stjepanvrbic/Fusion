@@ -170,6 +170,11 @@ FNXC:TestFlakeRegister 2026-10-08-04:50:
 Entry 28 was sighted a second time on the fork's Full Suite, so the deletion ratchet moves it from the
 active first-sighting inventory to the archive. The archived record must keep both run identifiers, the
 unchanged assertion text, and the product-race lead so a rescue starts from the executor rather than a timeout.
+
+FNXC:TestFlakeRegister 2026-10-08-07:20:
+Entry 26 was sighted a second time on the fork's Full Suite (desktop row after the mobile row), so the deletion
+ratchet moves it to the archive. The archived record must keep both run identifiers and the unchanged assertion
+text so a rescue starts from the Planning Mode product code rather than a timeout.
 */
 test("observed-flake register active count, escalation state, and owners stay synchronized", () => {
   const register = readFileSync(registerPath, "utf8");
@@ -202,10 +207,6 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "25. Signal-ingest incident capture PostgreSQL teardown hook",
-      status: "Active first sighting — recorded 2026-10-07, unattributed.",
-    },
-    {
-      heading: "26. Planning Mode mobile Other-input availability",
       status: "Active first sighting — recorded 2026-10-07, unattributed.",
     },
     {
@@ -302,6 +303,28 @@ test("archived executor task-done summary quarantine retains both-sighting evide
     "9cf9144d6",
   ]) {
     assert.ok(entry.includes(evidence), `Archived executor task-done summary entry is missing ${evidence}`);
+  }
+  assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
+});
+
+test("archived Planning Mode ui-interactions quarantine retains both-sighting evidence", () => {
+  const register = readFileSync(registerPath, "utf8");
+  const archive = register.match(/## Archive — closed records\n([\s\S]*)$/)?.[1];
+  assert.ok(archive, "Expected an Archive — closed records section");
+  const entry = archive.match(/^### 26\. Planning Mode sequential layout Other-input and answer submission\n([\s\S]*?)(?=^### |(?![\s\S]))/m)?.[1];
+  assert.ok(entry, "Expected archived Planning Mode ui-interactions quarantine entry");
+
+  for (const evidence of [
+    "packages/dashboard/app/components/__tests__/PlanningModeModal.ui-interactions.test.tsx",
+    "keeps five substantive choices and one Other usable on %s",
+    "37702452940",
+    "37735335086",
+    'Unable to find an element by: [data-testid="planning-other-input"]',
+    "Number of calls: 0",
+    "quarantined 2026-10-08",
+    "deletion deadline 2026-10-22",
+  ]) {
+    assert.ok(entry.includes(evidence), `Archived Planning Mode ui-interactions entry is missing ${evidence}`);
   }
   assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
 });
