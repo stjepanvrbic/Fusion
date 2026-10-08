@@ -1305,3 +1305,18 @@ KB-008 classified every unexpected Windows-lane failure across five consecutive 
 Each file passed in every other run of the five, and the engine files passed in a targeted run on a local Windows host at `c53017ac`.
 
 **Already a second sighting, escalated rather than recorded:** `packages/core/src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts > durable agent Activity analytics > turns a production durable no-task heartbeat into Activity sessions and tool usage` failed with `expected 0 to be greater than 0` on `activity.sessions` in runs 37693147198 and 37702452940, and passed in the other three. Core PostgreSQL quarantine is policy-forbidden, so this goes to its owner for a decision. The zero-session read fits usage events landing after the aggregation, but that mechanism is unconfirmed.
+
+### Record 2026-10-08: `merger-ai.test.ts` Windows 30 s timeouts (KB-089, resolved at the test seam)
+
+<!--
+FNXC:TestFlakeRegister 2026-10-08-18:13:
+KB-066 removed merger-ai.test.ts from the shrink-only Windows ledger on one passing run, and the next Full Suite run timed it out again. KB-089 diagnosed the cost as git process count and removed it at the test seam instead of re-adding the file or widening timeouts. Any further Windows timeout of this file is an immediate same-change file-level quarantine.
+-->
+
+- **File:** `packages/engine/src/__tests__/merger-ai.test.ts` (not in `scripts/lib/windows-known-failing-tests.json`; the ledger is shrink-only and its ceiling is unchanged).
+- **Sightings:**
+  - `runAiMerge > rebuilds when the source changes between clean confirmation reviews`, `Test timed out in 30000ms`, [run 37720328009](https://github.com/stjepanvrbic/Fusion/actions/runs/37720328009) (job 113126258190).
+  - `runAiMerge > lands after two clean approvals of the same candidate without an empty corrective pass`, `Test timed out in 30000ms`, [run 37781357666](https://github.com/stjepanvrbic/Fusion/actions/runs/37781357666) (job 113324972214), the first run after KB-066.
+- **Mechanism:** both jobs ran the engine lane as one job with default worker fan-out (engine import time above 3200 s cumulative, 19 and 50 failing engine files). Each real-git case spawned 64 to 98 git processes locally, including 5 to 8 detached `git maintenance run --auto` children and about 7 repository-setup spawns, so per-spawn cost under that contention pushed the two-cycle cases past 30 s. No clean-room filesystem retry evidence appeared in either log.
+- **Resolution (KB-089):** the file disables `maintenance.auto` and `gc.auto` for every git child (product calls included) through appended `GIT_CONFIG_*` entries, builds each repository shape once and copies it per test, and drops a redundant clean-path `git add -A`. The two named cases now spawn 51 and 81 processes (from 64 and 98), with zero maintenance children and zero test-side setup spawns. The whole file still passes all cases with unchanged assertions and timeouts, and its summed case time on a local Windows host dropped from 215.5 s to 164 to 186 s.
+- **Escalation rule:** a further Windows timeout of this file is an immediate file-level quarantine in `scripts/lib/test-quarantine.json` with its matching vitest exclude, never a Windows ledger re-add and never a widened timeout.

@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, afterAll } from "vitest";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { describe, it, expect, vi, afterAll, beforeAll } from "vitest";
+import { chmodSync, cpSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
@@ -59,19 +59,75 @@ process.env.GIT_AUTHOR_NAME = "t";
 process.env.GIT_AUTHOR_EMAIL = "t@t.t";
 process.env.GIT_COMMITTER_NAME = "t";
 process.env.GIT_COMMITTER_EMAIL = "t@t.t";
+
+/*
+FNXC:TestPerf 2026-10-08-18:13:
+KB-089: the Windows Full Suite engine lane timed out at 30 s on the first two-cycle runAiMerge cases (run 37720328009 `rebuilds when the source changes between clean confirmation reviews`; run 37781357666 job 113324972214 `lands after two clean approvals of the same candidate without an empty corrective pass`).
+The cost driver is git process count: GIT_TRACE2 measured 64 and 98 git processes for those cases, 5 and 8 of them detached `maintenance run --auto` children, and every case rebuilt its repo with about seven setup spawns.
+The fix stays at the test seam: auto-maintenance is disabled for every git child in this file (product calls included) through appended GIT_CONFIG_* env entries, and each repo shape is built once and copied per test without spawning.
+Never widen testTimeout, add retries, or re-add this file to the Windows ledger to absorb runner slowness; a further Windows timeout is an immediate file-level quarantine.
+*/
+const savedGitConfig = Object.fromEntries(
+  Object.keys(process.env).filter((key) => key.startsWith("GIT_CONFIG_")).map((key) => [key, process.env[key]]),
+);
+{
+  // Append after the shared vitest-setup entries (and any CI-provided ones) instead of clobbering them.
+  const base = Number.parseInt(process.env.GIT_CONFIG_COUNT ?? "0", 10) || 0;
+  const entries: Array<[string, string]> = [["maintenance.auto", "false"], ["gc.auto", "0"]];
+  entries.forEach(([key, value], i) => {
+    process.env[`GIT_CONFIG_KEY_${base + i}`] = key;
+    process.env[`GIT_CONFIG_VALUE_${base + i}`] = value;
+  });
+  process.env.GIT_CONFIG_COUNT = String(base + entries.length);
+}
 afterAll(() => {
   for (const d of tracked) {
     try { rmSync(d, RM); } catch { /* best effort */ }
   }
+  for (const key of Object.keys(process.env).filter((name) => name.startsWith("GIT_CONFIG_"))) delete process.env[key];
+  for (const [key, value] of Object.entries(savedGitConfig)) if (value !== undefined) process.env[key] = value;
 });
 
 function git(cwd: string, args: string): string {
   return execSync(`git ${args}`, { cwd, encoding: "utf-8" }).trim();
 }
 
-/** A repo on `main` with one base commit + a task branch carrying one change. */
-function initRepoWithBranch(opts: { branch: string; conflict?: boolean; gitignore?: string } = { branch: "fusion/fn-1" }): { dir: string } {
+type RepoShape = { branch: string; conflict?: boolean; gitignore?: string };
+/** One built template repo per distinct shape; tests only ever receive copies. */
+const repoTemplates = new Map<string, string>();
+
+/**
+ * A repo on `main` with one base commit + a task branch carrying one change.
+ * FNXC:TestPerf 2026-10-08-18:13: each call returns a fresh, private copy of a per-shape template (same commits, SHAs, branches, HEAD on `main`), so per-test isolation is unchanged while setup spawns no git process after the first build of a shape.
+ */
+function initRepoWithBranch(opts: RepoShape = { branch: "fusion/fn-1" }): { dir: string } {
+  const template = repoTemplateFor(opts);
   const dir = mkdtempSync(join(tmpdir(), "fusion-ai-merge-test-"));
+  tracked.add(dir);
+  cpSync(template, dir, { recursive: true });
+  return { dir };
+}
+
+/*
+FNXC:TestPerf 2026-10-08-18:13:
+Build the default shape (used by most cases) as shared file setup so its one-time spawns are not charged to whichever real-git case happens to run first; both Windows sightings were the first runAiMerge cases.
+*/
+beforeAll(() => {
+  repoTemplateFor({ branch: "fusion/fn-1" });
+});
+
+function repoTemplateFor(opts: RepoShape): string {
+  const key = JSON.stringify([opts.branch, Boolean(opts.conflict), opts.gitignore ?? null]);
+  let template = repoTemplates.get(key);
+  if (!template) {
+    template = buildRepoTemplate(opts);
+    repoTemplates.set(key, template);
+  }
+  return template;
+}
+
+function buildRepoTemplate(opts: RepoShape): string {
+  const dir = mkdtempSync(join(tmpdir(), "fusion-ai-merge-template-"));
   tracked.add(dir);
   git(dir, "init -q -b main");
   writeFileSync(join(dir, "base.txt"), "base\n");
@@ -91,7 +147,7 @@ function initRepoWithBranch(opts: { branch: string; conflict?: boolean; gitignor
     git(dir, "add -A");
     git(dir, "commit -q -m 'main: divergent'");
   }
-  return { dir };
+  return dir;
 }
 
 function createTaskWorktreeWithIgnoredContent(dir: string, branch: string): string {
@@ -203,7 +259,7 @@ function realMergeAgent(branch: string) {
       execSync("git checkout --theirs . || true", { cwd, stdio: "pipe", shell: "/bin/bash" } as any);
       execSync("git add -A", { cwd, stdio: "pipe" });
     }
-    execSync("git add -A", { cwd, stdio: "pipe" });
+    // A clean `merge --squash` already stages its result; only the conflict path needs `add -A`.
     execSync('git commit -q -m "squash: feature"', { cwd, stdio: "pipe" });
   });
 }
@@ -804,7 +860,6 @@ describe("runAiMerge", () => {
               execSync("git checkout --theirs . || true", { cwd: opts.cwd, stdio: "pipe", shell: "/bin/bash" } as any);
               execSync("git add -A", { cwd: opts.cwd, stdio: "pipe" });
             }
-            execSync("git add -A", { cwd: opts.cwd, stdio: "pipe" });
             execSync('git commit -q -m "squash: feature"', { cwd: opts.cwd, stdio: "pipe" });
           }
         },
