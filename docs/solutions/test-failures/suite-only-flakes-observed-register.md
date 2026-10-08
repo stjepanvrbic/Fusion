@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **5 active observation records** (entries 2, 13, 20, 21, and 25), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **6 active observation records** (entries 2, 13, 20, 21, 25, and 26), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -320,6 +320,20 @@ FN-9506 reproduced the pending-to-resolved transition with a deferred discovery 
 - **Observed frequency:** 1 failure, then 4 passing reruns, including one on `origin/main`.
 
 The failure was `Hook timed out in 15000ms` in the file's top-level `afterEach`, which tears down every PostgreSQL harness the case opened (`harnesses.pop()?.teardown()`). This is the same 15 s PostgreSQL hook mode recorded for entries 2 and 13, here on teardown rather than setup. The case's assertions passed on every rerun. No timeout, retry, or assertion changed. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`.
+
+### 26. Planning Mode mobile Other-input availability
+
+- **Status:** Active first sighting — recorded 2026-10-07, unattributed.
+- **File:** `packages/dashboard/app/components/__tests__/PlanningModeModal.ui-interactions.test.tsx`
+- **Exact test:** `PlanningModeModal sequential layout > keeps five substantive choices and one Other usable on %s` (the failing row was `mobile`; the CI log prints it as `...usable on mobile`)
+- **Observed tree/SHA:** fork Full Suite run [37702452940](https://github.com/stjepanvrbic/Fusion/actions/runs/37702452940) at `41950446a` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113067879798`), lane `dashboard-app-quality-backfill --shard=3/4`.
+- **Observed frequency:** 1 failure in that lane. No failure of this file appeared in the Full Suite test shards for the neighbouring commits `ab5717807` (run 37702158378) and `0480b153b` (run 37698750646). The `desktop` row of the same `it.each` did not fail, and it never reaches the Other input.
+
+The failure was `TestingLibraryElementError: Unable to find an element by: [data-testid="planning-other-input"]` at `PlanningModeModal.ui-interactions.test.tsx:199`, the `fireEvent.change` that immediately follows `fireEvent.click(screen.getByRole("radio", { name: /other \(write your own\)/i }))`. The synchronous click on the Other radio had not produced the free-text input by the time the next statement ran. The log showed a React `An update to QuestionForm inside a test was not wrapped in act(...)` warning for this case before the failure. The jsdom dump in the log is truncated, so it does not show whether the radio was selected.
+
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`.
+
+The Planning Mode subsystem already carries quarantined entries (entry 22 for `PlanningModeModal.planning-flow` and entry 23 for `planning-browser-e2e`) plus closed entries 4, 5, 8, and 10. Under the AGENTS.md rule that a repeated quarantine in one subsystem is a product-race smell, this sighting is a reason to look at the product code before the entry 22 deletion deadline. Start with how `QuestionForm` in `PlanningModeModal` commits the Other selection and renders the Other input after a radio change, and whether that state is set asynchronously.
 
 ### Common shape and investigated result
 

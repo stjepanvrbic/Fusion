@@ -199,6 +199,10 @@ test("observed-flake register active count, escalation state, and owners stay sy
       heading: "25. Signal-ingest incident capture PostgreSQL teardown hook",
       status: "Active first sighting — recorded 2026-10-07, unattributed.",
     },
+    {
+      heading: "26. Planning Mode mobile Other-input availability",
+      status: "Active first sighting — recorded 2026-10-07, unattributed.",
+    },
   ]);
 });
 
