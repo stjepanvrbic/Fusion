@@ -21,6 +21,7 @@ import { MERGE_BOUNDARY_RECOVERY_VALUE, MERGE_BOUNDARY_UNPROVEN_VALUE } from "..
 import { emitMergeBoundaryUnprovenParked } from "./emit-merge-boundary-unproven-audit.js";
 import type { MergeBoundaryRecoveryEvidence, MergeBoundaryUnprovenReasonCode } from "./workflow-merge-boundary.js";
 import { AUTO_MERGE_RETRY_REJECTED_PREFIX } from "../merge/stale-content-park.js";
+import { isEngineShutdownError } from "../merge/engine-shutdown-error.js";
 
 export type RouteGraphMergeFailureToRetryDeps = {
   store: TaskStore;
@@ -368,6 +369,26 @@ export async function routeGraphMergeFailureToRetry(
     unconditionally with its own bounded retry.
     */
     const reason = mergeRequestRejection instanceof Error ? mergeRequestRejection.message : String(mergeRequestRejection);
+    /*
+    FNXC:MergeRestartDeferral 2026-10-08-06:10:
+    A restart is never a merge failure. ProjectEngine rejects with a name-tagged EngineShutdownError when stop() abandons a pending request or a stopping/unstarted engine refuses the enqueue.
+    That rejection must not park, spend a retry, or touch status/error: the card stays exactly as a fresh approved review card, and the restarted engine's merge sweep re-dispatches it.
+    Classify on the error name only; the shutdown is signalled at its source, so no separate liveness predicate can race it.
+    */
+    if (isEngineShutdownError(mergeRequestRejection)) {
+      try {
+        await deps.store.logEntry(
+          live.id,
+          `Bounded auto-merge retry interrupted by an engine shutdown — not a merge failure; the merge will resume after the engine restart (${reason})`,
+          undefined,
+          deps.getRunContextFor(live.id),
+        );
+      } catch {
+        // best-effort telemetry; leaving the row untouched is what matters
+      }
+      await persistTokenUsageBestEffort(deps.persistTokenUsage, live.id);
+      return true;
+    }
     // An unrun gate is a deferral. The graph owner or periodic review recovery
     // must run it; a terminal park would hide the card from that recovery.
     if (reason.endsWith(PRE_MERGE_STEPS_NOT_RUN_BLOCKER)) {

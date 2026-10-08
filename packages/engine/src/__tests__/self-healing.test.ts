@@ -7313,10 +7313,17 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
+    /*
+    FNXC:MergeRestartDeferral 2026-10-08-06:10:
+    The deadlock brake applies to a card the merge door refuses while nothing marks it failed. These fixtures used to be `failed` parks, which are
+    already the terminal operator-visible outcome and are no longer stalls; an unfinished step is the genuine non-failed merge blocker.
+    */
+    const genuineMergeBlocker = { status: null, error: null, steps: [{ name: "step", status: "in-progress" }] };
+
     it("auto-disposes after three identical merge-blocker stalls", async () => {
       vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
       const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-      const reason = "task is marked 'failed': Failed to create worktree after 3 attempts: Branch fusion/fn-9999 conflict could not be auto-resolved";
+      const reason = "task has incomplete steps";
       (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
         taskStuckTimeoutMs: 60_000,
         autoMerge: true,
@@ -7325,8 +7332,7 @@ describe("SelfHealingManager", () => {
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         staleMergingTask({
           id: "FN-9999",
-          status: "failed",
-          error: "Failed to create worktree after 3 attempts: Branch fusion/fn-9999 conflict could not be auto-resolved",
+          ...genuineMergeBlocker,
           branch: "fusion/fn-9999",
           worktree: "/tmp/FN-9999",
           log: [
@@ -7356,8 +7362,8 @@ describe("SelfHealingManager", () => {
         target: "FN-9999",
         metadata: expect.objectContaining({
           code: "merge-blocker",
-          // The blocker text embeds raw failure prose; run-audit keeps only the fixed code.
-          redactedFields: expect.arrayContaining(["reason"]),
+          // A fixed-vocabulary blocker survives the run-audit sanitizer; prose-bearing reasons are dropped (see the terminal provider-error case).
+          reason: "task has incomplete steps",
           repetitionCount: 3,
           threshold: 3,
         }),
@@ -7368,13 +7374,12 @@ describe("SelfHealingManager", () => {
     it("does not dispose below threshold", async () => {
       vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
       const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-      const reason = "task is marked 'failed': Failed to create worktree after 3 attempts: Branch fusion/fn-9999 conflict could not be auto-resolved";
+      const reason = "task has incomplete steps";
       (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ taskStuckTimeoutMs: 60_000, autoMerge: true, inReviewStallDeadlockThreshold: 3 });
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         staleMergingTask({
           id: "FN-9999",
-          status: "failed",
-          error: "Failed to create worktree after 3 attempts: Branch fusion/fn-9999 conflict could not be auto-resolved",
+          ...genuineMergeBlocker,
           worktree: "/tmp/FN-9999",
           log: [{ timestamp: "2026-01-01T00:01:00.000Z", action: `In-review stall surfaced [merge-blocker]: ${reason}` }],
         }),
@@ -7390,13 +7395,12 @@ describe("SelfHealingManager", () => {
     it("does not dispose when threshold is disabled", async () => {
       vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
       const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-      const reason = "task is marked 'failed': Failed to create worktree after 3 attempts: Branch fusion/fn-9999 conflict could not be auto-resolved";
+      const reason = "task has incomplete steps";
       (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ taskStuckTimeoutMs: 60_000, autoMerge: true, inReviewStallDeadlockThreshold: 0 });
       (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
         staleMergingTask({
           id: "FN-9999",
-          status: "failed",
-          error: "Failed to create worktree after 3 attempts: Branch fusion/fn-9999 conflict could not be auto-resolved",
+          ...genuineMergeBlocker,
           worktree: "/tmp/FN-9999",
           log: [
             { timestamp: "2026-01-01T00:01:00.000Z", action: `In-review stall surfaced [merge-blocker]: ${reason}` },
@@ -7416,25 +7420,23 @@ describe("SelfHealingManager", () => {
     it("does not accumulate when reasons differ and no-ops when already paused", async () => {
       vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
       const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
-      const baseError = "Failed to create worktree after 3 attempts: Branch fusion/fn-9999 conflict could not be auto-resolved";
-      const currentReason = `task is marked 'failed': ${baseError}`;
+      const currentReason = "task has incomplete steps";
       (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ taskStuckTimeoutMs: 60_000, autoMerge: true, inReviewStallDeadlockThreshold: 3 });
       (store.listTasks as ReturnType<typeof vi.fn>)
         .mockResolvedValueOnce([
           staleMergingTask({
             id: "FN-9999",
-            status: "failed",
-            error: baseError,
+            ...genuineMergeBlocker,
             worktree: "/tmp/FN-9999",
             log: [
-              { timestamp: "2026-01-01T00:01:00.000Z", action: "In-review stall surfaced [merge-blocker]: task is marked 'failed': other reason 1" },
-              { timestamp: "2026-01-01T00:02:00.000Z", action: "In-review stall surfaced [merge-blocker]: task is marked 'failed': other reason 2" },
+              { timestamp: "2026-01-01T00:01:00.000Z", action: "In-review stall surfaced [merge-blocker]: other reason 1" },
+              { timestamp: "2026-01-01T00:02:00.000Z", action: "In-review stall surfaced [merge-blocker]: other reason 2" },
               { timestamp: "2026-01-01T00:03:00.000Z", action: `In-review stall surfaced [merge-blocker]: ${currentReason}` },
             ],
           }),
         ])
         .mockResolvedValueOnce([
-          staleMergingTask({ id: "FN-9999", paused: true, status: "failed", error: baseError, worktree: "/tmp/FN-9999" }),
+          staleMergingTask({ id: "FN-9999", paused: true, ...genuineMergeBlocker, worktree: "/tmp/FN-9999" }),
         ]);
 
       expect(await managerWithRecovery.surfaceInReviewStalls()).toBe(1);

@@ -46,7 +46,7 @@ import {
   rerouteFailedNoVerdictPreMergeGateToReview,
   rerouteUnrunPreMergeGateToReview,
 } from "../merge/pre-merge-gate-reseed.js";
-import { MERGE_BOUNDARY_RECOVERY_VALUE, MERGE_BOUNDARY_UNPROVEN_VALUE } from "../workflows/workflow-merge-nodes.js";
+import { MERGE_BOUNDARY_RECOVERY_VALUE, MERGE_BOUNDARY_UNPROVEN_VALUE, MERGE_ENGINE_SHUTDOWN_VALUE } from "../workflows/workflow-merge-nodes.js";
 import { emitMergeBoundaryUnprovenParked } from "./emit-merge-boundary-unproven-audit.js";
 import { PAUSE_ABORT_PARK_ERROR_MARKER, PAUSE_ABORT_PARK_OPERATOR_MARKER } from "../self-healing.js";
 import {
@@ -676,6 +676,21 @@ export async function handleGraphFailure(
         const cancellationExit = "Workflow graph run ended after operator cancellation — no merge routing, no failure park";
         executorLog.log(`${task.id}: ${cancellationExit}`);
         await deps.store.logEntry(task.id, cancellationExit, undefined, deps.getRunContextFor(task.id));
+        await deps.persistTokenUsage(task.id);
+        return;
+      }
+      /*
+      FNXC:MergeRestartDeferral 2026-10-08-06:10:
+      A restart is never a merge failure. The merge node returns this typed value only when the engine rejected the request because it is stopping or not yet started.
+      Classify it before every pause-abort and retry router: re-requesting inside the dying engine is refused again, and that refusal parked approved cards `failed` with `AUTO_MERGE_RETRY_REJECTED:` (KB-020, KB-024).
+      Write nothing to the row: no status, error, retry spend, or lane move. The card keeps exactly the state a fresh approved review card has, and the restarted engine's merge sweep re-dispatches it.
+      */
+      if (isMergeGraphFailure(failedNodeForLog) && failureValueForLog === MERGE_ENGINE_SHUTDOWN_VALUE) {
+        deps.clearPausedAborted(task.id);
+        deps.activeWorktrees.delete(task.id);
+        const restartDeferral = `Workflow merge at node '${failedNodeForLog}' was interrupted by an engine shutdown — not a merge failure; the merge will resume after the engine restart`;
+        executorLog.log(`${task.id}: ${restartDeferral}`);
+        await deps.store.logEntry(task.id, restartDeferral, undefined, deps.getRunContextFor(task.id));
         await deps.persistTokenUsage(task.id);
         return;
       }
