@@ -48,6 +48,12 @@ import {
 } from "../merge/pre-merge-gate-reseed.js";
 import { MERGE_BOUNDARY_RECOVERY_VALUE, MERGE_BOUNDARY_UNPROVEN_VALUE, MERGE_ENGINE_SHUTDOWN_VALUE } from "../workflows/workflow-merge-nodes.js";
 import { emitMergeBoundaryUnprovenParked } from "./emit-merge-boundary-unproven-audit.js";
+import {
+  deferMergeOnProviderRateLimit,
+  deferReviewStepOnProviderRateLimit,
+  findRateLimitedReviewResultForRun,
+  isProviderRateLimitError,
+} from "../external-block/provider-rate-limit-deferral.js";
 import { PAUSE_ABORT_PARK_ERROR_MARKER, PAUSE_ABORT_PARK_OPERATOR_MARKER } from "../self-healing.js";
 import {
   graphFailureErrorTexts,
@@ -521,6 +527,31 @@ export async function handleGraphFailure(
         });
         await deps.persistTokenUsage(task.id);
         return;
+      }
+      /*
+      FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+      KB-077: a review step (Plan Review, Code Review, Browser Verification, Post-merge Verification) that failed before producing a
+      verdict because of a provider rate limit freezes in place on the executor's external-block schedule (5/15/30/60/120/120 minutes,
+      shared budget of six) instead of spending the no-verdict re-seed budget or Plan Review's two-retry provider hold within a minute.
+      This runs before every review-recovery branch below so no reroute, remediation backstop, or failed park can follow a freeze.
+      A refusal (human control, auto-merge Off, merge-confirmed pre-merge gate) falls through to today's handling; non-RATE_LIMIT
+      provider failures keep the existing hold.
+      */
+      const rateLimitedReview = findRateLimitedReviewResultForRun(live, result.visitedNodeIds);
+      if (rateLimitedReview) {
+        const deferral = await deferReviewStepOnProviderRateLimit({
+          store: deps.store,
+          taskId: task.id,
+          result: rateLimitedReview,
+          runContext: deps.getRunContextFor(task.id),
+        }).catch((error: unknown) => {
+          executorLog.warn(`${task.id}: provider rate-limit review deferral failed: ${error instanceof Error ? error.message : String(error)}`);
+          return undefined;
+        });
+        if (deferral?.deferred || (deferral && !deferral.deferred && deferral.reason === "already-frozen")) {
+          await deps.persistTokenUsage(task.id);
+          return;
+        }
       }
       if (graphFailureValue(result) === PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE) {
         /*
@@ -1316,6 +1347,28 @@ export async function handleGraphFailure(
         */
         if (await deps.routeImplementationIncompleteMergeGraphFailure(live, failedNode ?? "unknown", failureValue, boundaryEvidence)) {
           return;
+        }
+      }
+      /*
+      FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+      KB-077: a graph-owned AI merge that failed with a provider rate limit freezes at its merge node on the external-block schedule
+      instead of entering the bounded merge retry, which would re-hit the same 429 and park failed. No merge retry budget is spent.
+      */
+      if (mergeGraphFailure) {
+        const recordedMergeError = failedNode ? result.context?.[`node:${failedNode}:error`] : undefined;
+        const mergeError = [recordedMergeError, failureValue].find((value): value is string => isProviderRateLimitError(value as string | undefined));
+        if (mergeError) {
+          const deferral = await deferMergeOnProviderRateLimit({
+            store: deps.store,
+            taskId: task.id,
+            errorMessage: mergeError,
+            preferredNodeId: failedNode?.includes("::") ? failedNode.slice(0, failedNode.indexOf("::")) : failedNode,
+            runContext: deps.getRunContextFor(task.id),
+          }).catch(() => undefined);
+          if (deferral?.deferred) {
+            await deps.persistTokenUsage(task.id);
+            return;
+          }
         }
       }
       if (mergeGraphFailure && !isTerminalMergeGraphFailureValue(failureValue) && await deps.routeGraphMergeFailureToRetry(live, result, abortProvenance)) {

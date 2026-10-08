@@ -130,7 +130,9 @@ export function hasExhaustedNoVerdictRecovery(result: WorkflowStepResult): boole
   const previous = (result.priorAttempts ?? []).filter((entry) => !entry.supersededAt && !entry.remediationArchivedAt
     && entry.reviewInputFingerprint === result.reviewInputFingerprint
     && entry.reviewedCommitSha === result.reviewedCommitSha
-    && entry.status === "failed" && entry.verdict === undefined);
+    && entry.status === "failed" && entry.verdict === undefined
+    // FNXC:ProviderRateLimitDeferral 2026-10-08-16:05: a provider rate limit is not a lost dispatch; KB-077 defers it on the external-block schedule, so it never spends this budget.
+    && entry.providerFailure?.code !== "RATE_LIMIT");
   return previous.length >= 3;
 }
 

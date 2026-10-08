@@ -49,6 +49,7 @@ import {
 } from "@fusion/core";
 import { mergeEffectiveSettings } from "../project/effective-settings.js";
 import { hasExhaustedNoVerdictRecovery, isUnavailablePlanLockResult } from "../merge/pre-merge-gate-reseed.js";
+import { deferReviewStepOnProviderRateLimit, isRateLimitedNoVerdictResult } from "../external-block/provider-rate-limit-deferral.js";
 import { moveTaskToReplanColumn, resolveReplanTargetColumn } from "../execution/replan-target.js";
 import { isNonPlanDefectPlanReviewFailure } from "../errors/transient-error-detector.js";
 import { parseRequiredArtifactMissingValue } from "../execution/required-workflow-artifacts.js";
@@ -359,6 +360,21 @@ async function requestPreMergeOptionalStepFixInner(
   if (isUnavailablePlanLockResult({ output: info.feedback })
     && (!failedResult || failedResult.status !== "failed" || failedResult.verdict !== undefined)) {
     throw new ClaimSupersededError();
+  }
+  /*
+  FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+  KB-077: a review that failed before producing a verdict because of a provider rate limit is never REVISE authority and never a
+  "Review recovery stopped" park. It freezes in place on the executor's external-block schedule; a refused freeze (human control,
+  auto-merge Off, merge-confirmed) falls through to today's handling.
+  */
+  if (info.verdict === undefined && isRateLimitedNoVerdictResult(failedResult)) {
+    const deferral = await deferReviewStepOnProviderRateLimit({
+      store: deps.store,
+      taskId,
+      result: failedResult!,
+      runContext: deps.getRunContextFor(taskId),
+    });
+    if (deferral.deferred || deferral.reason === "already-frozen") return false;
   }
   if (info.verdict === undefined && failedResult?.status === "failed" && failedResult.verdict === undefined
     && (isUnavailablePlanLockResult(failedResult) || hasExhaustedNoVerdictRecovery(failedResult))) {

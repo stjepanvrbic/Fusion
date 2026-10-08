@@ -141,6 +141,7 @@
     "packages/engine/src/executor/worktree-capture-modified-files.ts",
     "packages/engine/src/executor/worktree-git-refs.ts",
     "packages/engine/src/external-block/external-block-lifecycle.ts",
+    "packages/engine/src/external-block/provider-rate-limit-deferral.ts",
     "packages/engine/src/external-integrations/manifest.ts",
     "packages/engine/src/git-identity.ts",
     "packages/engine/src/goals/goal-anchoring-audit.ts",
@@ -6592,6 +6593,25 @@
       ],
       "axis1": "out-of-frontier",
       "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to requestExternalBlockResume; it is owned by operator Retry (dashboard) and the scheduler's automatic-resume sweep, outside the merge body.",
+      "axis2Provisional": "out-of-frontier",
+      "axis2Final": "out-of-frontier",
+      "observedInSuite": "out-of-frontier",
+      "executionProof": "none:out-of-frontier",
+      "followUpTaskId": "none:out-of-frontier"
+    },
+    {
+      "callSiteId": "packages/engine/src/external-block/provider-rate-limit-deferral.ts::deferMergeOnProviderRateLimit::store.logEntry::#1",
+      "callSiteFingerprint": "store.logEntry(taskId,\"AI merge hit a provider rate limit but its workflow has no merge node to resume at — keeping the existing merge failure,undefined,input.runContext)",
+      "file": "packages/engine/src/external-block/provider-rate-limit-deferral.ts",
+      "enclosingSymbolPath": "deferMergeOnProviderRateLimit",
+      "writer": "store.logEntry",
+      "ordinal": 1,
+      "owningEntryPoint": "other",
+      "reachableDataStates": [
+        "unobservable:closure-wide production fixture pending"
+      ],
+      "axis1": "out-of-frontier",
+      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to deferMergeOnProviderRateLimit; it is owned by the ProjectEngine merge pump's error handling after the merge body rejected, and by graph-failure merge retry routing, outside the merge body.",
       "axis2Provisional": "out-of-frontier",
       "axis2Final": "out-of-frontier",
       "observedInSuite": "out-of-frontier",

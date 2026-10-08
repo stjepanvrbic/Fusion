@@ -138,6 +138,10 @@ export async function recoverFailedPreMergeWorkflowStepDetailed(
     if (target.verdict === undefined && (isUnavailablePlanLockResult(target) || hasExhaustedNoVerdictRecovery(target))) {
       return { kind: "skipped" };
     }
+    /* FNXC:ProviderRateLimitDeferral 2026-10-08-16:05: KB-077 — a provider rate limit is never implementation remediation input; the freeze-and-auto-resume owner re-runs the review. */
+    if (target.verdict === undefined && target.providerFailure?.code === "RATE_LIMIT") {
+      return { kind: "skipped" };
+    }
 
     if (hasPreMergeRemediationAutoMergeHold(liveTask, await deps.store.getSettings())) {
       const reason = "operator-authored task-level auto-merge Off holds failed-step recovery";

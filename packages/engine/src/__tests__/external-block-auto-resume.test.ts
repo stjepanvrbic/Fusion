@@ -19,6 +19,7 @@ import {
   resolvePlanningContinuationCandidate,
 } from "../runtimes/in-process-runtime.js";
 import { projectAdmissionCoordinator, projectCapacityHoldersFromStore } from "../concurrency/concurrency.js";
+import { deferReviewStepOnProviderRateLimit } from "../external-block/provider-rate-limit-deferral.js";
 
 const IR = {
   version: "v2",
@@ -304,5 +305,42 @@ describe("a resumed frozen card re-enters through project admission", () => {
     expect(env.audits.find((event) => event.mutationType === "task:external-block-cleared")!.metadata).toMatchObject({
       taskId: "KB-046", code: "RATE_LIMIT", resumeNodeId: "implement", trigger: "operator",
     });
+  });
+
+  /*
+  FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+  KB-077: a review step frozen on a provider rate limit resumes through the same schedule and admission as an executor freeze, at its
+  own review node in its own lane.
+  */
+  it("resumes a rate-limited Code Review freeze at code-review in the review lane and clears it only on admission", async () => {
+    const env = createStore([card("KB-066", {
+      column: "review",
+      workflowStepResults: [{
+        workflowStepId: "code-review", workflowStepName: "Code Review", phase: "pre-merge", status: "failed",
+        output: "Code Review failed before producing a verdict: 429 Too Many Requests",
+        providerFailure: { origin: "model-provider", code: "RATE_LIMIT" },
+      }],
+    })]);
+    const result = env.rows.get("KB-066")!.workflowStepResults![0]!;
+    expect(await deferReviewStepOnProviderRateLimit({ store: env.store as never, taskId: "KB-066", result, nowMs: T0 })).toMatchObject({ deferred: true });
+
+    vi.setSystemTime(T0 + 5 * MINUTE);
+    expect(await resumeDueExternalBlocks({ store: env.store as never, tasks: [...env.rows.values()] })).toEqual(["KB-066"]);
+    const item = env.items.at(-1)!;
+    expect(item).toMatchObject({ nodeId: "code-review", sourceColumn: "review", targetColumn: "review" });
+
+    const executed: Task[] = [];
+    const run = createPlanningContinuationRun({ store: env.store as never, execute: async (task) => { executed.push(task); } });
+    expect(await admitPlanningContinuation({
+      store: env.store as never,
+      projectId: "/project",
+      task: env.rows.get("KB-066")!,
+      item,
+      dispatch: () => run(env.rows.get("KB-066")!, item),
+    })).toBe(true);
+    await vi.waitFor(() => expect(executed).toHaveLength(1));
+    expect(executed[0]).toMatchObject({ id: "KB-066", column: "review", paused: false });
+    expect(executed[0]!.status).toBeUndefined();
+    expect(executed[0]!.externalBlock).toBeUndefined();
   });
 });

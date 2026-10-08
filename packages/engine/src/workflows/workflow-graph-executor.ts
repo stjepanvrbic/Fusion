@@ -66,6 +66,20 @@ function parseWorkflowStepNotRunReason(value: unknown): WorkflowStepNotRunReason
     : undefined;
 }
 
+const PROVIDER_FAILURE_ORIGINS: ReadonlySet<string> = new Set(["host-environment", "model-provider", "credentials", "network", "third-party-service"]);
+
+/**
+ * FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+ * Copies only a well-formed `providerFailure` marker from a node's context patch onto its failed, verdict-less step result, so recovery
+ * can route a provider rate limit to the executor's freeze-and-auto-resume contract without re-reading reviewer prose.
+ */
+function readProviderFailure(contextPatch: Record<string, unknown> | undefined): WorkflowStepResult["providerFailure"] | undefined {
+  const raw = contextPatch?.providerFailure as { origin?: unknown; code?: unknown } | undefined;
+  if (!raw || typeof raw !== "object" || typeof raw.origin !== "string" || typeof raw.code !== "string") return undefined;
+  if (!PROVIDER_FAILURE_ORIGINS.has(raw.origin) || !raw.code.trim()) return undefined;
+  return { origin: raw.origin as NonNullable<WorkflowStepResult["providerFailure"]>["origin"], code: raw.code };
+}
+
 type WorkflowNodeSettings = Pick<Settings, "experimentalFeatures"> & {
   reviewerInlineFixes?: boolean;
 };
@@ -1332,6 +1346,7 @@ export class WorkflowGraphExecutor {
           const terminalFence = pendingLease.persisted
             ? { requireAttemptStartedAt: stepStartedAt }
             : { requireAttemptStartedAtOrAbsent: stepStartedAt };
+          const providerFailure = stepStatus === "failed" && !verdict ? readProviderFailure(exitContextPatch) : undefined;
           const terminalPersistence = await this.recordOptionalGroupStepResult(task.id, {
             workflowStepId: node.id,
             workflowStepName: groupName,
@@ -1343,6 +1358,7 @@ export class WorkflowGraphExecutor {
             ...(verdict ? { verdict } : {}),
             ...(stepOutput !== undefined ? { output: stepOutput } : {}),
             ...(stepNotes !== undefined ? { notes: stepNotes } : {}),
+            ...(providerFailure ? { providerFailure } : {}),
             ...(stepFindings?.length ? { findings: stepFindings } : {}),
             ...(repositoryReviewOutcomes?.length ? { repositoryReviewOutcomes } : {}),
             ...(repositoryScopeRevision !== undefined ? { repositoryScopeRevision } : {}),
@@ -2575,6 +2591,7 @@ export class WorkflowGraphExecutor {
         failureValue: nodeResult.value,
       });
     }
+    const providerFailure = status === "failed" && !verdict ? readProviderFailure(contextPatch) : undefined;
     const recorded = await this.recordOptionalGroupStepResult(taskId, {
       workflowStepId: node.id,
       workflowStepName: this.workflowNodeProgressName(node),
@@ -2587,6 +2604,7 @@ export class WorkflowGraphExecutor {
       ...(verdict ? { verdict } : {}),
       ...(output !== undefined ? { output } : {}),
       ...(notes !== undefined ? { notes } : {}),
+      ...(providerFailure ? { providerFailure } : {}),
       ...(findings?.length ? { findings } : {}),
       ...(repositoryReviewOutcomes?.length ? { repositoryReviewOutcomes } : {}),
       ...(repositoryScopeRevision !== undefined ? { repositoryScopeRevision } : {}),

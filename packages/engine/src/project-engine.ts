@@ -122,9 +122,16 @@ import { promoteBranchGroup, type BranchGroupPromotionResult, type CreateGroupPr
 import { rerouteWorkspaceReviewToCodeReview } from "./merge/workspace-review-reroute.js";
 import { rerouteSingularStaleContentToReview } from "./merge/stale-content-review-reroute.js";
 import {
+  isFailedNoVerdictPreMergeReviewResult,
   rerouteFailedNoVerdictPreMergeGateToReview,
   rerouteUnrunPreMergeGateToReview,
 } from "./merge/pre-merge-gate-reseed.js";
+import {
+  deferMergeOnProviderRateLimit,
+  deferReviewStepOnProviderRateLimit,
+  isProviderRateLimitError,
+  isRateLimitedNoVerdictResult,
+} from "./external-block/provider-rate-limit-deferral.js";
 import { WorkspaceEnvironmentError } from "./merge/workspace-integration-target.js";
 import {
   evaluateProjectCapacity,
@@ -3340,7 +3347,17 @@ export class ProjectEngine {
         receipts,
       },
     });
-    if (mergeContent.kind === "singular" && !await this.isMergePending(task.id)) {
+    /*
+    FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+    KB-077: this merge-gate probe is automatic recovery, so a rate-limited no-verdict review freezes on the external-block schedule
+    instead of re-seeding into the same 429. Operator retry calls rerouteFailedNoVerdictPreMergeReview directly and stays immediate.
+    */
+    const rateLimitedReview = (task.workflowStepResults ?? []).find((result) =>
+      isFailedNoVerdictPreMergeReviewResult(result, mergeGate.requiredPreMergeStepIds) && isRateLimitedNoVerdictResult(result));
+    const rateLimitDeferred = rateLimitedReview
+      ? (await deferReviewStepOnProviderRateLimit({ store, taskId: task.id, result: rateLimitedReview, agentId: "merge-gate" }).catch(() => undefined))?.deferred === true
+      : false;
+    if (!rateLimitDeferred && mergeContent.kind === "singular" && !await this.isMergePending(task.id)) {
       // Use the same in-memory admission fence as every other no-verdict recovery owner.
       const reroute = await this.rerouteFailedNoVerdictPreMergeReview(task);
       if (reroute === "rerouted") {
@@ -6091,6 +6108,21 @@ export class ProjectEngine {
               // re-attempt; the catch-block-top logEntry already recorded the
               // failure on the task log.
               try {
+                /*
+                FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+                KB-065 (2026-10-08): an AI merge session hit a 429 and this branch parked the card failed with the raw 429 as its error.
+                A provider rate limit is transient: freeze the card at its merge node on the executor's external-block schedule
+                (5/15/30/60/120/120 minutes, shared budget of six) without touching status/error/mergeRetries/mergeTransientRetryCount
+                or arming a setTimeout re-enqueue; the freeze's pause fences merge dispatch until the admitted resume. A refusal
+                (human control, auto-merge Off, merge-confirmed, no merge node) keeps today's handling below.
+                */
+                if (isProviderRateLimitError(errorMsg)) {
+                  const deferral = await deferMergeOnProviderRateLimit({ store, taskId, errorMessage: errorMsg }).catch(() => undefined);
+                  if (deferral?.deferred) {
+                    await this.holdMergeRequestForRateLimitFreeze(store, taskId, errorMsg);
+                    continue;
+                  }
+                }
                 if (await this.maybeRetryTransientMerge(store, taskId, taskOnErr, errorMsg)) {
                   continue;
                 }
@@ -6312,6 +6344,24 @@ export class ProjectEngine {
     }
     const current = task.mergeTransientRetryCount ?? 0;
     return current >= ProjectEngine.MAX_AUTO_MERGE_TRANSIENT_RETRIES;
+  }
+
+  /**
+   * FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+   * Under the merge-request contract shadow, a rate-limit freeze keeps the merge-request record non-terminal by mirroring
+   * `maybeRetryTransientMerge`'s running -> retrying -> queued transitions without spending its attempt budget.
+   */
+  private async holdMergeRequestForRateLimitFreeze(store: TaskStore, taskId: string, errorMsg: string): Promise<void> {
+    const settings = await store.getSettings().catch(() => null);
+    if (settings?.mergeRequestContractShadowEnabled !== true) return;
+    const record = await store.getMergeRequestRecordAsync(taskId).catch(() => null);
+    if (!record || record.state === "manual-required" || record.state === "cancelled" || record.state === "succeeded" || record.state === "exhausted") return;
+    if (record.state === "running") {
+      await store.transitionMergeRequestState(taskId, "retrying", { attemptCount: record.attemptCount, lastError: errorMsg });
+    }
+    if ((await store.getMergeRequestRecordAsync(taskId))?.state === "retrying") {
+      await store.transitionMergeRequestState(taskId, "queued", { attemptCount: record.attemptCount, lastError: errorMsg });
+    }
   }
 
   private async maybeRetryTransientMerge(

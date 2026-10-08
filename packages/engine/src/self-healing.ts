@@ -103,6 +103,7 @@ import {
   rerouteFailedNoVerdictPreMergeGateToReview,
   rerouteUnrunPreMergeGateToReview,
 } from "./merge/pre-merge-gate-reseed.js";
+import { deferReviewStepOnProviderRateLimit, isRateLimitedNoVerdictResult } from "./external-block/provider-rate-limit-deferral.js";
 import { cleanupLandedTaskWorktree, removeEmptyWorkspaceTaskDirectory } from "./merge/post-landing-worktree-cleanup.js";
 import { AutoRecoveryDispatcher } from "./healing/auto-recovery.js";
 import { activeSessionRegistry, executingTaskLock } from "./agents/active-session-registry.js";
@@ -10573,6 +10574,20 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           if (!(task.workflowStepResults ?? []).some((result) =>
             isFailedNoVerdictPreMergeReviewResult(result, gate.requiredPreMergeStepIds))) continue;
           noVerdictReviewTaskIds.add(task.id);
+          /*
+          FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+          KB-077: a no-verdict failure caused by a provider rate limit is not a lost dispatch. Re-seeding it now would re-hit the same 429,
+          so freeze it on the executor's external-block schedule instead (this also covers a crash between the result write and the freeze).
+          */
+          const rateLimited = (task.workflowStepResults ?? []).find((result) =>
+            isFailedNoVerdictPreMergeReviewResult(result, gate.requiredPreMergeStepIds) && isRateLimitedNoVerdictResult(result));
+          if (rateLimited) {
+            const deferral = await deferReviewStepOnProviderRateLimit({ store: this.store, taskId: task.id, result: rateLimited, agentId: "self-healing" });
+            if (deferral.deferred) {
+              noVerdictRecovered++;
+              continue;
+            }
+          }
           /*
           FNXC:NoVerdictReviewRecovery 2026-09-23-20:52:
           Queue admission can claim a review card between this sweep's liveness probe and the

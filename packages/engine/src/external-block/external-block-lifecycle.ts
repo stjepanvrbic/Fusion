@@ -77,8 +77,14 @@ export async function parkTaskOnExternalObstacle(input: {
   writeRunContext?: RunContext;
   logMessage: string;
   nowMs?: number;
+  /**
+   * FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+   * Run-audit attribution for the freeze rows. Defaults to `executor`; KB-077 review and merge freezes pass `reviewer` / `merger`.
+   */
+  agentId?: string;
 }): Promise<void> {
   const { store, task } = input;
+  const agentId = input.agentId ?? "executor";
   const nowMs = input.nowMs ?? Date.now();
   const plan = planExternalBlockAutoResume(input.externalBlock, task.externalBlockAutoResumeCount, nowMs);
   const externalBlock: TaskExternalBlock = plan
@@ -92,7 +98,7 @@ export async function parkTaskOnExternalObstacle(input: {
   await store.logEntry(task.id, input.logMessage, undefined, input.runContext);
   await emitBoundedRunAudit(store, {
     taskId: task.id,
-    agentId: "executor",
+    agentId,
     runId: generateSyntheticRunId("external-block", task.id),
     domain: "database",
     mutationType: "task:external-block-parked",
@@ -118,7 +124,7 @@ export async function parkTaskOnExternalObstacle(input: {
   );
   await emitBoundedRunAudit(store, {
     taskId: task.id,
-    agentId: "executor",
+    agentId,
     runId: generateSyntheticRunId("external-block-auto-resume", task.id),
     domain: "database",
     mutationType: "task:external-block-auto-resume-scheduled",

@@ -22,6 +22,7 @@ import { emitMergeBoundaryUnprovenParked } from "./emit-merge-boundary-unproven-
 import type { MergeBoundaryRecoveryEvidence, MergeBoundaryUnprovenReasonCode } from "./workflow-merge-boundary.js";
 import { AUTO_MERGE_RETRY_REJECTED_PREFIX } from "../merge/stale-content-park.js";
 import { isEngineShutdownError } from "../merge/engine-shutdown-error.js";
+import { deferMergeOnProviderRateLimit, isProviderRateLimitError } from "../external-block/provider-rate-limit-deferral.js";
 
 export type RouteGraphMergeFailureToRetryDeps = {
   store: TaskStore;
@@ -394,6 +395,24 @@ export async function routeGraphMergeFailureToRetry(
     if (reason.endsWith(PRE_MERGE_STEPS_NOT_RUN_BLOCKER)) {
       await persistTokenUsageBestEffort(deps.persistTokenUsage, live.id);
       return true;
+    }
+    /*
+    FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+    KB-077: a merge request rejected by a provider rate limit is transient. Freeze the card at its merge node on the executor's
+    external-block schedule instead of the AUTO_MERGE_RETRY_REJECTED failed park; a refused freeze keeps that park.
+    */
+    if (isProviderRateLimitError(reason)) {
+      const deferral = await deferMergeOnProviderRateLimit({
+        store: deps.store,
+        taskId: live.id,
+        errorMessage: reason,
+        preferredNodeId: failedNode.includes("::") ? failedNode.slice(0, failedNode.indexOf("::")) : failedNode,
+        runContext: deps.getRunContextFor(live.id),
+      }).catch(() => undefined);
+      if (deferral?.deferred || (deferral && !deferral.deferred && deferral.reason === "already-frozen")) {
+        await persistTokenUsageBestEffort(deps.persistTokenUsage, live.id);
+        return true;
+      }
     }
     try {
       await deps.store.logEntry(

@@ -7,6 +7,7 @@
 
 import type { WorkflowStepNotRunReason } from "../../workflows/workflow-step-results.js";
 import type { ThinkingLevel } from "../board/board.js";
+import type { TaskExternalBlockOrigin } from "../../tasks/task-external-block.js";
 
 /*
  * FNXC:CredentialInstanceSelection 2026-08-01-05:38:
@@ -309,6 +310,13 @@ export interface WorkflowStepResult {
   reviewKind?: WorkflowReviewKind;
   /** Output from the workflow step agent (findings, errors, etc.) */
   output?: string;
+  /**
+   * FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+   * Structured classification of the session/provider error that made a step fail before producing a verdict, using the executor's
+   * external-obstacle taxonomy. Recovery routing reads this marker (a `RATE_LIMIT` failure freezes and auto-resumes like an executor
+   * freeze) and never re-classifies reviewer prose. Absent on legacy rows, script steps, and genuine reviewer failures.
+   */
+  providerFailure?: { origin: TaskExternalBlockOrigin; code: string };
   /** Normalized structured advisory findings from an explicitly classified review node. */
   findings?: WorkflowReviewFinding[];
   /** Per-repository review records for workspace code-review nodes; clean peers carry NOT_REVIEWED without a verdict. */

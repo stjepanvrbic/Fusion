@@ -597,6 +597,9 @@ export type DatabaseMutationType =
   | "task:external-block-auto-resume-scheduled"
   /** Metadata: { taskId, origin, code, attempt, budget, column, resumeNodeId } */
   | "task:external-block-auto-resume-executed"
+  /* FNXC:ProviderRateLimitDeferral 2026-10-08-16:05: KB-077 review/merge rate-limit freeze attribution; ids/counts/fixed outcomes only, never provider error prose. */
+  /** Metadata: { taskId, lane: "review" | "merge", nodeId, workflowStepId?, phase?, code: "RATE_LIMIT", attempt, budget, outcome: "deferred" | "budget-exhausted" } */
+  | "task:provider-rate-limit-deferred"
   /** Metadata: { taskId, column, trigger, outcome, completedStepCount } */
   | "task:step-session-abort-contained"
   /** Metadata: { taskId, artifactKeys, owner, source, action, attempt, maxAttempts, nodeId? } */

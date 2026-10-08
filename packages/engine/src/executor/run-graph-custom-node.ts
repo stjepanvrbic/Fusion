@@ -56,6 +56,7 @@ import { closeFusionBrowserSession } from "../agent-browser-lifecycle.js";
 import { classifyTaskWorktree } from "../worktree/worktree-pool.js";
 import { resolveIntegrationBranch } from "../merge/integration-branch.js";
 import { resolveWorkspaceRepoBaseBranch } from "../worktree/workspace-base-branch.js";
+import { classifyExternalObstacle } from "../execution-block-classifier.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -384,6 +385,30 @@ export function preserveOutcomeFindingsFromReviewOutput(outcome: WorkflowStepOut
   if (outcome.findings || typeof outcome.output !== "string") return outcome;
   const parsedReviewOutput = parseWorkflowStepOutput(outcome.output, { requireVerdict: false });
   return parsedReviewOutput.findings?.length ? { ...outcome, findings: parsedReviewOutput.findings } : outcome;
+}
+
+/**
+ * FNXC:ProviderRateLimitDeferral 2026-10-08-16:05:
+ * KB-066: a Code Review that died on a 429 recorded `failed` with an empty diagnostic ("failed before producing a verdict: failed"),
+ * because the session/provider error on the step outcome was dropped here. Record that error under the node's `:error` context key (the
+ * key the terminal recorder already prefers) and, for prompt-mode steps, a structured `providerFailure` marker classified with the
+ * executor's taxonomy (`classifyExternalObstacle`). Only the session error is classified, never reviewer prose (`outcome.output`), so a
+ * review that discusses rate limiting is never mistaken for a 429. Script-mode steps have no provider and never carry the marker.
+ * An outcome that parsed a verdict is genuine reviewer evidence and records nothing here.
+ */
+export function buildStepFailureContextPatch(
+  nodeId: string,
+  outcome: { success: boolean; error?: unknown; verdict?: unknown },
+  mode: "prompt" | "script",
+): Record<string, unknown> {
+  if (outcome.success || typeof outcome.verdict === "string") return {};
+  if (typeof outcome.error !== "string" || !outcome.error.trim()) return {};
+  const patch: Record<string, unknown> = { [`node:${nodeId}:error`]: outcome.error };
+  if (mode === "prompt") {
+    const obstacle = classifyExternalObstacle(outcome.error);
+    if (obstacle) patch.providerFailure = { origin: obstacle.origin, code: obstacle.code };
+  }
+  return patch;
 }
 
 export async function runGraphCustomNode(
@@ -1359,7 +1384,7 @@ export async function runGraphCustomNode(
     // produced notes; `output` carries the raw step output when present.
     const stepOutput = (outcome as { output?: string }).output;
     const stepNotes = (outcome as { notes?: string }).notes;
-    const contextPatch: Record<string, unknown> = {};
+    const contextPatch: Record<string, unknown> = { ...buildStepFailureContextPatch(node.id, { ...outcome, verdict }, mode) };
     if (typeof stepOutput === "string") contextPatch.output = stepOutput;
     if (typeof outcome.notRunReason === "string" && WORKFLOW_STEP_NOT_RUN_REASON_SET.has(outcome.notRunReason)) {
       contextPatch.notRunReason = outcome.notRunReason;
