@@ -1,4 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
 import {
@@ -15,10 +19,56 @@ FNXC:EngineTests 2026-08-09-11:30:
 The graph resolves an executor principal before reaching tool or step-numbering behavior. Route
 these focused fixtures through the shared durable agent so their assertions reach the owned seam.
 */
-function createRoutingExecutor(store: any) {
-  return new TaskExecutor(store, "/tmp/test", {
+/*
+FNXC:EngineTests 2026-10-08-08:47:
+KB-056 (register entry 28). These sessions never call fn_task_done while `execute()` runs (each case calls the
+captured tool afterwards), so every executor enters the missing-fn_task_done in-place retry. The mock store never
+persists `taskDoneRetryCount`, so the guarded re-dispatch timer looped forever in the background: it re-created
+the worktree (taking real reservations) and re-claimed the process-wide FN-001 graph routing, dropping a later
+case's `execute()` as a duplicate. Each case's executor work is now tracked and drained (pending in-place retries
+cancelled, every in-flight dispatch awaited) before the next case, and teardown asserts no FN-001 owner leaked.
+*/
+const harnessExecutors = new Set<TaskExecutor>();
+const inflightExecutorWork = new Set<Promise<unknown>>();
+
+function trackExecutorWork<T>(work: Promise<T>): Promise<T> {
+  inflightExecutorWork.add(work);
+  const settle = () => inflightExecutorWork.delete(work);
+  void work.then(settle, settle);
+  return work;
+}
+
+function cancelPendingInPlaceRetries(): void {
+  for (const executor of harnessExecutors) {
+    const timers = (executor as any).inPlaceExecutionResumeTimers as Map<string, ReturnType<typeof setTimeout>>;
+    for (const handle of timers.values()) clearTimeout(handle);
+    timers.clear();
+  }
+}
+
+/** Cancel pending in-place retries and await every tracked run, including runs those runs start. */
+async function drainExecutorWork(): Promise<void> {
+  cancelPendingInPlaceRetries();
+  while (inflightExecutorWork.size > 0) {
+    await Promise.allSettled([...inflightExecutorWork]);
+    cancelPendingInPlaceRetries();
+  }
+  harnessExecutors.clear();
+}
+
+function createRoutingExecutor(store: any, rootDir = "/tmp/test") {
+  const executor = new TaskExecutor(store, rootDir, {
     agentStore: createWorkflowRoutingAgentStore(store).agentStore,
   });
+  // Deps bags resolve host methods by name at call time, so instance wrappers observe timer re-dispatches too.
+  const host = executor as any;
+  const execute = host.execute.bind(executor);
+  host.execute = (task: unknown) => trackExecutorWork(execute(task));
+  const dispatchUnpauseResume = host.dispatchUnpauseResume.bind(executor);
+  host.dispatchUnpauseResume = (task: unknown, options?: unknown) =>
+    trackExecutorWork(dispatchUnpauseResume(task, options));
+  harnessExecutors.add(executor);
+  return executor;
 }
 
 function createBaseTask() {
@@ -45,7 +95,7 @@ function createBaseTask() {
   };
 }
 
-async function setupTaskDoneTool(currentTaskOverrides: Record<string, unknown> = {}) {
+async function setupTaskDoneTool(currentTaskOverrides: Record<string, unknown> = {}, rootDir = "/tmp/test") {
   const store = createMockStore();
   let capturedTool: any = null;
   let currentTask: any = {
@@ -69,7 +119,7 @@ async function setupTaskDoneTool(currentTaskOverrides: Record<string, unknown> =
     } as any;
   });
 
-  const executor = createRoutingExecutor(store);
+  const executor = createRoutingExecutor(store, rootDir);
   await executor.execute(createBaseTask() as any);
   expect(capturedTool, "TaskExecutor should open an implementation session with fn_task_done").not.toBeNull();
 
@@ -97,6 +147,43 @@ describe("TaskExecutor fn_task_done summary persistence", () => {
     mockedExecSync.mockImplementation((command: string) =>
       command.includes("rev-parse --is-inside-work-tree") ? Buffer.from("true\n") : Buffer.from(""),
     );
+  });
+
+  afterEach(async () => {
+    await drainExecutorWork();
+    expect((TaskExecutor as any).processWideGraphRouting.has("FN-001")).toBe(false);
+  });
+
+  /*
+  FNXC:EngineTests 2026-10-08-08:47:
+  KB-056 regression for register entry 28. Under `pool: "threads"` every file shares one pid, so a live claim another
+  file holds (or abandoned at worker teardown) on the shared real reservation directory used to block this file's
+  acquisition for the full 30 s `acquireTimeoutMs`. With that exact foreign claim present, the implementation session
+  must still open at once because the harness gives each file its own reservation domain.
+  */
+  it("opens the implementation session while another test file holds the shared worktree reservation", async () => {
+    const actualCore = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
+    const rootDir = join(tmpdir(), `fusion-kb056-root-${randomUUID()}`);
+    const worktreesDir = join(rootDir, ".fusion", "worktrees");
+    const foreignClaim = await actualCore.acquireWorktreePathReservation({
+      canonicalPath: await actualCore.canonicalizeWorktreePath(join(worktreesDir, "fn-001")),
+      worktreesDir,
+      rootDir,
+      acquireTimeoutMs: 1_000,
+    });
+    try {
+      expect(foreignClaim.state).toBe("held");
+      const { store, capturedTool } = await setupTaskDoneTool({}, rootDir);
+
+      await capturedTool.execute("tool-1", { summary: "Initial summary" });
+
+      expect(getSummaryUpdateCalls(store)).toEqual([["FN-001", { summary: "Initial summary" }]]);
+      expect(foreignClaim.state).toBe("held");
+    } finally {
+      await foreignClaim.release();
+      await drainExecutorWork();
+      await rm(rootDir, { recursive: true, force: true });
+    }
   });
 
   it("replaces the summary on the first completion when no prior summary or workflow results exist", async () => {
