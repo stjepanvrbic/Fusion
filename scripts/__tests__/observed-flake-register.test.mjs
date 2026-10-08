@@ -175,6 +175,12 @@ FNXC:TestFlakeRegister 2026-10-08-07:20:
 Entry 26 was sighted a second time on the fork's Full Suite (desktop row after the mobile row), so the deletion
 ratchet moves it to the archive. The archived record must keep both run identifiers and the unchanged assertion
 text so a rescue starts from the Planning Mode product code rather than a timeout.
+
+FNXC:TestFlakeRegister 2026-10-08-08:12:
+Entries 33 and 34 record first sightings from the fork's Full Suite: an AutomationStore due-run claim that
+straddled a cron minute edge, and an AgentDetailView log-stream subscription read before its effect flushed.
+Both stay active first sightings with their mechanisms marked unmeasured, so a second appearance follows the
+file-level quarantine rule instead of a timeout, retry, or weakened assertion.
 */
 test("observed-flake register active count, escalation state, and owners stay synchronized", () => {
   const register = readFileSync(registerPath, "utf8");
@@ -227,6 +233,14 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "32. System controls rebuild output stream subscription",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+    },
+    {
+      heading: "33. AutomationStore due-run claim minute-boundary clock race",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+    },
+    {
+      heading: "34. AgentDetailView log history SSE suspend and reopen subscription",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
   ]);
