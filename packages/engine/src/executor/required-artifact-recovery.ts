@@ -5,6 +5,7 @@
  */
 import type { Task, TaskStore } from "@fusion/core";
 import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES } from "../healing/recovery-policy.js";
+import { parkExhaustedRecovery } from "../healing/recovery-exhaustion.js";
 import { generateSyntheticRunId, type EngineRunContext } from "../util/run-audit.js";
 import { emitBoundedRunAudit } from "./emit-bounded-run-audit.js";
 import { resolveTerminalColumnsFor } from "./lifecycle-columns.js";
@@ -14,6 +15,7 @@ export type RequiredArtifactRecoveryDeps = {
   getRunContextFor: (taskId: string) => EngineRunContext | undefined;
   isRequiredArtifactRecoveryProtected: (task: Task) => Promise<boolean>;
   workflowLifecycleMovesInFlight: Set<string>;
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
 };
 
 /**
@@ -55,13 +57,20 @@ export async function recoverMissingRequiredArtifacts(
   const currentTask = await deps.store.getTask(task.id).catch(() => null);
   if (!currentTask || await deps.isRequiredArtifactRecoveryProtected(currentTask)) return;
   task = currentTask;
+  /*
+  FNXC:RecoveryOwnership 2026-10-07-18:04:
+  A reseed does not restore a missing artifact: graph entry rejects the same absent input again.
+  This owner therefore has no reseed slot. Its bounded ladder gives a transient filesystem gap
+  time to clear (restoring the artifact lets the next retry progress); exhaustion parks the card
+  visibly instead of resetting the budget, which FN-9512 did forever.
+  */
   const decision = computeRecoveryDecision({
     recoveryRetryCount: task.recoveryRetryCount,
     nextRecoveryAt: task.nextRecoveryAt,
-  });
-  const attempt = decision.nextState.recoveryRetryCount ?? MAX_RECOVERY_RETRIES;
+  }, { reseedBudget: 0 });
+  const attempt = decision.disposition === "retry" ? decision.attempt : MAX_RECOVERY_RETRIES;
   const context = deps.getRunContextFor(task.id);
-  const action = decision.shouldRetry ? "retry-in-place" : "reseed-in-place";
+  const action = decision.disposition === "retry" ? "retry-in-place" : "park-in-place";
 
   await emitBoundedRunAudit(deps.store, {
     taskId: task.id,
@@ -82,19 +91,16 @@ export async function recoverMissingRequiredArtifacts(
     },
   });
 
-  if (!decision.shouldRetry) {
+  if (decision.disposition === "escalate") {
     const liveTask = await deps.store.getTask(task.id).catch(() => null);
     if (!liveTask || await deps.isRequiredArtifactRecoveryProtected(liveTask)) return;
-    /* FNXC:RecoveryOwnership 2026-10-06-15:28: Missing artifacts re-enter their current graph role after bounded verification; a failed park has no artifact-repair owner. */
-    await deps.store.logEntry(task.id, "Required artifact recovery exhausted its retry cadence; reseeding the current execution role.", undefined, context);
-    await deps.store.updateTask(task.id, {
-      status: null,
-      error: null,
-      recoveryRetryCount: null,
-      recoveryDisposition: "escalated-reseed",
-      nextRecoveryAt: null,
-      graphResumeRetryCount: 0,
-    }, context);
+    await parkExhaustedRecovery(deps.store, liveTask, {
+      owner: "executor-required-artifact",
+      attempts: decision.attempts,
+      detail: `required workflow artifact missing (${artifactKeys.join(", ")})`,
+      agentId: "executor",
+      runContext: context,
+    });
     return;
   }
 
@@ -113,4 +119,6 @@ export async function recoverMissingRequiredArtifacts(
     nextRecoveryAt: decision.nextState.nextRecoveryAt,
     graphResumeRetryCount: 0,
   }, context);
+  /* FNXC:RecoveryOwnership 2026-10-07-18:04: the retry needs an owner at its deadline; task:updated resume now honors nextRecoveryAt, so arm the in-place re-dispatch explicitly. */
+  deps.scheduleInPlaceExecutionResume(task.id);
 }

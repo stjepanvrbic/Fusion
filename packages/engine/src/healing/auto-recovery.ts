@@ -109,7 +109,8 @@ export class AutoRecoveryDispatcher {
     const maxRetries = context.settings.maxRetries ?? 3;
     const recovery = computeRecoveryDecision(
       { recoveryRetryCount: context.retryCount },
-      { maxRetries },
+      // FNXC:RecoveryOwnership 2026-10-07-18:04: the dispatcher's own retry count has no reseed slot; exhaustion escalates directly.
+      { maxRetries, reseedBudget: 0 },
     );
     if (recovery.disposition === "escalate") {
       return {

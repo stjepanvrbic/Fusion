@@ -18,6 +18,8 @@ FNXC:LifecycleContainment 2026-08-28-03:03:
 FN-207 centralizes source-relative backward recovery: review may target only WIP, WIP may target only
 hold, no target means no move, and capacity refusal remains in place. The seam preserves the caller's
 raw source because assigning engine here would change guard-bypass behavior for optionless callers.
+FNXC:LifecycleContainment 2026-10-07-18:04: superseded in part. Optionless callers are now attributed
+as engine with an explicit `bypassGuards: false`, which keeps guard behavior and enables the direction check.
 */
 export async function moveTaskToContainedBackwardTarget(
   store: TaskStore,
@@ -64,8 +66,21 @@ export async function moveTaskWithLifecycleReason(
   reason: string,
   options?: MoveTaskOptions,
 ): Promise<LifecycleMoveResult> {
+  /*
+  FNXC:LifecycleContainment 2026-10-07-18:04:
+  Every move through this seam is an automatic engine move, so it is attributed as one: the FN-207
+  direction postcondition only runs for an explicit engine/scheduler source, and an optionless call
+  took the store's fail-open legacy route. Guard bypass stays as the caller had it (an optionless
+  call ran guards), so attribution does not silently grant plugin-gate bypass.
+  */
+  const attributed: MoveTaskOptions = {
+    ...options,
+    moveSource: options?.moveSource ?? "engine",
+    // An explicit caller source keeps the store's derived bypass; an optionless call keeps its guards.
+    bypassGuards: options?.bypassGuards ?? (options?.moveSource ? undefined : false),
+  };
   try {
-    await store.moveTask(taskId, toColumn, { ...options, lifecycleReason: reason });
+    await store.moveTask(taskId, toColumn, { ...attributed, lifecycleReason: reason });
     return { moved: true };
   } catch (error) {
     if (!(error instanceof TransitionRejectionError) || error.rejection.code !== "capacity-exhausted") {

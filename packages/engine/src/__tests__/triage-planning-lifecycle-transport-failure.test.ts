@@ -145,13 +145,17 @@ describe("triage planning lifecycle lock transport failures (FN-8911)", () => {
     FNXC:TriagePlanningRetry 2026-10-07-05:26:
     FN-9512 hands exhausted lifecycle-lock transport failures to the needs-replan owner with an escalated-reseed disposition instead of parking them failed.
     The transport diagnosis must survive into the escalation log rather than being laundered into an unchanged-PROMPT verdict.
+
+    FNXC:RecoveryOwnership 2026-10-07-18:04:
+    That reseed is spent once per episode: the counter is kept (not cleared), so the next exhausted
+    batch parks the card visibly instead of re-admitting it with a reset budget forever.
     */
     expect(fixture.task().status).toBe("needs-replan");
     expect(fixture.task().error).toBeNull();
-    expect(fixture.task().recoveryRetryCount).toBeNull();
+    expect(fixture.task().recoveryRetryCount).toBe(4);
     expect(fixture.task().recoveryDisposition).toBe("escalated-reseed");
     expect(fixture.task().nextRecoveryAt).toBeNull();
-    expect(fixture.task().planningFailure?.lifecycleLockTransport).toBeUndefined();
+    expect(fixture.task().planningFailure?.lifecycleLockTransport).toMatchObject({ message: "direct PostgreSQL session endpoint is unavailable" });
     expect(fixture.task().customFields).toEqual({ unrelated: "preserve-me" });
 
     const escalationLog = fixture.logs.find((message) => message.includes("exhausted its retry cadence"));
@@ -159,6 +163,16 @@ describe("triage planning lifecycle lock transport failures (FN-8911)", () => {
     expect(escalationLog).toContain("Planning lifecycle lock transport failure recorded at");
     expect(escalationLog).not.toContain("did not update the authoritative PROMPT.md");
     expect(fixture.logs.some((message) => message.includes("did not update the authoritative PROMPT.md"))).toBe(false);
+
+    // A second full batch, each claimed by a fresh owner, ends in a bounded visible park.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      mockPromptWithFallback.mockResolvedValueOnce(undefined);
+      await new TriageProcessor(fixture.store, root).specifyTask(fixture.task());
+    }
+    expect(fixture.task().status).toBe("failed");
+    expect(fixture.task().recoveryRetryCount).toBe(7);
+    expect(fixture.task().error).toContain("Planning lifecycle lock transport failure recorded at");
+    expect(fixture.task().error).toContain("including one fresh-session reseed");
   });
 
   it("keeps the ordinary unchanged-PROMPT verdict when no persisted transport marker exists", async () => {

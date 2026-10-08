@@ -47,6 +47,7 @@ function harness(row: TaskDetail, workflowId: string) {
     clearTerminalStepFailuresForRetry: vi.fn(async () => undefined),
     persistTokenUsage: vi.fn(async () => undefined),
     isRemediationGraphNode: vi.fn(async () => false),
+    scheduleInPlaceExecutionResume: vi.fn(),
   };
   return { store, deps };
 }
@@ -89,6 +90,8 @@ describe("graph failure execution-resume containment", () => {
 
     expect(store.moveTask).not.toHaveBeenCalled();
     expect(row.column).toBe("in-progress");
+    // FNXC:RecoveryOwnership 2026-10-07-18:04: "resuming in place" must schedule the resume; no move event follows to trigger it.
+    expect(deps.scheduleInPlaceExecutionResume).toHaveBeenCalledWith(row.id);
   });
 
   it("fails closed when the workflow declares no WIP lane", async () => {

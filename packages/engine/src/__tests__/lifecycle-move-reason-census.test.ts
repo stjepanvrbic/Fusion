@@ -73,8 +73,16 @@ describe("engine lifecycle move reason census", () => {
      *
      * FNXC:WorktreeAcquisition 2026-10-07-19:51:
      * Heartbeat worktree-acquisition recovery no longer moves the card (lifecycle containment), which removes its three rebound moves: the base-refresh refusal, the in-budget retry, and the exhausted park.
+     *
+     * FNXC:LifecycleContainment 2026-10-07-18:04:
+     * 51 -> 25 (after the heartbeat change above). Every executor retry/rebound (transient, planning-lock, context overflow, stale
+     * continuation, non-continuable, worktree liveness, reclaim, no-fn_task_done, completion refusal,
+     * pause teardown, contamination, dependency abort, parse-pin, bootstrap misbinding, ephemeral gate,
+     * completed-blocked park), the self-healing pause-abort requeue, and the mission retry moves were
+     * automatic WIP-to-hold (or review-to-hold) moves that FN-207 forbids; each now recovers in place
+     * through the guarded in-place re-dispatch. A rise here means a new direct move needs review.
      */
-    expect(count).toBe(51);
+    expect(count).toBe(25);
   });
 
   it("requires direct backward-target moves to carry a registered reason", () => {

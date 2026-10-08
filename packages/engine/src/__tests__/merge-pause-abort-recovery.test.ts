@@ -742,6 +742,7 @@ describe("FN-6735 merge pause-abort recovery", () => {
         store: { logEntry: vi.fn(), updateTask: vi.fn(), getTaskWorkflowSelection: () => undefined }, getRunContextFor: () => undefined,
         resolveResumeLanes: vi.fn().mockResolvedValue(lanes), clearTerminalStepFailuresForRetry: vi.fn(),
         persistTokenUsage: vi.fn(), isRemediationGraphNode: vi.fn(),
+        scheduleInPlaceExecutionResume: vi.fn(),
       });
       const review = base();
       await expect(routeGraphFailureToExecutionResume(review as any, task({ steps: [{ status: "pending" }] }), "merge", "implementation-incomplete")).resolves.toBe(false);
@@ -752,6 +753,9 @@ describe("FN-6735 merge pause-abort recovery", () => {
       await expect(routeGraphFailureToExecutionResume(wip as any, task({ column: "building", steps: [{ status: "pending" }] }), "merge", "implementation-incomplete")).resolves.toBe(true);
       expect(wip.store.updateTask).toHaveBeenCalledWith("FN-6735", { status: null, error: null }, undefined);
       expect(wip.clearTerminalStepFailuresForRetry).toHaveBeenCalledWith("FN-6735", "archive");
+      // FNXC:RecoveryOwnership 2026-10-07-18:04: "resuming in place" must schedule the resume; no task:updated owner exists while the run still holds its claims.
+      expect(wip.scheduleInPlaceExecutionResume).toHaveBeenCalledWith("FN-6735");
+      expect(review.scheduleInPlaceExecutionResume).not.toHaveBeenCalled();
 
       const absentWip = base();
       absentWip.resolveResumeLanes.mockResolvedValue({ ...lanes, wipDeclared: false });

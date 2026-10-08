@@ -236,7 +236,14 @@ const LEDGER = {
      * the graph can model this recovery outcome; the live-row fence and resolved rebound lane
      * prevent it from bypassing an operator pause or inventing a terminal park.
      */
-    "column transitions (store.moveTask)": 11,
+    /*
+     * FNXC:LifecycleContainment 2026-10-07-18:04: 11 -> 0. Every remaining move here was an automatic
+     * WIP-to-hold rebound (transient, context-overflow, stale continuation, no-fn_task_done, reclaim,
+     * pause teardown, contamination, liveness, planning lock) that FN-207 forbids. Each retry now
+     * stays in its WIP lane via requeueExecutionInPlace and still marks the graph execute
+     * self-requeue, so the graph sees the same "requeued" outcome without a backward column move.
+     */
+    "column transitions (store.moveTask)": 0,
     /* U8: 3 -> 2. The pending-review handoff left this method — the graph's
        `review-pending-handoff` node performs it now. A decrement here is the unit working. */
     "review transitions (handoffTaskToReview)": 2,
@@ -294,7 +301,8 @@ describe("U8 execution-lifecycle ownership ledger", () => {
     expect(bodyLineCount(RUN_IMPLEMENTATION, RUN_IMPLEMENTATION_SOURCE)).toBeGreaterThan(2000);
     expect(bodyLineCount(RUN_IMPLEMENTATION, RUN_IMPLEMENTATION_SOURCE)).toBeLessThan(4500);
     expect(bodyLineCount(HANDLE_GRAPH_FAILURE, HANDLE_GRAPH_FAILURE_SOURCE)).toBeGreaterThan(500);
-    expect(bodyLineCount(HANDLE_GRAPH_FAILURE, HANDLE_GRAPH_FAILURE_SOURCE)).toBeLessThan(1600);
+    // FNXC:RecoveryOwnership 2026-10-07-18:04: ~1.66k after the visible exhausted-hold parks and the bounded invalid-plan replan landed.
+    expect(bodyLineCount(HANDLE_GRAPH_FAILURE, HANDLE_GRAPH_FAILURE_SOURCE)).toBeLessThan(1800);
   });
 
   it("runImplementation: executor-owned dispositions match the ledger", () => {
@@ -312,6 +320,6 @@ describe("U8 execution-lifecycle ownership ledger", () => {
   it("states the U8 baseline ratio: the implementation phase decides far more than it asks", () => {
     const owned = EXECUTOR_OWNED_LABELS.reduce<number>((sum, label) => sum + LEDGER.runImplementation[label], 0);
     const handbacks = LEDGER.runImplementation[GRAPH_HANDBACK_LABEL];
-    expect({ owned, handbacks }).toEqual({ owned: 19, handbacks: 3 });
+    expect({ owned, handbacks }).toEqual({ owned: 8, handbacks: 3 });
   });
 });

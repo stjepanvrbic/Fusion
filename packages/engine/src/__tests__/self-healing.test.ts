@@ -3966,6 +3966,40 @@ describe("SelfHealingManager", () => {
     });
 
 
+    it("leaves an eligible review-lane park intact, reports it once, and stays silent on an unchanged second pass", async () => {
+      /*
+      FNXC:LifecycleContainment 2026-10-07-18:04:
+      A review card cannot resume implementation in place and FN-217 removed the backward move, so the
+      former "requeue to todo" cleared the failed park and then moved nothing. The sweep is now
+      observation-only: the failed park (the operator's Retry signal) survives and no recovery is claimed.
+      */
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+      vi.spyOn(managerWithRecovery as any, "evaluateBackwardMoveTripleProof").mockResolvedValue({ ok: true, stalenessMs: 10_000, reason: "test" });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: "FN-PARTIAL",
+          column: "in-review",
+          status: "failed",
+          error: "Agent finished without calling fn_task_done (after retry)",
+          paused: false,
+          taskDoneRetryCount: 0,
+          steps: [{ status: "done" }, { status: "pending" }],
+          log: [],
+        },
+      ]);
+
+      expect(await managerWithRecovery.recoverPartialProgressNoTaskDoneFailures()).toBe(0);
+      expect(await managerWithRecovery.recoverPartialProgressNoTaskDoneFailures()).toBe(0);
+
+      expect(store.updateTask).not.toHaveBeenCalled();
+      expect(store.moveTask).not.toHaveBeenCalled();
+      const noAction = (store.recordRunAuditEvent as ReturnType<typeof vi.fn>).mock.calls
+        .filter(([event]) => (event as { mutationType?: string }).mutationType === "task:partial-progress-no-task-done-no-action");
+      expect(noAction).toHaveLength(1);
+
+      managerWithRecovery.stop();
+    });
+
     it("skips tasks whose retry count has reached the max", async () => {
       const managerWithRecovery = new SelfHealingManager(store, {
         rootDir: "/tmp/test-project",
@@ -4128,7 +4162,7 @@ describe("SelfHealingManager", () => {
           deletions: 2,
         }),
       });
-      expect(store.moveTask).toHaveBeenCalledWith("FN-1673", "done");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-1673", "done", expect.objectContaining({ moveSource: "engine", bypassGuards: false }));
       expect(store.logEntry).toHaveBeenCalledWith(
         "FN-1673",
         expect.stringContaining("stale merge status finalized from landed commit 979ba2c"),
@@ -4200,7 +4234,7 @@ describe("SelfHealingManager", () => {
           mergeConfirmed: true,
         }),
       });
-      expect(store.moveTask).toHaveBeenCalledWith("FN-2900", "done");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-2900", "done", expect.objectContaining({ moveSource: "engine", bypassGuards: false }));
 
       managerWithRecovery.stop();
     });
@@ -4329,7 +4363,7 @@ describe("SelfHealingManager", () => {
           deletions: 0,
         }),
       });
-      expect(store.moveTask).toHaveBeenCalledWith("FN-2221", "done");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-2221", "done", expect.objectContaining({ moveSource: "engine", bypassGuards: false }));
       expect(store.logEntry).toHaveBeenCalledWith(
         "FN-2221",
         expect.stringContaining("stale merge status finalized from landed commit 3b212b9"),
@@ -5650,7 +5684,7 @@ describe("SelfHealingManager", () => {
           }),
         }),
       );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-500", "done");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-500", "done", expect.objectContaining({ moveSource: "engine", bypassGuards: false }));
       expect(store.logEntry).toHaveBeenCalledWith(
         "FN-500",
         expect.stringContaining("Auto-finalized no-op (proven): start point on main; modifiedFiles cleared"),
@@ -5696,7 +5730,7 @@ describe("SelfHealingManager", () => {
       const result = await managerWithRecovery.finalizeNoOpReviewTasks();
 
       expect(result).toBe(1);
-      expect(store.moveTask).toHaveBeenCalledWith("FN-6462", "done");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-6462", "done", expect.objectContaining({ moveSource: "engine", bypassGuards: false }));
       expect(store.moveTask).not.toHaveBeenCalledWith("FN-6462", "todo", expect.anything());
 
       managerWithRecovery.stop();
@@ -6075,7 +6109,7 @@ describe("SelfHealingManager", () => {
       const result = await managerWithRecovery.recoverStuckMergeDeadlocks();
 
       expect(result).toBe(1);
-      expect(store.moveTask).toHaveBeenCalledWith("FN-stuck", "done");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-stuck", "done", expect.objectContaining({ moveSource: "engine", bypassGuards: false }));
       expect(store.updateTask).toHaveBeenCalledWith("FN-stuck", expect.objectContaining({
         status: null,
         error: null,
@@ -8330,16 +8364,21 @@ describe("SelfHealingManager", () => {
       vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
 
       await expect(recovery.recoverApprovedTriageTasks()).resolves.toBe(0);
+      /*
+      FNXC:RecoveryOwnership 2026-10-07-18:04:
+      The fresh planning pass is spent once per episode: the counter is kept (maxRetries + 1) so the
+      next exhaustion parks the card instead of re-admitting it with a reset budget.
+      */
       expect(task).toMatchObject({
         status: "needs-replan",
         error: null,
-        recoveryRetryCount: null,
+        recoveryRetryCount: 4,
         recoveryDisposition: "escalated-reseed",
         nextRecoveryAt: null,
       });
       expect(exhaustedStore.logEntry).toHaveBeenCalledWith(
         task.id,
-        expect.stringContaining("escalated to a fresh planning pass"),
+        expect.stringContaining("escalated to one fresh planning pass"),
       );
 
       // The escalation is no longer a planning-stage handoff candidate. Triage owns

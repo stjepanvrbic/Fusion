@@ -45,6 +45,10 @@ describe("FN-5346 reliability interactions: post-completion stale self-owned bin
     activeSessionRegistry.registerPath(PATH, { taskId: TASK_ID, kind: "executor", ownerKey: TASK_ID });
     (activeSessionRegistry.lookupByPath(PATH) as any).registeredAt = 0;
     const removeSpy = vi.spyOn(worktreePoolModule, "removeWorktree").mockResolvedValue(undefined);
+    // FNXC:LifecycleContainment 2026-10-07-18:04: dep-abort now discards progress in place, which resets PROMPT.md checkboxes through the real store surface.
+    (store as any).taskDir = vi.fn((id: string) => `${ROOT}/.fusion/tasks/${id}`);
+    (store as any).resetPromptCheckboxes = vi.fn(async () => undefined);
+    vi.spyOn(executor, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
 
     await (executor as any).handleDepAbortCleanup(TASK_ID, PATH);
 

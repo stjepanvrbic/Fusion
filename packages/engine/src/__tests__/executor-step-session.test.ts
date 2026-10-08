@@ -39,12 +39,23 @@ import {
 const mockedReviewStep = vi.mocked(mockedReviewStepFn);
 
 /* FNXC:EngineTests 2026-08-09-05:51: Graph-owned execution fails closed before session creation when a test omits agentStore, so every executor harness must route through the durable fixture unless a test explicitly overrides it. */
+/*
+FNXC:LifecycleContainment 2026-10-07-18:04:
+Executor retries now stay in the WIP lane and are re-dispatched by a guarded in-place timer instead of
+a hold-lane move. Each case here drives one run against a constant mocked task, so the timer is
+stubbed (and exposed as `scheduleInPlaceResume`): a retry armed by one case must not re-run the mocked
+task inside the next case, and a case can assert the in-place handoff directly.
+*/
 function createRoutingExecutor(store: any, rootDir: string, options: any = {}) {
   const { ephemeral, ...executorOptions } = options;
-  return new TaskExecutor(store, rootDir, {
+  const executor = new TaskExecutor(store, rootDir, {
     agentStore: createWorkflowRoutingAgentStore(store, { ephemeral }).agentStore,
     ...executorOptions,
   });
+  const scheduleInPlaceResume = vi.fn();
+  vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(scheduleInPlaceResume);
+  (executor as any).scheduleInPlaceResume = scheduleInPlaceResume;
+  return executor;
 }
 
 /*
@@ -287,7 +298,7 @@ describe("Workflow Steps Execution", () => {
     expect(toolNames).toContain("fn_artifact_register");
   });
 
-  it("requeues to todo after 3 retries when the agent exits without calling fn_task_done", async () => {
+  it("retries in place after 3 retries when the agent exits without calling fn_task_done", async () => {
     const store = createMockStore();
     store.getTask.mockResolvedValue({
       id: "FN-001",
@@ -341,15 +352,17 @@ describe("Workflow Steps Execution", () => {
     FN-6610 confirmed the intended executor.ts no-fn_task_done exhaustion behavior: after three in-session retries, tasks with remaining requeue budget return to todo with progress preserved; only exhausted requeue budget parks them in review.
     Keep these expectations aligned with Executor.execute()'s MAX_TASK_DONE_REQUEUE_RETRIES branch rather than treating the first in-session exhaustion as terminal.
     */
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: the requeue stays in the WIP lane and arms the in-place re-dispatch. */
     expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
       status: "queued",
       error: null,
       taskDoneRetryCount: 1,
-    });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveProgress: true });
+    }, expect.objectContaining({ agentId: "executor" }));
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-001", "todo", expect.anything());
+    expect((executor as any).scheduleInPlaceResume).toHaveBeenCalledWith("FN-001");
     expect(store.logEntry).toHaveBeenCalledWith(
       "FN-001",
-      "Agent finished without calling fn_task_done (after 3 retries) — requeued to todo immediately (1/3)",
+      "Agent finished without calling fn_task_done (after 3 retries) — retrying in place with progress preserved (1/3)",
       undefined,
       expect.objectContaining({ agentId: "executor" }),
     );
@@ -419,7 +432,7 @@ describe("Workflow Steps Execution", () => {
     );
   });
 
-  it("clears a stale assistant-continuation resume session and requeues without marking the task failed", async () => {
+  it("clears a stale assistant-continuation resume session and retries in place without marking the task failed", async () => {
     const store = createMockStore();
     const task = {
       id: "FN-ASSISTANT-STALE",
@@ -442,11 +455,6 @@ describe("Workflow Steps Execution", () => {
       updatedAt: new Date().toISOString(),
     };
     store.getTask.mockResolvedValue(task as any);
-    store.moveTask.mockImplementation(async () => {
-      expect(executingTaskLock.has("FN-ASSISTANT-STALE")).toBe(false);
-      expect((executor as any).activeWorktrees.has("FN-ASSISTANT-STALE")).toBe(false);
-      return task as any;
-    });
 
     /*
     FNXC:EngineTests 2026-07-19-10:40 (U10b):
@@ -476,20 +484,25 @@ describe("Workflow Steps Execution", () => {
     const markGraphExecuteSelfRequeued = vi.spyOn(executor as any, "markGraphExecuteSelfRequeued");
     await executor.execute(task as any);
 
+    /*
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The bounded fresh-session retry stays in the WIP lane: the backoff is persisted through the
+    in-place requeue (run-attributed write), the deferred cleanup still clears transient session
+    state after the lock drops, and the guarded re-dispatch is armed instead of a hold-lane move.
+    */
     const retryRecoveryWrite = store.updateTask.mock.calls.find(
-      ([id, patch, runContext]) => id === "FN-ASSISTANT-STALE"
+      ([id, patch]) => id === "FN-ASSISTANT-STALE"
         && patch?.sessionFile === null
         && patch?.recoveryRetryCount === 1
-        && typeof patch?.nextRecoveryAt === "string"
-        && runContext === undefined,
+        && typeof patch?.nextRecoveryAt === "string",
     );
-    expect(retryRecoveryWrite).toHaveLength(2);
-    expect(retryRecoveryWrite?.[2]).toBeUndefined();
+    expect(retryRecoveryWrite).toBeDefined();
     expect(store.updateTask.mock.calls).toContainEqual([
       "FN-ASSISTANT-STALE",
       { sessionFile: null, status: null, error: null },
     ]);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-ASSISTANT-STALE", "todo", { preserveResumeState: true });
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-ASSISTANT-STALE", "todo", expect.anything());
+    expect((executor as any).scheduleInPlaceResume).toHaveBeenCalledWith("FN-ASSISTANT-STALE");
     expect(markGraphExecuteSelfRequeued).toHaveBeenCalledWith("FN-ASSISTANT-STALE");
     expect(executingTaskLock.has("FN-ASSISTANT-STALE")).toBe(false);
     expect((executor as any).activeWorktrees.has("FN-ASSISTANT-STALE")).toBe(false);
@@ -534,27 +547,30 @@ describe("Workflow Steps Execution", () => {
     }) as any);
     const onError = vi.fn();
     const executor = createRoutingExecutor(store, "/tmp/test", { onError });
+    const atomicPatches: Array<Record<string, unknown> | null> = [];
+    store.updateTaskAtomic.mockImplementation(async (id: string, updater: (current: any) => any) => {
+      atomicPatches.push(await updater(await store.getTask(id)));
+      return store.getTask(id);
+    });
 
     await executor.execute(task as any);
 
     /*
-    FNXC:EngineTests 2026-08-09-12:02:
-    Graph-owned stale-assistant recovery reaches the existing classifier once reused-worktree
-    reconciliation is mocked safe. Assert the absent run context is observably undefined and the
-    two-argument store write retains its exact arity, distinguishing it from the graph wrapper path.
+    FNXC:RecoveryOwnership 2026-10-07-18:04:
+    The exhausted stale-session cadence spends the episode's single reseed: the fenced write keeps the
+    counter (3 -> 4) instead of clearing it, records the escalated-reseed diagnostic, and re-dispatches
+    in the WIP lane. The next exhaustion parks the task (covered in recovery-ownership-executor.test.ts).
     */
-    const exhaustedRecoveryWrite = store.updateTask.mock.calls.find(
-      ([id, patch, runContext]) => id === "FN-ASSISTANT-STALE-EXHAUSTED"
-        && patch?.status === null
-        && patch?.error === null
-        && patch?.recoveryRetryCount === null
-        && patch?.recoveryDisposition === "escalated-reseed"
-        && patch?.nextRecoveryAt === null
-        && runContext === undefined,
-    );
-    expect(exhaustedRecoveryWrite).toHaveLength(2);
-    expect(exhaustedRecoveryWrite?.[2]).toBeUndefined();
-    expect(store.moveTask).toHaveBeenCalledWith("FN-ASSISTANT-STALE-EXHAUSTED", "todo", { preserveResumeState: true });
+    expect(atomicPatches).toContainEqual(expect.objectContaining({
+      status: null,
+      error: null,
+      recoveryRetryCount: MAX_RECOVERY_RETRIES + 1,
+      recoveryDisposition: "escalated-reseed",
+      nextRecoveryAt: null,
+      sessionFile: null,
+    }));
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-ASSISTANT-STALE-EXHAUSTED", "todo", expect.anything());
+    expect((executor as any).scheduleInPlaceResume).toHaveBeenCalledWith("FN-ASSISTANT-STALE-EXHAUSTED");
     expect(onError).not.toHaveBeenCalled();
   });
 
@@ -684,7 +700,8 @@ describe("Workflow Steps Execution", () => {
         status: "queued",
         error: null,
         taskDoneRetryCount: 1,
-      });
+      }, expect.objectContaining({ agentId: "executor" }));
+      expect((executor as any).scheduleInPlaceResume).toHaveBeenCalledWith("FN-5436-C");
     });
 
     /*
@@ -1141,10 +1158,13 @@ describe("Workflow Steps Execution", () => {
     expect(outcome).toBe("bounced");
     // Review remediation returns directly to WIP; Planning is never an intermediate stop.
     expect(store.moveTask).toHaveBeenCalledTimes(1);
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the seam attributes the REVISE move as engine-sourced (so FN-207's direction check runs) and keeps guards on.
     expect(store.moveTask).toHaveBeenCalledWith("FN-7122", "in-progress", {
       preserveResumeState: true,
       preserveWorktree: true,
       workflowMoveSource: "workflow-remediation",
+      moveSource: "engine",
+      bypassGuards: false,
       lifecycleReason: "code-review-revise-remediation",
     });
     expect(onError).not.toHaveBeenCalled();

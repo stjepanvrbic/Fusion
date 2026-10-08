@@ -44,12 +44,14 @@ describe("FN-4946 implicit completion + REVISE verdict interaction", () => {
     });
   });
 
-  it("requeues with implicit-completion refusal shape and retry count", async () => {
+  it("retries in place with implicit-completion refusal shape and retry count", async () => {
     const store = createMockStore();
     const executor = new TaskExecutor(store as any, "/repo");
+    const scheduleInPlaceExecutionResume = vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
 
     await (executor as any).handleImplicitTaskDoneRefusal(makeTask({ id: "FN-4946-R1" }), refusal());
 
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the refused completion retries in its WIP lane; no move to the hold lane.
     expect(store.updateTask).toHaveBeenCalledWith("FN-4946-R1", expect.objectContaining({
       status: "queued",
       error: null,
@@ -57,8 +59,9 @@ describe("FN-4946 implicit completion + REVISE verdict interaction", () => {
       paused: false,
       pausedByAgentId: null,
       sessionFile: null,
-    }));
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4946-R1", "todo", { preserveProgress: true });
+    }), undefined);
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(scheduleInPlaceExecutionResume).toHaveBeenCalledWith("FN-4946-R1");
     const refusalLogCall = store.logEntry.mock.calls.find(
       ([id, message]: [string, string]) => id === "FN-4946-R1" && message.includes("pending-code-review-revise"),
     );

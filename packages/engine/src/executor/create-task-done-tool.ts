@@ -415,35 +415,31 @@ export function createTaskDoneTool(
             };
           }
 
+          /*
+          FNXC:LifecycleContainment 2026-10-07-18:04:
+          A refused completion stays in its WIP lane and in this session: the refusal text is the
+          repair instruction, exactly like the inside-worktree blocked refusal. The former requeue
+          cleared the checkout pointers and moved the card to the hold lane, an automatic WIP-to-hold
+          move FN-207 forbids, and it erased the wrong-checkout evidence the refusal is about. The
+          bounded taskDoneRetryCount budget still ends in a visible failed park.
+          */
           const priorRequeues = task.taskDoneRetryCount ?? 0;
           const nextRequeueCount = priorRequeues + 1;
           if (priorRequeues < MAX_TASK_DONE_REQUEUE_RETRIES) {
-            await store.updateTask(taskId, {
-              status: "queued",
-              error: null,
-              taskDoneRetryCount: nextRequeueCount,
-              paused: false,
-              pausedByAgentId: null,
-              worktree: null,
-              branch: null, branchWriteOrigin: "engine" as const,
-              sessionFile: null,
-            });
+            await store.updateTask(taskId, { taskDoneRetryCount: nextRequeueCount });
             await store.logEntry(
               taskId,
-              `${refusalMessage} — requeued to todo immediately (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`,
+              `${refusalMessage} — refused in place; the session must repair before completing (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`,
               undefined,
               deps.getRunContextFor(task.id),
             );
-            await store.moveTask(taskId, await resolveReboundColumnFor(store, taskId), { preserveProgress: true });
-            executorLog.log(`✗ ${taskId} failed invariant check — requeued to todo (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`);
+            executorLog.log(`✗ ${taskId} failed invariant check — refused in place (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`);
           } else {
             await store.updateTask(taskId, {
               status: "failed",
               error: refusalMessage,
               paused: false,
               pausedByAgentId: null,
-              worktree: null,
-              branch: null, branchWriteOrigin: "engine" as const,
               sessionFile: null,
             });
             await store.logEntry(taskId, `${refusalMessage} — invariant-check retry budget exhausted`, undefined, deps.getRunContextFor(task.id));
@@ -471,23 +467,18 @@ export function createTaskDoneTool(
           const priorRequeues = task.taskDoneRetryCount ?? 0;
           const nextRequeueCount = priorRequeues + 1;
           if (priorRequeues < MAX_TASK_DONE_REQUEUE_RETRIES) {
+            /* FNXC:LifecycleContainment 2026-10-07-18:04: explicit completion refusals repair in this session and lane, matching the invariant refusal above. */
             await store.updateTask(taskId, {
-              status: "queued",
-              error: null,
               taskDoneRetryCount: nextRequeueCount,
               ...taintUpdate,
-              paused: false,
-              pausedByAgentId: null,
-              sessionFile: null,
             });
             await store.logEntry(
               taskId,
-              `${refusalMessage} — requeued to todo immediately (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`,
+              `${refusalMessage} — refused in place; the session must repair before completing (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`,
               undefined,
               deps.getRunContextFor(task.id),
             );
-            await store.moveTask(taskId, await resolveReboundColumnFor(store, taskId), { preserveProgress: true });
-            executorLog.log(`✗ ${taskId} fn_task_done refusal (${taskDoneRefusal.refusalClass}) — requeued to todo (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`);
+            executorLog.log(`✗ ${taskId} fn_task_done refusal (${taskDoneRefusal.refusalClass}) — refused in place (${nextRequeueCount}/${MAX_TASK_DONE_REQUEUE_RETRIES})`);
           } else {
             await store.updateTask(taskId, {
               status: "failed",
@@ -643,7 +634,8 @@ export function createTaskDoneTool(
           );
           /* FNXC:WorkflowResolvedColumns 2026-07-30-21:40: census-invisible moveTask DESTINATION, and `latestColumn` must be set from the SAME resolved value or the check below it compares against a lane the card is not in. */
           const wipTarget = await resolveWipTargetForTask(store, taskId);
-          await store.moveTask(taskId, wipTarget);
+          /* FNXC:LifecycleContainment 2026-10-07-18:04: engine-attributed forward move; guards still run, as they did for the optionless call. */
+          await store.moveTask(taskId, wipTarget, { moveSource: "engine", bypassGuards: false });
           latestColumn = wipTarget;
         }
 

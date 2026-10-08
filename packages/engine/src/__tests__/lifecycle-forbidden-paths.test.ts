@@ -224,10 +224,12 @@ describe("forbidden lifecycle rebound paths", () => {
   it("keeps the production contamination retry in review", async () => {
     const { store, task } = productionStore();
     const runAudit = { database: vi.fn(async () => undefined) };
+    const resumeInPlace = vi.fn();
     const handler = new ContaminationAutoRecoveryHandler({
       taskStore: store,
       runAudit: runAudit as never,
       repoDir: "/tmp/fn-207-family",
+      resumeInPlace,
     });
 
     await handler.issueRetry(
@@ -238,6 +240,8 @@ describe("forbidden lifecycle rebound paths", () => {
 
     expect(task.column).toBe("in-review");
     expect(store.moveTask).not.toHaveBeenCalled();
+    // FNXC:LifecycleContainment 2026-10-07-18:04: the repaired card is handed to the in-place re-dispatch (a no-op outside WIP).
+    expect(resumeInPlace).toHaveBeenCalledWith(task.id);
   });
 
   it("keeps restart recovery in review when the workflow declares no WIP lane", async () => {
@@ -268,10 +272,12 @@ describe("forbidden lifecycle rebound paths", () => {
 
     expect(task.column).toBe("review");
     expect(store.moveTask).not.toHaveBeenCalled();
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: safe retry now happens in place; it reports a retry, never a backward move. */
     expect(store.logEntry).toHaveBeenCalledWith(
       task.id,
-      expect.stringContaining("has no backward-move authority"),
+      expect.stringContaining("retrying in place with a fresh checkout"),
     );
+    expect(store.logEntry).not.toHaveBeenCalledWith(task.id, expect.stringContaining("has no backward-move authority"));
   });
 
   it("permits only the declared adjacent recovery pairs for automatic movers", () => {

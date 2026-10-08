@@ -120,7 +120,14 @@ describe("recoverPausedAbortFailures", () => {
     );
   });
 
-  it("rehomes an in-progress pause-abort park back to todo", async () => {
+  it("recovers an in-progress pause-abort park in place with a single park-clearing write", async () => {
+    /*
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The node requeue used to clear status/error and THEN move WIP to hold under the same-role-only
+    `self-healing-session-recovery` reason, which the FN-207 direction policy rejects. The rejection
+    left a null-status WIP row with no owner. Recovery now stays in the WIP lane: the park clear is the
+    only write (the executor's task:updated resume path re-dispatches the lane) and nothing moves.
+    */
     const store = createMockStore([parkTask({ id: "FN-7001", column: "in-progress" })]);
     const manager = new SelfHealingManager(store, {
       rootDir: "/tmp/test-project",
@@ -130,26 +137,28 @@ describe("recoverPausedAbortFailures", () => {
     const recovered = await manager.recoverPausedAbortFailures();
 
     expect(recovered).toBe(1);
-    expect(store.updateTask).toHaveBeenNthCalledWith(1, "FN-7001", { status: null, error: null });
-    expect(store.moveTask).toHaveBeenCalledWith(
-      "FN-7001",
-      "todo",
-      { preserveProgress: true, preserveWorktree: true, moveSource: "engine", lifecycleReason: "self-healing-session-recovery", recoveryRehome: true },
-    );
-    expect(store.updateTask).toHaveBeenNthCalledWith(2, "FN-7001", {
-      workflowTransitionNotification: {
-        kind: "recovery-requeue",
-        column: "todo",
-        transitionId: "recovery-requeue:FN-7001:pause-abort-active-work",
-        nodeId: "pause-abort-recovery-router",
-        reason: "pause-abort-active-work",
-        createdAt: "2026-06-20T02:30:00.000Z",
-      },
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.updateTask).toHaveBeenCalledTimes(1);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-7001", { status: null, error: null });
+    expect(store.logEntry).toHaveBeenCalledWith("FN-7001", expect.stringContaining("resuming in 'in-progress'"));
+  });
+
+  it("leaves the park intact when the clearing write fails, so the next sweep still owns it", async () => {
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: F-SH-8 — no irreversible step precedes the park clear, so a failed write erases nothing. */
+    const parked = parkTask({ id: "FN-7003", column: "in-progress" });
+    const store = createMockStore([parked]);
+    (store.updateTask as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("database unavailable"));
+    const clearBinding = vi.fn().mockReturnValue(true);
+    const manager = new SelfHealingManager(store, {
+      rootDir: "/tmp/test-project",
+      getExecutingTaskIds: () => new Set<string>(),
+      clearPhantomExecutorBinding: clearBinding as (taskId: string) => boolean | void,
     });
-    expect((store.updateTask as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
-      .toBeLessThan((store.moveTask as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]);
-    expect((store.moveTask as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
-      .toBeLessThan((store.updateTask as ReturnType<typeof vi.fn>).mock.invocationCallOrder[1]);
+
+    expect(await manager.recoverPausedAbortFailures()).toBe(0);
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(clearBinding).not.toHaveBeenCalled();
+    expect(parked).toMatchObject({ status: "failed", error: PARK_ERROR });
   });
 
   it("clears a completed in-review pause-abort park without moving it backward", async () => {

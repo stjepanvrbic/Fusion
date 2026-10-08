@@ -34,7 +34,7 @@ const LEDGER: LedgerRow[] = [
   ["packages/engine/src/merge/merger-ai.ts",703,"A","store","TaskStore","merger AI TaskStore"],
   ["packages/engine/src/merge/pr-response-run-ops.ts",112,"A","store","TaskStore","PR response TaskStore"],
   ["packages/engine/src/agent-heartbeat.ts",242,"A","taskStore","nullable-root","heartbeat accepts a nullable root"],
-  ["packages/engine/src/triage.ts",3555,"A","this.store","TaskStore","triage TaskStore"],
+  ["packages/engine/src/triage.ts",3556,"A","this.store","TaskStore","triage TaskStore"],
   ["packages/engine/src/scheduling/cron-runner.ts",1073,"A","store","TaskStore","cron TaskStore"],
   ["packages/engine/src/missions/mission-execution-loop.ts",1126,"A","this.taskStore","TaskStore","mission TaskStore"],
   ["packages/engine/src/agents/agent-reflection.ts",161,"A","this.taskStore","TaskStore","reflection TaskStore"],

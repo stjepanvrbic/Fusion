@@ -34,6 +34,7 @@ export type BranchConflictHandleDepsSource = {
   cleanupConflictingWorktree: BranchConflictHandleDeps["cleanupConflictingWorktree"];
   getAutoRecoveryDispatcher: (audit: RunAuditor) => AutoRecoveryDispatcher;
   persistTokenUsage: (taskId: string) => Promise<void>;
+  scheduleInPlaceExecutionResume: (taskId: string) => void;
   onError?: (task: Task, error: Error) => void;
 };
 
@@ -48,6 +49,7 @@ export function buildBranchConflictHandleDeps(src: BranchConflictHandleDepsSourc
     getAutoRecoveryDispatcher: src.getAutoRecoveryDispatcher,
     createRunAuditor: (runContext) => createRunAuditor(src.store, runContext),
     persistTokenUsage: src.persistTokenUsage,
+    scheduleInPlaceExecutionResume: src.scheduleInPlaceExecutionResume,
     onError: src.onError,
   };
 }
@@ -121,6 +123,7 @@ export function buildNonContinuableSessionDeps(src: NonContinuableSessionDepsSou
     signalTaskComplete: src.signalTaskComplete,
     handoffTaskToReview: src.handoffTaskToReview,
     markGraphExecuteSelfRequeued: src.markGraphExecuteSelfRequeued,
+    scheduleInPlaceExecutionResume: src.scheduleInPlaceExecutionResume,
   };
 }
 
@@ -305,6 +308,7 @@ export function buildRunImplementationDeps(
       "createTaskAddDepTool", "createTaskDoneTool", "createReviewDisputeTool", "createSpawnAgentTool",
       "resolveInstructionsForRole", "finalizeAlreadyReviewedTask",
       "handleBranchConflict", "handleNonContinuableSessionRetry", "resumeApprovalAfterUnwindIfNeeded",
+      "scheduleInPlaceExecutionResume",
     ]),
     reexecuteTaskInPlace: async (taskId: string) => {
       const live = await host.store.getTask(taskId);
@@ -747,7 +751,7 @@ export function buildHandleImplicitTaskDoneRefusalDeps(host: any): any {
     ...facadeFields(host, ["store"]),
     ...facadeMethods(host, [
       "getRunContextFor", "markGraphExecuteSelfRequeued", "persistTokenUsage",
-      "deleteActiveSession",
+      "deleteActiveSession", "scheduleInPlaceExecutionResume",
     ]),
     clearTokenUsageBaseline: (taskId: string) => { host.tokenUsageBaselines.delete(taskId); },
   };
@@ -837,7 +841,7 @@ export function buildRouteGraphFailureToExecutionResumeDeps(host: any): any {
       "getRunContextFor", "resolveResumeLanes", "isLiveSharedBranchGroupMember", "clearTerminalStepFailuresForRetry",
       "persistTokenUsage",
       // FNXC:WorkflowRemediation 2026-08-09-21:41: FN-8910 completed-review park for refused remediation.
-      "isRemediationGraphNode",
+      "isRemediationGraphNode", "scheduleInPlaceExecutionResume",
     ]),
   };
 }
@@ -959,6 +963,7 @@ export function buildRecoverMissingRequiredArtifactsDeps(host: any): any {
     ...buildStoreRunContextDeps(host),
     isRequiredArtifactRecoveryProtected: (t: unknown) => host.isRequiredArtifactRecoveryProtected(t),
     workflowLifecycleMovesInFlight: host.workflowLifecycleMovesInFlight,
+    scheduleInPlaceExecutionResume: (taskId: string) => host.scheduleInPlaceExecutionResume(taskId),
   };
 }
 
@@ -1082,7 +1087,7 @@ export function buildMarkPausedAbortedDeps(host: any): any {
 
 export function buildResumeOrphanedDeps(host: any): any {
   return {
-    ...facadeFields(host, ["store", "executing", "recoveringCompleted"]),
+    ...facadeFields(host, ["store", "executing", "recoveringCompleted", "pendingOrphanResumes"]),
     // FNXC:MergeRetryReliability 2026-08-29-17:00 (CodeRabbit L1331): the
     // deferred-park intent reader must resolve the same tasks dir fallback
     // the handleGraphFailure writer uses when the store has no getTasksDir.
@@ -1090,7 +1095,7 @@ export function buildResumeOrphanedDeps(host: any): any {
     processWideGraphRouting: host.constructor.processWideGraphRouting as Set<string>,
     ...facadeMethods(host, [
       "listWipLaneTasks", "clearResumeFailureState", "recoverApprovedStepsOnResume",
-      "recoverCompletedTask", "execute",
+      "recoverCompletedTask", "execute", "scheduleInPlaceExecutionResume",
     ]),
   };
 }
@@ -1180,6 +1185,7 @@ export function buildGetAutoRecoveryDispatcherDeps(host: any): any {
     store: host.store,
     rootDir: host.rootDir,
     autoRecoveryDispatcher: host.options.autoRecoveryDispatcher,
+    scheduleInPlaceExecutionResume: (taskId: string) => host.scheduleInPlaceExecutionResume(taskId),
   };
 }
 
@@ -1273,7 +1279,7 @@ export function buildNonContinuableSessionFacadeDeps(host: any): any {
     ...facadeMethods(host, [
       "getRunContextFor", "resolveResumeLanes", "persistTokenUsage",
       "clearCompletedTaskWatchdog", "signalTaskComplete", "handoffTaskToReview",
-      "markGraphExecuteSelfRequeued",
+      "markGraphExecuteSelfRequeued", "scheduleInPlaceExecutionResume",
     ]),
   });
 }
@@ -1337,14 +1343,17 @@ export function buildWorktreeInvariantFacadeDeps(host: any): any {
 export function buildHandleDepAbortCleanupDeps(host: any): any {
   return {
     ...facadeFields(host, ["rootDir", "store", "activeWorktrees"]),
-    ...facadeMethods(host, ["removeOwnWorktreeWithReconcile"]),
+    ...facadeMethods(host, [
+      "removeOwnWorktreeWithReconcile", "getRunContextFor", "markGraphExecuteSelfRequeued",
+      "scheduleInPlaceExecutionResume",
+    ]),
   };
 }
 
 export function buildTryBootstrapMisbindingRecoveryDeps(host: any): any {
   return {
     ...facadeFields(host, ["rootDir", "store"]),
-    ...facadeMethods(host, ["getRunContextFor", "markGraphExecuteSelfRequeued"]),
+    ...facadeMethods(host, ["getRunContextFor", "markGraphExecuteSelfRequeued", "scheduleInPlaceExecutionResume"]),
   };
 }
 
@@ -1356,6 +1365,7 @@ export function buildBranchConflictHandleFacadeDeps(host: any): any {
     ...facadeMethods(host, [
       "getRunContextFor", "findActiveWorktreeOwner", "normalizeReclaimableWorktreePath",
       "cleanupConflictingWorktree", "getAutoRecoveryDispatcher", "persistTokenUsage",
+      "scheduleInPlaceExecutionResume",
     ]),
   });
 }
@@ -1431,7 +1441,7 @@ export function buildRunImplementationPhaseDeps(host: any): any {
 export function buildRouteResetParsePinMismatchToRetryDeps(host: any): any {
   return {
     ...facadeFields(host, ["store", "activeWorktrees"]),
-    ...facadeMethods(host, ["getRunContextFor", "clearPausedAborted", "persistTokenUsage"]),
+    ...facadeMethods(host, ["getRunContextFor", "clearPausedAborted", "persistTokenUsage", "scheduleInPlaceExecutionResume"]),
   };
 }
 
@@ -1471,6 +1481,8 @@ export function buildTaskLivenessDeps(host: any): any {
     activePlanningWorkflowSessions: host.activePlanningWorkflowSessions,
     activeWorkflowStepSessions: host.activeWorkflowStepSessions,
     processWideGraphRouting: host.constructor.processWideGraphRouting as Set<string>,
+    pendingOrphanResumes: host.pendingOrphanResumes,
+    inPlaceExecutionResumeTimers: host.inPlaceExecutionResumeTimers,
   };
 }
 

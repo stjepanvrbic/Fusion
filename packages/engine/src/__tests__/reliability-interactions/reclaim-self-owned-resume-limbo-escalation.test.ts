@@ -77,7 +77,7 @@ describe("FN-5704: reclaim self-owned resume limbo escalation", () => {
     vi.spyOn(worktreePoolModule, "isUsableTaskWorktree").mockResolvedValue(true);
   });
 
-  it("escalates frozen in-progress reclaim/resume loops to todo with preserve flags and audit event", async () => {
+  it("escalates frozen in-progress reclaim/resume loops to a visible in-place park with audit event", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-01T02:00:00.000Z"));
     const task = makeTask();
@@ -100,9 +100,16 @@ describe("FN-5704: reclaim self-owned resume limbo escalation", () => {
     await manager.reclaimSelfOwnedBranchConflicts();
 
     // FNXC:LifecycleContainment 2026-10-04-14:44: limbo escalation remains observable but cannot move WIP backward without a revision.
+    /*
+    FNXC:LifecycleContainment 2026-10-07-18:04:
+    The escalation now parks the card failed in its WIP lane and keeps the attempt counter, instead of
+    resetting it to zero (which restarted the no-progress loop on the next sweep).
+    */
     expect(store.moveTask).not.toHaveBeenCalled();
     expect(task.column).toBe("in-progress");
-    expect(task.resumeLimboCount).toBe(0);
+    expect(task.status).toBe("failed");
+    expect(task.error).toContain("Resume made no progress after 2 reclaim/resume attempts");
+    expect(task.resumeLimboCount).toBe(2);
     const limboEvent = (store.recordRunAuditEvent as any).mock.calls.find((call: any[]) => call[0].mutationType === "task:resume-limbo-escalated")?.[0];
     expect(limboEvent).toBeTruthy();
     expect(limboEvent.target).toBe(task.id);
@@ -114,6 +121,12 @@ describe("FN-5704: reclaim self-owned resume limbo escalation", () => {
     }));
     const auditMetadata = limboEvent.metadata;
     expect(auditMetadata.idleMs).toBeGreaterThan(0);
+
+    // A parked card is not re-selected into another escalation on the next sweep.
+    const escalationsBefore = (store.recordRunAuditEvent as any).mock.calls.filter((call: any[]) => call[0].mutationType === "task:resume-limbo-escalated").length;
+    await manager.reclaimSelfOwnedBranchConflicts();
+    expect((store.recordRunAuditEvent as any).mock.calls.filter((call: any[]) => call[0].mutationType === "task:resume-limbo-escalated").length).toBe(escalationsBefore);
+    expect(task.status).toBe("failed");
 
     vi.useRealTimers();
     manager.stop();

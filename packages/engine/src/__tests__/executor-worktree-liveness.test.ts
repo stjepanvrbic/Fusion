@@ -13,10 +13,26 @@ session. This local fixture supplies only the durable executor role and capacity
 bypassing graph admission; it returns routing for an intra-test guard that proves lifecycle
 assertions reached the routing seam rather than failing vacuously.
 */
+/*
+FNXC:LifecycleContainment 2026-10-07-18:04:
+A liveness refusal used to requeue the card to the hold lane (an automatic WIP-to-hold move FN-207
+forbids). It now retries in the WIP lane: the row is reset for a fresh worktree and the executor's
+guarded in-place re-dispatch is armed. The spy records that arming without re-running the mocked task.
+*/
+let lastScheduleInPlaceResume: ReturnType<typeof vi.fn> | undefined;
 function createRoutingExecutor(store: any, options: any = {}) {
   const routing = createWorkflowRoutingAgentStore(store);
   const executor = new TaskExecutor(store, "/repo", { agentStore: routing.agentStore, ...options });
-  return { executor, routing };
+  const scheduleResume = vi.fn();
+  vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(scheduleResume);
+  lastScheduleInPlaceResume = scheduleResume;
+  return { executor, routing, scheduleResume };
+}
+
+function expectRetriedInPlace(store: any): void {
+  expect(store.moveTask).not.toHaveBeenCalledWith("FN-4114", "todo", expect.anything());
+  expect(store.updateTask).toHaveBeenCalledWith("FN-4114", expect.objectContaining({ status: "queued", worktree: null, sessionFile: null, taskDoneRetryCount: 1 }), expect.objectContaining({ agentId: "executor" }));
+  expect(lastScheduleInPlaceResume).toHaveBeenCalledWith("FN-4114");
 }
 
 function task(overrides: Record<string, unknown> = {}) {
@@ -101,7 +117,7 @@ describe("FN-4114 worktree liveness assertion", () => {
     await executor.execute(task({ sessionFile: null }) as any);
 
     expect(mockedCreateFnAgent).not.toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4114", "todo", { preserveProgress: true });
+    expectRetriedInPlace(store);
   });
 
   it("FN-6861 aborts with structured audit when worktree realpath collides with repo root", async () => {
@@ -129,7 +145,7 @@ describe("FN-4114 worktree liveness assertion", () => {
     await executor.execute(task({ worktree: "/repo" }) as any);
 
     expect(mockedCreateFnAgent).not.toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4114", "todo", { preserveProgress: true });
+    expectRetriedInPlace(store);
     expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
       domain: "git",
       mutationType: "worktree:incomplete-detected",
@@ -205,7 +221,7 @@ describe("FN-4114 worktree liveness assertion", () => {
     await rejectExecutor.execute(task({ worktree: outsidePath }) as any);
 
     expect(mockedCreateFnAgent).not.toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4114", "todo", { preserveProgress: true });
+    expectRetriedInPlace(store);
 
     mockedCreateFnAgent.mockReset();
     mockCompletingAgent();
@@ -358,6 +374,6 @@ describe("FN-4114 worktree liveness assertion", () => {
     await executor.execute(task({ worktree: "/repo/.worktrees/swift-falcon", sessionFile: null }) as any);
 
     expect(classifySpy).toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4114", "todo", { preserveProgress: true });
+    expectRetriedInPlace(store);
   });
 });

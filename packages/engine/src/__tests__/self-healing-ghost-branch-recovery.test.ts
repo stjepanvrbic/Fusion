@@ -51,6 +51,8 @@ describe("self-healing ghost branch reclaim", () => {
     store = createStore();
     manager = new SelfHealingManager(store, { rootDir: "/tmp/test" });
     vi.spyOn(worktreePool, "isUsableTaskWorktree").mockResolvedValue(true);
+    /* FNXC:WorktreeLiveness 2026-10-08-00:20: destructive reclaim paths read the tri-state classification, so the usable fixture stubs it too. */
+    vi.spyOn(worktreePool, "classifyTaskWorktree").mockResolvedValue({ ok: true } as any);
     execMock.mockReset();
     execMock.mockResolvedValue("");
   });
@@ -89,7 +91,8 @@ describe("self-healing ghost branch reclaim", () => {
     mockSweepTask({ id: "FN-9001", column: "in-review", checkedOutBy: null, branch: "fusion/fn-9001", worktree: "/tmp/ghost-cat", baseCommitSha: "m0", paused: true, pausedReason: "branch-conflict-unrecoverable", status: "failed" });
     vi.spyOn(branchConflicts, "inspectBranchConflict").mockResolvedValueOnce({ kind: "stale-resolved" } as any);
     // It was usable on entry but disappeared during inspection.
-    vi.mocked(worktreePool.isUsableTaskWorktree).mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    vi.mocked(worktreePool.isUsableTaskWorktree).mockResolvedValueOnce(true);
+    vi.mocked(worktreePool.classifyTaskWorktree).mockResolvedValue({ ok: false, classification: "missing", reason: "gone" } as any);
 
     await manager.reclaimSelfOwnedBranchConflicts();
 
@@ -106,6 +109,15 @@ describe("self-healing ghost branch reclaim", () => {
     await manager.reclaimSelfOwnedBranchConflicts();
     expect(store.updateTask).not.toHaveBeenCalled();
     expect(store.moveTask).not.toHaveBeenCalled();
+  });
+
+  it("keeps cached metadata on stale-resolved when worktree registration cannot be read", async () => {
+    // FNXC:WorktreeLiveness 2026-10-08-00:20: an unknown registration is not proof the checkout is gone.
+    mockSweepTask({ id: "FN-9001", column: "in-review", checkedOutBy: null, branch: "fusion/fn-9001", worktree: "/tmp/ghost-cat", baseCommitSha: "m0", paused: true, pausedReason: "branch-conflict-unrecoverable", status: "failed" });
+    vi.spyOn(branchConflicts, "inspectBranchConflict").mockResolvedValueOnce({ kind: "stale-resolved" } as any);
+    vi.mocked(worktreePool.classifyTaskWorktree).mockResolvedValue({ ok: false, classification: "registration-unknown", reason: "git worktree list timed out" } as any);
+    await manager.reclaimSelfOwnedBranchConflicts();
+    expect(store.updateTask).not.toHaveBeenCalled();
   });
 
   it("keeps genuine live-foreign conflicts parked", async () => {

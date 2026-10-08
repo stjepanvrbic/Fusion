@@ -4,6 +4,7 @@
  * isBackwardMoveOutOfPlanning stays on TaskExecutor for payload/cache/legacy lane tiering; no sync lane resolver is permitted.
  */
 import type { Task, TaskDetail, Settings, Agent, ResolvedTaskOutputLanguage, WorkflowIr, WorkflowColumnAgent } from "@fusion/core";
+import { scheduleInPlaceExecutionResume as scheduleInPlaceExecutionResumeImpl } from "./in-place-execution-requeue.js";
 import * as impl from "./impl-bindings.js";
 import * as bags from "./deps-bags.js";
 import { type FacadeRestArgs, type FacadeAfterFirst } from "./facade-methods.js";
@@ -68,6 +69,16 @@ export abstract class TaskExecutorGraphFacades extends TaskExecutorSessionFacade
   protected async handleStaleInReviewParsePauseAbortReplay(...args: FacadeRestArgs<typeof impl.handleStaleInReviewParsePauseAbortReplayImpl>): ReturnType<typeof impl.handleStaleInReviewParsePauseAbortReplayImpl> { return impl.handleStaleInReviewParsePauseAbortReplayImpl(bags.buildHandleStaleInReviewParsePauseAbortReplayDeps(this), ...args); }
   protected async isReentrantPausedAbortedInFlightNode(...args: FacadeRestArgs<typeof impl.isReentrantPausedAbortedInFlightNodeImpl>): ReturnType<typeof impl.isReentrantPausedAbortedInFlightNodeImpl> { return impl.isReentrantPausedAbortedInFlightNodeImpl(bags.buildResumeLaneClassifierDeps(this), ...args); }
   protected async resolveResumeLanes(...args: FacadeRestArgs<typeof impl.resolveResumeLanesImpl>): Promise<{ hold: string; wip: string; review: string; wipDeclared: boolean }> { return impl.resolveResumeLanesImpl({ store: this.store }, ...args); }
+  /* FNXC:LifecycleContainment 2026-10-07-18:04: one guarded re-dispatch timer per task for executor retries that stay in their WIP lane. */
+  scheduleInPlaceExecutionResume(taskId: string): void {
+    scheduleInPlaceExecutionResumeImpl({
+      store: this.store,
+      resolveResumeLanes: (id) => this.resolveResumeLanes(id),
+      dispatchUnpauseResume: (task) => this.dispatchUnpauseResume(task, { logMessage: "Resuming execution in place after automatic recovery" }),
+      hasExecutionClaim: (id) => this.isTaskActive(id) || this.resumingUnpaused.has(id),
+      timers: this.inPlaceExecutionResumeTimers,
+    }, taskId);
+  }
   protected async reenterPausedAbortedWorkflowNode(...args: FacadeRestArgs<typeof impl.reenterPausedAbortedWorkflowNodeImpl>): ReturnType<typeof impl.reenterPausedAbortedWorkflowNodeImpl> { return impl.reenterPausedAbortedWorkflowNodeImpl(bags.buildReenterPausedAbortedWorkflowNodeDeps(this), ...args); }
   protected async routeGraphMergeFailureToRetry(...args: FacadeRestArgs<typeof impl.routeGraphMergeFailureToRetryImpl>): ReturnType<typeof impl.routeGraphMergeFailureToRetryImpl> { return impl.routeGraphMergeFailureToRetryImpl(bags.buildRouteGraphMergeFailureToRetryDeps(this), ...args); }
   protected async routeImplementationIncompleteMergeGraphFailure(...args: FacadeRestArgs<typeof impl.routeImplementationIncompleteMergeGraphFailureImpl>): ReturnType<typeof impl.routeImplementationIncompleteMergeGraphFailureImpl> { return impl.routeImplementationIncompleteMergeGraphFailureImpl(bags.buildRouteImplementationIncompleteMergeGraphFailureDeps(this), ...args); }

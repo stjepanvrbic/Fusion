@@ -128,6 +128,7 @@ describe("FN-9172 executor run-audit emitter isolation", () => {
     const recordRunAuditEvent = makeSink();
     const task = { id: "FN-ARTIFACT", column: "todo", steps: [], recoveryRetryCount: 0 } as Task;
     const updateTask = vi.fn().mockResolvedValue(undefined);
+    const scheduleInPlaceExecutionResume = vi.fn();
     const store = {
       getTask: vi.fn().mockResolvedValue(task),
       getTaskWorkflowSelection: () => ({ workflowId: "builtin:coding", stepIds: [] }),
@@ -144,10 +145,13 @@ describe("FN-9172 executor run-audit emitter isolation", () => {
       getRunContextFor: () => undefined,
       isRequiredArtifactRecoveryProtected: async () => false,
       workflowLifecycleMovesInFlight: new Set(),
+      scheduleInPlaceExecutionResume,
     }, task, ["plan"], { source: "graph-entry" }), state === "hanging");
 
     expect(recordRunAuditEvent).toHaveBeenCalledOnce();
     expect(updateTask).toHaveBeenCalledWith("FN-ARTIFACT", expect.objectContaining({ status: null }), undefined);
+    // FNXC:RecoveryOwnership 2026-10-07-18:04: the follow-up includes arming the in-place retry at its deadline.
+    expect(scheduleInPlaceExecutionResume).toHaveBeenCalledWith("FN-ARTIFACT");
   });
 
   it.each(Object.entries(sinkStates))("keeps completed-blocked parks returning true after a %s sink", async (state, makeSink) => {

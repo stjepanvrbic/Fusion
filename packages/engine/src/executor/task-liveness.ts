@@ -16,6 +16,14 @@ export type TaskLivenessDeps = {
   activePlanningWorkflowSessions: Set<string>;
   activeWorkflowStepSessions: Map<string, unknown>;
   processWideGraphRouting: Set<string>;
+  /**
+   * FNXC:RecoveryOwnership 2026-10-07-18:04:
+   * Scheduled-but-not-started executions are live: a deferred startup orphan resume and an armed
+   * in-place retry. Without them a sweep saw no executing/session/active signal during the delay
+   * and rewrote the row the deferred execute() would then run from.
+   */
+  pendingOrphanResumes: Set<string>;
+  inPlaceExecutionResumeTimers: Map<string, unknown>;
 };
 
 export function getExecutingTaskIds(deps: TaskLivenessDeps): Set<string> {
@@ -27,6 +35,8 @@ export function getExecutingTaskIds(deps: TaskLivenessDeps): Set<string> {
     ...deps.recoveringCompleted,
     ...deps.resumingUnpaused,
     ...deps.processWideGraphRouting,
+    ...deps.pendingOrphanResumes,
+    ...deps.inPlaceExecutionResumeTimers.keys(),
   ]);
 }
 
@@ -46,5 +56,7 @@ export function isTaskActive(
     || deps.activeSessions.has(taskId)
     || deps.recoveringCompleted.has(taskId)
     || deps.processWideGraphRouting.has(taskId)
+    || deps.pendingOrphanResumes.has(taskId)
+    || deps.inPlaceExecutionResumeTimers.has(taskId)
   );
 }

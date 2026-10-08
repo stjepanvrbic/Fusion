@@ -4,7 +4,6 @@ import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import { isFusionDeletableBranch, type Task, type TaskStore } from "@fusion/core";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
-import { moveTaskToContainedBackwardTarget } from "../execution/lifecycle-move.js";
 import {
   classifyForeignOnlyContamination,
   reanchorBranchToBase,
@@ -24,6 +23,8 @@ export interface RecoverForeignOnlyContaminationDeps {
   repoDir: string;
   taskStore: TaskStore;
   runAudit: RunAuditor;
+  /** Arms the executor's guarded in-place re-dispatch once the branch is repaired. */
+  resumeInPlace: (taskId: string) => void;
   integrationBranch: string;
 }
 
@@ -74,17 +75,7 @@ export async function recoverForeignOnlyContamination(
       taskId: task.id,
     });
 
-    /*
-    FNXC:LifecycleContainment 2026-08-28-03:03:
-    Foreign-only contamination recovery moves only to the adjacent backward lifecycle role. Missing
-    targets and capacity refusal stay in place, preserving the repaired branch/worktree metadata.
-    */
-    await moveTaskToContainedBackwardTarget(deps.taskStore, task.id, "contamination-recovery", {
-      moveSource: "engine",
-      preserveResumeState: true,
-      preserveProgress: true,
-      preserveWorktree: true,
-    }, task.column);
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: the re-anchored card resumes in its lane; the former contained move was an FN-217 no-op. */
     await deps.taskStore.updateTask(task.id, {
       recoveryRetryCount: 0,
       nextRecoveryAt: null,
@@ -92,6 +83,7 @@ export async function recoverForeignOnlyContamination(
       paused: false,
       pausedReason: null,
     });
+    deps.resumeInPlace(task.id);
     await deps.runAudit.database({
       type: "task:auto-recover-foreign-only-contamination",
       target: task.id,
@@ -114,17 +106,7 @@ export async function recoverForeignOnlyContamination(
     await execAsync(`git branch -D ${quote(task.branch)}`, { cwd: deps.repoDir, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER }).catch(() => undefined);
   }
 
-  /*
-    FNXC:LifecycleContainment 2026-08-28-03:03:
-    Foreign-only contamination recovery moves only to the adjacent backward lifecycle role. Missing
-    targets and capacity refusal stay in place, preserving the repaired branch/worktree metadata.
-    */
-  await moveTaskToContainedBackwardTarget(deps.taskStore, task.id, "contamination-recovery", {
-    moveSource: "engine",
-    preserveResumeState: true,
-    preserveProgress: true,
-    preserveWorktree: false,
-  }, task.column);
+  /* FNXC:LifecycleContainment 2026-10-07-18:04: the discarded branch is recreated by an in-place resume; the former contained move was an FN-217 no-op. */
   await deps.taskStore.updateTask(task.id, {
     recoveryRetryCount: 0,
     nextRecoveryAt: null,
@@ -136,6 +118,7 @@ export async function recoverForeignOnlyContamination(
     baseCommitSha: null,
     modifiedFiles: [],
   });
+  deps.resumeInPlace(task.id);
   await deps.runAudit.database({
     type: "task:auto-recover-foreign-only-contamination",
     target: task.id,

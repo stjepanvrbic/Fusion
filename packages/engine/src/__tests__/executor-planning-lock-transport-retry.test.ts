@@ -4,10 +4,17 @@ import {
   isPlanningLifecycleLockTransportFailure,
 } from "../planning-handoff-recovery.js";
 import {
-  reseedExhaustedTransientExecution,
+  escalateExhaustedExecutionRecovery,
   retryPlanningLifecycleLockTransportFailure,
   runImplementation,
 } from "../executor/run-implementation.js";
+import { computeRecoveryDecision, type RecoveryEscalationDecision } from "../healing/recovery-policy.js";
+
+function escalationAt(count: number): RecoveryEscalationDecision {
+  const decision = computeRecoveryDecision({ recoveryRetryCount: count });
+  if (decision.disposition !== "escalate") throw new Error(`count ${count} does not escalate`);
+  return decision;
+}
 
 function task(overrides: Partial<Task> = {}): Task {
   return {
@@ -37,16 +44,18 @@ describe("executor planning lifecycle lock transport recovery", () => {
       moveTask: vi.fn(async () => undefined),
     } as unknown as TaskStore;
     const markGraphExecuteSelfRequeued = vi.fn();
+    const scheduleInPlaceExecutionResume = vi.fn();
     const retried = await retryPlanningLifecycleLockTransportFailure(
-      { store, getRunContextFor: () => undefined, markGraphExecuteSelfRequeued } as never,
+      { store, getRunContextFor: () => undefined, markGraphExecuteSelfRequeued, scheduleInPlaceExecutionResume } as never,
       current,
       new PlanningLifecycleLockTransportError("acquisition timed out after 5000ms").message,
-      async () => "todo",
     );
 
+    /* FNXC:LifecycleContainment 2026-10-07-18:04: the retry stays in the WIP lane with its backoff; no move to the hold lane. */
     expect(retried).toBe(true);
-    expect(store.updateTask).toHaveBeenCalledWith(current.id, expect.objectContaining({ recoveryRetryCount: 1 }));
-    expect(store.moveTask).toHaveBeenCalledWith(current.id, "todo", { preserveProgress: true });
+    expect(store.updateTask).toHaveBeenCalledWith(current.id, expect.objectContaining({ recoveryRetryCount: 1, nextRecoveryAt: expect.any(String) }), undefined);
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(scheduleInPlaceExecutionResume).toHaveBeenCalledWith(current.id);
     expect(markGraphExecuteSelfRequeued).toHaveBeenCalledWith(current.id);
     expect(current.worktree).toBe("/tmp/fn-179-worktree");
     expect(current.branch).toBe("fusion/FN-179-lock");
@@ -99,20 +108,25 @@ describe("executor planning lifecycle lock transport recovery", () => {
       handleNonContinuableSessionError: vi.fn(async () => false),
       handleNonContinuableSessionRetry: vi.fn(async () => false),
       markGraphExecuteSelfRequeued: vi.fn(),
+      scheduleInPlaceExecutionResume: vi.fn(),
       terminateAllChildren: vi.fn(async () => undefined),
       resumeApprovalAfterUnwindIfNeeded: vi.fn(async () => undefined),
     } as never;
 
     await runImplementation(deps, current, vi.fn());
 
+    /* FNXC:RecoveryOwnership 2026-10-07-18:04: the reseed keeps the episode counter and re-dispatches in place. */
     expect((store as any).updateTaskAtomic).toHaveBeenCalledWith(current.id, expect.any(Function));
-    expect((store as any).moveTask).toHaveBeenCalledWith(current.id, "todo", { preserveProgress: true });
+    const reseedPatch = await ((store as any).updateTaskAtomic as ReturnType<typeof vi.fn>).mock.results.at(-1)?.value;
+    expect(reseedPatch).toMatchObject({ recoveryRetryCount: 4, recoveryDisposition: "escalated-reseed" });
+    expect((store as any).moveTask).not.toHaveBeenCalled();
+    expect((deps as any).scheduleInPlaceExecutionResume).toHaveBeenCalledWith(current.id);
     expect((store as any).updateTask).not.toHaveBeenCalledWith(current.id, expect.objectContaining({ status: "failed" }));
     expect(current.worktree).toBe("/tmp/fn-179-worktree");
     expect(current.branch).toBe("fusion/FN-179-lock");
   });
 
-  it("reseeds exhausted transient execution into the resolved current lane", async () => {
+  it("reseeds exhausted transient execution in its current lane and keeps the episode counter", async () => {
     const current = task({ recoveryRetryCount: 3, status: "queued", error: "network reset" });
     const live = { ...current };
     const store = {
@@ -121,16 +135,21 @@ describe("executor planning lifecycle lock transport recovery", () => {
       moveTask: vi.fn(async () => undefined),
     } as unknown as TaskStore;
     const markGraphExecuteSelfRequeued = vi.fn();
+    const scheduleInPlaceExecutionResume = vi.fn();
 
-    await expect(reseedExhaustedTransientExecution(
-      { store, getRunContextFor: () => undefined, markGraphExecuteSelfRequeued } as never,
+    await expect(escalateExhaustedExecutionRecovery(
+      { store, getRunContextFor: () => undefined, markGraphExecuteSelfRequeued, scheduleInPlaceExecutionResume } as never,
       current,
-      async () => "todo",
+      escalationAt(3),
+      { owner: "executor-transient", detail: "network reset" },
     )).resolves.toBe(true);
 
     expect(store.updateTaskAtomic).toHaveBeenCalledWith(current.id, expect.any(Function));
-    expect(store.moveTask).toHaveBeenCalledWith(current.id, "todo", { preserveProgress: true });
+    const patch = await (store.updateTaskAtomic as ReturnType<typeof vi.fn>).mock.results[0]?.value;
+    expect(patch).toMatchObject({ recoveryRetryCount: 4, recoveryDisposition: "escalated-reseed", worktree: null, branch: null });
+    expect(store.moveTask).not.toHaveBeenCalled();
     expect(markGraphExecuteSelfRequeued).toHaveBeenCalledWith(current.id);
+    expect(scheduleInPlaceExecutionResume).toHaveBeenCalledWith(current.id);
   });
 
   it("does not reseed when an operator pause wins the fenced transient recovery", async () => {
@@ -141,15 +160,18 @@ describe("executor planning lifecycle lock transport recovery", () => {
       moveTask: vi.fn(async () => undefined),
     } as unknown as TaskStore;
     const markGraphExecuteSelfRequeued = vi.fn();
+    const scheduleInPlaceExecutionResume = vi.fn();
 
-    await expect(reseedExhaustedTransientExecution(
-      { store, getRunContextFor: () => undefined, markGraphExecuteSelfRequeued } as never,
+    await expect(escalateExhaustedExecutionRecovery(
+      { store, getRunContextFor: () => undefined, markGraphExecuteSelfRequeued, scheduleInPlaceExecutionResume } as never,
       current,
-      async () => "todo",
+      escalationAt(3),
+      { owner: "executor-transient", detail: "network reset" },
     )).resolves.toBe(false);
 
     expect(store.moveTask).not.toHaveBeenCalled();
     expect(markGraphExecuteSelfRequeued).not.toHaveBeenCalled();
+    expect(scheduleInPlaceExecutionResume).not.toHaveBeenCalled();
   });
 
   it("replaces lock-transport exhaustion with a fenced current-role reseed", async () => {
@@ -160,14 +182,35 @@ describe("executor planning lifecycle lock transport recovery", () => {
       updateTaskAtomic: vi.fn(async (_id: string, updater: (value: Task) => unknown) => updater(current)),
       moveTask: vi.fn(async () => undefined),
     } as unknown as TaskStore;
+    const scheduleInPlaceExecutionResume = vi.fn();
     await expect(retryPlanningLifecycleLockTransportFailure(
-      { store, getRunContextFor: () => undefined, markGraphExecuteSelfRequeued: vi.fn() } as never,
+      { store, getRunContextFor: () => undefined, markGraphExecuteSelfRequeued: vi.fn(), scheduleInPlaceExecutionResume } as never,
       current,
       "Planning lifecycle lock acquisition timed out after 5000ms",
-      async () => "todo",
     )).resolves.toBe(true);
     expect(store.updateTaskAtomic).toHaveBeenCalledWith(current.id, expect.any(Function));
-    expect(store.moveTask).toHaveBeenCalledWith(current.id, "todo", { preserveProgress: true });
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(scheduleInPlaceExecutionResume).toHaveBeenCalledWith(current.id);
+  });
+
+  it("parks lock-transport exhaustion visibly once the episode reseed is spent", async () => {
+    const current = task({ recoveryRetryCount: 7 });
+    const store = {
+      logEntry: vi.fn(async () => undefined),
+      updateTask: vi.fn(),
+      updateTaskAtomic: vi.fn(async (_id: string, updater: (value: Task) => unknown) => updater(current)),
+      moveTask: vi.fn(async () => undefined),
+    } as unknown as TaskStore;
+    const scheduleInPlaceExecutionResume = vi.fn();
+    await expect(retryPlanningLifecycleLockTransportFailure(
+      { store, getRunContextFor: () => undefined, markGraphExecuteSelfRequeued: vi.fn(), scheduleInPlaceExecutionResume } as never,
+      current,
+      "Planning lifecycle lock acquisition timed out after 5000ms",
+    )).resolves.toBe(true);
+    const patch = await (store.updateTaskAtomic as ReturnType<typeof vi.fn>).mock.results[0]?.value;
+    expect(patch).toMatchObject({ status: "failed", recoveryRetryCount: 7 });
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(scheduleInPlaceExecutionResume).not.toHaveBeenCalled();
   });
 
   it("recognizes only canonical lock transport messages after graph error flattening", () => {

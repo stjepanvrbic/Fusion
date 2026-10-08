@@ -100,7 +100,7 @@ describe("recoverOrphanOnlyScopeViolations (FN-4379 / FN-4350)", () => {
     const recovered = await manager.recoverOrphanOnlyScopeViolations();
 
     expect(recovered).toBe(1);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-4350", "done");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-4350", "done", expect.objectContaining({ moveSource: "engine", bypassGuards: false }));
     expect(store.updateTask).toHaveBeenCalledWith("FN-4350", expect.objectContaining({
       mergeDetails: expect.objectContaining({ mergeConfirmed: true, resolutionStrategy: "orphan-discard-no-op" }),
     }));
@@ -151,7 +151,7 @@ describe("recoverOrphanOnlyScopeViolations (FN-4379 / FN-4350)", () => {
     });
 
     expect(await manager.recoverOrphanOnlyScopeViolations()).toBe(1);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-RENAMED", "done");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-RENAMED", "done", expect.objectContaining({ moveSource: "engine", bypassGuards: false }));
   });
 
   it("does NOT recover when landed commit cannot be verified (FN-4280)", async () => {

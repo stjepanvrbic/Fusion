@@ -5960,7 +5960,8 @@ export class ProjectEngine {
                       mergeConflictBounceCount: nextBounces,
                     });
                     /* FNXC:WorkflowResolvedColumns 2026-07-30-21:40: census-invisible moveTask DESTINATION — a call argument, not a comparison. */
-                    await store.moveTask(taskId, await resolveWipTargetForTask(store, taskId));
+                    /* FNXC:LifecycleContainment 2026-10-07-18:04: the merge-conflict bounce names its merge-fix REVISE reason so the FN-207 direction check sanctions review-to-WIP. Guards still run. */
+                    await store.moveTask(taskId, await resolveWipTargetForTask(store, taskId), { moveSource: "engine", lifecycleReason: "merge-fix-remediation", bypassGuards: false });
                     await store.logEntry(
                       taskId,
                       `Auto-merge conflicts unresolved (${maxAutoMergeRetriesOnErr}/${maxAutoMergeRetriesOnErr}) — bounced to in-progress for re-rebase (bounce ${nextBounces}/${bounceCap})`,

@@ -144,7 +144,7 @@ describe("planning retry hold safety gate (FN-9260)", () => {
     expect(task.status).toBe("awaiting-approval");
   });
 
-  it("keeps missing drafts claimable, preserves existing review holds, and reseeds an exhausted retry", async () => {
+  it("keeps missing drafts claimable, preserves existing review holds, reseeds an exhausted retry once, then parks", async () => {
     /*
      * FNXC:TriagePlanningRetry 2026-10-01-05:53:
      * FN-9446 requires missing-draft and review-hold coverage to run through specifyTask. The
@@ -178,11 +178,14 @@ describe("planning retry hold safety gate (FN-9260)", () => {
     /*
      * FNXC:TriagePlanningRetry 2026-10-06-19:53:
      * FN-9512 makes ordinary deterministic planning exhaustion re-enter the existing planning
-     * owner at and beyond the retry cap. A failed status has no automatic claimant, so both
-     * boundary counts must retain needs-replan and the visible reseed disposition until a new
-     * planning claim clears it.
+     * owner at the retry cap with the visible reseed disposition.
+     *
+     * FNXC:RecoveryOwnership 2026-10-07-18:04:
+     * That reseed is spent once per episode and keeps the counter: the cap reseeds (3 -> 4), the
+     * next count restarts the ladder (4 -> 5 with a deadline), and the second exhaustion parks the
+     * card failed instead of resetting the budget forever.
      */
-    for (const recoveryRetryCount of [3, 4]) {
+    const runExhaustion = async (recoveryRetryCount: number) => {
       const exhausted = taskFixture({
         id: `FN-9260-EXHAUSTED-${recoveryRetryCount}`,
         recoveryRetryCount,
@@ -194,20 +197,33 @@ describe("planning retry hold safety gate (FN-9260)", () => {
         await writeFile(exhaustedPath, INVALID_PLAN, "utf8");
       });
       await new TriageProcessor(exhaustedStore, rootDir).specifyTask(exhausted);
+      return { exhausted, exhaustedStore };
+    };
 
-      expect(exhaustedStore.updateTask).toHaveBeenCalledWith(exhausted.id, expect.objectContaining({
-        status: "needs-replan",
-        error: null,
-        recoveryRetryCount: null,
-        recoveryDisposition: "escalated-reseed",
-        nextRecoveryAt: null,
-      }));
-      expect(exhausted.status).toBe("needs-replan");
-      expect(exhausted.error).toBeNull();
-      expect(await evaluateUnplannedForExecution(exhaustedStore, exhausted, EMPTY_IR)).toMatchObject({
-        unplanned: true,
-        reason: "needs-replan",
-      });
-    }
+    const reseed = await runExhaustion(3);
+    expect(reseed.exhaustedStore.updateTask).toHaveBeenCalledWith(reseed.exhausted.id, expect.objectContaining({
+      status: "needs-replan",
+      error: null,
+      recoveryRetryCount: 4,
+      recoveryDisposition: "escalated-reseed",
+      nextRecoveryAt: null,
+    }));
+    expect(reseed.exhausted.status).toBe("needs-replan");
+    expect(reseed.exhausted.error).toBeNull();
+    expect(await evaluateUnplannedForExecution(reseed.exhaustedStore, reseed.exhausted, EMPTY_IR)).toMatchObject({
+      unplanned: true,
+      reason: "needs-replan",
+    });
+
+    const secondLadder = await runExhaustion(4);
+    expect(secondLadder.exhausted.recoveryRetryCount).toBe(5);
+    expect(secondLadder.exhausted.nextRecoveryAt).toEqual(expect.any(String));
+    expect(secondLadder.exhausted.status).not.toBe("failed");
+
+    const parked = await runExhaustion(7);
+    expect(parked.exhausted.status).toBe("failed");
+    expect(parked.exhausted.recoveryRetryCount).toBe(7);
+    expect(parked.exhausted.error).toContain("Generated plan failed deterministic validation");
+    expect(parked.exhausted.nextRecoveryAt ?? null).toBeNull();
   });
 });

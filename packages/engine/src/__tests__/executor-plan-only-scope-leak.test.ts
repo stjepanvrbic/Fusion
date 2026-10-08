@@ -88,9 +88,16 @@ async function setup(params?: {
   });
 
   const executor = new TaskExecutor(store as any, rootDir);
+  /*
+  FNXC:LifecycleContainment 2026-10-07-18:04:
+  A session that ends without fn_task_done now retries in place through a guarded re-dispatch timer.
+  These scope-guard cases drive one session each; the stub keeps a retry armed here from re-executing
+  the same task id (and holding the process-wide executor lock) inside the next case.
+  */
+  const scheduleInPlaceExecutionResume = vi.spyOn(executor as any, "scheduleInPlaceExecutionResume").mockImplementation(() => undefined);
   await executor.execute(task as any);
 
-  return { store, tool, executor };
+  return { store, tool, executor, scheduleInPlaceExecutionResume };
 }
 
 describe("FN-4482 plan-only scope leak guard", () => {
