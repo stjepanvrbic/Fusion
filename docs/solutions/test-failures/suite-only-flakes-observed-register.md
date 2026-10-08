@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 29, 30, 31, 32, 33, and 34), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **17 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, and 34), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **18 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -337,18 +337,6 @@ No timeout, retry, or assertion changed, and the file is not quarantined because
 
 The subprocess-guard line deserves a product look. It means a real PostgreSQL child reached a CLI unit test that does not obviously need one, and a startup that outlives its test left a stale port recorded as a joined instance for later cases. Start with how the embedded PostgreSQL startup records and joins an existing instance for a shared data directory, and whether `CentralCore` initialization in this file should use an in-memory or harness-provided store.
 
-### 29. MissionManager reconcile control switch-window cases
-
-- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
-- **File:** `packages/dashboard/app/components/__tests__/MissionManager.reconcile.test.tsx`
-- **Exact tests:** two cases in `MissionManager reconcile control`: `silently discards preview resolution and rejection in the pre-commit switch window` and `refuses a same-batch retained-panel apply click so no write reaches the abandoned mission`.
-- **Observed tree/SHA:** fork Full Suite run [37720328009](https://github.com/stjepanvrbic/Fusion/actions/runs/37720328009) at `9e948d488` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113126258105`), project `dashboard-app-quality-backfill`. That commit changed only this register and its validator. The file passed, with all 176 files in the shard green, in the Full Suite runs for `0bcb53f96` and `c5c3ee4fc`.
-- **Observed frequency:** 1 run, 2 failure entries, one per case.
-
-The first case failed at its second reconcile click with `AssertionError: expected "vi.fn()" to be called 2 times, but got 1 times`, raised by the `waitFor` on `reconcileMission` at line 179. The second case failed with `TestingLibraryElementError: Unable to find an element by: [data-testid="mission-reconcile-apply"]`, raised by the `findByTestId` at line 190 after the first click on the reconcile control. Both are default-timeout Testing Library waits that expired while the rendered `MissionManager` still showed the mission list and had not yet produced the expected reconcile call or panel. This reads the log; no reproduction was attempted, and the log does not show whether the two failures share a cause or whether the component was slow to commit the click or the test shell was starved.
-
-No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the dashboard vitest config. Before quarantining, look at the product code: both cases exercise the mission-switch window in `MissionManager`, where the reconcile panel is released synchronously on a row event, so check whether the reconcile click can be dropped or the panel withheld when a fetch for the other mission is still pending.
-
 ### 30. Instance-scoped OAuth refresh hanging-request bound
 
 - **Status:** Active first sighting — recorded 2026-10-08, unattributed.
@@ -520,6 +508,29 @@ Both failures sit in the step where a click on a radio or on Next must commit a 
 No timeout, retry, or assertion changed. The whole file is excluded from the dashboard projects. It is not in the thin merge gate, so no gate eviction was needed.
 
 This is the third quarantine in the Planning Mode subsystem after entries 22 and 23, plus closed entries 4, 5, 8, and 10. The AGENTS.md repeated-quarantine rule treats that as a product-race smell. Before the deletion deadline, inspect how `QuestionForm` in `PlanningModeModal` commits the Other selection and the Next submission after a radio change, and whether that state is set asynchronously. No product code changed in this quarantine.
+
+<!--
+FNXC:TestFlakeRegister 2026-10-08-08:41:
+Entry 29 recorded a second Full Suite sighting on the fork: the same two switch-window cases failed again on shard 3. Quarantine is file-level, so the whole file is excluded through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
+-->
+### 29. MissionManager reconcile control switch-window cases
+
+- **Status:** Closed — quarantined 2026-10-08 after a second Full Suite sighting; deletion deadline 2026-10-22.
+- **File:** `packages/dashboard/app/components/__tests__/MissionManager.reconcile.test.tsx`
+- **Exact tests:** two cases in `MissionManager reconcile control`: `silently discards preview resolution and rejection in the pre-commit switch window` and `refuses a same-batch retained-panel apply click so no write reaches the abandoned mission`.
+- **Observed trees/SHAs:** fork Full Suite runs [37720328009](https://github.com/stjepanvrbic/Fusion/actions/runs/37720328009) at `9e948d488` (job `113126258105`) and [37742324890](https://github.com/stjepanvrbic/Fusion/actions/runs/37742324890) at `668244c5e` (job `113195660160`), both Linux `ubuntu-latest`, job `Test shard 3/4`, project `dashboard-app-quality-backfill`.
+- **Observed frequency:** 2 runs, the same 2 cases each time. The file passed, with every other file in the shard green, in the Full Suite runs for `0bcb53f96` and `c5c3ee4fc`.
+
+| case | failure, identical in both runs |
+|---|---|
+| `silently discards preview resolution and rejection in the pre-commit switch window` | `AssertionError: expected "vi.fn()" to be called 2 times, but got 1 times` at `MissionManager.reconcile.test.tsx:179`, the `waitFor` on `reconcileMission` after the second reconcile click |
+| `refuses a same-batch retained-panel apply click so no write reaches the abandoned mission` | `TestingLibraryElementError: Unable to find an element by: [data-testid="mission-reconcile-apply"]` at `MissionManager.reconcile.test.tsx:190`, the `findByTestId` after the first click on the reconcile control |
+
+Both are default-timeout Testing Library waits that expired while the rendered `MissionManager` still showed the mission list. The two cases exercise the mission-switch window, where the reconcile panel is released synchronously on a row event. No reproduction was attempted, and the logs do not show whether the two failures share a cause or whether the component was slow to commit the click.
+
+No timeout, retry, or assertion changed. The whole file is excluded from the dashboard projects. It is not in the thin merge gate, so no gate eviction was needed.
+
+Before the deletion deadline, inspect how `MissionManager` releases the reconcile panel and handles a reconcile click while a fetch for another mission is still pending. No product code changed in this quarantine.
 
 <!--
 FNXC:TestFlakeRegister 2026-10-08-04:50:
