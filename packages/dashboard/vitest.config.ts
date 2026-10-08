@@ -380,6 +380,11 @@ const quarantinedDashboardTests: string[] = [
   */
   "app/components/__tests__/MissionManager.reconcile.test.tsx",
   /*
+  FNXC:DashboardTestQuarantine 2026-10-08-09:18:
+  Second Full Suite sighting of register entry 34: the SSE suspend and reopen case read the latest-run log stream from the subscribe mock before the subscribing effect had run, on two different shards of the backfill-4 command. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at when AgentDetailView subscribes after the run log entries render.
+  */
+  "app/components/__tests__/agent-detail-log-history.test.tsx",
+  /*
   FNXC:DashboardTestQuarantine 2026-07-17-16:50:
   FN-8245 re-admits all three UI files with their ledger rows removed in lockstep.
   QuickEntryBox restores focus from its resolved submit path while isolated jsdom
