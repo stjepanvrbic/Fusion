@@ -53,6 +53,18 @@ function directMoveWindows(source: string): string[] {
 
 const BACKWARD_TARGET_PATTERN = /resolve(?:ContainedBackwardTargetForTask|ReboundTargetForTask|ReboundColumnFor)|resolveMergerLifecycleColumn[\s\S]*?"rebound"|\b(?:reboundColumn|reboundTarget|requeueTarget|retryTarget|replanColumn)\b/;
 
+/**
+ * FNXC:LifecycleContainment 2026-10-08-13:52:
+ * KB-075: the per-window classification is a pure helper so a self-test can pin the census contract on synthetic source.
+ * An engine/scheduler move whose target matches BACKWARD_TARGET_PATTERN must carry a lifecycle reason; direction-checked targets are named so they do not match.
+ */
+function isUnreasonedBackwardMove(window: string): boolean {
+  if (!BACKWARD_TARGET_PATTERN.test(window)) return false;
+  if (!/moveSource:\s*"(?:engine|scheduler)"/.test(window)) return false;
+  if (window.includes("lifecycleReason:") || window.includes("moveTaskWithLifecycleReason(")) return false;
+  return true;
+}
+
 function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 }
@@ -90,14 +102,21 @@ describe("engine lifecycle move reason census", () => {
     for (const file of productionTypescriptFiles()) {
       const source = readFileSync(file, "utf8");
       directMoveWindows(source).forEach((window, index) => {
-        if (!BACKWARD_TARGET_PATTERN.test(window)) return;
-        if (!/moveSource:\s*"(?:engine|scheduler)"/.test(window)) return;
-        if (window.includes("lifecycleReason:") || window.includes("moveTaskWithLifecycleReason(")) return;
+        if (!isUnreasonedBackwardMove(window)) return;
         violations.push(`${relative(ENGINE_SRC, file)}#${index + 1}`);
       });
     }
 
     expect(violations).toEqual([]);
+  });
+
+  it("still flags an unchecked engine rebound without a reason", () => {
+    const classify = (options: string) =>
+      directMoveWindows(`await this.store.moveTask(task.id, reboundColumn, { ${options} });`).map(isUnreasonedBackwardMove);
+
+    expect(classify('moveSource: "engine", preserveProgress: true')).toEqual([true]);
+    expect(classify('moveSource: "engine", preserveProgress: true, lifecycleReason: "x"')).toEqual([false]);
+    expect(classify('moveSource: "user", preserveProgress: true')).toEqual([false]);
   });
 
   it("keeps review-capable recovery families off the hold-first resolver", () => {

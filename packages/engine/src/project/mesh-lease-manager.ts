@@ -174,12 +174,18 @@ export class MeshLeaseManager {
     }
   }
 
+  /**
+   * FNXC:LifecycleContainment 2026-10-08-13:52:
+   * KB-075: `containedTarget` is already direction-checked by `resolveReboundColumn`, which returns the current column for backward, forbidden, unresolved, or failed lookups.
+   * The move below is therefore only ever forward or lateral, is not a revision, and carries no `lifecycleReason`.
+   * It is named `containedTarget` (not `reboundColumn`) so the lifecycle move-reason census does not mistake it for an unchecked rebound.
+   */
   private async clearLocalLease(
     task: Task,
     reason: string,
     context: LeaseRecoveryContext,
     nextEpoch: number,
-    reboundColumn: string,
+    containedTarget: string,
   ): Promise<void> {
     await this.options.taskStore.updateTask(
       task.id,
@@ -199,8 +205,8 @@ export class MeshLeaseManager {
       `${reason}; epoch=${nextEpoch}`,
       context.runContext,
     );
-    if (task.column !== reboundColumn) {
-      await this.options.taskStore.moveTask(task.id, reboundColumn, {
+    if (task.column !== containedTarget) {
+      await this.options.taskStore.moveTask(task.id, containedTarget, {
         moveSource: "engine",
         preserveProgress:
           context.preserveProgress ??
@@ -505,13 +511,13 @@ export class MeshLeaseManager {
     Resolved once here so the move below and the unreachable audit further down
     report the SAME column. Two independent resolutions could disagree.
     */
-    const reboundColumn = await this.resolveReboundColumn(task);
+    const containedTarget = await this.resolveReboundColumn(task);
 
     try {
-      await this.clearLocalLease(task, `${reason} (${stale.reason ?? "stale"})`, context, nextEpoch, reboundColumn);
+      await this.clearLocalLease(task, `${reason} (${stale.reason ?? "stale"})`, context, nextEpoch, containedTarget);
     } catch (_error) {
       try {
-        await this.clearLocalLease(task, `${reason} (${stale.reason ?? "stale"})`, context, nextEpoch, reboundColumn);
+        await this.clearLocalLease(task, `${reason} (${stale.reason ?? "stale"})`, context, nextEpoch, containedTarget);
       } catch (retryError) {
         if (this.options.centralClaimStore && this.options.projectId) {
           await this.emitLeaseAudit(task, "task:auto-recover-lease-partial-write", {
@@ -561,7 +567,7 @@ export class MeshLeaseManager {
       await emitNodeUnreachableRecovery({
         /*
         FNXC:WorkflowLifecycleColumns 2026-07-27-23:20 (Phase B / U5):
-        Both fields read the SAME resolved `reboundColumn` the move used, so the
+        Both fields read the SAME resolved `containedTarget` the move used, so the
         audit can no longer claim a landing column the card never reached. Note
         `task` is the pre-move snapshot, so `task.column` is still the ORIGINAL
         column here — that is what makes the in-place comparison meaningful.
@@ -571,8 +577,8 @@ export class MeshLeaseManager {
         on, and renaming it would break them to describe the same decision. The
         column that was actually used is carried by `newColumn`.
         */
-        decisionPath: task.column === reboundColumn ? "lease-recovered-in-place" : "lease-recovered-to-todo",
-        newColumn: reboundColumn,
+        decisionPath: task.column === containedTarget ? "lease-recovered-in-place" : "lease-recovered-to-todo",
+        newColumn: containedTarget,
         leaseEpoch: nextEpoch,
         recoveryReason: reason,
         handoffPolicy,

@@ -12488,7 +12488,7 @@
     },
     {
       "callSiteId": "packages/engine/src/project/mesh-lease-manager.ts::clearLocalLease::this.options.taskStore.moveTask::#1",
-      "callSiteFingerprint": "this.options.taskStore.moveTask(task.id,reboundColumn,{moveSource,preserveProgress})",
+      "callSiteFingerprint": "this.options.taskStore.moveTask(task.id,containedTarget,{moveSource,preserveProgress})",
       "file": "packages/engine/src/project/mesh-lease-manager.ts",
       "enclosingSymbolPath": "clearLocalLease",
       "writer": "this.options.taskStore.moveTask",
