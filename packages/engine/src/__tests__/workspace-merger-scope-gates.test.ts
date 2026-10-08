@@ -26,12 +26,14 @@ function addBranch(fx: WorkspaceFixture, repo: string, file = "feature.txt"): vo
   fx.git(repo, `git worktree remove --force ${worktree}`);
 }
 
-function storeFor(task: Task, scope: string[]): TaskStore & { updates: Array<Record<string, unknown>>; audit: any[] } {
+function storeFor(task: Task, scope: string[]): TaskStore & { updates: Array<Record<string, unknown>>; audit: any[]; entryPatches: Array<{ repo: string; patch: Record<string, unknown> }> } {
   const emitter = new EventEmitter();
   const updates: Array<Record<string, unknown>> = [];
   const audit: any[] = [];
+  const entryPatches: Array<{ repo: string; patch: Record<string, unknown> }> = [];
   return Object.assign(emitter, {
-    updates, audit,
+    updates, audit, entryPatches,
+    mergeWorkspaceWorktreeEntry: vi.fn(async (_id: string, repo: string, patch: Record<string, unknown>) => { entryPatches.push({ repo, patch }); return task; }),
     getTask: vi.fn(async () => task),
     getProjectId: vi.fn(() => "test-project"),
     getSettings: vi.fn(async () => ({ autoMerge: false, merger: { mode: "ai", maxReviewPasses: 0 } })),
@@ -57,7 +59,7 @@ function storeFor(task: Task, scope: string[]): TaskStore & { updates: Array<Rec
     upsertTaskCommitAssociation: vi.fn(async () => undefined),
     accumulateTokenUsage: vi.fn(async () => undefined),
     recordRunAuditEvent: vi.fn(async (event: unknown) => { audit.push(event); }),
-  }) as unknown as TaskStore & { updates: Array<Record<string, unknown>>; audit: any[] };
+  }) as unknown as TaskStore & { updates: Array<Record<string, unknown>>; audit: any[]; entryPatches: Array<{ repo: string; patch: Record<string, unknown> }> };
 }
 
 function reviewEvidence(workspaceWorktrees: NonNullable<Task["workspaceWorktrees"]>): NonNullable<Task["repositoryScope"]>["reviewEvidence"] {
@@ -87,7 +89,12 @@ describeIfGit("landWorkspaceTask file-scope gates", () => {
     fx?.cleanup();
   });
 
-  it("lands the declared repo then blocks the foreign-only repo without advancing its integration ref", async () => {
+  /*
+  FNXC:FileScopeInvariant 2026-10-08-05:09:
+  A refused repository squash is terminal, not a partial land to retry. Returning `allLanded:false` made the engine retry the full AI merge of the refused repository with backoff.
+  The land records that repository's failure with the refusal text and rethrows the typed refusal; already-landed repositories stay landed.
+  */
+  it("lands the declared repo, then refuses the foreign-only repo with a typed terminal error and a recorded land failure", async () => {
     policy.mockResolvedValue({ fileScope: "strict", fileScopeRules: [] });
     fx = await createWorkspaceFixture(["repo-a", "repo-b"]);
     addBranch(fx, "repo-a");
@@ -119,16 +126,17 @@ describeIfGit("landWorkspaceTask file-scope gates", () => {
     const beforeA = fx.git("repo-a", "git rev-parse main");
     const beforeB = fx.git("repo-b", "git rev-parse main");
 
-    const result = await landWorkspaceTask(store, task, fx.rootDir, {}, {
+    await expect(landWorkspaceTask(store, task, fx.rootDir, {}, {
       mergeAgent: squashAgent(BRANCH), reviewAgent: async () => "REVIEW_VERDICT: approve",
-    });
+    })).rejects.toMatchObject({ name: "FileScopeViolationError" });
 
-    expect(result.allLanded).toBe(false);
-    expect(result.repos.find((repo) => repo.repo === "repo-a")?.status).toBe("landed");
-    expect(result.repos.find((repo) => repo.repo === "repo-b")?.status).toBe("failed");
     expect(fx.git("repo-a", "git rev-parse main")).not.toBe(beforeA);
     expect(fx.git("repo-b", "git rev-parse main")).toBe(beforeB);
     expect(store.audit.some((event) => event.mutationType === "merge:file-scope-violation")).toBe(true);
+    const repoBFailure = store.entryPatches.find((entry) => entry.repo === "repo-b" && entry.patch.landFailure)?.patch.landFailure as Record<string, unknown> | undefined;
+    expect(repoBFailure).toMatchObject({ category: "review", repository: "repo-b" });
+    expect(String(repoBFailure?.technicalDetail)).toContain("File-scope invariant violation");
+    expect(store.entryPatches.some((entry) => entry.repo === "repo-a" && entry.patch.landFailure)).toBe(false);
   });
 
   it("refuses landing when an acquired repository changed outside confirmed scope", async () => {

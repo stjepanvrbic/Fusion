@@ -112,28 +112,30 @@ export function classifyFileScopeFromPrompt(content: string): FileScopeClassific
   const section = extractFileScopeSection(content);
   if (!section) return { entries: [], effectiveWriteScope: [] };
 
+  /*
+  FNXC:FileScopeClassification 2026-10-08-05:09:
+  Only a standalone heading or prose line ("Read-only context:", "Only if changed:") sets the context for the lines under it.
+  A list item's own qualifier ("- `x.ts` (only if needed)") applies to that item alone. Letting it set the section context shrank KB-008's declared write targets to three files, so the strict squash invariant refused an approved, fully in-scope squash.
+  Qualifier words are read from the prose with backticked paths removed, so a path such as `metadata/read-only-view.ts` cannot reclassify its own line.
+  */
   const entries: FileScopeClassificationEntry[] = [];
   const effectiveWriteScope: string[] = [];
   const seen = new Set<string>();
-  let context: "include" | "exclude" | "conditional" = "include";
+  let sectionContext: FileScopeLineContext = "include";
 
   for (const rawLine of section.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
-    if (INCLUDE_CONTEXT_RE.test(line) && !EXCLUDE_CONTEXT_RE.test(line) && !CONDITIONAL_CONTEXT_RE.test(line)) {
-      context = "include";
-    }
-    if (EXCLUDE_CONTEXT_RE.test(line)) {
-      context = "exclude";
-    }
-    if (CONDITIONAL_CONTEXT_RE.test(line)) {
-      context = "conditional";
-    }
+    const prose = line.replace(/`[^`]*`/g, " ");
+    const lineContext = classifyLineContext(prose);
+    const isListItem = LIST_ITEM_RE.test(line);
+    if (!isListItem && lineContext) sectionContext = lineContext;
+    const context = (isListItem ? lineContext : undefined) ?? sectionContext;
 
     const tokens = extractBacktickedTokens(line);
     for (const rawToken of tokens) {
       const token = rawToken.trim();
-      const reason = classifyToken(token, line, context);
+      const reason = classifyToken(token, prose, context);
       if (reason !== "included-write-scope") {
         entries.push({ token, included: false, reason, line });
         continue;
@@ -151,10 +153,22 @@ export function classifyFileScopeFromPrompt(content: string): FileScopeClassific
   return { entries, effectiveWriteScope };
 }
 
+type FileScopeLineContext = "include" | "exclude" | "conditional";
+
+const LIST_ITEM_RE = /^(?:[-*+]|\d+[.)])\s+/;
+
+/** The context a line's own qualifier words declare, or undefined when it declares none. Conditional wins over exclude, and exclude over include. */
+function classifyLineContext(prose: string): FileScopeLineContext | undefined {
+  if (CONDITIONAL_CONTEXT_RE.test(prose)) return "conditional";
+  if (EXCLUDE_CONTEXT_RE.test(prose)) return "exclude";
+  if (INCLUDE_CONTEXT_RE.test(prose)) return "include";
+  return undefined;
+}
+
 function classifyToken(
   token: string,
   line: string,
-  context: "include" | "exclude" | "conditional",
+  context: FileScopeLineContext,
 ): FileScopeClassificationReason {
   /*
   FNXC:FileScopeClassification 2026-06-25-04:34:
@@ -172,7 +186,11 @@ function classifyToken(
   if (lowerToken.startsWith(".changeset/") && (context === "conditional" || CONDITIONAL_CONTEXT_RE.test(line))) {
     return "conditional-changeset";
   }
-  if (context === "conditional") return "read-only-context";
+  /*
+  FNXC:FileScopeClassification 2026-10-08-05:09:
+  A conditional entry ("only if the fixture is proven stale") still authorizes the write, so it is write scope.
+  Only a conditional changeset stays excluded: shipping it is optional, and it must not satisfy the squash overlap invariant on its own.
+  */
   if (context === "exclude") {
     if (lowerLine.includes("wrong-worktree") || lowerLine.includes("wrong worktree") || lowerLine.includes("safeguard")) {
       return "wrong-worktree-safeguard";

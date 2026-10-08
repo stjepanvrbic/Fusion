@@ -4,7 +4,7 @@
  * No instance state; re-exported from the facade for call-site stability.
  */
 import type { Task } from "@fusion/core";
-import { MERGE_BOUNDARY_UNPROVEN_VALUE } from "../workflows/workflow-merge-nodes.js";
+import { MERGE_BOUNDARY_UNPROVEN_VALUE, MERGE_FILE_SCOPE_VIOLATION_VALUE } from "../workflows/workflow-merge-nodes.js";
 
 /** True when every step is done or skipped (and at least one step exists). */
 export function isTaskWorkComplete(task: Task): boolean {
@@ -51,7 +51,8 @@ export function isRetryableMergePauseAbortStatus(status: string | null | undefin
 
 export function isTerminalMergeGraphFailureValue(value: string | undefined): boolean {
   if (!value) return false;
-  if (value === MERGE_BOUNDARY_UNPROVEN_VALUE) return true;
+  // FNXC:FileScopeInvariant 2026-10-08-05:09: a refused squash is a verdict on the candidate, so the graph parks it for the operator instead of spending a bounded retry on a full AI merge that must refuse again.
+  if (value === MERGE_BOUNDARY_UNPROVEN_VALUE || value === MERGE_FILE_SCOPE_VIOLATION_VALUE) return true;
   const normalized = value.toLowerCase();
   return normalized.includes("conflict")
     || normalized.includes("contamination")

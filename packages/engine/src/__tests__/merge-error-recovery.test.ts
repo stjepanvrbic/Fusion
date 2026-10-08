@@ -77,6 +77,7 @@ import { ProjectEngine } from "../project-engine.js";
 import { runtimeLog } from "../logger.js";
 import { VerificationError } from "../merger.js";
 import { AiMergeBlockedError, runAiMerge } from "../merge/merger-ai.js";
+import { FileScopeViolationError } from "../merge/merger-file-scope.js";
 
 type MockTask = {
   id: string;
@@ -441,6 +442,39 @@ describe("ProjectEngine merge error recovery", () => {
     expect(setTimeoutSpy).not.toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
     const canMergeTask = (engine as unknown as { canMergeTask: (task: MockTask, retries: number) => boolean }).canMergeTask.bind(engine);
     expect(canMergeTask(makeTask({ status: "failed", updatedAt: new Date(0).toISOString() }), 3)).toBe(false);
+    vi.useRealTimers();
+  });
+
+  /*
+  FNXC:FileScopeInvariant 2026-10-08-05:09:
+  A file-scope refusal lists the staged files, and a path such as `branch-conflicts.ts` made the text check below read it as a git conflict.
+  The typed refusal must park with its own reason before that check, never spend conflict retries or bounce the card.
+  */
+  it.each(["direct", "pull-request"] as const)("parks a file-scope refusal whose staged files name a conflict module without retrying or bouncing (%s strategy)", async (strategy) => {
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const store = makeStore({ tasks: [makeTask({ mergeRetries: 0 }), makeTask({ mergeRetries: 0 })] });
+    const refusal = new FileScopeViolationError(
+      TASK_ID,
+      ["packages/engine/src/execution/branch-conflicts.ts"],
+      ["packages/dashboard/src/__tests__/task-reset-lifecycle.test.ts"],
+    );
+    const processPullRequestMerge = vi.fn().mockRejectedValue(refusal);
+    vi.mocked(runAiMerge).mockRejectedValueOnce(refusal);
+
+    const engine = createEngine(store, strategy === "pull-request" ? { getMergeStrategy: () => "pull-request", processPullRequestMerge } : {});
+    await runMergeCycle(engine);
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, {
+      status: "failed",
+      mergeRetries: 3,
+      error: refusal.message,
+    });
+    expect(store.updateTask).not.toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ status: null }));
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalledWith(TASK_ID, expect.any(String), "MergeConflictBounce");
+    expect(store.logEntry).toHaveBeenCalledWith(TASK_ID, expect.stringContaining("file-scope invariant refused the approved squash"), "FileScopeViolationError");
+    expect(setTimeoutSpy).not.toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
     vi.useRealTimers();
   });
 

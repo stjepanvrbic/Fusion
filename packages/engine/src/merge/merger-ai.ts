@@ -135,6 +135,7 @@ import cycle (merger-ai-worktree imports `MIN_TEMP_WORKTREE_REAP_AGE_MS` from se
 import { isRepoLanded, findProvenLandedCommit, FUSION_TASK_ID_TRAILER_KEY } from "./workspace-land-predicate.js";
 import { resolveWorkspaceMergeReadiness } from "./workspace-merge-readiness.js";
 import { persistWorkspaceRepoLandFailure } from "./workspace-land-failure.js";
+import { FileScopeViolationError } from "./merger-file-scope.js";
 import { ensureTenancyFenceRef, mergeDispatchFenceRef, publishWorkspaceIntegrationRef, WorkspaceFenceRefError, workspaceLandFenceRef } from "./workspace-fence-ref.js";
 import { isPushAfterMergeEnabled } from "./push-after-merge-policy.js";
 import { resolveWorkspaceIntegrationTarget, WorkspaceEnvironmentError, WorkspaceIntegrationTargetError, type WorkspaceIntegrationTarget } from "./workspace-integration-target.js";
@@ -3173,6 +3174,24 @@ export async function landWorkspaceTask(
           throw new WorkspaceEnvironmentError(repoRel, `remote '${target.remote}'`, `restore access to remote '${target.remote}' and choose Retry`, err.message);
         }
         throw new WorkspaceMergeTechnicalError("repository-fence-publication", `Workspace repository fence publication failed for ${repoRel}: ${err.message}`);
+      }
+      /*
+      FNXC:FileScopeInvariant 2026-10-08-05:09:
+      A refused repository squash is a verdict on the candidate, not a partial land. Reporting it as `allLanded:false` made the engine retry the full AI merge of that repository with backoff.
+      Record the refusal as that repository's land failure, then rethrow the typed error so the engine and the graph park the card for the operator. Repositories already landed stay landed and are skipped on a later retry.
+      */
+      if (err instanceof FileScopeViolationError) {
+        await log(`AI merge (workspace): sub-repo ${repoRel} refused by the file-scope invariant: ${err.message}`);
+        await persistWorkspaceRepoLandFailure(store, taskId, repoRel, {
+          category: "review",
+          message: `Workspace repository ${repoRel} could not land: its approved squash does not overlap the task's declared File Scope.`,
+          at: new Date().toISOString(),
+          branch: entry.branch,
+          repository: repoRel,
+          action: "Widen the task's File Scope, set scopeOverride with a reason, or refile the out-of-scope work, then choose Retry",
+          technicalDetail: err.message.slice(0, 2_000),
+        }).catch(() => undefined);
+        throw err;
       }
       const message = getErrorMessage(err);
       await log(`AI merge (workspace): sub-repo ${repoRel} land failed: ${message}`);

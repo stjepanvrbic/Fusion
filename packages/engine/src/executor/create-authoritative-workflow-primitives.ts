@@ -18,7 +18,7 @@ import type {
   WorkflowRuntimePrimitives,
 } from "../execution/runtime-primitives.js";
 import { WorkflowPlanningService } from "../workflows/workflow-planning-service.js";
-import { MERGE_BOUNDARY_RECOVERY_VALUE } from "../workflows/workflow-merge-nodes.js";
+import { classifyMergeRequesterRejection, MERGE_BOUNDARY_RECOVERY_VALUE } from "../workflows/workflow-merge-nodes.js";
 import {
   FOREACH_ACTIVE_CONTEXT_KEY,
   SEAM_GOVERNING_NODE_CONTEXT_KEY,
@@ -453,7 +453,14 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
           ctx.signal.addEventListener("abort", onGraphAbort, { once: true });
         });
         try {
-          const result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal: mergeSignal, graphOwnedPostMergeTraversal: true }), timeout, cancelled]);
+          let result: Awaited<ReturnType<NonNullable<typeof deps.mergeRequester>>> | "timeout" | "cancelled";
+          try {
+            result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal: mergeSignal, graphOwnedPostMergeTraversal: true }), timeout, cancelled]);
+          } catch (error) {
+            const terminalRefusal = classifyMergeRequesterRejection(error, ctx.node.node.id);
+            if (terminalRefusal) return terminalRefusal;
+            throw error;
+          }
           if (result === "cancelled") {
             executorLog.warn(`${mergeTask.id}: workflow merge primitive cancelled by graph abort`);
             return { outcome: "failure", value: "merge-cancelled" };

@@ -116,6 +116,7 @@ import {
   WorkspacePartialLandError,
   WorkspaceRepoLandBusyError,
 } from "./merge/merger-ai.js";
+import { FileScopeViolationError } from "./merge/merger-file-scope.js";
 import { promoteBranchGroup, type BranchGroupPromotionResult, type CreateGroupPrFn, type SyncGroupPrFn } from "./merge/group-merge-coordinator.js";
 import { rerouteWorkspaceReviewToCodeReview } from "./merge/workspace-review-reroute.js";
 import { rerouteSingularStaleContentToReview } from "./merge/stale-content-review-reroute.js";
@@ -5833,6 +5834,30 @@ export class ProjectEngine {
             continue;
           }
 
+          /*
+          FNXC:FileScopeInvariant 2026-10-08-05:09:
+          A file-scope refusal is a verdict on the approved squash, so no retry can change it. Park it with its own reason before either strategy's classifier; a workspace task lands directly even under the pull-request strategy.
+          Its message lists the staged files, and a path such as `branch-conflicts.ts` would otherwise read as a git conflict in the direct classifier and spend conflict retries and a bounce.
+          */
+          if (err instanceof FileScopeViolationError) {
+            try {
+              await store.updateTask(taskId, {
+                status: "failed",
+                mergeRetries: maxAutoMergeRetriesOnErr,
+                error: errorMsg,
+              });
+              await store.logEntry(
+                taskId,
+                "AI merge stopped: the file-scope invariant refused the approved squash; widen the task's File Scope, set scopeOverride with a reason, or refile the out-of-scope work",
+                "FileScopeViolationError",
+              );
+            } catch (recoveryErr) {
+              runtimeLog.error(
+                `Auto-merge: failed to park ${taskId} after a file-scope refusal: ${recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr)}`,
+              );
+            }
+            continue;
+          }
           if (mergeStrategyOnErr === "direct") {
             /*
             FNXC:AIMergeReviewRecovery 2026-08-20-02:02:

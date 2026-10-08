@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileScopeViolationError } from "../merge/merger-file-scope.js";
 import { resolveRepoDeclaredScopeTransform } from "../merge/merger-ai-squash-gates.js";
+import { extractEffectiveWriteScopeFromPrompt } from "@fusion/core";
 
 const policy = vi.hoisted(() => vi.fn());
 vi.mock("../merge/merge-trait.js", () => ({ resolveMergePolicy: policy }));
@@ -110,6 +111,42 @@ describe("resolveRepoDeclaredScopeTransform", () => {
 });
 
 describe("runAiMerge approved-squash gates", () => {
+  /*
+  FNXC:FileScopeInvariant 2026-10-08-05:09:
+  Symptom (KB-008): an approved squash inside the declared File Scope was refused because an earlier bullet's "(only if ...)" qualifier removed every later bullet from the parsed scope.
+  Reproduction: a strict real-git merge whose scope is parsed from a PROMPT of that shape by the production classifier. Assertion: the squash lands on main and no violation is recorded.
+  */
+  it("lands an approved squash covered by a bullet that follows a conditional bullet", async () => {
+    setPolicy("strict");
+    const prompt = [
+      "## File Scope",
+      "",
+      "- `packages/engine/src/worktree/worktree-pool.ts` (only if the root cause is a probe defect)",
+      "- `packages/dashboard/src/__tests__/task-reset-workspace-lifecycle.test.ts` (modified)",
+      "- `packages/dashboard/src/__tests__/task-reset-lifecycle.test.ts` (check if affected)",
+      "- `packages/engine/src/__tests__/reliability-interactions/_helpers.ts` (only if the fixture is proven stale)",
+      "- `packages/core/src/**/*.ts` (limited to the failing test files and their product code)",
+      "- `.changeset/kb-008.md` (only if a product behavior fix ships)",
+      "",
+      "## Steps",
+    ].join("\n");
+    const dir = createRepo((root) => {
+      mkdirSync(join(root, "packages/core/src/process"), { recursive: true });
+      writeFileSync(join(root, "packages/core/src/process/process-supervisor.ts"), "export const fixed = true;\n");
+    });
+    const before = git(dir, "rev-parse main");
+    const { store } = makeStore(extractEffectiveWriteScopeFromPrompt(prompt));
+
+    const result = await runAiMerge(store, dir, "FN-9050", { manual: true }, {
+      mergeAgent: squashAgent("fusion/fn-9050"), reviewAgent: approve,
+    });
+
+    expect(result.merged).toBe(true);
+    expect(git(dir, "rev-parse main")).not.toBe(before);
+    expect(git(dir, "show --name-only --format= main")).toContain("packages/core/src/process/process-supervisor.ts");
+    expect(store.recordRunAuditEvent.mock.calls.some(([event]: any[]) => event.mutationType === "merge:file-scope-violation")).toBe(false);
+  });
+
   it("blocks a strict out-of-scope squash before main advances and records the violation", async () => {
     setPolicy();
     const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "outside\n"));
