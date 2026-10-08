@@ -2916,6 +2916,93 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     await engine.stop();
   });
 
+  /*
+  FNXC:PostMergeRecovery 2026-10-08-12:42:
+  KB-068: the fast path must announce `task:merged` before its awaited completion log line, so completion observers never see the complete column without the merge announcement (pipeline smoke S16/S17 regressed when #57 put the log write first).
+  A blocked post-merge deferral must neither announce nor write the completion line (KB-032 log de-duplication).
+  */
+  function createMergeConfirmedFastPathStore(workflowStepResults: Array<Record<string, unknown>>) {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    const currentTask = {
+      id: "FN-merged",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      branch: "fusion/fn-merged",
+      steps: [],
+      enabledWorkflowSteps: ["post-merge-verification"],
+      workflowStepResults,
+      mergeDetails: { mergeConfirmed: true, mergedAt: "2026-05-18T00:00:00.000Z", mergeTargetBranch: "main" },
+    };
+    mockStore.store.getTask.mockImplementation(async () => currentTask);
+    mockStore.store.updateTaskAtomic.mockImplementation(async (_id: string, mutate: (task: typeof currentTask) => Partial<typeof currentTask> | null | undefined | Promise<Partial<typeof currentTask> | null | undefined>) => {
+      const patch = await mutate(currentTask);
+      if (patch) Object.assign(currentTask, patch);
+      return currentTask;
+    });
+    mockStore.store.moveTask.mockImplementation(async (_id: string, column: string) => {
+      currentTask.column = column;
+      return currentTask;
+    });
+    // The post-merge evidence decision only reads the gate when the store can resolve the task's workflow.
+    Object.assign(mockStore.store, {
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: "builtin:coding", stepIds: currentTask.enabledWorkflowSteps })),
+      getTaskWorkflowSelectionAsync: vi.fn(async () => ({ workflowId: "builtin:coding", stepIds: currentTask.enabledWorkflowSteps })),
+    });
+    return mockStore;
+  }
+
+  const COMPLETION_LINE = "Merge already confirmed; refreshing row";
+
+  function completionLogCalls(logEntry: { mock: { calls: unknown[][]; invocationCallOrder: number[] } }) {
+    return logEntry.mock.calls
+      .map((call, index) => ({ call, order: logEntry.mock.invocationCallOrder[index] }))
+      .filter(({ call }) => typeof call[1] === "string" && (call[1] as string).includes(COMPLETION_LINE));
+  }
+
+  it("KB-068: emits task:merged exactly once before the fast-path completion log line", async () => {
+    const mockStore = createMergeConfirmedFastPathStore([
+      { workflowStepId: "post-merge-verification", status: "passed", verdict: "APPROVE" },
+    ]);
+    mocks.currentStore = mockStore.store;
+
+    const engine = createEngine();
+    await engine.start();
+    engine.enqueueMerge("FN-merged");
+
+    await vi.waitFor(() => {
+      expect(completionLogCalls(mockStore.store.logEntry)).toHaveLength(1);
+    });
+
+    const emitOrders = mockStore.store.emit.mock.calls
+      .map((call: unknown[], index: number) => ({ call, order: mockStore.store.emit.mock.invocationCallOrder[index] }))
+      .filter(({ call }: { call: unknown[] }) => call[0] === "task:merged");
+    expect(emitOrders).toHaveLength(1);
+    const [completionLine] = completionLogCalls(mockStore.store.logEntry);
+    expect(emitOrders[0].order).toBeLessThan(completionLine.order);
+
+    await engine.stop();
+  });
+
+  it("KB-068: a blocked post-merge deferral neither announces task:merged nor writes the completion line", async () => {
+    const mockStore = createMergeConfirmedFastPathStore([]);
+    mocks.currentStore = mockStore.store;
+
+    const engine = createEngine();
+    await engine.start();
+    engine.enqueueMerge("FN-merged");
+
+    await vi.waitFor(() => {
+      expect(mockStore.store.logEntry).toHaveBeenCalledWith("FN-merged", expect.stringMatching(/^Merge confirmed/));
+    });
+
+    expect(mockStore.store.emit).not.toHaveBeenCalledWith("task:merged", expect.anything());
+    expect(completionLogCalls(mockStore.store.logEntry)).toHaveLength(0);
+
+    await engine.stop();
+  });
+
   it("FN-5627: auto-recovers fast-path refusal by clearing poisoned mergeDetails + re-enqueueing (mergeRetries < budget)", async () => {
     // Repro for the FN-5625/FN-5623 false-positive done class: the merger
     // has a TOCTOU between writing `mergeConfirmed: true` and `git update-ref`

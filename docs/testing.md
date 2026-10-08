@@ -521,7 +521,9 @@ prerequisite is absent (or accepts `--allow-skip` only for an explicit local
 non-execution). On Darwin, where the embedded PostgreSQL helper is unavailable, point
 `FUSION_PG_TEST_URL_BASE` at a manually provisioned Docker PostgreSQL service and run
 `pnpm --filter @fusion/engine exec vitest run --project=engine-pipeline-smoke` as the
-supported substitute. The wrapper pins its child to three Vitest workers: this prevents
+supported substitute. On Windows, enable Git long paths for the run without touching host
+config (`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.longpaths GIT_CONFIG_VALUE_0=true`);
+otherwise fixture merges fail with `Filename too long`. The wrapper pins its child to three Vitest workers: this prevents
 the workspace-wide worker setting from oversubscribing the lane's single PostgreSQL
 service while keeping the fixed 175-second watchdog budget unchanged. The workflow
 project is intentionally excluded from `engine-default` and `engine-core` so it cannot

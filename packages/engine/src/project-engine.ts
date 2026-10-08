@@ -4721,6 +4721,12 @@ export class ProjectEngine {
                 }
                 continue;
               }
+              /*
+              FNXC:PostMergeRecovery 2026-10-08-12:42:
+              KB-068: `task:merged` must be emitted immediately after a completed finalization, before the completion log line.
+              Completion observers (the activity-history listener, GitHub tracking, pipeline smoke S16/S17) must not see the complete column without the merge announcement; an awaited log write between them let the card read as done with no `task:merged` activity.
+              This matches self-healing's emit-then-log order in `recover-merged-review`.
+              */
               const mergedTask = finalization.task ?? (await store.getTask(taskId).catch(() => null)) ?? task;
               store.emit("task:merged", {
                 task: mergedTask,
@@ -4733,11 +4739,6 @@ export class ProjectEngine {
                 mergeTargetBranch: mergedTask.mergeDetails?.mergeTargetBranch,
                 mergeTargetSource: mergedTask.mergeDetails?.mergeTargetSource,
               } as MergeResult);
-              /*
-              FNXC:PostMergeRecovery 2026-10-08-10:46:
-              `task:merged` must follow the completion move with no await in between, as it always did: the merged activity is the completion signal observers read once the card reaches the complete lane.
-              The completion log line is therefore written after the emit.
-              */
               await store.logEntry(
                 taskId,
                 "Merge already confirmed; refreshing row and completing task (recovered from post-merge state inconsistency)",
