@@ -403,13 +403,9 @@ export default defineConfig({
             agent-activity-writers.test.ts is rescued into engine-default (not re-admitted to engine-core). Its sightings were cross-test leakage: executors left subscribed to the shared PostgreSQL store acted on the next test's KB-001, plus a completion fixture that predated the confirmed-merge finalizer. The file now detaches per-test store listeners; the exclude and ledger row were removed in lockstep.
             */
             /*
-            FNXC:ExecutorPauseResumeQuarantine 2026-10-05-17:10:
-            FN-9510's second full-suite sighting again observed zero agent creations only under
-            shard-wide mock/process interference. Keep the whole high-coverage file out of
-            engine-default until the deletion-ratchet deadline rather than weakening its resume
-            assertion or changing the production lifecycle fence.
+            FNXC:ExecutorPauseResumeQuarantine 2026-10-08-06:34:
+            KB-048 rescued executor-prompt.test.ts into engine-default (not admitted to engine-core). FN-9510's zero agent creations were a fixed 50 ms sleep racing the unpause-resume chain on a loaded worker, masked by earlier tests' runs leaking into later ones; the file now awaits tracked listener/dispatch/run work and drains it per test, and its PR #32 pause fixtures were refreshed. The exclude and ledger row were removed in lockstep.
             */
-            "src/__tests__/executor-prompt.test.ts",
             /*
             FNXC:ExecutorTaskDoneSummaryQuarantine 2026-10-08-04:50:
             Second Full Suite sighting of register entry 28: under shard load the executor returned from execute without opening the fn_task_done implementation session. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at the guarded in-place re-dispatch timer.

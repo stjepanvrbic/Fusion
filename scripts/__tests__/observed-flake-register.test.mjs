@@ -196,6 +196,11 @@ FNXC:TestFlakeRegister 2026-10-08-09:04:
 Entry 36 records a first sighting from the fork's Full Suite: a WorkflowNodeEditor edge-targeted fragment pick saved a
 graph that still held the original edge. The commit under test did not touch the editor and the mechanism is unmeasured,
 so a second appearance follows the file-level quarantine rule instead of a timeout, retry, or weakened assertion.
+
+FNXC:TestFlakeRegister 2026-10-08-09:18:
+Entry 34 was sighted a second time on the fork's Full Suite (the same case and assertion on another shard), so the
+deletion ratchet moves it to the archive. The archived record must keep both run identifiers and the unchanged
+assertion message so a rescue starts from when AgentDetailView subscribes rather than from a timeout.
 */
 test("observed-flake register active count, escalation state, and owners stay synchronized", () => {
   const register = readFileSync(registerPath, "utf8");
@@ -248,10 +253,6 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "33. AutomationStore due-run claim minute-boundary clock race",
-      status: "Active first sighting — recorded 2026-10-08, unattributed.",
-    },
-    {
-      heading: "34. AgentDetailView log history SSE suspend and reopen subscription",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
     {
@@ -381,6 +382,27 @@ test("archived MissionManager reconcile quarantine retains both-sighting evidenc
     "deletion deadline 2026-10-22",
   ]) {
     assert.ok(entry.includes(evidence), `Archived MissionManager reconcile entry is missing ${evidence}`);
+  }
+  assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
+});
+
+test("archived AgentDetailView log history quarantine retains both-sighting evidence", () => {
+  const register = readFileSync(registerPath, "utf8");
+  const archive = register.match(/## Archive — closed records\n([\s\S]*)$/)?.[1];
+  assert.ok(archive, "Expected an Archive — closed records section");
+  const entry = archive.match(/^### 34\. AgentDetailView log history SSE suspend and reopen subscription\n([\s\S]*?)(?=^### |(?![\s\S]))/m)?.[1];
+  assert.ok(entry, "Expected archived AgentDetailView log history quarantine entry");
+
+  for (const evidence of [
+    "packages/dashboard/app/components/__tests__/agent-detail-log-history.test.tsx",
+    "converges after an SSE suspend/reopen cycle without losing lines",
+    "37739564135",
+    "37747085495",
+    "the latest-run log stream must be subscribed: expected undefined to be truthy",
+    "quarantined 2026-10-08",
+    "deletion deadline 2026-10-22",
+  ]) {
+    assert.ok(entry.includes(evidence), `Archived AgentDetailView log history entry is missing ${evidence}`);
   }
   assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
 });

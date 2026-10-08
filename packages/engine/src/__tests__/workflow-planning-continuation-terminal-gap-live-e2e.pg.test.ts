@@ -182,7 +182,7 @@ pgDescribe("planning-continuation terminal columns, measured on a live store", (
     expect(resolved.kind === "orphan" ? resolved.reason : null).toBe("task-terminal");
   });
 
-  it("AUDIT — both direct predicate call sites receive resolved terminal columns; one classifier call still does not", async () => {
+  it("AUDIT — both direct predicate call sites and both production classifier calls receive resolved terminal columns; the unwired helper still does not", async () => {
     /*
     NOT driven: reaching the drain needs the runtime's full dependency set. Asserted against the
     module's SYNTAX and labelled as such.
@@ -205,14 +205,20 @@ pgDescribe("planning-continuation terminal columns, measured on a live store", (
     /** Every call of `name`, as its argument-expression list. Declarations are not call expressions,
      *  so they are excluded structurally rather than by guessing at their text. */
     function callArguments(name: string): ts.NodeArray<ts.Expression>[] {
-      const found: ts.NodeArray<ts.Expression>[] = [];
-      const visit = (node: ts.Node) => {
+      return callSites(name).map((site) => site.args);
+    }
+
+    /** Every call of `name` with the name of the top-level function declaration that contains it. */
+    function callSites(name: string): Array<{ enclosing: string | undefined; args: ts.NodeArray<ts.Expression> }> {
+      const found: Array<{ enclosing: string | undefined; args: ts.NodeArray<ts.Expression> }> = [];
+      const visit = (node: ts.Node, enclosing: string | undefined) => {
+        const owner = ts.isFunctionDeclaration(node) && node.name ? node.name.text : enclosing;
         if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name) {
-          found.push(node.arguments);
+          found.push({ enclosing: owner, args: node.arguments });
         }
-        ts.forEachChild(node, visit);
+        ts.forEachChild(node, (child) => visit(child, owner));
       };
-      ts.forEachChild(sf, visit);
+      ts.forEachChild(sf, (child) => visit(child, undefined));
       return found;
     }
 
@@ -227,9 +233,20 @@ pgDescribe("planning-continuation terminal columns, measured on a live store", (
         return ts.isIdentifier(arg) && arg.text === "terminalColumns";
       });
 
-    const classifierCalls = callArguments("resolvePlanningContinuationCandidate");
-    expect(classifierCalls).toHaveLength(2);
-    expect(classifierCalls.filter(passesTerminalColumns)).toHaveLength(1);
+    /*
+    FNXC:ConcurrencyAdmission 2026-10-08-09:16:
+    The continuation admission provider (`listContinuationAdmissionCandidates`) is the THIRD classifier call site and a production one: every project admission pass consults it.
+    It passes terminal columns resolved from the task's own workflow, derived exactly like the drain's (`resolveLifecycleColumns` over the task's resolved IR, through the shared `continuationTerminalColumns` helper, with the same legacy-pair fallback when the workflow cannot be read).
+    A legacy-only call here would offer a renamed board's completed card for admission, so the census pins each site by its enclosing function rather than by a bare count: both production sites must pass the resolved set, and only the unwired `selectActionablePlanningContinuations` helper may not.
+    The provider's renamed-board behaviour is pinned in `continuation-admission-provider.test.ts`.
+    */
+    const classifierSites = callSites("resolvePlanningContinuationCandidate");
+    expect(classifierSites).toHaveLength(3);
+    expect(Object.fromEntries(classifierSites.map((site) => [site.enclosing, passesTerminalColumns(site.args)]))).toEqual({
+      drainDuePlanningContinuations: true,
+      listContinuationAdmissionCandidates: true,
+      selectActionablePlanningContinuations: false,
+    });
 
     /*
     FNXC:WorkflowScheduling 2026-10-04-15:18:
