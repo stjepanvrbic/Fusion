@@ -4,30 +4,11 @@ import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { isSkillsGetInvocation } from "./skills-get-route.mjs";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 const distEntry = resolve(packageDir, "dist", "bin.js");
 const skillsGetEntry = resolve(packageDir, "dist", "skills-get-bin.js");
-
-function isSkillsGetInvocation(argv) {
-  const cleanedArgs = [];
-  let hasProjectFlag = false;
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    // Global terminal flags and invalid global flag forms retain full CLI parsing.
-    if (arg === "--version" || arg === "-v" || arg === "--help" || arg === "-h") return false;
-    if (arg === "--quiet" || arg === "-q" || arg === "--skip-onboarding") continue;
-    if (arg === "--project" || arg === "-P") {
-      const projectName = argv[index + 1];
-      if (hasProjectFlag || !projectName || projectName.startsWith("-")) return false;
-      hasProjectFlag = true;
-      index += 1;
-      continue;
-    }
-    cleanedArgs.push(arg);
-  }
-  return cleanedArgs[0] === "skills" && cleanedArgs[1] === "get";
-}
 
 const selectedEntry = isSkillsGetInvocation(globalThis.process.argv.slice(2))
   ? skillsGetEntry

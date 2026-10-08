@@ -155,7 +155,8 @@ export async function finalizeAcceptedNoOpCompletion(
     let latestColumn = refreshed.column;
     if (latestColumn === await resolveReboundColumnFor(deps.store, task.id)) {
       const wipTarget = await resolveWipTargetForTask(deps.store, task.id);
-      await deps.store.moveTask(task.id, wipTarget);
+      // FNXC:LifecycleContainment 2026-10-07-21:40: a forward hold-to-WIP engine move names its source; guards still apply, as they did when the source was absent.
+      await deps.store.moveTask(task.id, wipTarget, { moveSource: "engine", bypassGuards: false });
       latestColumn = wipTarget;
     }
     const beforeWatchdog = await deps.store.getTask(task.id);

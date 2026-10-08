@@ -79,8 +79,8 @@ describe("reliability interaction (FN-4766): PR changes-requested re-execution",
       "please fix Y",
     );
 
-    expect((s as any).moveTask).toHaveBeenCalledWith(t.id, "in-progress");
-    expect((s as any).moveTask.mock.calls[0].length).toBe(2);
+    // FNXC:LifecycleContainment 2026-10-07-21:40: the engine source is explicit and names the code-review revision that lets the card leave review.
+    expect((s as any).moveTask).toHaveBeenCalledWith(t.id, "in-progress", { moveSource: "engine", lifecycleReason: "code-review-revise-remediation", bypassGuards: false });
     expect(t.branch).toBe("fusion/fn-4992");
     expect(t.worktree).toBe("/tmp/test/.worktrees/fn-4992");
     expect(t.paused).toBe(true);

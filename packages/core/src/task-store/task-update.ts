@@ -40,6 +40,7 @@ import {BranchWriteProvenanceError, validateTaskBranchName} from "../branch/bran
 import {withTaskBranchContextInSourceMetadata} from "./branch-context.js";
 import {writePromptFileAtomic} from "./prompt-file.js";
 import type { TaskAtomicPersistFence } from "./project-store-ops.js";
+import type { TaskRowWriteOptions } from "./task-row-merge.js";
 
 /*
 FNXC:TaskRecommendations 2026-08-08-07:06:
@@ -193,7 +194,7 @@ async function persistPromptDerivedDeclaredSymbols(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updates: Parameters<TaskStore["updateTask"]>[1], runContext?: RunMutationContext, shouldPersist?: () => boolean, persistFence?: TaskAtomicPersistFence,): Promise<Task> {
+export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updates: Parameters<TaskStore["updateTask"]>[1], runContext?: RunMutationContext, shouldPersist?: () => boolean, persistFence?: TaskAtomicPersistFence, writeOptions?: TaskRowWriteOptions,): Promise<Task> {
   /* FNXC:TaskRecommendations 2026-08-08-05:02: every writer, including the recommendation route, shares this authoritative malformed/duplicate-id rejection boundary. */
   if (updates.recommendations !== undefined) assertValidRecommendations(updates.recommendations);
   if (updates.branch !== undefined) {
@@ -1348,9 +1349,9 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
             updatedFields: Object.keys(updates).filter((k) => (updates as Record<string, unknown>)[k] !== undefined),
             ...(titleNormalized ? { titleNormalized: true } : {}),
           },
-        }, planningInvalidation, undefined, shouldPersist, persistFence);
+        }, planningInvalidation, undefined, shouldPersist, persistFence, writeOptions);
       } else {
-        await store.atomicWriteTaskJsonWithAudit(dir, task, undefined, planningInvalidation, undefined, shouldPersist, persistFence);
+        await store.atomicWriteTaskJsonWithAudit(dir, task, undefined, planningInvalidation, undefined, shouldPersist, persistFence, writeOptions);
       }
 
       /*

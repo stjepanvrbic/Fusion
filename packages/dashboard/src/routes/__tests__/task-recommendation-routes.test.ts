@@ -466,7 +466,7 @@ describe("recommendation task creation route", () => {
     expect(recovered.status).toBe(200);
     expect(store.createTask).toHaveBeenCalledTimes(1);
     expect(store.unarchiveTask).not.toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenLastCalledWith("FN-102", "todo", { recoveryRehome: true });
+    expect(store.moveTask).toHaveBeenLastCalledWith("FN-102", "todo", { recoveryRehome: true, moveSource: "operator" });
     expect(tasks[0]?.recommendations?.[0]?.createdTaskId).toBe("FN-102");
   });
 
@@ -490,7 +490,7 @@ describe("recommendation task creation route", () => {
 
     expect(recovered.status).toBe(200);
     expect(store.unarchiveTask).not.toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenLastCalledWith("FN-102", "backlog", { recoveryRehome: true });
+    expect(store.moveTask).toHaveBeenLastCalledWith("FN-102", "backlog", { recoveryRehome: true, moveSource: "operator" });
     expect(tasks.find((item) => item.id === "FN-102")?.column).toBe("backlog");
   });
 
@@ -840,7 +840,7 @@ describe("recommendation task creation route", () => {
     expect(response.status).toBe(200);
     expect(custom.store.createTask).not.toHaveBeenCalled();
     expect(custom.store.unarchiveTask).not.toHaveBeenCalled();
-    expect(custom.store.moveTask).toHaveBeenCalledWith("FN-10", "backlog", { recoveryRehome: true });
+    expect(custom.store.moveTask).toHaveBeenCalledWith("FN-10", "backlog", { recoveryRehome: true, moveSource: "operator" });
     expect(custom.store.linkTaskRecommendation).toHaveBeenCalledWith(
       "FN-1",
       "rec-1",
@@ -879,7 +879,7 @@ describe("recommendation task creation route", () => {
     expect(response.status).toBe(200);
     expect(custom.store.createTask).not.toHaveBeenCalled();
     expect(custom.store.unarchiveTask).not.toHaveBeenCalled();
-    expect(custom.store.moveTask).toHaveBeenCalledWith("FN-10", "backlog", { recoveryRehome: true });
+    expect(custom.store.moveTask).toHaveBeenCalledWith("FN-10", "backlog", { recoveryRehome: true, moveSource: "operator" });
     expect(custom.store.linkTaskRecommendation).toHaveBeenCalledWith(
       "FN-1",
       "rec-1",
@@ -918,7 +918,7 @@ describe("recommendation task creation route", () => {
     expect(response.status).toBe(200);
     expect(legacy.store.createTask).not.toHaveBeenCalled();
     expect(legacy.store.unarchiveTask).not.toHaveBeenCalled();
-    expect(legacy.store.moveTask).toHaveBeenCalledWith("FN-10", "triage", { recoveryRehome: true });
+    expect(legacy.store.moveTask).toHaveBeenCalledWith("FN-10", "triage", { recoveryRehome: true, moveSource: "operator" });
     expect(legacy.store.linkTaskRecommendation).toHaveBeenCalledWith(
       "FN-1",
       "rec-1",

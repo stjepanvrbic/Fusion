@@ -177,7 +177,7 @@ describe("plan approval on a split intake and hold workflow", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-228", "ideas");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-228", "ideas", { moveSource: "operator" });
   });
 
   it("moves respecify to intake when a v1 workflow cannot declare planning placement", async () => {
@@ -189,7 +189,7 @@ describe("plan approval on a split intake and hold workflow", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-228", "triage");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-228", "triage", { moveSource: "operator" });
   });
 
   it("moves rejection to intake when a v1 workflow cannot declare planning placement", async () => {
@@ -200,6 +200,7 @@ describe("plan approval on a split intake and hold workflow", () => {
     expect(response.status).toBe(200);
     expect(store.moveTask).toHaveBeenCalledWith("FN-228", "triage", {
       preserveStatus: true,
+      moveSource: "operator",
       workflowMoveSource: "plan-approval",
     });
   });

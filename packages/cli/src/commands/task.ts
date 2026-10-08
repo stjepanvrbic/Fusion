@@ -1856,7 +1856,7 @@ export async function runTaskRetry(id: string, projectName?: string) {
         ...autoPauseClearPatch,
         ...buildManualRetryResetPatch({ resetMergeRetries: true }),
       }));
-      await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { preserveProgress: true, workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE }));
+      await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { preserveProgress: true, moveSource: "operator", workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE }));
       await retryBoardCall(context, id, "log entry", () => context.store.logEntry(id, `Retry requested from CLI (unusable worktree session-start recovery → todo, preserving progress${retryLogSuffix})`));
 
       console.log();
@@ -1876,7 +1876,7 @@ export async function runTaskRetry(id: string, projectName?: string) {
           ...autoPauseClearPatch,
           ...buildManualRetryResetPatch({ resetMergeRetries: isDeadlockAutoPauseRecovery }),
         }));
-        await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { preserveProgress: true, workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE }));
+        await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { preserveProgress: true, moveSource: "operator", workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE }));
         await retryBoardCall(context, id, "log entry", () => context.store.logEntry(
           id,
           isInReviewExecutionStall
@@ -1910,6 +1910,9 @@ export async function runTaskRetry(id: string, projectName?: string) {
     The fenced reset compares the live row with the pre-retry snapshot, and reopening into planning clears `worktree` (and `branch` from review), so a reset applied after the move was always refused as "superseded" after the card had already moved.
     Apply the reset to the unmoved row first, then move; the store is the single durable index, so the move no longer overwrites the reset.
     Retry moves carry no moveSource (a user source would park the card userPaused) and explicit manual-retry provenance.
+
+    FNXC:LifecycleContainment 2026-10-07-21:40:
+    Retry moves now name their source "operator": guards apply, the user hard-cancel park does not, and lifecycle containment does not treat the step back as an automatic move.
     */
     /*
     FNXC:WorkflowLifecycleColumns 2026-07-31-12:30 (PR #2752 review — greptile P1):
@@ -1932,7 +1935,7 @@ export async function runTaskRetry(id: string, projectName?: string) {
       ...autoPauseClearPatch,
       ...buildManualRetryResetPatch({ resetMergeRetries: true }),
     }));
-    await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE }));
+    await retryBoardCall(context, id, "move task", () => context.store.moveTask(id, retryHoldColumn as never, { moveSource: "operator", workflowMoveSource: MANUAL_RETRY_MOVE_PROVENANCE }));
 
     // Log the retry action
     await retryBoardCall(context, id, "log entry", () => context.store.logEntry(

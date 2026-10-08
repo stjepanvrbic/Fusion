@@ -129,7 +129,8 @@ export async function performWorkflowRerunBounce(
       // Already in `todo` (non-mergeable) — archive prior gate failures for the next reviewer.
       await deps.clearTerminalStepFailuresForRetry(taskId, "archive");
       /* FNXC:WorkflowResolvedColumns 2026-07-30-21:40: census-invisible moveTask DESTINATION — a call argument, not a comparison. The SOURCE guard four lines up already resolves via resolveReboundColumnFor; leaving the destination literal is a split brain inside one function. */
-      await deps.store.moveTask(taskId, await resolveWipTargetForTask(deps.store, taskId));
+      // FNXC:LifecycleContainment 2026-10-07-21:40: a forward hold-to-WIP engine move names its source; guards still apply, as they did when the source was absent.
+      await deps.store.moveTask(taskId, await resolveWipTargetForTask(deps.store, taskId), { moveSource: "engine", bypassGuards: false });
       return "bounced";
     }
 

@@ -2149,6 +2149,8 @@ describe("ChatManager.sendMessage", () => {
 
     const messageStore = {
       sendMessage: vi.fn().mockReturnValue({ id: "msg-123" }),
+      // Operator mail goes through the store's atomic dedupe seam; this fake never finds a duplicate.
+      sendMessageUnlessDuplicate: vi.fn(async () => ({ sent: true, message: { id: "msg-123" } })),
       getInbox: vi.fn().mockReturnValue([]),
       markAsRead: vi.fn(),
       markAllAsRead: vi.fn(),
@@ -2168,13 +2170,15 @@ describe("ChatManager.sendMessage", () => {
     }, undefined, undefined, undefined);
 
     expect(sendResult.content[0]?.type === "text" ? sendResult.content[0].text : "").toContain("Message sent to dashboard");
-    expect(messageStore.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+    // Agent-to-user mail is persisted through the atomic duplicate guard, never a bare insert.
+    expect(messageStore.sendMessageUnlessDuplicate).toHaveBeenCalledWith(expect.objectContaining({
       fromId: "agent-001",
       fromType: "agent",
       toId: "dashboard",
       toType: "user",
       type: "agent-to-user",
-    }));
+    }), expect.objectContaining({ scan: expect.objectContaining({ type: "agent-to-user", read: false }) }));
+    expect(messageStore.sendMessage).not.toHaveBeenCalled();
   });
 
   it("exposes mailbox tools when an agent-bound chat has a MessageStore", async () => {
@@ -2191,6 +2195,8 @@ describe("ChatManager.sendMessage", () => {
 
     const messageStore = {
       sendMessage: vi.fn().mockReturnValue({ id: "msg-123" }),
+      // Operator mail goes through the store's atomic dedupe seam; this fake never finds a duplicate.
+      sendMessageUnlessDuplicate: vi.fn(async () => ({ sent: true, message: { id: "msg-123" } })),
       getInbox: vi.fn().mockReturnValue([]),
       markAsRead: vi.fn(),
       markAllAsRead: vi.fn(),
@@ -2273,6 +2279,8 @@ describe("ChatManager.sendMessage", () => {
 
     const messageStore = {
       sendMessage: vi.fn().mockReturnValue({ id: "msg-123" }),
+      // Operator mail goes through the store's atomic dedupe seam; this fake never finds a duplicate.
+      sendMessageUnlessDuplicate: vi.fn(async () => ({ sent: true, message: { id: "msg-123" } })),
       getInbox: vi.fn().mockReturnValue([]),
       markAsRead: vi.fn(),
       markAllAsRead: vi.fn(),

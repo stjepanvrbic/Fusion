@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { sql } from "drizzle-orm";
 import { createSharedPgTaskStoreTestHarness, pgDescribe, type SharedPgTaskStoreHarness } from "../__test-utils__/pg-test-harness.js";
 import { withTaskWorkflowSerialization } from "../task-store/async/async-workflow-workitems.js";
+import { taskAdvisoryLockKey } from "../task-store/task-advisory-lock.js";
 
 const pgTest = pgDescribe;
 
@@ -91,11 +92,13 @@ pgTest("FN-8592 conditional stranded Plan Review seed", () => {
   async function installSeedInsertBarrier(taskId: string) {
     const layer = h.layer();
     const gateProjectId = `${layer.projectId}:fn8592-seed-gate`;
+    // FNXC:TaskRowConcurrency 2026-10-07-21:40: the trigger waits on the one per-task advisory key withTaskWorkflowSerialization now takes.
+    const gateKey = taskAdvisoryLockKey(gateProjectId, taskId).replaceAll("'", "''");
     await layer.db.execute(sql.raw(`
       CREATE OR REPLACE FUNCTION project.fn8592_pause_seed_insert() RETURNS trigger AS $$
       BEGIN
         IF NEW.task_id = '${taskId}' THEN
-          PERFORM pg_advisory_xact_lock(hashtext('${gateProjectId}'), hashtext(NEW.task_id));
+          PERFORM pg_advisory_xact_lock(hashtextextended('${gateKey}', 0));
         END IF;
         RETURN NEW;
       END;

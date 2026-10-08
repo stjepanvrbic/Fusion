@@ -11,6 +11,10 @@ Other platforms and non-pnpm commands are returned unchanged.
 FNXC:WindowsPnpmLaunch 2026-10-07-19:30:
 The release script also launches npm and gh, which are `.cmd` shims on Windows, and reported the resulting ENOENT as an npm login problem.
 For any other command on Windows, search PATH with PATHEXT the way cmd.exe would; a `.cmd`/`.bat` hit runs through cmd.exe by its full path, while an executable hit or no hit leaves the command unchanged so spawn reports its own error.
+
+FNXC:WindowsPnpmLaunch 2026-10-07-23:12:
+cmd.exe wrapping is acceptable only for fixed, trusted argument lists: the repo's release and build scripts qualify, while user, agent or plugin text must launch shell-free (core's resolveShellFreeLaunch).
+PATH entries are joined with Windows path rules and the file probe is injectable, so the Windows decision is identical, and tested, on every host.
 */
 
 const SAFE_CMD_ARG = /^[A-Za-z0-9_@+=:,./\\-]+$/;
@@ -35,7 +39,7 @@ function readEnv(env, name) {
   return key ? env[key] : undefined;
 }
 
-function isFile(candidate) {
+function defaultIsFile(candidate) {
   try {
     return statSync(candidate).isFile();
   } catch {
@@ -48,15 +52,16 @@ function isFile(candidate) {
  *
  * @param {string} command
  * @param {NodeJS.ProcessEnv | undefined} env
+ * @param {(candidate: string) => boolean} isFile
  * @returns {string | null}
  */
-function findOnWindowsPath(command, env) {
+function findOnWindowsPath(command, env, isFile) {
   if (/[\\/]/.test(command) || path.win32.extname(command)) return null;
   const dirs = (readEnv(env, "PATH") ?? "").split(";").map((dir) => dir.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean);
   const extensions = (readEnv(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").map((ext) => ext.trim()).filter(Boolean);
   for (const dir of dirs) {
     for (const ext of extensions) {
-      const candidate = path.join(dir, command + ext);
+      const candidate = path.win32.join(dir, command + ext);
       if (isFile(candidate)) return candidate;
     }
   }
@@ -72,13 +77,13 @@ function viaCmd(env, line) {
  *
  * @param {string} command
  * @param {string[]} args
- * @param {{ platform?: NodeJS.Platform, env?: NodeJS.ProcessEnv, execPath?: string }} [options]
+ * @param {{ platform?: NodeJS.Platform, env?: NodeJS.ProcessEnv, execPath?: string, isFile?: (candidate: string) => boolean }} [options]
  * @returns {{ command: string, args: string[], windowsVerbatimArguments: boolean }}
  */
-export function resolveCommandInvocation(command, args, { platform = process.platform, env = process.env, execPath = process.execPath } = {}) {
+export function resolveCommandInvocation(command, args, { platform = process.platform, env = process.env, execPath = process.execPath, isFile = defaultIsFile } = {}) {
   if (platform !== "win32") return { command, args, windowsVerbatimArguments: false };
   if (command !== "pnpm") {
-    const resolved = findOnWindowsPath(command, env);
+    const resolved = findOnWindowsPath(command, env, isFile);
     if (resolved && /\.(cmd|bat)$/i.test(resolved)) return viaCmd(env, [resolved, ...args]);
     return { command, args, windowsVerbatimArguments: false };
   }

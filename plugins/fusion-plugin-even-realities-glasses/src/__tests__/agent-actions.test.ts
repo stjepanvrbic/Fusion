@@ -204,7 +204,7 @@ describe("retryTask", () => {
     const result = await retryTask({ taskId: "FN-1" }, deps as never);
     expect(deps.updateTask).toHaveBeenCalledTimes(1);
     if (expectMove) {
-      expect(deps.moveTask).toHaveBeenCalledWith("FN-1", "todo");
+      expect(deps.moveTask).toHaveBeenCalledWith("FN-1", "todo", { moveSource: "operator" });
     } else {
       expect(deps.moveTask).not.toHaveBeenCalled();
     }
@@ -433,7 +433,7 @@ describe("resolved lanes drive destinations, not just gates", () => {
 
     await returnToAgent({ taskId: "FN-1" }, deps as never);
 
-    expect(deps.moveTask).toHaveBeenCalledWith("FN-1", "backlog");
+    expect(deps.moveTask).toHaveBeenCalledWith("FN-1", "backlog", { moveSource: "operator" });
     expect(deps.moveTask).not.toHaveBeenCalledWith("FN-1", "todo");
   });
 
@@ -442,7 +442,7 @@ describe("resolved lanes drive destinations, not just gates", () => {
 
     await retryTask({ taskId: "FN-1" }, deps as never);
 
-    expect(deps.moveTask).toHaveBeenCalledWith("FN-1", "backlog");
+    expect(deps.moveTask).toHaveBeenCalledWith("FN-1", "backlog", { moveSource: "operator" });
     expect(deps.moveTask).not.toHaveBeenCalledWith("FN-1", "todo");
   });
 

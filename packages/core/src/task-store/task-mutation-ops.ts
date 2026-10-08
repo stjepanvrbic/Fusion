@@ -18,7 +18,8 @@ import {TaskStore, storeLog} from "../store.js";
 import {TaskDeletedError, TaskNotFoundError} from "./errors.js";
 import type {LegacyAutoMergeStampReconcileResult} from "../store.js";
 import {randomUUID} from "node:crypto";
-import {mkdir, readFile, writeFile, rename, unlink} from "node:fs/promises";
+import {mkdir, readFile, writeFile, unlink} from "node:fs/promises";
+import {renameWithTransientRetry} from "../fs/rename-with-transient-retry.js";
 import {join} from "node:path";
 import {existsSync} from "node:fs";
 import { getTaskActivityLogEntryLimit } from "./comments.js";
@@ -29,12 +30,13 @@ import {validateSettingValuePatch, WorkflowSettingRejectionError} from "../workf
 import "../builtin-traits.js";
 import {toJson} from "../db/db.js";
 import {resolveSameAgentDuplicateIntake} from "./task-creation.js";
-import {type TaskRow, TASK_COLUMN_DESCRIPTORS} from "../task-store/persistence.js";
+import {type TaskRow} from "../task-store/persistence.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {assertSafeGitBranchName} from "../task-store/shell-safety.js";
 import {isFusionDeletableBranch} from "../branch/branch-assignment.js";
 import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction, resolveActiveTaskWedgeEpisodeRow} from "../task-store/async/async-persistence.js";
 import {findArchivedTaskEntry, upsertArchivedTaskEntry} from "./async/async-archive-lineage.js";
+import {isPathInside} from "../fs/path-identity.js";
 import { appendPatchnodeEntry } from "./async/async-patchnode.js";
 import { buildPatchnodeEntryInput } from "../board/patchnode.js";
 import { resolveProjectColumnsForRoles } from "../project-lane-vocabulary.js";
@@ -52,7 +54,7 @@ import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
 import {getActivityLog as getActivityLogAsync} from "../task-store/async/async-audit.js";
 import {insertArtifactRow as insertArtifactRowAsync} from "../task-store/async/async-comments-attachments.js";
 import {appendConfigurationRevision, createConfigurationRevision, getConfigurationRevision, rollbackConfiguration} from "../async-stores/async-configuration-revision-store.js";
-import {readProjectConfig, writeProjectConfig} from "./async/async-settings.js";
+import {readProjectConfigForUpdate, writeProjectConfig} from "./async/async-settings.js";
 import {publishSettingsUpdated} from "./settings-ops.js";
 import {loadWorkspaceConfig} from "../git/git-repository.js";
 import { mergeRestoredProjectSettings } from "../config/settings-schema.js";
@@ -60,8 +62,10 @@ import type {ConfigChangedBy, ConfigurationRevision} from "../types.js";
 import { resolveArchivedLanes } from "../project-lane-vocabulary.js";
 import { invalidateSupersededRepositoryScopeReviews } from "../tasks/repository-scope.js";
 import { TaskAtomicPersistGuardRefusedError, type TaskAtomicPersistFence } from "./project-store-ops.js";
+import { rememberTaskRowBaseline, taskRowBaselineOf, TaskWriteConflictError } from "./task-row-merge.js";
 import { STALE_REVIEW_CALLBACK_WAIVER_ACTOR, STALE_REVIEW_CALLBACK_WAIVER_POLICY_VERSION, STALE_REVIEW_CALLBACK_WAIVER_REASON, type StaleReviewCallbackWaiverReceipt } from "../merge/pre-merge-approval.js";
 import { deriveStaleReviewCallbackAttemptId } from "../workflows/workflow-step-results.js";
+import { publishCommittedTaskJson } from "./task-row-mappers.js";
 
 export function getTaskSelectClauseWithActivityLogLimitImpl(store: TaskStore, limit: number): string {
     const columns = [
@@ -109,20 +113,6 @@ export function getTaskSelectClauseWithActivityLogLimitImpl(store: TaskStore, li
     return [...columns, limitedLog].join(", ");
   }
 
-export function getChangedTaskColumnsImpl(store: TaskStore, existingRow: TaskRow, task: Task): Set<keyof TaskRow> {
-    const nextValues = store.getTaskPersistValues(task, existingRow);
-    const changedColumns = new Set<keyof TaskRow>();
-    for (const [index, descriptor] of TASK_COLUMN_DESCRIPTORS.entries()) {
-      if (descriptor.column === "updatedAt") {
-        continue;
-      }
-      if (!Object.is(existingRow[descriptor.column], nextValues[index])) {
-        changedColumns.add(descriptor.column);
-      }
-    }
-    return changedColumns;
-  }
-
 export function getSoftDeletedWriteConflictImpl(store: TaskStore, id: string, task: Task, existingRow?: TaskRow): string | undefined {
     const existing = existingRow ?? store.readTaskRowFromDb(id, { includeDeleted: true });
     if (!existing?.deletedAt || task.deletedAt !== undefined) {
@@ -147,7 +137,9 @@ export async function readTaskJsonImpl(store: TaskStore, dir: string): Promise<T
       if (pgRow.deletedAt) {
         throw new TaskDeletedError(id, pgRow.deletedAt as string);
       }
-      return store.rowToTask(store.pgRowToTaskRow(pgRow));
+      // FNXC:TaskRowConcurrency 2026-10-07-21:40: the read row is the baseline a later write of this snapshot merges against.
+      const taskRow = store.pgRowToTaskRow(pgRow);
+      return rememberTaskRowBaseline(store.rowToTask(taskRow), taskRow);
     }
     const filePath = join(dir, "task.json");
     const raw = await readFile(filePath, "utf-8");
@@ -194,7 +186,7 @@ export async function writeConfigImpl(store: TaskStore, config: BoardConfig, opt
     try {
       const tmpPath = store.configPath + ".tmp";
       await writeFile(tmpPath, store.serializeConfigForDisk(config));
-      await rename(tmpPath, store.configPath);
+      await renameWithTransientRetry(tmpPath, store.configPath);
     } catch (err) {
       // Best-effort: SQLite is the primary store
       storeLog.warn("Backward-compat config.json sync failed after config write", {
@@ -357,19 +349,22 @@ export async function renewCheckoutLeaseImpl(store: TaskStore, taskId: string, u
       if (row?.deletedAt) {
         return { deletedAt: row.deletedAt as string, current: undefined };
       }
-      const result = await tx
+      /*
+      FNXC:CheckoutLease 2026-10-07-21:40:
+      Without RETURNING the driver result has no rows, so every successful renewal took the not-found branch and threw after
+      its timestamp committed. The UPDATE also lacked the project predicate, so a renewal by one project's store rewrote a
+      same-id task in another project. RETURNING yields the renewed row, and the row is scoped like every other task write.
+      */
+      const [renewed] = await tx
         .update(schema.project.tasks)
         .set({
           checkoutRunId: update.checkoutRunId,
           checkoutLeaseRenewedAt: update.checkoutLeaseRenewedAt,
           updatedAt: update.checkoutLeaseRenewedAt,
         })
-        .where(and(eq(schema.project.tasks.id, taskId), isNull(schema.project.tasks.deletedAt)));
-      if (result.length === 0) {
-        return { deletedAt: undefined, current: undefined };
-      }
-      const fresh = await readTaskRowInTransaction(tx, taskId, undefined, layer.projectId);
-      return { deletedAt: undefined, current: fresh };
+        .where(and(eq(schema.project.tasks.id, taskId), taskProjectScope(layer), isNull(schema.project.tasks.deletedAt)))
+        .returning();
+      return { deletedAt: undefined, current: renewed as Record<string, unknown> | undefined };
     });
 
     if (outcome.deletedAt) {
@@ -381,7 +376,7 @@ export async function renewCheckoutLeaseImpl(store: TaskStore, taskId: string, u
       throw new Error(`Task ${taskId} not found`);
     }
     const current = store.rowToTask(store.pgRowToTaskRow(outcome.current));
-    await store.writeTaskJsonFile(dir, current);
+    await publishCommittedTaskJson(store, dir, current);
     if (store.isWatching) {
       store.taskCache.set(taskId, { ...current });
     }
@@ -389,18 +384,32 @@ export async function renewCheckoutLeaseImpl(store: TaskStore, taskId: string, u
     return current;
 }
 
+/** Updater runs per updateTaskAtomic call before a persistent cross-process conflict is surfaced to the caller. */
+const UPDATE_TASK_ATOMIC_MAX_ATTEMPTS = 5;
+
 export async function updateTaskAtomicImpl(store: TaskStore, id: string, updater: ( current: Task, ) => Parameters<TaskStore["updateTask"]>[1] | null | undefined | Promise<Parameters<TaskStore["updateTask"]>[1] | null | undefined>, runContext?: RunMutationContext, shouldPersist?: () => boolean, persistFence?: TaskAtomicPersistFence,): Promise<Task> {
+    /*
+    FNXC:TaskRowConcurrency 2026-10-07-21:40:
+    withTaskLock orders callers inside this store only. An updater computes its patch from `current`, so a column another
+    process changed after that read makes the patch stale (two increments of one counter would land as one). The write
+    refuses with TaskWriteConflictError when a column it writes moved since `current`, and the updater re-runs on a fresh
+    read, a bounded number of times.
+    */
     return store.withTaskLock(id, async () => {
-      const current = await store.readTaskJson(store.taskDir(id));
-      const updates = await updater(current);
-      if (!updates || Object.values(updates).every((value) => value === undefined)) {
-        return current;
-      }
-      try {
-        return await store.updateTaskUnlocked(id, updates, runContext, shouldPersist, persistFence);
-      } catch (error) {
-        if (error instanceof TaskAtomicPersistGuardRefusedError) return current;
-        throw error;
+      for (let attempt = 1; ; attempt++) {
+        const current = await store.readTaskJson(store.taskDir(id));
+        const updates = await updater(current);
+        if (!updates || Object.values(updates).every((value) => value === undefined)) {
+          return current;
+        }
+        const observedRow = taskRowBaselineOf(current);
+        try {
+          return await store.updateTaskUnlocked(id, updates, runContext, shouldPersist, persistFence, observedRow ? { observedRow } : undefined);
+        } catch (error) {
+          if (error instanceof TaskAtomicPersistGuardRefusedError) return current;
+          if (error instanceof TaskWriteConflictError && attempt < UPDATE_TASK_ATOMIC_MAX_ATTEMPTS) continue;
+          throw error;
+        }
       }
     });
   }
@@ -489,7 +498,7 @@ export async function updateWorkflowStepResultsFencedImpl(
     });
 
     if (outcome.applied) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -586,7 +595,7 @@ export async function issueStaleReviewCallbackWaiverImpl(
       return { applied: true, task: store.rowToTask(store.pgRowToTaskRow(updatedRow)), receipt };
     });
     if (outcome.applied) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -631,7 +640,7 @@ export async function updateWorkflowStepResultsWithLogFencedImpl(
     });
 
     if (outcome.applied) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -723,7 +732,7 @@ export async function linkTaskRecommendationImpl(
     });
 
     if (!updated.archived) {
-      await store.writeTaskJsonFile(store.taskDir(id), updated.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), updated.task);
       if (store.isWatching) store.taskCache.set(id, { ...updated.task });
     }
     store.emitTaskLifecycleEventSafely("task:updated", [updated.task]);
@@ -873,7 +882,7 @@ export async function mergeWorkspaceWorktreeEntryImpl(
     });
 
     if (outcome.mutated) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -952,7 +961,7 @@ export async function updateTaskRepositoryScopeImpl(
       if (!updatedRow) throw new TaskNotFoundError(id);
       return store.rowToTask(store.pgRowToTaskRow(updatedRow));
     });
-    await store.writeTaskJsonFile(store.taskDir(id), outcome);
+    await publishCommittedTaskJson(store, store.taskDir(id), outcome);
     if (store.isWatching) store.taskCache.set(id, { ...outcome });
     store.emitTaskLifecycleEventSafely("task:updated", [outcome]);
     return outcome;
@@ -992,7 +1001,7 @@ export async function updateWorkspaceReviewStateImpl(
       return { task: store.rowToTask(store.pgRowToTaskRow(updatedRow)), updated: true };
     });
     if (outcome.updated) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -1057,7 +1066,7 @@ export async function publishWorkspaceCodeReviewEvidenceImpl(
     });
 
     if (outcome.published) {
-      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      await publishCommittedTaskJson(store, store.taskDir(id), outcome.task);
       if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
       store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
     }
@@ -1232,11 +1241,17 @@ export async function updateWorkflowSettingValuesImpl(store: TaskStore, workflow
 FNXC:ConfigVersioning 2026-08-09-04:09:
 Exact project restores must retain the live heartbeat: new snapshots omit it while legacy snapshots can carry stale values that fabricate downtime. Extraction makes the same-transaction restore contract directly testable.
 */
+/*
+FNXC:ConfigVersioning 2026-10-07-21:40:
+The rollback's `before` snapshot and its replacement must describe one serialized state. A plain read let a concurrent
+settings write commit between them, so the revision recorded a stale `before`. readProjectConfigForUpdate holds the config
+row lock for the rest of the transaction; updateSettings takes the same lock, so it waits for the rollback to commit.
+*/
 export function createProjectSettingsRollbackSnapshotOps(layer: AsyncDataLayer, tx: DbTransaction) {
   return {
-    readCurrent: async () => (await readProjectConfig(layer, tx)).settings ?? {},
+    readCurrent: async () => (await readProjectConfigForUpdate(layer, tx)).settings ?? {},
     replace: async (snapshot: unknown) => {
-      const live = (await readProjectConfig(layer, tx)).settings ?? {};
+      const live = (await readProjectConfigForUpdate(layer, tx)).settings ?? {};
       await writeProjectConfig(layer, mergeRestoredProjectSettings(snapshot as Record<string, unknown>, live), undefined, tx);
     },
   };
@@ -1803,39 +1818,65 @@ export async function cleanupArchivedTasksImpl(store: TaskStore): Promise<string
     const patchnodeCompleteColumns = await resolveProjectColumnsForRoles(store, ["complete"])
       .catch(() => new Set<string>());
 
+    /*
+    FNXC:ArchiveCleanup 2026-10-07-21:40:
+    Cold storage is the authoritative terminal snapshot and housekeeping must never degrade it. Rebuilding the entry from the
+    soft-deleted row overwrote its pre-archive column with the archive marker and its log with one line, so a later unarchive
+    restored a card archived mid-flight to the complete lane. An existing entry is now kept as written by archiveTask.
+    archiveTask always writes that entry in the same transaction as its soft-delete, so a marker row with no entry is a
+    deleteTask tombstone, not an archive, and is left in place.
+    Each task is isolated: a failure is logged and the sweep moves on. The directory is removed only inside this store's
+    tasks root, with Node's transient-error retry, and residue after the row is gone is logged rather than thrown.
+    */
     for (const row of archivedRows) {
       const task = store.rowToTask(store.pgRowToTaskRow(row));
       const dir = store.taskDir(task.id);
-      /*
-      FNXC:PatchnodeLedger 2026-08-28-12:16:
-      A pre-Patchnode archived row reaches its last surviving summary here. Consult the existing cold snapshot before rewriting it, and leave the row intact when capture fails so a later cleanup can retry instead of hard-deleting the only evidence.
-      */
-      const existingEntry = await findArchivedTaskEntry(layer.db, task.id, layer.projectId);
-      if (
-        patchnodeCompleteColumns.has(existingEntry?.preArchiveColumn ?? "")
-        && task.columnMovedAt
-        && Number.isFinite(Date.parse(task.columnMovedAt))
-      ) {
+      try {
+        const existingEntry = await findArchivedTaskEntry(layer.db, task.id, layer.projectId);
+        if (!existingEntry) continue;
+        /*
+        FNXC:PatchnodeLedger 2026-08-28-12:16:
+        A pre-Patchnode archived row reaches its last surviving summary here. Consult the existing cold snapshot before rewriting it, and leave the row intact when capture fails so a later cleanup can retry instead of hard-deleting the only evidence.
+        */
+        if (
+          patchnodeCompleteColumns.has(existingEntry.preArchiveColumn ?? "")
+          && task.columnMovedAt
+          && Number.isFinite(Date.parse(task.columnMovedAt))
+        ) {
+          try {
+            await appendPatchnodeEntry(layer, buildPatchnodeEntryInput(task, "completed", task.columnMovedAt));
+          } catch (error) {
+            storeLog.warn(`[patchnode] skipping archived cleanup after capture failure for ${task.id}`, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            continue;
+          }
+        }
+
+        await purgeTaskWorkflowSelectionRowsAsyncImpl(store, task.id);
+        await layer.db
+          .delete(schema.project.tasks)
+          .where(and(eq(schema.project.tasks.projectId, projectId), eq(schema.project.tasks.id, task.id)));
+      } catch (error) {
+        storeLog.warn("archived-task cleanup skipped a task after a failure", {
+          phase: "cleanupArchivedTasks",
+          taskId: task.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+
+      if (isPathInside(store.tasksDir, dir) && existsSync(dir)) {
         try {
-          await appendPatchnodeEntry(layer, buildPatchnodeEntryInput(task, "completed", task.columnMovedAt));
+          await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
         } catch (error) {
-          storeLog.warn(`[patchnode] skipping archived cleanup after capture failure for ${task.id}`, {
+          storeLog.warn("archived-task directory removal left residue after the row was removed", {
+            phase: "cleanupArchivedTasks:task-dir",
+            taskId: task.id,
+            taskDir: dir,
             error: error instanceof Error ? error.message : String(error),
           });
-          continue;
         }
-      }
-      // Guarantee a cold-storage snapshot before the destructive delete.
-      const entry = await store.taskToArchiveEntry(task, task.deletedAt ?? new Date().toISOString());
-      await upsertArchivedTaskEntry(layer.db, entry, layer.projectId);
-
-      await purgeTaskWorkflowSelectionRowsAsyncImpl(store, task.id);
-      await layer.db
-        .delete(schema.project.tasks)
-        .where(and(eq(schema.project.tasks.projectId, projectId), eq(schema.project.tasks.id, task.id)));
-
-      if (existsSync(dir)) {
-        await rm(dir, { recursive: true, force: true });
       }
       if (store.isWatching) {
         store.taskCache.delete(task.id);

@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 
 const settingsOps = vi.hoisted(() => ({
   readProjectConfig: vi.fn(),
+  readProjectConfigForUpdate: vi.fn(),
   writeProjectConfig: vi.fn(),
 }));
 vi.mock("../task-store/async/async-settings.js", () => settingsOps);
@@ -136,35 +137,35 @@ describe("configuration revision paging", () => {
 });
 
 describe("project settings rollback snapshot operations", () => {
-  it("uses the identical transaction for reads and writes and overlays the live heartbeat", async () => {
+  it("reads the config row for update on the identical transaction and overlays the live heartbeat", async () => {
     const tx = {};
-    settingsOps.readProjectConfig.mockResolvedValueOnce({ settings: { autoMerge: false } })
+    settingsOps.readProjectConfigForUpdate.mockResolvedValueOnce({ settings: { autoMerge: false } })
       .mockResolvedValueOnce({ settings: { autoMerge: false, engineLastActiveAt: "live" } });
     settingsOps.writeProjectConfig.mockResolvedValue(undefined);
     const ops = createProjectSettingsRollbackSnapshotOps({} as never, tx as never);
     expect(await ops.readCurrent()).toEqual({ autoMerge: false });
     await ops.replace({ autoMerge: true, engineLastActiveAt: "stale" });
-    expect(settingsOps.readProjectConfig).toHaveBeenNthCalledWith(1, expect.anything(), tx);
-    expect(settingsOps.readProjectConfig).toHaveBeenNthCalledWith(2, expect.anything(), tx);
+    expect(settingsOps.readProjectConfigForUpdate).toHaveBeenNthCalledWith(1, expect.anything(), tx);
+    expect(settingsOps.readProjectConfigForUpdate).toHaveBeenNthCalledWith(2, expect.anything(), tx);
     expect(settingsOps.writeProjectConfig).toHaveBeenCalledWith(expect.anything(), { autoMerge: true, engineLastActiveAt: "live" }, undefined, tx);
   });
 
   it("re-overlays a live heartbeat for a stripped snapshot with the same transaction", async () => {
     const tx = {};
-    settingsOps.readProjectConfig.mockReset();
+    settingsOps.readProjectConfigForUpdate.mockReset();
     settingsOps.writeProjectConfig.mockReset();
-    settingsOps.readProjectConfig.mockResolvedValue({ settings: { autoMerge: false, engineLastActiveAt: "live" } });
+    settingsOps.readProjectConfigForUpdate.mockResolvedValue({ settings: { autoMerge: false, engineLastActiveAt: "live" } });
     const ops = createProjectSettingsRollbackSnapshotOps({} as never, tx as never);
     await ops.replace({ autoMerge: true });
-    expect(settingsOps.readProjectConfig).toHaveBeenCalledWith(expect.anything(), tx);
+    expect(settingsOps.readProjectConfigForUpdate).toHaveBeenCalledWith(expect.anything(), tx);
     expect(settingsOps.writeProjectConfig).toHaveBeenCalledWith(expect.anything(), { autoMerge: true, engineLastActiveAt: "live" }, undefined, tx);
   });
 
   it("keeps an absent live heartbeat absent", async () => {
     const tx = {};
-    settingsOps.readProjectConfig.mockReset();
+    settingsOps.readProjectConfigForUpdate.mockReset();
     settingsOps.writeProjectConfig.mockReset();
-    settingsOps.readProjectConfig.mockResolvedValue({ settings: { autoMerge: false } });
+    settingsOps.readProjectConfigForUpdate.mockResolvedValue({ settings: { autoMerge: false } });
     const ops = createProjectSettingsRollbackSnapshotOps({} as never, tx as never);
     await ops.replace({ autoMerge: true, engineLastActiveAt: "stale" });
     expect(settingsOps.writeProjectConfig).toHaveBeenCalledWith(expect.anything(), { autoMerge: true }, undefined, tx);

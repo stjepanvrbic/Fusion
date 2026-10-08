@@ -1416,7 +1416,7 @@ describe("project-aware task command behavior", () => {
 
     expect(getTask).toHaveBeenCalledWith("FN-123");
     expect(updateTask).toHaveBeenCalled();
-    expect(moveTask).toHaveBeenCalledWith("FN-123", "todo", { workflowMoveSource: "manual-retry" });
+    expect(moveTask).toHaveBeenCalledWith("FN-123", "todo", { moveSource: "operator", workflowMoveSource: "manual-retry" });
     expect(logEntry).toHaveBeenCalled();
   });
 
@@ -3236,7 +3236,7 @@ describe("runTaskRetry", () => {
       mergeRetries: 0,
       resumeLimboCount: 0,
     });
-    expect(mockMoveTask).toHaveBeenCalledWith("FN-001", "todo", { workflowMoveSource: "manual-retry" });
+    expect(mockMoveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "operator", workflowMoveSource: "manual-retry" });
     expect(mockLogEntry).toHaveBeenCalledWith("FN-001", "Retry requested from CLI", "Task reset to todo for retry");
 
     const successLine = logSpy.mock.calls.find(
@@ -3331,7 +3331,7 @@ describe("runTaskRetry", () => {
       mergeRetries: 0,
       resumeLimboCount: 0,
     });
-    expect(mockMoveTask).toHaveBeenCalledWith("FN-001", "todo", { workflowMoveSource: "manual-retry" });
+    expect(mockMoveTask).toHaveBeenCalledWith("FN-001", "todo", { moveSource: "operator", workflowMoveSource: "manual-retry" });
     expect(mockLogEntry).toHaveBeenCalledWith("FN-001", "Retry requested from CLI", "Task reset to todo for retry");
 
     const successLine = logSpy.mock.calls.find(
@@ -3365,7 +3365,7 @@ describe("runTaskRetry", () => {
       error: null,
     }));
     expect(mockUpdateTask.mock.calls[0][1]).not.toHaveProperty("mergeRetries");
-    expect(mockMoveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveProgress: true, workflowMoveSource: "manual-retry" });
+    expect(mockMoveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveProgress: true, moveSource: "operator", workflowMoveSource: "manual-retry" });
     expect(mockLogEntry).toHaveBeenCalledWith(
       "FN-001",
       "Retry requested from CLI (stranded in-review execution retry → todo, preserving progress)",
@@ -3386,7 +3386,7 @@ describe("runTaskRetry", () => {
 
     await runTaskRetry("FN-001");
 
-    expect(mockMoveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveProgress: true, workflowMoveSource: "manual-retry" });
+    expect(mockMoveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveProgress: true, moveSource: "operator", workflowMoveSource: "manual-retry" });
     expect(mockLogEntry).toHaveBeenCalledWith(
       "FN-001",
       "Retry requested from CLI (stranded in-review execution retry → todo, preserving progress)",

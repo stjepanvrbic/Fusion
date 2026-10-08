@@ -140,7 +140,7 @@ describe("POST /tasks/:id/spec/revise preservePlan", () => {
     }), { "Content-Type": "application/json" });
 
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(store.moveTask).toHaveBeenCalledWith("FN-212", "planning");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-212", "planning", { moveSource: "operator" });
     expect(row).toMatchObject({ column: "planning", status: "needs-replan", approvedPlanFingerprint: null, awaitingApprovalReason: null });
     await expect(readFile(promptPath, "utf8")).resolves.toContain("# Existing plan");
   });

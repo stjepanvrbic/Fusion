@@ -9,7 +9,7 @@ import { emitBoundedRunAudit } from "../run-audit/emit-bounded-run-audit.js";
  * instance as its first parameter and performs byte-identical work.
  */
 import { and, eq, isNull } from "drizzle-orm";
-import {TaskStore} from "../store.js";
+import {TaskStore, storeLog} from "../store.js";
 import type { Task, TaskDetail, TaskLogEntry, RunMutationContext } from "../types.js";
 import {findWorkflowColumn} from "../plugins/plugin-gate-verdict.js";
 import {getTraitRegistry} from "../workflows/trait-registry.js";
@@ -18,13 +18,21 @@ import {writeTransitionPendingAsync} from "./async/async-transition-pending.js";
 import type {WorkflowIr} from "../workflows/workflow-ir-types.js";
 import "../builtin-traits.js";
 import {__setTaskActivityLogLimitsForTesting, truncateTaskLogOutcome, getTaskActivityLogEntryLimit} from "../task-store/comments.js";
-import {readTaskRow, updateTaskColumns} from "../task-store/async/async-persistence.js";
+import {readTaskRow, readTaskRowInTransaction} from "../task-store/async/async-persistence.js";
+import {projectScopeFor} from "../postgres/data-layer.js";
 import { getLiveTaskColumn } from "./async/async-comments-attachments.js";
 import { acquireTaskAdvisoryXactLock } from "./task-advisory-lock.js";
 import { resolveArchivedLanes } from "../project-lane-vocabulary.js";
 import { buildTaskLogReadOnlyMessage, buildTaskNotFoundMessage } from "./task-log-write-refusal.js";
 import * as schema from "../postgres/schema/index.js";
 import { observeOverlapWaitTransitionInTransaction } from "./overlap-wait-ops.js";
+import { publishCommittedTaskJson } from "./task-row-mappers.js";
+
+/** An error's class name when it is identifier-shaped, else "Error"; never message text. */
+function auditFailureClass(error: unknown): string {
+  const name = error instanceof Error ? error.name : undefined;
+  return typeof name === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "Error";
+}
 
 export async function runPluginColumnTransitionHooksImpl(store: TaskStore, taskId: string, workflowIr: WorkflowIr, fromColumn: string, toColumn: string,): Promise<void> {
     const registry = getTraitRegistry();
@@ -81,8 +89,15 @@ export async function runPluginColumnTransitionHooksImpl(store: TaskStore, taskI
     const remaining = ["default-workflow:postCommit", ...hookIds];
     for (const { traitId, hookKind } of pending) {
       const resolved = registry.resolveTraitHook(traitId, hookKind);
+      /*
+      FNXC:RunAudit 2026-10-07-21:40:
+      Run-audit metadata is ids, counts and fixed outcomes only. The warning text and a hook's raw error message can carry
+      credential-bearing URLs or task content, so they go to the diagnostic log; the audit row keeps the trait id, the hook
+      kind, a fixed reason and, for a throw, an identifier-shaped error class.
+      */
       if (resolved.warning) {
         // Degraded (no impl / force-disabled) → passive no-op, audit the warning.
+        storeLog.warn("plugin trait hook degraded", { taskId, traitId, hookKind, reason: "no-impl", message: resolved.warning.message });
         void emitBoundedRunAudit(store, {
           taskId,
           agentId: "system",
@@ -90,13 +105,14 @@ export async function runPluginColumnTransitionHooksImpl(store: TaskStore, taskI
           domain: "database",
           mutationType: "plugin:trait-hook-degraded",
           target: taskId,
-          metadata: { traitId, hookKind, reason: "no-impl", message: resolved.warning.message },
+          metadata: { traitId, hookKind, reason: "no-impl" },
         });
       } else if (resolved.impl) {
         try {
           await resolved.impl({ task: taskDetail, context: { fromColumn, toColumn, hookKind } });
         } catch (err) {
           // A throwing plugin hook DEGRADES — audited, never wedges the lock.
+          storeLog.warn("plugin trait hook threw", { taskId, traitId, hookKind, error: err instanceof Error ? err.message : String(err) });
           void emitBoundedRunAudit(store, {
             taskId,
             agentId: "system",
@@ -104,12 +120,7 @@ export async function runPluginColumnTransitionHooksImpl(store: TaskStore, taskI
             domain: "database",
             mutationType: "plugin:trait-hook-degraded",
             target: taskId,
-            metadata: {
-              traitId,
-              hookKind,
-              reason: "threw",
-              error: err instanceof Error ? err.message : String(err),
-            },
+            metadata: { traitId, hookKind, reason: "threw", failureClass: auditFailureClass(err) },
           });
         }
       }
@@ -160,7 +171,7 @@ export async function logEntryOnceImpl(
     return { appended: true, row: updated[0]! };
   });
   const task = store.rowToTask(store.pgRowToTaskRow(result.row as unknown as Record<string, unknown>));
-  await store.writeTaskJsonFile(store.taskDir(id), task);
+  await publishCommittedTaskJson(store, store.taskDir(id), task);
   if (store.isWatching) store.taskCache.set(id, { ...task });
   return result.appended;
 }
@@ -250,7 +261,7 @@ export async function transitionQueuedEpisodeImpl(
     return { appended, task: updated[0]! };
   });
   const task = store.rowToTask(store.pgRowToTaskRow(result.task as unknown as Record<string, unknown>));
-  await store.writeTaskJsonFile(store.taskDir(id), task);
+  await publishCommittedTaskJson(store, store.taskDir(id), task);
   if (store.isWatching) store.taskCache.set(id, { ...task });
   store.emitTaskLifecycleEventSafely("task:updated", [task]);
   return { appended: result.appended, task };
@@ -360,7 +371,8 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
           domain: "database",
           mutationType: "task:log",
           target: task.id,
-          metadata: { action, outcome },
+          // FNXC:RunAudit 2026-10-07-21:40: the entry's action and outcome are prose and live in the task log this row audits; metadata stays fixed-shape.
+          metadata: { hasOutcome: outcome !== undefined },
         });
 
         if (store.isWatching) store.taskCache.set(id, { ...task });
@@ -377,7 +389,16 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
       // sync this.db.prepare() path which throws "SQLite Database is not
       // available in backend mode" (discovered by sqlite-final-removal session 3).
             const layer = store.asyncLayer!;
-      const pgRow = await readTaskRow(layer, id, { includeDeleted: true });
+      const archivedLanes = await resolveArchivedLanes(store);
+      /*
+      FNXC:TaskRowConcurrency 2026-10-07-21:40:
+      The read-append-write of the log column was three separate statements, so two processes appending at once each wrote
+      back their own copy and one entry vanished. The read and the write now share one transaction holding the per-task
+      advisory lock every generic task-row writer takes.
+      */
+      const updatedRow = await layer.transactionImmediate(async (tx) => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const pgRow = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
       if (!pgRow) {
         throw new Error(buildTaskNotFoundMessage(id));
       }
@@ -434,7 +455,6 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
       front of it, no encoding's count moves, and an unwired or degraded caller behaves exactly as
       before — the same additive shape as the six Drizzle LANE sites.
       */
-      const archivedLanes = await resolveArchivedLanes(store);
       const rowIsArchivedLane = archivedLanes
         ? archivedLanes.has(String(pgRow.column ?? ""))
         /* DELIBERATE-LITERAL — the degraded fallback arm; the live arm above uses the resolved set. */
@@ -450,21 +470,22 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
         existingLog.splice(0, existingLog.length - _entryLimit);
       }
       const updatedAt = new Date().toISOString();
-      await updateTaskColumns(layer, id, { log: existingLog, updatedAt });
+      const [written] = await tx.update(schema.project.tasks)
+        .set({ log: existingLog, updatedAt })
+        .where(and(eq(schema.project.tasks.id, id), projectScopeFor(schema.project.tasks.projectId, layer.projectId)))
+        .returning();
+      return written as Record<string, unknown> | undefined;
+      });
 
-      // Re-read the task for event emission (full row → Task).
-      const updatedRow = await readTaskRow(layer, id, { includeDeleted: false });
       if (updatedRow) {
         const current = store.rowToTask(store.pgRowToTaskRow(updatedRow));
-        await store.writeTaskJsonFile(store.taskDir(id), current);
+        await publishCommittedTaskJson(store, store.taskDir(id), current);
         if (store.isWatching) {
           store.taskCache.set(id, { ...current });
         }
         store.emitTaskLifecycleEventSafely("task:updated", [current]);
         return current;
       }
-      const emittedTask = ({ id, log: existingLog, updatedAt } as unknown) as Task;
-      store.emitTaskLifecycleEventSafely("task:updated", [emittedTask]);
-      return emittedTask;
+      throw new Error(buildTaskNotFoundMessage(id));
 });
   }

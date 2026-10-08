@@ -17,7 +17,9 @@ function createMessageStoreHarness(parent?: Record<string, unknown> | null) {
     }
     return { id: "msg-1" };
   });
-  return { messageStore: { getMessage, sendMessage }, getMessage, sendMessage, wakeSpy };
+  // Operator mail goes through the store's atomic dedupe seam; this harness never finds a duplicate.
+  const sendMessageUnlessDuplicate = vi.fn(async (input: Record<string, unknown>) => ({ sent: true, message: await sendMessage(input) }));
+  return { messageStore: { getMessage, sendMessage, sendMessageUnlessDuplicate }, getMessage, sendMessage, wakeSpy };
 }
 
 async function executeSend(

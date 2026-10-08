@@ -8,6 +8,7 @@
  * behavior-preserving refactor. Each function receives the TaskStore
  * instance as its first parameter and performs byte-identical work.
  */
+import { resolveMoveSource } from "../workflows/workflow-transition-policy.js";
 import {TaskStore} from "../store.js";
 import {resolveEntryColumnId} from "../workflows/workflow-reconciliation.js";
 import {resolveWorkflowIrForTask} from "../workflows/workflow-ir-resolver.js";
@@ -37,11 +38,14 @@ import {upsertTaskRowInTransaction, readTaskRowInTransaction, buildTaskInsertVal
 import {preserveDurableTaskWedgeInvariants} from "../task-store/persistence.js";
 import {isPlanReviewSatisfied} from "../planner/plan-approval.js";
 import {listDueWorkflowWorkItems as listDueWorkflowWorkItemsAsync, withTaskWorkflowSerialization} from "../task-store/async/async-workflow-workitems.js";
+import {acquireTaskAdvisoryXactLock} from "./task-advisory-lock.js";
+import {adoptCommittedTaskRow, planTaskRowWrite} from "./task-row-merge.js";
 import {getTaskMovedCountsByDay as getTaskMovedCountsByDayAsync} from "../task-store/async/async-audit.js";
 import {getAllDocuments as getAllDocumentsAsync} from "../task-store/async/async-comments-attachments.js";
 import {recordGoalCitations as recordGoalCitationsAsync} from "../task-store/async/async-events.js";
 import type { WorkflowWorkItemRow } from "../task-store/row-types.js";
 import { projectScopeFor, type DbTransaction } from "../postgres/data-layer.js";
+import { publishCommittedTaskJson } from "./task-row-mappers.js";
 
 export async function recordGoalCitationsImpl(store: TaskStore, inputs: GoalCitationInput[]): Promise<GoalCitation[]> {
         const layer = store.asyncLayer!;
@@ -87,8 +91,8 @@ export async function atomicWriteTaskJsonImpl2(
     /*
     FNXC:PostgresCutover 2026-07-10:
     Parity with the SQLite branch below: write ONLY the columns this update
-    actually changed (getChangedTaskColumns against the row read inside the
-    transaction), never a full-row upsert from the caller's snapshot. The
+    actually changed (planTaskRowWrite against the caller's read baseline),
+    never a full-row upsert from the caller's snapshot. The
     previous full-row upsert silently clobbered any column another writer
     committed between this caller's read and its write — the lost-update
     class behind triage's `status: "planning"` clear never taking effect
@@ -98,6 +102,8 @@ export async function atomicWriteTaskJsonImpl2(
     */
     await layer.transactionImmediate(async (tx) => {
       const persist = async () => {
+      // FNXC:TaskRowConcurrency 2026-10-07-21:40: serialize on the per-task key before the row read the merge decides against.
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
       const pgRow = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
       if (!pgRow || pgRow.deletedAt != null) {
         // Update-only path: never resurrect a soft-deleted row; a missing row
@@ -116,8 +122,15 @@ export async function atomicWriteTaskJsonImpl2(
       if (deletedAt) {
         store.throwSoftDeletedWriteBlocked(id, deletedAt, "atomicWriteTaskJson");
       }
-      const changedColumns = store.getChangedTaskColumns(existingRow, task);
+      /*
+      FNXC:TaskRowConcurrency 2026-10-07-21:40:
+      Diff against the caller's read baseline, not this live row, so columns another process committed after that read
+      are neither written back nor left stale in the caller's snapshot.
+      */
+      const plan = planTaskRowWrite(store, existingRow, task);
+      const changedColumns = plan.writeColumns;
       if (changedColumns.size === 0) {
+        adoptCommittedTaskRow(store, task, existingRow, plan);
         return;
       }
       const context = store.createTaskPersistSerializationContext(task, existingRow);
@@ -133,10 +146,12 @@ export async function atomicWriteTaskJsonImpl2(
       */
       const updateConds = [eq(schema.project.tasks.id, id)];
       if (layer.projectId) updateConds.push(eq(schema.project.tasks.projectId, layer.projectId));
-      await tx
+      const [committed] = await tx
         .update(schema.project.tasks)
         .set(setValues as never)
-        .where(and(...updateConds));
+        .where(and(...updateConds))
+        .returning();
+      adoptCommittedTaskRow(store, task, committed ? store.pgRowToTaskRow(committed as Record<string, unknown>) : existingRow, plan);
       };
       /*
       FNXC:WorkflowSerialization 2026-07-26-15:30:
@@ -152,7 +167,7 @@ export async function atomicWriteTaskJsonImpl2(
       }
       await options?.withinTransaction?.(tx);
     });
-    await store.writeTaskJsonFile(dir, task);
+    await publishCommittedTaskJson(store, dir, task);
     return;
 }
 
@@ -358,7 +373,7 @@ export async function getTaskColumnsImpl(store: TaskStore, ids: string[]): Promi
 
 export async function prepareWorkflowMovePolicyPreflightImpl(store: TaskStore, id: string, toColumn: ColumnId, options: MoveTaskOptions | undefined, internal: MoveTaskInternalOptions,): Promise<MoveTaskInternalOptions["movePolicyPreflight"]> {
     const task = await store.readTaskForMove(id);
-    const moveSource = options?.moveSource ?? "engine";
+    const moveSource = resolveMoveSource(options?.moveSource);
     /*
     FNXC:WorkflowColumns 2026-07-30-04:00 (U12 — flipped ATOMICALLY with moves.ts):
     The compatibility-flag gate is DELETED. This preflight computes the `movePolicyPreflight` that

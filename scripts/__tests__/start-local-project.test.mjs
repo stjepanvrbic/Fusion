@@ -76,11 +76,23 @@ test("pnpm launcher wraps a Windows .cmd shim found on PATH in cmd.exe with esca
   const env = { PATH: "C:\\Users\\me\\AppData\\Roaming\\npm", PATHEXT: ".EXE;.CMD", ComSpec: "C:\\Windows\\system32\\cmd.exe" };
   const launcher = resolvePnpmLauncher({ platform: "win32", env, isFile: files("C:\\Users\\me\\AppData\\Roaming\\npm\\pnpm.cmd") });
   assert.equal(launcher.kind, "cmd-shim");
+  assert.equal(launcher.command, "C:\\Users\\me\\AppData\\Roaming\\npm\\pnpm.cmd");
   const spec = pnpmSpawnSpec(launcher, ["exec", "tsx", "C:\\Temp\\a b\\register.mts"], env);
   assert.equal(spec.command, "C:\\Windows\\system32\\cmd.exe");
   assert.equal(spec.windowsVerbatimArguments, true);
   assert.deepEqual(spec.args.slice(0, 3), ["/d", "/s", "/c"]);
   assert.ok(spec.args[3].includes("pnpm.cmd"));
+});
+
+test("pnpm launcher never wraps pnpm in cmd.exe off Windows, even with a .cmd file on PATH", () => {
+  const env = { PATH: "/usr/local/bin:/opt/pnpm", PATHEXT: ".CMD" };
+  const launcher = resolvePnpmLauncher({ platform: "linux", env, isFile: () => true });
+  assert.equal(launcher.kind, "native");
+  assert.deepEqual(pnpmSpawnSpec(launcher, ["exec", "tsx", "/tmp/a b/register.mts"], env), {
+    command: "pnpm",
+    args: ["exec", "tsx", "/tmp/a b/register.mts"],
+    windowsVerbatimArguments: false,
+  });
 });
 
 test("pnpm launcher leaves a missing pnpm bare so the spawn reports ENOENT", () => {

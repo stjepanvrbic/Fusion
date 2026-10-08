@@ -236,7 +236,7 @@ describe("PrCommentHandler", () => {
           }),
         }),
       );
-      expect(mockStore.moveTask).toHaveBeenCalledWith("FN-001", "in-progress");
+      expect(mockStore.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", { moveSource: "engine", lifecycleReason: "code-review-revise-remediation", bypassGuards: false });
     });
 
     /*
@@ -283,7 +283,7 @@ describe("PrCommentHandler", () => {
         }),
       );
       // ...and the card returns to THIS board's wip lane, not the legacy id.
-      expect(mockStore.moveTask).toHaveBeenCalledWith("FN-001", RENAMED_VOCAB.wip);
+      expect(mockStore.moveTask).toHaveBeenCalledWith("FN-001", RENAMED_VOCAB.wip, { moveSource: "engine", lifecycleReason: "code-review-revise-remediation", bypassGuards: false });
       expect(mockStore.moveTask).not.toHaveBeenCalledWith("FN-001", "in-progress");
     });
 

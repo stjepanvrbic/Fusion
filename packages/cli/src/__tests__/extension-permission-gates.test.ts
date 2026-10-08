@@ -731,7 +731,7 @@ pgDescribe("extension tool permission gates", () => {
 
     const todoMove = moves.find((m) => m.to === "todo");
     expect(todoMove).toBeTruthy();
-    expect(todoMove?.requestedSource).toBeUndefined();
+    expect(todoMove?.requestedSource).toBe("operator");
     expect(todoMove?.workflowMoveSource).toBe("manual-retry");
     const retried = await h.store().getTask(task.id);
     expect(retried.column).toBe("todo");

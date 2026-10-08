@@ -1161,7 +1161,7 @@ async function finalizePullRequestMerge(
 ): Promise<void> {
   await cleanupMergedTaskArtifacts(cwd, task);
   await store.updateTask(task.id, { status: null, mergeRetries: 0 });
-  const movedTask = await store.moveTask(task.id, await resolveCompleteTargetForTask(store, task.id));
+  const movedTask = await store.moveTask(task.id, await resolveCompleteTargetForTask(store, task.id), { moveSource: "operator" });
   const mergedTask = movedTask ?? (await store.getTask(task.id));
   await store.logEntry(task.id, message, `PR #${prInfo.number}: ${prInfo.url}`);
   const settings = await store.getSettings();
@@ -1198,7 +1198,7 @@ async function finalizeNoOpMergeTask(
   const branch = task.branch ?? getTaskBranchName(task.id);
   await cleanupMergedTaskArtifacts(cwd, task);
   await store.updateTask(task.id, { status: null, mergeRetries: 0 });
-  const movedTask = await store.moveTask(task.id, await resolveCompleteTargetForTask(store, task.id));
+  const movedTask = await store.moveTask(task.id, await resolveCompleteTargetForTask(store, task.id), { moveSource: "operator" });
   const mergedTask = movedTask ?? (await store.getTask(task.id));
   await store.logEntry(task.id, reason, `Branch ${branch} has no commits relative to the base branch; nothing to merge.`);
   store.emit("task:merged", {

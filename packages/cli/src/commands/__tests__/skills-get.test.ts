@@ -2,10 +2,12 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { runSkillsGet } from "../skills-get.js";
 import { COMPUTER_USE_GUIDE_HEADINGS } from "../computer/guide.js";
+import { readOwnCliVersion } from "../../cli-version.js";
+import { isSkillsGetInvocation } from "../../../skills-get-route.mjs";
 
 const cliRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const builtCli = join(cliRoot, "bin.mjs");
@@ -76,11 +78,15 @@ describe("fn skills get", () => {
 
   it("prints a guide and version from the same built CLI entry point", async () => {
     const guide = await runBuiltCli(["skills", "get", "computer-use"]);
-    const version = await runBuiltCli(["--version"]);
+    /*
+     * FNXC:CliTests 2026-10-08-00:26:
+     * `fn --version` prints readOwnCliVersion resolved from the built dist entry; resolve it the same way in-process instead of paying a cold full-CLI start.
+     */
+    const version = readOwnCliVersion(pathToFileURL(join(cliRoot, "dist", "bin.js")).href);
     expect(guide).toMatchObject({ code: 0, signal: null });
-    expect(version).toMatchObject({ code: 0, signal: null });
+    expect(version).toMatch(/^\d+\.\d+\.\d+/);
     for (const heading of COMPUTER_USE_GUIDE_HEADINGS) expect(guide.stdout).toContain(heading);
-    expect(guide.stdout).toContain(`# Fusion computer-use guide (v${version.stdout.trim()})`);
+    expect(guide.stdout).toContain(`# Fusion computer-use guide (v${version})`);
 
     const unknown = await runBuiltCli(["skills", "get", "definitely-not-a-skill"]);
     const missing = await runBuiltCli(["skills", "get"]);
@@ -88,23 +94,31 @@ describe("fn skills get", () => {
     expect(missing).toMatchObject({ code: 1, signal: null, stderr: expect.stringContaining("computer-use") });
   });
 
-  it("preserves global flag precedence and validation for built guide requests", async () => {
-    const version = await runBuiltCli(["skills", "get", "computer-use", "--version"]);
-    expect(version).toMatchObject({ code: 0, signal: null });
-    expect(version.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+  /*
+   * FNXC:CliTests 2026-10-08-00:26:
+   * Global terminal flags and invalid global flag forms keep full CLI precedence over the lightweight guide entry.
+   * The launcher decides that route alone, so assert its routing predicate in-process; the full CLI's own --version, --help, and duplicate --project handling is covered in-process by bin.test.ts.
+   * Spawning three cold full-CLI processes here cost ~2s each on an idle host and exceeded the default 5s budget by construction (FN-9425 quarantine).
+   */
+  it("routes global terminal flags and invalid project flags to the full CLI", () => {
+    for (const flag of ["--version", "-v", "--help", "-h"]) {
+      expect(isSkillsGetInvocation(["skills", "get", "computer-use", flag])).toBe(false);
+      expect(isSkillsGetInvocation([flag, "skills", "get", "computer-use"])).toBe(false);
+    }
+    expect(isSkillsGetInvocation(["skills", "get", "computer-use", "--project", "one", "-P", "two"])).toBe(false);
+    expect(isSkillsGetInvocation(["skills", "get", "computer-use", "--project"])).toBe(false);
+    expect(isSkillsGetInvocation(["skills", "get", "computer-use", "-P", "--quiet"])).toBe(false);
+    expect(isSkillsGetInvocation(["skills", "list"])).toBe(false);
+    expect(isSkillsGetInvocation([])).toBe(false);
+  });
 
-    const help = await runBuiltCli(["skills", "get", "computer-use", "--help"]);
-    expect(help).toMatchObject({ code: 0, signal: null });
-    expect(help.stdout).toContain("fn — AI-orchestrated task board");
-
-    const duplicateProject = await runBuiltCli([
-      "skills", "get", "computer-use", "--project", "one", "-P", "two",
-    ]);
-    expect(duplicateProject).toMatchObject({
-      code: 1,
-      signal: null,
-      stderr: expect.stringContaining("Duplicate --project flag"),
-    });
+  it("routes plain and valid global-flag guide requests to the lightweight entry", () => {
+    expect(isSkillsGetInvocation(["skills", "get", "computer-use"])).toBe(true);
+    expect(isSkillsGetInvocation(["skills", "get"])).toBe(true);
+    expect(isSkillsGetInvocation(["--quiet", "skills", "get", "computer-use"])).toBe(true);
+    expect(isSkillsGetInvocation(["-q", "--skip-onboarding", "skills", "get", "computer-use"])).toBe(true);
+    expect(isSkillsGetInvocation(["skills", "get", "computer-use", "--project", "one"])).toBe(true);
+    expect(isSkillsGetInvocation(["-P", "one", "skills", "get", "computer-use"])).toBe(true);
   });
 
   it("finishes the built guide before cwd bootstrap configuration", async () => {

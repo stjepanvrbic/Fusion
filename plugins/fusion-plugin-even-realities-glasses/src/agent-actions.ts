@@ -376,7 +376,8 @@ export async function returnToAgent(input: AgentActionInput, deps: AgentActionDe
     assignedAgentId: null,
   });
       /* FNXC:GlassesAgentActions 2026-07-30-12:40: intentionally DEFAULT (engine) source: a user-source move to the hold lane parks the task userPaused, defeating the return-to-agent intent. */
-  await deps.taskStore.moveTask(taskId, returnTarget);
+  /* FNXC:LifecycleContainment 2026-10-07-21:40: the default is now spelled "operator": same guards and emitted source, no userPaused park, not an automatic move. */
+  await deps.taskStore.moveTask(taskId, returnTarget, { moveSource: "operator" });
   return toResult(deps.taskStore, taskId);
 }
 
@@ -452,7 +453,7 @@ export async function retryTask(input: AgentActionInput, deps: AgentActionDeps):
       nextRecoveryAt: null,
     });
       /* FNXC:GlassesAgentActions 2026-07-30-12:40: intentionally DEFAULT (engine) source: retry requeues for execution; a user source would userPaused-park the row. */
-    await deps.taskStore.moveTask(taskId, retryTarget);
+    await deps.taskStore.moveTask(taskId, retryTarget, { moveSource: "operator" });
     return toResult(deps.taskStore, taskId);
   }
 

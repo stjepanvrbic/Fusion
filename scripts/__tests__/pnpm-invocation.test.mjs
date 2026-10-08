@@ -73,32 +73,33 @@ test("the resolved invocation launches the installed pnpm on this host", () => {
 FNXC:WindowsPnpmLaunch 2026-10-07-19:30:
 Any command, not only pnpm, must launch on Windows the way a shell would resolve it: npm, gh and other tools ship as .cmd shims that spawn cannot execute without cmd.exe.
 */
-test("win32: a command found as a .cmd/.bat shim on PATH runs through cmd.exe by its full path", async () => {
-  const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = await import("node:fs");
-  const { join } = await import("node:path");
-  const { tmpdir } = await import("node:os");
-  const root = mkdtempSync(join(tmpdir(), "fusion-launch-"));
-  try {
-    const first = join(root, "first dir");
-    const second = join(root, "second");
-    mkdirSync(first);
-    mkdirSync(second);
-    writeFileSync(join(first, "npm.CMD"), "");
-    writeFileSync(join(second, "npm.EXE"), "");
-    writeFileSync(join(second, "gh.EXE"), "");
-    writeFileSync(join(second, "tool.BAT"), "");
-    const env = { Path: `${first};${second}`, PATHEXT: ".COM;.EXE;.BAT;.CMD" };
+const files = (...paths) => (candidate) => paths.some((path) => path.toLowerCase() === candidate.toLowerCase());
 
-    assert.deepEqual(resolveCommandInvocation("npm", ["whoami", "--registry=https://registry.npmjs.org/"], { platform: "win32", env }), {
-      command: "cmd.exe",
-      args: ["/d", "/s", "/c", `""${join(first, "npm.CMD")}" whoami --registry=https://registry.npmjs.org/"`],
-      windowsVerbatimArguments: true,
-    });
-    assert.deepEqual(resolveCommandInvocation("gh", ["--version"], { platform: "win32", env }), { command: "gh", args: ["--version"], windowsVerbatimArguments: false });
-    assert.equal(resolveCommandInvocation("tool", [], { platform: "win32", env }).windowsVerbatimArguments, true);
-    assert.deepEqual(resolveCommandInvocation("missing", ["x"], { platform: "win32", env }), { command: "missing", args: ["x"], windowsVerbatimArguments: false });
-  } finally {
-    rmSync(root, { recursive: true, force: true });
+test("win32: a command found as a .cmd/.bat shim on PATH runs through cmd.exe by its full path", () => {
+  const env = { Path: "C:\\Users\\me\\first dir;C:\\tools", PATHEXT: ".COM;.EXE;.BAT;.CMD" };
+  const isFile = files("C:\\Users\\me\\first dir\\npm.CMD", "C:\\tools\\npm.EXE", "C:\\tools\\gh.EXE", "C:\\tools\\tool.BAT");
+  const resolve = (command, args) => resolveCommandInvocation(command, args, { platform: "win32", env, isFile });
+
+  assert.deepEqual(resolve("npm", ["whoami", "--registry=https://registry.npmjs.org/"]), {
+    command: "cmd.exe",
+    args: ["/d", "/s", "/c", '""C:\\Users\\me\\first dir\\npm.CMD" whoami --registry=https://registry.npmjs.org/"'],
+    windowsVerbatimArguments: true,
+  });
+  assert.deepEqual(resolve("gh", ["--version"]), { command: "gh", args: ["--version"], windowsVerbatimArguments: false });
+  assert.deepEqual(resolve("tool", []), { command: "cmd.exe", args: ["/d", "/s", "/c", '"C:\\tools\\tool.BAT"'], windowsVerbatimArguments: true });
+  assert.deepEqual(resolve("missing", ["x"]), { command: "missing", args: ["x"], windowsVerbatimArguments: false });
+});
+
+test("non-win32: commands are never wrapped in cmd.exe, even with a .cmd shim on PATH", () => {
+  const env = { PATH: "/usr/local/bin:/opt/tools", PATHEXT: ".CMD" };
+  for (const platform of ["linux", "darwin"]) {
+    for (const command of ["npm", "gh", "pnpm"]) {
+      assert.deepEqual(resolveCommandInvocation(command, ["--version"], { platform, env, isFile: () => true }), {
+        command,
+        args: ["--version"],
+        windowsVerbatimArguments: false,
+      });
+    }
   }
 });
 
