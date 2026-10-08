@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 27, 32, 33, 35, 36, and 37): ten **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **21 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 32, 33, 35, 36, 37, and 38): eleven **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **21 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -475,6 +475,30 @@ No timeout, retry, or assertion changed, and the file is not quarantined because
 The error was `unable to open database file`, raised by SQLite when it cannot open a database path. In this file every case opens SQLite in its `beforeEach` through `setupCtx()`, which creates a `fusion-migrate-` directory under the system temp directory and then opens `fusion.db` and `archive.db` there in `buildPopulatedSqliteProject` and `buildPopulatedSqliteArchive`. Several cases also open `new DatabaseSync(sqlitePath)` inline. The same error class was recorded by the FN-6610 engine isolation rescue in `docs/testing.md`, where a redirected temp or `.fusion` parent vanished under package load; that is a known mode, not a diagnosis of these sightings. The file is also listed under `@fusion/core` in `scripts/lib/windows-known-failing-tests.json`, from the ledger's first recording (run 37678193811); ledger membership is a separate mechanism from this register.
 
 The operator designated the two transient observations as this file's single first-sighting record. No timeout, retry, or assertion changed, and the file is not quarantined. The next sighting is an immediate same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the inline `exclude` array of `packages/core/vitest.config.ts`, not another register line. That sighting should pin the run, commit, host OS, and failing case or hook.
+
+### 38. ModelOnboardingModal GitHub Copilot device-code panel clipboard auto-copy
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/dashboard/app/components/__tests__/ModelOnboardingModal.test.tsx`
+- **Exact test:** `ModelOnboardingModal > AI Setup step > renders github copilot device-code panel in onboarding`.
+- **Observed tree/SHA:** fork Full Suite (non-blocking) run [37777837004](https://github.com/stjepanvrbic/Fusion/actions/runs/37777837004/job/113313079385) at `a93f18c744be13653ec97e3f7e2e1fc5bcec7c10` (KB-037, Linux, `ubuntu-latest`), job `Test shard 3/4` (`113313079385`), command `@fusion/dashboard run test:quality:app:backfill-3`, project `dashboard-app-quality-backfill`. That commit changed docs, the root and dashboard `package.json` test-script wrappers (`test:app`, `test:api`, `test:deep`, `test:build`, none of which the backfill command uses), `scripts/run-with-env.mjs`, `scripts/test-with-lock.mjs`, and their script tests. It touched no onboarding or modal file and no file under `packages/dashboard/app`. The shard-3 job passed in the Full Suite runs for `5c3bbd44f` (37771841940), `5369d3747` (37775466262), `23049497f` (37778394023), `ce5dd1aac` (37778520119), and `072f02fa8` (37779214412).
+- **Observed frequency:** 1 failure, in a command that reported 6036 tests across 176 files (1 failed, 6035 passed).
+
+The failure was `AssertionError: expected "vi.fn()" to be called with arguments: [ 'ABCD-1234' ]` with `Number of calls: 0`, at `ModelOnboardingModal.test.tsx:1283`. The case awaits `findByText("ABCD-1234")` in the Copilot card, asserts the login-instructions block is absent and `window.open` was not called, and then reads the clipboard `writeText` mock once, synchronously. The panel had rendered, so `deviceCodes` state held the code, but the mock had no calls at that read.
+
+Hypothesis, not measured: the component copies the code from a passive effect keyed on `deviceCodes` (`ModelOnboardingModal.tsx` near line 908), which calls `copyTextToClipboard`. The test's only wait is for the rendered text, so on a starved shard the assertion can run before that effect's clipboard call is observable. This shares a shape with entries 32 and 34, where a test read a mock before the effect that feeds it had flushed. The mechanism is unmeasured for all three and is cited here only as a common shape.
+
+| run | result |
+|---|---|
+| Full Suite 37771841940 (`5c3bbd44f`), shard 3/4 | passed |
+| Full Suite 37775466262 (`5369d3747`), shard 3/4 | passed |
+| Full Suite 37777837004 (`a93f18c74`), shard 3/4 | **failed** (this case) |
+| Full Suite 37778394023 (`23049497f`), shard 3/4 | passed |
+| Full Suite 37778520119 (`ce5dd1aac`), shard 3/4 | passed |
+| Full Suite 37779214412 (`072f02fa8`), shard 3/4 | passed |
+| `pnpm exec vitest run app/components/__tests__/ModelOnboardingModal.test.tsx --project dashboard-app-quality-backfill --reporter=dot` in `packages/dashboard`, local Windows, `34a914125` | passed, 208 tests, 18.9 s wall (tests 12.1 s) |
+
+The local run did not reproduce the failure, so it neither confirms nor refutes the hypothesis. No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting and the file carries 207 other cases. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. A fix should wait on the clipboard call itself, by asserting on `writeText` inside `waitFor` as the later lines of the same case already do, rather than reading it once.
 
 ### Common shape and investigated result
 
