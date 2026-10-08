@@ -18,7 +18,7 @@ import {
   createPlanningContinuationRun,
   resolvePlanningContinuationCandidate,
 } from "../runtimes/in-process-runtime.js";
-import { projectAdmissionCoordinator } from "../concurrency/concurrency.js";
+import { projectAdmissionCoordinator, projectCapacityHoldersFromStore } from "../concurrency/concurrency.js";
 
 const IR = {
   version: "v2",
@@ -203,19 +203,44 @@ describe("rate-limit freeze automatic resume", () => {
     expect(env.logs.some((entry) => entry.message.includes("Automatic resume"))).toBe(false);
   });
 
-  it("lets operator Retry resume at any time and clears the automatic budget", async () => {
+  /*
+  FNXC:ExternalBlockResume 2026-10-08-12:10:
+  Operator Retry with a free running-agent slot admits synchronously and leaves the card unfrozen when it returns; at a full cap it
+  stays queued (covered by the admission test below). Both paths clear the automatic budget.
+  */
+  it("lets operator Retry resume at any time, unfreezing at once when a slot is free, and clears the automatic budget", async () => {
     const env = createStore([card("KB-048", { externalBlockAutoResumeCount: 3 })]);
     await park(env, "KB-048", "RATE_LIMIT");
     expect(env.rows.get("KB-048")!.externalBlock?.autoResume?.attempt).toBe(4);
 
     const result = await requestExternalBlockResume({ store: env.store as never, taskId: "KB-048", trigger: "operator" });
     expect(result).toMatchObject({ kind: "requested", nodeId: "implement" });
-    const requested = env.rows.get("KB-048")!;
-    expect(requested.externalBlockAutoResumeCount).toBe(0);
-    expect(requested.externalBlock?.autoResume).toBeUndefined();
-    expect(requested.externalBlock?.resumeRequest?.trigger).toBe("operator");
-    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-048", trigger: "operator" })).toMatchObject({ kind: "already-requested" });
+    const resumed = env.rows.get("KB-048")!;
+    expect(resumed.externalBlockAutoResumeCount).toBe(0);
+    expect(resumed.externalBlock).toBeUndefined();
+    expect(resumed.status).toBeUndefined();
+    expect(resumed.paused).toBe(false);
+    expect((await projectCapacityHoldersFromStore(env.store as never, [resumed])).runningTaskIds).toEqual(["KB-048"]);
+    // The bridging reservation was handed to the now-live row, not leaked.
+    expect(projectAdmissionCoordinator.inspectProjectStateForTests("/project").reservedCount).toBe(0);
+    expect(env.audits.find((event) => event.mutationType === "task:external-block-cleared")!.metadata).toMatchObject({ trigger: "operator" });
+    // A second click finds the resume continuation pending and replays nothing.
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-048", trigger: "operator" })).toEqual({ kind: "not-blocked", resumePending: true });
     expect(env.items).toHaveLength(1);
+  });
+
+  it("keeps operator Retry queued at a full running-agent cap", async () => {
+    const running = ["KB-001", "KB-002", "KB-003", "KB-004", "KB-005", "KB-006"].map((id) => card(id));
+    const env = createStore([...running, card("KB-047")]);
+    await park(env, "KB-047", "RATE_LIMIT");
+
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-047", trigger: "operator" })).toMatchObject({ kind: "requested" });
+    const queued = env.rows.get("KB-047")!;
+    expect(queued.status).toBe("blocked");
+    expect(queued.externalBlock?.resumeRequest?.trigger).toBe("operator");
+    expect(isRunningAgentTask(queued)).toBe(false);
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-047", trigger: "operator" })).toMatchObject({ kind: "already-requested" });
+    expect(projectAdmissionCoordinator.inspectProjectStateForTests("/project").reservedCount).toBe(0);
   });
 
   it("lets operator Retry take over a pending automatic resume without publishing a second continuation", async () => {
@@ -225,8 +250,9 @@ describe("rate-limit freeze automatic resume", () => {
     await resumeDueExternalBlocks({ store: env.store as never, tasks: [env.rows.get("KB-049")!] });
     expect(env.rows.get("KB-049")!.externalBlockAutoResumeCount).toBe(3);
 
-    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-049", trigger: "operator" })).toMatchObject({ kind: "requested" });
-    expect(env.rows.get("KB-049")!.externalBlock?.resumeRequest?.trigger).toBe("operator");
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-049", trigger: "operator" })).toMatchObject({ kind: "requested", nodeId: "implement" });
+    // A free slot lets the operator's takeover unfreeze the card at once, on the already-published continuation.
+    expect(env.rows.get("KB-049")!.externalBlock).toBeUndefined();
     expect(env.rows.get("KB-049")!.externalBlockAutoResumeCount).toBe(0);
     expect(env.items).toHaveLength(1);
   });
