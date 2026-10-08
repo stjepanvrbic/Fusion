@@ -27,6 +27,8 @@ import { runHoldReleaseSweep } from "../../execution/hold-release.js";
 import { SelfHealingManager } from "../../self-healing.js";
 import { Scheduler } from "../../scheduler.js";
 import { reconcileRecovery } from "../../recovery-reconciler.js";
+import { admitPlanningContinuation, createPlanningContinuationRun } from "../../runtimes/in-process-runtime.js";
+import { isExternalBlockResumeWorkItem } from "../../external-block/external-block-lifecycle.js";
 import { createPipelineClock, type PipelineClock } from "./_pipeline-clock.js";
 import { createPipelineGitFixture, createPipelineWorkspaceFixture, type PipelineGitFixture } from "./_pipeline-git-fixture.js";
 import { createPipelineNoAiGuard, type PipelineNoAiGuard } from "./_pipeline-no-ai-guard.js";
@@ -703,9 +705,19 @@ export class PipelineSmokeHarness {
   }
 
   async assertExternalBlockReplay(task: PipelineTaskSeed, expectedStatus: "blocked" | "resumed"): Promise<void> {
-    const live = await this.freshTask(task.id);
-    const worktree = await this.requireTaskWorktree(task.id);
-    const before = this.externalBlockBindings.get(task.id);
+    const live = await this.assertRetainedExternalBlockWork(task.id);
+    if (expectedStatus === "blocked") {
+      if (live.status !== "blocked" || live.externalBlock?.code !== "ENOSPC") throw new Error("S21: external obstacle is not durably readable.");
+    } else if (live.status === "blocked" || live.externalBlock) {
+      throw new Error("S21: dashboard Retry did not clear the external block.");
+    }
+  }
+
+  /** Shared S21 retention checks: five proof commits, step progress, and the worktree binding survive every recovery phase. */
+  private async assertRetainedExternalBlockWork(taskId: string): Promise<Task> {
+    const live = await this.freshTask(taskId);
+    const worktree = await this.requireTaskWorktree(taskId);
+    const before = this.externalBlockBindings.get(taskId);
     if (!before) throw new Error("S21: missing pre-recovery worktree binding snapshot.");
     if (!before.baseCommitSha) throw new Error("S21: missing pre-block acquisition base commit.");
     const commitCount = Number(git(worktree, ["rev-list", "--count", `${before.baseCommitSha}..HEAD`]));
@@ -713,7 +725,7 @@ export class PipelineSmokeHarness {
     if (live.steps.slice(0, 6).some((step) => step.status !== "done") || live.steps[6]?.status !== "in-progress" || live.currentStep !== 6) {
       throw new Error("S21: completed or interrupted step progress changed across external block recovery.");
     }
-    const holders = this.wireExecutor().listWorktreeHolders().filter((holder) => holder.taskId === task.id);
+    const holders = this.wireExecutor().listWorktreeHolders().filter((holder) => holder.taskId === taskId);
     if (
       JSON.stringify(holders) !== JSON.stringify(before.holders)
       || live.worktree !== before.worktree
@@ -722,18 +734,78 @@ export class PipelineSmokeHarness {
     ) {
       throw new Error("S21: external block recovery detached the task worktree binding.");
     }
-    if (expectedStatus === "blocked") {
-      if (live.status !== "blocked" || live.externalBlock?.code !== "ENOSPC") throw new Error("S21: external obstacle is not durably readable.");
-    } else if (live.status === "blocked" || live.externalBlock) {
-      throw new Error("S21: dashboard Retry did not clear the external block.");
-    }
+    return live;
   }
 
+  /*
+  FNXC:ExternalBlockPipeline 2026-10-08-16:14:
+  Since #60 (bfe6023d4) dashboard Retry only queues the resume: it publishes a runnable external-block resume continuation and records
+  an operator `resumeRequest` while the freeze stays raised, so a frozen card never holds a running-agent slot it has not been granted.
+  S21 therefore proves the queued phase here and leaves the clear to `admitExternalBlockResume`.
+  */
   async resumeExternalBlockReplay(taskId: string): Promise<void> {
     const { resumeExternallyBlockedTask } = await import("../../../../dashboard/src/routes/task-external-block-resume.js");
     const result = await resumeExternallyBlockedTask({ store: this.store, taskId });
     if (result.kind !== "resumed" || result.nodeId !== "steps") {
       throw new Error("S21: dashboard Retry did not arm the interrupted verification node.");
+    }
+    const queued = await this.assertRetainedExternalBlockWork(taskId);
+    if (queued.status !== "blocked" || queued.externalBlock?.code !== "ENOSPC") {
+      throw new Error("S21: dashboard Retry cleared the external block before project admission.");
+    }
+    if (queued.externalBlock.resumeRequest?.trigger !== "operator") {
+      throw new Error("S21: dashboard Retry did not record an operator resume request.");
+    }
+    const resumeItems = (await this.store.listWorkflowWorkItemsForTask(taskId))
+      .filter((item) => item.state === "runnable" && isExternalBlockResumeWorkItem(item) && item.nodeId === "steps");
+    if (resumeItems.length !== 1) {
+      throw new Error(`S21: dashboard Retry published ${resumeItems.length} runnable resume continuations at steps, expected exactly one.`);
+    }
+  }
+
+  /*
+  FNXC:ExternalBlockPipeline 2026-10-08-16:14:
+  The freeze clears only inside the admitted continuation run (`createPlanningContinuationRun` under `admitPlanningContinuation`), the same
+  composition the production drain uses. `execute` only records the task it receives: running the graph would change the step progress
+  and parked terminal S21 asserts. The run promise is captured from `dispatch` and awaited directly, with no polling or timers.
+  */
+  async admitExternalBlockResume(taskId: string): Promise<void> {
+    const task = await this.freshTask(taskId);
+    const item = (await this.store.listWorkflowWorkItemsForTask(taskId))
+      .find((candidate) => candidate.state === "runnable" && isExternalBlockResumeWorkItem(candidate) && candidate.nodeId === "steps");
+    if (!item) throw new Error("S21: no runnable resume continuation to admit.");
+    const executed: Task[] = [];
+    const run = createPlanningContinuationRun({
+      store: this.store,
+      execute: async (runTask) => { executed.push(runTask); },
+    });
+    let runPromise: Promise<void> | undefined;
+    const admitted = await admitPlanningContinuation({
+      store: this.store,
+      projectId: this.store.getRootDir(),
+      task,
+      item,
+      dispatch: () => (runPromise = run(task, item)),
+    });
+    if (!admitted) throw new Error("S21: project admission refused the resumed external-block continuation.");
+    if (!runPromise) throw new Error("S21: project admission did not dispatch the resumed external-block continuation.");
+    await runPromise;
+    if (executed.length !== 1) throw new Error(`S21: admitted resume executed ${executed.length} times, expected once.`);
+    if (executed[0]!.status === "blocked" || executed[0]!.externalBlock) {
+      throw new Error("S21: admitted resume re-entered the graph before the external block was cleared.");
+    }
+    const cleared = await this.freshTask(taskId);
+    if (!cleared.log?.some((entry) => entry.action.includes("External block cleared by operator Retry; resuming workflow at steps"))) {
+      throw new Error("S21: admitted resume did not log the operator clear.");
+    }
+    const audits = await this.store.getRunAuditEventsAsync({ taskId });
+    const clearedAudit = audits.find((event) => event.mutationType === "task:external-block-cleared");
+    if (
+      clearedAudit?.metadata?.code !== "ENOSPC"
+      || clearedAudit.metadata.resumeNodeId !== "steps"
+      || clearedAudit.metadata.trigger !== "operator"
+    ) {
+      throw new Error("S21: admitted resume did not audit task:external-block-cleared for the operator Retry.");
     }
   }
 

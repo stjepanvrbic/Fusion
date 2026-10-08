@@ -14,7 +14,7 @@ applies_when: A task stops because infrastructure outside its worktree is unavai
 
 ## Decision
 
-An obstacle outside a task worktree becomes durable `blocked` state only when the shared classifier recognizes a conservative host-resource, network, model-provider, or credential cause. A classified block is not failure, replan, or operator pause: the task retains its column, step state, worktree, branch, capacity slot, and file-scope lease, while Dashboard Retry clears only the block and resumes the recorded workflow node.
+An obstacle outside a task worktree becomes durable `blocked` state only when the shared classifier recognizes a conservative host-resource, network, model-provider, or credential cause. A classified block is not failure, replan, or operator pause: the task retains its column, step state, worktree, branch, and file-scope lease, but holds no running-agent slot (its retained checkout still counts toward `maxWorktrees`). Dashboard Retry (or a due `RATE_LIMIT` automatic resume) only records `externalBlock.resumeRequest` and publishes a resume continuation at the recorded workflow node; the freeze clears when project admission grants that resumed run a slot (`clearExternalBlockForAdmittedResume` inside `createPlanningContinuationRun`).
 
 FN-243 corrected the broader agent-declaration route: `outside-worktree` alone no longer authorizes a freeze. An unclassified cause is returned to the executor without lifecycle mutation to resolve it, substitute a runnable check, or complete achievable work and record the deferred check as non-blocking. Internal defects—code, tests, type errors, merge conflicts, planning gaps, and review revisions—remain owned by the existing AI remediation paths. Dependencies and file overlap remain waiting states.
 
