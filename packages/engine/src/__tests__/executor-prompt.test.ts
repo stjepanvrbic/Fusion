@@ -9,6 +9,7 @@ import { createFnAgent } from "../pi.js";
 import { reviewStep as mockedReviewStepFn } from "../execution/reviewer.js";
 import { execSync } from "node:child_process";
 import { writeFile, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { findWorktreeUser, aiMergeTask } from "../merger.js";
 import { resolveWorktreesDirLayout, type Task, type TaskDetail } from "@fusion/core";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -39,12 +40,77 @@ import {
 const mockedReviewStep = vi.mocked(mockedReviewStepFn);
 
 /* FNXC:EngineTests 2026-08-09-05:51: Graph-owned execution fails closed before session creation when a test omits agentStore, so every executor harness must route through the durable fixture unless a test explicitly overrides it. */
+/*
+FNXC:ExecutorPauseResumeQuarantine 2026-10-08-06:34:
+KB-048 root cause of the FN-9510 quarantine: tests fired a resume through task:updated and then slept a fixed wall-clock window, so a cold or loaded worker had not reached createFnAgent yet (0 agent creations), while executors from earlier tests kept running past their test (fire-and-forget execute, in-place retry timers) and created agents inside the next test.
+Every harness executor therefore records its dispatches and runs; tests await that work instead of sleeping, and the file-wide afterEach drains it (cancelling pending in-place retry timers) so no run outlives the test that started it.
+*/
+const harnessExecutors = new Set<TaskExecutor>();
+const inflightExecutorWork = new Set<Promise<unknown>>();
+
+function trackExecutorWork<T>(work: Promise<T>): Promise<T> {
+  inflightExecutorWork.add(work);
+  void work.then(
+    () => inflightExecutorWork.delete(work),
+    () => inflightExecutorWork.delete(work),
+  );
+  return work;
+}
+
+const trackedListenerStores = new WeakSet<object>();
+
+/** Track every store listener invocation so fire-and-forget `_trigger` work is drained too. */
+function trackStoreListeners(store: any): void {
+  const register = store?.on?.getMockImplementation?.();
+  if (!register || trackedListenerStores.has(store)) return;
+  trackedListenerStores.add(store);
+  store.on.mockImplementation((event: string, listener: (...args: unknown[]) => unknown) =>
+    register(event, (...args: unknown[]) => trackExecutorWork(Promise.resolve(listener(...args)))));
+}
+
 function createRoutingExecutor(store: any, rootDir: string, options: any = {}) {
-  return new TaskExecutor(store, rootDir, {
+  trackStoreListeners(store);
+  const executor = new TaskExecutor(store, rootDir, {
     agentStore: createWorkflowRoutingAgentStore(store).agentStore,
     ...options,
   });
+  // Deps bags resolve host methods by name at call time, so instance wrappers observe internal dispatches too.
+  const host = executor as any;
+  const execute = host.execute.bind(executor);
+  host.execute = (task: Task) => trackExecutorWork(execute(task));
+  const dispatchUnpauseResume = host.dispatchUnpauseResume.bind(executor);
+  host.dispatchUnpauseResume = (task: Task, dispatchOptions?: unknown) =>
+    trackExecutorWork(dispatchUnpauseResume(task, dispatchOptions));
+  harnessExecutors.add(executor);
+  return executor;
 }
+
+function cancelPendingInPlaceRetries(): void {
+  for (const executor of harnessExecutors) {
+    const timers = (executor as any).inPlaceExecutionResumeTimers as Map<string, ReturnType<typeof setTimeout>>;
+    for (const handle of timers.values()) clearTimeout(handle);
+    timers.clear();
+  }
+}
+
+/** Await every dispatch and run the harness executors started, including runs those runs start. */
+async function settleExecutorWork(): Promise<void> {
+  while (inflightExecutorWork.size > 0) {
+    await Promise.allSettled([...inflightExecutorWork]);
+  }
+}
+
+/** Teardown: cancel pending in-place retries and wait until no harness run remains in flight. */
+async function drainExecutorWork(): Promise<void> {
+  cancelPendingInPlaceRetries();
+  while (inflightExecutorWork.size > 0) {
+    await Promise.allSettled([...inflightExecutorWork]);
+    cancelPendingInPlaceRetries();
+  }
+  harnessExecutors.clear();
+}
+
+afterEach(drainExecutorWork);
 
 function createMockTaskDetail(overrides: Partial<TaskDetail> = {}): TaskDetail {
   return {
@@ -799,14 +865,33 @@ Drain those in-flight runs between tests, then clear the registries, so each cas
 const processWideGraphRouting = () =>
   (TaskExecutor as unknown as { processWideGraphRouting: Set<string> }).processWideGraphRouting;
 
+/*
+FNXC:ExecutorPauseResumeQuarantine 2026-10-08-06:34:
+KB-048 replaced the 3s wall-clock poll here: under shard load a run could outlive it, keep its process-wide owner, and make the next same-id dispatch drop as a duplicate. Draining the tracked runs is deterministic, so a drained test must leave no process-wide graph-routing owner behind.
+*/
 async function settleLeakedBackgroundRuns(): Promise<void> {
-  const deadline = Date.now() + 3000;
-  while (processWideGraphRouting().size > 0 && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 10));
-  }
+  await drainExecutorWork();
+  const leakedOwners = [...processWideGraphRouting()];
   processWideGraphRouting().clear();
   executingTaskLock._clearForTest();
+  expect(leakedOwners).toEqual([]);
 }
+
+/** Task-log lines written for one task, in order. */
+function taskLogMessages(store: any, taskId: string): string[] {
+  return store.logEntry.mock.calls
+    .filter(([id]: [string]) => id === taskId)
+    .map(([, message]: [string, string]) => message);
+}
+
+/*
+FNXC:ExecutorPauseResumeQuarantine 2026-10-08-06:34:
+PR #32 (FN-207 lifecycle containment) landed while this file was quarantined: a pause teardown no longer moves the WIP card back to todo. It retries in place through requeueExecutionInPlace, which arms the per-task in-place resume timer, and the pause flags decide whether that timer re-dispatches or the card waits for an explicit unpause.
+KB-048 refreshed the pause fixtures to state that contract: the row is paused in the store when the pause event fires, no moveTask is issued, and the in-place requeue is observable in the task log.
+*/
+const PAUSE_PARKED_IN_PLACE = "Execution paused — agent terminated, parked in place (pause preserved, awaiting explicit unpause)";
+const PAUSE_RESUMING_IN_PLACE = "Execution paused — agent terminated, resuming in place";
+const PAUSE_SESSION_PRESERVED_IN_PLACE = "Execution paused — session preserved for resume in place";
 
 describe("TaskExecutor pause behavior", () => {
   beforeEach(() => {
@@ -822,7 +907,7 @@ describe("TaskExecutor pause behavior", () => {
 
   afterEach(settleLeakedBackgroundRuns);
 
-  it("terminates agent and moves task to todo when paused during execution", async () => {
+  it("terminates agent and parks the paused task in place when paused during execution", async () => {
     const store = createMockStore();
     const disposeFn = vi.fn();
 
@@ -830,7 +915,8 @@ describe("TaskExecutor pause behavior", () => {
       return {
         session: {
           prompt: vi.fn().mockImplementation(async () => {
-            // Simulate pause happening during agent execution
+            // Simulate pause happening during agent execution; the store row carries the pause.
+            store._setRow("FN-001", { paused: true });
             store._trigger("task:updated", { id: "FN-001", paused: true, column: "in-progress" });
             // Simulate the dispose causing an error (session terminated)
             throw new Error("Session terminated");
@@ -854,21 +940,24 @@ describe("TaskExecutor pause behavior", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    // Should move to todo, NOT mark as failed.
-    // FNXC:ExecutorMoveTaskOptions 2026-07-12: executor.ts:11622-11625 now always passes a moveTask options object built from conditional spreads.
     /*
     FNXC:EngineTests 2026-07-23-21:40 (FN-8464 / #2403):
-    A pause-abort bounce to todo preserves resume state ONLY when the run recorded resumable
-    progress (currentStep > 0 or a step marked done/in-progress). A FRESH task's first
-    implementation pass now OWNS the step projection: `runProjectedGraphTaskStep` defers the
-    atomic `startStep` in-progress write until the task has a real worktree (FN-8464 baseline
-    cwd gating) and #2403 routed step starts through the dependency-gated `store.startStep`.
-    A pause landing during that first session therefore finds every step still `pending`,
-    so the bounce carries no `preserveResumeState` — the conditional spreads collapse to `{}`.
-    The protective intent is unchanged: pause parks in todo and never marks the task failed.
+    A pause-abort keeps resume state ONLY when the run recorded resumable progress (currentStep > 0 or
+    a step marked done/in-progress). A FRESH task's first implementation pass finds every step still
+    `pending`, so the teardown also drops the branch pointer along with the worktree.
+
+    FNXC:ExecutorPauseResumeQuarantine 2026-10-08-06:34:
+    Since PR #32 the teardown stays in the WIP lane (no moveTask) and, because the pause is still in
+    force on the row, parks awaiting an explicit unpause. It never marks the task failed.
     */
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", {});
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(taskLogMessages(store, "FN-001")).toContain(PAUSE_PARKED_IN_PLACE);
+    expect(store.updateTask.mock.calls.some(
+      ([id, patch]: [string, Record<string, unknown>]) =>
+        id === "FN-001" && "worktree" in patch && patch.worktree === undefined && "branch" in patch && patch.branch === undefined,
+    )).toBe(true);
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: "failed" });
+    expect(disposeFn).toHaveBeenCalled();
   });
 
   it("does not move to in-review when paused during execution (graceful session end)", async () => {
@@ -902,14 +991,13 @@ describe("TaskExecutor pause behavior", () => {
 
     // Should NOT move to in-review (paused tasks skip that logic)
     expect(store.moveTask).not.toHaveBeenCalledWith("FN-001", "in-review");
-    // Should move to todo instead (regression: was stranding in in-progress).
-    // Pause-graceful path flags preserveResumeState so the bounce keeps
-    // the worktree and accumulated step progress.
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveResumeState: true });
+    // FN-207/PR #32: the graceful pause exit keeps the session for an in-place resume instead of a backward move.
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(taskLogMessages(store, "FN-001")).toContain(PAUSE_SESSION_PRESERVED_IN_PLACE);
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: "failed" });
   });
 
-  it("moves paused task to todo when session ends gracefully (regression for FN-827)", async () => {
+  it("arms an in-place resume for a paused task when session ends gracefully (regression for FN-827)", async () => {
     const store = createMockStore();
     const disposeFn = vi.fn();
 
@@ -942,14 +1030,14 @@ describe("TaskExecutor pause behavior", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    // The critical fix: task must end in todo, not stranded in in-progress.
-    // The pause path must also flag preserveResumeState so the move does not
-    // wipe accumulated step progress and the worktree pointer.
-    expect(store.moveTask).toHaveBeenCalledWith("FN-805", "todo", { preserveResumeState: true });
+    // The critical fix: the task must not be stranded. Since FN-207/PR #32 it is not moved backward;
+    // it stays in its WIP lane with an in-place resume armed (the timer's fire-time read honors the pause).
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect((executor as any).inPlaceExecutionResumeTimers.has("FN-805")).toBe(true);
     // Should NOT be marked as failed
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-805", expect.objectContaining({ status: "failed" }));
     // Should log the pause event
-    expect(store.logEntry).toHaveBeenCalledWith("FN-805", expect.stringContaining("Execution paused"));
+    expect(taskLogMessages(store, "FN-805")).toContain(PAUSE_SESSION_PRESERVED_IN_PLACE);
     // Session should be disposed
     expect(disposeFn).toHaveBeenCalled();
     // Stuck detector should have untracked the task
@@ -991,12 +1079,10 @@ describe("TaskExecutor pause behavior", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    // The task should still be moved to todo exactly once (the pause took effect)
+    // The pause still takes effect exactly once: one in-place requeue, never a backward move (FN-207/PR #32).
     // Even if unpause happened rapidly, the session was already disposed
-    const todoCalls = store.moveTask.mock.calls.filter(
-      (call: any[]) => call[0] === "FN-001" && call[1] === "todo",
-    );
-    expect(todoCalls.length).toBe(1);
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-001", "todo", expect.anything());
+    expect(taskLogMessages(store, "FN-001").filter((message) => message === PAUSE_SESSION_PRESERVED_IN_PLACE)).toHaveLength(1);
     // Should NOT have duplicate in-review calls
     const inReviewCalls = store.moveTask.mock.calls.filter(
       (call: any[]) => call[0] === "FN-001" && call[1] === "in-review",
@@ -1061,7 +1147,7 @@ describe("TaskExecutor pause behavior", () => {
 
     // Simulate unpause of an in-progress task that has no active session
     // (e.g., engine restarted while task was paused in-progress)
-    store._trigger("task:updated", {
+    await store._triggerAsync("task:updated", {
       id: "FN-001",
       paused: undefined,
       column: "in-progress",
@@ -1075,13 +1161,70 @@ describe("TaskExecutor pause behavior", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    // Wait for async execution to start
-    await new Promise((r) => setTimeout(r, 50));
+    // Await the resumed run itself; a fixed wall-clock window was the FN-9510 flake (KB-048).
+    await settleExecutorWork();
 
     // Agent created at least twice: initial resume + retry when agent finishes without fn_task_done
     // (async worktree validation may allow additional retry cycles within the timeout)
     expect(mockedCreateFnAgent.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(store.logEntry).toHaveBeenCalledWith("FN-001", "Resuming execution after unpause", undefined, undefined);
+  });
+
+  /*
+  FNXC:ExecutorPauseResumeQuarantine 2026-10-08-06:34:
+  KB-048 regression scenarios for the FN-9510 flake. The hosted failure was a resume chain that had not reached createFnAgent when a fixed 50 ms sleep ended (reproduced by delaying getSettings past that window), and a harness drain that returned before a leaked run finished. Both scenarios fail with the pre-KB-048 sleep/poll and pass with tracked-work settling.
+  */
+  const unpausedInProgressTask = () => ({
+    id: "FN-001",
+    paused: undefined,
+    column: "in-progress",
+    description: "Test task",
+    title: "Resumed task",
+    dependencies: [],
+    steps: [],
+    currentStep: 0,
+    log: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  it("observes the unpause resume when a resume-chain collaborator outlasts the old 50 ms window", async () => {
+    const store = createMockStore();
+    mockedCreateFnAgent.mockImplementation(async () => ({
+      session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn() },
+    }) as any);
+    // A loaded shard: the pause-label settings read on the resume chain resolves after the old fixed window.
+    const settings = store.getSettings.getMockImplementation()!;
+    store.getSettings.mockImplementationOnce(async (...args: unknown[]) => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return settings(...args);
+    });
+
+    createRoutingExecutor(store, "/tmp/test");
+    await store._triggerAsync("task:updated", unpausedInProgressTask());
+    await settleExecutorWork();
+
+    expect(mockedCreateFnAgent.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(store.logEntry).toHaveBeenCalledWith("FN-001", "Resuming execution after unpause", undefined, undefined);
+  });
+
+  it("drains a resume left in flight so it cannot leak into the next test", async () => {
+    const store = createMockStore();
+    mockedCreateFnAgent.mockImplementation(async () => ({
+      session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn() },
+    }) as any);
+
+    const executor = createRoutingExecutor(store, "/tmp/test");
+    // Fire-and-forget, as the pre-KB-048 tests did: the listener has not claimed any owner yet.
+    store._trigger("task:updated", unpausedInProgressTask());
+    await drainExecutorWork();
+
+    // The drain awaited the whole resumed run rather than returning while it was still in flight.
+    expect(store.logEntry).toHaveBeenCalledWith("FN-001", "Resuming execution after unpause", undefined, undefined);
+    expect(mockedCreateFnAgent.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(processWideGraphRouting().size).toBe(0);
+    expect(executor.isTaskActive("FN-001")).toBe(false);
+    expect((executor as any).inPlaceExecutionResumeTimers.size).toBe(0);
   });
 
   it("does not resume unpaused in-progress task while global pause is active", async () => {
@@ -1104,7 +1247,7 @@ describe("TaskExecutor pause behavior", () => {
 
     const executor = createRoutingExecutor(store, "/tmp/test");
 
-    store._trigger("task:updated", {
+    await store._triggerAsync("task:updated", {
       id: "FN-001",
       paused: undefined,
       column: "in-progress",
@@ -1118,7 +1261,8 @@ describe("TaskExecutor pause behavior", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    await new Promise((r) => setTimeout(r, 20));
+    // The listener and its dispatch decision are awaited, so the negative assertions cannot pass vacuously.
+    await settleExecutorWork();
 
     expect(executor).toBeTruthy();
     expect(mockedCreateFnAgent).not.toHaveBeenCalled();
@@ -1152,14 +1296,15 @@ describe("TaskExecutor pause behavior", () => {
     store.logEntry.mockImplementation(async (_id: string, action: string) => {
       if (action === "Resuming execution after unpause" && !emittedUpdateFromLog) {
         emittedUpdateFromLog = true;
-        store._trigger("task:updated", { ...task, updatedAt: new Date().toISOString() });
+        // Track the nested listener so settling observes the re-entrant dispatch it triggers.
+        void trackExecutorWork(store._triggerAsync("task:updated", { ...task, updatedAt: new Date().toISOString() }));
       }
     });
 
     createRoutingExecutor(store, "/tmp/test");
-    store._trigger("task:updated", task);
+    await store._triggerAsync("task:updated", task);
 
-    await new Promise((r) => setTimeout(r, 50));
+    await settleExecutorWork();
 
     const resumeLogCalls = store.logEntry.mock.calls.filter(
       ([id, action]: [string, string]) => id === "FN-001" && action === "Resuming execution after unpause",
@@ -1179,7 +1324,7 @@ describe("TaskExecutor pause behavior", () => {
 
     const _executor = createRoutingExecutor(store, "/tmp/test");
 
-    store._trigger("task:updated", {
+    await store._triggerAsync("task:updated", {
       id: "FN-001",
       paused: undefined,
       column: "in-progress",
@@ -1196,7 +1341,7 @@ describe("TaskExecutor pause behavior", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    await new Promise((r) => setTimeout(r, 30));
+    await settleExecutorWork();
 
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: null, error: null });
     expect(store.logEntry).not.toHaveBeenCalledWith("FN-001", "Resuming execution after unpause", undefined, undefined);
@@ -1240,14 +1385,13 @@ describe("TaskExecutor pause behavior", () => {
     mockedCreateFnAgent.mockImplementation(async () => ({
       session: {
         prompt: vi.fn().mockImplementation(async () => {
-          // Simulate rapid unpause during execution — should NOT start a second run
-          store._trigger("task:updated", {
+          // Simulate rapid unpause during execution — should NOT start a second run.
+          // Await the listener so its dispatch decision is made while this session is live.
+          await store._triggerAsync("task:updated", {
             id: "FN-001",
             paused: undefined,
             column: "in-progress",
           });
-          // Wait a bit to let the unpause handler run
-          await new Promise((r) => setTimeout(r, 10));
         }),
         dispose: disposeFn,
       },
@@ -1285,13 +1429,13 @@ describe("TaskExecutor pause behavior", () => {
     const _executor = createRoutingExecutor(store, "/tmp/test");
 
     // Unpause a todo task — executor should NOT try to execute it
-    store._trigger("task:updated", {
+    await store._triggerAsync("task:updated", {
       id: "FN-001",
       paused: undefined,
       column: "todo",
     });
 
-    await new Promise((r) => setTimeout(r, 20));
+    await settleExecutorWork();
 
     // No agent should have been created
     expect(mockedCreateFnAgent).not.toHaveBeenCalled();
@@ -1308,12 +1452,11 @@ describe("TaskExecutor pause behavior", () => {
       session: {
         prompt: vi.fn().mockImplementation(async () => {
           // Simulate unpause while session is still active (should be a no-op)
-          store._trigger("task:updated", {
+          await store._triggerAsync("task:updated", {
             id: "FN-001",
             paused: undefined,
             column: "in-progress",
           });
-          await new Promise((r) => setTimeout(r, 10));
         }),
         dispose: disposeFn,
       },
@@ -1369,7 +1512,7 @@ describe("TaskExecutor pause behavior", () => {
 
     // FNXC:WorktreeLayout 2026-09-04-04:35: FN-268 moved new task worktrees beneath .fusion/worktrees; derive the expected root from the production resolver so this assertion tracks the authoritative layout contract.
     expect(mockedSessionManager.create).toHaveBeenCalledWith(
-      `${resolveWorktreesDirLayout("/tmp/test", undefined)}/fn-001`,
+      join(resolveWorktreesDirLayout("/tmp/test", undefined), "fn-001"),
     );
     expect(mockedSessionManager.open).not.toHaveBeenCalled();
 
@@ -1479,9 +1622,9 @@ describe("TaskExecutor pause behavior", () => {
     );
     expect(clearCalls.length).toBe(0);
 
-    // Task should be moved to todo (ready for resume) with preserveResumeState
-    // so step progress and the worktree survive the pause→unpause hop.
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveResumeState: true });
+    // The task stays in its WIP lane with the session preserved for an in-place resume (FN-207/PR #32).
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(taskLogMessages(store, "FN-001")).toContain(PAUSE_SESSION_PRESERVED_IN_PLACE);
   });
 
   it("falls back to fresh session when sessionFile no longer exists on disk", async () => {
@@ -1624,7 +1767,7 @@ describe("swallowed async store failure observability", () => {
     completely: only its canonical path exists and the registered-worktree probe proves the expected
     branch, rather than using a blanket existence override that would weaken FN-258's empty-probe refusal.
     */
-    const pinnedWorktreePath = `${resolveWorktreesDirLayout("/tmp/test", undefined)}/fn-8490`;
+    const pinnedWorktreePath = join(resolveWorktreesDirLayout("/tmp/test", undefined), "fn-8490");
     mockedExistsSync.mockImplementation((path) => String(path) === pinnedWorktreePath);
     vi.spyOn(worktreePool, "getRegisteredWorktreeBranches").mockResolvedValueOnce([
       { worktreePath: pinnedWorktreePath, branch: "fusion/fn-8490" },
@@ -1678,12 +1821,14 @@ describe("swallowed async store failure observability", () => {
       ),
     ).toBe(false);
     expect(store.moveTask).not.toHaveBeenCalledWith("FN-8490", "todo", expect.anything());
-    expect(store.logEntry).toHaveBeenCalledWith(
-      "FN-8490",
-      "Workflow graph failed at node 'steps#0:step-execute' (step-failed) — automatic recovery cannot move 'in-progress' backward; card remains in place",
-      undefined,
-      undefined,
-    );
+    /*
+    FNXC:ExecutorPauseResumeQuarantine 2026-10-08-06:34:
+    PR #32 landed while this file was quarantined: the step-session recovery's in-place self-requeue now makes the trailing execute-node failure a benign in-place retry instead of a "card remains in place" graph failure. The card still never moves backward.
+    */
+    expect(taskLogMessages(store, "FN-8490")).toEqual(expect.arrayContaining([
+      "Step-session step-failure repaired in place; resuming the same node and step (Step 1: start rejected)",
+      "Workflow graph execute node ended after executor re-queued the task for an in-place retry (step-failed) — executor recovery preserved",
+    ]));
     expect(onError).toHaveBeenCalledWith(
       expect.objectContaining({ id: "FN-8490" }),
       expect.objectContaining({ message: "Step 1: start rejected" }),
@@ -2016,8 +2161,9 @@ describe("TaskExecutor executor model hot-swap", () => {
     ...overrides,
   });
 
+  /* FNXC:ExecutorPauseResumeQuarantine 2026-10-08-06:34: KB-048 — the triggers await their listeners, so flushing settles tracked executor work instead of sleeping a fixed window. */
   const flushTaskUpdated = async () => {
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await settleExecutorWork();
   };
 
   beforeEach(() => {
@@ -2045,7 +2191,7 @@ describe("TaskExecutor executor model hot-swap", () => {
       lastAssignedAgentId: null,
     });
 
-    store._trigger("task:updated", buildUpdatedTask({
+    await store._triggerAsync("task:updated", buildUpdatedTask({
       modelProvider: "openai",
       modelId: "gpt-4o",
     }));
@@ -2066,7 +2212,7 @@ describe("TaskExecutor executor model hot-swap", () => {
 
     createRoutingExecutor(store, "/tmp/test");
 
-    store._trigger("task:updated", buildUpdatedTask({
+    await store._triggerAsync("task:updated", buildUpdatedTask({
       modelProvider: "openai",
       modelId: "gpt-4o",
     }));
@@ -2093,7 +2239,7 @@ describe("TaskExecutor executor model hot-swap", () => {
       lastAssignedAgentId: null,
     });
 
-    store._trigger("task:updated", buildUpdatedTask({
+    await store._triggerAsync("task:updated", buildUpdatedTask({
       modelProvider: "anthropic",
       modelId: "claude-sonnet-4-5",
     }));
@@ -2136,7 +2282,7 @@ describe("TaskExecutor executor model hot-swap", () => {
       lastAssignedAgentId: null,
     });
 
-    store._trigger("task:updated", buildUpdatedTask({
+    await store._triggerAsync("task:updated", buildUpdatedTask({
       modelProvider: undefined,
       modelId: undefined,
     }));
@@ -2179,7 +2325,7 @@ describe("TaskExecutor executor model hot-swap", () => {
       lastAssignedAgentId: null,
     });
 
-    store._trigger("task:updated", buildUpdatedTask({
+    await store._triggerAsync("task:updated", buildUpdatedTask({
       modelProvider: undefined,
       modelId: undefined,
     }));
@@ -2211,7 +2357,7 @@ describe("TaskExecutor executor model hot-swap", () => {
       lastAssignedAgentId: null,
     });
 
-    store._trigger("task:updated", buildUpdatedTask({
+    await store._triggerAsync("task:updated", buildUpdatedTask({
       modelProvider: "openai",
       modelId: "gpt-4o",
     }));
@@ -2240,7 +2386,7 @@ describe("TaskExecutor executor model hot-swap", () => {
       lastAssignedAgentId: null,
     });
 
-    store._trigger("task:updated", buildUpdatedTask({
+    await store._triggerAsync("task:updated", buildUpdatedTask({
       paused: true,
       modelProvider: "openai",
       modelId: "gpt-4o",
@@ -2398,15 +2544,18 @@ describe("TaskExecutor global pause behavior", () => {
     releaseBarrier();
     await run;
 
-    // Global pause should move both tasks out of in-progress without marking failed.
-    const moveCalls = store.moveTask.mock.calls;
-    expect(moveCalls.some(([id, column]) => id === "FN-002" && /^(todo|in-review)$/.test(String(column)))).toBe(true);
-    expect(moveCalls.some(([id, column]) => id === "FN-001" && /^(todo|in-review)$/.test(String(column)))).toBe(true);
+    // Global pause disposes both sessions and retries both tasks in their WIP lane without marking them
+    // failed; since FN-207/PR #32 it no longer moves them backward to todo.
+    expect(disposeFn1).toHaveBeenCalled();
+    expect(disposeFn2).toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(taskLogMessages(store, "FN-001")).toContain(PAUSE_RESUMING_IN_PLACE);
+    expect(taskLogMessages(store, "FN-002")).toContain(PAUSE_RESUMING_IN_PLACE);
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: "failed" });
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-002", { status: "failed" });
   });
 
-  it("moves paused tasks to todo (not marked as failed)", async () => {
+  it("keeps globally paused tasks in their WIP lane (not marked as failed)", async () => {
     const store = createMockStore();
 
     mockedCreateFnAgent.mockImplementation(async () => ({
@@ -2437,8 +2586,13 @@ describe("TaskExecutor global pause behavior", () => {
     implementation pass owns the step projection (startStep is deferred until a real
     worktree exists), so a pause during that first session leaves all steps `pending`
     and the bounce options collapse to `{}`.
+
+    FNXC:ExecutorPauseResumeQuarantine 2026-10-08-06:34:
+    PR #32 (FN-207) replaced that bounce with an in-place retry: the card keeps its WIP column and
+    is never marked failed.
     */
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", {});
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(taskLogMessages(store, "FN-001")).toContain(PAUSE_RESUMING_IN_PLACE);
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: "failed" });
   });
 
