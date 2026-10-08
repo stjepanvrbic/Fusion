@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { promisify } from "node:util";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
+  isPathInside,
+  isSamePath,
   isStrictDescendantPath,
   resolveLegacyWorktreesDirLayout,
   resolveWorktreesDirCandidates,
@@ -49,33 +51,29 @@ export async function isReclaimableWorktreeCandidate(
 
   // The normal linked-worktree form is a gitdir file below the main checkout's
   // admin directory. Prove that relationship without trusting a directory name.
+  /*
+  FNXC:WorktreeReclaim 2026-10-07-23:34:
+  Ownership is proven by path identity. Scan roots are canonicalized natively (8.3 short names expanded, junctions resolved), so a raw comparison with an alias spelling of the project root failed the gitdir proof.
+  Both git probes are settled before deciding: a probe abandoned after the other failed kept the project root as its working directory, and Windows then refused to delete it.
+  */
   try {
     const match = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"));
     if (match) {
       const gitdir = resolve(entryAbsPath, match[1]!.trim());
-      const rootGitDir = resolve(options.rootDir, ".git");
-      const rel = relative(rootGitDir, gitdir);
-      if (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)) return true;
+      if (isPathInside(join(options.rootDir, ".git"), gitdir)) return true;
       // FNXC:WorkspaceWorktree 2026-08-20-01:46: A linked project root has a `.git` file, so Git must prove its external common directory.
     }
   } catch {
     // Fall through to Git's common-dir probe for uncommon worktree layouts.
   }
 
-  try {
-    const [candidate, root] = await Promise.all([
-      execFileAsync("git", ["-C", entryAbsPath, "rev-parse", "--git-common-dir"], { encoding: "utf8", timeout: 10_000 }),
-      execFileAsync("git", ["-C", options.rootDir, "rev-parse", "--git-common-dir"], { encoding: "utf8", timeout: 10_000 }),
-    ]);
-    const canonical = (cwd: string, value: string) => {
-      const path = resolve(cwd, value.trim());
-      try { return realpathSync(path); } catch { return path; }
-    };
-    return canonical(entryAbsPath, candidate.stdout) === canonical(options.rootDir, root.stdout);
-  } catch {
-    // Destructive sweeps fail closed when Git metadata cannot prove ownership.
-    return false;
-  }
+  const [candidate, root] = await Promise.allSettled([
+    execFileAsync("git", ["-C", entryAbsPath, "rev-parse", "--git-common-dir"], { encoding: "utf8", timeout: 10_000 }),
+    execFileAsync("git", ["-C", options.rootDir, "rev-parse", "--git-common-dir"], { encoding: "utf8", timeout: 10_000 }),
+  ]);
+  // Destructive sweeps fail closed when Git metadata cannot prove ownership.
+  if (candidate.status !== "fulfilled" || root.status !== "fulfilled") return false;
+  return isSamePath(resolve(entryAbsPath, candidate.value.stdout.trim()), resolve(options.rootDir, root.value.stdout.trim()));
 }
 
 export function resolveAiMergeRootPath(

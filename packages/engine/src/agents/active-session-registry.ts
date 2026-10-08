@@ -33,6 +33,8 @@ running in, and escalated the resulting failure to `branch-conflict-unrecoverabl
 healthy card `paused` with no operator action. A planner holding a worktree is a live session and
 must be as visible as an executor or merger.
 */
+import { pathIdentityKey } from "@fusion/core";
+
 export type ActiveSessionKind = "executor" | "planning" | "step-session" | "workflow-step" | "step-session-parallel" | "ai-merge" | "workspace-repo-acquire" | "workspace-repo-land";
 
 export interface ActiveSessionRegistration {
@@ -89,8 +91,28 @@ export class ActiveSessionPathHeldByForeignTaskError extends Error {
   }
 }
 
+/*
+FNXC:ActiveSessionRegistry 2026-10-07-23:34:
+Entries are keyed by path identity, not by the raw spelling a caller registered.
+Sweeps canonicalize candidates (8.3 short names expanded, on-disk case, junctions and symlinks resolved) while sessions register whatever spelling their caller held, so a raw-string key let a sweep miss a live session and delete its checkout.
+Each entry keeps the spelling it was registered with: `pathsForTask` and `entriesByKind` return it, and a release by that exact spelling still finds the entry after an alias in it was removed.
+*/
+interface RegistryEntry {
+  path: string;
+  record: ActiveSessionRecord;
+}
+
 export class ActiveSessionRegistry {
-  private readonly records = new Map<string, ActiveSessionRecord>();
+  private readonly records = new Map<string, RegistryEntry>();
+
+  private keyFor(worktreePath: string): string {
+    const identity = pathIdentityKey(worktreePath);
+    if (this.records.has(identity)) return identity;
+    for (const [key, entry] of this.records) {
+      if (entry.path === worktreePath) return key;
+    }
+    return identity;
+  }
 
   /*
   FNXC:Workspace 2026-06-22-04:10 (Phase C review A2 — taskId-aware lease across kinds):
@@ -106,31 +128,32 @@ export class ActiveSessionRegistry {
   condition rather than this raw guard throw; this guard is the last-line safety net.
   */
   registerPath(worktreePath: string, registration: ActiveSessionRegistration): void {
-    const existing = this.records.get(worktreePath);
+    const key = this.keyFor(worktreePath);
+    const existing = this.records.get(key)?.record;
     if (existing && existing.taskId !== registration.taskId) {
       throw new ActiveSessionPathHeldByForeignTaskError(worktreePath, existing.taskId, registration.taskId);
     }
-    this.records.set(worktreePath, {
-      ...registration,
-      registeredAt: Date.now(),
+    this.records.set(key, {
+      path: worktreePath,
+      record: { ...registration, registeredAt: Date.now() },
     });
   }
 
   unregisterPath(worktreePath: string): void {
-    this.records.delete(worktreePath);
+    this.records.delete(this.keyFor(worktreePath));
   }
 
   lookupByPath(worktreePath: string): ActiveSessionRecord | null {
-    return this.records.get(worktreePath) ?? null;
+    return this.records.get(this.keyFor(worktreePath))?.record ?? null;
   }
 
   isPathActive(worktreePath: string): boolean {
-    return this.records.has(worktreePath);
+    return this.records.has(this.keyFor(worktreePath));
   }
 
   pathsForTask(taskId: string): string[] {
     const paths: string[] = [];
-    for (const [path, record] of this.records.entries()) {
+    for (const { path, record } of this.records.values()) {
       if (record.taskId === taskId) {
         paths.push(path);
       }
@@ -151,7 +174,7 @@ export class ActiveSessionRegistry {
   */
   entriesByKind(kind: ActiveSessionKind): Array<{ path: string; taskId: string; kind: ActiveSessionKind; registeredAt: number }> {
     const out: Array<{ path: string; taskId: string; kind: ActiveSessionKind; registeredAt: number }> = [];
-    for (const [path, record] of this.records.entries()) {
+    for (const { path, record } of this.records.values()) {
       if (record.kind === kind) {
         out.push({ path, taskId: record.taskId, kind: record.kind, registeredAt: record.registeredAt });
       }

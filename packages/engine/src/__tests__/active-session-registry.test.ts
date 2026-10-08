@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   activeSessionRegistry,
   reconcileSelfOwnedActiveSessionForRemoval,
@@ -188,5 +191,74 @@ describe("activeSessionRegistry", () => {
       { processActiveProbe: () => true, minIdleMs: 5000 },
     );
     expect(outcome).toEqual({ action: "live-binding-refuses", ownerTaskId: "FN-1" });
+  });
+});
+
+/*
+FNXC:ActiveSessionRegistry 2026-10-07-23:34:
+One checkout is one live session whatever spelling names it: an 8.3 short name, a different letter case on Windows, or a symlink or junction alias.
+Sweeps canonicalize their candidates while sessions register the spelling their caller held, so a raw-string registry let a sweep miss a live session and delete its checkout.
+*/
+describe("activeSessionRegistry path identity", () => {
+  const roots: string[] = [];
+
+  beforeEach(() => {
+    activeSessionRegistry.clear();
+  });
+
+  afterEach(() => {
+    activeSessionRegistry.clear();
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+
+  function aliasedCheckout(): { real: string; alias: string; root: string } {
+    const root = mkdtempSync(join(tmpdir(), "fusion-session-identity-"));
+    roots.push(root);
+    const real = join(root, "real", "fn-1");
+    mkdirSync(real, { recursive: true });
+    const aliasRoot = join(root, "alias");
+    symlinkSync(join(root, "real"), aliasRoot, "junction");
+    return { real, alias: join(aliasRoot, "fn-1"), root };
+  }
+
+  function spellings(real: string, alias: string): string[] {
+    return process.platform === "win32" ? [alias, real.toUpperCase(), real.toLowerCase()] : [alias];
+  }
+
+  it("matches a session registered under one spelling through every other spelling of the same checkout", () => {
+    const { real, alias } = aliasedCheckout();
+    for (const registered of [real, ...spellings(real, alias)]) {
+      activeSessionRegistry.clear();
+      activeSessionRegistry.registerPath(registered, { taskId: "FN-1", kind: "executor", ownerKey: "FN-1" });
+      for (const probe of [real, ...spellings(real, alias)]) {
+        expect(activeSessionRegistry.isPathActive(probe)).toBe(true);
+        expect(activeSessionRegistry.lookupByPath(probe)?.taskId).toBe("FN-1");
+        expect(() => activeSessionRegistry.registerPath(probe, { taskId: "FN-2", kind: "executor", ownerKey: "FN-2" }))
+          .toThrow(ActiveSessionPathHeldByForeignTaskError);
+      }
+      expect(activeSessionRegistry.pathsForTask("FN-1")).toEqual([registered]);
+      expect(activeSessionRegistry.entriesByKind("executor").map((entry) => entry.path)).toEqual([registered]);
+    }
+  });
+
+  it("releases a session through another spelling and through its own spelling after the alias is gone", () => {
+    const { real, alias, root } = aliasedCheckout();
+    activeSessionRegistry.registerPath(alias, { taskId: "FN-1", kind: "executor", ownerKey: "FN-1" });
+    activeSessionRegistry.unregisterPath(real);
+    expect(activeSessionRegistry.isPathActive(alias)).toBe(false);
+
+    activeSessionRegistry.registerPath(alias, { taskId: "FN-1", kind: "executor", ownerKey: "FN-1" });
+    rmSync(join(root, "alias"), { recursive: true, force: true });
+    activeSessionRegistry.unregisterPath(alias);
+    expect(activeSessionRegistry.pathsForTask("FN-1")).toEqual([]);
+  });
+
+  it("keeps distinct checkouts distinct", () => {
+    const { real, root } = aliasedCheckout();
+    const sibling = join(root, "real", "fn-2");
+    mkdirSync(sibling);
+    activeSessionRegistry.registerPath(real, { taskId: "FN-1", kind: "executor", ownerKey: "FN-1" });
+    expect(activeSessionRegistry.isPathActive(sibling)).toBe(false);
+    expect(activeSessionRegistry.isPathActive(`${real}#session:FN-1`)).toBe(false);
   });
 });
