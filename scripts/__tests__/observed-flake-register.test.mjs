@@ -201,6 +201,11 @@ FNXC:TestFlakeRegister 2026-10-08-09:18:
 Entry 34 was sighted a second time on the fork's Full Suite (the same case and assertion on another shard), so the
 deletion ratchet moves it to the archive. The archived record must keep both run identifiers and the unchanged
 assertion message so a rescue starts from when AgentDetailView subscribes rather than from a timeout.
+
+FNXC:TestFlakeRegister 2026-10-08-11:22:
+Entry 30 was sighted a second time on the fork's Full Suite (the same case and assertion on a later commit), so the
+deletion ratchet moves it to the archive. The archived record must keep both run identifiers and the unchanged
+assertion message so a rescue starts from the refresh path's pre-fetch I/O rather than from a timeout.
 */
 /*
 FNXC:TestFlakeRegister 2026-10-08-01:13:
@@ -242,10 +247,6 @@ test("observed-flake register active count, escalation state, and owners stay sy
     {
       heading: "27. ensureCwdProjectRegistered embedded PostgreSQL startup cascade",
       status: "Active first sighting — recorded 2026-10-07, unattributed.",
-    },
-    {
-      heading: "30. Instance-scoped OAuth refresh hanging-request bound",
-      status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
     {
       heading: "31. Mailbox paging production surfaces 120-message inbox desktop paging",
@@ -386,6 +387,27 @@ test("archived MissionManager reconcile quarantine retains both-sighting evidenc
     "deletion deadline 2026-10-22",
   ]) {
     assert.ok(entry.includes(evidence), `Archived MissionManager reconcile entry is missing ${evidence}`);
+  }
+  assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
+});
+
+test("archived instance-scoped OAuth refresh quarantine retains both-sighting evidence", () => {
+  const register = readFileSync(registerPath, "utf8");
+  const archive = register.match(/## Archive — closed records\n([\s\S]*)$/)?.[1];
+  assert.ok(archive, "Expected an Archive — closed records section");
+  const entry = archive.match(/^### 30\. Instance-scoped OAuth refresh hanging-request bound\n([\s\S]*?)(?=^### |(?![\s\S]))/m)?.[1];
+  assert.ok(entry, "Expected archived instance-scoped OAuth refresh quarantine entry");
+
+  for (const evidence of [
+    "packages/engine/src/__tests__/auth-storage-durability.test.ts",
+    "bounds a hanging refresh request instead of waiting on it indefinitely",
+    "37725718700",
+    "37756067075",
+    "expected \"vi.fn()\" to be called 1 times, but got 0 times",
+    "quarantined 2026-10-08",
+    "deletion deadline 2026-10-22",
+  ]) {
+    assert.ok(entry.includes(evidence), `Archived instance-scoped OAuth refresh entry is missing ${evidence}`);
   }
   assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
 });

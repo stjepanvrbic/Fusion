@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, 35, and 36): eleven **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **19 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 27, 31, 32, 33, 35, and 36): ten **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **20 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -358,18 +358,6 @@ No timeout, retry, or assertion changed, and the file is not quarantined because
 
 The subprocess-guard line deserves a product look. It means a real PostgreSQL child reached a CLI unit test that does not obviously need one, and a startup that outlives its test left a stale port recorded as a joined instance for later cases. Start with how the embedded PostgreSQL startup records and joins an existing instance for a shared data directory, and whether `CentralCore` initialization in this file should use an in-memory or harness-provided store.
 
-### 30. Instance-scoped OAuth refresh hanging-request bound
-
-- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
-- **File:** `packages/engine/src/__tests__/auth-storage-durability.test.ts`
-- **Exact test:** `instance-scoped OAuth refresh > bounds a hanging refresh request instead of waiting on it indefinitely`.
-- **Observed tree/SHA:** fork Full Suite run [37725718700](https://github.com/stjepanvrbic/Fusion/actions/runs/37725718700) at `b2dfb6316` (Linux, `ubuntu-latest`), job `Test shard 1/4` (`113143293387`), project `engine-default`. That commit changed only a register entry. The file passed in the Full Suite runs 37718606719 (`0bcb53f96`) and 37720328009 (`9e948d488`); neither run's failed-job log names it. The test came from audit PR #7 (`01a945ee9`, operator CLI, credentials and agent shell boundaries).
-- **Observed frequency:** 1 run, 1 failure entry. The shard otherwise passed (576 files, 7450 tests).
-
-The case failed with `AssertionError: expected "vi.fn()" to be called 1 times, but got 0 times` at the `expect(fetchMock).toHaveBeenCalledTimes(1)` on line 160. The test fakes only `setTimeout` and `clearTimeout`, starts `getApiKey` on an expiring OAuth instance, then advances fake time in 5 ms steps for at most 200 iterations while waiting for the mocked `fetch` to be invoked. The loop ended with no call, so the refresh path never reached `fetch` within those iterations. This reads the log; no reproduction was attempted. The loop is a bounded count of microtask-yielding advances rather than a wall-clock wait, so it can run out when the real work between the call and `fetch` (instance read, lock acquisition, file I/O) is starved of event-loop turns.
-
-The Full Suite was under heavy load that hour: several Full Suite runs were queued or in progress at once on the fork. No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the engine vitest config. Before quarantining, look at the product code: check whether the refresh path performs real file or lock I/O before calling `fetch`, which a fake-timer polling loop cannot wait out deterministically.
-
 ### 31. Mailbox paging production surfaces 120-message inbox desktop paging
 
 - **Status:** Active first sighting — recorded 2026-10-08, unattributed.
@@ -573,6 +561,27 @@ Both are default-timeout Testing Library waits that expired while the rendered `
 No timeout, retry, or assertion changed. The whole file is excluded from the dashboard projects. It is not in the thin merge gate, so no gate eviction was needed.
 
 Before the deletion deadline, inspect how `MissionManager` releases the reconcile panel and handles a reconcile click while a fetch for another mission is still pending. No product code changed in this quarantine.
+
+<!--
+FNXC:TestFlakeRegister 2026-10-08-11:22:
+Entry 30 recorded a second Full Suite sighting on the fork: the same case failed at the same assertion on a later commit. Quarantine is file-level, so the whole file is excluded through the dated ledger and the literal engine-default exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
+-->
+### 30. Instance-scoped OAuth refresh hanging-request bound
+
+- **Status:** Closed — quarantined 2026-10-08 after a second Full Suite sighting; deletion deadline 2026-10-22.
+- **File:** `packages/engine/src/__tests__/auth-storage-durability.test.ts`
+- **Exact test:** `instance-scoped OAuth refresh > bounds a hanging refresh request instead of waiting on it indefinitely`.
+- **Observed trees/SHAs:** fork Full Suite runs [37725718700](https://github.com/stjepanvrbic/Fusion/actions/runs/37725718700/job/113143293387) at `b2dfb6316` (job `113143293387`) and [37756067075](https://github.com/stjepanvrbic/Fusion/actions/runs/37756067075/job/113240796645) at `b4ffbded6` (job `113240796645`), both Linux `ubuntu-latest`, job `Test shard 1/4`, project `engine-default`. The file passed in the Full Suite runs 37718606719 (`0bcb53f96`) and 37720328009 (`9e948d488`). A Windows lane single sighting of the same case at `9d216bec` (run 37693147198) is recorded in the KB-008 table below.
+- **Observed frequency:** 2 Linux runs, 1 failure entry each, the same case and the same assertion.
+
+| run | result |
+|---|---|
+| 37725718700 | `AssertionError: expected "vi.fn()" to be called 1 times, but got 0 times` at `auth-storage-durability.test.ts:160` |
+| 37756067075 | the same message at the same line; the shard also failed `workflow-planning-continuation-terminal-gap-live-e2e.pg.test.ts` (2 failed, 7526 passed, 13 skipped across 581 files) |
+
+The case fakes only `setTimeout` and `clearTimeout`, starts `getApiKey` on an expiring OAuth instance, then advances fake time in 5 ms steps for at most 200 iterations while waiting for the mocked `fetch` to be invoked. The loop ended with no call both times, so the refresh path never reached `fetch` within those iterations. The loop is a bounded count of microtask-yielding advances rather than a wall-clock wait, so it can run out when the real work between the call and `fetch` (instance read, lock acquisition, file I/O) is starved of event-loop turns. This reads the logs; no shard-shaped reproduction was attempted.
+
+No timeout, retry, or assertion changed. The whole file is excluded from the `engine-default` project. It is not in the engine-core merge-gate allow-list, so no gate eviction was needed. Before the deletion deadline, check whether the refresh path performs real file or lock I/O before calling `fetch`, which a fake-timer polling loop cannot wait out deterministically. No product code changed in this quarantine.
 
 <!--
 FNXC:TestFlakeRegister 2026-10-08-09:18:
