@@ -430,6 +430,21 @@ describe("POST /api/action-gate/reload", () => {
   });
 });
 
+/*
+FNXC:VitestProcessDiscovery 2026-10-08-06:15:
+`findVitestProcessIds` is a documented no-op on win32 (pgrep/ps are POSIX-only) and reads `process.platform` at call time.
+POSIX-semantics route assertions pin the platform per test and restore the original descriptor afterwards; win32 cases assert the no-op shape so both branches are covered on every host.
+*/
+async function withProcessPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T>): Promise<T> {
+  const original = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: platform, configurable: true, enumerable: true, writable: false });
+  try {
+    return await run();
+  } finally {
+    if (original) Object.defineProperty(process, "platform", original);
+  }
+}
+
 describe("GET /api/system-stats", () => {
   const projectId = "proj-system-stats";
 
@@ -440,7 +455,7 @@ describe("GET /api/system-stats", () => {
     return app;
   }
 
-  it("returns process/system metrics with task and agent aggregates", async () => {
+  it("returns process/system metrics with task and agent aggregates", () => withProcessPlatform("linux", async () => {
     const cpuUsageSpy = vi.spyOn(process, "cpuUsage");
     /*
     FNXC:DashboardCpuSampling 2026-07-16-09:00:
@@ -537,7 +552,24 @@ describe("GET /api/system-stats", () => {
     cpuUsageSpy.mockRestore();
     vi.useRealTimers();
     mockExecFile.mockClear();
-  });
+  }));
+
+  it("reports zero vitest processes without spawning pgrep/ps on Windows", () => withProcessPlatform("win32", async () => {
+    mockExecFile.mockClear();
+    const store = createMockStore({
+      listTasks: vi.fn().mockResolvedValue([]),
+      getFusionDir: vi.fn().mockReturnValue("/fake/default"),
+    });
+    vi.spyOn(AgentStore.prototype, "init").mockResolvedValue(undefined);
+    vi.spyOn(AgentStore.prototype, "listAgents").mockResolvedValue([]);
+
+    const res = await GET(buildApp(store), "/api/system-stats");
+
+    expect(res.status).toBe(200);
+    expect(res.body.vitestProcessCount).toBe(0);
+    expect(mockExecFile).not.toHaveBeenCalledWith("pgrep", expect.anything(), expect.anything(), expect.anything());
+    expect(mockExecFile).not.toHaveBeenCalledWith("ps", expect.anything(), expect.anything(), expect.anything());
+  }));
 
   it("reports systemFreeMem from process.availableMemory instead of macOS-shaped freemem", async () => {
     type ProcessWithAvailableMemory = NodeJS.Process & { availableMemory?: () => number };
@@ -774,7 +806,7 @@ describe("POST /api/kill-vitest", () => {
     return app;
   }
 
-  it("returns killed: 0 when no vitest processes are found", async () => {
+  it("returns killed: 0 when no vitest processes are found", () => withProcessPlatform("linux", async () => {
     const store = createMockStore();
     mockExecFile.mockImplementationOnce((...callArgs: unknown[]) => {
       const cb = callArgs[callArgs.length - 1] as (err: unknown, stdout?: string, stderr?: string) => void;
@@ -786,9 +818,9 @@ describe("POST /api/kill-vitest", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ killed: 0, pids: [] });
     mockExecFile.mockClear();
-  });
+  }));
 
-  it("kills all matched vitest pids except the current dashboard process", async () => {
+  it("kills all matched vitest pids except the current dashboard process", () => withProcessPlatform("linux", async () => {
     const store = createMockStore();
     mockExecFile
       .mockImplementationOnce((...callArgs: unknown[]) => {
@@ -814,9 +846,26 @@ describe("POST /api/kill-vitest", () => {
 
     killSpy.mockRestore();
     mockExecFile.mockClear();
-  });
+  }));
 
-  it("returns killed: 0 when pgrep exits with no matches", async () => {
+  it("is a no-op on Windows: no pgrep/ps spawn and no process kill", () => withProcessPlatform("win32", async () => {
+    mockExecFile.mockClear();
+    const store = createMockStore();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    try {
+      const res = await REQUEST(buildApp(store), "POST", "/api/kill-vitest");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ killed: 0, pids: [] });
+      expect(mockExecFile).not.toHaveBeenCalled();
+      expect(killSpy).not.toHaveBeenCalled();
+    } finally {
+      killSpy.mockRestore();
+    }
+  }));
+
+  it("returns killed: 0 when pgrep exits with no matches", () => withProcessPlatform("linux", async () => {
     const store = createMockStore();
     mockExecFile.mockImplementationOnce((...callArgs: unknown[]) => {
       const cb = callArgs[callArgs.length - 1] as (err: unknown, stdout?: string, stderr?: string) => void;
@@ -829,7 +878,7 @@ describe("POST /api/kill-vitest", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ killed: 0, pids: [] });
     mockExecFile.mockClear();
-  });
+  }));
 });
 
 describe("GET /api/plugins/dashboard-views", () => {

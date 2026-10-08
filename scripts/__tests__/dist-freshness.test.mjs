@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import { join } from "node:path";
+
 import { computeDistStaleness, formatDistStalenessWarning } from "../lib/dist-freshness.mjs";
 
 /*
@@ -10,14 +12,20 @@ src-ahead-of-dist build, stays quiet when fresh, and never false-positives for
 pure-source (no dist) or packaged (no src) layouts.
 */
 
-// In-memory fs seam: paths are exact strings; dirs list children; files carry mtimeMs.
-function makeFs({ dirs, files }) {
-  const dirSet = new Set(dirs);
+/*
+FNXC:WindowsPortableTests 2026-10-08-06:19:
+The product builds every fs path with native `path.join` (`\`-separated on Windows) and uses it only for fs access.
+The fake normalizes both its keys and each lookup through the same `join`, so POSIX-literal fixtures match on every platform.
+*/
+// In-memory fs seam: paths are join-normalized strings; dirs list children; files carry mtimeMs.
+function makeFs({ dirs, files: rawFiles }) {
+  const dirSet = new Set(dirs.map((d) => join(d)));
   // files: { "<dir>": [{ name, mtimeMs, isDir? }] } keyed by parent dir
+  const files = Object.fromEntries(Object.entries(rawFiles).map(([dir, entries]) => [join(dir), entries]));
   return {
-    existsSync: (p) => dirSet.has(p),
+    existsSync: (p) => dirSet.has(join(p)),
     readdirSync: (dir) =>
-      (files[dir] ?? []).map((e) => ({
+      (files[join(dir)] ?? []).map((e) => ({
         name: e.name,
         isDirectory: () => Boolean(e.isDir),
       })),
@@ -25,7 +33,7 @@ function makeFs({ dirs, files }) {
       // p is "<dir>/<name>"; look it up by scanning entries
       for (const [dir, entries] of Object.entries(files)) {
         for (const e of entries) {
-          if (`${dir}/${e.name}` === p) return { mtimeMs: e.mtimeMs };
+          if (join(dir, e.name) === join(p)) return { mtimeMs: e.mtimeMs };
         }
       }
       return { mtimeMs: 0 };

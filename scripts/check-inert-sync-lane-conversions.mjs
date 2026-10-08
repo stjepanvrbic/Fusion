@@ -76,7 +76,7 @@ add the site to the baseline to make the build pass — that is the same false g
   node scripts/check-inert-sync-lane-conversions.mjs --update-baseline
 */
 import { readdirSync, readFileSync, writeFileSync, statSync } from "node:fs";
-import { join, relative, resolve, dirname } from "node:path";
+import { join, relative, resolve, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
@@ -398,7 +398,11 @@ for (const file of files) {
   const locals = syncLaneLocals(sf, sources);
   const hits = countInertGuards(sf, locals, sources);
   if (hits.length === 0) continue;
-  const rel = relative(REPO, file);
+  /*
+  FNXC:InertSyncLane 2026-10-08-06:19:
+  The committed baseline is keyed by `/`-separated repo-relative paths. `path.relative` yields `\` on Windows, so normalize the key; otherwise a Windows run never matches the baseline and a Windows-recorded baseline drifts from Linux.
+  */
+  const rel = relative(REPO, file).split(sep).join("/");
   byFile[rel] = hits.length;
   detail[rel] = hits;
 }

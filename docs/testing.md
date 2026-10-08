@@ -1037,6 +1037,14 @@ Windows-safe test conventions:
 - **Shell-less `execFile`:** on Windows it resolves only `.exe`/`.com`, so a script shim cannot intercept it. Mock the module seam instead.
 - **Path comparisons:** use `posixFixturePath`/`nativeFixturePath` from `_posix-fixture-path.ts`, or compare `git worktree list --porcelain` and relative paths with forward slashes. Every one of these is the identity on Linux.
 
+The dashboard, CLI and `scripts/__tests__` suites have no Windows CI lane yet, so the ledger and comparator do not cover them. Their named Windows failures were fixed in KB-036. Its `windows-census` task document lists the remaining Windows-only failures, mostly in `packages/cli/src/commands/__tests__/`. Keep new tests in those suites portable:
+
+- Derive expected absolute paths with `path.resolve` (`resolve("/project")` is the identity on POSIX and `C:\project` on Windows) instead of comparing POSIX literals. Build file URLs with `pathToFileURL(resolve(...))`.
+- Compare relative paths `/`-normalized (`relative(a, b).split(path.sep).join("/")`), and key in-memory fs fakes with the same `path.join` the product uses.
+- Launch npm/pnpm through `resolveShellFreeLaunch` (`@fusion/core`) or `resolveCommandInvocation` (`scripts/lib/pnpm-invocation.mjs`), never bare `execFileSync("npm")` or `shell: true`; on Windows they are `.cmd` shims.
+- After killing a spawned child, `await once(child, "exit")` before removing a directory it uses as cwd; Windows refuses to delete it (EPERM) while the process is alive.
+- Pin `process.platform` per test with `Object.defineProperty` and restore the original descriptor in `finally` when asserting POSIX-only behavior, and cover the win32 branch explicitly.
+
 ## No live provider credentials in test workers
 
 The shared Vitest setup removes provider credentials from every worker before any test runs: every `*_API_KEY`/`API_KEY_*` variable plus the provider token and cloud-credential names pi-ai resolves. A test that reaches a model session must mock the session seam, for example `reviewStep`, instead of relying on whatever keys the operator's shell exports. A deliberate live-provider run sets `FUSION_TEST_ALLOW_LIVE_PROVIDER_CREDENTIALS=1`. The same setup also drops `DATABASE_URL`.

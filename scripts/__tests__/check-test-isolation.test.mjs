@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync, spawn } from "node:child_process";
+import { once } from "node:events";
 
 const scriptPath = path.resolve("scripts/check-test-isolation.mjs");
 
@@ -28,6 +29,32 @@ function withFixture(fn) {
 
 function childEnv({ home, tmp }) {
   return { ...process.env, HOME: home, USERPROFILE: home, TMPDIR: tmp, TEMP: tmp, TMP: tmp };
+}
+
+/*
+FNXC:WindowsPortableTests 2026-10-08-06:19:
+Windows refuses to delete a directory that a live process uses as its cwd (EPERM), and child.kill() returns before the process has exited.
+Fixtures that spawn a child inside the fixture cwd must await its exit before the fixture is removed; awaiting exit also removes the race on POSIX.
+*/
+async function withFixtureAsync(fn) {
+  const tmp = mkdtempSync(path.join(tmpdir(), "check-isolation-tmp-"));
+  const cwd = mkdtempSync(path.join(tmp, "check-isolation-cwd-"));
+  const home = mkdtempSync(path.join(tmp, "check-isolation-home-"));
+  mkdirSync(path.join(cwd, ".fusion"), { recursive: true });
+  mkdirSync(path.join(home, ".fusion"), { recursive: true });
+  try {
+    await fn({ cwd, home, tmp });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/** Terminate a spawned child and resolve only once it has actually exited. */
+async function stopChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit");
+  child.kill("SIGTERM");
+  await exited;
 }
 
 function runScript(args, options) {
@@ -59,8 +86,8 @@ test("fails when a tracked temp leak appears after baseline", () => {
   });
 });
 
-test("ignores tracked temp dirs that disappear during the settle window", () => {
-  withFixture(({ cwd, home, tmp }) => {
+test("ignores tracked temp dirs that disappear during the settle window", async () => {
+  await withFixtureAsync(async ({ cwd, home, tmp }) => {
     const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
 
@@ -76,14 +103,14 @@ test("ignores tracked temp dirs that disappear during the settle window", () => 
       const after = runScript([], { cwd, home, tmp });
       assert.equal(after.status, 0, after.stderr || after.stdout);
     } finally {
-      cleanup.kill("SIGTERM");
+      await stopChild(cleanup);
       rmSync(transientPath, { recursive: true, force: true });
     }
   });
 });
 
-test("ignores active fusion-test-workers roots created after baseline", () => {
-  withFixture(({ cwd, home, tmp }) => {
+test("ignores active fusion-test-workers roots created after baseline", async () => {
+  await withFixtureAsync(async ({ cwd, home, tmp }) => {
     const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
 
@@ -100,7 +127,7 @@ test("ignores active fusion-test-workers roots created after baseline", () => {
       const after = runScript([], { cwd, home, tmp });
       assert.equal(after.status, 0, after.stderr || after.stdout);
     } finally {
-      owner.kill("SIGTERM");
+      await stopChild(owner);
       rmSync(activeRoot, { recursive: true, force: true });
     }
   });
@@ -266,8 +293,8 @@ test("--before-fast falls back to the full probe when no prior baseline exists",
   });
 });
 
-test("passes when HOME .fusion is externally active during baseline and check", () => {
-  withFixture(({ cwd, home, tmp }) => {
+test("passes when HOME .fusion is externally active during baseline and check", async () => {
+  await withFixtureAsync(async ({ cwd, home, tmp }) => {
     const churnScript = `
       const fs = require("node:fs");
       const path = require("node:path");
@@ -294,7 +321,7 @@ test("passes when HOME .fusion is externally active during baseline and check", 
     const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 0);
 
-    churn.kill("SIGTERM");
+    await stopChild(churn);
     rmSync(path.join(home, ".fusion", "external-churn.txt"), { force: true });
   });
 });

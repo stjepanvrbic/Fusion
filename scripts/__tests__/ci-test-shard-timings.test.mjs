@@ -385,7 +385,8 @@ test("discoverWorkspaceTimingFiles finds root and per-package .timings files", (
   writeFileSync(path.join(root, "plugins/bbb/.timings/timings-shard2-0.json"), "{}");
   writeFileSync(path.join(root, "packages/aaa/.timings/not-a-match.txt"), "");
 
-  const found = discoverWorkspaceTimingFiles(root).map((f) => path.relative(root, f));
+  // FNXC:WindowsPortableTests 2026-10-08-06:19: discovery returns native absolute paths; compare `/`-normalized relatives so the case holds on win32 too.
+  const found = discoverWorkspaceTimingFiles(root).map((f) => path.relative(root, f).split(path.sep).join("/"));
   assert.deepEqual(found.sort(), [
     ".timings/timings-shard1-0.json",
     "packages/aaa/.timings/timings-shard1-0.json",

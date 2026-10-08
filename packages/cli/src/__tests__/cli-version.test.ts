@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const fsMock = vi.hoisted(() => ({
   existsSync: vi.fn(),
@@ -15,8 +15,13 @@ import {
   readOwnCliVersion,
 } from "../cli-version.js";
 
-const startUrl = "file:///a/b/c/d/e/module.js";
-const depthStartUrl = "file:///a/b/c/d/e/f/g/h/i/j/module.js";
+/*
+FNXC:WindowsPortableTests 2026-10-08-06:19:
+A drive-less `file:///a/...` URL is not absolute on Windows, so `fileURLToPath` throws before any case runs.
+Build the module URLs from `resolve`d paths, which keeps the POSIX URL unchanged and adds the drive letter on win32.
+*/
+const startUrl = pathToFileURL(resolve("/a/b/c/d/e/module.js")).href;
+const depthStartUrl = pathToFileURL(resolve("/a/b/c/d/e/f/g/h/i/j/module.js")).href;
 const startDir = dirname(fileURLToPath(startUrl));
 
 type Manifest = string | Error;
@@ -124,7 +129,7 @@ describe("readOwnCliVersion", () => {
   });
 
   it("terminates at the filesystem root", () => {
-    expect(readOwnCliVersion("file:///module.js")).toBeUndefined();
+    expect(readOwnCliVersion(pathToFileURL(resolve("/module.js")).href)).toBeUndefined();
     expect(fsMock.existsSync).toHaveBeenCalledOnce();
   });
 

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { existsSync, statSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import { TaskStore, createTaskStoreForBackend } from "@fusion/core";
 
 function makeConstructibleMock<T extends (...args: any[]) => unknown>(impl?: T) {
@@ -113,6 +114,13 @@ const {
   resetProjectResolution,
 } = projectResolver;
 
+/*
+FNXC:WindowsPortableTests 2026-10-08-06:19:
+Project discovery resolves every candidate with node:path, which is drive-qualified on Windows (`C:\project`).
+Mock comparisons and expected directories derive from the same `resolve` so these cases hold on win32 and POSIX; on POSIX `abs` is the identity.
+*/
+const abs = (p: string): string => resolvePath(p);
+
 describe("Project Resolver", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -131,24 +139,24 @@ describe("Project Resolver", () => {
 
   describe("findKbDir", () => {
     it("finds a PostgreSQL-era project identity marker without SQLite", () => {
-      mockHasProjectIdentity.mockImplementation((path) => String(path) === "/project/.fusion");
+      mockHasProjectIdentity.mockImplementation((path) => String(path) === abs("/project/.fusion"));
 
-      expect(findKbDir("/project/src")).toBe("/project");
-      expect(mockIsValidSqliteDatabaseFile).not.toHaveBeenCalledWith("/project/.fusion/fusion.db");
+      expect(findKbDir("/project/src")).toBe(abs("/project"));
+      expect(mockIsValidSqliteDatabaseFile).not.toHaveBeenCalledWith(abs("/project/.fusion/fusion.db"));
     });
 
     it("should find .fusion directory in current path", () => {
-      mockIsValidSqliteDatabaseFile.mockImplementation((path) => String(path) === "/project/.fusion/fusion.db");
+      mockIsValidSqliteDatabaseFile.mockImplementation((path) => String(path) === abs("/project/.fusion/fusion.db"));
 
       const result = findKbDir("/project");
-      expect(result).toBe("/project");
+      expect(result).toBe(abs("/project"));
     });
 
     it("should walk up parent directories to find .fusion", () => {
-      mockIsValidSqliteDatabaseFile.mockImplementation((path) => String(path) === "/a/b/.fusion/fusion.db");
+      mockIsValidSqliteDatabaseFile.mockImplementation((path) => String(path) === abs("/a/b/.fusion/fusion.db"));
 
       const result = findKbDir("/a/b/c");
-      expect(result).toBe("/a/b");
+      expect(result).toBe(abs("/a/b"));
     });
 
     it("should return null if no .fusion found", () => {
@@ -331,7 +339,7 @@ describe("Project Resolver", () => {
 
   describe("isKbProject", () => {
     it("should return true if fusion.db is a valid SQLite database", () => {
-      mockIsValidSqliteDatabaseFile.mockImplementation((path) => String(path) === "/project/.fusion/fusion.db");
+      mockIsValidSqliteDatabaseFile.mockImplementation((path) => String(path) === abs("/project/.fusion/fusion.db"));
       expect(isKbProject("/project")).toBe(true);
     });
 
@@ -681,7 +689,7 @@ describe("Project Resolver", () => {
     it("findProjectByPath supports explicit central parameter", async () => {
       const central = {
         listProjects: vi.fn().mockResolvedValue([
-          { id: "p1", name: "one", path: "/work/one", status: "active", isolationMode: "in-process" },
+          { id: "p1", name: "one", path: abs("/work/one"), status: "active", isolationMode: "in-process" },
         ]),
       } as any;
 
@@ -693,7 +701,7 @@ describe("Project Resolver", () => {
     it("findProjectByPath uses singleton central when not provided", async () => {
       const core = await getCentralCore();
       core.listProjects.mockResolvedValue([
-        { id: "p2", name: "two", path: "/work/two", status: "active", isolationMode: "in-process" },
+        { id: "p2", name: "two", path: abs("/work/two"), status: "active", isolationMode: "in-process" },
       ]);
 
       const found = await findProjectByPath("/work/two");

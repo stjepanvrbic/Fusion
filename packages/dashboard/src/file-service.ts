@@ -240,7 +240,12 @@ async function listFilesForBasePath(basePath: string, subPath?: string, options:
       return a.name.localeCompare(b.name);
     });
 
-    const relativeBase = relative(basePath, targetPath);
+    /*
+    FNXC:FileBrowserPaths 2026-10-08-06:15:
+    The File Browser client treats the listing `path` as a `/`-separated workspace-relative path on every platform, like the markdown scan and search results.
+    `path.relative` yields `\`-separated segments on Windows, so normalize here; the absolute out-of-base branch keeps its native resolved path.
+    */
+    const relativeBase = relative(basePath, targetPath).replace(/\\/g, "/");
 
     return {
       path: options.allowAbsolutePaths === true && isOutsideBase(basePath, targetPath) ? targetPath : (relativeBase || "."),

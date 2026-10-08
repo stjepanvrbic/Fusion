@@ -23,6 +23,14 @@ import {
   MAX_FILE_SIZE,
 } from "../file-service.js";
 import type { TaskStore } from "@fusion/core";
+import { resolve } from "node:path";
+
+/*
+FNXC:FileBrowserPaths 2026-10-08-06:15:
+The file service resolves every filesystem path with node:path, which is drive-qualified on Windows (`C:\project`).
+Mock keys and expected fs-call arguments are derived with the same `resolve` so the suite asserts identical behavior on win32 and POSIX; on POSIX `abs` is the identity.
+*/
+const abs = (p: string): string => resolve(p);
 
 // Mock node:fs/promises - use vi.hoisted for proper hoisting with ES modules
 const { mockReaddir, mockReadFile, mockWriteFile, mockStat, mockCopyFile, mockRename, mockRm, mockMkdir, mockAccess } = vi.hoisted(() => ({
@@ -131,28 +139,28 @@ describe("path traversal protection", () => {
 
   describe("via listProjectFiles", () => {
     it("rejects path traversal attacks (../)", async () => {
-      mockGetRootDir.mockReturnValue("/test/project");
+      mockGetRootDir.mockReturnValue(abs("/test/project"));
 
       await expect(listProjectFiles(mockStore, "../secret.txt")).rejects.toThrow(FileServiceError);
       await expect(listProjectFiles(mockStore, "../secret.txt")).rejects.toThrow("Path traversal detected");
     });
 
     it("rejects absolute paths", async () => {
-      mockGetRootDir.mockReturnValue("/test/project");
+      mockGetRootDir.mockReturnValue(abs("/test/project"));
 
       await expect(listProjectFiles(mockStore, "/etc/passwd")).rejects.toThrow(FileServiceError);
       await expect(listProjectFiles(mockStore, "/etc/passwd")).rejects.toThrow("Absolute paths not allowed");
     });
 
     it("rejects paths with null bytes", async () => {
-      mockGetRootDir.mockReturnValue("/test/project");
+      mockGetRootDir.mockReturnValue(abs("/test/project"));
 
       await expect(listProjectFiles(mockStore, "file\0.txt")).rejects.toThrow(FileServiceError);
       await expect(listProjectFiles(mockStore, "file\0.txt")).rejects.toThrow("Invalid characters");
     });
 
     it("treats percent-encoded traversal text as a literal already-decoded path", async () => {
-      mockGetRootDir.mockReturnValue("/test/project");
+      mockGetRootDir.mockReturnValue(abs("/test/project"));
       mockStat.mockResolvedValue({ isDirectory: () => true, isFile: () => false });
       mockReaddir.mockResolvedValue([]);
 
@@ -160,20 +168,20 @@ describe("path traversal protection", () => {
         path: "%2e%2e%2fsecret.txt",
         entries: [],
       });
-      expect(mockStat).toHaveBeenCalledWith("/test/project/%2e%2e%2fsecret.txt");
+      expect(mockStat).toHaveBeenCalledWith(abs("/test/project/%2e%2e%2fsecret.txt"));
     });
   });
 
   describe("via readProjectFile", () => {
     it("rejects path traversal attacks", async () => {
-      mockGetRootDir.mockReturnValue("/test/project");
+      mockGetRootDir.mockReturnValue(abs("/test/project"));
 
       await expect(readProjectFile(mockStore, "../.env")).rejects.toThrow(FileServiceError);
       await expect(readProjectFile(mockStore, "../.env")).rejects.toThrow("Path traversal detected");
     });
 
     it("rejects absolute paths", async () => {
-      mockGetRootDir.mockReturnValue("/test/project");
+      mockGetRootDir.mockReturnValue(abs("/test/project"));
 
       await expect(readProjectFile(mockStore, "/etc/passwd")).rejects.toThrow(FileServiceError);
       await expect(readProjectFile(mockStore, "/etc/passwd")).rejects.toThrow("Absolute paths not allowed");
@@ -182,21 +190,21 @@ describe("path traversal protection", () => {
 
   describe("via writeProjectFile", () => {
     it("rejects path traversal attacks", async () => {
-      mockGetRootDir.mockReturnValue("/test/project");
+      mockGetRootDir.mockReturnValue(abs("/test/project"));
 
       await expect(writeProjectFile(mockStore, "../.env", "evil")).rejects.toThrow(FileServiceError);
       await expect(writeProjectFile(mockStore, "../.env", "evil")).rejects.toThrow("Path traversal detected");
     });
 
     it("rejects null bytes in path", async () => {
-      mockGetRootDir.mockReturnValue("/test/project");
+      mockGetRootDir.mockReturnValue(abs("/test/project"));
 
       await expect(writeProjectFile(mockStore, "file\0.txt", "content")).rejects.toThrow(FileServiceError);
       await expect(writeProjectFile(mockStore, "file\0.txt", "content")).rejects.toThrow("Invalid characters");
     });
 
     it("rejects absolute paths", async () => {
-      mockGetRootDir.mockReturnValue("/test/project");
+      mockGetRootDir.mockReturnValue(abs("/test/project"));
 
       await expect(writeProjectFile(mockStore, "/etc/crontab", "evil")).rejects.toThrow(FileServiceError);
       await expect(writeProjectFile(mockStore, "/etc/crontab", "evil")).rejects.toThrow("Absolute paths not allowed");
@@ -205,7 +213,7 @@ describe("path traversal protection", () => {
 
   describe("via listFiles (task)", () => {
     it("rejects path traversal in task context", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetTask.mockResolvedValue({ id: "FN-123", worktree: undefined });
 
       await expect(listFiles(mockStore, "FN-123", "../other-task")).rejects.toThrow(FileServiceError);
@@ -213,7 +221,7 @@ describe("path traversal protection", () => {
     });
 
     it("rejects absolute paths in task context", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetTask.mockResolvedValue({ id: "FN-123", worktree: undefined });
 
       await expect(listFiles(mockStore, "FN-123", "/etc/passwd")).rejects.toThrow(FileServiceError);
@@ -222,7 +230,7 @@ describe("path traversal protection", () => {
 
   describe("via readFile (task)", () => {
     it("rejects path traversal when reading task files", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetTask.mockResolvedValue({ id: "FN-123", worktree: undefined });
 
       await expect(readFile(mockStore, "FN-123", "../../secret.txt")).rejects.toThrow(FileServiceError);
@@ -232,7 +240,7 @@ describe("path traversal protection", () => {
 
   describe("via writeFile (task)", () => {
     it("rejects path traversal when writing task files", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetTask.mockResolvedValue({ id: "FN-123", worktree: undefined });
 
       await expect(writeFile(mockStore, "FN-123", "../../outside.txt", "data")).rejects.toThrow(FileServiceError);
@@ -241,31 +249,31 @@ describe("path traversal protection", () => {
 
   describe("via workspace operations", () => {
     it("rejects path traversal in workspace file listing", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
 
       await expect(listWorkspaceFiles(mockStore, "project", "../../outside")).rejects.toThrow(FileServiceError);
     });
 
     it("rejects path traversal in workspace file read", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
 
       await expect(readWorkspaceFile(mockStore, "project", "../.env")).rejects.toThrow(FileServiceError);
     });
 
     it("rejects path traversal in workspace file write", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
 
       await expect(writeWorkspaceFile(mockStore, "project", "../.env", "data")).rejects.toThrow(FileServiceError);
     });
 
     it("rejects absolute paths in workspace file read", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
 
       await expect(readWorkspaceFile(mockStore, "project", "/etc/passwd")).rejects.toThrow(FileServiceError);
     });
 
     it("allows slash-prefixed workspace file reads when the project setting is enabled", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetSettings.mockResolvedValue({ allowAbsoluteFileBrowserPaths: true });
       mockStat.mockResolvedValue({
         isFile: () => true,
@@ -278,11 +286,11 @@ describe("path traversal protection", () => {
       const result = await readWorkspaceFile(mockStore, "project", "/tmp/file.txt");
 
       expect(result.content).toBe("absolute data");
-      expect(mockStat).toHaveBeenCalledWith("/tmp/file.txt");
+      expect(mockStat).toHaveBeenCalledWith(abs("/tmp/file.txt"));
     });
 
     it("allows slash-prefixed workspace directory listing when the project setting is enabled", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetSettings.mockResolvedValue({ allowAbsoluteFileBrowserPaths: true });
       mockStat
         .mockResolvedValueOnce({ isDirectory: () => true, isFile: () => false })
@@ -296,13 +304,13 @@ describe("path traversal protection", () => {
 
       const result = await listWorkspaceFiles(mockStore, "project", "/tmp");
 
-      expect(result.path).toBe("/tmp");
+      expect(result.path).toBe(abs("/tmp"));
       expect(result.entries).toEqual(expect.arrayContaining([expect.objectContaining({ name: "file.txt" })]));
     });
 
     it("allows slash-prefixed workspace reads for task worktree browsers when the project setting is enabled", async () => {
-      mockGetRootDir.mockReturnValue("/project");
-      mockGetTask.mockResolvedValue({ id: "FN-123", worktree: "/project/.worktrees/FN-123" });
+      mockGetRootDir.mockReturnValue(abs("/project"));
+      mockGetTask.mockResolvedValue({ id: "FN-123", worktree: abs("/project/.worktrees/FN-123") });
       mockGetSettings.mockResolvedValue({ allowAbsoluteFileBrowserPaths: true });
       mockAccess.mockResolvedValue(undefined);
       mockStat.mockResolvedValue({
@@ -316,12 +324,12 @@ describe("path traversal protection", () => {
       const result = await readWorkspaceFile(mockStore, "FN-123", "/tmp/file.txt");
 
       expect(result.content).toBe("absolute task browser data");
-      expect(mockAccess).toHaveBeenCalledWith("/project/.worktrees/FN-123");
-      expect(mockStat).toHaveBeenCalledWith("/tmp/file.txt");
+      expect(mockAccess).toHaveBeenCalledWith(abs("/project/.worktrees/FN-123"));
+      expect(mockStat).toHaveBeenCalledWith(abs("/tmp/file.txt"));
     });
 
     it("keeps project and task file APIs confined even when absolute file-browser paths are enabled", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetTask.mockResolvedValue({ id: "FN-123", worktree: undefined });
       mockGetSettings.mockResolvedValue({ allowAbsoluteFileBrowserPaths: true });
 
@@ -330,14 +338,14 @@ describe("path traversal protection", () => {
     });
 
     it("keeps Windows drive-letter paths blocked even when absolute file-browser paths are enabled", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetSettings.mockResolvedValue({ allowAbsoluteFileBrowserPaths: true });
 
       await expect(readWorkspaceFile(mockStore, "project", "C:/Users/name/file.txt")).rejects.toThrow("Absolute paths not allowed");
     });
 
     it("keeps percent-escaped text literal instead of decoding it into an absolute path", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetSettings.mockResolvedValue({ allowAbsoluteFileBrowserPaths: true });
       mockStat.mockResolvedValue({
         isFile: () => true,
@@ -350,12 +358,12 @@ describe("path traversal protection", () => {
       const result = await readWorkspaceFile(mockStore, "project", "%2Ftmp%2Fx");
 
       expect(result.content).toBe("literal percent data");
-      expect(mockStat).toHaveBeenCalledWith("/project/%2Ftmp%2Fx");
-      expect(mockReadFile).toHaveBeenCalledWith("/project/%2Ftmp%2Fx", "utf-8");
+      expect(mockStat).toHaveBeenCalledWith(abs("/project/%2Ftmp%2Fx"));
+      expect(mockReadFile).toHaveBeenCalledWith(abs("/project/%2Ftmp%2Fx"), "utf-8");
     });
 
     it("keeps malformed percent-encoded text literal in file-service paths", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetSettings.mockResolvedValue({ allowAbsoluteFileBrowserPaths: true });
       mockStat.mockResolvedValue({
         isFile: () => true,
@@ -368,11 +376,11 @@ describe("path traversal protection", () => {
       await expect(readWorkspaceFile(mockStore, "project", "%E0%A4%A")).resolves.toMatchObject({
         content: "malformed literal data",
       });
-      expect(mockStat).toHaveBeenCalledWith("/project/%E0%A4%A");
+      expect(mockStat).toHaveBeenCalledWith(abs("/project/%E0%A4%A"));
     });
 
     it("allows slash-prefixed workspace writes and directory creation when the project setting is enabled", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetSettings.mockResolvedValue({ allowAbsoluteFileBrowserPaths: true });
       mockStat
         .mockRejectedValueOnce({ code: "ENOENT" })
@@ -385,12 +393,12 @@ describe("path traversal protection", () => {
 
       await expect(writeWorkspaceFile(mockStore, "project", "/tmp/file.txt", "content")).resolves.toMatchObject({ success: true, size: 7 });
       await expect(createWorkspaceDirectory(mockStore, "project", "/tmp/new-dir")).resolves.toMatchObject({ success: true, path: "/tmp/new-dir" });
-      expect(mockWriteFile).toHaveBeenCalledWith("/tmp/file.txt", "content", "utf-8");
-      expect(mockMkdir).toHaveBeenCalledWith("/tmp/new-dir");
+      expect(mockWriteFile).toHaveBeenCalledWith(abs("/tmp/file.txt"), "content", "utf-8");
+      expect(mockMkdir).toHaveBeenCalledWith(abs("/tmp/new-dir"));
     });
 
     it("allows slash-prefixed workspace copy, move, delete, and rename operations when the project setting is enabled", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetSettings.mockResolvedValue({ allowAbsoluteFileBrowserPaths: true });
       mockStat
         .mockResolvedValueOnce({ isFile: () => true, isDirectory: () => false })
@@ -410,14 +418,14 @@ describe("path traversal protection", () => {
       await expect(moveWorkspaceFile(mockStore, "project", "/tmp/source.txt", "/tmp/moved.txt")).resolves.toMatchObject({ success: true });
       await expect(deleteWorkspaceFile(mockStore, "project", "/tmp/old.txt")).resolves.toMatchObject({ success: true });
       await expect(renameWorkspaceFile(mockStore, "project", "/tmp/name.txt", "renamed.txt")).resolves.toMatchObject({ success: true });
-      expect(mockCopyFile).toHaveBeenCalledWith("/tmp/source.txt", "/tmp/copy.txt");
-      expect(mockRename).toHaveBeenCalledWith("/tmp/source.txt", "/tmp/moved.txt");
-      expect(mockRm).toHaveBeenCalledWith("/tmp/old.txt");
-      expect(mockRename).toHaveBeenCalledWith("/tmp/name.txt", "/tmp/renamed.txt");
+      expect(mockCopyFile).toHaveBeenCalledWith(abs("/tmp/source.txt"), abs("/tmp/copy.txt"));
+      expect(mockRename).toHaveBeenCalledWith(abs("/tmp/source.txt"), abs("/tmp/moved.txt"));
+      expect(mockRm).toHaveBeenCalledWith(abs("/tmp/old.txt"));
+      expect(mockRename).toHaveBeenCalledWith(abs("/tmp/name.txt"), abs("/tmp/renamed.txt"));
     });
 
     it("allows slash-prefixed workspace file and folder downloads when the project setting is enabled", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockGetSettings.mockResolvedValue({ allowAbsoluteFileBrowserPaths: true });
       const fileMtime = new Date("2026-06-29T00:00:00.000Z");
       mockStat
@@ -425,12 +433,12 @@ describe("path traversal protection", () => {
         .mockResolvedValueOnce({ isFile: () => false, isDirectory: () => true });
 
       await expect(getWorkspaceFileForDownload(mockStore, "project", "/tmp/file.txt")).resolves.toMatchObject({
-        absolutePath: "/tmp/file.txt",
+        absolutePath: abs("/tmp/file.txt"),
         fileName: "file.txt",
         stats: { size: 11, mtime: fileMtime, isFile: true },
       });
       await expect(getWorkspaceFolderForZip(mockStore, "project", "/tmp/folder")).resolves.toMatchObject({
-        absolutePath: "/tmp/folder",
+        absolutePath: abs("/tmp/folder"),
         dirName: "folder",
       });
     });
@@ -438,20 +446,20 @@ describe("path traversal protection", () => {
 
   describe("complex path traversal patterns", () => {
     it("rejects nested path traversal", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
 
       await expect(listProjectFiles(mockStore, "foo/../../secret")).rejects.toThrow(FileServiceError);
     });
 
     it("rejects parent directory at root", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
 
       await expect(listProjectFiles(mockStore, "..")).rejects.toThrow(FileServiceError);
       await expect(listProjectFiles(mockStore, "../")).rejects.toThrow(FileServiceError);
     });
 
     it("allows valid relative paths with dots", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockStat.mockResolvedValue({
         isDirectory: () => true,
         isFile: () => false,
@@ -465,7 +473,7 @@ describe("path traversal protection", () => {
     });
 
     it("allows paths containing single dots in middle", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockStat.mockResolvedValue({
         isDirectory: () => true,
         isFile: () => false,
@@ -476,6 +484,25 @@ describe("path traversal protection", () => {
       const result = await listProjectFiles(mockStore, "src/./components");
       expect(result.path).toBe("src/components");
       expect(result.entries).toEqual([]);
+    });
+
+    it("returns forward-slash relative listing paths for nested directories on every platform", async () => {
+      mockGetRootDir.mockReturnValue(abs("/project"));
+      mockStat.mockResolvedValue({
+        isDirectory: () => true,
+        isFile: () => false,
+      });
+      mockReaddir.mockResolvedValue([]);
+
+      for (const [requested, expected] of [
+        ["src/./components", "src/components"],
+        ["docs/guides", "docs/guides"],
+        ["docs/guides/deep/nested", "docs/guides/deep/nested"],
+      ] as const) {
+        const result = await listProjectFiles(mockStore, requested);
+        expect(result.path).toBe(expected);
+        expect(result.path).not.toContain("\\");
+      }
     });
   });
 });
@@ -493,7 +520,7 @@ describe("listProjectFiles", () => {
   });
 
   it("throws FileServiceError with ENOENT for missing directory", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
     mockStat.mockRejectedValue({ code: "ENOENT" });
 
     await expect(listProjectFiles(mockStore, "missing")).rejects.toThrow(FileServiceError);
@@ -501,7 +528,7 @@ describe("listProjectFiles", () => {
   });
 
   it("throws FileServiceError with ENOTDIR for non-directory", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
     mockStat.mockResolvedValue({
       isDirectory: () => false,
       isFile: () => true,
@@ -524,7 +551,7 @@ describe("readProjectFile", () => {
   });
 
   it("enforces max file size limit (1MB)", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
     mockStat.mockResolvedValue({
       isFile: () => true,
       size: MAX_FILE_SIZE + 1,
@@ -536,7 +563,7 @@ describe("readProjectFile", () => {
   });
 
   it("throws FileServiceError with ENOENT for missing file", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
     mockStat.mockRejectedValue({ code: "ENOENT" });
 
     await expect(readProjectFile(mockStore, "missing.txt")).rejects.toThrow(FileServiceError);
@@ -544,7 +571,7 @@ describe("readProjectFile", () => {
   });
 
   it("throws FileServiceError when path is not a file", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
     mockStat.mockResolvedValue({
       isFile: () => false,
       isDirectory: () => true,
@@ -555,7 +582,7 @@ describe("readProjectFile", () => {
   });
 
   it("requires file path", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
 
     await expect(readProjectFile(mockStore, "")).rejects.toThrow(FileServiceError);
     await expect(readProjectFile(mockStore, "")).rejects.toThrow("File path is required");
@@ -575,7 +602,7 @@ describe("writeProjectFile", () => {
   });
 
   it("prevents writing to directories", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
     mockStat.mockResolvedValue({
       isDirectory: () => true,
       isFile: () => false,
@@ -586,7 +613,7 @@ describe("writeProjectFile", () => {
   });
 
   it("validates parent directory exists", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
     mockStat
       .mockRejectedValueOnce({ code: "ENOENT" }) // File doesn't exist
       .mockRejectedValueOnce({ code: "ENOENT" }); // Parent doesn't exist (this should throw)
@@ -595,7 +622,7 @@ describe("writeProjectFile", () => {
   });
 
   it("throws when parent is not a directory", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
     mockStat
       .mockRejectedValueOnce({ code: "ENOENT" }) // File doesn't exist
       .mockResolvedValueOnce({
@@ -607,14 +634,14 @@ describe("writeProjectFile", () => {
   });
 
   it("requires file path", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
 
     await expect(writeProjectFile(mockStore, "", "content")).rejects.toThrow(FileServiceError);
     await expect(writeProjectFile(mockStore, "", "content")).rejects.toThrow("File path is required");
   });
 
   it("enforces max content size", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
     const largeContent = "x".repeat(MAX_FILE_SIZE + 1);
 
     await expect(writeProjectFile(mockStore, "large.txt", largeContent)).rejects.toThrow(FileServiceError);
@@ -643,7 +670,7 @@ describe("task file operations", () => {
 
   describe("getTaskBasePath", () => {
     it("returns worktree path if it exists", async () => {
-      const worktreePath = "/worktrees/kb-123";
+      const worktreePath = abs("/worktrees/kb-123");
 
       mockGetTask.mockResolvedValue({
         id: "FN-123",
@@ -660,7 +687,7 @@ describe("task file operations", () => {
       const result = await readFile(mockStore, "FN-123", "PROMPT.md");
 
       expect(mockReadFile).toHaveBeenCalledWith(
-        "/worktrees/kb-123/PROMPT.md",
+        abs("/worktrees/kb-123/PROMPT.md"),
         "utf-8",
       );
       expect(result.content).toBe("Task content");
@@ -669,9 +696,9 @@ describe("task file operations", () => {
     it("falls back to task directory when worktree doesn't exist", async () => {
       mockGetTask.mockResolvedValue({
         id: "FN-123",
-        worktree: "/missing/worktree",
+        worktree: abs("/missing/worktree"),
       });
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockAccess.mockRejectedValue(new Error("not found"));
       mockStat.mockResolvedValue({
         isFile: () => true,
@@ -683,7 +710,7 @@ describe("task file operations", () => {
       await readFile(mockStore, "FN-123", "PROMPT.md");
 
       expect(mockReadFile).toHaveBeenCalledWith(
-        "/project/.fusion/tasks/FN-123/PROMPT.md",
+        abs("/project/.fusion/tasks/FN-123/PROMPT.md"),
         "utf-8",
       );
     });
@@ -693,7 +720,7 @@ describe("task file operations", () => {
         id: "FN-123",
         worktree: undefined,
       });
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockStat.mockResolvedValue({
         isFile: () => true,
         size: 100,
@@ -704,7 +731,7 @@ describe("task file operations", () => {
       await readFile(mockStore, "FN-123", "PROMPT.md");
 
       expect(mockReadFile).toHaveBeenCalledWith(
-        "/project/.fusion/tasks/FN-123/PROMPT.md",
+        abs("/project/.fusion/tasks/FN-123/PROMPT.md"),
         "utf-8",
       );
     });
@@ -743,7 +770,7 @@ describe("workspace operations", () => {
 
   describe("listWorkspaceFiles", () => {
     it('"project" workspace resolves to project root', async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockStat.mockResolvedValue({
         isDirectory: () => true,
         isFile: () => false,
@@ -768,7 +795,7 @@ describe("workspace operations", () => {
 
     it("task ID workspace resolves to task path", async () => {
       mockGetTask.mockResolvedValue({ id: "FN-456", worktree: undefined });
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       // First call: stat on the directory
       // Second call: stat on PROMPT.md entry
       mockStat
@@ -798,7 +825,7 @@ describe("workspace operations", () => {
 
   describe("readWorkspaceFile", () => {
     it("reads file from project workspace", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockStat.mockResolvedValue({
         isFile: () => true,
         size: 50,
@@ -810,14 +837,14 @@ describe("workspace operations", () => {
 
       expect(result.content).toBe("File contents");
       expect(mockReadFile).toHaveBeenCalledWith(
-        "/project/README.md",
+        abs("/project/README.md"),
         "utf-8",
       );
     });
 
     it("reads file from task workspace", async () => {
       mockGetTask.mockResolvedValue({ id: "FN-123", worktree: undefined });
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockStat.mockResolvedValue({
         isFile: () => true,
         size: 200,
@@ -829,7 +856,7 @@ describe("workspace operations", () => {
 
       expect(result.content).toBe("Task description");
       expect(mockReadFile).toHaveBeenCalledWith(
-        "/project/.fusion/tasks/FN-123/PROMPT.md",
+        abs("/project/.fusion/tasks/FN-123/PROMPT.md"),
         "utf-8",
       );
     });
@@ -837,7 +864,7 @@ describe("workspace operations", () => {
 
   describe("writeWorkspaceFile", () => {
     it("writes file to project workspace", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockStat
         .mockRejectedValueOnce({ code: "ENOENT" })
         .mockResolvedValueOnce({ isDirectory: () => true });
@@ -851,7 +878,7 @@ describe("workspace operations", () => {
 
       expect(result.success).toBe(true);
       expect(mockWriteFile).toHaveBeenCalledWith(
-        "/project/notes.txt",
+        abs("/project/notes.txt"),
         "My notes",
         "utf-8",
       );
@@ -859,7 +886,7 @@ describe("workspace operations", () => {
 
     it("writes file to task workspace", async () => {
       mockGetTask.mockResolvedValue({ id: "FN-123", worktree: undefined });
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockStat
         .mockRejectedValueOnce({ code: "ENOENT" })
         .mockResolvedValueOnce({ isDirectory: () => true });
@@ -873,7 +900,7 @@ describe("workspace operations", () => {
 
       expect(result.success).toBe(true);
       expect(mockWriteFile).toHaveBeenCalledWith(
-        "/project/.fusion/tasks/FN-123/output.txt",
+        abs("/project/.fusion/tasks/FN-123/output.txt"),
         "Task output",
         "utf-8",
       );
@@ -899,7 +926,7 @@ describe("hidden files visibility", () => {
 
   describe("listWorkspaceFiles", () => {
     it("includes hidden files (dotfiles) in workspace listing", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       // stat for the directory itself, then for each entry
       mockStat
         .mockResolvedValueOnce({ isDirectory: () => true, isFile: () => false, size: 0, mtime: new Date() })
@@ -923,7 +950,7 @@ describe("hidden files visibility", () => {
     });
 
     it("includes hidden directories (dot-directories) in workspace listing", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockStat
         .mockResolvedValueOnce({ isDirectory: () => true, isFile: () => false, size: 0, mtime: new Date() })
         .mockResolvedValueOnce({ isDirectory: () => true, isFile: () => false, size: 0, mtime: new Date() })
@@ -948,7 +975,7 @@ describe("hidden files visibility", () => {
     });
 
     it("includes mixed hidden and non-hidden entries with correct sort order", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       // Directory stat + 6 entry stats = 7 mock returns
       const dirStat = { isDirectory: () => true, isFile: () => false, size: 0, mtime: new Date() };
       const fileStat = (size: number) => ({ isDirectory: () => false, isFile: () => true, size, mtime: new Date() });
@@ -989,7 +1016,7 @@ describe("hidden files visibility", () => {
 
   describe("listProjectFiles", () => {
     it("includes hidden files and directories in project listing", async () => {
-      mockGetRootDir.mockReturnValue("/project");
+      mockGetRootDir.mockReturnValue(abs("/project"));
       mockStat
         .mockResolvedValueOnce({ isDirectory: () => true, isFile: () => false, size: 0, mtime: new Date() })
         .mockResolvedValueOnce({ isDirectory: () => false, isFile: () => true, size: 18, mtime: new Date() })
@@ -1022,7 +1049,7 @@ describe("URL-encoded characters handling", () => {
   });
 
   it("keeps percent-encoded characters literal in file-service paths", async () => {
-    mockGetRootDir.mockReturnValue("/test/project");
+    mockGetRootDir.mockReturnValue(abs("/test/project"));
     mockStat.mockResolvedValue({
       isFile: () => true,
       size: 100,
@@ -1033,7 +1060,7 @@ describe("URL-encoded characters handling", () => {
     await readProjectFile(mockStore, "file%20name.txt");
 
     expect(mockReadFile).toHaveBeenCalledWith(
-      "/test/project/file%20name.txt",
+      abs("/test/project/file%20name.txt"),
       "utf-8",
     );
   });
@@ -1056,7 +1083,7 @@ describe("copyWorkspaceFile", () => {
   });
 
   it("copies a file within the workspace", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     // stat for source (exists), stat for destination (ENOENT), stat for dest parent (exists)
     mockStat
       .mockResolvedValueOnce({ isFile: () => true, isDirectory: () => false, size: 100 })  // source
@@ -1069,11 +1096,11 @@ describe("copyWorkspaceFile", () => {
 
     expect(result.success).toBe(true);
     expect(result.message).toContain("Copied");
-    expect(mockCopyFile).toHaveBeenCalledWith("/project/src/file.ts", "/project/src/file-copy.ts");
+    expect(mockCopyFile).toHaveBeenCalledWith(abs("/project/src/file.ts"), abs("/project/src/file-copy.ts"));
   });
 
   it("copies a directory recursively", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat
       .mockResolvedValueOnce({ isFile: () => false, isDirectory: () => true })  // source is dir
       .mockRejectedValueOnce({ code: "ENOENT" })  // dest doesn't exist
@@ -1090,38 +1117,38 @@ describe("copyWorkspaceFile", () => {
     const result = await copyWorkspaceFile(mockStore, "project", "src", "src-copy");
 
     expect(result.success).toBe(true);
-    expect(mockMkdir).toHaveBeenCalledWith("/project/src-copy", { recursive: true });
-    expect(mockCopyFile).toHaveBeenCalledWith("/project/src/sub.ts", "/project/src-copy/sub.ts");
+    expect(mockMkdir).toHaveBeenCalledWith(abs("/project/src-copy"), { recursive: true });
+    expect(mockCopyFile).toHaveBeenCalledWith(abs("/project/src/sub.ts"), abs("/project/src-copy/sub.ts"));
   });
 
   it("rejects path traversal in source", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(copyWorkspaceFile(mockStore, "project", "../secret", "dest")).rejects.toThrow("Path traversal");
   });
 
   it("rejects path traversal in destination", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(copyWorkspaceFile(mockStore, "project", "file.ts", "../outside")).rejects.toThrow("Path traversal");
   });
 
   it("rejects missing source path", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(copyWorkspaceFile(mockStore, "project", "", "dest")).rejects.toThrow("Source path is required");
   });
 
   it("rejects missing destination path", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(copyWorkspaceFile(mockStore, "project", "file.ts", "")).rejects.toThrow("Destination path is required");
   });
 
   it("rejects when source does not exist", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockRejectedValueOnce({ code: "ENOENT" });
     await expect(copyWorkspaceFile(mockStore, "project", "missing.ts", "dest.ts")).rejects.toThrow("Source not found");
   });
 
   it("rejects when destination already exists", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat
       .mockResolvedValueOnce({ isFile: () => true })  // source exists
       .mockResolvedValueOnce({ isFile: () => true });  // dest exists
@@ -1129,7 +1156,7 @@ describe("copyWorkspaceFile", () => {
   });
 
   it("rejects when destination parent does not exist", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat
       .mockResolvedValueOnce({ isFile: () => true })  // source
       .mockRejectedValueOnce({ code: "ENOENT" })  // dest doesn't exist
@@ -1138,7 +1165,7 @@ describe("copyWorkspaceFile", () => {
   });
 
   it("rejects operating on workspace root", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     // Even though validatePath would resolve "." to the root, the function checks for it
     await expect(copyWorkspaceFile(mockStore, "project", ".", "dest")).rejects.toThrow("Cannot operate on workspace root");
   });
@@ -1159,7 +1186,7 @@ describe("moveWorkspaceFile", () => {
   });
 
   it("moves a file within the workspace", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat
       .mockResolvedValueOnce({ isFile: () => true })  // source exists
       .mockRejectedValueOnce({ code: "ENOENT" })  // dest doesn't exist
@@ -1171,27 +1198,27 @@ describe("moveWorkspaceFile", () => {
 
     expect(result.success).toBe(true);
     expect(result.message).toContain("Moved");
-    expect(mockRename).toHaveBeenCalledWith("/project/old.ts", "/project/new.ts");
+    expect(mockRename).toHaveBeenCalledWith(abs("/project/old.ts"), abs("/project/new.ts"));
   });
 
   it("rejects path traversal in source", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(moveWorkspaceFile(mockStore, "project", "../secret", "dest")).rejects.toThrow("Path traversal");
   });
 
   it("rejects path traversal in destination", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(moveWorkspaceFile(mockStore, "project", "file.ts", "../outside")).rejects.toThrow("Path traversal");
   });
 
   it("rejects when source does not exist", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockRejectedValueOnce({ code: "ENOENT" });
     await expect(moveWorkspaceFile(mockStore, "project", "missing.ts", "dest.ts")).rejects.toThrow("Source not found");
   });
 
   it("rejects when destination already exists", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat
       .mockResolvedValueOnce({ isFile: () => true })  // source
       .mockResolvedValueOnce({ isFile: () => true });  // dest exists
@@ -1199,7 +1226,7 @@ describe("moveWorkspaceFile", () => {
   });
 
   it("rejects missing source path", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(moveWorkspaceFile(mockStore, "project", "", "dest")).rejects.toThrow("Source path is required");
   });
 });
@@ -1217,7 +1244,7 @@ describe("deleteWorkspaceFile", () => {
   });
 
   it("deletes a file", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockResolvedValueOnce({ isFile: () => true, isDirectory: () => false });
     mockRm.mockResolvedValue(undefined);
 
@@ -1225,37 +1252,37 @@ describe("deleteWorkspaceFile", () => {
 
     expect(result.success).toBe(true);
     expect(result.message).toContain("Deleted");
-    expect(mockRm).toHaveBeenCalledWith("/project/src/old.ts");
+    expect(mockRm).toHaveBeenCalledWith(abs("/project/src/old.ts"));
   });
 
   it("deletes a directory recursively", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockResolvedValueOnce({ isFile: () => false, isDirectory: () => true });
     mockRm.mockResolvedValue(undefined);
 
     const result = await deleteWorkspaceFile(mockStore, "project", "src/olddir");
 
     expect(result.success).toBe(true);
-    expect(mockRm).toHaveBeenCalledWith("/project/src/olddir", { recursive: true });
+    expect(mockRm).toHaveBeenCalledWith(abs("/project/src/olddir"), { recursive: true });
   });
 
   it("rejects path traversal", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(deleteWorkspaceFile(mockStore, "project", "../secret")).rejects.toThrow("Path traversal");
   });
 
   it("rejects deleting workspace root", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(deleteWorkspaceFile(mockStore, "project", ".")).rejects.toThrow("Cannot delete workspace root");
   });
 
   it("rejects missing file path", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(deleteWorkspaceFile(mockStore, "project", "")).rejects.toThrow("File path is required");
   });
 
   it("rejects when file does not exist", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockRejectedValueOnce({ code: "ENOENT" });
     await expect(deleteWorkspaceFile(mockStore, "project", "missing.ts")).rejects.toThrow("Not found");
   });
@@ -1274,7 +1301,7 @@ describe("renameWorkspaceFile", () => {
   });
 
   it("renames a file", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     // stat: source exists, dest doesn't exist
     mockStat
       .mockResolvedValueOnce({ isFile: () => true })  // source
@@ -1286,11 +1313,11 @@ describe("renameWorkspaceFile", () => {
 
     expect(result.success).toBe(true);
     expect(result.message).toContain("Renamed");
-    expect(mockRename).toHaveBeenCalledWith("/project/old.ts", "/project/new.ts");
+    expect(mockRename).toHaveBeenCalledWith(abs("/project/old.ts"), abs("/project/new.ts"));
   });
 
   it("renames a directory", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat
       .mockResolvedValueOnce({ isDirectory: () => true })
       .mockRejectedValueOnce({ code: "ENOENT" });
@@ -1300,37 +1327,37 @@ describe("renameWorkspaceFile", () => {
     const result = await renameWorkspaceFile(mockStore, "project", "src/olddir", "newdir");
 
     expect(result.success).toBe(true);
-    expect(mockRename).toHaveBeenCalledWith("/project/src/olddir", "/project/src/newdir");
+    expect(mockRename).toHaveBeenCalledWith(abs("/project/src/olddir"), abs("/project/src/newdir"));
   });
 
   it("rejects path traversal", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(renameWorkspaceFile(mockStore, "project", "../secret", "newname")).rejects.toThrow("Path traversal");
   });
 
   it("rejects new name with path separator", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(renameWorkspaceFile(mockStore, "project", "file.ts", "sub/name.ts")).rejects.toThrow("path separators");
   });
 
   it("rejects new name with backslash", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(renameWorkspaceFile(mockStore, "project", "file.ts", "sub\\name.ts")).rejects.toThrow("path separators");
   });
 
   it("rejects empty new name", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(renameWorkspaceFile(mockStore, "project", "file.ts", "")).rejects.toThrow("New name is required");
   });
 
   it("rejects when file does not exist", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockRejectedValueOnce({ code: "ENOENT" });
     await expect(renameWorkspaceFile(mockStore, "project", "missing.ts", "new.ts")).rejects.toThrow("Not found");
   });
 
   it("rejects when a file with the new name already exists", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat
       .mockResolvedValueOnce({ isFile: () => true })  // source exists
       .mockResolvedValueOnce({ isFile: () => true });  // dest exists
@@ -1339,12 +1366,12 @@ describe("renameWorkspaceFile", () => {
   });
 
   it("rejects renaming workspace root", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(renameWorkspaceFile(mockStore, "project", ".", "newname")).rejects.toThrow("Cannot rename workspace root");
   });
 
   it("rejects null bytes in new name", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(renameWorkspaceFile(mockStore, "project", "file.ts", "bad\0name")).rejects.toThrow("path separators");
   });
 });
@@ -1362,7 +1389,7 @@ describe("getWorkspaceFileForDownload", () => {
 
   it("returns file info for download", async () => {
     const mtime = new Date("2024-01-15");
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockResolvedValue({
       isFile: () => true,
       isDirectory: () => false,
@@ -1372,14 +1399,14 @@ describe("getWorkspaceFileForDownload", () => {
 
     const result = await getWorkspaceFileForDownload(mockStore, "project", "src/file.ts");
 
-    expect(result.absolutePath).toBe("/project/src/file.ts");
+    expect(result.absolutePath).toBe(abs("/project/src/file.ts"));
     expect(result.fileName).toBe("file.ts");
     expect(result.stats.size).toBe(2048);
     expect(result.stats.isFile).toBe(true);
   });
 
   it("rejects directories", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockResolvedValue({
       isFile: () => false,
       isDirectory: () => true,
@@ -1389,23 +1416,23 @@ describe("getWorkspaceFileForDownload", () => {
   });
 
   it("rejects path traversal", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(getWorkspaceFileForDownload(mockStore, "project", "../secret")).rejects.toThrow("Path traversal");
   });
 
   it("rejects empty path", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(getWorkspaceFileForDownload(mockStore, "project", "")).rejects.toThrow("File path is required");
   });
 
   it("rejects non-existent file", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockRejectedValue({ code: "ENOENT" });
     await expect(getWorkspaceFileForDownload(mockStore, "project", "missing.ts")).rejects.toThrow("File not found");
   });
 
   it("rejects downloading workspace root", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(getWorkspaceFileForDownload(mockStore, "project", ".")).rejects.toThrow("Cannot download workspace root");
   });
 });
@@ -1422,7 +1449,7 @@ describe("getWorkspaceFolderForZip", () => {
   });
 
   it("returns directory info for zip download", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockResolvedValue({
       isFile: () => false,
       isDirectory: () => true,
@@ -1430,12 +1457,12 @@ describe("getWorkspaceFolderForZip", () => {
 
     const result = await getWorkspaceFolderForZip(mockStore, "project", "src");
 
-    expect(result.absolutePath).toBe("/project/src");
+    expect(result.absolutePath).toBe(abs("/project/src"));
     expect(result.dirName).toBe("src");
   });
 
   it("rejects files (not directories)", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockStat.mockResolvedValue({
       isFile: () => true,
       isDirectory: () => false,
@@ -1445,17 +1472,17 @@ describe("getWorkspaceFolderForZip", () => {
   });
 
   it("rejects path traversal", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(getWorkspaceFolderForZip(mockStore, "project", "../secret")).rejects.toThrow("Path traversal");
   });
 
   it("rejects empty path", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(getWorkspaceFolderForZip(mockStore, "project", "")).rejects.toThrow("Directory path is required");
   });
 
   it("rejects downloading workspace root as ZIP", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     await expect(getWorkspaceFolderForZip(mockStore, "project", ".")).rejects.toThrow("Cannot download workspace root as ZIP");
   });
 });
@@ -1477,7 +1504,7 @@ describe("moveWorkspaceFile EXDEV fallback", () => {
   });
 
   it("falls back to copy+delete on cross-device move (EXDEV)", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     // Source exists, destination doesn't exist, dest parent exists
     mockStat
       .mockResolvedValueOnce({ isFile: () => true, isDirectory: () => false })  // source exists (move check)
@@ -1499,8 +1526,8 @@ describe("moveWorkspaceFile EXDEV fallback", () => {
 
     expect(result.success).toBe(true);
     expect(result.message).toContain("Moved");
-    expect(mockCopyFile).toHaveBeenCalledWith("/project/file.ts", "/project/moved.ts");
-    expect(mockRm).toHaveBeenCalledWith("/project/file.ts");
+    expect(mockCopyFile).toHaveBeenCalledWith(abs("/project/file.ts"), abs("/project/moved.ts"));
+    expect(mockRm).toHaveBeenCalledWith(abs("/project/file.ts"));
   });
 });
 
@@ -1516,7 +1543,7 @@ describe("searchWorkspaceFiles", () => {
   });
 
   it("returns matching files filtered by query", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     // Mock: root has one subdir and one file
     mockReaddir.mockResolvedValueOnce([
@@ -1535,7 +1562,7 @@ describe("searchWorkspaceFiles", () => {
   });
 
   it("excludes common directories (node_modules, .git, etc.)", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     // Root has a subdir that will be excluded
     mockReaddir.mockResolvedValueOnce([
@@ -1555,7 +1582,7 @@ describe("searchWorkspaceFiles", () => {
   });
 
   it("limits results to 50 matches maximum", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     // Return 60 files to test the limit
     const manyFiles = Array.from({ length: 60 }, (_, i) => ({
@@ -1570,7 +1597,7 @@ describe("searchWorkspaceFiles", () => {
   });
 
   it("does not throw when a subdirectory cannot be read", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     // Root has two directories
     mockReaddir.mockResolvedValueOnce([
@@ -1592,7 +1619,7 @@ describe("searchWorkspaceFiles", () => {
   });
 
   it("returns empty array when no files match", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockResolvedValueOnce([
       { name: "src", isDirectory: () => true, isFile: () => false },
@@ -1608,7 +1635,7 @@ describe("searchWorkspaceFiles", () => {
   });
 
   it("supports case-insensitive matching", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockResolvedValueOnce([
       { name: "MyComponent.tsx", isDirectory: () => false, isFile: () => true },
@@ -1651,10 +1678,10 @@ describe("listProjectMarkdownFiles", () => {
   });
 
   it("returns markdown files from root and nested directories", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [
           fileEntry("README.md"),
           fileEntry("notes.txt"),
@@ -1662,7 +1689,7 @@ describe("listProjectMarkdownFiles", () => {
         ];
       }
 
-      if (targetPath === "/project/docs") {
+      if (targetPath === abs("/project/docs")) {
         return [fileEntry("guide.md")];
       }
 
@@ -1703,10 +1730,10 @@ describe("listProjectMarkdownFiles", () => {
   });
 
   it("skips node_modules, .git, .fusion, and dist directories", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [
           directoryEntry("node_modules"),
           directoryEntry(".git"),
@@ -1716,7 +1743,7 @@ describe("listProjectMarkdownFiles", () => {
         ];
       }
 
-      if (targetPath === "/project/docs") {
+      if (targetPath === abs("/project/docs")) {
         return [fileEntry("allowed.md")];
       }
 
@@ -1741,17 +1768,17 @@ describe("listProjectMarkdownFiles", () => {
       },
     ]);
 
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/node_modules", { withFileTypes: true });
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/.git", { withFileTypes: true });
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/.fusion", { withFileTypes: true });
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/dist", { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/node_modules"), { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/.git"), { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/.fusion"), { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/dist"), { withFileTypes: true });
   });
 
   it("omits hidden markdown files and markdown files inside hidden directories by default", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [
           fileEntry("README.md"),
           fileEntry(".secret.md"),
@@ -1760,11 +1787,11 @@ describe("listProjectMarkdownFiles", () => {
         ];
       }
 
-      if (targetPath === "/project/docs") {
+      if (targetPath === abs("/project/docs")) {
         return [fileEntry("guide.md")];
       }
 
-      if (targetPath === "/project/.hidden") {
+      if (targetPath === abs("/project/.hidden")) {
         return [fileEntry("internal.md")];
       }
 
@@ -1784,14 +1811,14 @@ describe("listProjectMarkdownFiles", () => {
       "docs/guide.md",
       "README.md",
     ]);
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/.hidden", { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/.hidden"), { withFileTypes: true });
   });
 
   it("includes hidden markdown files and hidden directories when showHidden is true", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [
           fileEntry("README.md"),
           fileEntry(".secret.md"),
@@ -1800,11 +1827,11 @@ describe("listProjectMarkdownFiles", () => {
         ];
       }
 
-      if (targetPath === "/project/docs") {
+      if (targetPath === abs("/project/docs")) {
         return [fileEntry("guide.md")];
       }
 
-      if (targetPath === "/project/.hidden") {
+      if (targetPath === abs("/project/.hidden")) {
         return [fileEntry("internal.md")];
       }
 
@@ -1829,10 +1856,10 @@ describe("listProjectMarkdownFiles", () => {
   });
 
   it("keeps hard-excluded directories hidden even when showHidden is true", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [
           directoryEntry(".git"),
           directoryEntry(".fusion"),
@@ -1841,11 +1868,11 @@ describe("listProjectMarkdownFiles", () => {
         ];
       }
 
-      if (targetPath === "/project/.hidden") {
+      if (targetPath === abs("/project/.hidden")) {
         return [fileEntry("internal.md")];
       }
 
-      if (targetPath === "/project/docs") {
+      if (targetPath === abs("/project/docs")) {
         return [fileEntry("guide.md")];
       }
 
@@ -1865,12 +1892,12 @@ describe("listProjectMarkdownFiles", () => {
       ".hidden/internal.md",
       "docs/guide.md",
     ]);
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/.git", { withFileTypes: true });
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/.fusion", { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/.git"), { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/.fusion"), { withFileTypes: true });
   });
 
   it("returns an empty list when no markdown files exist", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockResolvedValue([
       fileEntry("package.json"),
@@ -1884,10 +1911,10 @@ describe("listProjectMarkdownFiles", () => {
   });
 
   it("sorts markdown results alphabetically by path", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [
           fileEntry("zeta.md"),
           directoryEntry("docs"),
@@ -1895,7 +1922,7 @@ describe("listProjectMarkdownFiles", () => {
         ];
       }
 
-      if (targetPath === "/project/docs") {
+      if (targetPath === abs("/project/docs")) {
         return [fileEntry("middle.md")];
       }
 
@@ -1960,10 +1987,10 @@ describe("scanMarkdownFiles", () => {
   });
 
   it("finds markdown files in project root and nested directories", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [
           fileEntry("README.md"),
           fileEntry("notes.txt"),
@@ -1971,7 +1998,7 @@ describe("scanMarkdownFiles", () => {
         ];
       }
 
-      if (targetPath === "/project/docs") {
+      if (targetPath === abs("/project/docs")) {
         return [fileEntry("CONTRIBUTING.md")];
       }
 
@@ -2024,10 +2051,10 @@ describe("scanMarkdownFiles", () => {
   });
 
   it("excludes markdown files in blocked directories", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [
           directoryEntry(".git"),
           directoryEntry("node_modules"),
@@ -2038,7 +2065,7 @@ describe("scanMarkdownFiles", () => {
         ];
       }
 
-      if (targetPath === "/project/docs") {
+      if (targetPath === abs("/project/docs")) {
         return [fileEntry("README.md")];
       }
 
@@ -2057,26 +2084,26 @@ describe("scanMarkdownFiles", () => {
 
     expect(result).toHaveLength(1);
     expect(result[0].path).toBe("docs/README.md");
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/.git", { withFileTypes: true });
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/node_modules", { withFileTypes: true });
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/.fusion", { withFileTypes: true });
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/dist", { withFileTypes: true });
-    expect(mockReaddir).not.toHaveBeenCalledWith("/project/build", { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/.git"), { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/node_modules"), { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/.fusion"), { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/dist"), { withFileTypes: true });
+    expect(mockReaddir).not.toHaveBeenCalledWith(abs("/project/build"), { withFileTypes: true });
   });
 
   it("respects maxDepth when scanning nested directories", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [directoryEntry("level-1")];
       }
 
-      if (targetPath === "/project/level-1") {
+      if (targetPath === abs("/project/level-1")) {
         return [directoryEntry("level-2")];
       }
 
-      if (targetPath === "/project/level-1/level-2") {
+      if (targetPath === abs("/project/level-1/level-2")) {
         return [fileEntry("deep.md")];
       }
 
@@ -2100,7 +2127,7 @@ describe("scanMarkdownFiles", () => {
   });
 
   it("skips files that exceed max file size", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockResolvedValue([fileEntry("LARGE.md")]);
     mockStat.mockResolvedValue({
@@ -2116,7 +2143,7 @@ describe("scanMarkdownFiles", () => {
   });
 
   it("caps content preview to 200 characters", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockResolvedValue([fileEntry("README.md")]);
     mockStat.mockResolvedValue({
@@ -2135,14 +2162,14 @@ describe("scanMarkdownFiles", () => {
   });
 
   it("follows symlinked directories when they point to markdown files", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [symlinkEntry("docs-link")];
       }
 
-      if (targetPath === "/project/docs-link") {
+      if (targetPath === abs("/project/docs-link")) {
         return [fileEntry("linked.md")];
       }
 
@@ -2150,7 +2177,7 @@ describe("scanMarkdownFiles", () => {
     });
 
     mockStat.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project/docs-link") {
+      if (targetPath === abs("/project/docs-link")) {
         return {
           isDirectory: () => true,
           isFile: () => false,
@@ -2159,7 +2186,7 @@ describe("scanMarkdownFiles", () => {
         };
       }
 
-      if (targetPath === "/project/docs-link/linked.md") {
+      if (targetPath === abs("/project/docs-link/linked.md")) {
         return {
           isDirectory: () => false,
           isFile: () => true,
@@ -2184,11 +2211,11 @@ describe("scanMarkdownFiles", () => {
         contentPreview: "Linked markdown content",
       },
     ]);
-    expect(mockReaddir).toHaveBeenCalledWith("/project/docs-link", { withFileTypes: true });
+    expect(mockReaddir).toHaveBeenCalledWith(abs("/project/docs-link"), { withFileTypes: true });
   });
 
   it("returns an empty list when root directory has no entries", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
     mockReaddir.mockResolvedValue([]);
 
     const result = await scanMarkdownFiles(mockStore);
@@ -2199,14 +2226,14 @@ describe("scanMarkdownFiles", () => {
   });
 
   it("finds markdown files at depth 4 and deeper within maxDepth", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") return [directoryEntry("level-1")];
-      if (targetPath === "/project/level-1") return [directoryEntry("level-2")];
-      if (targetPath === "/project/level-1/level-2") return [directoryEntry("level-3")];
-      if (targetPath === "/project/level-1/level-2/level-3") return [directoryEntry("level-4")];
-      if (targetPath === "/project/level-1/level-2/level-3/level-4") return [fileEntry("deep.md")];
+      if (targetPath === abs("/project")) return [directoryEntry("level-1")];
+      if (targetPath === abs("/project/level-1")) return [directoryEntry("level-2")];
+      if (targetPath === abs("/project/level-1/level-2")) return [directoryEntry("level-3")];
+      if (targetPath === abs("/project/level-1/level-2/level-3")) return [directoryEntry("level-4")];
+      if (targetPath === abs("/project/level-1/level-2/level-3/level-4")) return [fileEntry("deep.md")];
       return [];
     });
 
@@ -2225,17 +2252,17 @@ describe("scanMarkdownFiles", () => {
   });
 
   it("does not treat directories with .md in the name as markdown files", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [
           directoryEntry("readme.md-backup"),
           fileEntry("actual.md"),
         ];
       }
 
-      if (targetPath === "/project/readme.md-backup") {
+      if (targetPath === abs("/project/readme.md-backup")) {
         return [fileEntry("notes.txt")];
       }
 
@@ -2243,7 +2270,7 @@ describe("scanMarkdownFiles", () => {
     });
 
     mockStat.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project/actual.md") {
+      if (targetPath === abs("/project/actual.md")) {
         return {
           isFile: () => true,
           isDirectory: () => false,
@@ -2252,7 +2279,7 @@ describe("scanMarkdownFiles", () => {
         };
       }
 
-      if (targetPath === "/project/readme.md-backup/notes.txt") {
+      if (targetPath === abs("/project/readme.md-backup/notes.txt")) {
         return {
           isFile: () => true,
           isDirectory: () => false,
@@ -2274,10 +2301,10 @@ describe("scanMarkdownFiles", () => {
   });
 
   it("returns files sorted by relative path", async () => {
-    mockGetRootDir.mockReturnValue("/project");
+    mockGetRootDir.mockReturnValue(abs("/project"));
 
     mockReaddir.mockImplementation(async (targetPath: string) => {
-      if (targetPath === "/project") {
+      if (targetPath === abs("/project")) {
         return [
           fileEntry("z-last.md"),
           directoryEntry("docs"),
@@ -2285,7 +2312,7 @@ describe("scanMarkdownFiles", () => {
         ];
       }
 
-      if (targetPath === "/project/docs") {
+      if (targetPath === abs("/project/docs")) {
         return [fileEntry("middle.md")];
       }
 
