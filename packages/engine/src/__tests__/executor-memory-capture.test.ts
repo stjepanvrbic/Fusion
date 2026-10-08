@@ -16,9 +16,14 @@ import {
 /**
  * Partial mock: keep every real @fusion/core symbol except `captureMemory`, which becomes a
  * deterministic spy so capture paths never attempt a real (or dangling-url) network write.
+ *
+ * FNXC:EngineTests 2026-10-08-08:47:
+ * KB-056: executor-test-helpers owns the file's `@fusion/core` mock (per-file worktree reservation domain), and its
+ * later registration replaces a test file's own `vi.mock("@fusion/core")`. Mock the defining core module instead;
+ * the barrel re-exports from it, so the harness mock's `importOriginal` carries this spy through.
  */
 const { mockCaptureMemory } = vi.hoisted(() => ({ mockCaptureMemory: vi.fn() }));
-vi.mock("@fusion/core", async (importOriginal) => {
+vi.mock("../../../core/src/memory/memory-backend.ts", async (importOriginal) => {
   const mod = await importOriginal<Record<string, unknown>>();
   return { ...mod, captureMemory: mockCaptureMemory };
 });

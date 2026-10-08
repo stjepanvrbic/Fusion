@@ -409,10 +409,9 @@ export default defineConfig({
             KB-048 rescued executor-prompt.test.ts into engine-default (not admitted to engine-core). FN-9510's zero agent creations were a fixed 50 ms sleep racing the unpause-resume chain on a loaded worker, masked by earlier tests' runs leaking into later ones; the file now awaits tracked listener/dispatch/run work and drains it per test, and its PR #32 pause fixtures were refreshed. The exclude and ledger row were removed in lockstep.
             */
             /*
-            FNXC:ExecutorTaskDoneSummaryQuarantine 2026-10-08-04:50:
-            Second Full Suite sighting of register entry 28: under shard load the executor returned from execute without opening the fn_task_done implementation session. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at the guarded in-place re-dispatch timer.
+            FNXC:ExecutorTaskDoneSummaryQuarantine 2026-10-08-09:04:
+            KB-056 rescued executor-task-done-summary.test.ts into engine-default (not admitted to engine-core). Files sharing the "/tmp/test" FN-001 path contended for one real worktree-reservation claim; a claim abandoned by a torn-down worker (shared pid under threads) stalled the next acquisition for 30 s while its routing dropped later executes. The executor harness now isolates reservation state per file and the file drains its in-place retry loop per test; the exclude and ledger row were removed in lockstep.
             */
-            "src/__tests__/executor-task-done-summary.test.ts",
             /*
             FNXC:AuthStorageDurabilityQuarantine 2026-10-08-11:22:
             Second Full Suite sighting of register entry 30: the hanging-refresh case polled fake timers for 200 iterations and the mocked fetch was still uncalled, on two different commits. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at the file and lock I/O the refresh path does before it calls fetch.

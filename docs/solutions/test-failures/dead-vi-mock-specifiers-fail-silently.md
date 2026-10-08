@@ -34,8 +34,9 @@ The repository guard is
 `packages/engine/src/__tests__/vi-mock-specifiers-resolve.test.ts`; run it directly
 when moving modules.
 
-At execution, the census contains **12 dead specifiers across 8 files**. The guard
-holds those temporary exceptions as `{ file, specifier }` pairs, not bare strings:
+At execution, the census contains **12 dead specifiers across 8 files** (3 entries across 3 files as of KB-046). The guard
+normalizes file keys to `/` separators so the scan also inspects files on Windows, and it
+fails if it inspects too few test files. It holds those temporary exceptions as `{ file, specifier }` pairs, not bare strings:
 `../run-audit.js` and `../reviewer.js` recur in several files, and a string-only
 allowlist would let a new defect hide behind another file's exception.
 

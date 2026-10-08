@@ -37,6 +37,13 @@ jobs:
         with:
           node-version: "20"
 
+      # FNXC:ThreatCrushAllowList 2026-10-08-04:53:
+      # The SARIF helper now decides which findings are known fixtures. A broken
+      # allow-list must fail the job here rather than silently hide or keep
+      # findings, so its unit tests run before any scan result is trusted.
+      - name: Self-test the SARIF helper
+        run: python3 -B .github/scripts/threatcrush-to-sarif.test.py
+
       # An unretried `npm i -g` is a network call to a registry that decides
       # whether a security gate runs at all. Retry before giving up; a
       # transient registry blip is not a security signal and should not read
@@ -144,10 +151,9 @@ jobs:
           code=0
 
           if [ "$NATIVE" = "true" ]; then
+            # --fail-on is not passed to the CLI: the threshold is evaluated
+            # once, by the allow-list filter below, on the filtered results.
             ARGS=(scan "$SCAN_PATH" --format sarif --output threatcrush.sarif)
-            if [ -n "$FAIL_ON" ]; then
-              ARGS+=(--fail-on "$FAIL_ON")
-            fi
             threatcrush "${ARGS[@]}" || code=$?
           else
             # Compatibility path for CLIs older than native SARIF. The
@@ -166,8 +172,7 @@ jobs:
               --input threatcrush-output.txt \
               --output threatcrush.sarif \
               --path-prefix "$PREFIX" \
-              --tool-version "$(threatcrush --version 2>/dev/null || echo unknown)" \
-              --fail-on "$FAIL_ON" || code=$?
+              --tool-version "$(threatcrush --version 2>/dev/null || echo unknown)" || code=$?
           fi
 
           # The SARIF file is the evidence that a scan happened, and it is the
@@ -181,12 +186,40 @@ jobs:
             exit 1
           fi
 
+          # FNXC:ThreatCrushAllowList 2026-10-08-04:53:
+          # PR #11 failed the ThreatCrush code-scanning check on four known
+          # fixtures (CI Postgres defaults, a test placeholder token). The
+          # reviewed allow-list in threatcrush-to-sarif.py removes only results
+          # whose rule, exact path, and actual checkout line all match, so every
+          # consumer below (Security tab upload, report, artifact) sees the
+          # filtered file, from the native and compat paths alike. A real secret
+          # elsewhere, including in the same files, is kept and still fails the
+          # check. --exclude / .threatcrushignore were rejected because they
+          # hide whole files. The filter fails closed: exit 2 means the file was
+          # not trusted, never a clean scan. --fail-on is evaluated here only.
+          FILTER_ARGS=(--filter-sarif threatcrush.sarif --repo-root "$GITHUB_WORKSPACE")
+          if [ -n "$FAIL_ON" ]; then
+            FILTER_ARGS+=(--fail-on "$FAIL_ON")
+          fi
+          filter_code=0
+          python3 -B .github/scripts/threatcrush-to-sarif.py "${FILTER_ARGS[@]}" || filter_code=$?
+          case "$filter_code" in
+            0) ;;
+            1) code=1 ;;
+            *)
+              echo "status=error" >> "$GITHUB_OUTPUT"
+              echo "::error::SARIF allow-list filter failed — results not trusted"
+              exit 1
+              ;;
+          esac
+
           case "$code" in
             0) echo "status=clean" >> "$GITHUB_OUTPUT" ;;
             # Exit 1 *with* a SARIF file is the documented "findings at or
-            # above --fail-on" result. Without one it was caught above. The CLI
-            # only returns 1 when --fail-on was passed, so propagate it: a gate
-            # that records the finding and then lets the job pass is not a gate.
+            # above --fail-on" result. Without one it was caught above. The
+            # filter only returns 1 when --fail-on was passed, so propagate it: a
+            # gate that records the finding and then lets the job pass is not a
+            # gate. A CLI exit 1 (no --fail-on is passed to it) is kept too.
             1)
               echo "status=findings" >> "$GITHUB_OUTPUT"
               exit 1
@@ -245,12 +278,24 @@ jobs:
               )
 
           status = os.environ.get("SCAN_STATUS", "")
+          suppressed = []
           try:
-              with open("threatcrush.sarif") as handle:
-                  results = json.load(handle)["runs"][0]["results"]
+              with open("threatcrush.sarif", encoding="utf-8") as handle:
+                  run = json.load(handle)["runs"][0]
+              results = run["results"]
           except Exception as err:
               results = None
               print(f"::warning::could not read SARIF: {err}")
+          else:
+              # FNXC:ThreatCrushAllowList 2026-10-08-04:53:
+              # Every finding the allow-list quieted is listed by name in the
+              # report so nothing disappears silently. A missing or malformed
+              # record renders nothing extra and never changes NOT RUN logic.
+              try:
+                  records = (run.get("properties") or {}).get("fusion/knownFixtureSuppressions") or []
+                  suppressed = [r for r in records if isinstance(r, dict)] if isinstance(records, list) else []
+              except Exception:
+                  suppressed = []
 
           lines = ["## ThreatCrush Security Scan", ""]
 
@@ -316,7 +361,15 @@ jobs:
               else:
                   lines.append("No findings.")
 
-          with open(os.environ["RUNNER_TEMP"] + "/threatcrush-comment.md", "w") as handle:
+              if suppressed:
+                  lines += ["", f"_{len(suppressed)} known fixture(s) suppressed by the allow-list:_", ""]
+                  for record in suppressed:
+                      lines.append(
+                          f"- `{cell(record.get('fixtureId', '?'))}` — "
+                          f"`{cell(record.get('uri', '?'))}`:{cell(record.get('startLine', '?'))}"
+                      )
+
+          with open(os.environ["RUNNER_TEMP"] + "/threatcrush-comment.md", "w", encoding="utf-8") as handle:
               handle.write("\n".join(lines) + "\n")
           PYEOF
         env:

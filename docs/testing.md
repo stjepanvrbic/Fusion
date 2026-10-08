@@ -1042,9 +1042,33 @@ the cache useful across a normal work week.
 
 ## Windows Full Suite lane
 
-The non-blocking `test-windows` job runs the merge gate plus the full core and engine suites on `windows-latest`. Some files still fail on Windows only; they are listed in `scripts/lib/windows-known-failing-tests.json`. Each lane writes a Vitest JSON report, and `scripts/check-windows-known-failing.mjs` fails the job only when a file outside that list fails, the report is missing, or the lane exits nonzero with no failing file. The job summary lists every result. A listed file that now passes produces a warning: remove it and lower the ledger's `ceiling`. The ledger may only shrink; a new Windows-only failure is fixed or quarantined under the normal rules.
+The non-blocking `test-windows` job runs the merge gate plus the full core, engine, dashboard-api, CLI and `scripts/__tests__` suites on `windows-latest`. Some files still fail on Windows only; they are listed in `scripts/lib/windows-known-failing-tests.json`. Each lane writes a Vitest JSON report, and `scripts/check-windows-known-failing.mjs` fails the job only when a file outside that list fails, the report is missing, or the lane exits nonzero with no failing file. The job summary lists every result. A listed file that now passes produces a warning: remove it and lower the ledger's `ceiling`. The ledger may only shrink; a new Windows-only failure is fixed or quarantined under the normal rules.
 
 Core tests must stay Windows-runnable: a fake native client (such as `pg_dump`) is a Node script launched through `packages/core/src/__tests__/_fake-pg-client.ts`, not an extensionless shebang file, and tests must not shell out to `psql` or GNU `tar` (use the harness admin helper and the `tar` npm package).
+
+The job is a matrix of eight parallel legs: `gate`, `core-1`/`core-2` (core `--shard=1/2` and `2/2`), `engine-1`/`engine-2`, `dashboard`, `cli` and `scripts`. Each core and engine shard runs with `VITEST_MAX_WORKERS=1` and its own 75-minute step budget, under a 120-minute job backstop. One worker per shard gives every test a fixed CPU share that does not depend on the runner's core count, so a slow runner does not turn healthy tests into 15-second timeouts. Running the shards in parallel keeps wall time bounded. Timeouts are never widened. Each shard writes `.windows-lane/<lane>.json` and `.windows-lane/<lane>.exit`. A known file that belongs to the other shard simply does not appear in this shard's report, so it produces neither a failure nor a now-passing warning.
+
+The `dashboard`, `cli` and `scripts` legs are not sharded. They are keyed on `matrix.suite` (the comparator package key) and share one compare step:
+
+- `dashboard` runs the `dashboard-api` Vitest project with `FUSION_DASHBOARD_DEEP=1` (without it the project matches nothing). It does not run `dashboard-app` (jsdom) or the curated quality projects.
+- `cli` runs the `@runfusion/fusion` Vitest suite.
+- `scripts` runs `node scripts/run-script-tests.mjs`. node:test has no Vitest JSON reporter, so `scripts/lib/node-test-json-reporter.mjs` writes the comparator's report shape. `run-script-tests.mjs` forwards `--test-reporter` and `--test-reporter-destination` flags (both `--flag=value` and `--flag value` forms) to `node --test` and treats every other argument as a test file, exactly as before. A file fails when any of its tests or its load fails; `skip` and `todo` tests never fail a file.
+
+Dashboard and CLI legs pin `VITEST_MAX_WORKERS=1` with a 60-minute step budget; the scripts leg has a 30-minute budget.
+
+Ledger keys and path spellings (forward slashes, relative to the package directory):
+
+| Key | Directory | Entry shape |
+|---|---|---|
+| `@fusion/core` | `packages/core` | `src/...test.ts(x)` |
+| `@fusion/engine` | `packages/engine` | `src/...test.ts(x)` |
+| `@fusion/dashboard` | `packages/dashboard` | `src/...test.ts(x)` |
+| `@runfusion/fusion` | `packages/cli` | `src/...test.ts(x)` |
+| `scripts` | `scripts` | `__tests__/<name>.test.mjs` |
+
+The ledger test validates every key against the comparator's exported `PACKAGE_DIRS`. A package with no ledger key has no known failures.
+
+The comparator's summary has a separate **Load timeouts** section. A failing file is listed there only when its report contains at least one Vitest `Test timed out in Nms` / `Hook timed out in Nms` message and no other failure message. A failure with no captured message counts as a real failure. The section is informational: an unexpected timeout-only file still fails the shard, and the reason line says when all unexpected files are timeout-only (runner load suspected). A timeout-only failure is not grounds to add a ledger entry; rerun the shard or investigate the runner instead.
 
 To run the engine census locally, use Git Bash at the repository root on a Windows host:
 
@@ -1052,6 +1076,21 @@ To run the engine census locally, use Git Bash at the repository root on a Windo
 pnpm --filter @fusion/engine test --reporter=json --outputFile.json=../../.windows-lane/engine.json; echo $? > .windows-lane/engine.exit
 node scripts/check-windows-known-failing.mjs --package @fusion/engine --report .windows-lane/engine.json --exit-code .windows-lane/engine.exit
 ```
+
+Dashboard, CLI and scripts censuses, also from the repository root in Git Bash after `pnpm build`:
+
+```bash
+FUSION_DASHBOARD_DEEP=1 NODE_OPTIONS=--max-old-space-size=6144 pnpm --filter @fusion/dashboard exec vitest run --project dashboard-api --silent=passed-only --reporter=dot --reporter=json --outputFile.json=../../.windows-lane/dashboard.json; echo $? > .windows-lane/dashboard.exit
+node scripts/check-windows-known-failing.mjs --package @fusion/dashboard --report .windows-lane/dashboard.json --exit-code .windows-lane/dashboard.exit
+
+pnpm --filter @runfusion/fusion test --reporter=json --outputFile.json=../../.windows-lane/cli.json; echo $? > .windows-lane/cli.exit
+node scripts/check-windows-known-failing.mjs --package @runfusion/fusion --report .windows-lane/cli.json --exit-code .windows-lane/cli.exit
+
+node scripts/run-script-tests.mjs --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./scripts/lib/node-test-json-reporter.mjs --test-reporter-destination=.windows-lane/scripts.json; echo $? > .windows-lane/scripts.exit
+node scripts/check-windows-known-failing.mjs --package scripts --report .windows-lane/scripts.json --exit-code .windows-lane/scripts.exit
+```
+
+To reproduce one CI shard, add `--shard=1/2` to the test command, set `VITEST_MAX_WORKERS=1`, and pass `--label "engine-1 (shard 1/2)"` to the comparator.
 
 `.windows-lane/` is gitignored. To check only the ledgered files, pass them to `pnpm --filter @fusion/engine exec vitest run <files> --reporter=json --outputFile.json=<report>` and run the comparator on that report.
 
@@ -1064,7 +1103,7 @@ Windows-safe test conventions:
 - **Drive-less absolute paths:** the runner checks out on `D:` with temp on `C:`. A drive-less absolute setting such as `/var/tmp/x` resolves against the project root's drive, so derive expectations with `resolve(rootDir, "/var/tmp/x")`, not `resolve("/var/tmp/x")`.
 - **Git long paths:** real-git fixtures nested deep under temp can exceed Git for Windows' MAX_PATH (`failed to stat '<sha>...<sha>': Filename too long`). Set `core.longpaths true` on the fixture repo; it is a no-op elsewhere.
 
-The dashboard, CLI and `scripts/__tests__` suites have no Windows CI lane yet, so the ledger and comparator do not cover them. Their named Windows failures were fixed in KB-036. Its `windows-census` task document lists the remaining Windows-only failures, mostly in `packages/cli/src/commands/__tests__/`. Keep new tests in those suites portable:
+The dashboard, CLI and scripts suites joined the Windows lane in KB-062, after KB-036 fixed their named Windows failures. Their ledger entries are limited to CLI files still open on KB-061 (KB-036 census class c) that failed in a local win32 census; the dashboard and scripts keys have no entries. Seeding a newly covered package was a one-time scope extension, and the ledger still may only shrink. Any other Windows failure in these suites shows as unexpected until it is fixed. Keep new tests in those suites portable:
 
 - Derive expected absolute paths with `path.resolve` (`resolve("/project")` is the identity on POSIX and `C:\project` on Windows) instead of comparing POSIX literals. Build file URLs with `pathToFileURL(resolve(...))`.
 - Compare relative paths `/`-normalized (`relative(a, b).split(path.sep).join("/")`), and key in-memory fs fakes with the same `path.join` the product uses.

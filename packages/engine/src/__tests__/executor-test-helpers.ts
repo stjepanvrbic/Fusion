@@ -1,5 +1,6 @@
-import { vi } from "vitest";
+import { afterAll, vi } from "vitest";
 import type { Mock } from "vitest";
+import { removeIsolatedReservationRoot } from "./worktree-reservation-isolation.js";
 import { DEFAULT_MAX_POST_REVIEW_FIXES, type Task } from "@fusion/core";
 import { installTaskWorktreeIdentityGuard } from "../worktree/worktree-hooks.js";
 import type * as ReviewerModule from "../execution/reviewer.js";
@@ -32,6 +33,20 @@ vi.mock("../executor.js", async (importOriginal) => {
   }
   return { ...actual, TaskExecutor: DefaultRoutedTaskExecutor };
 });
+
+/*
+FNXC:EngineTests 2026-10-08-08:47:
+KB-056: every file using this harness gets a private worktree-reservation domain, so a claim held or abandoned by
+another file's executor (shared pid under `pool: "threads"`, shared "/tmp/test" FN-001 path) can never stall this
+file's acquisition for the 30 s `acquireTimeoutMs`. See worktree-reservation-isolation.ts for the proven race. This
+registration replaces a test file's own `vi.mock("@fusion/core")`, so such files mock the defining core module instead.
+*/
+vi.mock("@fusion/core", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  const { createIsolatedCoreMock } = await import("./worktree-reservation-isolation.js");
+  return createIsolatedCoreMock(actual);
+});
+afterAll(removeIsolatedReservationRoot);
 
 // Mock external dependencies
 vi.mock("../pi.js", () => ({

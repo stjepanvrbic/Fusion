@@ -508,7 +508,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
   Windows is the operator's primary platform, yet every test job ran on ubuntu-latest, so POSIX-only fixtures and separator assumptions landed unseen.
   Every first-class platform needs at least one CI test signal: a non-blocking windows-latest job runs the merge gate plus the core and engine unit lanes against the image's preinstalled PostgreSQL.
   */
-  it("gives Windows a non-blocking test signal: gate, core and engine lanes", () => {
+  it("gives Windows a non-blocking test signal: gate, core, engine, dashboard, CLI and scripts lanes", () => {
     const windowsJobs = Object.entries(workflow.jobs ?? {}).filter(([, job]: [string, any]) =>
       String(job?.["runs-on"] ?? "").startsWith("windows"));
     expect(windowsJobs.map(([name]) => name)).toEqual(["test-windows"]);
@@ -521,7 +521,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     expect(indexOf("pnpm config set script-shell")).toBeGreaterThanOrEqual(0);
     const build = indexOf("pnpm build");
     expect(build).toBeGreaterThan(indexOf("pnpm config set script-shell"));
-    for (const lane of ["pnpm test:gate", "pnpm --filter @fusion/core test", "pnpm --filter @fusion/engine test"]) {
+    for (const lane of ["pnpm test:gate", "pnpm --filter ${{ matrix.package }} test"]) {
       expect(indexOf(lane)).toBeGreaterThan(build);
       expect(indexOf(lane)).toBeGreaterThan(indexOf("Start-Service"));
     }
@@ -532,14 +532,79 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     Vitest JSON report and exit code, then the known-failing comparator decides the step. No step may use continue-on-error.
     */
     expect((job?.steps ?? []).some((step: any) => step["continue-on-error"] !== undefined)).toBe(false);
-    for (const [pkg, short] of [["@fusion/core", "core"], ["@fusion/engine", "engine"]] as const) {
-      const lane = indexOf(`pnpm --filter ${pkg} test`);
-      expect(runs[lane]).toContain(`--outputFile.json=../../.windows-lane/${short}.json`);
-      expect(runs[lane]).toContain(`> .windows-lane/${short}.exit`);
-      const compare = indexOf(`check-windows-known-failing.mjs --package ${pkg}`);
-      expect(compare).toBe(lane + 1);
-      expect(runs[compare]).toContain(`--report .windows-lane/${short}.json --exit-code .windows-lane/${short}.exit`);
+
+    /*
+    FNXC:CI 2026-10-08-08:51:
+    Run 37720611351 turned the lane red with load-only timeouts. The job is a five-leg matrix (gate plus core and engine shards 1/2 and 2/2)
+    so each unit shard runs with exactly one Vitest worker, a per-test CPU share that does not depend on runner size, under its own step budget.
+    Each shard records its own report and exit file keyed on matrix.lane, and the comparator still decides the step.
+    */
+    expect(job?.strategy?.["fail-fast"]).toBe(false);
+    const legs: any[] = job?.strategy?.matrix?.include ?? [];
+    expect(legs.filter((leg) => leg.lane === "gate")).toEqual([{ lane: "gate" }]);
+    for (const pkg of ["@fusion/core", "@fusion/engine"]) {
+      expect(legs.filter((leg) => leg.package === pkg).map((leg) => leg.shard).sort()).toEqual(["1/2", "2/2"]);
     }
+    /*
+    FNXC:CI 2026-10-08-13:40:
+    KB-062 adds unsharded dashboard-api, CLI and scripts legs so KB-036's Windows fixes there cannot regress unseen.
+    Each is keyed on matrix.suite (the comparator package key) and matrix.lane (the report/exit file name).
+    */
+    const suites: Array<[string, string]> = [["@fusion/dashboard", "dashboard"], ["@runfusion/fusion", "cli"], ["scripts", "scripts"]];
+    for (const [suite, short] of suites) {
+      expect(legs.filter((leg) => leg.suite === suite)).toEqual([{ lane: short, suite }]);
+    }
+    expect(legs).toHaveLength(8);
+
+    const steps: any[] = job?.steps ?? [];
+    const gate = indexOf("pnpm test:gate");
+    expect(String(steps[gate]?.if)).toContain("matrix.lane == 'gate'");
+    const lane = indexOf("pnpm --filter ${{ matrix.package }} test --shard=${{ matrix.shard }}");
+    expect(lane).toBeGreaterThan(gate);
+    expect(runs[lane]).toContain("--outputFile.json=../../.windows-lane/${{ matrix.lane }}.json");
+    expect(runs[lane]).toContain("> .windows-lane/${{ matrix.lane }}.exit");
+    expect(String(steps[lane]?.if)).toContain("matrix.package");
+    expect(steps[lane]?.env?.VITEST_MAX_WORKERS).toBe("1");
+    expect(typeof steps[lane]?.["timeout-minutes"]).toBe("number");
+    expect(steps[lane]["timeout-minutes"]).toBeLessThan(job["timeout-minutes"]);
+    const compare = indexOf("check-windows-known-failing.mjs --package ${{ matrix.package }}");
+    expect(compare).toBe(lane + 1);
+    expect(String(steps[compare]?.if)).toContain("matrix.package");
+    expect(runs[compare]).toContain("--report .windows-lane/${{ matrix.lane }}.json --exit-code .windows-lane/${{ matrix.lane }}.exit");
+
+    const suiteCompare = indexOf("check-windows-known-failing.mjs --package ${{ matrix.suite }}");
+    expect(String(steps[suiteCompare]?.if)).toContain("matrix.suite");
+    expect(String(steps[suiteCompare]?.if)).toContain("!cancelled()");
+    expect(runs[suiteCompare]).toContain("--label");
+    expect(runs[suiteCompare]).toContain("--report .windows-lane/${{ matrix.lane }}.json --exit-code .windows-lane/${{ matrix.lane }}.exit");
+    const laneCommands: Record<string, string> = {
+      dashboard: "pnpm --filter @fusion/dashboard exec vitest run --project dashboard-api",
+      cli: "pnpm --filter @runfusion/fusion test",
+      scripts: "node scripts/run-script-tests.mjs",
+    };
+    const suiteLanes = suites.map(([, short]) => indexOf(laneCommands[short]));
+    suites.forEach(([, short], i) => {
+      const at = suiteLanes[i];
+      expect(at).toBeGreaterThan(build);
+      expect(at).toBeGreaterThan(compare);
+      expect(at).toBeLessThan(suiteCompare);
+      expect(String(steps[at]?.if)).toContain(`matrix.lane == '${short}'`);
+      expect(String(steps[at]?.if)).toContain("!cancelled()");
+      expect(steps[at]?.shell).toBe("bash");
+      expect(typeof steps[at]?.["timeout-minutes"]).toBe("number");
+      expect(steps[at]["timeout-minutes"]).toBeLessThan(job["timeout-minutes"]);
+      expect(runs[at]).toContain("set +e");
+      expect(runs[at]).toContain(`> .windows-lane/${short}.exit`);
+    });
+    // The shared compare step sits directly after the last suite lane.
+    expect(suiteCompare).toBe(Math.max(...suiteLanes) + 1);
+    const [dashboardLane, cliLane, scriptsLane] = suiteLanes;
+    expect(runs[dashboardLane]).toContain("FUSION_DASHBOARD_DEEP=1");
+    expect(runs[dashboardLane]).toContain("--outputFile.json=../../.windows-lane/dashboard.json");
+    expect(steps[dashboardLane]?.env?.VITEST_MAX_WORKERS).toBe("1");
+    expect(runs[cliLane]).toContain("--outputFile.json=../../.windows-lane/cli.json");
+    expect(steps[cliLane]?.env?.VITEST_MAX_WORKERS).toBe("1");
+    expect(runs[scriptsLane]).toContain("--test-reporter=./scripts/lib/node-test-json-reporter.mjs --test-reporter-destination=.windows-lane/scripts.json");
   });
 
   /*

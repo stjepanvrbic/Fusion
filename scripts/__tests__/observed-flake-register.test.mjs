@@ -219,6 +219,12 @@ loaded) and landed a deterministic test wait. It stays an active first sighting;
 FNXC:TestFlakeRegister 2026-10-08-07:19:
 KB-043 recorded the operator-reported transient sqlite-migrator SQLite open failures as active entry 37 (renumbered at merge; main had taken 33 through 36), so the
 pinned active inventory gains that record; the signal-routes teardown flake was already entry 25.
+
+FNXC:TestFlakeRegister 2026-10-08-13:59:
+Entry 38 records a first sighting from the fork's Full Suite: the ModelOnboardingModal Copilot device-code case read the
+clipboard mock before the auto-copy effect's call was observable. The commit under test touched no dashboard app file and
+the mechanism is unmeasured, so a second appearance follows the file-level quarantine rule instead of a timeout, retry,
+or weakened assertion.
 */
 /*
 FNXC:TestFlakeRegister 2026-10-08-01:13:
@@ -279,6 +285,10 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "37. SQLite-to-PostgreSQL migrator transient SQLite open failure",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+    },
+    {
+      heading: "38. ModelOnboardingModal GitHub Copilot device-code panel clipboard auto-copy",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
   ]);

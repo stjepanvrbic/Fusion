@@ -12,11 +12,6 @@
       "quarantinedAt": "2026-10-07"
     },
     {
-      "file": "packages/engine/src/__tests__/executor-task-done-summary.test.ts",
-      "reason": "Second sighting: https://github.com/stjepanvrbic/Fusion/actions/runs/37717586213 (08361ff9c) and https://github.com/stjepanvrbic/Fusion/actions/runs/37720611351 (a05be4484), both Linux Test shard 2/4 engine-default; first case timed out at 30s and four cases saw no fn_task_done implementation session; register entry 28. Product-race smell: audit PR #32's guarded in-place executor re-dispatch timer, and the second executor-subsystem quarantine after executor-prompt.",
-      "quarantinedAt": "2026-10-08"
-    },
-    {
       "file": "packages/dashboard/app/components/__tests__/PlanningModeModal.ui-interactions.test.tsx",
       "reason": "Second sighting of one parametrized test: https://github.com/stjepanvrbic/Fusion/actions/runs/37702452940 (41950446a, mobile row, Other input not rendered after the radio click) and https://github.com/stjepanvrbic/Fusion/actions/runs/37735335086 (90619eba9, desktop row, respondToPlanning never called after Next), both Linux Test shard 3/4 dashboard-app-quality-backfill; register entry 26. Product-race smell: third Planning Mode quarantine after entries 22 and 23.",
       "quarantinedAt": "2026-10-08"
