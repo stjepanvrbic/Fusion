@@ -18,16 +18,35 @@ function resolveBin(command: string, cwd: string): string {
   return resolve(workspaceRoot, "node_modules", ".bin", `${command}${suffix}`);
 }
 
+/**
+ * Builds the spawn command and shell flag for an absolute `node_modules/.bin` shim path.
+ *
+ * FNXC:DesktopWindowsSpawn 2026-10-08-04:41:
+ * On Windows workspace bins are `.cmd` shims, and Node >= 20.12 refuses to spawn `.cmd`/`.bat` without a shell (EINVAL, CVE-2024-27980).
+ * With `shell: true` Node runs `cmd.exe /d /s /c "<command> <args>"`; `/s` strips only the outer quotes, so a double-quoted command path survives intact.
+ * Quoting is required because absolute bin paths live under user profiles that can contain spaces (e.g. `C:\Users\Jane Doe`).
+ * Other platforms spawn the raw path with no shell, unchanged.
+ * This is the single place that decides shell/quoting for workspace bins; `dev.ts` and `runWorkspaceBin` both use it.
+ */
+export function workspaceBinSpawnCommand(
+  binPath: string,
+  platform: NodeJS.Platform = process.platform,
+): { command: string; shell: boolean } {
+  if (platform === "win32") {
+    return { command: `"${binPath}"`, shell: true };
+  }
+  return { command: binPath, shell: false };
+}
+
 export function runWorkspaceBin(command: string, args: string[], cwd: string): Promise<void> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(resolveBin(command, cwd), args, {
+    // FNXC:DesktopWindowsSpawn 2026-10-08-04:41: shell + quoting rationale lives on workspaceBinSpawnCommand.
+    const { command: spawnCommand, shell } = workspaceBinSpawnCommand(resolveBin(command, cwd));
+    const child = spawn(spawnCommand, args, {
       cwd,
       stdio: "inherit",
       env: process.env,
-      // On Windows the resolved bin is a .cmd shim; Node refuses to spawn
-      // .cmd/.bat without a shell (EINVAL) since CVE-2024-27980. resolveBin
-      // produces an absolute, space-free path, so shell quoting is safe here.
-      shell: process.platform === "win32",
+      shell,
     });
 
     child.on("error", rejectPromise);
@@ -137,6 +156,7 @@ function runPnpm(args: string[], cwd: string): Promise<void> {
       stdio: "inherit",
       env: process.env,
       // pnpm resolves to a .cmd shim on Windows; Node refuses to spawn it without a shell.
+      // The bare `pnpm` name contains no path, so no quoting is needed.
       shell: process.platform === "win32",
     });
     child.on("error", rejectPromise);

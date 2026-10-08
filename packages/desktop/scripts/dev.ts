@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { createRequire } from "node:module";
-import { packageRoot, workspaceRoot } from "./workspace-tools";
+import { packageRoot, workspaceBinSpawnCommand, workspaceRoot } from "./workspace-tools";
 const distDir = join(packageRoot, "dist");
 
 const require = createRequire(import.meta.url);
@@ -90,13 +90,20 @@ async function main(): Promise<void> {
   const dashboardPort = dashboardUrl.port || (dashboardUrl.protocol === "https:" ? "443" : "80");
 
   console.log(`[desktop:dev] Starting dashboard Vite dev server on ${dashboardUrl.origin}...`);
+  /*
+  FNXC:DesktopWindowsSpawn 2026-10-08-04:41:
+  vite.cmd must be spawned through a shell with a quoted path on Windows (EINVAL otherwise on Node >= 20.12); see workspaceBinSpawnCommand.
+  */
+  const viteBin = join(workspaceRoot, "packages", "dashboard", "node_modules", ".bin", process.platform === "win32" ? "vite.cmd" : "vite");
+  const { command: viteCommand, shell: viteShell } = workspaceBinSpawnCommand(viteBin);
   const viteProcess = spawn(
-    join(workspaceRoot, "packages", "dashboard", "node_modules", ".bin", process.platform === "win32" ? "vite.cmd" : "vite"),
+    viteCommand,
     ["dev", "--host", dashboardHost, "--port", dashboardPort, "--strictPort"],
     {
       cwd: join(workspaceRoot, "packages", "dashboard"),
       env: process.env,
       stdio: "inherit",
+      shell: viteShell,
     },
   );
 
@@ -131,6 +138,12 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", () => shutdown(0));
   process.on("SIGTERM", () => shutdown(0));
+
+  // FNXC:DesktopWindowsSpawn 2026-10-08-04:41: surface spawn failures promptly instead of an unhandled error or renderer-wait timeout.
+  viteProcess.on("error", (error) => {
+    console.error("[desktop:dev] Failed to start dashboard dev server", error);
+    shutdown(1);
+  });
 
   viteProcess.on("exit", (code) => {
     if (!isShuttingDown) {
