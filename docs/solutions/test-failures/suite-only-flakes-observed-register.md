@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **10 active observation records** (entries 2, 13, 20, 21, 25, 27, 29, 30, 31, and 32), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **17 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 29, 30, 31, 32, 33, and 34), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **17 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -394,6 +394,47 @@ Hypothesis, not measured: the `job` state is set by `adoptJob` after `startSyste
 | `pnpm --filter @fusion/dashboard exec vitest run app/components/command-center/__tests__/SystemControlsArea.test.tsx --project dashboard-app-quality-backfill`, local Windows, `0c50dbd0f` | passed, 17 tests, 24.7 s wall (tests 11.4 s) |
 
 No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the dashboard vitest config. Before quarantining, a fix should wait on the subscription itself, for example by asserting on `subscribeSseMock` inside `waitFor`, rather than on the rendered output.
+
+### 33. AutomationStore due-run claim minute-boundary clock race
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/core/src/__tests__/postgres/satellite-stores.pg.test.ts`
+- **Exact test:** `PostgreSQL satellite stores (U6 consolidated, shared harness) > PostgreSQL satellite fusion-dir stores (VAL-DATA-015, VAL-DATA-016) > AutomationStore: isolates duplicate IDs and due-run claims across two bound projects`.
+- **Observed tree/SHA:** fork Full Suite (non-blocking) run [37735335086](https://github.com/stjepanvrbic/Fusion/actions/runs/37735335086/job/113173460315) at `90619eba9412969f8bb76deff34424d6aa544227`, job `Windows tests` (`113173460315`), `@fusion/core`. The Windows lane flagged the file as outside its known-failing list. The same file is not excluded on Linux, so the mechanism is not specific to Windows.
+- **Observed frequency:** 1 failure, in 1 test of the 38 in the file. The failure is an assertion, not a timeout.
+
+The failing line is `expect(await storeA.getDueSchedules("project")).toEqual([])` (test line 711), made right after `expect(await storeA.claimDueSchedule(duplicateId, past)).toBe(true)`. It received one schedule, `shared-automation-id` named `project-a-updated`, with the cron `* * * * *`, `createdAt` 2026-10-08T06:12:59.735Z, `nextRunAt` 2026-10-08T06:13:00.000Z, and `updatedAt` 2026-10-08T06:13:00.068Z. The claim had succeeded, so `nextRunAt` was already advanced, yet the schedule was due again when `getDueSchedules` ran.
+
+Hypothesis, not measured: `claimDueSchedule` in `automation-store.ts` computes the next run with `computeNextRun` and stamps `updatedAt` with a separate `new Date()` in the same call. The record shows the next run at 06:13:00.000 and the stamp 68 ms after it, so the next run was derived from a clock read before the minute edge while the stamp and the following read came after it. With a `* * * * *` schedule the claimed occurrence is then already due. If so, the test is exposed whenever the claim crosses a minute edge on any platform, and a loaded runner widens that window.
+
+| run | result |
+|---|---|
+| Full Suite 37735335086 (`90619eba9`), Windows `@fusion/core` | **failed** (this case) |
+| `pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/satellite-stores.pg.test.ts` with `FUSION_PG_TEST_URL_BASE=postgresql://postgres:postgres@localhost:55432`, local Windows, `628231a55` | passed, 38 tests, 9.2 s wall |
+| the same command with `-t "isolates duplicate IDs and due-run claims"`, local Windows | passed, 1 test |
+
+The local runs did not land on a minute edge, so they neither confirm nor refute the hypothesis. No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting and the file carries 37 other cases. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the core vitest config. A fix should pin the clock with fake timers, or build the schedule so its next occurrence cannot be the boundary the claim computes.
+
+### 34. AgentDetailView log history SSE suspend and reopen subscription
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/dashboard/app/components/__tests__/agent-detail-log-history.test.tsx`
+- **Exact test:** `AgentDetailView — agent log history is windowed, not discarded > converges after an SSE suspend/reopen cycle without losing lines`.
+- **Observed tree/SHA:** fork Full Suite (non-blocking) run [37739564135](https://github.com/stjepanvrbic/Fusion/actions/runs/37739564135/job/113186875691) at `7fcb6ea1cee6a4c2e16cceb9c67f13b131c1afa6` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113186875691`), command `@fusion/dashboard run test:quality:app:backfill-4`, project `dashboard-app-quality-backfill`. The shard-3 jobs of the two preceding Full Suite runs (37739288627 at `cd7130a99` and 37736870698 at `0c50dbd0f`) passed. The diff `cd7130a99..7fcb6ea1c` touches engine code, engine tests, and one docs line, and no dashboard file.
+- **Observed frequency:** 1 failure, in a command that reported 2274 tests (1 failed, 2268 passed, 5 skipped).
+
+The failure was `AssertionError: the latest-run log stream must be subscribed: expected undefined to be truthy` at `agent-detail-log-history.test.tsx:217`. The case reads `mockSubscribeSse.mock.calls.find(...)` for `/api/agents/agent-001/runs/<run>/logs/stream` right after `await waitFor(() => expect(renderedEntryTexts()).toHaveLength(WINDOW))`, and found no call. The earlier case in the same file that needs this subscription (line 183) wraps the same lookup in `waitFor`; this one does not.
+
+This shares a mechanism with entry 32 (`SystemControlsArea`, PR 50), where the test read the SSE subscribe mock before the subscribing effect had flushed. Hypothesis, not measured: the rendered log entries come from the `fetchAgentRunLogs` response, while the subscription is made by a passive effect in `AgentDetailView.tsx` (near line 2210) that returns early until `selectedRunId` is set and `selectedRunStatus` is `active`. Those values come from the runs fetch, so on a starved shard the entries can render before that effect has run, and the unguarded read sees an empty mock. The mechanism is unmeasured for both entries and is cited here only as a common shape.
+
+| run | result |
+|---|---|
+| Full Suite 37736870698 (`0c50dbd0f`), shard 3/4 | passed |
+| Full Suite 37739288627 (`cd7130a99`), shard 3/4 | passed |
+| Full Suite 37739564135 (`7fcb6ea1c`), shard 3/4 | **failed** (this case) |
+| `pnpm exec vitest run app/components/__tests__/agent-detail-log-history.test.tsx --project dashboard-app-quality-backfill` in `packages/dashboard`, local Windows, `628231a55` | passed, 9 tests, 11.3 s wall (tests 1.9 s) |
+
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. A fix should wait on the subscription itself, by asserting on `mockSubscribeSse` inside `waitFor` as the case at line 183 already does, rather than reading it once.
 
 ### Common shape and investigated result
 
