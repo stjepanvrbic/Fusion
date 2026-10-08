@@ -254,3 +254,89 @@ Example only:
     ]);
   });
 });
+
+/*
+FNXC:FileScopeClassification 2026-10-08-05:09:
+A qualifier written on one File Scope bullet belongs to that bullet only. KB-008 declared twenty write targets, several qualified "(only if ...)"; the qualifier leaked into every later bullet, the effective scope shrank to three files, and the strict squash invariant refused an approved, fully in-scope squash twice.
+*/
+describe("File Scope qualifiers stay on their own bullet", () => {
+  const kb008Shape = `## File Scope
+
+- \`packages/engine/src/worktree/worktree-pool.ts\` (only if the L7/L8 root cause is a probe/identity defect)
+- \`packages/engine/src/merger.ts\` (plus the sync module that #21 changed, for L7)
+- \`packages/dashboard/src/__tests__/task-reset-lifecycle.test.ts\` (check if affected)
+- \`packages/engine/src/__tests__/reliability-interactions/_helpers.ts\` (only if the fixture is proven stale)
+- \`packages/core/src/**/*.ts\` and \`packages/engine/src/**/*.ts\` (limited to the failing test files and their product code)
+- \`scripts/lib/windows-known-failing-tests.json\` (remove now-passing entries)
+- \`docs/solutions/test-failures/suite-only-flakes-observed-register.md\` (first-sighting records only)
+- \`.changeset/kb-008-fullsuite-regressions.md\` (only if a product behavior fix ships in the published CLI package)
+
+## Steps
+`;
+
+  it("keeps every write target after a conditional bullet, including conditional non-changeset targets", () => {
+    expect(extractEffectiveWriteScopeFromPrompt(kb008Shape)).toEqual([
+      "packages/engine/src/worktree/worktree-pool.ts",
+      "packages/engine/src/merger.ts",
+      "packages/dashboard/src/__tests__/task-reset-lifecycle.test.ts",
+      "packages/engine/src/__tests__/reliability-interactions/_helpers.ts",
+      "packages/core/src/**/*.ts",
+      "packages/engine/src/**/*.ts",
+      "scripts/lib/windows-known-failing-tests.json",
+      "docs/solutions/test-failures/suite-only-flakes-observed-register.md",
+    ]);
+  });
+
+  it("scopes read-only and forbidden bullet qualifiers to their own bullet", () => {
+    const prompt = `## File Scope
+- \`packages/core/src/a.ts\` (read-only, evidence only)
+- \`packages/core/src/b.ts\`
+- \`packages/core/src/c.ts\` (do not edit)
+- \`packages/core/src/d.ts\`
+`;
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual([
+      "packages/core/src/b.ts",
+      "packages/core/src/d.ts",
+    ]);
+  });
+
+  it("does not read qualifier words out of the paths themselves", () => {
+    const prompt = `## File Scope
+- \`packages/core/src/metadata/read-only-view.ts\`
+- \`packages/engine/src/merge/merge-write-fence.ts\`
+- \`packages/engine/src/safeguards.ts\`
+`;
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual([
+      "packages/core/src/metadata/read-only-view.ts",
+      "packages/engine/src/merge/merge-write-fence.ts",
+      "packages/engine/src/safeguards.ts",
+    ]);
+  });
+
+  it("still lets a standalone heading line set the context for the bullets under it", () => {
+    const prompt = `## File Scope
+- \`src/a.ts\` (only if needed)
+
+Read-only context:
+- \`src/ref.ts\`
+- \`src/ref2.ts\` (modify the export only)
+
+Forbidden:
+- \`src/never.ts\`
+
+Files changed:
+- \`src/b.ts\`
+
+Only if changed:
+- \`.changeset/fix.md\`
+- \`src/c.ts\`
+`;
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual([
+      "src/a.ts",
+      "src/ref2.ts",
+      "src/b.ts",
+      "src/c.ts",
+    ]);
+  });
+});
+
