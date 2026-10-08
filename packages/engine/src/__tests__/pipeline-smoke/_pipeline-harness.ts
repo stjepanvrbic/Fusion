@@ -27,7 +27,6 @@ import { runHoldReleaseSweep } from "../../execution/hold-release.js";
 import { SelfHealingManager } from "../../self-healing.js";
 import { Scheduler } from "../../scheduler.js";
 import { reconcileRecovery } from "../../recovery-reconciler.js";
-import { admitPlanningContinuation, createPlanningContinuationRun } from "../../runtimes/in-process-runtime.js";
 import { isExternalBlockResumeWorkItem } from "../../external-block/external-block-lifecycle.js";
 import { createPipelineClock, type PipelineClock } from "./_pipeline-clock.js";
 import { createPipelineGitFixture, createPipelineWorkspaceFixture, type PipelineGitFixture } from "./_pipeline-git-fixture.js";
@@ -738,10 +737,14 @@ export class PipelineSmokeHarness {
   }
 
   /*
-  FNXC:ExternalBlockPipeline 2026-10-08-16:14:
-  Since #60 (bfe6023d4) dashboard Retry only queues the resume: it publishes a runnable external-block resume continuation and records
-  an operator `resumeRequest` while the freeze stays raised, so a frozen card never holds a running-agent slot it has not been granted.
-  S21 therefore proves the queued phase here and leaves the clear to `admitExternalBlockResume`.
+  FNXC:ExternalBlockPipeline 2026-10-08-18:45:
+  Since #66 (1857850d5) operator Retry admits synchronously when a running-agent slot is free: `requestExternalBlockResume` publishes the
+  runnable resume continuation and records the operator `resumeRequest`, then `admitOperatorResumeNow` reserves a slot through the project
+  admission coordinator and calls `clearExternalBlockForAdmittedResume`. S21 runs with free slots, so it asserts the cleared state, the
+  operator clear log and audit, and the retained work directly after Retry. The continuation is published before the clear and the
+  synchronous clear does not consume it, so exactly one runnable resume continuation at `steps` must remain (duplicate guard).
+  The full-cap operator path and automatic resumes stay queued; they are covered deterministically by
+  `external-block-auto-resume.test.ts` ("keeps operator Retry queued at a full running-agent cap") and `external-block-capacity.test.ts`.
   */
   async resumeExternalBlockReplay(taskId: string): Promise<void> {
     const { resumeExternallyBlockedTask } = await import("../../../../dashboard/src/routes/task-external-block-resume.js");
@@ -749,54 +752,20 @@ export class PipelineSmokeHarness {
     if (result.kind !== "resumed" || result.nodeId !== "steps") {
       throw new Error("S21: dashboard Retry did not arm the interrupted verification node.");
     }
-    const queued = await this.assertRetainedExternalBlockWork(taskId);
-    if (queued.status !== "blocked" || queued.externalBlock?.code !== "ENOSPC") {
-      throw new Error("S21: dashboard Retry cleared the external block before project admission.");
+    const cleared = await this.assertRetainedExternalBlockWork(taskId);
+    if (cleared.externalBlock?.resumeRequest) {
+      throw new Error("S21: dashboard Retry left the operator resume request unconsumed.");
     }
-    if (queued.externalBlock.resumeRequest?.trigger !== "operator") {
-      throw new Error("S21: dashboard Retry did not record an operator resume request.");
+    if (cleared.status === "blocked" || cleared.externalBlock) {
+      throw new Error("S21: dashboard Retry did not clear the external block.");
     }
     const resumeItems = (await this.store.listWorkflowWorkItemsForTask(taskId))
       .filter((item) => item.state === "runnable" && isExternalBlockResumeWorkItem(item) && item.nodeId === "steps");
     if (resumeItems.length !== 1) {
       throw new Error(`S21: dashboard Retry published ${resumeItems.length} runnable resume continuations at steps, expected exactly one.`);
     }
-  }
-
-  /*
-  FNXC:ExternalBlockPipeline 2026-10-08-16:14:
-  The freeze clears only inside the admitted continuation run (`createPlanningContinuationRun` under `admitPlanningContinuation`), the same
-  composition the production drain uses. `execute` only records the task it receives: running the graph would change the step progress
-  and parked terminal S21 asserts. The run promise is captured from `dispatch` and awaited directly, with no polling or timers.
-  */
-  async admitExternalBlockResume(taskId: string): Promise<void> {
-    const task = await this.freshTask(taskId);
-    const item = (await this.store.listWorkflowWorkItemsForTask(taskId))
-      .find((candidate) => candidate.state === "runnable" && isExternalBlockResumeWorkItem(candidate) && candidate.nodeId === "steps");
-    if (!item) throw new Error("S21: no runnable resume continuation to admit.");
-    const executed: Task[] = [];
-    const run = createPlanningContinuationRun({
-      store: this.store,
-      execute: async (runTask) => { executed.push(runTask); },
-    });
-    let runPromise: Promise<void> | undefined;
-    const admitted = await admitPlanningContinuation({
-      store: this.store,
-      projectId: this.store.getRootDir(),
-      task,
-      item,
-      dispatch: () => (runPromise = run(task, item)),
-    });
-    if (!admitted) throw new Error("S21: project admission refused the resumed external-block continuation.");
-    if (!runPromise) throw new Error("S21: project admission did not dispatch the resumed external-block continuation.");
-    await runPromise;
-    if (executed.length !== 1) throw new Error(`S21: admitted resume executed ${executed.length} times, expected once.`);
-    if (executed[0]!.status === "blocked" || executed[0]!.externalBlock) {
-      throw new Error("S21: admitted resume re-entered the graph before the external block was cleared.");
-    }
-    const cleared = await this.freshTask(taskId);
     if (!cleared.log?.some((entry) => entry.action.includes("External block cleared by operator Retry; resuming workflow at steps"))) {
-      throw new Error("S21: admitted resume did not log the operator clear.");
+      throw new Error("S21: dashboard Retry did not log the operator clear.");
     }
     const audits = await this.store.getRunAuditEventsAsync({ taskId });
     const clearedAudit = audits.find((event) => event.mutationType === "task:external-block-cleared");
@@ -805,7 +774,7 @@ export class PipelineSmokeHarness {
       || clearedAudit.metadata.resumeNodeId !== "steps"
       || clearedAudit.metadata.trigger !== "operator"
     ) {
-      throw new Error("S21: admitted resume did not audit task:external-block-cleared for the operator Retry.");
+      throw new Error("S21: dashboard Retry did not audit task:external-block-cleared for the operator Retry.");
     }
   }
 

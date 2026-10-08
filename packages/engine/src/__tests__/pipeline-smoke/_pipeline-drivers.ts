@@ -542,14 +542,14 @@ export const PIPELINE_SCENARIO_DRIVERS = {
   continuation. Keep the recorded outcome intact so the manifest census does not mislabel a
   successful recovery observation as a failed blocked-stage assertion.
 
-  FNXC:ExternalBlockPipeline 2026-10-08-16:14:
-  Since #60 Retry only queues the resume (continuation + operator `resumeRequest`, freeze still raised); the admitted continuation run
-  clears the freeze. Recovery is Retry (queued assertions) -> project admission -> resumed assertions -> parked terminal.
+  FNXC:ExternalBlockPipeline 2026-10-08-18:45:
+  Since #66 operator Retry with a free running-agent slot admits synchronously, so the freeze is cleared when Retry returns.
+  Recovery is Retry (cleared-state, operator log/audit, and retention assertions) -> resumed assertions -> parked terminal.
+  Full-cap and automatic resumes stay queued and are covered by the external-block unit tests.
   */
   s21Recovery: driver("invoke dashboard Retry and re-enter the interrupted verification node", async (context) => {
     const task = taskFor(context);
     await context.harness.resumeExternalBlockReplay(task.id);
-    await context.harness.admitExternalBlockResume(task.id);
     await context.harness.assertExternalBlockReplay(task, "resumed");
     await context.harness.assertTerminal(task.id, "parked");
   }),
