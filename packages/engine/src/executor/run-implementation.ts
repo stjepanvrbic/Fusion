@@ -65,6 +65,7 @@ import {
   isLegacyWorkspaceWorktreeLayout,
   resolveWorkspaceTaskWorktreeDir,
   resolveSandboxBackend as resolveConfiguredSandboxBackend,
+  isSamePath,
 } from "@fusion/core";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -1052,7 +1053,8 @@ export async function runImplementation(
       let livenessFailure: string | null = null;
       try {
         observedWorktreeRealpath = canonicalizePath(worktreePath);
-        if (observedWorktreeRealpath === expectedRoot) {
+        // FNXC:PathIdentity 2026-10-08-16:08: compare by path identity so an 8.3-alias or case-variant spelling of the repo root is still caught (KB-082).
+        if (isSamePath(observedWorktreeRealpath, expectedRoot)) {
           livenessFailure = "realpath_matches_repo_root";
         }
       } catch (error) {

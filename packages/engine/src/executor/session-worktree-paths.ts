@@ -3,18 +3,18 @@
  * Session worktree path helpers peeled from executor.ts.
  */
 import { readFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
-import type { Settings } from "@fusion/core";
+import { canonicalizePath as canonicalizePathIdentity, type Settings } from "@fusion/core";
 import type { GitRepoDetection } from "../worktree/worktree-pool.js";
 import { resolveWorktreesDir } from "../worktree/worktree-paths.js";
 
+/**
+ * FNXC:PathIdentity 2026-10-08-16:08:
+ * Delegates to the shared `@fusion/core` canonicalizer (`realpathSync.native`), which expands Windows 8.3 short aliases and on-disk case so the result matches what git reports.
+ * JavaScript `realpathSync` kept `RUNNER~1`-style aliases, so a worktree spelled short never equalled the git-reported root (KB-082). Never throws.
+ */
 export function canonicalizePath(path: string): string {
-  try {
-    return realpathSync(path);
-  } catch {
-    return resolvePath(path);
-  }
+  return canonicalizePathIdentity(path);
 }
 
 /*

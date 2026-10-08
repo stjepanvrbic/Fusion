@@ -16,6 +16,7 @@ import type { Settings, Task, TaskStore } from "@fusion/core";
 import { detectWorkspaceMainCheckoutWork, workspaceExecutionAnchor } from "../executor/workspace-main-checkout-guard.js";
 import { verifyWorktreeInvariants } from "../executor/worktree-verify-invariants.js";
 import { createWorkspaceFixture, hasGit, type WorkspaceFixture } from "./_workspace-fixture.js";
+import { hasDistinctShortAlias, nativeRealPath, win32ShortAlias } from "./helpers/real-path.js";
 
 const describeIfGit = hasGit ? describe : describe.skip;
 const settings = {} as Settings;
@@ -329,5 +330,41 @@ describeIfGit("workspace main-checkout guard", () => {
     expect(result.violations).toEqual([]);
     expect(result.warnings).toContainEqual(expect.objectContaining({ repo: "repo-a", reason: "pre-existing-dirt", files: ["old.txt"] }));
     rmSync(path.dirname(path.dirname(nested)), { recursive: true, force: true });
+  });
+});
+
+/*
+FNXC:PathIdentity 2026-10-08-16:08:
+KB-082: an operator workspace root spelled with a Windows 8.3 short alias must still be probed, keep refusing task-attributed main commits, and exclude a recorded worktree that is stored in the long spelling.
+Lexical containment across the two spellings previously missed the recorded worktree and reported it as main-checkout work.
+*/
+describe.runIf(hasGit && process.platform === "win32")("workspace main-checkout guard — win32 8.3 short alias root", () => {
+  let fixture: WorkspaceFixture;
+  afterEach(() => fixture?.cleanup());
+
+  it("probes a short-aliased root, refuses task commits, and excludes long-spelled recorded worktrees", async () => {
+    fixture = await createWorkspaceFixture(["repo-a"]);
+    const longRoot = nativeRealPath(fixture.rootDir);
+    const shortRoot = win32ShortAlias(longRoot);
+    if (hasDistinctShortAlias(longRoot)) expect(shortRoot).not.toBe(longRoot);
+
+    const activeTask = task();
+    const recordedWorktree = path.join(longRoot, "repo-a", "task-wt");
+    const baseCommitSha = fixture.git("repo-a", "git rev-parse HEAD");
+    fixture.git("repo-a", `git worktree add -b fusion/fn-1001 ${recordedWorktree.replace(/\\/g, "/")} HEAD`);
+    writeFileSync(path.join(recordedWorktree, "task-work.ts"), "export {};\n");
+    activeTask.workspaceWorktrees = { "repo-a": { worktreePath: recordedWorktree, baseCommitSha, branch: "fusion/fn-1001" } };
+
+    const file = path.join(fixture.repoPath("repo-a"), "committed.ts");
+    writeFileSync(file, "export const direct = true;\n");
+    const commitDate = new Date(Date.parse(activeTask.firstExecutionAt!) + 10_000).toISOString();
+    fixture.git("repo-a", "git add committed.ts");
+    fixture.git("repo-a", `GIT_AUTHOR_DATE='${commitDate}' GIT_COMMITTER_DATE='${commitDate}' git commit -m 'fix(FN-1001): direct main edit'`);
+
+    const result = await detectWorkspaceMainCheckoutWork({ rootDir: shortRoot, settings }, activeTask, ["repo-a"], []);
+    expect(result.skipped).not.toContain("repo-a");
+    expect(result.violations).toContainEqual(expect.objectContaining({ repo: "repo-a", evidence: "task-attributed-commit" }));
+    const reportedFiles = [...result.violations, ...result.warnings].flatMap((finding) => finding.files);
+    expect(reportedFiles.some((entry) => entry.startsWith("task-wt"))).toBe(false);
   });
 });

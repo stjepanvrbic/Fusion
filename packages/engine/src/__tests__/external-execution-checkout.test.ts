@@ -4,11 +4,11 @@ Persisted external checkout routing is an explicit operator contract. Execution 
 */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { inspectExternalGitCheckout, resolveExternalExecutionCheckoutRoute } from "../execution/external-execution-checkout.js";
 import { resolveReviewCheckoutCwd } from "../execution/review-checkout.js";
-import { nativeRealPath, realTempDir } from "./helpers/real-path.js";
+import { hasDistinctShortAlias, nativeRealPath, realTempDir, win32ShortAlias } from "./helpers/real-path.js";
 
 function makeGitCheckout(branch = "local/runtime-fixes"): string {
   const dir = realTempDir("external-execution-checkout-");
@@ -90,6 +90,51 @@ describe("resolveExternalExecutionCheckoutRoute", () => {
     await expect(inspectExternalGitCheckout(checkout, { requireClean: true })).resolves.toMatchObject({
       valid: false,
       reason: expect.stringContaining("must be clean"),
+    });
+  });
+});
+
+/*
+FNXC:PathIdentity 2026-10-08-16:08:
+KB-082: an operator may persist a checkout path spelled with a Windows 8.3 short alias (the GitHub runner temp is `RUNNER~1`) while git reports the long name.
+The route must accept that spelling as the Git top-level and return the native long path, without widening the guard to subdirectories.
+*/
+describe.runIf(process.platform === "win32")("external checkout routing with a win32 8.3 short alias", () => {
+  let aliasCheckout: string;
+
+  beforeAll(() => {
+    aliasCheckout = makeGitCheckout("main");
+    mkdirSync(join(aliasCheckout, "nested-subdirectory"));
+  });
+
+  afterAll(() => {
+    rmSync(aliasCheckout, { recursive: true, force: true });
+  });
+
+  it("accepts the short alias as the Git top-level and returns the long spelling", async () => {
+    const shortAlias = win32ShortAlias(aliasCheckout);
+    if (hasDistinctShortAlias(aliasCheckout)) expect(shortAlias).not.toBe(aliasCheckout);
+
+    await expect(inspectExternalGitCheckout(shortAlias)).resolves.toEqual({
+      valid: true,
+      checkoutPath: nativeRealPath(aliasCheckout),
+      branch: "main",
+    });
+    await expect(resolveExternalExecutionCheckoutRoute({
+      sourceMetadata: { externalExecutionCheckout: shortAlias, externalExecutionBranch: "main" },
+    })).resolves.toEqual({
+      configured: true,
+      valid: true,
+      checkoutPath: nativeRealPath(aliasCheckout),
+      branch: "main",
+    });
+  });
+
+  it("still refuses a short-aliased subdirectory of the repository", async () => {
+    const shortSubdirectory = win32ShortAlias(join(aliasCheckout, "nested-subdirectory"));
+    await expect(inspectExternalGitCheckout(shortSubdirectory)).resolves.toMatchObject({
+      valid: false,
+      reason: expect.stringContaining("must be the Git top-level"),
     });
   });
 });

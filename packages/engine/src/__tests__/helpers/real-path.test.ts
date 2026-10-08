@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { gitPorcelainPath, nativeRealPath, realTempDir } from "./real-path.js";
+import { gitPorcelainPath, hasDistinctShortAlias, nativeRealPath, realTempDir, win32ShortAlias } from "./real-path.js";
 
 const created: string[] = [];
 
@@ -69,6 +69,22 @@ describe("nativeRealPath", () => {
       expect(realpathSync(short)).not.toBe(long);
       expect(nativeRealPath(short)).not.toMatch(/~\d/);
     }
+  });
+});
+
+describe("win32ShortAlias", () => {
+  it.runIf(process.platform === "win32")("returns a spelling that resolves to the same long directory", () => {
+    const dir = tempDir("kb082-long-name-");
+    const alias = win32ShortAlias(dir);
+    expect(nativeRealPath(alias)).toBe(dir);
+    if (hasDistinctShortAlias(dir)) expect(alias).toContain("~");
+    else expect(alias).toBe(dir);
+  });
+
+  it.runIf(process.platform !== "win32")("is the identity off Windows", () => {
+    const dir = tempDir("kb082-long-name-");
+    expect(win32ShortAlias(dir)).toBe(dir);
+    expect(hasDistinctShortAlias(dir)).toBe(false);
   });
 });
 

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { canonicalizePath } from "@fusion/core";
+import { existsSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
 function readMetadataPath(value: unknown): string | undefined {
@@ -31,14 +32,18 @@ export function resolveReviewCheckoutCwd(task: unknown, fallbackCwd: string): st
   if (!candidate || !isAbsolute(candidate)) return fallbackCwd;
   try {
     if (!existsSync(candidate) || !statSync(candidate).isDirectory()) return fallbackCwd;
-    const realCandidate = realpathSync(candidate);
+    /*
+    FNXC:PathIdentity 2026-10-08-16:08:
+    Review checkout metadata may spell the path with a Windows 8.3 short alias; canonicalize natively so the returned cwd is the long spelling git reports (KB-082).
+    */
+    const realCandidate = canonicalizePath(candidate);
     const topLevel = execFileSync("git", ["rev-parse", "--show-toplevel"], {
       cwd: realCandidate,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     if (!topLevel) return fallbackCwd;
-    return realpathSync(topLevel);
+    return canonicalizePath(topLevel);
   } catch {
     return fallbackCwd;
   }

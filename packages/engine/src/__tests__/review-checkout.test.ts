@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { resolveReviewCheckoutCwd, getTaskReviewCheckoutPath } from "../execution/review-checkout.js";
-import { nativeRealPath, realTempDir } from "./helpers/real-path.js";
+import { hasDistinctShortAlias, nativeRealPath, realTempDir, win32ShortAlias } from "./helpers/real-path.js";
 
 const FALLBACK = "/some/fallback/worktree";
 const cleanupDirs: string[] = [];
@@ -256,6 +256,26 @@ describe("resolveReviewCheckoutCwd — does NOT fabricate approval or widen scop
 
   it("relative sourceMetadata.externalReviewCheckout: returns fallback", () => {
     const task = { sourceMetadata: { externalReviewCheckout: "relative/path" } };
+    expect(resolveReviewCheckoutCwd(task, FALLBACK)).toBe(FALLBACK);
+  });
+});
+
+/*
+FNXC:PathIdentity 2026-10-08-16:08:
+KB-082: review checkout metadata spelled with a Windows 8.3 short alias must resolve to the native long top-level, not the fallback; non-git aliased paths still fall back.
+*/
+describe.runIf(process.platform === "win32")("resolveReviewCheckoutCwd — win32 8.3 short alias", () => {
+  it("resolves a short-alias git checkout to its native long top-level", () => {
+    const checkout = makeGitCheckout();
+    const shortAlias = win32ShortAlias(checkout);
+    if (hasDistinctShortAlias(checkout)) expect(shortAlias).not.toBe(checkout);
+    const task = { sourceMetadata: { externalReviewCheckout: shortAlias } };
+    expect(resolveReviewCheckoutCwd(task, FALLBACK)).toBe(nativeRealPath(checkout));
+  });
+
+  it("returns the fallback for a short-alias non-git directory", () => {
+    const dir = makeNonGitDir();
+    const task = { sourceMetadata: { externalReviewCheckout: win32ShortAlias(dir) } };
     expect(resolveReviewCheckoutCwd(task, FALLBACK)).toBe(FALLBACK);
   });
 });

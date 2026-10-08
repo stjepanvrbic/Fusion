@@ -29,6 +29,7 @@ import { classifyBranchProbeError } from "../self-healing-git-evidence.js";
 import { activeSessionRegistry, executingTaskLock } from "../agents/active-session-registry.js";
 import { landWorkspaceTask } from "../merge/merger-ai.js";
 import { createWorkspaceFixture, hasGit, type WorkspaceFixture } from "./_workspace-fixture.js";
+import { hasDistinctShortAlias, nativeRealPath, win32ShortAlias } from "./helpers/real-path.js";
 
 const describeIfGit = hasGit ? describe : describe.skip;
 
@@ -1154,6 +1155,30 @@ describeIfGit("workspace-aware self-healing (Phase D U1)", () => {
     expect(await manager.reconcileOrphanedWorkspaceWorktrees()).toBe(1);
     expect(existsSync(worktreePath)).toBe(false);
     expect(fx.git("repo-a", `git branch --list ${BRANCH}`).trim()).toBe("");
+  });
+
+  /*
+  FNXC:PathIdentity 2026-10-08-16:08:
+  KB-082: a workspace worktree recorded with a Windows 8.3 short alias (`RUNNER~1`) is the same directory `git worktree list` prints in long form.
+  Ownership, root containment, and the destructive claim must be decided by path identity so the teardown proves it owned instead of refusing it.
+  */
+  it.runIf(process.platform === "win32")("tears down a soft-deleted workspace worktree recorded with an 8.3 short alias", async () => {
+    fx = await createWorkspaceFixture(["repo-a"]);
+    const longWorktree = path.join(nativeRealPath(fx.repoPath("repo-a")), ".wt-short-alias");
+    fx.git("repo-a", `git worktree add -b ${BRANCH} ${longWorktree.replace(/\\/g, "/")} HEAD`);
+    const shortWorktree = win32ShortAlias(longWorktree);
+    if (hasDistinctShortAlias(longWorktree)) expect(shortWorktree).not.toBe(longWorktree);
+    const old = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+    const task = workspaceTask({ "repo-a": { worktreePath: shortWorktree, branch: BRANCH } }, { deletedAt: old, updatedAt: old, columnMovedAt: old });
+    const store = createStore([task]);
+
+    expect(await makeManager(store, nativeRealPath(fx.rootDir)).reconcileOrphanedWorkspaceWorktrees()).toBe(1);
+    expect(existsSync(longWorktree)).toBe(false);
+    expect(fx.git("repo-a", `git branch --list ${BRANCH}`).trim()).toBe("");
+    expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+      mutationType: "task:reconcile-orphaned-workspace-worktree",
+      metadata: expect.objectContaining({ success: true }),
+    }));
   });
 
   it("retains a failed-task branch when its recorded landed SHA is not reachable from integration", async () => {

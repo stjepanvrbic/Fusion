@@ -75,7 +75,10 @@ vi.mock("node:fs", async (importOriginal) => {
 vi.mock("../worktree/worktree-pool.js", async () => {
   const { existsSync: fsExistsSync } = await import("node:fs");
   const { join: joinPath, resolve: resolvePath } = await import("node:path");
+  // KB-082: self-healing canonicalizes candidate paths through the pool's core-delegating canonicalizer.
+  const { canonicalizePath } = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
   return {
+  canonicalizePath,
   // FN-4811: Must mirror the production `RemovalReason` const in worktree-backend.ts
   // exactly — every key referenced as `RemovalReason.X` in production code (self-healing,
   // executor, merger) needs to resolve here, otherwise removeWorktree({ reason: undefined })

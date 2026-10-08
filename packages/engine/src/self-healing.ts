@@ -26,11 +26,11 @@ import { isPostMergeGateRecoveryDue, resumeMissingPostMergeGate } from "./merge/
 import { execSync } from "node:child_process";
 import { withPosixShell } from "@fusion/core";
 import { setImmediate as setImmediateCb } from "node:timers";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir, hostname } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { PRE_MERGE_STEPS_NOT_RUN_BLOCKER, isSamePath, loadWorkspaceConfig, type TaskMoveLanes, resolveColumnFlags, IN_REVIEW_STALL_DEADLOCK_LOG_PREFIX, IN_REVIEW_STALL_LOG_PREFIX, IN_REVIEW_STALL_TERMINAL_LOG_PREFIX, allowsAutoMergeProcessing, hasSharedBranchMemberAutoMergeHold, hasUserAutoMergeHold, resolveEffectiveAutoMerge, countRecentIdenticalStallEntries, detectDependencyCycle, detectSelfDefeatingDependency, evaluateNoCommitsNoOpFinalize, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, getInReviewStalledSignal, getInReviewStallReason, getPrimaryPrInfo, getStalePausedReviewSignal, getStalePausedTodoSignal, getTaskHardMergeBlocker, getMergeConfirmedFinalizationBlocker, getPostMergeFinalizeBlocker, getRequiredPostMergeEvidenceBlocker, getRequiredPostMergeEvidenceDecision, planConfirmedMergeChecklistReconciliation, getTaskMergeBlocker, isStaleContentApprovalBlocker, resolvePreMergeGateForTask, isEphemeralAgent, isMergeRequestContractShadowEnabled, isWorkspaceTask, isSharedBranchGroupMemberIntegration, isLiveSharedBranchGroupMemberIntegration, isNearDuplicateCanonicalInactive, resolveExplicitDuplicateMarker, flagTriageDuplicate, isTriageDuplicateKeepAcknowledged, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, getBuiltinWorkflow, isBuiltinWorkflowId, resolveWorkflowIrForTask, resolveWorkflowIrForTaskWithProvenance, resolveRequiredPreMergeStepIds, resolveReboundTarget, columnsWithFlag, resolveLifecycleColumns, resolveTaskLifecycleColumns, isWipColumnRole, isReviewColumnRole, isTerminalColumnRole, workflowHasColumn, planLegacyAdoption, resolveOrphanedPendingStepResults, resolveUnprovenReviewApproval, classifyReviewLease, PLAN_REVIEW_LEASE_STALENESS_MS, DEFAULT_MAX_POST_REVIEW_FIXES, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AWAITING_APPROVAL_PAUSE_REASON, type Agent, type AgentStore, type ChatStore, type MessageStore, type TaskStore, type Settings, type Task, type MergeDetails, type TaskPriority, type MergeResult, type WorkflowStepResult, type WorkflowIr, type WorkflowIrV2,
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { PRE_MERGE_STEPS_NOT_RUN_BLOCKER, isPathInside, isSamePath, pathIdentityKey, loadWorkspaceConfig, type TaskMoveLanes, resolveColumnFlags, IN_REVIEW_STALL_DEADLOCK_LOG_PREFIX, IN_REVIEW_STALL_LOG_PREFIX, IN_REVIEW_STALL_TERMINAL_LOG_PREFIX, allowsAutoMergeProcessing, hasSharedBranchMemberAutoMergeHold, hasUserAutoMergeHold, resolveEffectiveAutoMerge, countRecentIdenticalStallEntries, detectDependencyCycle, detectSelfDefeatingDependency, evaluateNoCommitsNoOpFinalize, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, getInReviewStalledSignal, getInReviewStallReason, getPrimaryPrInfo, getStalePausedReviewSignal, getStalePausedTodoSignal, getTaskHardMergeBlocker, getMergeConfirmedFinalizationBlocker, getPostMergeFinalizeBlocker, getRequiredPostMergeEvidenceBlocker, getRequiredPostMergeEvidenceDecision, planConfirmedMergeChecklistReconciliation, getTaskMergeBlocker, isStaleContentApprovalBlocker, resolvePreMergeGateForTask, isEphemeralAgent, isMergeRequestContractShadowEnabled, isWorkspaceTask, isSharedBranchGroupMemberIntegration, isLiveSharedBranchGroupMemberIntegration, isNearDuplicateCanonicalInactive, resolveExplicitDuplicateMarker, flagTriageDuplicate, isTriageDuplicateKeepAcknowledged, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, getBuiltinWorkflow, isBuiltinWorkflowId, resolveWorkflowIrForTask, resolveWorkflowIrForTaskWithProvenance, resolveRequiredPreMergeStepIds, resolveReboundTarget, columnsWithFlag, resolveLifecycleColumns, resolveTaskLifecycleColumns, isWipColumnRole, isReviewColumnRole, isTerminalColumnRole, workflowHasColumn, planLegacyAdoption, resolveOrphanedPendingStepResults, resolveUnprovenReviewApproval, classifyReviewLease, PLAN_REVIEW_LEASE_STALENESS_MS, DEFAULT_MAX_POST_REVIEW_FIXES, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AWAITING_APPROVAL_PAUSE_REASON, type Agent, type AgentStore, type ChatStore, type MessageStore, type TaskStore, type Settings, type Task, type MergeDetails, type TaskPriority, type MergeResult, type WorkflowStepResult, type WorkflowIr, type WorkflowIrV2,
 
   resolveNearDuplicateCanonicalFlags,
   LEGACY_COLUMN_IDS_BY_ROLE,
@@ -6532,19 +6532,19 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         worktreeMetadataReconcileLog.warn(`skipped worktree metadata reconcile — registration unknown: ${error.message}`);
         return 0;
       }
-      // FN-5256: macOS git surfaces realpath-normalized worktree paths (/private/var/...)
-      // while task.worktree may be persisted as the symlinked path. Compare on realpath
-      // to avoid false-stale flagging that yanks a live worktree.
-      const safeRealpath = (path: string): string => {
-        try {
-          return realpathSync(path);
-        } catch {
-          return path;
-        }
-      };
-      const registeredRealpaths = new Set<string>();
+      /*
+      FN-5256: macOS git surfaces realpath-normalized worktree paths (/private/var/...)
+      while task.worktree may be persisted as the symlinked path. Compare on realpath
+      to avoid false-stale flagging that yanks a live worktree.
+
+      FNXC:PathIdentity 2026-10-08-16:08:
+      On Windows task.worktree may be spelled with an 8.3 short alias (`RUNNER~1`) or another case while git reports the long name.
+      JavaScript `realpathSync` kept the alias, so a live worktree read as unregistered and was rebound (KB-082).
+      Membership uses `pathIdentityKey` (native realpath, case-folded on win32), which also resolves the macOS symlink and never throws.
+      */
+      const registeredKeys = new Set<string>();
       for (const path of branchMap.values()) {
-        registeredRealpaths.add(safeRealpath(path));
+        registeredKeys.add(pathIdentityKey(path));
       }
       let repaired = 0;
 
@@ -6576,9 +6576,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         if (activeSessionRegistry.isPathActive(task.worktree)) continue;
 
         const normalizedBranch = resolveTaskWorkingBranch(task);
-        const resolvedTaskWorktree = resolve(task.worktree);
-        const realpathTaskWorktree = safeRealpath(resolvedTaskWorktree);
-        const stale = !existsSync(task.worktree) || !registeredRealpaths.has(realpathTaskWorktree);
+        const stale = !existsSync(task.worktree) || !registeredKeys.has(pathIdentityKey(task.worktree));
         if (!stale) continue;
 
         const previousWorktree = task.worktree;
@@ -12411,17 +12409,17 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       }
       if (!candidates.length) return 0;
 
-      const canonicalPath = (value: string): string => {
-        const absolute = resolve(value);
-        try { return realpathSync(absolute); } catch {
-          /*
-          FNXC:Workspace 2026-08-15-05:33:
-          A manually removed worktree has no leaf to realpath. Canonicalize its existing parent so
-          /var and /private/var aliases still share one destructive claim and one retry budget.
-          */
-          try { return join(realpathSync(dirname(absolute)), basename(absolute)); } catch { return absolute; }
-        }
-      };
+      /*
+      FNXC:Workspace 2026-08-15-05:33:
+      A manually removed worktree has no leaf to realpath. Canonicalize its existing parent so
+      /var and /private/var aliases still share one destructive claim and one retry budget.
+
+      FNXC:PathIdentity 2026-10-08-16:08:
+      A recorded worktree path may be spelled with a Windows 8.3 short alias (`RUNNER~1`) or another case while `git worktree list` prints the long name.
+      Canonicalize through the shared native canonicalizer (absent leaves re-join onto the nearest existing ancestor) and compare with `isSamePath` / `isPathInside`, never raw strings, so a git-registered worktree is still proven owned (KB-082).
+      Claims key on `pathIdentityKey` so case variants share one destructive claim.
+      */
+      const canonicalPath = (value: string): string => canonicalizePath(value);
       type Claim = { taskId: string; repoRel: string; candidate: boolean };
       const pathClaims = new Map<string, Claim[]>();
       const branchClaims = new Map<string, Claim[]>();
@@ -12434,7 +12432,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       for (const task of allRows) for (const [repoRel, entry] of Object.entries(task.workspaceWorktrees ?? {})) {
         const claim = { taskId: task.id, repoRel, candidate: candidateIds.has(task.id) };
         if (entry?.worktreePath) {
-          const key = canonicalPath(entry.worktreePath);
+          const key = pathIdentityKey(entry.worktreePath);
           pathClaims.set(key, [...(pathClaims.get(key) ?? []), claim]);
         }
         if (entry?.branch) {
@@ -12451,13 +12449,13 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         if (this.settledWorkspaceWorktreeTeardowns.has(entryKey) || (this.orphanWorktreeRemovalFailures.get(entryKey) ?? 0) >= MAX_STARVATION_DROPS) continue;
         const repoRootDir = join(this.options.rootDir, repoRel);
         const canonicalRootDir = canonicalPath(this.options.rootDir);
-        const claims = pathClaims.get(pathKey) ?? [];
+        const claims = pathClaims.get(pathIdentityKey(pathKey)) ?? [];
         const uniqueClaims = new Set(claims.map((claim) => `${claim.taskId}::${claim.repoRel}`));
         // FNXC:Workspace 2026-08-15-05:13: destructive terminal cleanup treats shared, foreign, and
         // misattributed paths as ambiguous. Skipping is safer than deleting another row's worktree.
         if (uniqueClaims.size !== 1 || claims.some((claim) => !claim.candidate)
-          || !relative(canonicalRootDir, pathKey) || relative(canonicalRootDir, pathKey).startsWith("..")
-          || pathKey === canonicalRootDir || pathKey === canonicalPath(repoRootDir) || pathKey === canonicalPath(join(repoRootDir, ".git"))) continue;
+          || !isPathInside(canonicalRootDir, pathKey)
+          || isSamePath(pathKey, repoRootDir) || isSamePath(pathKey, join(repoRootDir, ".git"))) continue;
         const resolvedPath = resolve(worktreePath);
         if (activeSessionRegistry.isPathActive(worktreePath) || activeSessionRegistry.isPathActive(resolvedPath) || activeSessionRegistry.isPathActive(pathKey)) continue;
         const branch = entry.branch;
@@ -12474,7 +12472,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         try {
           if (!worktreeGone) {
             const listing = await this.execWorkspaceTeardownGit("git worktree list --porcelain", { cwd: repoRootDir, timeout: 120_000 });
-            const owned = listing.stdout.split("\n").some((line) => line.startsWith("worktree ") && canonicalPath(line.slice(9)) === pathKey);
+            const owned = listing.stdout.split("\n").some((line) => line.startsWith("worktree ") && isSamePath(line.slice(9), pathKey));
             /* FNXC:Workspace 2026-08-15-05:33: Only the attributed sub-repo may prove a directory removable. */
             if (!owned) continue;
             await this.execWorkspaceTeardownGit(`git worktree remove --force ${shellQuote(worktreePath)}`, { cwd: repoRootDir, timeout: 120_000 });
@@ -14045,7 +14043,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
 
     for (const candidate of candidates) {
       let canonicalCandidate = candidate;
-      try { canonicalCandidate = realpathSync(candidate); } catch { /* keep original */ }
+      // FNXC:PathIdentity 2026-10-08-16:08: native canonical spelling matches git output and 8.3-alias spellings (KB-082); never throws.
+      canonicalCandidate = canonicalizePath(candidate);
       if (activeSessionRegistry.isPathActive(candidate) || activeSessionRegistry.isPathActive(canonicalCandidate)) continue;
 
       try {
@@ -17756,11 +17755,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             }
             ageGateMs = Math.max(ageGateMs, MIN_TEMP_WORKTREE_REAP_AGE_MS);
             if (ageMs < ageGateMs) continue;
-            try {
-              canonicalPath = realpathSync(path);
-            } catch {
-              canonicalPath = path;
-            }
+            // FNXC:PathIdentity 2026-10-08-16:08: native canonical spelling (8.3 aliases expanded) so audit and git cwd match git output (KB-082); never throws.
+            canonicalPath = canonicalizePath(path);
           } catch (err: unknown) {
             const errorMessage = err instanceof Error ? err.message : String(err);
             log.warn(`[self-healing] temp-dir sweep: failed to stat ${path}: ${errorMessage}`);

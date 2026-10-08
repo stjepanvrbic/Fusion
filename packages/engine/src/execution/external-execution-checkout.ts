@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { canonicalizePath, isSamePath } from "@fusion/core";
+import { existsSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { promisify } from "node:util";
 
@@ -40,15 +41,20 @@ export async function inspectExternalGitCheckout(
     if (!existsSync(checkoutPath) || !statSync(checkoutPath).isDirectory()) {
       return { valid: false, reason: `checkoutPath is not a directory: ${checkoutPath}` };
     }
-    const canonicalCheckout = realpathSync(checkoutPath);
+    /*
+    FNXC:PathIdentity 2026-10-08-16:08:
+    Operator-supplied checkout paths may use a Windows 8.3 short alias (`RUNNER~1`) while git reports the long name.
+    Canonicalize natively and compare through `@fusion/core` path identity, never raw strings, so an aliased Git top-level is accepted and a subdirectory is still refused (KB-082).
+    */
+    const canonicalCheckout = canonicalizePath(checkoutPath);
     const { stdout: topLevelOutput } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], {
       cwd: canonicalCheckout,
       encoding: "utf-8",
       timeout: 10_000,
     });
     const topLevel = topLevelOutput.trim();
-    const canonicalTopLevel = realpathSync(topLevel);
-    if (canonicalTopLevel !== canonicalCheckout) {
+    if (!isSamePath(topLevel, canonicalCheckout)) {
+      const canonicalTopLevel = canonicalizePath(topLevel);
       return {
         valid: false,
         reason: `checkoutPath must be the Git top-level (observed ${canonicalTopLevel})`,

@@ -2,6 +2,7 @@
  * FNXC:CodeOrganization 2026-08-03-13:35:
  * Review checkout routing log helper peeled from TaskExecutor (U4).
  */
+import { isSamePath } from "@fusion/core";
 import { getTaskReviewCheckoutPath } from "../execution/review-checkout.js";
 import { reviewerLog } from "../logger.js";
 
@@ -10,7 +11,8 @@ FNXC:ReviewRouting 2026-07-01-16:36:
 Review routing must expose whether the reviewer is using an explicit external checkout or the task worktree, but the invalid-sourceMetadata warning is only valid when sourceMetadata supplied the selected candidate. Higher-priority metadata can fail closed before sourceMetadata is considered, so centralize the logging to keep both review seams consistent and avoid false invalid-path warnings.
 */
 export function logReviewCheckoutRouting(taskId: string, task: unknown, reviewCwd: string, worktreePath: string): void {
-  if (reviewCwd !== worktreePath) {
+  // FNXC:PathIdentity 2026-10-08-16:08: the two spellings may differ only by 8.3 alias or case (KB-082), so compare by path identity.
+  if (!isSamePath(reviewCwd, worktreePath)) {
     reviewerLog.log(`${taskId}: review routed to external checkout ${reviewCwd} (task worktree: ${worktreePath})`);
     return;
   }

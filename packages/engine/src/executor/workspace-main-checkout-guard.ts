@@ -24,7 +24,7 @@ import { exec } from "node:child_process";
 import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { Settings, Task } from "@fusion/core";
+import { isPathInside, isSamePath, type Settings, type Task } from "@fusion/core";
 import { normalizeRepoRelPath, resolveRepoDeclaredScope } from "../worktree/workspace-paths.js";
 import { resolveWorktreesDir } from "../worktree/worktree-paths.js";
 import { isAlwaysAllowedScopeLeakPath, workflowPathMatchesDeclaredScope } from "./workflow-feedback-paths.js";
@@ -50,9 +50,13 @@ export function workspaceExecutionAnchor(task: Task): number | null {
   return values.length ? Math.min(...values) - 5_000 : null;
 }
 
+/*
+FNXC:PathIdentity 2026-10-08-16:08:
+Workspace roots, recorded worktree paths, and git output may spell one directory differently (Windows 8.3 short alias such as `RUNNER~1`, case, `/private/var`).
+Containment and equality go through `@fusion/core` path identity, never lexical `path.relative` or raw string comparison (KB-082).
+*/
 function isWithin(candidate: string, parent: string): boolean {
-  const relative = path.relative(parent, candidate);
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
+  return isPathInside(parent, candidate, { allowEqual: true });
 }
 
 async function nearestMtime(filePath: string): Promise<number | null> {
@@ -97,7 +101,7 @@ export async function detectWorkspaceMainCheckoutWork(
   const recordedPaths = Object.values(workspaceWorktrees).map((entry) => path.resolve(entry.worktreePath));
   for (const repo of repoKeys) {
     const checkout = path.resolve(deps.rootDir, repo);
-    if (!existsSync(checkout) || recordedPaths.some((candidate) => candidate === checkout)) { skipped.push(repo); continue; }
+    if (!existsSync(checkout) || recordedPaths.some((candidate) => isSamePath(candidate, checkout))) { skipped.push(repo); continue; }
     try {
       const { stdout: insideWorkTree } = await execAsync("git rev-parse --is-inside-work-tree", { ...probeOptions, cwd: checkout });
       const { stdout: topLevel } = await execAsync("git rev-parse --show-toplevel", { ...probeOptions, cwd: checkout });
@@ -105,7 +109,7 @@ export async function detectWorkspaceMainCheckoutWork(
       // A configured path can sit inside an enclosing Git checkout without being a repository itself.
       // Require its canonical top-level to be itself so an invalid repo entry cannot inspect unrelated
       // operator work or consume fn_task_done's bounded refusal budget.
-      if (insideWorkTree.trim() !== "true" || await fs.realpath(topLevel.trim()) !== await fs.realpath(checkout)) {
+      if (insideWorkTree.trim() !== "true" || !isSamePath(topLevel.trim(), checkout)) {
         skipped.push(repo);
         continue;
       }

@@ -13,9 +13,9 @@
  *   - Graceful shutdown of all engines via `stopAll()`
  */
 
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { resolve as pathResolve } from "node:path";
-import { createTaskStoreForBackend, resolveEffectiveConcurrency, type CentralCore, type TaskStore, type RegisteredProject, type MigrationProgressEvent } from "@fusion/core";
+import { createTaskStoreForBackend, isSamePath, resolveEffectiveConcurrency, type CentralCore, type TaskStore, type RegisteredProject, type MigrationProgressEvent } from "@fusion/core";
 import { ProjectEngine } from "./project-engine.js";
 import type { ProjectEngineOptions } from "./project-engine.js";
 import type { ProjectRuntimeConfig } from "./project/project-runtime.js";
@@ -663,15 +663,11 @@ export class ProjectEngineManager {
  * FNXC:FasterStartup 2026-07-15-00:40:
  * Path identity for externalTaskStore matching: resolve then realpath so
  * symlinked project roots compare equal to their canonical registry path.
+ *
+ * FNXC:PathIdentity 2026-10-08-16:08:
+ * A root spelled with a Windows 8.3 short alias (`RUNNER~1`) or another case is the same project.
+ * Compare through `@fusion/core` path identity (native realpath), never JavaScript `realpathSync` + raw `===` (KB-082).
  */
 function sameProjectRoot(a: string, b: string): boolean {
-  const normalize = (p: string): string => {
-    const resolved = pathResolve(p);
-    try {
-      return realpathSync(resolved);
-    } catch {
-      return resolved;
-    }
-  };
-  return normalize(a) === normalize(b);
+  return isSamePath(pathResolve(a), pathResolve(b));
 }

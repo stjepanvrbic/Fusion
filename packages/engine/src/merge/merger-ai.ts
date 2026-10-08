@@ -37,7 +37,7 @@ import { commitIdentityArgs, resolveCommitIdentity } from "../git-identity.js";
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { realpathSync, readdirSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -76,6 +76,7 @@ import {
   type TaskStore,
   type WorkspaceLeaseHandle,
   resolveReviewColumns,
+  canonicalizePath,
 } from "@fusion/core";
 import { selectUserCommentsForAgentContext } from "../agents/agent-user-comments.js";
 import { resolveTaskWorkingBranch } from "../worktree/worktree-names.js";
@@ -390,7 +391,8 @@ async function recoverApprovedPreexistingAiMergeWorktree(
   const recoverableCandidates: PreexistingAiMergeRecoveryCandidate[] = [];
   for (const candidate of listAiMergeWorktreeCandidates(taskId, repoRootDir, settings)) {
     let mergeRoot = candidate;
-    try { mergeRoot = realpathSync(candidate); } catch { /* keep original */ }
+    // FNXC:PathIdentity 2026-10-08-16:08: native canonical spelling (Windows 8.3 aliases expanded) matches git output (KB-082); never throws.
+    mergeRoot = canonicalizePath(candidate);
     if (activeSessionRegistry.isPathActive(candidate) || activeSessionRegistry.isPathActive(mergeRoot)) continue;
 
     try {
@@ -1275,12 +1277,8 @@ export async function landOneRepo(
       registerMergeRoot(mergeRoot);
       await git(["worktree", "add", "--detach", mergeRoot, tipSha], repoRootDir);
       worktreeAdded = true;
-      let canonicalMergeRoot = mergeRoot;
-      try {
-        canonicalMergeRoot = realpathSync(mergeRoot);
-      } catch {
-        canonicalMergeRoot = mergeRoot;
-      }
+      // FNXC:PathIdentity 2026-10-08-16:08: native canonical spelling (Windows 8.3 aliases expanded) matches git output (KB-082); never throws.
+      const canonicalMergeRoot = canonicalizePath(mergeRoot);
       for (const pathToRegister of new Set([canonicalMergeRoot, mergeRoot])) {
         registerMergeRoot(pathToRegister);
       }
@@ -3932,12 +3930,8 @@ export async function pushAfterMergeToRemote(input: {
     }
     await git(["worktree", "add", "--detach", pushRoot, localSha], projectRootDir);
     worktreeAdded = true;
-    let canonicalPushRoot = pushRoot;
-    try {
-      canonicalPushRoot = realpathSync(pushRoot);
-    } catch {
-      canonicalPushRoot = pushRoot;
-    }
+    // FNXC:PathIdentity 2026-10-08-16:08: native canonical spelling (Windows 8.3 aliases expanded) matches git output (KB-082); never throws.
+    const canonicalPushRoot = canonicalizePath(pushRoot);
     if (!registeredPaths.has(canonicalPushRoot)) {
       activeSessionRegistry.registerPath(canonicalPushRoot, { taskId, kind: "ai-merge", ownerKey: `ai-merge-push:${taskId}` });
       registeredPaths.add(canonicalPushRoot);

@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { rmSync } from "node:fs";
+import { hasDistinctShortAlias, realTempDir, win32ShortAlias } from "./helpers/real-path.js";
 
 // Stub out the per-machine singleton lock so tests with fake working dirs
 // (e.g. /mapped/...) don't try to mkdir or bind real sockets.
@@ -149,6 +151,33 @@ describe("ProjectEngineManager", () => {
         centralCore,
         expect.objectContaining({ externalTaskStore: sharedStore }),
       );
+    });
+
+    /*
+    FNXC:PathIdentity 2026-10-08-16:08:
+    KB-082: a shared store whose root is the Windows 8.3 short alias of the project working directory is the same project and must be shared.
+    */
+    it.runIf(process.platform === "win32")("shares externalTaskStore when the store root is an 8.3 short alias of the working directory", async () => {
+      const longRoot = realTempDir("kb082-project-root-");
+      try {
+        const shortRoot = win32ShortAlias(longRoot);
+        if (hasDistinctShortAlias(longRoot)) expect(shortRoot).not.toBe(longRoot);
+        (centralCore.resolveLocalProjectWorkingDirectory as ReturnType<typeof vi.fn>).mockResolvedValue(longRoot);
+        const getSettingsFast = vi.fn().mockResolvedValue({ maxConcurrent: 3 });
+        const sharedStore = { getRootDir: () => shortRoot, getSettingsFast } as any;
+        const manager = new ProjectEngineManager(centralCore, { externalTaskStore: sharedStore });
+
+        await manager.ensureEngine("proj_aaa");
+        expect(ProjectEngine).toHaveBeenLastCalledWith(
+          expect.objectContaining({ workingDirectory: longRoot }),
+          centralCore,
+          expect.objectContaining({ externalTaskStore: sharedStore }),
+        );
+        // Startup concurrency also reads the live store instead of opening a second one.
+        expect(getSettingsFast).toHaveBeenCalled();
+      } finally {
+        rmSync(longRoot, { recursive: true, force: true });
+      }
     });
 
     it("uses the live scoped settings blob over a stale registry snapshot at runtime startup", async () => {
