@@ -65,7 +65,15 @@ test("the committed ledger names only existing files and stays at or under its c
     const dir = { "@fusion/core": "packages/core", "@fusion/engine": "packages/engine" }[packageName];
     assert.ok(dir, `unknown package ${packageName}`);
     assert.deepEqual(files, [...new Set(files)].sort(), `${packageName} entries must be sorted and unique`);
-    for (const file of files) assert.ok(existsSync(path.join(repoRoot, dir, file)), `${packageName}: ${file} does not exist`);
+    for (const file of files) {
+      // FNXC:CI 2026-10-07-23:34: entries use the comparator's one spelling (package-relative, forward slashes), so a backslash or ./ form can never silently miss its report row.
+      const segments = file.split("/");
+      assert.ok(
+        segments[0] === "src" && file.endsWith(".test.ts") && !file.includes("\\") && segments.every((segment) => segment !== "" && segment !== "." && segment !== ".."),
+        `${packageName}: ${file} must be a package-relative forward-slash path`,
+      );
+      assert.ok(existsSync(path.join(repoRoot, dir, file)), `${packageName}: ${file} does not exist`);
+    }
     total += files.length;
   }
   assert.ok(total <= ledger.ceiling, `ledger has ${total} entries, above its ceiling of ${ledger.ceiling}; it may only shrink`);
