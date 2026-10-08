@@ -2,8 +2,8 @@ name: Full Suite (non-blocking)
 
 # The demoted test tier (docs/plans/2026-06-04-001-refactor-fast-trusted-test-gate-plan.md).
 # Runs the full sharded suite, the engine slow tier, the dashboard inventory
-# guard, the scripts node:test suite, and the Windows gate/core/engine lanes
-# on every push to main — post-merge signal only. These jobs
+# guard, the scripts node:test suite, and the Windows gate plus sharded core/engine,
+# dashboard-api, CLI and scripts lanes on every push to main — post-merge signal only. These jobs
 # are NON-BLOCKING by design: they never run on PRs and must never be added
 # to branch-protection required checks. A red run here is information, not a
 # merge stopper; see docs/testing.md for the quarantine ratchet that keeps
@@ -329,9 +329,47 @@ jobs:
   # POSIX syntax, so pnpm routes them through Git Bash as on the operator's machine.
   # Promote to blocking once green.
   test-windows:
-    name: Windows tests
+    name: Windows tests (${{ matrix.lane }})
     runs-on: windows-latest
+    # FNXC:CI 2026-10-08-08:51:
+    # Run 37720611351 took 4,091 s on the core lane (vs 1,737 s and 2,109 s before) and produced
+    # 11 fifteen-second timeouts with no assertion failure: runner load, not Windows bugs. The single
+    # job is now a matrix of parallel legs. Each core/engine shard pins VITEST_MAX_WORKERS=1, so each
+    # test gets a fixed CPU share that does not depend on the runner's core count; splitting each suite
+    # into two parallel shards keeps wall time bounded after halving workers, and each shard has its
+    # own 75-minute step budget under the 120-minute job backstop. A larger runner was not chosen
+    # because it needs paid/org runner configuration this repo cannot assume. Timeouts are never
+    # widened; the comparator lists timeout-only failures in a separate informational
+    # "Load timeouts" summary section without changing its verdict.
+    # FNXC:CI 2026-10-08-13:12:
+    # KB-062 adds dashboard (dashboard-api project), CLI (@runfusion/fusion) and scripts
+    # (scripts/__tests__ node:test) legs so KB-036's Windows fixes there cannot regress unseen.
+    # They use matrix.suite rather than matrix.package because they are not sharded; each has its
+    # own lane step and shares one compare step against the same known-failing ledger.
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: gate
+          - lane: core-1
+            package: "@fusion/core"
+            shard: "1/2"
+          - lane: core-2
+            package: "@fusion/core"
+            shard: "2/2"
+          - lane: engine-1
+            package: "@fusion/engine"
+            shard: "1/2"
+          - lane: engine-2
+            package: "@fusion/engine"
+            shard: "2/2"
+          - lane: dashboard
+            suite: "@fusion/dashboard"
+          - lane: cli
+            suite: "@runfusion/fusion"
+          - lane: scripts
+            suite: scripts
     env:
       FUSION_PG_TEST_URL_BASE: "postgresql://postgres:root@localhost:5432"
       PGPASSWORD: "root"
@@ -364,6 +402,7 @@ jobs:
         run: pnpm build
 
       - name: Merge gate suite
+        if: ${{ matrix.lane == 'gate' }}
         shell: bash
         run: pnpm test:gate
 
@@ -373,33 +412,72 @@ jobs:
       # the step; the comparator step fails only on a failure outside
       # scripts/lib/windows-known-failing-tests.json, a missing report, or an unexplained nonzero exit,
       # and writes the result to the job summary.
-      - name: Core unit lane
-        if: ${{ !cancelled() }}
+      # FNXC:CI 2026-10-08-08:51:
+      # One generic lane/compare pair serves every core/engine shard, keyed on matrix.lane. The compare
+      # step still runs after a lane step timeout, finds no report, and fails with "no test results".
+      - name: Unit lane shard
+        if: ${{ matrix.package && !cancelled() }}
+        timeout-minutes: 75
+        shell: bash
+        env:
+          VITEST_MAX_WORKERS: "1"
+        run: |
+          mkdir -p .windows-lane
+          echo "runner cpus: $(node -p "require('os').cpus().length"); VITEST_MAX_WORKERS=$VITEST_MAX_WORKERS"
+          set +e
+          pnpm --filter ${{ matrix.package }} test --shard=${{ matrix.shard }} --reporter=json --outputFile.json=../../.windows-lane/${{ matrix.lane }}.json
+          echo $? > .windows-lane/${{ matrix.lane }}.exit
+
+      - name: Compare shard with known Windows failures
+        if: ${{ matrix.package && !cancelled() }}
+        shell: bash
+        run: node scripts/check-windows-known-failing.mjs --package ${{ matrix.package }} --label "${{ matrix.lane }} (shard ${{ matrix.shard }})" --report .windows-lane/${{ matrix.lane }}.json --exit-code .windows-lane/${{ matrix.lane }}.exit
+
+      # FNXC:CI 2026-10-08-13:12:
+      # KB-062 dashboard, CLI and scripts legs: same record-then-compare contract as the unit shards.
+      # Dashboard and CLI pin VITEST_MAX_WORKERS=1 like the core/engine shards; their local win32
+      # summed file time is about 4-5 minutes each, so a 60-minute step budget is ample on a 4-vCPU
+      # runner without sharding. dashboard-api matches nothing unless FUSION_DASHBOARD_DEEP=1. The
+      # scripts suite has no Vitest JSON reporter, so scripts/lib/node-test-json-reporter.mjs writes
+      # the comparator's report shape, forwarded through run-script-tests.mjs.
+      - name: Dashboard API lane
+        if: ${{ matrix.lane == 'dashboard' && !cancelled() }}
+        timeout-minutes: 60
+        shell: bash
+        env:
+          VITEST_MAX_WORKERS: "1"
+        run: |
+          mkdir -p .windows-lane
+          set +e
+          FUSION_DASHBOARD_DEEP=1 NODE_OPTIONS=--max-old-space-size=6144 pnpm --filter @fusion/dashboard exec vitest run --project dashboard-api --silent=passed-only --reporter=dot --reporter=json --outputFile.json=../../.windows-lane/dashboard.json
+          echo $? > .windows-lane/dashboard.exit
+
+      - name: CLI lane
+        if: ${{ matrix.lane == 'cli' && !cancelled() }}
+        timeout-minutes: 60
+        shell: bash
+        env:
+          VITEST_MAX_WORKERS: "1"
+        run: |
+          mkdir -p .windows-lane
+          set +e
+          pnpm --filter @runfusion/fusion test --reporter=json --outputFile.json=../../.windows-lane/cli.json
+          echo $? > .windows-lane/cli.exit
+
+      - name: Scripts lane
+        if: ${{ matrix.lane == 'scripts' && !cancelled() }}
+        timeout-minutes: 30
         shell: bash
         run: |
           mkdir -p .windows-lane
           set +e
-          pnpm --filter @fusion/core test --reporter=json --outputFile.json=../../.windows-lane/core.json
-          echo $? > .windows-lane/core.exit
+          node scripts/run-script-tests.mjs --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./scripts/lib/node-test-json-reporter.mjs --test-reporter-destination=.windows-lane/scripts.json
+          echo $? > .windows-lane/scripts.exit
 
-      - name: Compare core lane with known Windows failures
-        if: ${{ !cancelled() }}
+      - name: Compare suite with known Windows failures
+        if: ${{ matrix.suite && !cancelled() }}
         shell: bash
-        run: node scripts/check-windows-known-failing.mjs --package @fusion/core --report .windows-lane/core.json --exit-code .windows-lane/core.exit
-
-      - name: Engine unit lane
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: |
-          mkdir -p .windows-lane
-          set +e
-          pnpm --filter @fusion/engine test --reporter=json --outputFile.json=../../.windows-lane/engine.json
-          echo $? > .windows-lane/engine.exit
-
-      - name: Compare engine lane with known Windows failures
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: node scripts/check-windows-known-failing.mjs --package @fusion/engine --report .windows-lane/engine.json --exit-code .windows-lane/engine.exit
+        run: node scripts/check-windows-known-failing.mjs --package ${{ matrix.suite }} --label "${{ matrix.lane }}" --report .windows-lane/${{ matrix.lane }}.json --exit-code .windows-lane/${{ matrix.lane }}.exit
 
   # FNXC:PipelineSmoke 2026-08-23-14:52:
   # FN-182 runs the deterministic full-pipeline composition only after merge.
