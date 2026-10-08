@@ -54,6 +54,7 @@
     "packages/engine/src/cli-runtime/session-skill-context.ts",
     "packages/engine/src/cli-runtime/skill-resolver.ts",
     "packages/engine/src/concurrency/concurrency.ts",
+    "packages/engine/src/concurrency/continuation-admission-lane.ts",
     "packages/engine/src/concurrency/token-budget-enforcer.ts",
     "packages/engine/src/concurrency/verification-concurrency.ts",
     "packages/engine/src/credential-instance-rotation.ts",
@@ -10916,7 +10917,7 @@
       "enclosingSymbolPath": "releaseFileScopeWaitingContinuations>transitioned",
       "writer": "store.transitionWorkflowWorkItem",
       "ordinal": 1,
-      "lineHint": 804,
+      "lineHint": 927,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
