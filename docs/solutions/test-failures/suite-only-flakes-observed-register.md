@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **7 active observation records** (entries 2, 13, 20, 21, 25, 26, and 27), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **8 active observation records** (entries 2, 13, 20, 21, 25, 26, 27, and 28), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -350,6 +350,22 @@ The log shows one embedded PostgreSQL data directory, under the worker's test ho
 No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the CLI vitest config.
 
 The subprocess-guard line deserves a product look. It means a real PostgreSQL child reached a CLI unit test that does not obviously need one, and a startup that outlives its test left a stale port recorded as a joined instance for later cases. Start with how the embedded PostgreSQL startup records and joins an existing instance for a shared data directory, and whether `CentralCore` initialization in this file should use an in-memory or harness-provided store.
+
+### 28. TaskExecutor fn_task_done summary persistence implementation session never opened
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/engine/src/__tests__/executor-task-done-summary.test.ts`
+- **Exact tests:** five cases in `TaskExecutor fn_task_done summary persistence`: `replaces the summary on the first completion when no prior summary or workflow results exist`, `appends rerun summaries when a prior summary exists and workflow steps have already run`, `falls back to replace mode when a prior summary exists but no workflow steps have run yet`, `does not rewrite the summary when fn_task_done receives an empty or missing summary`, and `avoids duplicate appends when the rerun summary is already the existing suffix`.
+- **Observed tree/SHA:** fork Full Suite run [37717586213](https://github.com/stjepanvrbic/Fusion/actions/runs/37717586213) at `08361ff9c` (Linux, `ubuntu-latest`), job `Test shard 2/4` (`113117541124`), project `engine-default`. That commit changed only a CLI test, so the failure is load- or environment-shaped. The file passed in the Full Suite runs for the neighbouring commits `997ab2360` and `81da06824`.
+- **Observed frequency:** 1 run, 5 failure entries, one per case.
+
+The first case failed with `Error: Test timed out in 30000ms`. The other four each failed in the `setupTaskDoneTool` helper with `AssertionError: TaskExecutor should open an implementation session with fn_task_done: expected null not to be null`. In those four, `executor.execute` returned without `createFnAgent` ever receiving a `fn_task_done` custom tool, so no implementation session was opened. This reads the log; no reproduction was attempted, and the log does not show why `execute` returned early or whether the four later cases were a cascade from the first case's timeout.
+
+The same shard also reported a failure in `merge-orphan-durable-write-inventory-drift.test.ts`. That is a different file and mechanism, and is not part of this record.
+
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the engine vitest config.
+
+The executor lifecycle changed shortly before this sighting. Audit PR #32 (`9cf9144d6`, recovery ownership) made executor retries stay in their lane and re-dispatch through a guarded in-place timer. A session that never opens under load is the shape that change could produce. If this file is sighted again, look at the product code before quarantining: start with the in-place re-dispatch timer and its guard in the executor, and whether `execute` can return or defer re-dispatch before the first implementation session is created.
 
 ### Common shape and investigated result
 

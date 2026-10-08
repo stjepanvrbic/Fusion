@@ -207,6 +207,10 @@ test("observed-flake register active count, escalation state, and owners stay sy
       heading: "27. ensureCwdProjectRegistered embedded PostgreSQL startup cascade",
       status: "Active first sighting — recorded 2026-10-07, unattributed.",
     },
+    {
+      heading: "28. TaskExecutor fn_task_done summary persistence implementation session never opened",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+    },
   ]);
 });
 
