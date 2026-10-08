@@ -165,6 +165,11 @@ FNXC:AgentSkillDetailOrdering 2026-10-05-08:54:
 FN-9506 records the shard-three Agent Detail badge observation after a controlled pending-discovery
 repair. Keep the first-sighting record active so a second appearance follows the file-level
 quarantine rule rather than silently treating a deterministic test repair as a policy exemption.
+
+FNXC:TestFlakeRegister 2026-10-08-04:50:
+Entry 28 was sighted a second time on the fork's Full Suite, so the deletion ratchet moves it from the
+active first-sighting inventory to the archive. The archived record must keep both run identifiers, the
+unchanged assertion text, and the product-race lead so a rescue starts from the executor rather than a timeout.
 */
 test("observed-flake register active count, escalation state, and owners stay synchronized", () => {
   const register = readFileSync(registerPath, "utf8");
@@ -206,10 +211,6 @@ test("observed-flake register active count, escalation state, and owners stay sy
     {
       heading: "27. ensureCwdProjectRegistered embedded PostgreSQL startup cascade",
       status: "Active first sighting — recorded 2026-10-07, unattributed.",
-    },
-    {
-      heading: "28. TaskExecutor fn_task_done summary persistence implementation session never opened",
-      status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
     {
       heading: "29. MissionManager reconcile control switch-window cases",
@@ -268,6 +269,29 @@ test("archived skills-get quarantine retains both-sighting and sibling-coverage 
   ]) {
     assert.ok(entry.includes(evidence), `Archived skills-get record is missing ${evidence}`);
   }
+});
+
+test("archived executor task-done summary quarantine retains both-sighting evidence", () => {
+  const register = readFileSync(registerPath, "utf8");
+  const archive = register.match(/## Archive — closed records\n([\s\S]*)$/)?.[1];
+  assert.ok(archive, "Expected an Archive — closed records section");
+  const entry = archive.match(/^### 28\. TaskExecutor fn_task_done summary persistence implementation session never opened\n([\s\S]*?)(?=^### |(?![\s\S]))/m)?.[1];
+  assert.ok(entry, "Expected archived executor task-done summary quarantine entry");
+
+  for (const evidence of [
+    "packages/engine/src/__tests__/executor-task-done-summary.test.ts",
+    "replaces the summary on the first completion when no prior summary or workflow results exist",
+    "37717586213",
+    "37720611351",
+    "Test timed out in 30000ms",
+    "TaskExecutor should open an implementation session with fn_task_done: expected null not to be null",
+    "quarantined 2026-10-08",
+    "deletion deadline 2026-10-22",
+    "9cf9144d6",
+  ]) {
+    assert.ok(entry.includes(evidence), `Archived executor task-done summary entry is missing ${evidence}`);
+  }
+  assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
 });
 
 test("archived terminal graph-gate quarantine retains both-sighting evidence", () => {

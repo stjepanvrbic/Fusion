@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **9 active observation records** (entries 2, 13, 20, 21, 25, 26, 27, 28, and 29), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **8 active observation records** (entries 2, 13, 20, 21, 25, 26, 27, and 29), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **16 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -351,22 +351,6 @@ No timeout, retry, or assertion changed, and the file is not quarantined because
 
 The subprocess-guard line deserves a product look. It means a real PostgreSQL child reached a CLI unit test that does not obviously need one, and a startup that outlives its test left a stale port recorded as a joined instance for later cases. Start with how the embedded PostgreSQL startup records and joins an existing instance for a shared data directory, and whether `CentralCore` initialization in this file should use an in-memory or harness-provided store.
 
-### 28. TaskExecutor fn_task_done summary persistence implementation session never opened
-
-- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
-- **File:** `packages/engine/src/__tests__/executor-task-done-summary.test.ts`
-- **Exact tests:** five cases in `TaskExecutor fn_task_done summary persistence`: `replaces the summary on the first completion when no prior summary or workflow results exist`, `appends rerun summaries when a prior summary exists and workflow steps have already run`, `falls back to replace mode when a prior summary exists but no workflow steps have run yet`, `does not rewrite the summary when fn_task_done receives an empty or missing summary`, and `avoids duplicate appends when the rerun summary is already the existing suffix`.
-- **Observed tree/SHA:** fork Full Suite run [37717586213](https://github.com/stjepanvrbic/Fusion/actions/runs/37717586213) at `08361ff9c` (Linux, `ubuntu-latest`), job `Test shard 2/4` (`113117541124`), project `engine-default`. That commit changed only a CLI test, so the failure is load- or environment-shaped. The file passed in the Full Suite runs for the neighbouring commits `997ab2360` and `81da06824`.
-- **Observed frequency:** 1 run, 5 failure entries, one per case.
-
-The first case failed with `Error: Test timed out in 30000ms`. The other four each failed in the `setupTaskDoneTool` helper with `AssertionError: TaskExecutor should open an implementation session with fn_task_done: expected null not to be null`. In those four, `executor.execute` returned without `createFnAgent` ever receiving a `fn_task_done` custom tool, so no implementation session was opened. This reads the log; no reproduction was attempted, and the log does not show why `execute` returned early or whether the four later cases were a cascade from the first case's timeout.
-
-The same shard also reported a failure in `merge-orphan-durable-write-inventory-drift.test.ts`. That is a different file and mechanism, and is not part of this record.
-
-No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the engine vitest config.
-
-The executor lifecycle changed shortly before this sighting. Audit PR #32 (`9cf9144d6`, recovery ownership) made executor retries stay in their lane and re-dispatch through a guarded in-place timer. A session that never opens under load is the shape that change could produce. If this file is sighted again, look at the product code before quarantining: start with the in-place re-dispatch timer and its guard in the executor, and whether `execute` can return or defer re-dispatch before the first implementation session is created.
-
 ### 29. MissionManager reconcile control switch-window cases
 
 - **Status:** Active first sighting — recorded 2026-10-08, unattributed.
@@ -441,6 +425,29 @@ explicit-file diagnostics runnable; timeout, retry, and assertion appeasement re
 FNXC:TestFlakeRegister 2026-10-07-18:04:
 Entries 22 and 23 record same-day second sightings on the fork's Full Suite. Both files are quarantined through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
 -->
+<!--
+FNXC:TestFlakeRegister 2026-10-08-04:50:
+Entry 28 recorded a second Full Suite sighting on the fork, so the file is quarantined through the dated ledger and the literal engine-default exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
+-->
+### 28. TaskExecutor fn_task_done summary persistence implementation session never opened
+
+- **Status:** Closed — quarantined 2026-10-08 after a second Full Suite sighting; deletion deadline 2026-10-22.
+- **File:** `packages/engine/src/__tests__/executor-task-done-summary.test.ts`
+- **Exact tests:** five cases in `TaskExecutor fn_task_done summary persistence`: `replaces the summary on the first completion when no prior summary or workflow results exist`, `appends rerun summaries when a prior summary exists and workflow steps have already run`, `falls back to replace mode when a prior summary exists but no workflow steps have run yet`, `does not rewrite the summary when fn_task_done receives an empty or missing summary`, and `avoids duplicate appends when the rerun summary is already the existing suffix`.
+- **Observed trees/SHAs:** fork Full Suite runs [37717586213](https://github.com/stjepanvrbic/Fusion/actions/runs/37717586213) at `08361ff9c` (job `113117541124`) and [37720611351](https://github.com/stjepanvrbic/Fusion/actions/runs/37720611351) at `a05be4484` (job `113127146317`), both Linux `ubuntu-latest`, job `Test shard 2/4`, project `engine-default`.
+- **Observed frequency:** 2 runs, 5 failure entries each, one per case. The file passed in the Full Suite runs for `997ab2360` and `81da06824` around the first sighting.
+
+| run | result |
+|---|---|
+| 37717586213 | first case `Error: Test timed out in 30000ms`; the other four `AssertionError: TaskExecutor should open an implementation session with fn_task_done: expected null not to be null` in `setupTaskDoneTool`; 1 other file failed in the shard (`merge-orphan-durable-write-inventory-drift.test.ts`) |
+| 37720611351 | the same five failures with the same messages and lines; 575 of 577 engine-default files passed, and the other failure was `mcp-builtin-lane-coverage.test.ts` line-number drift after KB-010 |
+
+In every failing case `executor.execute` returned without `createFnAgent` ever receiving a `fn_task_done` custom tool, so no implementation session was opened. The `08361ff9c` commit changed only a CLI test, so the first sighting is load- or environment-shaped. The `a05be4484` commit edited merge-path session disposal and did not touch the executor. The file run alone passed 5 of 5 on a local Windows checkout at `f0d352f45`; no shard-shaped reproduction was attempted. Neither log shows why `execute` returned early or whether the four later cases cascade from the first case's timeout.
+
+No timeout, retry, or assertion changed. The whole file is excluded from the `engine-default` project, which also refuses an explicit-path run until the exclude is removed. It is not in the engine-core merge-gate allow-list, so no gate eviction was needed.
+
+This is the second executor-subsystem quarantine after `executor-prompt.test.ts`, whose pause-resume case also observed zero `createFnAgent` calls only under shard load. The AGENTS.md repeated-quarantine rule treats that as a product-race smell. Before the deletion deadline, inspect the guarded in-place re-dispatch timer that audit PR #32 (`9cf9144d6`) introduced for executor retries, and whether `execute` can return or defer re-dispatch before the first implementation session is created. No product code changed in this quarantine.
+
 ### 24. test-changed prune cases scanning the shared temp dir
 
 - **Status:** Closed 2026-10-07 — structurally resolved on first sighting; no quarantine.
