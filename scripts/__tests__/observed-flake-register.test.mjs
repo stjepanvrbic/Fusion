@@ -206,6 +206,11 @@ FNXC:TestFlakeRegister 2026-10-08-11:22:
 Entry 30 was sighted a second time on the fork's Full Suite (the same case and assertion on a later commit), so the
 deletion ratchet moves it to the archive. The archived record must keep both run identifiers and the unchanged
 assertion message so a rescue starts from the refresh path's pre-fetch I/O rather than from a timeout.
+
+FNXC:TestFlakeRegister 2026-10-08-12:03:
+Entry 31 was sighted a second time on the fork's Full Suite (the same parameterized row and assertion on a later commit),
+so the deletion ratchet moves it to the archive. The archived record must keep both run identifiers and the unchanged
+assertion message so a rescue starts from MailboxView's load-more handling rather than from a timeout.
 */
 /*
 FNXC:TestFlakeRegister 2026-10-08-01:13:
@@ -247,10 +252,6 @@ test("observed-flake register active count, escalation state, and owners stay sy
     {
       heading: "27. ensureCwdProjectRegistered embedded PostgreSQL startup cascade",
       status: "Active first sighting — recorded 2026-10-07, unattributed.",
-    },
-    {
-      heading: "31. Mailbox paging production surfaces 120-message inbox desktop paging",
-      status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
     {
       heading: "32. System controls rebuild output stream subscription",
@@ -387,6 +388,27 @@ test("archived MissionManager reconcile quarantine retains both-sighting evidenc
     "deletion deadline 2026-10-22",
   ]) {
     assert.ok(entry.includes(evidence), `Archived MissionManager reconcile entry is missing ${evidence}`);
+  }
+  assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
+});
+
+test("archived Mailbox paging surfaces quarantine retains both-sighting evidence", () => {
+  const register = readFileSync(registerPath, "utf8");
+  const archive = register.match(/## Archive — closed records\n([\s\S]*)$/)?.[1];
+  assert.ok(archive, "Expected an Archive — closed records section");
+  const entry = archive.match(/^### 31\. Mailbox paging production surfaces 120-message inbox desktop paging\n([\s\S]*?)(?=^### |(?![\s\S]))/m)?.[1];
+  assert.ok(entry, "Expected archived Mailbox paging surfaces quarantine entry");
+
+  for (const evidence of [
+    "packages/dashboard/app/components/__tests__/MailboxPaging.surfaces.test.tsx",
+    "MailboxView desktop",
+    "37725718700",
+    "37763234227",
+    "Unable to find an element by: [data-testid=\"mailbox-item-in-99\"]",
+    "quarantined 2026-10-08",
+    "deletion deadline 2026-10-22",
+  ]) {
+    assert.ok(entry.includes(evidence), `Archived Mailbox paging surfaces entry is missing ${evidence}`);
   }
   assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
 });

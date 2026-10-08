@@ -385,6 +385,11 @@ const quarantinedDashboardTests: string[] = [
   */
   "app/components/__tests__/agent-detail-log-history.test.tsx",
   /*
+  FNXC:DashboardTestQuarantine 2026-10-08-12:03:
+  Second Full Suite sighting of register entry 31: the MailboxView desktop paging row never rendered the second page after the first load-more click, at the same assertion on two commits under dashboard-app-quality-backfill load. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at whether MailboxView drops a load-more click while an inbox request is in flight.
+  */
+  "app/components/__tests__/MailboxPaging.surfaces.test.tsx",
+  /*
   FNXC:DashboardTestQuarantine 2026-07-17-16:50:
   FN-8245 re-admits all three UI files with their ledger rows removed in lockstep.
   QuickEntryBox restores focus from its resolved submit path while isolated jsdom

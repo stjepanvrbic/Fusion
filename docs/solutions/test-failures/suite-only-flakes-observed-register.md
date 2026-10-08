@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 27, 31, 32, 33, 35, and 36): ten **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **20 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **10 active observation records** (entries 2, 13, 20, 21, 25, 27, 32, 33, 35, and 36): nine **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **21 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -358,18 +358,6 @@ No timeout, retry, or assertion changed, and the file is not quarantined because
 
 The subprocess-guard line deserves a product look. It means a real PostgreSQL child reached a CLI unit test that does not obviously need one, and a startup that outlives its test left a stale port recorded as a joined instance for later cases. Start with how the embedded PostgreSQL startup records and joins an existing instance for a shared data directory, and whether `CentralCore` initialization in this file should use an in-memory or harness-provided store.
 
-### 31. Mailbox paging production surfaces 120-message inbox desktop paging
-
-- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
-- **File:** `packages/dashboard/app/components/__tests__/MailboxPaging.surfaces.test.tsx`
-- **Exact test:** `mailbox paging production surfaces > pages a 120-message inbox in %s %s until the last message is reachable` (parameterized `it.each`; the failing row was `MailboxView desktop`, and the CI log prints it as `...inbox in MailboxView desktop until the last message is reachable`).
-- **Observed tree/SHA:** fork Full Suite run [37725718700](https://github.com/stjepanvrbic/Fusion/actions/runs/37725718700) at `b2dfb6316` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113143293384`), project `dashboard-app-quality-backfill` (`--shard=4/4`). That commit changed only a register entry. The file passed in the Full Suite runs 37718606719 (`0bcb53f96`) and 37720328009 (`9e948d488`); neither run's failed-job log names it. The test came from audit PR #24 (`b2baf33d5`, operator messaging delivery, mailbox and recommendations UI, inbound webhook auth).
-- **Observed frequency:** 1 run, 1 failure entry. The sibling mobile and other host cases of the same `it.each` passed (175 of 176 files passed in the shard).
-
-The case failed with `TestingLibraryElementError: Unable to find an element by: [data-testid="mailbox-item-in-99"]`, raised by the `findByTestId` on line 88 after the click on `mailbox-inbox-load-more`. The first page (`mailbox-item-in-49`) had already rendered, so the first load-more click did not produce the second page of 50 rows within the default Testing Library timeout. This reads the log; no reproduction was attempted, and the log does not show whether the click was dropped, the second `fetchInbox` resolved late, or the rendered list was slow to commit 100 rows.
-
-The Full Suite was under heavy load that hour: several Full Suite runs were queued or in progress at once on the fork. No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the dashboard vitest config. Before quarantining, look at the product code: check whether `MailboxView` can ignore or drop a load-more click while the previous inbox request or a background refresh is in flight.
-
 ### 32. System controls rebuild output stream subscription
 
 - **Status:** Active first sighting — recorded 2026-10-08, unattributed.
@@ -516,6 +504,27 @@ explicit-file diagnostics runnable; timeout, retry, and assertion appeasement re
 FNXC:TestFlakeRegister 2026-10-07-18:04:
 Entries 22 and 23 record same-day second sightings on the fork's Full Suite. Both files are quarantined through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
 -->
+<!--
+FNXC:TestFlakeRegister 2026-10-08-12:03:
+Entry 31 recorded a second Full Suite sighting on the fork: the same parameterized row failed at the same assertion on a later commit. Quarantine is file-level, so the whole file is excluded through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
+-->
+### 31. Mailbox paging production surfaces 120-message inbox desktop paging
+
+- **Status:** Closed — quarantined 2026-10-08 after a second Full Suite sighting; deletion deadline 2026-10-22.
+- **File:** `packages/dashboard/app/components/__tests__/MailboxPaging.surfaces.test.tsx`
+- **Exact test:** `mailbox paging production surfaces > pages a 120-message inbox in %s %s until the last message is reachable` (parameterized `it.each`; the failing row was `MailboxView desktop` both times, and the CI log prints it as `...inbox in MailboxView desktop until the last message is reachable`).
+- **Observed trees/SHAs:** fork Full Suite runs [37725718700](https://github.com/stjepanvrbic/Fusion/actions/runs/37725718700) at `b2dfb6316` (job `113143293384`) and [37763234227](https://github.com/stjepanvrbic/Fusion/actions/runs/37763234227/job/113264519354) at `bfe6023d4` (Test shard 4/4, job `113264519354`), both Linux `ubuntu-latest`, command `@fusion/dashboard run test:quality:app:backfill-4`, project `dashboard-app-quality-backfill`. The file passed in the Full Suite runs 37718606719 (`0bcb53f96`) and 37720328009 (`9e948d488`).
+- **Observed frequency:** 2 runs, 1 failure entry each, the same row and the same assertion. The sibling mobile and other host rows passed (second run: 1 failed of 2260 tests in the command, 175 of 176 files passed).
+
+| run | result |
+|---|---|
+| 37725718700 | `TestingLibraryElementError: Unable to find an element by: [data-testid="mailbox-item-in-99"]` from the `findByTestId` at `MailboxPaging.surfaces.test.tsx:88` |
+| 37763234227 | the same message from the same line |
+
+The first page (`mailbox-item-in-49`) had already rendered in both runs, so the first load-more click did not produce the second page of 50 rows within the default Testing Library timeout. The logs do not show whether the click was dropped, the second `fetchInbox` resolved late, or the rendered list was slow to commit 100 rows. No reproduction was attempted.
+
+No timeout, retry, or assertion changed. The whole file is excluded from the dashboard projects. It is not in the thin merge gate, so no gate eviction was needed. Before the deletion deadline, check whether `MailboxView` can ignore or drop a load-more click while the previous inbox request or a background refresh is in flight. No product code changed in this quarantine.
+
 <!--
 FNXC:TestFlakeRegister 2026-10-08-07:20:
 Entry 26 recorded a second Full Suite sighting on the fork: the same parametrized test failed on its desktop row after failing on its mobile row. Quarantine is file-level, so the whole file is excluded through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
