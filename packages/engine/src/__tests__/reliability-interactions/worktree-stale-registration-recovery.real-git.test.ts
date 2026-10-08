@@ -4,9 +4,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { NativeWorktreeBackend } from "../../worktree/worktree-backend.js";
 import { git, hasGit } from "./_helpers.js";
+import { gitPorcelainPath } from "../helpers/real-path.js";
 
 // FNXC:TestInfraWindows 2026-10-08-06:45: `git worktree list --porcelain` prints forward slashes on every platform, so native paths are compared in that spelling (a no-op on Linux).
-const gitPorcelainPath = (path: string): string => path.replace(/\\/g, "/");
+// FNXC:TestInfraWindows 2026-10-08-10:05: KB-066 moved that spelling into helpers/real-path.ts; `fs.promises.realpath` below is already native, so it expands 8.3 aliases.
 
 describe.skipIf(!hasGit)("reliability interactions: worktree stale registration recovery", () => {
   const roots: string[] = [];

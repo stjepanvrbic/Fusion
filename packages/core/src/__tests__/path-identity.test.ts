@@ -1,3 +1,4 @@
+import {execFileSync} from "node:child_process";
 import {mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
@@ -94,6 +95,27 @@ describe("path identity: host filesystem", () => {
     expect(canonicalizePath(`\\\\?\\${existing.toUpperCase()}`)).toBe(existing);
     expect(isSamePath(existing.toUpperCase(), existing)).toBe(true);
     expect(isSamePath(join(existing.toLowerCase(), "absent"), join(existing, "ABSENT"))).toBe(true);
+  });
+
+  /*
+  FNXC:PathIdentity 2026-10-08-10:05:
+  KB-066: the GitHub Windows runner's temp is an 8.3 short alias (`RUNNER~1`) while git reports the long name, so a short and a long spelling of one checkout must be one identity, including for absent suffixes under an aliased ancestor.
+  Node's `realpathSync.native` is the oracle; the volume may generate no alias, in which case the long-form identities still hold.
+  */
+  it.runIf(process.platform === "win32")("treats an 8.3 short alias and its long spelling as one identity", () => {
+    const dir = fixture();
+    const long = join(dir, "long checkout name with spaces");
+    mkdirSync(long);
+    const short = execFileSync("cmd.exe", ["/d", "/c", `for %I in ("${long}") do @echo %~sI`], {encoding: "utf8", windowsVerbatimArguments: true}).trim();
+    const oracle = realpathSync.native(long);
+
+    expect(realpathSync.native(short)).toBe(oracle);
+    expect(canonicalizePath(short)).toBe(oracle);
+    expect(isSamePath(short, long)).toBe(true);
+    expect(pathIdentityKey(short)).toBe(pathIdentityKey(long));
+    expect(isPathInside(long, join(short, "missing", "child"))).toBe(true);
+    expect(isPathInside(short, join(long, "missing", "child"))).toBe(true);
+    expect(canonicalizePath(join(short, "missing"))).toBe(join(oracle, "missing"));
   });
 
   it.skipIf(process.platform !== "linux")("keeps case variants distinct on a case-sensitive filesystem", () => {

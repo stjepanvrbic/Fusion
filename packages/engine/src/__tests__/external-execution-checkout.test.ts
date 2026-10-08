@@ -4,14 +4,14 @@ Persisted external checkout routing is an explicit operator contract. Execution 
 */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { inspectExternalGitCheckout, resolveExternalExecutionCheckoutRoute } from "../execution/external-execution-checkout.js";
 import { resolveReviewCheckoutCwd } from "../execution/review-checkout.js";
+import { nativeRealPath, realTempDir } from "./helpers/real-path.js";
 
 function makeGitCheckout(branch = "local/runtime-fixes"): string {
-  const dir = mkdtempSync(join(tmpdir(), "external-execution-checkout-"));
+  const dir = realTempDir("external-execution-checkout-");
   execFileSync("git", ["init", "-b", branch], { cwd: dir, stdio: "ignore" });
   execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir });
   execFileSync("git", ["config", "user.name", "Fusion Test"], { cwd: dir });
@@ -44,7 +44,7 @@ describe("resolveExternalExecutionCheckoutRoute", () => {
   });
 
   it("resolves a persisted path and branch and matches explicit review routing", async () => {
-    const realCheckout = realpathSync(checkout);
+    const realCheckout = nativeRealPath(checkout);
     const task = {
       sourceMetadata: {
         externalExecutionCheckout: checkout,

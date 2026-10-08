@@ -1,6 +1,5 @@
 import { execSync } from "node:child_process";
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { BranchConflictError } from "../execution/branch-conflicts.js";
@@ -8,9 +7,10 @@ import { AutoRecoveryDispatcher } from "../healing/auto-recovery.js";
 import { BranchWorktreeAutoRecoveryHandler } from "../auto-recovery-handlers/branch-worktree.js";
 import { acquireTaskWorktree } from "../worktree/worktree-acquisition.js";
 import { NativeWorktreeBackend } from "../worktree/worktree-backend.js";
+import { nativeRealPath, realTempDir, gitPorcelainPath } from "./helpers/real-path.js";
 
 // FNXC:TestInfraWindows 2026-10-08-06:45: `git worktree list --porcelain` prints forward slashes on every platform, so native paths are compared in that spelling (a no-op on Linux).
-const gitPorcelainPath = (path: string): string => path.replace(/\\/g, "/");
+// FNXC:TestInfraWindows 2026-10-08-10:05: KB-066 moved that spelling and 8.3-alias-free canonicalization into helpers/real-path.ts.
 
 function git(repo: string, command: string): string {
   return execSync(command, { cwd: repo, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
@@ -18,7 +18,7 @@ function git(repo: string, command: string): string {
 
 function assertRegisteredWorktree(repo: string, worktreePath: string, branch: string): void {
   const porcelain = git(repo, "git worktree list --porcelain");
-  expect(porcelain).toContain(`worktree ${gitPorcelainPath(realpathSync(worktreePath))}`);
+  expect(porcelain).toContain(`worktree ${gitPorcelainPath(nativeRealPath(worktreePath))}`);
   expect(porcelain).toContain(`branch refs/heads/${branch}`);
 }
 
@@ -30,7 +30,7 @@ describe("NativeWorktreeBackend bare branch collision recovery", { timeout: 60_0
   });
 
   function setup(): string {
-    const repo = mkdtempSync(join(tmpdir(), "fn-8132-collision-"));
+    const repo = realTempDir("fn-8132-collision-");
     dirs.push(repo);
     git(repo, "git init -q -b main");
     git(repo, 'git config user.email "test@example.com"');

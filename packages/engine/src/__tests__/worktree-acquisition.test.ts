@@ -2,8 +2,7 @@ import { proveTaskWorktreeRebind } from "../worktree/prove-task-worktree-rebind.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join, sep } from "node:path";
 import { promisify } from "node:util";
 import { acquireWorktreePathReservation, readWorktreePathReservation } from "@fusion/core";
@@ -14,6 +13,7 @@ import * as branchConflicts from "../execution/branch-conflicts.js";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
 import { NativeWorktreeBackend } from "../worktree/worktree-backend.js";
 import { markAuthorizedCheckoutResidue } from "../worktree/remove-checkout.js";
+import { nativeRealPath, realTempDir } from "./helpers/real-path.js";
 
 
 vi.mock("../worktree/worktree-pool.js", async () => {
@@ -79,7 +79,7 @@ function porcelainPath(path: string): string {
 }
 
 function makeRepo(): string {
-  const rootDir = track(mkdtempSync(join(tmpdir(), "fn-6861-acquisition-root-")));
+  const rootDir = track(realTempDir("fn-6861-acquisition-root-"));
   git(rootDir, "git init -b main");
   git(rootDir, 'git config user.email "test@example.com"');
   git(rootDir, 'git config user.name "Test User"');
@@ -213,8 +213,8 @@ describe("acquireTaskWorktree", () => {
   });
 
   function dependencyFixture() {
-    const rootDir = track(mkdtempSync(join(tmpdir(), "fn-258-dependency-root-")));
-    const worktreePath = track(mkdtempSync(join(tmpdir(), "fn-258-dependency-worktree-")));
+    const rootDir = track(realTempDir("fn-258-dependency-root-"));
+    const worktreePath = track(realTempDir("fn-258-dependency-worktree-"));
     const binDir = join(rootDir, "bin");
     mkdirSync(binDir, { recursive: true });
     writeFileSync(join(binDir, "pnpm"), "fixture", "utf-8");
@@ -457,7 +457,7 @@ describe("acquireTaskWorktree", () => {
 
   it("preserves an orphan beside an external worktree root when project recovery is cross-device", async () => {
     const rootDir = makeRepo();
-    const externalWorktrees = track(mkdtempSync(join(tmpdir(), "fn-external-worktrees-")));
+    const externalWorktrees = track(realTempDir("fn-external-worktrees-"));
     const pinnedPath = join(externalWorktrees, "fn-1");
     mkdirSync(join(pinnedPath, ".build"), { recursive: true });
     writeFileSync(join(pinnedPath, ".build", "cache"), "stale\n", "utf-8");
@@ -615,12 +615,12 @@ describe("acquireTaskWorktree", () => {
     const recoveryRoot = join(rootDir, ".fusion", "recovery", "worktrees");
     const seeded = seedPreservedOrphans(recoveryRoot, 11);
     const unknownPath = join(recoveryRoot, "operator-notes");
-    const symlinkTarget = track(mkdtempSync(join(tmpdir(), "fn-orphan-retention-symlink-target-")));
+    const symlinkTarget = track(realTempDir("fn-orphan-retention-symlink-target-"));
     const generatedSymlink = join(recoveryRoot, `fn-999-${randomUUID()}`);
     mkdirSync(pinnedPath, { recursive: true });
     mkdirSync(unknownPath);
     symlinkSync(symlinkTarget, generatedSymlink);
-    activeSessionRegistry.registerPath(join(realpathSync(recoveryRoot), seeded[0]), {
+    activeSessionRegistry.registerPath(join(nativeRealPath(recoveryRoot), seeded[0]), {
       taskId: "FN-RETAIN",
       kind: "executor",
       ownerKey: "executor:FN-RETAIN",
@@ -652,14 +652,14 @@ describe("acquireTaskWorktree", () => {
 
   it("retains only the newest ten generated orphan directories in the EXDEV fallback root", async () => {
     const rootDir = makeRepo();
-    const externalWorktrees = track(mkdtempSync(join(tmpdir(), "fn-external-retention-worktrees-")));
+    const externalWorktrees = track(realTempDir("fn-external-retention-worktrees-"));
     const pinnedPath = join(externalWorktrees, "fn-1");
     const recoveryRoot = join(externalWorktrees, ".fusion-recovery", "worktrees");
     const seeded = seedPreservedOrphans(recoveryRoot, 11);
     const unknownPath = join(recoveryRoot, "operator-notes");
     mkdirSync(pinnedPath, { recursive: true });
     mkdirSync(unknownPath);
-    activeSessionRegistry.registerPath(join(realpathSync(recoveryRoot), seeded[0]), {
+    activeSessionRegistry.registerPath(join(nativeRealPath(recoveryRoot), seeded[0]), {
       taskId: "FN-RETAIN-EXDEV",
       kind: "executor",
       ownerKey: "executor:FN-RETAIN-EXDEV",
@@ -834,7 +834,7 @@ describe("acquireTaskWorktree", () => {
   it("refuses to preserve an orphan through a recovery-directory symlink", async () => {
     const rootDir = makeRepo();
     const pinnedPath = join(rootDir, ".worktrees", "fn-1");
-    const outside = track(mkdtempSync(join(tmpdir(), "fn-orphan-recovery-outside-")));
+    const outside = track(realTempDir("fn-orphan-recovery-outside-"));
     mkdirSync(join(pinnedPath, ".build"), { recursive: true });
     writeFileSync(join(pinnedPath, ".build", "cache"), "stale\n", "utf-8");
     mkdirSync(join(rootDir, ".fusion", "recovery"), { recursive: true });
@@ -850,7 +850,7 @@ describe("acquireTaskWorktree", () => {
       rootDir,
       store,
       settings: { worktreeNaming: "task-id", recycleWorktrees: false },
-    })).rejects.toThrow(`Refusing to use recovery directory outside ${realpathSync(join(rootDir, ".fusion", "recovery"))}`);
+    })).rejects.toThrow(`Refusing to use recovery directory outside ${nativeRealPath(join(rootDir, ".fusion", "recovery"))}`);
 
     expect(readFileSync(join(pinnedPath, ".build", "cache"), "utf-8")).toBe("stale\n");
     expect(readdirSync(outside)).toHaveLength(0);
@@ -859,7 +859,7 @@ describe("acquireTaskWorktree", () => {
   it("refuses to create recovery contents through an ancestor symlink", async () => {
     const rootDir = makeRepo();
     const pinnedPath = join(rootDir, ".worktrees", "fn-1");
-    const outside = track(mkdtempSync(join(tmpdir(), "fn-orphan-recovery-ancestor-outside-")));
+    const outside = track(realTempDir("fn-orphan-recovery-ancestor-outside-"));
     mkdirSync(join(pinnedPath, ".build"), { recursive: true });
     writeFileSync(join(pinnedPath, ".build", "cache"), "stale\n", "utf-8");
     mkdirSync(join(rootDir, ".fusion"), { recursive: true });
@@ -875,7 +875,7 @@ describe("acquireTaskWorktree", () => {
       rootDir,
       store,
       settings: { worktreeNaming: "task-id", recycleWorktrees: false },
-    })).rejects.toThrow(`Refusing to use recovery directory outside ${realpathSync(join(rootDir, ".fusion"))}`);
+    })).rejects.toThrow(`Refusing to use recovery directory outside ${nativeRealPath(join(rootDir, ".fusion"))}`);
 
     expect(readFileSync(join(pinnedPath, ".build", "cache"), "utf-8")).toBe("stale\n");
     expect(readdirSync(outside)).toHaveLength(0);
@@ -1423,8 +1423,8 @@ describe("acquireTaskWorktree", () => {
   });
 
   it("copies configured files for fresh acquisition before init command", async () => {
-    const rootDir = track(mkdtempSync(join(tmpdir(), "fn-copy-fresh-root-")));
-    const worktreePath = track(mkdtempSync(join(tmpdir(), "fn-copy-fresh-worktree-")));
+    const rootDir = track(realTempDir("fn-copy-fresh-root-"));
+    const worktreePath = track(realTempDir("fn-copy-fresh-worktree-"));
     writeFileSync(join(rootDir, ".env"), "SECRET=redacted\n", "utf-8");
     const runConfiguredCommand = vi.fn().mockImplementation(async () => {
       expect(readFileSync(join(worktreePath, ".env"), "utf-8")).toBe("SECRET=redacted\n");
@@ -1446,8 +1446,8 @@ describe("acquireTaskWorktree", () => {
   });
 
   it("does not copy configured files over resumed worktree state", async () => {
-    const rootDir = track(mkdtempSync(join(tmpdir(), "fn-copy-resume-root-")));
-    const worktreePath = track(mkdtempSync(join(tmpdir(), "fn-copy-resume-worktree-")));
+    const rootDir = track(realTempDir("fn-copy-resume-root-"));
+    const worktreePath = track(realTempDir("fn-copy-resume-worktree-"));
     writeFileSync(join(rootDir, ".env"), "ROOT=updated\n", "utf-8");
     writeFileSync(join(worktreePath, ".env"), "RESUME=keep\n", "utf-8");
 

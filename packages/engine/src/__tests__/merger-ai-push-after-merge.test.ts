@@ -61,6 +61,11 @@ function initRepoWithRemote(opts: { branch: string } = { branch: "fusion/fn-1" }
   const dir = join(root, "work");
   execSync(`git init -q --bare "${originDir}"`, { encoding: "utf-8" });
   execSync(`git init -q -b main "${dir}"`, { encoding: "utf-8" });
+  /* FNXC:TestInfraWindows 2026-10-08-10:05:
+     KB-066: the product's clean-room worktrees nest under `work/.fusion/worktrees/.ai-merge/` inside the vitest worker temp root.
+     On the GitHub Windows runner that cwd plus a full-SHA rev range (`git diff --stat A..B`, the `A...B` that `git pull --rebase` stats) exceeds Git for Windows' MAX_PATH budget, so git dies with `failed to stat '<range>': Filename too long` before the push behavior under test runs.
+     The failure depends only on temp depth (the runner's `RUNNER~1` spelling, or any deeper TEMP), so the fixture repo opts into Git for Windows long-path support; linked worktrees inherit it and it is a no-op elsewhere. */
+  git(dir, "config core.longpaths true");
   git(dir, "config user.email t@t.t");
   git(dir, "config user.name t");
   writeFileSync(join(dir, "base.txt"), "base\n");

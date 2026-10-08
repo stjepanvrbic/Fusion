@@ -1,18 +1,24 @@
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TaskExecutor } from "../executor.js";
+import { nativeRealPath } from "./helpers/real-path.js";
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 }
 
+/*
+FNXC:TestInfraWindows 2026-10-08-10:05:
+KB-066: git reports the long name while the fixture root may be an 8.3 alias (`RUNNER~1` on the GitHub runner), and JavaScript realpath keeps that alias.
+Both sides go through the native-realpath oracle; the root stays in its tmpdir spelling so the executor is still exercised with an aliased project root.
+*/
 function canonicalPath(path: string): string {
-  return normalize(realpathSync(path));
+  return normalize(nativeRealPath(path));
 }
 
 function registeredWorktrees(rootDir: string): Array<{ path: string; branch?: string }> {

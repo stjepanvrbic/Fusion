@@ -1,22 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { acquireWorktreePathReservation, type Settings, type Task, type TaskStore } from "@fusion/core";
 import { SelfHealingManager, STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS } from "../../self-healing.js";
 import { activeSessionRegistry } from "../../agents/active-session-registry.js";
+import { nativeRealPath, realTempDir, gitPorcelainPath } from "../helpers/real-path.js";
 
 // FNXC:TestInfraWindows 2026-10-08-06:45: `git worktree list --porcelain` prints forward slashes on every platform, so native paths are compared in that spelling (a no-op on Linux).
-const gitPorcelainPath = (path: string): string => path.replace(/\\/g, "/");
+// FNXC:TestInfraWindows 2026-10-08-10:05: KB-066 moved that spelling and 8.3-alias-free canonicalization into helpers/real-path.ts.
 
 function sh(command: string, cwd: string): string {
   return String(execSync(command, { cwd, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }) ?? "");
 }
 
 function makeRepo(): string {
-  const root = mkdtempSync(join(tmpdir(), "fn-4949-"));
+  const root = realTempDir("fn-4949-");
   sh("git init", root);
   sh("git config user.email 'test@example.com'", root);
   sh("git config user.name 'Test User'", root);
@@ -224,7 +224,7 @@ describe("FN-4924 / FN-4949: reclaim-stale-active-branches defers in-flight exec
     try {
       await expect(manager.reclaimStaleActiveBranches()).resolves.toBe(0);
       expect(() => sh(`git rev-parse --verify ${branch}`, repo)).not.toThrow();
-      expect(sh("git worktree list --porcelain", repo)).toContain(`worktree ${gitPorcelainPath(realpathSync(worktree))}`);
+      expect(sh("git worktree list --porcelain", repo)).toContain(`worktree ${gitPorcelainPath(nativeRealPath(worktree))}`);
       expect((store.updateTask as any).mock.calls.some((call: any[]) => call[1]?.branch === null)).toBe(false);
       expect(store.auditEvents.some((event) => event.mutationType === "branch:stale-active-reclaim-deferred" && event.metadata?.reason === "path-reservation")).toBe(true);
     } finally {
@@ -297,7 +297,7 @@ describe("FN-4924 / FN-4949: reclaim-stale-active-branches defers in-flight exec
 
     try {
       await expect((manager as any).cleanupOrphans()).resolves.toBe(0);
-      expect(sh("git worktree list --porcelain", repo)).toContain(`worktree ${gitPorcelainPath(realpathSync(worktree))}`);
+      expect(sh("git worktree list --porcelain", repo)).toContain(`worktree ${gitPorcelainPath(nativeRealPath(worktree))}`);
     } finally {
       await reservation.release();
       manager.stop();

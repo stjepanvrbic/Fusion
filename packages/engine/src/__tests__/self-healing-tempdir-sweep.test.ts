@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { execFileSync, execSync } from "node:child_process";
@@ -60,14 +60,15 @@ import { activeSessionRegistry } from "../agents/active-session-registry.js";
 import { CHECKOUT_REMOVAL_RESIDUE_MARKER } from "../worktree/remove-checkout.js";
 import { DONE_TASK_TEMP_WORKTREE_GRACE_MS, MIN_TEMP_WORKTREE_REAP_AGE_MS, SelfHealingManager, STALE_TEMP_MERGE_WORKTREE_MS } from "../self-healing.js";
 import { resolveAiMergeRootPath, resolveLegacyAiMergeRootPath } from "../worktree/worktree-paths.js";
+import { nativeRealPath, realTempDir } from "./helpers/real-path.js";
 
 const RM = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as const;
 let sandboxRoot = "";
 let projectRoot = "";
 
 beforeEach(() => {
-  sandboxRoot = realpathSync(mkdtempSync(join(tmpdir(), "fusion-tempdir-sweep-sandbox-")));
-  projectRoot = realpathSync(mkdtempSync(join(tmpdir(), "fusion-tempdir-sweep-project-")));
+  sandboxRoot = realTempDir("fusion-tempdir-sweep-sandbox-");
+  projectRoot = realTempDir("fusion-tempdir-sweep-project-");
   osState.tempRoot = sandboxRoot;
   fsState.failRmPath = "";
   fsState.rmCalls = [];
@@ -298,7 +299,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
 
     expect(existsSync(stale)).toBe(false);
     expect(sweepAudits(audits)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ mutationType: "worktree:tempdir-sweep", metadata: expect.objectContaining({ path: join(realpathSync(sandboxRoot), basename(stale)), success: true, reason: "stale" }) }),
+      expect.objectContaining({ mutationType: "worktree:tempdir-sweep", metadata: expect.objectContaining({ path: join(nativeRealPath(sandboxRoot), basename(stale)), success: true, reason: "stale" }) }),
     ]));
   });
 
@@ -317,16 +318,16 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
     expect(existsSync(staleLegacy)).toBe(false);
     expect(existsSync(staleLegacyWorktrees)).toBe(false);
     expect(sweepAudits(audits)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ metadata: expect.objectContaining({ path: join(realpathSync(resolveAiMergeRootPath(projectRoot, undefined)), "fusion-ai-merge-fn-1-localstale"), success: true, reason: "stale" }) }),
-      expect.objectContaining({ metadata: expect.objectContaining({ path: join(realpathSync(resolveLegacyAiMergeRootPath(projectRoot)), "fusion-ai-merge-fn-1-legacystale"), success: true, reason: "stale" }) }),
-      expect.objectContaining({ metadata: expect.objectContaining({ path: join(realpathSync(join(projectRoot, ".worktrees", ".ai-merge")), "fusion-ai-merge-fn-1-legacyworktrees"), success: true, reason: "stale" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ path: join(nativeRealPath(resolveAiMergeRootPath(projectRoot, undefined)), "fusion-ai-merge-fn-1-localstale"), success: true, reason: "stale" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ path: join(nativeRealPath(resolveLegacyAiMergeRootPath(projectRoot)), "fusion-ai-merge-fn-1-legacystale"), success: true, reason: "stale" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ path: join(nativeRealPath(join(projectRoot, ".worktrees", ".ai-merge")), "fusion-ai-merge-fn-1-legacyworktrees"), success: true, reason: "stale" }) }),
     ]));
   });
 
   it("defers active worktrees-dir AI merge directories", async () => {
     const stale = localMergeDir("fusion-ai-merge-fn-1-localactive");
     makeStale(stale);
-    const canonical = realpathSync(stale);
+    const canonical = nativeRealPath(stale);
     activeSessionRegistry.registerPath(canonical, { taskId: "FN-1", kind: "ai-merge", ownerKey: "ai-merge:FN-1" });
     const { manager, audits } = makeManager();
 
@@ -350,7 +351,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
   it("skips active session paths and removes them after unregister", async () => {
     const stale = tempMergeDir();
     makeStale(stale);
-    const canonical = realpathSync(stale);
+    const canonical = nativeRealPath(stale);
     activeSessionRegistry.registerPath(canonical, { taskId: "FN-1", kind: "ai-merge", ownerKey: "ai-merge:FN-1" });
     const { manager, audits } = makeManager();
 
@@ -379,7 +380,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
   it("attempts git worktree removal before filesystem removal", async () => {
     const stale = tempMergeDir();
     makeStale(stale);
-    const canonical = realpathSync(stale);
+    const canonical = nativeRealPath(stale);
     const { manager } = makeManager();
 
     await expect(sweep(manager)).resolves.toBe(1);
@@ -393,7 +394,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
     const succeeding = tempMergeDir("fusion-ai-merge-fn-1-succeeding");
     makeStale(failing);
     makeStale(succeeding);
-    const canonicalFailing = realpathSync(failing);
+    const canonicalFailing = nativeRealPath(failing);
     fsState.failRmPath = canonicalFailing;
     fsState.rmFailuresRemaining = -1;
     const { manager, audits } = makeManager();
@@ -431,7 +432,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
   it("retries a Windows-shaped EBUSY filesystem fallback before recording sweep success", async () => {
     const stale = tempMergeDir("fusion-ai-merge-fn-9169-transient");
     makeStale(stale);
-    const canonical = realpathSync(stale);
+    const canonical = nativeRealPath(stale);
     fsState.failRmPath = canonical;
     fsState.rmFailureCode = "EBUSY";
     fsState.rmFailuresRemaining = 1;
@@ -450,7 +451,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
   it("keeps the sweep's git-remove-failed vocabulary when a registered path is already absent", async () => {
     const stale = tempMergeDir("fusion-ai-merge-fn-9169-registered-missing");
     makeStale(stale);
-    const canonical = realpathSync(stale);
+    const canonical = nativeRealPath(stale);
     childState.gitRemoveError = new Error(`fatal: '${canonical}' is not a working tree`);
     fsState.rmPretendAbsentPath = canonical;
     const { manager, audits } = makeManager();
@@ -468,7 +469,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
   it("retries an unregistered on-disk sweep leftover after git removal fails", async () => {
     const stale = tempMergeDir("fusion-ai-merge-fn-9169-sweep-r2");
     makeStale(stale);
-    const canonical = realpathSync(stale);
+    const canonical = nativeRealPath(stale);
     childState.gitRemoveError = Object.assign(new Error("unregistered clean room"), {
       stderr: `fatal: failed to delete '${canonical}': Device or resource busy`,
       code: "1",
@@ -498,7 +499,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
 
     expect(existsSync(stale)).toBe(false);
     expect(sweepAudits(audits)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ metadata: expect.objectContaining({ path: join(realpathSync(sandboxRoot), "fusion-ai-merge-fn-999-donetask"), success: true, reason: "done-task-stale" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ path: join(nativeRealPath(sandboxRoot), "fusion-ai-merge-fn-999-donetask"), success: true, reason: "done-task-stale" }) }),
     ]));
   });
 

@@ -4,29 +4,29 @@ External review checkout contract tests pin fail-closed resolution: absent, blan
 */
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { resolveReviewCheckoutCwd, getTaskReviewCheckoutPath } from "../execution/review-checkout.js";
+import { nativeRealPath, realTempDir } from "./helpers/real-path.js";
 
 const FALLBACK = "/some/fallback/worktree";
 const cleanupDirs: string[] = [];
 
 function makeGitCheckout(): string {
-  const dir = mkdtempSync(join(tmpdir(), "review-git-checkout-"));
+  const dir = realTempDir("review-git-checkout-");
   cleanupDirs.push(dir);
   execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
   return dir;
 }
 
 function makeNonGitDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), "review-nongit-"));
+  const dir = realTempDir("review-nongit-");
   cleanupDirs.push(dir);
   return dir;
 }
 
 function makeRegularFile(): string {
-  const dir = mkdtempSync(join(tmpdir(), "review-file-"));
+  const dir = realTempDir("review-file-");
   cleanupDirs.push(dir);
   const file = join(dir, "file.txt");
   writeFileSync(file, "not a directory");
@@ -158,14 +158,14 @@ describe("resolveReviewCheckoutCwd — fail-closed defaults", () => {
 
   it("returns resolved realpath for valid git checkout", () => {
     const checkout = makeGitCheckout();
-    const expected = realpathSync(checkout);
+    const expected = nativeRealPath(checkout);
     const task = { customFields: { reviewCheckoutPath: checkout } };
     expect(resolveReviewCheckoutCwd(task, FALLBACK)).toBe(expected);
   });
 
   it("resolves sourceMetadata.externalReviewCheckout for valid git checkout", () => {
     const checkout = makeGitCheckout();
-    const expected = realpathSync(checkout);
+    const expected = nativeRealPath(checkout);
     const task = { sourceMetadata: { externalReviewCheckout: checkout } };
     expect(resolveReviewCheckoutCwd(task, FALLBACK)).toBe(expected);
   });
@@ -181,7 +181,7 @@ describe("resolveReviewCheckoutCwd — fail-closed defaults", () => {
   it("conflicting metadata between customFields and sourceMetadata: customFields wins when valid", () => {
     const checkoutA = makeGitCheckout();
     const checkoutB = makeGitCheckout();
-    const expectedA = realpathSync(checkoutA);
+    const expectedA = nativeRealPath(checkoutA);
     const task = {
       customFields: { reviewCheckoutPath: checkoutA },
       sourceMetadata: { externalReviewCheckout: checkoutB },
@@ -191,7 +191,7 @@ describe("resolveReviewCheckoutCwd — fail-closed defaults", () => {
 
   it("valid customFields + invalid sourceMetadata: uses customFields", () => {
     const checkout = makeGitCheckout();
-    const expected = realpathSync(checkout);
+    const expected = nativeRealPath(checkout);
     const task = {
       customFields: { reviewCheckoutPath: checkout },
       sourceMetadata: { externalReviewCheckout: "/nonexistent" },
@@ -230,7 +230,7 @@ describe("resolveReviewCheckoutCwd — does NOT fabricate approval or widen scop
     const parent = makeGitCheckout();
     const task = { customFields: { reviewCheckoutPath: parent } };
     const result = resolveReviewCheckoutCwd(task, FALLBACK);
-    expect(result).toBe(realpathSync(parent));
+    expect(result).toBe(nativeRealPath(parent));
     expect(result).not.toBe(FALLBACK);
   });
 

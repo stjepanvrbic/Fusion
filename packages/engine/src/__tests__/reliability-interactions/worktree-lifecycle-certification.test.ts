@@ -18,7 +18,7 @@ This suite pins:
 Real git + real PG; reliability lane (serialized) — deliberately NOT gate-eligible.
 */
 import { describe, it, expect, afterEach } from "vitest";
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
 import {
@@ -29,6 +29,7 @@ import {
   type ReliabilityFixture,
 } from "./_helpers.js";
 import { scanIdleWorktrees } from "../../worktree/worktree-pool.js";
+import { nativeRealPath } from "../helpers/real-path.js";
 
 const describeCertification = hasGit && hasPg ? describe : describe.skip;
 
@@ -63,7 +64,7 @@ async function makeCertFixture(input?: { column?: string; brokenBranchBinding?: 
   });
   const taskId = fx.task.id;
   const canonicalBranch = `fusion/${taskId.toLowerCase()}`;
-  const rootReal = realpathSync(fx.rootDir);
+  const rootReal = nativeRealPath(fx.rootDir);
   const worktreesDir = join(rootReal, ".worktrees");
   mkdirSync(worktreesDir, { recursive: true });
   git(fx.rootDir, `git branch ${canonicalBranch}`);

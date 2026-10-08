@@ -21,6 +21,11 @@ import {
 } from "../worktree/worktree-paths.js";
 
 describe("worktree-paths", () => {
+  /*
+  FNXC:TestInfraWindows 2026-10-08-10:05:
+  KB-066: a drive-less absolute `worktreesDir` (`/var/tmp/...`) takes the PROJECT ROOT's drive on win32, not the process cwd's.
+  The GitHub runner checks out on `D:` with temp on `C:`, so expectations built with a bare `resolve("/x")` pointed at the wrong drive; they resolve against `rootDir` instead (identical off Windows).
+  */
   const rootDir = join(tmpdir(), "repo-name");
 
   it("defaults to <rootDir>/.fusion/worktrees when unset", () => {
@@ -32,7 +37,7 @@ describe("worktree-paths", () => {
   });
 
   it("supports absolute path", () => {
-    expect(resolveWorktreesDir(rootDir, { worktreesDir: "/var/tmp/fn-worktrees" } as any)).toBe(resolve("/var/tmp/fn-worktrees")); // FNXC:TestInfraWindows 2026-10-08-06:25: absolute worktreesDir is resolve()d (drive-qualified on win32).
+    expect(resolveWorktreesDir(rootDir, { worktreesDir: "/var/tmp/fn-worktrees" } as any)).toBe(resolve(rootDir, "/var/tmp/fn-worktrees")); // FNXC:TestInfraWindows 2026-10-08-06:25: absolute worktreesDir is resolve()d (drive-qualified on win32).
   });
 
   it("supports ~ expansion", () => {
@@ -58,7 +63,7 @@ describe("worktree-paths", () => {
   });
 
   it("builds the AI-merge root under an absolute custom worktrees dir", () => {
-    expect(resolveAiMergeRootPath(rootDir, { worktreesDir: "/tmp/ext-worktrees" } as any)).toBe(resolve("/tmp/ext-worktrees", AI_MERGE_DIRNAME));
+    expect(resolveAiMergeRootPath(rootDir, { worktreesDir: "/tmp/ext-worktrees" } as any)).toBe(resolve(rootDir, "/tmp/ext-worktrees", AI_MERGE_DIRNAME));
   });
 
   it("searches current, legacy, and historic AI-merge roots without configured worktrees", () => {
@@ -78,7 +83,7 @@ describe("worktree-paths", () => {
 
   it("does not search the historic root for an external configured worktrees dir", () => {
     expect(resolveAiMergeSearchRoots(rootDir, { worktreesDir: "/abs/elsewhere" } as any)).toEqual([
-      resolve("/abs/elsewhere", AI_MERGE_DIRNAME),
+      resolve(rootDir, "/abs/elsewhere", AI_MERGE_DIRNAME),
       resolveLegacyAiMergeRootPath(rootDir),
     ]);
   });

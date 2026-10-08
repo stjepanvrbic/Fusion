@@ -1,12 +1,12 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { relocateReclaimableWorktreeIntoRoot } from "../worktree/worktree-pool.js";
+import { nativeRealPath, realTempDir, gitPorcelainPath } from "./helpers/real-path.js";
 
 // FNXC:TestInfraWindows 2026-10-08-06:45: `git worktree list --porcelain` prints forward slashes on every platform, so native paths are compared in that spelling (a no-op on Linux).
-const gitPorcelainPath = (path: string): string => path.replace(/\\/g, "/");
+// FNXC:TestInfraWindows 2026-10-08-10:05: KB-066 moved that spelling and 8.3-alias-free canonicalization into helpers/real-path.ts.
 
 const cleanupPaths: string[] = [];
 
@@ -15,7 +15,7 @@ function git(cwd: string, args: string[]): string {
 }
 
 function createRepositoryFixture(): { rootDir: string; sourcePath: string; targetPath: string } {
-  const fixtureRoot = mkdtempSync(join(tmpdir(), "fn-8400-reclaim-placement-"));
+  const fixtureRoot = realTempDir("fn-8400-reclaim-placement-");
   cleanupPaths.push(fixtureRoot);
   const rootDir = join(fixtureRoot, "repo");
   const sourcePath = join(fixtureRoot, "legacy-worktrees", "recover-fn-8400");
@@ -56,7 +56,7 @@ describe("reclaimable worktree placement", () => {
     expect(existsSync(sourcePath)).toBe(false);
     expect(existsSync(targetPath)).toBe(true);
     expect(readFileSync(join(targetPath, "preserved.txt"), "utf8")).toBe("uncommitted task work\n");
-    expect(git(rootDir, ["worktree", "list", "--porcelain"])).toContain(`worktree ${gitPorcelainPath(realpathSync(targetPath))}`);
+    expect(git(rootDir, ["worktree", "list", "--porcelain"])).toContain(`worktree ${gitPorcelainPath(nativeRealPath(targetPath))}`);
     expect(git(targetPath, ["branch", "--show-current"])).toBe("fusion/fn-8400");
     expect(git(targetPath, ["status", "--porcelain"])).toContain("?? preserved.txt");
   });
@@ -76,7 +76,7 @@ describe("reclaimable worktree placement", () => {
     expect(result).toEqual({ kind: "deferred-live", path: sourcePath });
     expect(existsSync(sourcePath)).toBe(true);
     expect(existsSync(targetPath)).toBe(false);
-    expect(git(rootDir, ["worktree", "list", "--porcelain"])).toContain(`worktree ${gitPorcelainPath(realpathSync(sourcePath))}`);
+    expect(git(rootDir, ["worktree", "list", "--porcelain"])).toContain(`worktree ${gitPorcelainPath(nativeRealPath(sourcePath))}`);
   });
 
   it("preserves the backend-assigned path when Worktrunk owns the layout", async () => {
@@ -94,7 +94,7 @@ describe("reclaimable worktree placement", () => {
     expect(result).toEqual({ kind: "ready", path: sourcePath, relocated: false });
     expect(existsSync(sourcePath)).toBe(true);
     expect(existsSync(targetPath)).toBe(false);
-    expect(git(rootDir, ["worktree", "list", "--porcelain"])).toContain(`worktree ${gitPorcelainPath(realpathSync(sourcePath))}`);
+    expect(git(rootDir, ["worktree", "list", "--porcelain"])).toContain(`worktree ${gitPorcelainPath(nativeRealPath(sourcePath))}`);
   });
 
   it("chooses a task-scoped target when the legacy basename is occupied", async () => {
@@ -115,7 +115,7 @@ describe("reclaimable worktree placement", () => {
     expect(result).toEqual({ kind: "ready", path: disambiguatedPath, relocated: true });
     expect(readFileSync(join(targetPath, "owner.txt"), "utf8")).toBe("unrelated path\n");
     expect(readFileSync(join(disambiguatedPath, "preserved.txt"), "utf8")).toBe("uncommitted task work\n");
-    expect(git(rootDir, ["worktree", "list", "--porcelain"])).toContain(`worktree ${gitPorcelainPath(realpathSync(disambiguatedPath))}`);
+    expect(git(rootDir, ["worktree", "list", "--porcelain"])).toContain(`worktree ${gitPorcelainPath(nativeRealPath(disambiguatedPath))}`);
   });
 
   it("rejects a relocation target outside the configured root before touching the source", async () => {

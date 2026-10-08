@@ -19,8 +19,7 @@ the cwd of each call. Coverage:
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ReviewResult } from "../execution/reviewer.js";
 
@@ -44,6 +43,7 @@ import { ReviewerProviderError, reviewStep as mockedReviewStepFn } from "../exec
 import { TaskExecutor } from "../executor.js";
 import { FOREACH_ACTIVE_CONTEXT_KEY } from "../workflows/workflow-node-handlers.js";
 import type { Task, TaskStore, WorkspaceConfig } from "@fusion/core";
+import { nativeRealPath, realTempDir } from "./helpers/real-path.js";
 
 const mockedReviewStep = vi.mocked(mockedReviewStepFn);
 
@@ -54,7 +54,7 @@ const cleanupDirs: string[] = [];
 let capturedFilesByCwd: Record<string, string[]> = {};
 
 function makeGitCheckout(): string {
-  const dir = mkdtempSync(join(tmpdir(), "fusion-review-checkout-"));
+  const dir = realTempDir("fusion-review-checkout-");
   cleanupDirs.push(dir);
   execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
   return dir;
@@ -646,7 +646,7 @@ describe("U2 KTD3 — step-inversion review seam (executor.ts:5668) loops per su
 
   it("explicit external review checkout overrides the active graph worktree", async () => {
     const externalCheckout = makeGitCheckout();
-    const expectedCheckout = realpathSync(externalCheckout);
+    const expectedCheckout = nativeRealPath(externalCheckout);
     const task = makeTask({ worktree: WT_A, customFields: { reviewCheckoutPath: externalCheckout } } as any);
     const store = makeStore(task);
     const executor = new TaskExecutor(store, ROOT);
@@ -661,7 +661,7 @@ describe("U2 KTD3 — step-inversion review seam (executor.ts:5668) loops per su
 describe("sourceMetadata.externalReviewCheckout for workflow stepReview", () => {
   it("sourceMetadata.externalReviewCheckout overrides the active graph worktree for stepReview", async () => {
     const externalCheckout = makeGitCheckout();
-    const expectedCheckout = realpathSync(externalCheckout);
+    const expectedCheckout = nativeRealPath(externalCheckout);
     const task = makeTask({ worktree: WT_A, sourceMetadata: { externalReviewCheckout: externalCheckout } } as any);
     const store = makeStore(task);
     const executor = new TaskExecutor(store, ROOT);
