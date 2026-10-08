@@ -267,6 +267,29 @@ pgDescribe("engine agent activity durable writer", () => {
   afterAll(h.afterAll);
 
   /*
+  FNXC:AgentActivityStream 2026-10-08-00:26:
+  Every test here reuses task id KB-001 on one shared store, and TaskExecutor subscribes to that store's
+  task:moved/task:updated/task:deleted/settings:updated events with no teardown. A test that constructs an
+  executor must not leave it subscribed: the next test's move into in-progress would start a real execution
+  that writes the new KB-001 row and outlives the test (the gate attempt counter read 1, a git subprocess
+  survived the test, and queries ran after pool teardown). Detach every listener a test added once it ends.
+  */
+  let listenerBaseline = new Map<string | symbol, Function[]>();
+  beforeEach(() => {
+    const store = h.store();
+    listenerBaseline = new Map(store.eventNames().map((name) => [name, [...store.rawListeners(name as never)]]));
+  });
+  afterEach(() => {
+    const store = h.store();
+    for (const name of store.eventNames()) {
+      const baseline = listenerBaseline.get(name) ?? [];
+      for (const listener of store.rawListeners(name as never)) {
+        if (!baseline.includes(listener)) store.removeListener(name as never, listener as never);
+      }
+    }
+  });
+
+  /*
   FNXC:AgentActivityStream 2026-08-09-21:19:
   Task start is emitted inside the executor's real implementation phase, not graph routing.
   Stop at its normal unmet-dependency exit immediately after startup so this PostgreSQL test proves
@@ -274,13 +297,15 @@ pgDescribe("engine agent activity durable writer", () => {
   */
   it("persists task start from the real executor implementation path", async () => {
     const task = await h.createTestTask();
-    const liveTask = {
-      ...await h.store().moveTask(task.id, "in-progress", { moveSource: "agent" }),
-      dependencies: ["FN-blocking-activity"],
-    } as any;
-    const store = Object.assign(Object.create(h.store()), {
-      listTasks: vi.fn().mockResolvedValue([{ id: "FN-blocking-activity", column: "todo" }]),
-    }) as any;
+    /*
+    FNXC:AgentActivityStream 2026-10-08-00:26:
+    The executor re-reads the row before its dependency check, so an in-memory dependency override never
+    reached that exit and the run fell through to worktree creation. Persist a real unmet blocker instead.
+    */
+    const blocker = await h.store().createTask({ description: "unfinished blocker" });
+    await h.store().moveTask(task.id, "in-progress", { moveSource: "agent" });
+    const liveTask = await h.store().updateTask(task.id, { dependencies: [blocker.id] }) as any;
+    const store = Object.create(h.store()) as any;
     const executor = new TaskExecutor(store, h.rootDir());
     const workEngine = vi.spyOn(executor as any, "maybeDispatchWorkflowWorkEngine").mockResolvedValue(false);
 
@@ -404,7 +429,9 @@ pgDescribe("engine agent activity durable writer", () => {
     await h.store().moveTask(task.id, "in-progress", { moveSource: "agent" });
     await h.store().moveTask(task.id, "in-review", { moveSource: "agent" });
 
-    await completeTask(h.store(), task.id, { merged: true, commitSha: "a".repeat(40) } as any);
+    /* FNXC:AgentActivityStream 2026-10-08-00:26: the shared finalizer refuses an unconfirmed merge
+       (missing-merge-confirmation) since every merger route must prove it landed; state the proof. */
+    await completeTask(h.store(), task.id, { merged: true, mergeConfirmed: true, commitSha: "a".repeat(40) } as any);
 
     const { events } = await queryAgentActivityEvents(h.layer(), { taskId: task.id, type: "task:completed" });
     expect(events).toHaveLength(1);

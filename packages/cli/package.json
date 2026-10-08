@@ -32,6 +32,7 @@
     "agent-browser.mjs",
     "agent-browser-lifecycle.mjs",
     "bin.mjs",
+    "skills-get-route.mjs",
     "dist/**/*.js",
     "dist/**/*.d.ts",
     "dist/**/*.d.ts.map",
