@@ -104,6 +104,13 @@ export interface HoldReleaseDeps {
    * reservation (the in-txn capacity check still arbitrates), which is the
    * default-workflow legacy parity path where the scheduler dispatch loop owns
    * worktree allocation via `allocateWorktree`.
+   *
+   * FNXC:ConcurrencyAdmission 2026-10-08-09:56:
+   * KB-065: the scheduler's implementation enters `ProjectAdmissionCoordinator.admitNext` on the
+   * execute lane, so it honors the merge-lane slot reservation and returns `null` while the last
+   * slot is held for a pending merge. `promoteHeldTask` / `releaseHeldTaskByEvent` without a
+   * `reserveSlot` remain explicit operator/event releases governed only by the in-transaction
+   * capacity check; they deliberately bypass that reservation.
    */
   reserveSlot?: (task: Task, targetColumn: string) => SlotReservation | null | Promise<SlotReservation | null>;
   /** Allocate a worktree path for a release into a processing column (passed

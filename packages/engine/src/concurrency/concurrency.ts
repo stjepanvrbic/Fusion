@@ -198,6 +198,30 @@ export function compareAdmissionCandidates(a: Pick<AdmissionCandidate, "taskId" 
   return numeric !== 0 ? numeric : a.taskId.localeCompare(b.taskId);
 }
 
+/**
+ * Synchronous, in-memory view of one project's single-flight merge pump.
+ * `pending`: merge work exists that has not been admitted yet (queued, capacity-deferred, or dequeued).
+ * `holdsSlot`: the merge lane already occupies (or has been admitted into) a running-agent slot.
+ */
+export type MergeLaneDemand = { pending: boolean; holdsSlot: boolean };
+
+/** Details reported when the merge-lane reservation ends an admission pass. */
+export interface LaneReservationHoldInfo {
+  lane: AdmissionLane;
+  taskId: string;
+  occupied: number;
+  maxConcurrent: number;
+  heldBackSlots: number;
+}
+
+/*
+FNXC:ConcurrencyAdmission 2026-10-08-09:56:
+KB-065: the single-flight merge pump must never starve behind executors. On 2026-10-08 (08:22Z-09:00Z, maxConcurrent=7) 24 approved cards queued for merge while six executors ran: every merge was capacity-deferred and the next hold-release sweep gave each freed slot to a new hour-long executor.
+While a project's merge lane has pending work and holds no slot, execute and planning candidates are admitted only up to the caller's limit minus one. Review-lane candidates (the merge pump, review and post-merge continuations) may use the reserved slot.
+At most ONE slot is ever held back, regardless of queue length, and none while the merge lane already occupies a slot. Caps (maxConcurrent, maxWorktrees, resolveActiveTaskCapacityLimit) are unchanged; the hold-back only applies inside admitNext against the limit the caller passes.
+The demand probe is registered by ProjectEngine; if it throws, admission fails open (no hold-back) and warns once so it can never wedge.
+*/
+
 /*
 FNXC:ConcurrencyAdmission 2026-08-03-12:00:
 FN-8453 / #2359 requires a per-project oldest-first authority rather than
@@ -214,6 +238,43 @@ export class ProjectAdmissionCoordinator {
    * same-project admission observe stale persisted rows and exceed maxConcurrent.
    */
   private reservations = new Map<string, Set<string>>();
+  /** KB-065: one merge-lane demand probe per project (keyed by the store root dir). */
+  private mergeLaneProbes = new Map<string, () => MergeLaneDemand>();
+  /** Projects whose probe threw and has not succeeded since; warn once per failure episode. */
+  private mergeLaneProbeWarned = new Set<string>();
+
+  /**
+   * Register the merge-lane demand probe for a project. Re-registering replaces the previous
+   * probe; the returned unregister removes only this registration (identity check).
+   */
+  registerMergeLaneReservation(projectId: string, probe: () => MergeLaneDemand): () => void {
+    this.mergeLaneProbes.set(projectId, probe);
+    return () => {
+      if (this.mergeLaneProbes.get(projectId) === probe) {
+        this.mergeLaneProbes.delete(projectId);
+        this.mergeLaneProbeWarned.delete(projectId);
+      }
+    };
+  }
+
+  /** Slots withheld from execute/planning for the merge lane: always 0 or 1. Fails open on error. */
+  private mergeLaneHeldBackSlots(projectId: string): number {
+    const probe = this.mergeLaneProbes.get(projectId);
+    if (!probe) return 0;
+    try {
+      const demand = probe();
+      this.mergeLaneProbeWarned.delete(projectId);
+      return demand.pending && !demand.holdsSlot ? 1 : 0;
+    } catch (error) {
+      if (!this.mergeLaneProbeWarned.has(projectId)) {
+        this.mergeLaneProbeWarned.add(projectId);
+        concurrencyLog.warn(
+          `Merge-lane demand probe failed for ${projectId}; admitting without slot reservation: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return 0;
+    }
+  }
 
   private reserve(projectId: string, taskId: string): void {
     const tasks = this.reservations.get(projectId) ?? new Set<string>();
@@ -240,17 +301,21 @@ export class ProjectAdmissionCoordinator {
     this.reservations.clear();
     this.draining.clear();
     this.providers.clear();
+    this.mergeLaneProbes.clear();
+    this.mergeLaneProbeWarned.clear();
   }
 
   inspectProjectStateForTests(projectId: string): {
     reservedCount: number;
     draining: boolean;
     providerIds: string[];
+    mergeLaneReservationRegistered: boolean;
   } {
     return {
       reservedCount: this.reservationCount(projectId),
       draining: this.draining.has(projectId),
       providerIds: [...(this.providers.get(projectId)?.keys() ?? [])].sort(),
+      mergeLaneReservationRegistered: this.mergeLaneProbes.has(projectId),
     };
   }
 
@@ -334,6 +399,7 @@ export class ProjectAdmissionCoordinator {
    * Reserve only for compatibility callers that cannot supply a lifecycle candidate.
    * Top-level production lanes must use admitNext so refreshed higher-priority work
    * is considered before this project capacity is claimed.
+   * Lane-less, so it does NOT apply the KB-065 merge-lane slot hold-back (no production callers).
    */
   async reserveIfAvailable(params: {
     projectId: string;
@@ -392,6 +458,8 @@ export class ProjectAdmissionCoordinator {
     /** One-shot source for callers that do not hold a durable lane registration. */
     refresh?: () => Promise<AdmissionCandidate[]>;
     semaphore?: Pick<AgentSemaphore, "tryAcquire" | "release">;
+    /** Called at most once per pass when the merge-lane reservation ends it without an admission. */
+    onLaneReservationHold?: (info: LaneReservationHoldInfo) => void;
   }): Promise<string | undefined> {
     const existing = this.draining.get(params.projectId);
     if (existing) await existing;
@@ -410,6 +478,10 @@ export class ProjectAdmissionCoordinator {
       if (candidates.length === 0) return;
       const { runningFor, reservations } = await this.occupancy(params);
       const worktrees = await ProjectAdmissionCoordinator.readWorktreeCapacity(params.worktreeCapacity);
+      // KB-065: evaluated lazily, once per pass, at the first execute/planning candidate.
+      let heldBackSlots: number | undefined;
+      // First hold-back observed this pass; reported only if the pass ends without an admission.
+      let laneReservationHold: LaneReservationHoldInfo | undefined;
       // Older test/runtime semaphore wrappers predate tryAcquire. They still
       // exercise project admission, while production semaphores atomically take
       // the host slot here.
@@ -438,6 +510,25 @@ export class ProjectAdmissionCoordinator {
         // A candidate needing a new worktree cannot take a slot a frozen checkout still holds; a frozen card's own resume can.
         if (!ProjectAdmissionCoordinator.worktreeAdmits(worktrees, runningWithoutCandidate, reservations, winner.taskId)) continue;
         const reusedReservation = this.reservations.get(params.projectId)?.has(winner.taskId) === true;
+        /*
+        FNXC:ConcurrencyAdmission 2026-10-08-10:30:
+        KB-065 merge-lane hold-back is judged per candidate against the same-slot-discounted occupancy.
+        A same-slot handoff (reused reservation) takes no new slot, so it is never held back; holding it could deadlock the merge it waits behind.
+        Nothing was acquired or reserved for a held-back candidate.
+        */
+        if (winner.lane !== "review" && !reusedReservation) {
+          heldBackSlots ??= this.mergeLaneHeldBackSlots(params.projectId);
+          if (runningWithoutCandidate + heldBackSlots >= params.maxConcurrent) {
+            laneReservationHold ??= {
+              lane: winner.lane,
+              taskId: winner.taskId,
+              occupied: runningWithoutCandidate,
+              maxConcurrent: params.maxConcurrent,
+              heldBackSlots,
+            };
+            continue;
+          }
+        }
         const acquiredHostSlot = hasReservableHostSlot
           ? params.semaphore!.tryAcquire()
           : true;
@@ -485,6 +576,7 @@ export class ProjectAdmissionCoordinator {
           throw error;
         }
       }
+      if (laneReservationHold) params.onLaneReservationHold?.(laneReservationHold);
     })();
     this.draining.set(params.projectId, drain);
     try {

@@ -4,7 +4,7 @@ import { makeTransitionRejection, TransitionRejectionError, buildBootstrapPrompt
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { Scheduler } from "../scheduler.js";
-import { AgentSemaphore } from "../concurrency/concurrency.js";
+import { AgentSemaphore, projectAdmissionCoordinator } from "../concurrency/concurrency.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -932,5 +932,58 @@ describe("Scheduler workflow cutover", () => {
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-002", expect.objectContaining({ status: null }));
     expect(onSchedule).not.toHaveBeenCalled();
     expect(ready.column).toBe("todo");
+  });
+});
+
+/*
+FNXC:ConcurrencyAdmission 2026-10-08-09:56:
+KB-065: the hold-release sweep enters the shared coordinator on the execute lane, so a pending merge keeps
+the last running-agent slot. The sweep must leave the card held and log the honest reservation reason
+instead of reporting capacity exhaustion; with no merge demand the same sweep releases the card.
+*/
+describe("Scheduler hold-release merge-lane slot reservation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFile).mockResolvedValue("# Task\nBody");
+    projectAdmissionCoordinator.clearReservationsForTests();
+  });
+
+  afterEach(() => {
+    projectAdmissionCoordinator.clearReservationsForTests();
+  });
+
+  async function sweepWithMergeDemand(pending: boolean) {
+    const active = task({ id: "FN-001", column: "in-progress" });
+    const ready = task({ id: "FN-002", status: "queued" });
+    const store = storeWith([active, ready], { maxConcurrent: 2, maxWorktrees: 4 });
+    projectAdmissionCoordinator.registerMergeLaneReservation(store.getRootDir(), () => ({ pending, holdsSlot: false }));
+    const onSchedule = vi.fn();
+    const scheduler = new Scheduler(store, { onSchedule });
+    (scheduler as unknown as { running: boolean }).running = true;
+    await scheduler.schedule();
+    return { store, ready, onSchedule };
+  }
+
+  it("keeps the held card queued and reports the slot reserved for a pending merge", async () => {
+    const { store, ready, onSchedule } = await sweepWithMergeDemand(true);
+
+    expect(store.moveTaskIf).not.toHaveBeenCalledWith("FN-002", "in-progress", expect.anything(), expect.anything());
+    expect(onSchedule).not.toHaveBeenCalled();
+    expect(ready.column).toBe("todo");
+    expect(ready.status).toBe("queued");
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "FN-002",
+      expect.stringContaining("slot reserved for pending merge: used=1/2; reserved=1"),
+    );
+    expect(store.logEntry).not.toHaveBeenCalledWith("FN-002", expect.stringContaining("capacity exhausted"));
+  });
+
+  it("releases the card into the last slot when no merge is pending", async () => {
+    const { store, ready, onSchedule } = await sweepWithMergeDemand(false);
+
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-002", "in-progress", expect.any(Function), expect.anything());
+    expect(onSchedule).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-002", column: "in-progress" }));
+    expect(ready.column).toBe("in-progress");
   });
 });

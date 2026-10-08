@@ -1098,11 +1098,15 @@ describe("ProjectAdmissionCoordinator", () => {
     expect(coordinator.inspectProjectStateForTests(projectId).providerIds)
       .toContain("specify:project-reset");
 
+    coordinator.registerMergeLaneReservation(projectId, () => ({ pending: true, holdsSlot: false }));
+    expect(coordinator.inspectProjectStateForTests(projectId).mergeLaneReservationRegistered).toBe(true);
+
     coordinator.clearReservationsForTests();
     expect(coordinator.inspectProjectStateForTests(projectId)).toEqual({
       reservedCount: 0,
       draining: false,
       providerIds: [],
+      mergeLaneReservationRegistered: false,
     });
     expect(await coordinator.reserveIfAvailable({
       projectId,
@@ -1553,5 +1557,188 @@ describe("ProjectAdmissionCoordinator", () => {
       { taskId: "FN-older-planning", lane: "planning" as const, createdAt: "2020-01-01T00:00:00.000Z" },
     ].sort(compareAdmissionCandidates);
     expect(ordered.map((item) => item.taskId)).toEqual(["FN-2", "FN-12", "also-bad", "bad", "FN-older-planning"]);
+  });
+});
+
+/*
+FNXC:ConcurrencyAdmission 2026-10-08-09:56:
+KB-065: while the single-flight merge pump has pending work and holds no slot, execute and planning
+admission stops at limit - 1 so a freed slot goes to the merge. Review-lane work may use it, at most one
+slot is held back, and an empty merge queue leaves every slot available.
+*/
+describe("merge-lane slot reservation", () => {
+  const PROJECT = "project-merge-lane";
+
+  function candidate(taskId: string, lane: "review" | "execute" | "planning", projectId = PROJECT) {
+    const start = vi.fn(async () => true);
+    const reserve = vi.fn();
+    return { taskId, projectId, lane, createdAt: "2026-10-08T08:00:00.000Z", start, reserve };
+  }
+
+  it("refuses an execute sweep for the freed slot and gives it to the pending merge", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    coordinator.registerMergeLaneReservation(PROJECT, () => ({ pending: true, holdsSlot: false }));
+    const semaphore = { tryAcquire: vi.fn(() => true), release: vi.fn() };
+    const onLaneReservationHold = vi.fn();
+    const executor = candidate("FN-EXEC", "execute");
+
+    const refused = await coordinator.admitNext({
+      projectId: PROJECT,
+      maxConcurrent: 7,
+      claimed: () => 6,
+      refresh: async () => [executor],
+      semaphore,
+      onLaneReservationHold,
+    });
+
+    expect(refused).toBeUndefined();
+    expect(executor.start).not.toHaveBeenCalled();
+    expect(executor.reserve).not.toHaveBeenCalled();
+    expect(semaphore.tryAcquire).not.toHaveBeenCalled();
+    expect(onLaneReservationHold).toHaveBeenCalledTimes(1);
+    expect(onLaneReservationHold).toHaveBeenCalledWith({
+      lane: "execute",
+      taskId: "FN-EXEC",
+      occupied: 6,
+      maxConcurrent: 7,
+      heldBackSlots: 1,
+    });
+    expect(coordinator.inspectProjectStateForTests(PROJECT).reservedCount).toBe(0);
+
+    const merge = candidate("FN-MERGE", "review");
+    expect(await coordinator.admitNext({
+      projectId: PROJECT,
+      maxConcurrent: 7,
+      claimed: () => 6,
+      refresh: async () => [merge],
+    })).toBe("FN-MERGE");
+    expect(merge.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds back the planning lane too", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    coordinator.registerMergeLaneReservation(PROJECT, () => ({ pending: true, holdsSlot: false }));
+    const planner = candidate("FN-PLAN", "planning");
+    expect(await coordinator.admitNext({
+      projectId: PROJECT,
+      maxConcurrent: 7,
+      claimed: () => 6,
+      refresh: async () => [planner],
+    })).toBeUndefined();
+    expect(planner.start).not.toHaveBeenCalled();
+  });
+
+  it("lets executors use every slot when the merge queue is empty or no probe is registered", async () => {
+    for (const register of [true, false]) {
+      const coordinator = new ProjectAdmissionCoordinator();
+      if (register) coordinator.registerMergeLaneReservation(PROJECT, () => ({ pending: false, holdsSlot: false }));
+      for (let claimed = 0; claimed < 7; claimed += 1) {
+        const executor = candidate(`FN-E${claimed}`, "execute");
+        expect(await coordinator.admitNext({
+          projectId: PROJECT,
+          maxConcurrent: 7,
+          claimed: () => claimed,
+          refresh: async () => [executor],
+        })).toBe(`FN-E${claimed}`);
+        coordinator.releaseReservation(`FN-E${claimed}`);
+      }
+      const overCap = candidate("FN-OVER", "execute");
+      expect(await coordinator.admitNext({
+        projectId: PROJECT,
+        maxConcurrent: 7,
+        claimed: () => 7,
+        refresh: async () => [overCap],
+      })).toBeUndefined();
+    }
+  });
+
+  it("never holds back more than one slot, however many merges are queued", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const queuedMerges = Array.from({ length: 24 }, (_, i) => `FN-M${i}`);
+    coordinator.registerMergeLaneReservation(PROJECT, () => ({ pending: queuedMerges.length > 0, holdsSlot: false }));
+    const fifth = candidate("FN-E5", "execute");
+    expect(await coordinator.admitNext({
+      projectId: PROJECT, maxConcurrent: 7, claimed: () => 5, refresh: async () => [fifth],
+    })).toBe("FN-E5");
+    coordinator.releaseReservation("FN-E5");
+    const sixth = candidate("FN-E6", "execute");
+    expect(await coordinator.admitNext({
+      projectId: PROJECT, maxConcurrent: 7, claimed: () => 6, refresh: async () => [sixth],
+    })).toBeUndefined();
+  });
+
+  it("holds nothing back while the merge lane already holds its slot", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    coordinator.registerMergeLaneReservation(PROJECT, () => ({ pending: true, holdsSlot: true }));
+    const executor = candidate("FN-EXEC", "execute");
+    expect(await coordinator.admitNext({
+      projectId: PROJECT, maxConcurrent: 7, claimed: () => 6, refresh: async () => [executor],
+    })).toBe("FN-EXEC");
+  });
+
+  it("lets a review-lane continuation use the reserved slot", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    coordinator.registerMergeLaneReservation(PROJECT, () => ({ pending: true, holdsSlot: false }));
+    const postMerge = candidate("FN-POST", "review");
+    expect(await coordinator.admitNext({
+      projectId: PROJECT, maxConcurrent: 7, claimed: () => 6, refresh: async () => [postMerge],
+    })).toBe("FN-POST");
+  });
+
+  it("admits only review work at limit 1 while merges are pending", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    coordinator.registerMergeLaneReservation(PROJECT, () => ({ pending: true, holdsSlot: false }));
+    const executor = candidate("FN-EXEC", "execute");
+    expect(await coordinator.admitNext({
+      projectId: PROJECT, maxConcurrent: 1, claimed: () => 0, refresh: async () => [executor],
+    })).toBeUndefined();
+    const merge = candidate("FN-MERGE", "review");
+    expect(await coordinator.admitNext({
+      projectId: PROJECT, maxConcurrent: 1, claimed: () => 0, refresh: async () => [executor, merge],
+    })).toBe("FN-MERGE");
+    expect(executor.start).not.toHaveBeenCalled();
+  });
+
+  it("is project-isolated and unregisters only its own probe", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const unregisterStale = coordinator.registerMergeLaneReservation("project-a", () => ({ pending: true, holdsSlot: false }));
+    const otherProject = candidate("FN-B", "execute", "project-b");
+    expect(await coordinator.admitNext({
+      projectId: "project-b", maxConcurrent: 2, claimed: () => 1, refresh: async () => [otherProject],
+    })).toBe("FN-B");
+
+    const unregisterCurrent = coordinator.registerMergeLaneReservation("project-a", () => ({ pending: true, holdsSlot: false }));
+    unregisterStale();
+    expect(coordinator.inspectProjectStateForTests("project-a").mergeLaneReservationRegistered).toBe(true);
+    const held = candidate("FN-A1", "execute", "project-a");
+    expect(await coordinator.admitNext({
+      projectId: "project-a", maxConcurrent: 2, claimed: () => 1, refresh: async () => [held],
+    })).toBeUndefined();
+
+    unregisterCurrent();
+    expect(coordinator.inspectProjectStateForTests("project-a").mergeLaneReservationRegistered).toBe(false);
+    const free = candidate("FN-A2", "execute", "project-a");
+    expect(await coordinator.admitNext({
+      projectId: "project-a", maxConcurrent: 2, claimed: () => 1, refresh: async () => [free],
+    })).toBe("FN-A2");
+  });
+
+  it("fails open and warns once when the probe throws", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      coordinator.registerMergeLaneReservation(PROJECT, () => { throw new Error("probe exploded"); });
+      for (const taskId of ["FN-T1", "FN-T2"]) {
+        const executor = candidate(taskId, "execute");
+        expect(await coordinator.admitNext({
+          projectId: PROJECT, maxConcurrent: 2, claimed: () => 1, refresh: async () => [executor],
+        })).toBe(taskId);
+        coordinator.releaseReservation(taskId);
+      }
+      const probeWarnings = warn.mock.calls.filter((call) => String(call[0]).includes("Merge-lane demand probe failed"));
+      expect(probeWarnings).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

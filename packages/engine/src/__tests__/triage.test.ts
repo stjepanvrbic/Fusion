@@ -1886,6 +1886,7 @@ Planner rewrote mission without the raw request.
       reservedCount: 0,
       draining: false,
       providerIds: [],
+      mergeLaneReservationRegistered: false,
     });
     expect(projectAdmissionCoordinator.inspectProjectStateForTests(projectId).providerIds)
       .not.toContain(`specify:${projectId}`);

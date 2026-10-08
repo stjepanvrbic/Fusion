@@ -15,6 +15,7 @@ const WORKSPACE_BUSY_REENQUEUE_MARKER = "private scheduleWorkspaceBusyReenqueue(
 /** Merge-lane fields deliberately omitted because the prototype merge drain never reads them. */
 const NOT_SEEDED_BY_FIXTURE: Record<string, string> = {
   unregisterMergeAdmissionProvider: "registration cleanup is used only during engine lifecycle management",
+  unregisterMergeLaneReservation: "KB-065 probe registration cleanup is used only during engine lifecycle management",
   autostashSweepTimer: "autostash maintenance is not part of the prototype merge drain",
   mergeActiveReconcileTimer: "reconciliation maintenance is not part of the prototype merge drain",
 };

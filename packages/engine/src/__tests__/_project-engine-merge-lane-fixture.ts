@@ -7,6 +7,8 @@ type MergeLaneState = {
   capacityDeferredMergeReasons: Map<string, string>;
   capacityDeferredMerges: Map<string, unknown>;
   coordinatorAdmittedMergeTaskIds: Set<string>;
+  mergeLaneSlotTaskId: string | null;
+  mergeLaneDequeuedTaskId: string | null;
   pausedReviewTaskIds: Set<string>;
   mergeSweepHoldReasons: Map<string, string>;
   mergeRunning: boolean;
@@ -47,6 +49,10 @@ export function seedMergeLaneState<T extends object>(
     capacityDeferredMergeReasons: new Map(),
     capacityDeferredMerges: new Map(),
     coordinatorAdmittedMergeTaskIds: new Set(),
+    /* FNXC:ConcurrencyAdmission 2026-10-08-09:56: KB-065 merge-lane slot and dequeued-pending
+       markers; a fresh engine holds no merge slot and has dequeued nothing. */
+    mergeLaneSlotTaskId: null,
+    mergeLaneDequeuedTaskId: null,
     pausedReviewTaskIds: new Set(),
     /* FNXC:MergeAuthority 2026-08-23-21:40: the merge-sweep hold-reason log de-duplicator. Empty is
        the production-equivalent default — a fresh engine has held nothing yet. */

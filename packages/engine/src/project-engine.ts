@@ -679,6 +679,12 @@ export class ProjectEngine {
   /** Merge ids selected by the shared coordinator but not yet handed to rawMerge. */
   private readonly coordinatorAdmittedMergeTaskIds = new Set<string>();
   private unregisterMergeAdmissionProvider?: () => void;
+  /** KB-065: unregisters this engine's merge-lane demand probe from the shared coordinator. */
+  private unregisterMergeLaneReservation?: () => void;
+  /** KB-065: merge id that has been admitted into a running-agent slot and is running (or about to). */
+  private mergeLaneSlotTaskId: string | null = null;
+  /** KB-065: merge id the pump dequeued but has not admitted or deferred yet; still counts as demand. */
+  private mergeLaneDequeuedTaskId: string | null = null;
   private pausedReviewTaskIds = new Set<string>();
   private mergeRunning = false;
   private mergeRunningSince = 0;
@@ -1012,7 +1018,14 @@ export class ProjectEngine {
     this.unregisterMergeAdmissionProvider = projectAdmissionCoordinator.registerProvider(`merge:${projectId}`, {
       projectId,
       refresh: async () => {
-        if (this.shuttingDown || !this.started || this.coordinatorAdmittedMergeTaskIds.size > 0) return [];
+        /*
+        FNXC:ConcurrencyAdmission 2026-10-08-09:56:
+        KB-065: offer nothing while the merge lane already holds a slot. Selecting queued merge B while
+        merge A runs parked a second idle coordinator reservation for up to a full merge, i.e. a second
+        merge-lane slot. The pump's own one-shot admission picks B up after A finishes.
+        */
+        if (this.shuttingDown || !this.started || this.coordinatorAdmittedMergeTaskIds.size > 0
+          || this.mergeLaneSlotTaskId !== null || this.activeMergeTaskId !== null) return [];
         const store = this.runtime.getTaskStore();
         const queuedTaskIds = [...this.mergeQueue];
         const tasks = await Promise.all(queuedTaskIds.map(async (taskId) => await store.getTask(taskId).catch(() => null)));
@@ -1373,6 +1386,34 @@ export class ProjectEngine {
         });
       }
     }
+  }
+
+  /*
+  FNXC:ConcurrencyAdmission 2026-10-08-09:56:
+  KB-065: register this project's merge-lane demand probe so the shared coordinator keeps one running-agent slot free for the single-flight merge pump while merges wait.
+  The key must be the store root dir, the projectId the scheduler, triage, continuation, and merge one-shot admissions pass (drainMergeQueue's `cwd`).
+  Registered in start(), never the constructor: the TaskStore does not exist before runtime.start().
+  The probe is synchronous and in-memory (no store I/O). `pending` counts:
+  - queued ids in `mergeQueue`;
+  - `capacityDeferredMergeTaskIds`, because a capacity-deferred merge is removed from the queue while its retry timer runs (the 2026-10-08 starvation state);
+  - the dequeued-but-not-admitted id, because the pump awaits several store reads between dequeue and admission and a concurrent hold-release sweep would otherwise take the freed slot.
+  Paused cards leave `mergeQueue` and enter `pausedReviewTaskIds`, so they are excluded and cannot pin a slot. Residual: an id whose card left the review lane without a pause lingers until the next drain drops it (bounded by one poll).
+  `holdsSlot` covers an admitted, running, or coordinator-selected merge, so the lane never takes a second slot. Post-merge gates use the review lane and may use the reserved slot.
+  */
+  private registerMergeLaneReservation(store: TaskStore): void {
+    const storeRootDir = store.getRootDir?.() ?? this.config.workingDirectory;
+    this.unregisterMergeLaneReservation?.();
+    this.unregisterMergeLaneReservation = projectAdmissionCoordinator.registerMergeLaneReservation(storeRootDir, () => {
+      const holdsSlot = this.mergeLaneSlotTaskId !== null
+        || this.activeMergeTaskId !== null
+        || this.coordinatorAdmittedMergeTaskIds.size > 0;
+      if (!this.started || this.shuttingDown) return { pending: false, holdsSlot };
+      const isDemand = (taskId: string) => !this.pausedReviewTaskIds.has(taskId);
+      const pending = this.mergeQueue.some(isDemand)
+        || [...this.capacityDeferredMergeTaskIds].some(isDemand)
+        || (this.mergeLaneDequeuedTaskId !== null && isDemand(this.mergeLaneDequeuedTaskId));
+      return { pending, holdsSlot };
+    });
   }
 
   async isMergePending(taskId: string): Promise<boolean> {
@@ -1749,6 +1790,7 @@ export class ProjectEngine {
     this.scheduleStaleAutostashSweep(store);
 
     this.started = true;
+    this.registerMergeLaneReservation(store);
     runtimeLog.log(
       `ProjectEngine started for ${this.config.projectId} (critical path ${Date.now() - engineStartT0}ms; deferred work in background)`,
     );
@@ -1939,6 +1981,10 @@ export class ProjectEngine {
     unregisterProjectVerificationLimit(this.config.projectId);
     this.unregisterMergeAdmissionProvider?.();
     this.unregisterMergeAdmissionProvider = undefined;
+    this.unregisterMergeLaneReservation?.();
+    this.unregisterMergeLaneReservation = undefined;
+    this.mergeLaneSlotTaskId = null;
+    this.mergeLaneDequeuedTaskId = null;
     // Stop merge retry timer
     if (this.mergeRetryTimer) {
       clearTimeout(this.mergeRetryTimer);
@@ -4255,9 +4301,12 @@ export class ProjectEngine {
       const cwd = store.getRootDir?.() ?? this.config.workingDirectory;
 
       while (this.mergeQueue.length > 0 && !this.shuttingDown) {
+        // KB-065: a dequeued id only counts as merge demand for the pump pass that took it.
+        this.mergeLaneDequeuedTaskId = null;
         const shadowCandidateTaskId = await this.getShadowMergeRequestCandidateId();
         const taskId = await this.pickNextMergeTaskId(store);
         if (!taskId) break;
+        this.mergeLaneDequeuedTaskId = taskId;
         const shadowSettings = await store.getSettings();
         if (shadowSettings.mergeRequestContractShadowEnabled === true) {
           this.emitMergeRequestShadowDequeueParity(taskId, shadowCandidateTaskId);
@@ -4860,10 +4909,13 @@ export class ProjectEngine {
           */
           const runWithMergeAdmission = async <T>(start: () => Promise<T>): Promise<T | undefined> => {
             if (coordinatorReservedMerge) {
+              this.mergeLaneSlotTaskId = taskId;
+              this.mergeLaneDequeuedTaskId = null;
               try {
                 return await start();
               } finally {
                 projectAdmissionCoordinator.releaseReservation(taskId);
+                if (this.mergeLaneSlotTaskId === taskId) this.mergeLaneSlotTaskId = null;
               }
             }
             let selected = false;
@@ -4933,10 +4985,13 @@ export class ProjectEngine {
               return undefined;
             }
             this.capacityDeferredMergeReasons.delete(taskId);
+            this.mergeLaneSlotTaskId = taskId;
+            this.mergeLaneDequeuedTaskId = null;
             try {
               return await start();
             } finally {
               if (!reusedReservation) projectAdmissionCoordinator.releaseReservation(taskId);
+              if (this.mergeLaneSlotTaskId === taskId) this.mergeLaneSlotTaskId = null;
             }
           };
           const deferMergeForCapacity = (): void => {
@@ -4945,6 +5000,8 @@ export class ProjectEngine {
             const generation = this.startupGeneration;
             this.clearMergeActive(taskId);
             this.capacityDeferredMergeTaskIds.add(taskId);
+            // The deferred set now carries this id's merge demand (KB-065).
+            if (this.mergeLaneDequeuedTaskId === taskId) this.mergeLaneDequeuedTaskId = null;
             const timer = setTimeout(() => {
               const deferred = this.capacityDeferredMerges.get(taskId);
               if (!deferred || deferred.timer !== timer) return;
@@ -6233,6 +6290,7 @@ export class ProjectEngine {
         }
       }
     } finally {
+      this.mergeLaneDequeuedTaskId = null;
       this.mergeRunning = false;
     }
   }

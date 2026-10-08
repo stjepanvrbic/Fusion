@@ -31,6 +31,7 @@ import {
   registerPreHeldExecutorSlot,
   type AgentSemaphore,
   type ProjectCapacityHolders,
+  type LaneReservationHoldInfo,
 } from "./concurrency/concurrency.js";
 import { planTaskWorktreePath, resolveTaskWorkingBranch } from "./worktree/worktree-names.js";
 import { resumeDueExternalBlocks } from "./external-block/external-block-lifecycle.js";
@@ -3287,10 +3288,13 @@ export class Scheduler {
             return projectCapacityHoldersFromStore(this.store, liveTasks);
           })();
           let projectSlotReserved = false;
+          // Assigned inside the admission callback; the cast keeps TS from narrowing it to undefined.
+          let laneReservationHold = undefined as LaneReservationHoldInfo | undefined;
           const admittedTaskId = await projectAdmissionCoordinator.admitNext({
             projectId: this.store.getRootDir(),
             ...projectCapacityAdmissionLimits(capacitySettings, getFinalClaimSnapshot),
             semaphore: this.options.semaphore,
+            onLaneReservationHold: (info) => { laneReservationHold = info; },
             refresh: async () => [{
               taskId: task.id,
               projectId: this.store.getRootDir(),
@@ -3330,9 +3334,16 @@ export class Scheduler {
               inProgressTaskIds: freshClaims.runningTaskIds,
               topLevelClaimedSlots: freshClaims.runningTaskIds.length,
             });
-            const reason = exhausted
-              ? formatConcurrencyLimitReason(freshDiagnostic)
-              : `queued — higher-priority lifecycle admission started: task=${admittedTaskId}`;
+            /*
+            FNXC:ConcurrencyAdmission 2026-10-08-09:56:
+            KB-065: when the coordinator withheld the last slot for a pending merge, say so. Reporting
+            capacity exhaustion here was misleading because one slot is free and reserved for the pump.
+            */
+            const reason = exhausted && laneReservationHold
+              ? `queued — running-agent slot reserved for pending merge: used=${laneReservationHold.occupied}/${laneReservationHold.maxConcurrent}; reserved=${laneReservationHold.heldBackSlots}`
+              : exhausted
+                ? formatConcurrencyLimitReason(freshDiagnostic)
+                : `queued — higher-priority lifecycle admission started: task=${admittedTaskId}`;
             await this.store.updateTask(task.id, { status: "queued" });
             await this.logDispatchQueuedReason(task.id, reason);
             return null;
