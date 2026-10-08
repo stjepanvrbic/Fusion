@@ -8,12 +8,13 @@
  *  2. An end-to-end symptom test: a fixture Node process fires a background refresh
  *     against a slow fake `qmd` stub on PATH and must exit well before the stub does.
  */
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
+import { expectStubInvoked, fixtureEnv, writeQmdStub } from "./_qmd-stub.js";
 import { unrefQmdChildProcess } from "../memory/memory-backend.js";
 
 const tsxPackageJsonPath = createRequire(import.meta.url).resolve("tsx/package.json");
@@ -44,31 +45,13 @@ describe("unrefQmdChildProcess (unit)", () => {
   });
 });
 
-/** Invocation log the stub appends its argv to, proving the stub (not a real or absent qmd) was reached. */
-function invocationLogPath(stubDir: string): string {
-  return join(stubDir, "invocations.log");
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
 /**
- * FNXC:ProjectMemory 2026-10-08-07:11:
- * The symptom proof is only meaningful when the bash stub is the qmd that ran.
- * The stub logs every invocation and each test waits for its first call (`collection add`); later calls race the fixture's prompt exit by design, so they are not required.
- * Skipped on Windows: shell-free `spawn("qmd")` only launches `qmd.exe`/`qmd.com`, never an extensionless bash stub, and a real `qmd.exe` on the host PATH shadows it.
- * The search stub's "ignore SIGTERM" model also cannot exist there, because kill is TerminateProcess.
- * The unit suites above keep running on every platform.
+ * FNXC:ProjectMemory 2026-10-08-12:42:
+ * KB-072: these symptom suites now run on win32 too, via an npm-style `qmd.cmd` shim that the default executor launches shell-free through `resolveShellFreeLaunch`.
+ * On win32 the stub's SIGTERM-ignore model is moot because kill is TerminateProcess, but the invariant (the short-lived caller exits before the child) is the same.
+ * The stub logs every invocation, and each test waits for its first call (`collection add`) to prove the stub was the qmd that ran.
  */
-async function expectStubInvoked(stubDir: string): Promise<void> {
-  const logPath = invocationLogPath(stubDir);
-  await vi.waitFor(() => {
-    expect(existsSync(logPath) ? readFileSync(logPath, "utf8") : "").toContain("collection add");
-  }, { timeout: 5_000, interval: 50 });
-}
-
-describe.skipIf(process.platform === "win32")("qmd background refresh does not keep a short-lived caller alive (symptom)", () => {
+describe("qmd background refresh does not keep a short-lived caller alive (symptom)", () => {
   const tempDirs: string[] = [];
 
   afterEach(() => {
@@ -77,43 +60,13 @@ describe.skipIf(process.platform === "win32")("qmd background refresh does not k
     }
   });
 
-  function writeSlowQmdStub(stubDir: string): void {
-    // Fake `qmd`: resolves instantly for "collection add", but sleeps well past our
-    // exit-bound assertion for "update"/"embed" — this models the real symptom
-    // (long-sleeping qmd child) without a real multi-second wait dominating the test
-    // budget on the assertion side; only the *stub* sleeps long, the *test* just
-    // measures how fast the fixture process exits.
-    // FNXC:ProjectMemory 2026-10-08-01:40: the stub leaves the project root before sleeping. It outlives the test by design, and on Windows a live process's working directory cannot be deleted, so cleanup failed while the modeled symptom (a long-lived child holding the caller's pipes) never needed the directory.
-    const stubPath = join(stubDir, "qmd");
-    writeFileSync(
-      stubPath,
-      [
-        "#!/usr/bin/env bash",
-        `echo "$*" >> ${shellQuote(invocationLogPath(stubDir))}`,
-        'case "$1" in',
-        "  update|embed)",
-        "    cd / && sleep 8",
-        "    ;;",
-        "esac",
-        "exit 0",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    chmodSync(stubPath, 0o755);
-  }
-
   async function runFixture(mode: "project" | "agent", rootDir: string, stubDir: string) {
     const fixturePath = join(import.meta.dirname, "fixtures", "qmd-refresh-fixture.mjs");
     const startedAt = Date.now();
     return new Promise<{ code: number | null; elapsedMs: number; stdout: string }>((resolvePromise, reject) => {
       let stdout = "";
       const child = spawn(process.execPath, [tsxCliPath, fixturePath, rootDir, mode], {
-        env: {
-          ...process.env,
-          PATH: `${stubDir}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
-          FUSION_ENABLE_QMD_REFRESH_IN_TESTS: "1",
-        },
+        env: fixtureEnv(stubDir),
         stdio: ["ignore", "pipe", "pipe"],
       });
 
@@ -132,7 +85,7 @@ describe.skipIf(process.platform === "win32")("qmd background refresh does not k
     tempDirs.push(stubDir);
     const rootDir = mkdtempSync(join(tmpdir(), "fn-7706-qmd-root-"));
     tempDirs.push(rootDir);
-    writeSlowQmdStub(stubDir);
+    writeQmdStub(stubDir, "refresh");
 
     const exitInfo = await runFixture("project", rootDir, stubDir);
     await expectStubInvoked(stubDir);
@@ -150,7 +103,7 @@ describe.skipIf(process.platform === "win32")("qmd background refresh does not k
     tempDirs.push(stubDir);
     const rootDir = mkdtempSync(join(tmpdir(), "fn-7706-qmd-agent-root-"));
     tempDirs.push(rootDir);
-    writeSlowQmdStub(stubDir);
+    writeQmdStub(stubDir, "refresh");
 
     const exitInfo = await runFixture("agent", rootDir, stubDir);
     await expectStubInvoked(stubDir);

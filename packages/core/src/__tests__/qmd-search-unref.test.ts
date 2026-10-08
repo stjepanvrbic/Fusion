@@ -14,10 +14,11 @@
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
+import { expectStubInvoked, fixtureEnv, writeQmdStub } from "./_qmd-stub.js";
 
 const tsxPackageJsonPath = createRequire(import.meta.url).resolve("tsx/package.json");
 const tsxCliPath = join(tsxPackageJsonPath, "..", "dist", "cli.mjs");
@@ -44,11 +45,12 @@ describe("searchWithQmd routes through the hardened default executor (unit)", ()
         ...actual,
         spawn: (file: string, args: string[], options: unknown) => {
           spawnCalls.push({ file, args });
-          const lastArg = Array.isArray(args) ? args[0] : undefined;
           // Fake a fast-closing child for both "collection"/"add" and "search".
+          // KB-072: match the qmd subcommand anywhere in args, since a host's real qmd.cmd resolves to node with the script path first.
+          const isSearch = Array.isArray(args) && args.includes("search");
           const fakeChild = actual.spawn(
             process.execPath,
-            ["-e", lastArg === "search" ? "process.stdout.write('[]')" : ""],
+            ["-e", isSearch ? "process.stdout.write('[]')" : ""],
             options as Record<string, unknown>,
           );
           return fakeChild;
@@ -76,8 +78,11 @@ describe("searchWithQmd routes through the hardened default executor (unit)", ()
     // `spawn` (the default executor's underlying primitive) — proving searchWithQmd
     // no longer constructs its own private `promisify(execFile)` copy, which would
     // bypass this mock entirely and use the real un-unref'd execFile path instead.
-    const collectionAddCalls = spawnCalls.filter((call) => call.args[0] === "collection" && call.args[1] === "add");
-    const searchCalls = spawnCalls.filter((call) => call.args[0] === "search");
+    const collectionAddCalls = spawnCalls.filter((call) => {
+      const at = call.args.indexOf("collection");
+      return at >= 0 && call.args[at + 1] === "add";
+    });
+    const searchCalls = spawnCalls.filter((call) => call.args.includes("search"));
     expect(collectionAddCalls.length).toBeGreaterThanOrEqual(1);
     expect(searchCalls.length).toBeGreaterThanOrEqual(1);
 
@@ -85,31 +90,13 @@ describe("searchWithQmd routes through the hardened default executor (unit)", ()
   });
 });
 
-/** Invocation log the stub appends its argv to, proving the stub (not a real or absent qmd) was reached. */
-function invocationLogPath(stubDir: string): string {
-  return join(stubDir, "invocations.log");
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
 /**
- * FNXC:ProjectMemory 2026-10-08-07:11:
- * The symptom proof is only meaningful when the bash stub is the qmd that ran.
- * The stub logs every invocation and each test waits for its first call (`collection add`); later calls race the fixture's prompt exit by design, so they are not required.
- * Skipped on Windows: shell-free `spawn("qmd")` only launches `qmd.exe`/`qmd.com`, never an extensionless bash stub, and a real `qmd.exe` on the host PATH shadows it.
- * The search stub's "ignore SIGTERM" model also cannot exist there, because kill is TerminateProcess.
- * The unit suites above keep running on every platform.
+ * FNXC:ProjectMemory 2026-10-08-12:42:
+ * KB-072: these symptom suites now run on win32 too, via an npm-style `qmd.cmd` shim that the default executor launches shell-free through `resolveShellFreeLaunch`.
+ * On win32 the stub's SIGTERM-ignore model is moot because kill is TerminateProcess, but the invariant (the short-lived caller exits before the child) is the same.
+ * The stub logs every invocation, and each test waits for its first call (`collection add`) to prove the stub was the qmd that ran.
  */
-async function expectStubInvoked(stubDir: string): Promise<void> {
-  const logPath = invocationLogPath(stubDir);
-  await vi.waitFor(() => {
-    expect(existsSync(logPath) ? readFileSync(logPath, "utf8") : "").toContain("collection add");
-  }, { timeout: 5_000, interval: 50 });
-}
-
-describe.skipIf(process.platform === "win32")("qmd search does not keep a short-lived caller alive (symptom)", () => {
+describe("qmd search does not keep a short-lived caller alive (symptom)", () => {
   const tempDirs: string[] = [];
 
   afterEach(() => {
@@ -118,47 +105,13 @@ describe.skipIf(process.platform === "win32")("qmd search does not keep a short-
     }
   });
 
-  function writeStubbornSlowQmdStub(stubDir: string): void {
-    // Fake `qmd`: "collection add" (and anything else) responds instantly.
-    // "search" traps and ignores SIGTERM, then sleeps ~8s before responding — this
-    // models a qmd child that keeps running past searchWithQmd's own 4s internal
-    // timeout kill attempt, so only a properly unref'd child+stdio (not a merely
-    // "timed-out" JS promise) lets the caller process exit promptly.
-    // FNXC:ProjectMemory 2026-10-08-01:40: the stub leaves the project root before sleeping. It outlives the test by design, and on Windows a live process's working directory cannot be deleted, so cleanup failed while the modeled symptom (a long-lived child holding the caller's pipes) never needed the directory.
-    const stubPath = join(stubDir, "qmd");
-    writeFileSync(
-      stubPath,
-      [
-        "#!/usr/bin/env bash",
-        `echo "$*" >> ${shellQuote(invocationLogPath(stubDir))}`,
-        "trap '' TERM",
-        'case "$1" in',
-        "  search)",
-        "    cd / && sleep 8",
-        "    echo '[]'",
-        "    ;;",
-        "  *)",
-        "    exit 0",
-        "    ;;",
-        "esac",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    chmodSync(stubPath, 0o755);
-  }
-
   async function runFixture(rootDir: string, stubDir: string) {
     const fixturePath = join(import.meta.dirname, "fixtures", "qmd-search-fixture.mjs");
     const startedAt = Date.now();
     return new Promise<{ code: number | null; elapsedMs: number; stdout: string }>((resolvePromise, reject) => {
       let stdout = "";
       const child = spawn(process.execPath, [tsxCliPath, fixturePath, rootDir], {
-        env: {
-          ...process.env,
-          PATH: `${stubDir}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
-          FUSION_ENABLE_QMD_REFRESH_IN_TESTS: "1",
-        },
+        env: fixtureEnv(stubDir),
         stdio: ["ignore", "pipe", "pipe"],
       });
 
@@ -177,7 +130,7 @@ describe.skipIf(process.platform === "win32")("qmd search does not keep a short-
     tempDirs.push(stubDir);
     const rootDir = mkdtempSync(join(tmpdir(), "fn-7707-qmd-root-"));
     tempDirs.push(rootDir);
-    writeStubbornSlowQmdStub(stubDir);
+    writeQmdStub(stubDir, "search");
 
     const exitInfo = await runFixture(rootDir, stubDir);
     await expectStubInvoked(stubDir);

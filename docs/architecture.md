@@ -611,6 +611,7 @@ const backend = resolveMemoryBackend(settings);
 
 **QMD Backend Behavior:**
 The QMD backend (`qmd`) delegates read/write I/O to the file backend and schedules background QMD index refreshes. For search, it attempts QMD query first and falls back to local `.fusion/memory/` file search when QMD is unavailable, errors, or returns no matches.
+Every qmd launch (and the install command's `bun`) goes shell-free through `resolveShellFreeLaunch`, so npm/bun `.cmd` shims work on Windows without handing arguments to `cmd.exe`; a command only a shell could run is treated as "qmd unavailable" and falls back to file search.
 
 QMD-backed memory behavior also applies to agent-private memory workspaces under `.fusion/agent-memory/{agentId}/`:
 - Agent memory search normalizes QMD hit paths (including `qmd://...`, absolute paths, and relative filenames) into canonical readable workspace paths (`MEMORY.md`, `DREAMS.md`, `YYYY-MM-DD.md`) so results can be passed directly into `fn_memory_get`.

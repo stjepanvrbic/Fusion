@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 // it here (local binding for this module's own throws) and re-export so the
 // public surface is unchanged.
 import { MemoryBackendError } from "./memory-backend-error.js";
+import { resolveShellFreeLaunch, type ShellFreeLaunch } from "../process/windows-launch.js";
 // FNXC:StashBackend 2026-08-13-16:35:
 // Import the Stash backend as a runtime value (registration + per-project URL/key
 // materialization in resolveMemoryBackend). memory-backend-stash.ts imports ONLY
@@ -1199,12 +1200,27 @@ interface QmdExecError extends Error {
   stderr?: string;
 }
 
+/**
+ * FNXC:ProjectMemory 2026-10-08-12:38:
+ * An npm- or bun-installed `qmd.cmd` (and `bun.cmd` for `installQmd`) must work on win32.
+ * Node's shell-free `spawn` resolves a bare name only to `.exe`/`.com`, so a shim was unreachable and qmd silently reported unavailable.
+ * Every launch goes through `resolveShellFreeLaunch`, which unwraps npm/pnpm shims to `node <script>` or the native executable, so no batch file or shell ever receives arguments (they include the user's search query).
+ * A command only a shell could run rejects without spawning, which every caller treats as "qmd unavailable" (file-search fallback).
+ * POSIX launches are identity. Error messages keep naming the original command and args.
+ */
 async function getDefaultExecFileAsync(): Promise<ExecFileAsync> {
   const { spawn } = await import("node:child_process");
 
   return (file, args, options) =>
     new Promise<{ stdout: string; stderr: string }>((resolvePromise, reject) => {
-      const child = spawn(file, args as string[], {
+      let launch: ShellFreeLaunch;
+      try {
+        launch = resolveShellFreeLaunch(file, args);
+      } catch (err) {
+        reject(err);
+        return;
+      }
+      const child = spawn(launch.command, launch.args, {
         cwd: options?.cwd,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
