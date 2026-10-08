@@ -1280,6 +1280,10 @@ describe("ModelOnboardingModal", () => {
       expect(await within(copilotCard).findByText("ABCD-1234")).toBeTruthy();
       expect(within(copilotCard).queryByTestId("onboarding-login-instructions-github-copilot")).toBeNull();
       expect(mockWindowOpen).not.toHaveBeenCalled();
+      // FNXC:OnboardingCopilotAuthTest 2026-10-08-16:03: auto-copy runs in a passive effect after the pill commits, so flush effects before reading the clipboard mock (KB-085, flake register entry 38).
+      await act(async () => {
+        await Promise.resolve();
+      });
       expect(writeText).toHaveBeenCalledWith("ABCD-1234");
       expect(writeText).toHaveBeenCalledTimes(1);
 

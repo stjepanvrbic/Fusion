@@ -484,7 +484,7 @@ The operator designated the two transient observations as this file's single fir
 
 ### 38. ModelOnboardingModal GitHub Copilot device-code panel clipboard auto-copy
 
-- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **Status:** Closed 2026-10-08 — structurally resolved on first sighting by KB-085 (test synchronization); no quarantine.
 - **File:** `packages/dashboard/app/components/__tests__/ModelOnboardingModal.test.tsx`
 - **Exact test:** `ModelOnboardingModal > AI Setup step > renders github copilot device-code panel in onboarding`.
 - **Observed tree/SHA:** fork Full Suite (non-blocking) run [37777837004](https://github.com/stjepanvrbic/Fusion/actions/runs/37777837004/job/113313079385) at `a93f18c744be13653ec97e3f7e2e1fc5bcec7c10` (KB-037, Linux, `ubuntu-latest`), job `Test shard 3/4` (`113313079385`), command `@fusion/dashboard run test:quality:app:backfill-3`, project `dashboard-app-quality-backfill`. That commit changed docs, the root and dashboard `package.json` test-script wrappers (`test:app`, `test:api`, `test:deep`, `test:build`, none of which the backfill command uses), `scripts/run-with-env.mjs`, `scripts/test-with-lock.mjs`, and their script tests. It touched no onboarding or modal file and no file under `packages/dashboard/app`. The shard-3 job passed in the Full Suite runs for `5c3bbd44f` (37771841940), `5369d3747` (37775466262), `23049497f` (37778394023), `ce5dd1aac` (37778520119), and `072f02fa8` (37779214412).
@@ -503,8 +503,13 @@ Hypothesis, not measured: the component copies the code from a passive effect ke
 | Full Suite 37778520119 (`ce5dd1aac`), shard 3/4 | passed |
 | Full Suite 37779214412 (`072f02fa8`), shard 3/4 | passed |
 | `pnpm exec vitest run app/components/__tests__/ModelOnboardingModal.test.tsx --project dashboard-app-quality-backfill --reporter=dot` in `packages/dashboard`, local Windows, `34a914125` | passed, 208 tests, 18.9 s wall (tests 12.1 s) |
+| KB-085 census: `Test shard 3/4` job logs of 34 further Full Suite runs on main, 37756067075 (`b4ffbded6`) through 37802084164 (`1857850d5`, still running), read through the job-log API | no sighting of this case (one shard-3 failure, 37758138036 at `2f807ed88`, was a different test) |
+| KB-085 file alone, local Windows, before the fix | passed |
+| KB-085 forcing probe (uncommitted): a `MutationObserver` records `writeText` calls at the first DOM commit that shows the pill | **0 calls** with the pill in the DOM; an `act` flush from that point then gave exactly 1 call |
+| KB-085 file alone ×3, local Windows, after the fix | passed each run |
+| KB-085 `@fusion/dashboard run test:quality:app:backfill-3`, local Windows, after the fix | passed, 196.8 s wall |
 
-The local run did not reproduce the failure, so it neither confirms nor refutes the hypothesis. No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting and the file carries 207 other cases. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. A fix should wait on the clipboard call itself, by asserting on `writeText` inside `waitFor` as the later lines of the same case already do, rather than reading it once.
+KB-085 measured the window: when the commit that renders the pill lands, the auto-copy passive effect has not run yet and `writeText` has no calls. The case had passed only because RTL's post-`waitFor` drain usually flushed React's scheduled passive effect before the synchronous read. The failure itself was not reproduced locally, so the specific CI race that let the read run first under load remains unmeasured. KB-085 made the case flush effects with `await act(async () => { await Promise.resolve(); })` before the read, mirroring the sibling `SettingsModal.models-auth.test.tsx` case. The exact `toHaveBeenCalledWith("ABCD-1234")`, `toHaveBeenCalledTimes(1)`, and `(2)` assertions are unchanged, and no timeout, retry, or product code changed. The neighboring execCommand-fallback and error-toast cases already wait with `waitFor`. A new sighting re-opens normal escalation.
 
 ### Common shape and investigated result
 
