@@ -140,6 +140,7 @@ import {
   ActiveSessionWorktreeRemovalError,
   getRegisteredWorktreePaths,
   getRegisteredWorktreeBranches,
+  WorktreeRegistrationUnknownError,
   pruneWorktreeAdminEntries,
   isInsideConfiguredWorktreesDir,
   resumeApprovedPlanReviewHandoff,
@@ -4116,11 +4117,19 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
             that canonical path is sufficient when a user reopen has cleared or mismatched `task.branch`.
             Unregistered directories and every non-canonical path still fail closed.
             */
+            /*
+            FNXC:TaskReset 2026-10-08-07:40:
+            The registered-path list is only the fallback proof, so it is read only when branch ownership fails.
+            A registration probe that cannot run is reported as unproven ownership (409, retryable), never a 500.
+            */
+            const unprovenOwnership = (error: unknown): never => {
+              if (error instanceof WorktreeRegistrationUnknownError) {
+                throw conflict(`Reset refuses a worktree whose managed task ownership cannot be proven${targetSuffix(target.repoRel)}: ${error.message}`);
+              }
+              throw error;
+            };
             if (targetExists) {
-              const [registeredBranches, registeredPaths] = await Promise.all([
-                getRegisteredWorktreeBranches(target.repoRootDir),
-                getRegisteredPathsForRepo(target.repoRootDir),
-              ]);
+              const registeredBranches = await getRegisteredWorktreeBranches(target.repoRootDir).catch(unprovenOwnership);
               const targetBranch = typeof target.branch === "string" ? target.branch.trim() : "";
               let registeredOwner = false;
               if (targetBranch.length > 0) {
@@ -4133,7 +4142,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
               }
               const recoveredCanonicalOwner = !registeredOwner
                 && target.canonicalPath === resetPlan.canonicalSingularWorktreePath
-                && registeredPaths.has(target.canonicalPath);
+                && (await getRegisteredPathsForRepo(target.repoRootDir).catch(unprovenOwnership)).has(target.canonicalPath);
               if (!registeredOwner && !recoveredCanonicalOwner) {
                 throw conflict(`Reset refuses a worktree whose managed task ownership cannot be proven${targetSuffix(target.repoRel)}`);
               }

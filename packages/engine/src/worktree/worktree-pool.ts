@@ -1,7 +1,7 @@
 import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, lstatSync, readdirSync, readFileSync, rmdirSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { lstat, mkdir } from "node:fs/promises";
 import { dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { Settings, TaskStore, WorktrunkSettings, WorkspaceWorktreeContext } from "@fusion/core";
 import { worktreePoolLog } from "../logger.js";
@@ -174,6 +174,17 @@ export async function isGitRepository(dir: string): Promise<boolean> {
   return (await detectGitRepository(dir)).status === "repo";
 }
 
+/** Consulted only after git failed: a missing cwd is a filesystem fact, not a git failure. */
+async function isMissingDirectory(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return false;
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR";
+  }
+}
+
 /**
  * `git worktree list` could not run, so registration is unknown.
  * Distinct from an empty list: callers must never read it as "unregistered".
@@ -192,6 +203,12 @@ A failed `git worktree list` (timeout, index or config lock, dubious ownership, 
 The probe now throws `WorktreeRegistrationUnknownError`; every derived lister propagates it and no caller may act destructively on it.
 */
 export async function describeRegisteredWorktrees(rootDir: string): Promise<{ rawOutput: string; canonicalized: string[] }> {
+  /*
+  FNXC:WorktreeLiveness 2026-10-08-07:40:
+  Registrations live in a repository's own git dir, so a root that does not exist, or that git positively reports is not a repository, has none: that is proof, not an unknown.
+  Spawning git with a missing cwd fails as `spawn /bin/sh ENOENT` (cmd.exe on Windows), which read as an unknown probe and made workspace Task Reset return 500 for members whose sub-repository root was gone. The root is checked only after git fails, so a missing cwd is told apart from git itself being missing.
+  Every other failure (timeout, lock, dubious ownership, git missing) still throws `WorktreeRegistrationUnknownError`.
+  */
   let stdout: string;
   try {
     const result = await execAsync("git worktree list --porcelain", {
@@ -202,6 +219,9 @@ export async function describeRegisteredWorktrees(rootDir: string): Promise<{ ra
     });
     stdout = getExecStdout(result);
   } catch (err: unknown) {
+    if (classifyGitRepoDetectionError(err).status === "not-repo" || await isMissingDirectory(rootDir)) {
+      return { rawOutput: "", canonicalized: [] };
+    }
     const error = new WorktreeRegistrationUnknownError(rootDir, err);
     worktreePoolLog.warn(`[worktree-pool] ${error.message}`);
     throw error;

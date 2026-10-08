@@ -705,6 +705,7 @@ export {
   reapOrphanWorktrees,
   getRegisteredWorktreePaths,
   getRegisteredWorktreeBranches,
+  WorktreeRegistrationUnknownError,
 } from "./worktree/worktree-pool.js";
 export { removeWorktree, RemovalReason, type RemovalReason as WorktreeRemovalReason, type WorktreeRemoveOutcome } from "./worktree/worktree-backend.js";
 export { isInsideConfiguredWorktreesDir, resolveWorktreesDir } from "./worktree/worktree-paths.js";

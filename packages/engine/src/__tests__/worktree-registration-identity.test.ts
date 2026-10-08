@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const injected = vi.hoisted(() => ({ failWhen: null as null | ((command: string) => boolean) }));
@@ -151,6 +151,32 @@ FNXC:WorktreeLiveness 2026-10-07-19:23:
 Registration is tri-state. A `git worktree list` that cannot run is unknown, never "unregistered": no caller deletes, clears a pointer, or reclaims on it.
 */
 describe("an inconclusive registration probe never reads as unregistered", () => {
+  /*
+  FNXC:WorktreeLiveness 2026-10-08-07:40:
+  A repository root that does not exist, or that git positively reports is not a repository, has no registrations: that is proof, not an unknown.
+  Reset and cleanup of workspace members whose sub-repository root is gone must not fail on a `spawn` with a missing cwd.
+  */
+  it("reports no registrations for a repository root that does not exist", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "fusion-wt-missing-root-"));
+    tracked.push(parent);
+    const missing = join(parent, "gone");
+
+    await expect(pool.getRegisteredWorktreePaths(missing)).resolves.toEqual(new Set());
+    await expect(pool.getRegisteredWorktreeBranches(missing)).resolves.toEqual([]);
+    await expect(pool.isRegisteredGitWorktree(missing, join(missing, ".worktrees", "fn-1"))).resolves.toBe(false);
+  });
+
+  it("reports no registrations for a directory git says is not a repository", async () => {
+    const plain = mkdtempSync(join(tmpdir(), "fusion-wt-not-a-repo-"));
+    tracked.push(plain);
+    process.env.GIT_CEILING_DIRECTORIES = dirname(plain);
+    try {
+      await expect(pool.getRegisteredWorktreePaths(plain)).resolves.toEqual(new Set());
+    } finally {
+      delete process.env.GIT_CEILING_DIRECTORIES;
+    }
+  });
+
   it("throws a distinct error from the registration lister", async () => {
     const root = repo();
     injected.failWhen = failWorktreeList;
