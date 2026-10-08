@@ -1152,6 +1152,14 @@ export async function cleanupMergedTaskArtifacts(
   }
 }
 
+/*
+FNXC:LifecycleContainment 2026-10-08-01:16:
+These finalizers run from the daemon, serve and dashboard PR-merge processors, so the review-to-complete move is automatic,
+not an operator action. It names the engine source so lifecycle containment judges it, and keeps guards (bypassGuards
+false) so the merge blocker still applies, exactly as it did when the source was absent.
+*/
+const PR_MERGE_COMPLETION_MOVE = { moveSource: "engine", bypassGuards: false } as const;
+
 async function finalizePullRequestMerge(
   store: TaskStore,
   cwd: string,
@@ -1161,7 +1169,7 @@ async function finalizePullRequestMerge(
 ): Promise<void> {
   await cleanupMergedTaskArtifacts(cwd, task);
   await store.updateTask(task.id, { status: null, mergeRetries: 0 });
-  const movedTask = await store.moveTask(task.id, await resolveCompleteTargetForTask(store, task.id), { moveSource: "operator" });
+  const movedTask = await store.moveTask(task.id, await resolveCompleteTargetForTask(store, task.id), PR_MERGE_COMPLETION_MOVE);
   const mergedTask = movedTask ?? (await store.getTask(task.id));
   await store.logEntry(task.id, message, `PR #${prInfo.number}: ${prInfo.url}`);
   const settings = await store.getSettings();
@@ -1198,7 +1206,7 @@ async function finalizeNoOpMergeTask(
   const branch = task.branch ?? getTaskBranchName(task.id);
   await cleanupMergedTaskArtifacts(cwd, task);
   await store.updateTask(task.id, { status: null, mergeRetries: 0 });
-  const movedTask = await store.moveTask(task.id, await resolveCompleteTargetForTask(store, task.id), { moveSource: "operator" });
+  const movedTask = await store.moveTask(task.id, await resolveCompleteTargetForTask(store, task.id), PR_MERGE_COMPLETION_MOVE);
   const mergedTask = movedTask ?? (await store.getTask(task.id));
   await store.logEntry(task.id, reason, `Branch ${branch} has no commits relative to the base branch; nothing to merge.`);
   store.emit("task:merged", {

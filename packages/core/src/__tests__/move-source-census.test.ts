@@ -15,18 +15,15 @@ const ROOT = join(__dirname, "..", "..", "..", "..");
 const SOURCE_ROOTS = ["packages", "plugins"];
 const SKIPPED_DIRECTORIES = new Set(["__tests__", "__test-utils__", "dist", "node_modules", "e2e", "stories", ".storybook"]);
 
-/** Unattributed calls owned by the in-flight recovery-ownership change, which names each of these sources. */
-const PENDING_RECOVERY_OWNERSHIP: Readonly<Record<string, number>> = {
-  "packages/engine/src/executor/run-implementation.ts": 13,
-  "packages/engine/src/executor/create-task-done-tool.ts": 3,
-  "packages/engine/src/executor/non-continuable-session.ts": 2,
-  "packages/engine/src/executor/task-done-refusal-handler.ts": 1,
-  "packages/engine/src/executor/route-reset-parse-pin-mismatch.ts": 1,
-  "packages/engine/src/executor/dep-abort-cleanup.ts": 1,
-  "packages/engine/src/executor/bootstrap-misbinding-recovery.ts": 1,
-  "packages/engine/src/self-healing.ts": 1,
-  "packages/engine/src/runtimes/in-process-runtime.ts": 1,
-  // Spreads its caller's options; the seam's callers must name the source.
+/*
+FNXC:LifecycleContainment 2026-10-08-01:16:
+The recovery-ownership change named the source at every executor, self-healing, scheduler, triage, runtime, mission and
+merge-conflict call it owned; its own engine census ratchets those files. What is left here is the seam that forwards its
+caller's options, and the automatic moves still waiting on a containment decision.
+*/
+/** Seams that spread their caller's options, so the source is named at their call sites. */
+const FORWARDS_CALLER_OPTIONS: Readonly<Record<string, number>> = {
+  // moveTaskWithLifecycleReason spreads `options`; the engine census covers its callers.
   "packages/engine/src/execution/lifecycle-move.ts": 1,
 };
 
@@ -37,10 +34,6 @@ const PENDING_RECOVERY_OWNERSHIP: Readonly<Record<string, number>> = {
 const PENDING_CONTAINMENT_DECISION: Readonly<Record<string, number>> = {
   // Automatic triage routing lands cards in the default board's intake-role lane (rule F1).
   "packages/dashboard/src/triage-trait.ts": 3,
-  // The merge-conflict bounce sends a review card to WIP; containment keeps merge-failure repair in review.
-  "packages/engine/src/project-engine.ts": 1,
-  // The mission retry returns a failed WIP card to the hold lane (rule F5).
-  "packages/engine/src/missions/mission-autopilot.ts": 1,
   // Abandoned-lease recovery rebounds a WIP card to the hold lane (rule F5).
   "packages/engine/src/project/mesh-lease-manager.ts": 1,
   // Agent-requested column routing of an existing canonical task may step it backward.
@@ -162,7 +155,7 @@ function unattributedMoveCalls(): Record<string, number> {
 describe("moveTask source census", () => {
   it("every production moveTask call names its source except the listed open sites", () => {
     expect(unattributedMoveCalls()).toEqual({
-      ...PENDING_RECOVERY_OWNERSHIP,
+      ...FORWARDS_CALLER_OPTIONS,
       ...PENDING_CONTAINMENT_DECISION,
       ...NOT_A_STORE_MOVE,
     });
