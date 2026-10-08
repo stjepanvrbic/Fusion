@@ -1087,6 +1087,12 @@ Prefer `it.each` over copy-pasted `it()` blocks. When trimming, keep: first case
 - Integration tests exercising real SQLite, real worker pool, or spawned processes.
 - Lean core/engine unit tests with low mock burden.
 
+## Test isolation guard and stray shell artifacts
+
+<!-- FNXC:TestIsolation 2026-10-08-06:20: KB-039 found cmd.exe-misparsed POSIX fixture commands leaving `{}` and `-p` in packages/engine; the isolation guard now fails when such names appear during a run. -->
+
+`scripts/check-test-isolation.mjs` (run around `pnpm test` and `pnpm test:isolated`) also fails when a known stray shell-artifact name (`{}`, `-p`) appears in the repo root or any workspace package root during the run; names that predate the baseline only warn. These entries come from POSIX shell strings that cmd.exe misreads on Windows: `mkdir -p dir` creates a literal `-p` directory, and an unhonored single-quoted `node -e '... => {}, ...'` redirects stdout into a file named `{}`. Fixtures should create files and directories with Node fs APIs (`mkdirSync(dir, { recursive: true })`) and run any unavoidable shell command with a temp cwd, never the package directory.
+
 ## Test isolation for module-singleton state
 
 <!-- FNXC:ConcurrencyAdmission 2026-08-01-06:57: Module-singleton admission state can survive mocked lane starts and unstopped processors, silently consuming capacity in later tests. FN-8671 fixes that root cause without quarantine: stop tracked owners first, then clear shared state in a finally block and assert the result through read-only inspection seams. -->

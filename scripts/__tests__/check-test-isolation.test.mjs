@@ -115,6 +115,7 @@ test("ignores active fusion-test-workers roots created after baseline", async ()
     assert.equal(before.status, 0);
 
     const activeRoot = path.join(tmp, `fusion-test-workers-active-check-${process.pid}`);
+    // FNXC:TestInfraWindows 2026-10-08-05:36: the owner runs outside the fixture cwd; Windows refuses to delete a directory that is a live process's cwd, and SIGTERM there is asynchronous, so the fixture cleanup failed with EPERM.
     const owner = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], {
       cwd: process.cwd(),
       env: childEnv({ home, tmp }),
@@ -240,6 +241,70 @@ test("warns without failing for a workspace package .fusion directory that preda
     const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 0, after.stderr || after.stdout);
     assert.match(after.stderr, /workspace package \.fusion/i);
+  });
+});
+
+/*
+FNXC:TestIsolation 2026-10-08-05:36:
+KB-039: POSIX shell strings run through cmd.exe with a package cwd left an empty `{}` file and an empty `-p` directory in `packages/engine`. Either name appearing in the repo root or a workspace package root during a run must fail it, in both baseline modes; one that predates the baseline only warns.
+*/
+function createStrayArtifacts(dir) {
+  writeFileSync(path.join(dir, "{}"), "");
+  mkdirSync(path.join(dir, "-p"), { recursive: true });
+}
+
+test("fails when stray shell-artifact entries appear in a workspace package root", () => {
+  withFixture(({ cwd, home, tmp }) => {
+    mkdirSync(path.join(cwd, "packages", "engine"), { recursive: true });
+    const before = runScript(["--before"], { cwd, home, tmp });
+    assert.equal(before.status, 0, before.stderr || before.stdout);
+    createStrayArtifacts(path.join(cwd, "packages", "engine"));
+    const after = runScript([], { cwd, home, tmp });
+    assert.equal(after.status, 1, after.stdout);
+    assert.match(after.stderr, /stray shell-artifact/i);
+    assert.ok(after.stderr.includes(path.join("packages", "engine", "{}")), after.stderr);
+    assert.ok(after.stderr.includes(path.join("packages", "engine", "-p")), after.stderr);
+  });
+});
+
+test("--before-fast still detects stray shell-artifact entries", () => {
+  withFixture(({ cwd, home, tmp }) => {
+    mkdirSync(path.join(cwd, "packages", "engine"), { recursive: true });
+    assert.equal(runScript(["--before"], { cwd, home, tmp }).status, 0);
+    const fast = runScript(["--before-fast"], { cwd, home, tmp });
+    assert.equal(fast.status, 0, fast.stderr || fast.stdout);
+    assert.match(fast.stdout, /Baseline recorded \(fast\)/);
+    createStrayArtifacts(path.join(cwd, "packages", "engine"));
+    const after = runScript([], { cwd, home, tmp });
+    assert.equal(after.status, 1, after.stdout);
+    assert.ok(after.stderr.includes(path.join("packages", "engine", "{}")), after.stderr);
+    assert.ok(after.stderr.includes(path.join("packages", "engine", "-p")), after.stderr);
+  });
+});
+
+test("detects stray shell-artifact entries in plugin roots and the repo root", () => {
+  withFixture(({ cwd, home, tmp }) => {
+    mkdirSync(path.join(cwd, "plugins", "fusion-plugin-demo"), { recursive: true });
+    const before = runScript(["--before"], { cwd, home, tmp });
+    assert.equal(before.status, 0, before.stderr || before.stdout);
+    mkdirSync(path.join(cwd, "plugins", "fusion-plugin-demo", "-p"));
+    writeFileSync(path.join(cwd, "{}"), "");
+    const after = runScript([], { cwd, home, tmp });
+    assert.equal(after.status, 1, after.stdout);
+    assert.ok(after.stderr.includes(path.join("plugins", "fusion-plugin-demo", "-p")), after.stderr);
+    assert.match(after.stderr, /^\s+\{\}$/m);
+  });
+});
+
+test("warns without failing for stray shell-artifact entries that predate the run", () => {
+  withFixture(({ cwd, home, tmp }) => {
+    mkdirSync(path.join(cwd, "packages", "engine"), { recursive: true });
+    createStrayArtifacts(path.join(cwd, "packages", "engine"));
+    const before = runScript(["--before"], { cwd, home, tmp });
+    assert.equal(before.status, 0, before.stderr || before.stdout);
+    const after = runScript([], { cwd, home, tmp });
+    assert.equal(after.status, 0, after.stderr || after.stdout);
+    assert.match(after.stderr, /WARN: .*stray shell-artifact/i);
   });
 });
 

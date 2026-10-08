@@ -1544,7 +1544,8 @@ describeIfGit("workspace-aware self-healing (Phase D U1)", () => {
     const wtA = path.join(fx.repoPath("repo-a"), ".wt-task");
     fx.git("repo-a", `git worktree add -b ${BRANCH} ${wtA} HEAD`);
     const wtB = path.join(fx.repoPath("repo-b"), ".not-a-worktree");
-    execSync(`mkdir -p ${wtB}`, { stdio: "pipe" });
+    // FNXC:TestInfraWindows 2026-10-08-05:36: KB-039 — fixture filesystem setup uses Node fs, not a shell string; cmd.exe `mkdir -p` created a literal `-p` directory in the engine package cwd.
+    mkdirSync(wtB, { recursive: true });
     writeFileSync(path.join(wtB, "stray.txt"), "x", "utf-8");
     expect(existsSync(wtA)).toBe(true);
     expect(existsSync(wtB)).toBe(true);

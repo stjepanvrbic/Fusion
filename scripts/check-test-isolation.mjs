@@ -113,7 +113,8 @@ One bounded readdir per workspace package parent finds them. A directory that ap
 */
 const WORKSPACE_PACKAGE_PARENTS = ["packages", "plugins", join("plugins", "examples")];
 
-function listWorkspacePackageFusionDirs(rootDir = process.cwd()) {
+/** Relative paths of every workspace package directory: one bounded, non-recursive readdir per parent; a missing parent is skipped. */
+function listWorkspacePackageDirs(rootDir = process.cwd()) {
   const found = [];
   for (const parent of WORKSPACE_PACKAGE_PARENTS) {
     let entries;
@@ -123,8 +124,35 @@ function listWorkspacePackageFusionDirs(rootDir = process.cwd()) {
       continue;
     }
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const relative = join(parent, entry.name, ".fusion");
+      if (entry.isDirectory()) found.push(join(parent, entry.name));
+    }
+  }
+  return found;
+}
+
+function listWorkspacePackageFusionDirs(rootDir = process.cwd()) {
+  const found = [];
+  for (const pkgDir of listWorkspacePackageDirs(rootDir)) {
+    const relative = join(pkgDir, ".fusion");
+    if (existsSync(join(rootDir, relative))) found.push(relative);
+  }
+  return found.sort();
+}
+
+/**
+ * FNXC:TestIsolation 2026-10-08-05:36:
+ * KB-039: these names are the residue of POSIX shell strings run through cmd.exe with a package cwd, observed in `packages/engine`.
+ * cmd `mkdir -p <dir>` creates a literal `-p` directory; an unquoted or single-quoted `=> {}, ...` parses as a stdout redirect to a file named `{}` because cmd treats `,` as a token delimiter.
+ * The repo root and every workspace package root are checked with a plain existsSync (file or directory form), never a recursive walk.
+ * A name that appears during the run fails it; one that predates the baseline only warns. Add newly observed shell-artifact names here.
+ */
+const STRAY_SHELL_ARTIFACT_NAMES = ["{}", "-p"];
+
+function listStrayShellArtifacts(rootDir = process.cwd()) {
+  const found = [];
+  for (const dir of ["", ...listWorkspacePackageDirs(rootDir)]) {
+    for (const name of STRAY_SHELL_ARTIFACT_NAMES) {
+      const relative = dir ? join(dir, name) : name;
       if (existsSync(join(rootDir, relative))) found.push(relative);
     }
   }
@@ -271,6 +299,7 @@ function recordBaselineFast() {
     protectedFusion: latestProtected,
     unstableProtectedDirs: [...unstableProtectedDirs],
     packageFusionDirs: listWorkspacePackageFusionDirs(),
+    strayShellArtifacts: listStrayShellArtifacts(),
   };
   writeFileSync(BASELINE_FILE, JSON.stringify(payload));
   console.log(`[test-isolation] Baseline recorded (fast): ${payload.tmpNames.length} temp dir(s), ${payload.protectedFusion.length} protected .fusion root(s).`);
@@ -314,6 +343,7 @@ function recordBaseline() {
     protectedFusion: latestProtected,
     unstableProtectedDirs,
     packageFusionDirs: listWorkspacePackageFusionDirs(),
+    strayShellArtifacts: listStrayShellArtifacts(),
   };
   writeFileSync(BASELINE_FILE, JSON.stringify(payload));
   console.log(`[test-isolation] Baseline recorded: ${payload.tmpNames.length} temp dir(s), ${payload.protectedFusion.length} protected .fusion root(s).`);
@@ -441,13 +471,22 @@ function checkAgainstBaseline() {
     for (const dir of stalePackageFusionDirs) console.warn(`  ${dir}`);
   }
 
+  const baselineStrayArtifacts = new Set(baseline.strayShellArtifacts ?? []);
+  const currentStrayArtifacts = listStrayShellArtifacts();
+  const strayArtifactLeaks = currentStrayArtifacts.filter((entry) => !baselineStrayArtifacts.has(entry));
+  const staleStrayArtifacts = currentStrayArtifacts.filter((entry) => baselineStrayArtifacts.has(entry));
+  if (staleStrayArtifacts.length > 0) {
+    console.warn(`[test-isolation] WARN: ${staleStrayArtifacts.length} stray shell-artifact entr${staleStrayArtifacts.length === 1 ? "y predates" : "ies predate"} this run; delete them:`);
+    for (const entry of staleStrayArtifacts) console.warn(`  ${entry}`);
+  }
+
   if (skippedUnknownDirs.length > 0) {
     console.warn(`[test-isolation] WARN: ${skippedUnknownDirs.length} protected dir(s) absent from baseline (was \`--before\` run from a different cwd?):`);
     for (const dir of skippedUnknownDirs) console.warn(`  ${dir}`);
   }
 
-  if (leaks.length === 0 && protectedViolations.length === 0 && packageFusionLeaks.length === 0) {
-    console.log("[test-isolation] No temp leaks or live .fusion mutations detected.");
+  if (leaks.length === 0 && protectedViolations.length === 0 && packageFusionLeaks.length === 0 && strayArtifactLeaks.length === 0) {
+    console.log("[test-isolation] No temp leaks, live .fusion mutations, or stray shell artifacts detected.");
     process.exit(0);
   }
 
@@ -467,6 +506,12 @@ function checkAgainstBaseline() {
     console.error("[test-isolation] FAIL: workspace package .fusion directories appeared during tests:");
     for (const dir of packageFusionLeaks) console.error(`  ${dir}`);
     console.error("Tests must pass a temp project root, never process.cwd(), to code that writes .fusion state.");
+  }
+
+  if (strayArtifactLeaks.length > 0) {
+    console.error("[test-isolation] FAIL: stray shell-artifact entries appeared during tests:");
+    for (const entry of strayArtifactLeaks) console.error(`  ${entry}`);
+    console.error("Use Node fs APIs or a temp cwd instead of POSIX shell strings: cmd.exe misparses `mkdir -p` and `=> {}`.");
   }
 
   process.exit(1);
