@@ -95,6 +95,52 @@ describe("auth helpers", () => {
     );
   });
 
+  it("captures a legacy ?rt= shell handoff token when token is absent", async () => {
+    window.history.replaceState({}, "", "/dashboard?rt=legacy-123&view=board#focus");
+
+    const { getAuthToken } = await loadAuthModule();
+
+    expect(getAuthToken()).toBe("legacy-123");
+    expect(window.localStorage.getItem("fn.authToken")).toBe("legacy-123");
+    expect(`${window.location.pathname}${window.location.search}${window.location.hash}`).toBe(
+      "/dashboard?view=board#focus",
+    );
+  });
+
+  it("prefers ?token= over legacy ?rt= and strips both", async () => {
+    window.history.replaceState({}, "", "/?token=new&rt=old");
+
+    const { getAuthToken } = await loadAuthModule();
+
+    expect(getAuthToken()).toBe("new");
+    expect(window.localStorage.getItem("fn.authToken")).toBe("new");
+    expect(window.location.search).toBe("");
+  });
+
+  it("never captures /remote-login?rt= as a bearer token", async () => {
+    window.history.replaceState({}, "", "/remote-login?rt=remote-xyz");
+
+    const { getAuthToken } = await loadAuthModule();
+
+    expect(getAuthToken()).toBeUndefined();
+    expect(window.localStorage.getItem("fn.authToken")).toBeNull();
+    expect(`${window.location.pathname}${window.location.search}`).toBe("/remote-login?rt=remote-xyz");
+  });
+
+  it("round-trips the shell redirect URL built by buildRemoteDashboardUrl into the session token", async () => {
+    const { buildRemoteDashboardUrl } = await import("../utils/appLifecycle");
+    const built = new URL(buildRemoteDashboardUrl("http://localhost/", "secret-token"));
+    window.history.replaceState({}, "", `${built.pathname}${built.search}`);
+
+    const { getAuthToken } = await loadAuthModule();
+
+    expect(getAuthToken()).toBe("secret-token");
+    expect(window.localStorage.getItem("fn.authToken")).toBe("secret-token");
+    const remaining = new URLSearchParams(window.location.search);
+    expect(remaining.has("token")).toBe(false);
+    expect(remaining.has("rt")).toBe(false);
+  });
+
   it("appends fn_token for same-origin API URLs and same-host websocket URLs", async () => {
     window.localStorage.setItem("fn.authToken", "daemon-abc");
 

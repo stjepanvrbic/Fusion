@@ -125,6 +125,21 @@ describe("bootstrapMobileShell", () => {
           token: "secret-token",
           shellCanOpenConnectionManager: "1",
         });
+        expect(url.searchParams.has("rt")).toBe(false);
+      });
+
+      it("hands off a saved profile without an auth token carrying no credential param", async () => {
+        const { bootstrapMobileShell } = await load();
+        const { authToken: _omitted, ...tokenlessProfile } = prodProfile;
+        saveProfiles("prod", [tokenlessProfile]);
+        const target = createTarget(bundled);
+
+        const result = await bootstrapMobileShell({ target });
+
+        expect(result.kind).toBe("handoff");
+        const url = new URL(vi.mocked(target.location.assign).mock.calls[0]![0] as string);
+        expect(url.searchParams.has("token")).toBe(false);
+        expect(url.searchParams.has("rt")).toBe(false);
       });
 
       it("does not hand off to a saved profile whose server URL is invalid", async () => {

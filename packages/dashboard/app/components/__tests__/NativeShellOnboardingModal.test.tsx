@@ -103,7 +103,9 @@ describe("NativeShellOnboardingModal", () => {
       expect(saveProfile).toHaveBeenCalledWith(expect.objectContaining({ name: "Remote Server", serverUrl: "https://fusion.example.com" }));
       expect(setActiveProfile).toHaveBeenCalledWith("p1");
       expect(window.location.href).toContain("https://fusion.example.com");
-      expect(window.location.href).toContain("rt=abc");
+      const redirect = new URL(window.location.href);
+      expect(redirect.searchParams.get("token")).toBe("abc");
+      expect(redirect.searchParams.has("rt")).toBe(false);
     });
 
     Object.defineProperty(window, "location", { configurable: true, value: originalLocation });

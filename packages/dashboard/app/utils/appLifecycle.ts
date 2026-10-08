@@ -6,6 +6,7 @@ Module-level lifecycle helpers, storage-key constants, and banner/CLI-banner pur
 import type { AiSessionSummary } from "../api";
 import { api, relaunchCliSession } from "../api";
 import type { CliActionId } from "../components/SessionNotificationBanner";
+import { URL_TOKEN_PARAM } from "../auth";
 
 export const SETUP_WARNING_DISMISSED_KEY = "kb-setup-warning-dismissed";
 export const WORKING_BRANCH_FILTER_STORAGE_KEY = "kb-dashboard-working-branch-filter";
@@ -65,10 +66,16 @@ export function persistApprovalBannerDismissals(map: Map<string, number>): void 
   }
 }
 
+/**
+ * FNXC:NativeShellHandoff 2026-10-08-04:16:
+ * `token` (`URL_TOKEN_PARAM`) is the single canonical shell → dashboard credential query param, shared with mobile `SHELL_HANDOFF_QUERY.token`, desktop `native.ts`, and `shell-context.ts`.
+ * KB-038: this builder previously wrote `rt`, which the dashboard SPA never captured (only the server's `/remote-login` door reads `rt`), so onboarding and desktop remote switches silently dropped the credential.
+ * The credential param is written only when a non-empty token is supplied; this is the only builder (the onboarding modal imports it rather than keeping a duplicate).
+ */
 export function buildRemoteDashboardUrl(serverUrl: string, authToken?: string | null): string {
   const url = new URL(serverUrl);
   if (authToken) {
-    url.searchParams.set("rt", authToken);
+    url.searchParams.set(URL_TOKEN_PARAM, authToken);
   }
   return url.toString();
 }

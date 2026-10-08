@@ -15,6 +15,10 @@ This module is the browser-bound entry, so its import graph must stay free of No
 FNXC:MobileShell 2026-10-07-19:30:
 Handoff needs `server.allowNavigation: ["*"]` because saved servers are arbitrary hosts, and iOS injects the Capacitor bridge into every main-frame page it allows.
 Saved profiles (including auth tokens) are readable through that bridge, so clicks on links to any origin other than the current page or a saved server are opened outside the WebView (Capacitor iOS hands window.open to Safari).
+
+FNXC:NativeShellHandoff 2026-10-08-04:16:
+The handoff credential query param is `SHELL_HANDOFF_QUERY.token` (`"token"`), the canonical name shared with the dashboard's `URL_TOKEN_PARAM`, the onboarding/desktop `buildRemoteDashboardUrl`, and the desktop shell.
+Do not use `rt` here: `rt` is the server-side `/remote-login` access-token door, so the dashboard SPA only reads it as a temporary legacy fallback (KB-038).
 */
 
 export const MOBILE_SHELL_HANDOFF_MARKER_KEY = "fusion.mobile.handoff.v1";

@@ -33,7 +33,7 @@ The dashboard gates first-run shell onboarding in `requiresNativeShellOnboarding
    - Saves profile via `saveProfile(...)`
    - Sets desktop mode to remote when relevant
    - Activates profile via `setActiveProfile(...)`
-   - Redirects to selected remote dashboard URL (adds `rt=<token>` query when token is present)
+   - Redirects to selected remote dashboard URL (adds `token=<token>` query when token is present)
 
 ## QR scan and manual fallback
 
@@ -83,7 +83,7 @@ Saved servers are arbitrary hosts, so `capacitor.config.ts` sets `server.allowNa
 
 Desktop shell stores shell settings separately from Fusion project/global settings.
 
-When desktop mode is `remote` and an active profile exists, `App.tsx` redirects to that profile URL and appends `rt` when a token exists.
+When desktop mode is `remote` and an active profile exists, `App.tsx` redirects to that profile URL and appends `token` when a token exists. `token` is the single shell → dashboard credential param used by the onboarding modal, the desktop remote switch, the desktop main process, and the mobile bootstrap handoff. For compatibility with older shell builds that wrote `?rt=<token>`, the dashboard still captures a legacy `rt` param when `token` is absent, except on `/remote-login`, where `rt` remains the server-side remote-access login token.
 
 When desktop mode is `local` and the local server reports `ready` with a port, `App.tsx` redirects to `http://localhost:<port>`.
 

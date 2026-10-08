@@ -3,14 +3,8 @@ import { useTranslation } from "react-i18next";
 import type { FusionShellApi, ShellConnectionState } from "../types/native-shell";
 import "./NativeShellOnboardingModal.css";
 import { FloatingWindow } from "./FloatingWindow";
-
-function buildRemoteDashboardUrl(serverUrl: string, authToken?: string | null): string {
-  const url = new URL(serverUrl);
-  if (authToken) {
-    url.searchParams.set("rt", authToken);
-  }
-  return url.toString();
-}
+// FNXC:NativeShellHandoff 2026-10-08-04:16: KB-038 removed this modal's private builder that wrote `?rt=`; the shared builder writes the canonical `?token=`.
+import { buildRemoteDashboardUrl } from "../utils/appLifecycle";
 
 interface NativeShellOnboardingModalProps {
   open: boolean;

@@ -44,6 +44,20 @@ describe("shouldShowSessionInBanner", () => {
   });
 });
 
+describe("buildRemoteDashboardUrl", () => {
+  it("writes the canonical token param and never rt", () => {
+    const url = new URL(buildRemoteDashboardUrl("https://fusion.example.com", "abc"));
+    expect(url.searchParams.get("token")).toBe("abc");
+    expect(url.searchParams.get("rt")).toBeNull();
+  });
+
+  it.each([null, undefined, ""])("writes no credential param for %j", (authToken) => {
+    const url = new URL(buildRemoteDashboardUrl("https://fusion.example.com", authToken));
+    expect(url.searchParams.has("token")).toBe(false);
+    expect(url.searchParams.has("rt")).toBe(false);
+  });
+});
+
 describe("resolveDesktopShellRedirectTarget", () => {
   const remoteProfile = {
     id: "remote-1",
@@ -177,6 +191,9 @@ describe("resolveDesktopShellRedirectTarget", () => {
       "http://127.0.0.1:50123/",
     );
     expect(target).toBe(buildRemoteDashboardUrl(remoteProfile.serverUrl, remoteProfile.authToken));
+    const parsed = new URL(target as string);
+    expect(parsed.searchParams.get("token")).toBe("tok-123");
+    expect(parsed.searchParams.has("rt")).toBe(false);
   });
 
   it("returns null when already on the target remote url", () => {

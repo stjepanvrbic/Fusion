@@ -26,6 +26,14 @@
 
 const STORAGE_KEY = "fn.authToken";
 export const URL_TOKEN_PARAM = "token";
+/**
+ * FNXC:NativeShellHandoff 2026-10-08-04:16:
+ * Legacy shell "handoff" credential param. Shell clients built before KB-038 (onboarding modal, desktop remote switch) wrote `?rt=<token>`.
+ * Captured only as a temporary compatibility fallback when `token` is absent; remove once those clients age out.
+ */
+export const LEGACY_URL_TOKEN_PARAM = "rt";
+/** `/remote-login?rt=` carries a remote-access token handled server-side; the SPA never captures it as a bearer. */
+const REMOTE_LOGIN_PATH = "/remote-login";
 /** Query param name used when we can't set an Authorization header (EventSource, WebSocket). */
 export const QUERY_TOKEN_PARAM = "fn_token";
 
@@ -63,7 +71,7 @@ function writeStoredToken(token: string): void {
 }
 
 /**
- * Read the `?token=...` param off the current URL (if present) and stash it
+ * Read the `?token=...` param (or the legacy `?rt=...` fallback) off the current URL (if present) and stash it
  * into localStorage, then remove it from the visible URL so the secret is not
  * retained in browser history. Returns the token if one was captured.
  *
@@ -77,13 +85,22 @@ function captureTokenFromUrl(): string | undefined {
 
   try {
     const url = new URL(window.location.href);
-    const token = url.searchParams.get(URL_TOKEN_PARAM);
+    /*
+    FNXC:NativeShellHandoff 2026-10-08-04:16:
+    `token` is canonical and always wins. The legacy `rt` fallback is read only when `token` is absent and never on `/remote-login`.
+    Whenever a credential is captured, both params are stripped so neither secret stays in browser history.
+    */
+    let token = url.searchParams.get(URL_TOKEN_PARAM);
+    if (!token && url.pathname !== REMOTE_LOGIN_PATH) {
+      token = url.searchParams.get(LEGACY_URL_TOKEN_PARAM);
+    }
     if (!token) {
       return undefined;
     }
 
     writeStoredToken(token);
     url.searchParams.delete(URL_TOKEN_PARAM);
+    url.searchParams.delete(LEGACY_URL_TOKEN_PARAM);
     const cleaned = url.pathname + (url.search ? url.search : "") + url.hash;
     window.history.replaceState(window.history.state, "", cleaned);
     return token;
