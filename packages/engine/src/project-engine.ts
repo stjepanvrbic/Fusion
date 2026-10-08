@@ -4672,10 +4672,6 @@ export class ProjectEngine {
                 }
                 continue;
               }
-              await store.logEntry(
-                taskId,
-                "Merge already confirmed; refreshing row and completing task (recovered from post-merge state inconsistency)",
-              );
               const mergedTask = finalization.task ?? (await store.getTask(taskId).catch(() => null)) ?? task;
               store.emit("task:merged", {
                 task: mergedTask,
@@ -4688,6 +4684,15 @@ export class ProjectEngine {
                 mergeTargetBranch: mergedTask.mergeDetails?.mergeTargetBranch,
                 mergeTargetSource: mergedTask.mergeDetails?.mergeTargetSource,
               } as MergeResult);
+              /*
+              FNXC:PostMergeRecovery 2026-10-08-10:46:
+              `task:merged` must follow the completion move with no await in between, as it always did: the merged activity is the completion signal observers read once the card reaches the complete lane.
+              The completion log line is therefore written after the emit.
+              */
+              await store.logEntry(
+                taskId,
+                "Merge already confirmed; refreshing row and completing task (recovered from post-merge state inconsistency)",
+              );
               continue;
             }
 
