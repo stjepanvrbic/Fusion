@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { Settings, TaskStore } from "@fusion/core";
 import { activeSessionRegistry } from "../../agents/active-session-registry.js";
 import { SelfHealingManager } from "../../self-healing.js";
+import { markAuthorizedCheckoutResidue } from "../../worktree/remove-checkout.js";
 
 function sh(command: string, cwd: string): string {
   return String(execSync(command, { cwd, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }) ?? "");
@@ -95,17 +96,53 @@ describe("FN-4811 / FN-5065: reapUnregisteredOrphans defers active-session paths
     manager.stop();
   });
 
-  it("FN-5065 control: removes unregistered orphan when no FN-4811 active session is registered", async () => {
+  it("FN-5065 control: removes marked removal residue when no FN-4811 active session is registered", async () => {
     const repo = makeRepo();
     tempRoots.push(repo);
     const orphanPath = makeUnregisteredOrphan(repo, "fn-5065-control");
     writeFileSync(join(orphanPath, "stale.txt"), "stale\n", "utf-8");
+    expect(await markAuthorizedCheckoutResidue(orphanPath, { taskId: "FN-5065", source: "test" })).toBe(true);
 
     const manager = new SelfHealingManager(makeStore() as any, { rootDir: repo } as any);
     const cleaned = await (manager as any).reapUnregisteredOrphans();
 
     expect(cleaned).toBe(1);
     expect(existsSync(orphanPath)).toBe(false);
+    manager.stop();
+  });
+
+  /*
+  FNXC:WorktreeOrphanReap 2026-10-08-00:20:
+  Abandonment is not disposability: an unregistered folder without the removal-residue marker (an
+  operator copy, or a checkout git stopped listing) is preserved. And an unreadable registration is
+  "unknown", never "unregistered": the sweep deletes nothing, even marked residue.
+  */
+  it("preserves an unregistered folder that carries no removal-residue marker", async () => {
+    const repo = makeRepo();
+    tempRoots.push(repo);
+    const orphanPath = makeUnregisteredOrphan(repo, "fn-5065-unmarked");
+    writeFileSync(join(orphanPath, "operator-copy.txt"), "keep\n", "utf-8");
+
+    const manager = new SelfHealingManager(makeStore() as any, { rootDir: repo } as any);
+    const cleaned = await (manager as any).reapUnregisteredOrphans();
+
+    expect(cleaned).toBe(0);
+    expect(existsSync(join(orphanPath, "operator-copy.txt"))).toBe(true);
+    manager.stop();
+  });
+
+  it("deletes nothing when git cannot list registered worktrees", async () => {
+    const repo = makeRepo();
+    tempRoots.push(repo);
+    const orphanPath = makeUnregisteredOrphan(repo, "fn-5065-unknown");
+    expect(await markAuthorizedCheckoutResidue(orphanPath, { taskId: "FN-5065", source: "test" })).toBe(true);
+    // A malformed repository config makes every git invocation (including `git worktree list`) fail.
+    writeFileSync(join(repo, ".git", "config"), "[core\n\tbroken = = =\n", "utf-8");
+
+    const manager = new SelfHealingManager(makeStore() as any, { rootDir: repo } as any);
+    await expect((manager as any).reapUnregisteredOrphans()).resolves.toBe(0);
+
+    expect(existsSync(orphanPath)).toBe(true);
     manager.stop();
   });
 });

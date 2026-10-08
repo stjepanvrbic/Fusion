@@ -57,6 +57,7 @@ vi.mock("node:child_process", async () => {
 });
 
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
+import { CHECKOUT_REMOVAL_RESIDUE_MARKER } from "../worktree/remove-checkout.js";
 import { DONE_TASK_TEMP_WORKTREE_GRACE_MS, MIN_TEMP_WORKTREE_REAP_AGE_MS, SelfHealingManager, STALE_TEMP_MERGE_WORKTREE_MS } from "../self-healing.js";
 import { resolveAiMergeRootPath, resolveLegacyAiMergeRootPath } from "../worktree/worktree-paths.js";
 
@@ -214,6 +215,8 @@ describe("SelfHealingManager worktrees-dir sweeps", () => {
     mkdirSync(aiMergeContainer, { recursive: true });
     mkdirSync(recoveryContainer, { recursive: true });
     makeReclaimableWorktree(orphan, "half-built");
+    // FNXC:WorktreeOrphanReap 2026-10-08-00:20: only marked removal residue is reclaimed.
+    writeFileSync(join(orphan, CHECKOUT_REMOVAL_RESIDUE_MARKER), "{}\n");
     const { manager } = makeManager({ recycleWorktrees: true });
 
     await expect((manager as any).reapUnregisteredOrphans()).resolves.toBe(1);

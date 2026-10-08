@@ -71,7 +71,7 @@ import {
   buildDuplicateReplanExhaustedError,
 } from "./duplicate-marker-clear.js";
 import { mergeEffectiveSettings } from "./project/effective-settings.js";
-import { RemovalReason, canonicalizePath, classifyTaskWorktree, getRegisteredWorktreeBranchMap, getRegisteredWorktreePaths, isUsableTaskWorktree, relocateReclaimableWorktreeIntoRoot, removeWorktree, resolveWorktreeBackend, scanIdleWorktrees, scanOrphanedBranches } from "./worktree/worktree-pool.js";
+import { RemovalReason, WorktreeRegistrationUnknownError, canonicalizePath, classifyTaskWorktree, getRegisteredWorktreeBranchMap, getRegisteredWorktreePaths, isUsableTaskWorktree, relocateReclaimableWorktreeIntoRoot, removeWorktree, resolveWorktreeBackend, scanIdleWorktrees, scanOrphanedBranches } from "./worktree/worktree-pool.js";
 import {
   isMissingWorktreeSessionStartFailure,
   isMergeActiveMissingWorktreeSessionStartFailure,
@@ -137,6 +137,7 @@ import { reapExpiredFusionBrowserLeasesInProduction } from "./agent-browser-life
 import { advanceIntegrationBranchRef } from "./merge/merger-ref-update-advance.js";
 import { isInsideConfiguredWorktreesDir, isReclaimableWorktreeCandidate, isWorktreeContainerDir, resolveAiMergeSearchRoots, resolveWorktreesDir, resolveWorktreesDirScanRoots } from "./worktree/worktree-paths.js";
 import { removeDirectoryWithRetry } from "./worktree/worktree-removal-retry.js";
+import { isAuthorizedCheckoutResidue } from "./worktree/remove-checkout.js";
 import { canonicalFusionBranchName, resolveTaskWorkingBranch } from "./worktree/worktree-names.js";
 import { preservedWorktreeTargetPathForTask } from "./worktree/worktree-pinning.js";
 import { resolveIntegrationBranch } from "./merge/integration-branch.js";
@@ -908,6 +909,8 @@ liveness/eligibility fence blocked reconciliation so an operator retry has a con
 export type LandedReviewReconcileResult =
   | { outcome: "reconciled"; sha: string; strategy: string; baseBranch: string }
   | { outcome: "resumed"; gateId: string }
+  /** The required post-merge gate is waiting for the landed commit to be published; reported, not collapsed. */
+  | { outcome: "awaiting-publication"; gateId: string; reason: string; message: string }
   | { outcome: "already-complete" }
   | { outcome: "not-landed"; baseBranch: string }
   | { outcome: "raced"; reason: string }
@@ -1498,19 +1501,26 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       worktreeClassification = cls.ok
         ? { ok: true }
         : { ok: false, classification: cls.classification, reason: cls.reason };
-      worktreeUnusable = !cls.ok;
+      // FNXC:WorktreeLiveness 2026-10-08-00:20: an unreadable registration is not proof the checkout is dead.
+      worktreeUnusable = !cls.ok && cls.classification !== "registration-unknown";
     } else {
       const expected = resolveTaskWorkingBranch(task);
-      const registeredPaths = await getRegisteredWorktreePaths(this.options.rootDir);
-      const registeredBranchMap = await getRegisteredWorktreeBranchMap(this.options.rootDir);
-      const matchingRegisteredPaths = [...registeredPaths].filter((path) => {
-        const branch = registeredBranchMap.get(path);
-        return typeof branch === "string" && branch.trim().toLowerCase() === expected;
-      });
-      worktreeClassification = matchingRegisteredPaths.length === 0
-        ? { ok: false, classification: "missing", reason: "task.worktree is null and no registered fusion worktree exists" }
-        : { ok: true, reason: "registered fusion worktree exists while task.worktree is null" };
-      worktreeUnusable = matchingRegisteredPaths.length === 0;
+      try {
+        const registeredPaths = await getRegisteredWorktreePaths(this.options.rootDir);
+        const registeredBranchMap = await getRegisteredWorktreeBranchMap(this.options.rootDir);
+        const matchingRegisteredPaths = [...registeredPaths].filter((path) => {
+          const branch = registeredBranchMap.get(path);
+          return typeof branch === "string" && branch.trim().toLowerCase() === expected;
+        });
+        worktreeClassification = matchingRegisteredPaths.length === 0
+          ? { ok: false, classification: "missing", reason: "task.worktree is null and no registered fusion worktree exists" }
+          : { ok: true, reason: "registered fusion worktree exists while task.worktree is null" };
+        worktreeUnusable = matchingRegisteredPaths.length === 0;
+      } catch (error: unknown) {
+        if (!(error instanceof WorktreeRegistrationUnknownError)) throw error;
+        worktreeClassification = { ok: false, classification: "registration-unknown", reason: error.message };
+        worktreeUnusable = false;
+      }
     }
 
     const anchorMs = input.stalenessAnchor ? Date.parse(input.stalenessAnchor) : Number.NaN;
@@ -1577,6 +1587,18 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       if (live.deletedAt || live.paused || live.userPaused || live.column !== task.column || live.status === "failed") return null;
       return { status: "failed", error: `${error}. Retry the task to re-run implementation.` };
     });
+  }
+
+  /*
+  FNXC:WorktreeLiveness 2026-10-08-00:20:
+  Worktree usability is tri-state since `git worktree list` can fail. `registration-unknown` proves
+  neither a live nor a dead checkout, so destructive self-healing paths treat it as "do nothing"; only
+  a proven-unusable checkout lets them clear pointers or reclaim branches.
+  */
+  private async taskWorktreeUsability(worktreePath: string): Promise<"usable" | "unusable" | "unknown"> {
+    const cls = await classifyTaskWorktree(this.options.rootDir, worktreePath);
+    if (cls.ok) return "usable";
+    return cls.classification === "registration-unknown" ? "unknown" : "unusable";
   }
 
   private resumeInPlaceIfExecutionLane(task: Pick<Task, "id">): void {
@@ -4875,7 +4897,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           if (inspection.kind === "stale-resolved") {
             // A missing expected ref does not prove its registered checkout is gone. Acquisition
             // can rebind a renamed, task-owned branch; clearing the pointers loses that evidence.
-            if (await isUsableTaskWorktree(this.options.rootDir, task.worktree)) continue;
+            // FNXC:WorktreeLiveness 2026-10-08-00:20: clear the pointers only for a proven-unusable checkout; unknown registration keeps them.
+            if (await this.taskWorktreeUsability(task.worktree) !== "unusable") continue;
             await this.store.updateTask(task.id, {
               worktree: null,
               branch: null, branchWriteOrigin: "engine" as const,
@@ -5690,7 +5713,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           }
         }
 
-        if (task.worktree && await isUsableTaskWorktree(this.options.rootDir, task.worktree)) continue;
+        // FNXC:WorktreeLiveness 2026-10-08-00:20: a checkout whose registration is unknown is not reclaimable.
+        if (task.worktree && await this.taskWorktreeUsability(task.worktree) !== "unusable") continue;
 
         const inspection = await this.inspectOrphanedBranch(branch);
         if (!inspection) continue;
@@ -6497,7 +6521,15 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       if (settings.globalPause || settings.enginePaused) return 0;
 
       const allTasks = await this.store.listTasks({ slim: true, includeArchived: false });
-      const branchMap = await getRegisteredWorktreeBranchMap(this.options.rootDir);
+      let branchMap: Awaited<ReturnType<typeof getRegisteredWorktreeBranchMap>>;
+      try {
+        branchMap = await getRegisteredWorktreeBranchMap(this.options.rootDir);
+      } catch (error: unknown) {
+        // FNXC:WorktreeLiveness 2026-10-08-00:20: without a readable registration every pointer would look stale; repair nothing this pass.
+        if (!(error instanceof WorktreeRegistrationUnknownError)) throw error;
+        worktreeMetadataReconcileLog.warn(`skipped worktree metadata reconcile — registration unknown: ${error.message}`);
+        return 0;
+      }
       // FN-5256: macOS git surfaces realpath-normalized worktree paths (/private/var/...)
       // while task.worktree may be persisted as the symlinked path. Compare on realpath
       // to avoid false-stale flagging that yanks a live worktree.
@@ -14319,7 +14351,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       if (isPostMergeGateRecoveryDue(task, decision)
         || (options.source === "manual" && decision.outcome === "blocked" && decision.reason === "failed")) {
         const resumed = await resumeMissingPostMergeGate(this.store, task.id, { manualRetry: options.source === "manual" });
-        if (resumed.outcome === "resumed") return resumed;
+        /* FNXC:PostMergePublication 2026-10-08-00:20: an awaiting-publication gate is passed through so the operator sees why the gate did not reseed, instead of a generic "raced" or "awaiting-finalization". */
+        if (resumed.outcome === "resumed" || resumed.outcome === "awaiting-publication") return resumed;
         if (decision.outcome === "resumable") return { outcome: "raced", reason: "post-merge-continuation-not-idle" };
       }
       return { outcome: "ineligible", reason: decision.outcome === "blocked" ? "post-merge-evidence-pending" : "awaiting-finalization" };
@@ -17538,7 +17571,15 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       return 0;
     }
 
-    const registered = await getRegisteredWorktreePaths(this.options.rootDir);
+    let registered: Set<string>;
+    try {
+      registered = await getRegisteredWorktreePaths(this.options.rootDir);
+    } catch (error: unknown) {
+      // FNXC:WorktreeOrphanReap 2026-10-08-00:20: an unreadable registration is "unknown", never "unregistered"; delete nothing.
+      if (!(error instanceof WorktreeRegistrationUnknownError)) throw error;
+      log.warn(`[self-healing] skipped unregistered-orphan reap — worktree registration unknown: ${error.message}`);
+      return 0;
+    }
     const ownedDirs = (await Promise.all(dirs.map(async (dir) =>
       (await isReclaimableWorktreeCandidate(dir, { rootDir: this.options.rootDir })) ? dir : null,
     ))).filter((dir): dir is string => dir !== null);
@@ -17560,6 +17601,16 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       // U8: never reclaim a worktree backing a resume-eligible CLI session.
       if (this.isWorktreeResumeReserved(path)) {
         log.debug(`[self-healing] deferring unregistered-orphan reap for ${path}: resume-eligible CLI session present`);
+        continue;
+      }
+      /*
+      FNXC:WorktreeOrphanReap 2026-10-08-00:20:
+      Abandonment is not disposability. Only residue a deletion-authorized removal marked
+      (`CHECKOUT_REMOVAL_RESIDUE_MARKER`, no live `.git`) is deleted; an unmarked unregistered folder
+      (an operator copy, or a checkout git simply stopped listing) is preserved for a human.
+      */
+      if (!(await isAuthorizedCheckoutResidue(path))) {
+        log.debug(`[self-healing] preserving unregistered folder ${path}: no removal-residue marker`);
         continue;
       }
       try {

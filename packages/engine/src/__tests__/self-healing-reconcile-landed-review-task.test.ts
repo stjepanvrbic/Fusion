@@ -174,7 +174,17 @@ describe("SelfHealingManager.reconcileLandedReviewTask", () => {
     });
     try {
       const result = await manager.reconcileLandedReviewTask(task.id, { source: "manual" });
-      expect(result).not.toMatchObject({ outcome: "resumed" });
+      /*
+      FNXC:PostMergePublication 2026-10-08-00:20:
+      The withheld reseed is reported as awaiting-publication with its reason, not collapsed into a
+      generic raced or awaiting-finalization answer the operator cannot act on.
+      */
+      expect(result).toMatchObject({
+        outcome: "awaiting-publication",
+        gateId: "post-merge-verification",
+        reason: expect.any(String),
+        message: expect.any(String),
+      });
     } finally {
       probe.mockRestore();
     }

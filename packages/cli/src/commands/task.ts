@@ -1296,6 +1296,11 @@ export async function runTaskReconcile(id: string, projectName?: string) {
       console.log(`${id} is already complete; no reconciliation was needed.`);
       return;
     }
+    if (result.outcome === "awaiting-publication") {
+      console.error(`Cannot resume ${id}'s post-merge gate ${result.gateId} yet: ${result.message}`);
+      await closeBoardContextAndExit(context, 1);
+      return;
+    }
     if (result.outcome === "not-landed") {
       console.error(`Cannot reconcile ${id}: no commit with Fusion-Task-Id: ${id} (or its lineage trailer) was found on ${result.baseBranch}. Reconcile never fabricates an approval.`);
     } else if (result.outcome === "raced") {
