@@ -864,6 +864,162 @@ describe("unresponsive agent recovery", () => {
     customMonitor.stop();
     vi.useRealTimers();
   });
+
+  /*
+  FNXC:HeartbeatRecovery 2026-10-08-01:34:
+  KB-016: unresponsive terminations share the heartbeatErrorRecovery budget, exhaustion parks with error-retry-exhausted without resuming, and the tracked controller is aborted before dispose.
+  */
+  describe("shared retry budget", () => {
+    type RecoveryInternals = {
+      recoverUnresponsiveAgent: (tracked: unknown, heartbeatTimeoutMs: number) => Promise<void>;
+      trackedAgents: Map<string, unknown>;
+    };
+
+    function createBudgetHarness(options: {
+      metadata?: Record<string, unknown>;
+      settings?: Record<string, unknown> | "reject";
+      recordRunAuditEvent?: (...args: unknown[]) => unknown;
+      withTaskStore?: boolean;
+    } = {}) {
+      const agent = {
+        id: "agent-001",
+        state: "running",
+        runtimeConfig: { enabled: false },
+        ...(options.metadata ? { metadata: options.metadata } : {}),
+      };
+      const localStore = createMockStore({
+        getAgent: vi.fn().mockResolvedValue(agent),
+        updateAgentState: vi.fn().mockResolvedValue(agent),
+        updateAgent: vi.fn().mockResolvedValue(agent),
+      });
+      const recordRunAuditEvent = vi.fn(options.recordRunAuditEvent ?? (async () => undefined));
+      const taskStore = options.withTaskStore === false ? undefined : ({
+        getSettings: options.settings === "reject"
+          ? vi.fn().mockRejectedValue(new Error("settings down"))
+          : vi.fn().mockResolvedValue(options.settings ?? {}),
+        recordRunAuditEvent,
+      } as unknown as TaskStore);
+      const localMonitor = new HeartbeatMonitor({ store: localStore, taskStore, heartbeatTimeoutMs: 5000, pollIntervalMs: 1000 });
+      const internals = localMonitor as unknown as RecoveryInternals;
+      return { localStore, localMonitor, internals, recordRunAuditEvent };
+    }
+
+    function writtenAttempts(localStore: AgentStore): number[] {
+      return vi.mocked(localStore.updateAgent).mock.calls
+        .map(([, patch]) => (patch as { metadata?: { heartbeatErrorRecovery?: { consecutiveAttempts?: number } } }).metadata?.heartbeatErrorRecovery?.consecutiveAttempts)
+        .filter((count): count is number => typeof count === "number");
+    }
+
+    async function recover(harness: ReturnType<typeof createBudgetHarness>, controller?: AbortController, session = createMockSession()) {
+      harness.localMonitor.trackAgent("agent-001", session, "run-001", undefined, controller);
+      const tracked = harness.internals.trackedAgents.get("agent-001");
+      await harness.internals.recoverUnresponsiveAgent(tracked, 5000);
+      // Flush the non-blocking resume dispatch.
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      return session;
+    }
+
+    it("counts an attempt for an agent with no metadata and resumes it", async () => {
+      const harness = createBudgetHarness();
+      await recover(harness);
+      expect(writtenAttempts(harness.localStore)).toEqual([1]);
+      expect(harness.localStore.updateAgentState).toHaveBeenCalledWith("agent-001", "paused");
+      expect(harness.localStore.updateAgentState).toHaveBeenCalledWith("agent-001", "active");
+    });
+
+    it("increments a partial count and resumes", async () => {
+      const harness = createBudgetHarness({ metadata: { heartbeatErrorRecovery: { consecutiveAttempts: 2 } } });
+      await recover(harness);
+      expect(writtenAttempts(harness.localStore)).toEqual([3]);
+      expect(harness.localStore.updateAgentState).toHaveBeenCalledWith("agent-001", "active");
+    });
+
+    it("honors a legacy durableErrorRecovery count", async () => {
+      const harness = createBudgetHarness({ metadata: { durableErrorRecovery: { attempts: 5 } } });
+      await recover(harness);
+      expect(harness.localStore.updateAgent).toHaveBeenCalledWith("agent-001", expect.objectContaining({ pauseReason: "error-retry-exhausted" }));
+      expect(harness.localStore.updateAgentState).not.toHaveBeenCalledWith("agent-001", "active");
+    });
+
+    it("parks an exhausted agent without resuming and records the exhaustion audit", async () => {
+      const harness = createBudgetHarness({ metadata: { heartbeatErrorRecovery: { consecutiveAttempts: 5 } } });
+      await recover(harness);
+      expect(harness.localStore.updateAgentState).toHaveBeenCalledWith("agent-001", "paused");
+      expect(harness.localStore.updateAgent).toHaveBeenCalledWith("agent-001", expect.objectContaining({
+        pauseReason: "error-retry-exhausted",
+        lastError: expect.stringContaining("No heartbeat for"),
+      }));
+      expect(harness.localStore.updateAgentState).not.toHaveBeenCalledWith("agent-001", "active");
+      expect(writtenAttempts(harness.localStore)).toEqual([]);
+      expect(harness.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "agent:error-retry-exhausted",
+        metadata: { agentId: "agent-001", attempts: 5, limit: 5, source: "heartbeat-unresponsive" },
+      }));
+    });
+
+    it("uses a custom heartbeatErrorRecoveryAttempts limit", async () => {
+      const harness = createBudgetHarness({ metadata: { heartbeatErrorRecovery: { consecutiveAttempts: 2 } }, settings: { heartbeatErrorRecoveryAttempts: 2 } });
+      await recover(harness);
+      expect(harness.localStore.updateAgent).toHaveBeenCalledWith("agent-001", expect.objectContaining({ pauseReason: "error-retry-exhausted" }));
+    });
+
+    it("falls back to the default limit when settings lookup rejects", async () => {
+      const harness = createBudgetHarness({ metadata: { heartbeatErrorRecovery: { consecutiveAttempts: 2 } }, settings: "reject" });
+      await recover(harness);
+      expect(writtenAttempts(harness.localStore)).toEqual([3]);
+      expect(harness.localStore.updateAgentState).toHaveBeenCalledWith("agent-001", "active");
+    });
+
+    it("uses the default limit when the monitor has no task store", async () => {
+      const harness = createBudgetHarness({ metadata: { heartbeatErrorRecovery: { consecutiveAttempts: 5 } }, withTaskStore: false });
+      await recover(harness);
+      expect(harness.localStore.updateAgent).toHaveBeenCalledWith("agent-001", expect.objectContaining({ pauseReason: "error-retry-exhausted" }));
+    });
+
+    it("aborts the tracked controller before disposing the session", async () => {
+      const harness = createBudgetHarness();
+      const controller = new AbortController();
+      const abortedAtDispose: boolean[] = [];
+      const session: AgentSession = { dispose: vi.fn(() => { abortedAtDispose.push(controller.signal.aborted); }) };
+      await recover(harness, controller, session as ReturnType<typeof createMockSession>);
+      expect(abortedAtDispose).toEqual([true]);
+    });
+
+    it("recovers a tracked entry once when invoked concurrently", async () => {
+      const harness = createBudgetHarness();
+      const session = createMockSession();
+      harness.localMonitor.trackAgent("agent-001", session, "run-001");
+      const tracked = harness.internals.trackedAgents.get("agent-001");
+      await Promise.all([
+        harness.internals.recoverUnresponsiveAgent(tracked, 5000),
+        harness.internals.recoverUnresponsiveAgent(tracked, 5000),
+      ]);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      expect(session.dispose).toHaveBeenCalledTimes(1);
+      expect(writtenAttempts(harness.localStore)).toEqual([1]);
+    });
+
+    it.each([
+      ["throws", () => { throw new Error("audit sink exploded"); }],
+      ["never settles", () => new Promise(() => undefined)],
+    ])("parks and completes recovery when the audit sink %s", async (_label, sink) => {
+      const harness = createBudgetHarness({ metadata: { heartbeatErrorRecovery: { consecutiveAttempts: 5 } }, recordRunAuditEvent: sink });
+      await recover(harness);
+      expect(harness.recordRunAuditEvent).toHaveBeenCalled();
+      expect(harness.localStore.updateAgent).toHaveBeenCalledWith("agent-001", expect.objectContaining({ pauseReason: "error-retry-exhausted" }));
+      expect(harness.localMonitor.getTrackedAgents()).toHaveLength(0);
+    });
+
+    it("logs rather than throws when budget bookkeeping fails", async () => {
+      const warnSpy = vi.mocked(heartbeatLog.warn);
+      warnSpy.mockClear();
+      const harness = createBudgetHarness();
+      vi.mocked(harness.localStore.updateAgent).mockRejectedValue(new Error("metadata write lost"));
+      await expect(recover(harness)).resolves.toBeDefined();
+      const warnMessages = warnSpy.mock.calls.map(([message]) => String(message));
+      expect(warnMessages.some((message) => message.includes("budget update failed") && message.includes("metadata write lost"))).toBe(true);
+    });
+  });
 });
 
 describe("untrackAgent", () => {

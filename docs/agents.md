@@ -1408,9 +1408,14 @@ Lifecycle notes:
 
 When a tracked agent misses heartbeat for `2 × heartbeatTimeoutMs`, the monitor now performs recovery (not termination). The base `heartbeatTimeoutMs` is already multiplier-scaled (`heartbeatMultiplier`) before applying this `× 2` window:
 
-1. Dispose the stuck session and untrack the stale run
-2. `pauseAgent(agentId, { pauseReason: "heartbeat-unresponsive", stopActiveRun: false })`
-3. `resumeAgent(agentId, { triggerDetail: "unresponsive-recovery", triggerSource: "heartbeat-unresponsive", clearPauseReason: true })`
+1. Fence the stalled run, abort its tracked `AbortController`, then dispose the session and untrack that run (run-scoped). A tracked entry is recovered once, even when polls overlap.
+2. Complete the stalled run as `terminated`.
+3. Check the shared durable-agent retry budget (`metadata.heartbeatErrorRecovery`, limit from the `heartbeatErrorRecoveryAttempts` setting, default 5). This is the same budget used by error-state, run-failure, and model-unavailable recovery, and the legacy `durableErrorRecovery.attempts` count is honored.
+4. **Budget spent:** park the agent `paused` with `pauseReason: "error-retry-exhausted"` and `lastError` set to the stall reason, emit `agent:error-retry-exhausted` (metadata `source: "heartbeat-unresponsive"`, ids/counts only), and do not resume.
+5. **Under budget:** increment the budget, then `pauseAgent(agentId, { pauseReason: "heartbeat-unresponsive", stopActiveRun: false })`.
+6. Release the stalled run's per-agent start-lock slot (only when that exact run still holds it), then dispatch `resumeAgent(agentId, { triggerDetail: "unresponsive-recovery", triggerSource: "heartbeat-unresponsive", clearPauseReason: true })` without blocking the poll.
+
+KB-016 bounds this loop. A provider that hangs after its first token is restarted at most the budgeted number of times, with restarts spaced by the `2 × heartbeatTimeoutMs` detection window. A prompt that never settles after dispose no longer holds the start lock, so the resumed run starts promptly. If the stalled run settles later, its completion is ignored: it cannot overwrite the terminated run row, reset the budget, change agent state, or untrack the successor. A successful resumed run resets the budget. When an operator resumes an exhausted agent, it gets one more run, which parks again on the next stall unless that run succeeds.
 
 Effects:
 - Agent state transitions `running/active → paused → active`

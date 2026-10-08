@@ -4368,6 +4368,266 @@ describe("executeHeartbeat", () => {
       expect(store.startHeartbeatRun).toHaveBeenCalledTimes(2);
       expect(session.prompt).toHaveBeenCalledTimes(1);
     });
+
+    /*
+    FNXC:HeartbeatRecovery 2026-10-08-01:34:
+    Unresponsive recovery may release the slot of the exact run it terminated so a never-settling prompt cannot starve the resumed run, but it must never release any other holder.
+    */
+    type LockInternals = {
+      agentStartLocks: Map<string, unknown>;
+      liveRunIdByAgent: Map<string, string>;
+      markRunLive: (agentId: string, runId: string) => void;
+      abandonAgentStartLock: (agentId: string, runId: string) => boolean;
+    };
+
+    it("releases a never-settling holder for its own run so a queued successor runs", async () => {
+      const store = createStoreWithAgentForExec();
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+      const internals = monitor as unknown as LockInternals;
+      let holderStarted!: () => void;
+      const started = new Promise<void>((resolve) => { holderStarted = resolve; });
+      let holderSettled = false;
+
+      const holder = monitor.withAgentStartLock("agent-001", async () => {
+        internals.markRunLive("agent-001", "run-stalled");
+        holderStarted();
+        await new Promise<never>(() => undefined);
+      });
+      void holder.finally(() => { holderSettled = true; });
+      const successor = monitor.withAgentStartLock("agent-001", async () => "successor-result");
+      await started;
+
+      expect(internals.abandonAgentStartLock("agent-001", "run-stalled")).toBe(true);
+      expect(internals.liveRunIdByAgent.has("agent-001")).toBe(false);
+      await expect(successor).resolves.toBe("successor-result");
+      await Promise.resolve();
+      expect(holderSettled).toBe(false);
+      expect(internals.agentStartLocks.has("agent-001")).toBe(false);
+    });
+
+    it("does not release a holder bound to a different run", async () => {
+      const store = createStoreWithAgentForExec();
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+      const internals = monitor as unknown as LockInternals;
+      let holderStarted!: () => void;
+      const started = new Promise<void>((resolve) => { holderStarted = resolve; });
+      let finishHolder!: () => void;
+      const order: string[] = [];
+
+      const holder = monitor.withAgentStartLock("agent-001", async () => {
+        internals.markRunLive("agent-001", "run-2");
+        holderStarted();
+        await new Promise<void>((resolve) => { finishHolder = resolve; });
+        order.push("holder");
+      });
+      const successor = monitor.withAgentStartLock("agent-001", async () => { order.push("successor"); });
+      await started;
+
+      expect(internals.abandonAgentStartLock("agent-001", "run-1")).toBe(false);
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      expect(order).toEqual([]);
+      expect(internals.liveRunIdByAgent.get("agent-001")).toBe("run-2");
+
+      finishHolder();
+      await holder;
+      await successor;
+      expect(order).toEqual(["holder", "successor"]);
+    });
+
+    it("leaves the successor's live-run marker intact when an abandoned holder settles late", async () => {
+      const store = createStoreWithAgentForExec();
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+      const internals = monitor as unknown as LockInternals;
+      let holderStarted!: () => void;
+      const started = new Promise<void>((resolve) => { holderStarted = resolve; });
+      let finishHolder!: () => void;
+      let successorStarted!: () => void;
+      const successorRunning = new Promise<void>((resolve) => { successorStarted = resolve; });
+      let finishSuccessor!: () => void;
+
+      const holder = monitor.withAgentStartLock("agent-001", async () => {
+        internals.markRunLive("agent-001", "run-stalled");
+        holderStarted();
+        await new Promise<void>((resolve) => { finishHolder = resolve; });
+      });
+      const successor = monitor.withAgentStartLock("agent-001", async () => {
+        internals.markRunLive("agent-001", "run-next");
+        successorStarted();
+        await new Promise<void>((resolve) => { finishSuccessor = resolve; });
+      });
+      await started;
+      internals.abandonAgentStartLock("agent-001", "run-stalled");
+      await successorRunning;
+
+      finishHolder();
+      await holder;
+      expect(internals.liveRunIdByAgent.get("agent-001")).toBe("run-next");
+
+      finishSuccessor();
+      await successor;
+      expect(internals.liveRunIdByAgent.has("agent-001")).toBe(false);
+    });
+  });
+
+  /*
+  FNXC:HeartbeatRecovery 2026-10-08-01:34:
+  KB-016 symptom: a provider that hangs after its first token was disposed and resumed forever, and a prompt that never settled on dispose starved the resume behind the per-agent start lock.
+  Recovery must abort before dispose, start the resumed run while the stalled prompt is still pending, count each recovery in the shared budget, park once it is spent, and fence the stalled run's late settlement.
+  */
+  describe("unresponsive recovery with a never-settling prompt", () => {
+    type StalledSession = ReturnType<typeof createMockAgentSession> & {
+      abortedAtDispose: boolean[];
+      settle: (outcome: "resolve" | "reject") => void;
+    };
+    type MonitorInternals = {
+      checkMissedHeartbeats: () => Promise<void>;
+      trackedAgents: Map<string, { runId: string; abortController?: AbortController }>;
+      recoveryFencedRunIds: Set<string>;
+    };
+
+    function createStatefulStore(metadata: Record<string, unknown> = {}): AgentStore {
+      const store = createStoreWithAgentForExec({ metadata });
+      let runCounter = 0;
+      vi.mocked(store.getAgent).mockImplementation(async () => ({ ...mockAgent }));
+      vi.mocked(store.updateAgentState).mockImplementation(async (_id, state) => {
+        mockAgent.state = state;
+        return { ...mockAgent };
+      });
+      vi.mocked(store.updateAgent).mockImplementation(async (_id, patch) => {
+        Object.assign(mockAgent, patch);
+        return { ...mockAgent };
+      });
+      vi.mocked(store.startHeartbeatRun).mockImplementation(async () => ({
+        id: `run-${++runCounter}`,
+        agentId: "agent-001",
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+        status: "active",
+      } as AgentHeartbeatRun));
+      (store as unknown as { listAgents: () => Promise<Agent[]> }).listAgents = vi.fn(async () => []);
+      return store;
+    }
+
+    function stallingSessions(monitor: () => HeartbeatMonitor, options: { disposeRejects?: boolean } = {}): StalledSession[] {
+      const sessions: StalledSession[] = [];
+      mockedCreateFnAgent.mockImplementation(async () => {
+        const base = createMockAgentSession();
+        let resolvePrompt!: () => void;
+        let rejectPrompt!: (error: Error) => void;
+        const pending = new Promise<void>((resolve, reject) => { resolvePrompt = resolve; rejectPrompt = reject; });
+        const session = base as StalledSession;
+        session.abortedAtDispose = [];
+        session.settle = (outcome) => (outcome === "resolve" ? resolvePrompt() : rejectPrompt(new Error("session disposed")));
+        let controller: AbortController | undefined;
+        session.prompt = vi.fn(() => {
+          controller = (monitor() as unknown as MonitorInternals).trackedAgents.get("agent-001")?.abortController;
+          return pending;
+        });
+        session.dispose = vi.fn(() => {
+          session.abortedAtDispose.push(controller?.signal.aborted ?? false);
+          if (options.disposeRejects) session.settle("reject");
+        });
+        sessions.push(session);
+        return { session: session as any };
+      });
+      return sessions;
+    }
+
+    function attemptsOf(): number | undefined {
+      return (mockAgent.metadata as { heartbeatErrorRecovery?: { consecutiveAttempts?: number } } | undefined)
+        ?.heartbeatErrorRecovery?.consecutiveAttempts;
+    }
+
+    async function flush(): Promise<void> {
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    async function stall(monitor: HeartbeatMonitor): Promise<void> {
+      const internals = monitor as unknown as MonitorInternals;
+      vi.setSystemTime(Date.now() + 6_000);
+      await internals.checkMissedHeartbeats();
+      vi.setSystemTime(Date.now() + 6_000);
+      await internals.checkMissedHeartbeats();
+    }
+
+    function setup(options: { disposeRejects?: boolean } = {}) {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-08T00:00:00.000Z"));
+      mockTaskStore = createMockTaskStore({ getSettings: vi.fn().mockResolvedValue({ heartbeatErrorRecoveryAttempts: 2 }) });
+      const store = createStatefulStore();
+      let monitor!: HeartbeatMonitor;
+      const sessions = stallingSessions(() => monitor, options);
+      monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp", heartbeatTimeoutMs: 5_000, pollIntervalMs: 1_000 });
+      return { store, monitor, sessions };
+    }
+
+    it("restarts a stalled run without waiting on its lock, counts each recovery, and parks once the budget is spent", async () => {
+      const { store, monitor, sessions } = setup();
+      void monitor.executeHeartbeat({ agentId: "agent-001", source: "on_demand" });
+      await vi.waitFor(() => expect(sessions[0]?.prompt).toHaveBeenCalled());
+
+      await stall(monitor);
+      expect(sessions[0].abortedAtDispose[0]).toBe(true);
+      await vi.waitFor(() => expect(sessions[1]?.prompt).toHaveBeenCalled());
+      expect(mockedCreateFnAgent).toHaveBeenCalledTimes(2);
+      expect(attemptsOf()).toBe(1);
+      expect((await store.getRunDetail("agent-001", "run-1"))?.status).toBe("terminated");
+
+      await stall(monitor);
+      expect(sessions[1].abortedAtDispose[0]).toBe(true);
+      await vi.waitFor(() => expect(sessions[2]?.prompt).toHaveBeenCalled());
+      expect(attemptsOf()).toBe(2);
+
+      await stall(monitor);
+      await flush();
+      expect(sessions[2].abortedAtDispose[0]).toBe(true);
+      expect(mockAgent.state).toBe("paused");
+      expect(mockAgent.pauseReason).toBe("error-retry-exhausted");
+      expect(attemptsOf()).toBe(2);
+
+      await stall(monitor);
+      await stall(monitor);
+      await flush();
+      expect(mockedCreateFnAgent).toHaveBeenCalledTimes(3);
+      expect(mockAgent.state).toBe("paused");
+      for (const runId of ["run-1", "run-2", "run-3"]) {
+        expect((await store.getRunDetail("agent-001", runId))?.status).toBe("terminated");
+      }
+    });
+
+    it("fences a stalled run that later settles successfully", async () => {
+      const { store, monitor, sessions } = setup();
+      void monitor.executeHeartbeat({ agentId: "agent-001", source: "on_demand" });
+      await vi.waitFor(() => expect(sessions[0]?.prompt).toHaveBeenCalled());
+      await stall(monitor);
+      await vi.waitFor(() => expect(sessions[1]?.prompt).toHaveBeenCalled());
+      expect(attemptsOf()).toBe(1);
+
+      sessions[0].settle("resolve");
+      await flush();
+
+      expect(attemptsOf()).toBe(1);
+      expect((await store.getRunDetail("agent-001", "run-1"))?.status).toBe("terminated");
+      const internals = monitor as unknown as MonitorInternals;
+      expect(internals.trackedAgents.get("agent-001")?.runId).toBe("run-2");
+      expect(internals.trackedAgents.get("agent-001")?.abortController?.signal.aborted).toBe(false);
+      expect(vi.mocked(store.endHeartbeatRun).mock.calls.filter(([runId]) => runId === "run-1")).toEqual([["run-1", "terminated"]]);
+      expect(internals.recoveryFencedRunIds.has("run-1")).toBe(false);
+    });
+
+    it("fences the late failure of a stalled run whose prompt rejects on dispose", async () => {
+      const { store, monitor, sessions } = setup({ disposeRejects: true });
+      void monitor.executeHeartbeat({ agentId: "agent-001", source: "on_demand" });
+      await vi.waitFor(() => expect(sessions[0]?.prompt).toHaveBeenCalled());
+      await stall(monitor);
+      await vi.waitFor(() => expect(sessions[1]?.prompt).toHaveBeenCalled());
+      await flush();
+
+      expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "error");
+      expect(attemptsOf()).toBe(1);
+      expect((await store.getRunDetail("agent-001", "run-1"))?.status).toBe("terminated");
+      expect(mockedCreateFnAgent).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe("in-run liveness", () => {

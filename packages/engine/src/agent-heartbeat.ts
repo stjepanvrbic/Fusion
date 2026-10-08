@@ -98,6 +98,7 @@ heartbeat-model-unavailable parks from assignment/on-demand runs were terminal u
 import { acquireTaskWorktree, WorktreeBaseRefreshError } from "./worktree/worktree-acquisition.js";
 import { resolvePendingOverlapWaits } from "./workflows/overlap-plan-revalidation.js";
 import { createRunAuditor, generateSyntheticRunId, type DatabaseMutationType, type EngineRunContext } from "./util/run-audit.js";
+import { emitBoundedRunAudit } from "./util/emit-bounded-run-audit.js";
 import { promptWithFallback } from "./pi.js";
 import { withRateLimitRetry } from "./errors/rate-limit-retry.js";
 import type { CredentialInstanceRotator } from "./credential-instance-rotation.js";
@@ -378,6 +379,16 @@ export interface ResumeAgentOptions {
 export interface AgentSession {
   /** Dispose the agent session (stop execution, cleanup resources) */
   dispose(): void;
+}
+
+/** Per-invocation handle for the run currently holding an agent's start-lock slot. */
+interface AgentStartLockHolder {
+  /** Heartbeat run bound to this holder by markRunLive. */
+  runId?: string;
+  /** Set when unresponsive recovery released the slot early; the holder's own finally then leaves successor state alone. */
+  abandoned: boolean;
+  /** Releases the queue slot so successors may run while this holder's fn is still pending. */
+  release: () => void;
 }
 
 /** In-memory tracking data for a monitored agent */
@@ -812,6 +823,19 @@ export class HeartbeatMonitor {
   private agentStartLocks: Map<string, Promise<unknown>> = new Map();
   /** Run id each agent's current serialized executeHeartbeat owns (mirrored in inProcessLiveHeartbeatRunIds). */
   private liveRunIdByAgent: Map<string, string> = new Map();
+  /**
+   * FNXC:HeartbeatRecovery 2026-10-08-01:34:
+   * Handle for the invocation currently holding each agent's start-lock slot, installed when its fn starts (not when queued).
+   * Unresponsive recovery may release the slot early for a run whose prompt never settles, so the resumed run is not starved behind it.
+   * Release is only ever granted to the exact stalled run (matched by runId); a different holder that has since acquired the slot is never released.
+   */
+  private agentStartLockHolders: Map<string, AgentStartLockHolder> = new Map();
+  /**
+   * FNXC:HeartbeatRecovery 2026-10-08-01:34:
+   * Runs terminated by unresponsive recovery. A fenced run's late settlement must not overwrite its terminated run row, reset the shared recovery budget, transition agent state, or fire run callbacks.
+   * Entries are removed when the fenced run's locked fn settles, so the set stays bounded.
+   */
+  private recoveryFencedRunIds: Set<string> = new Set();
   private pollInterval: NodeJS.Timeout | null = null;
   private isRunning = false;
   /**
@@ -1523,21 +1547,44 @@ export class HeartbeatMonitor {
     A rejected run must never affect the next run's admission. The stored queue tail is rejection-neutral, so a predecessor's failure is seen only by its own caller and the successor still runs after it settles.
     The tail entry is deleted when the operation that set it settles while still being the current tail, so the map cannot grow or retain a settled promise.
     */
+    /*
+    FNXC:HeartbeatRecovery 2026-10-08-01:34:
+    The stored tail also settles when the holder is released by unresponsive recovery (abandonAgentStartLock), so queued successors run while a stalled fn whose prompt never settles is still pending.
+    Non-abandoned holders keep the strict non-overlap guarantee: their tail only settles when fn settles.
+    The caller still receives fn's own result or rejection.
+    */
     const existing = this.agentStartLocks.get(agentId) ?? Promise.resolve();
+    let releaseSlot: () => void = () => undefined;
+    const released = new Promise<void>((resolve) => { releaseSlot = resolve; });
+    const holder: AgentStartLockHolder = { abandoned: false, release: () => releaseSlot() };
     const operation = existing.then(async () => {
+      this.agentStartLockHolders.set(agentId, holder);
       try {
         return await fn();
       } finally {
+        if (this.agentStartLockHolders.get(agentId) === holder) {
+          this.agentStartLockHolders.delete(agentId);
+        }
+        if (holder.runId !== undefined) {
+          this.recoveryFencedRunIds.delete(holder.runId);
+        }
         // Clean up accumulated run state for this agent at end of each serialized run.
         // This guarantees cleanup even when the run path throws without calling completeRun
         // (e.g., execution error before completeRun is reached, or completeRun itself throws).
         // Because withAgentStartLock serializes runs per agent, the finally runs after each
         // run completes but before the next concurrent call's callback starts.
-        this.clearRunState(agentId);
-        this.releaseLiveRun(agentId);
+        // An abandoned holder's run state and live-run marker now belong to its successor;
+        // abandonAgentStartLock already performed this cleanup when it released the slot.
+        if (!holder.abandoned) {
+          this.clearRunState(agentId);
+          this.releaseLiveRun(agentId);
+        }
       }
     });
-    const tail: Promise<void> = operation.then(() => undefined, () => undefined);
+    const tail: Promise<void> = Promise.race([
+      operation.then(() => undefined, () => undefined),
+      released,
+    ]);
     this.agentStartLocks.set(agentId, tail);
     void tail.then(() => {
       if (this.agentStartLocks.get(agentId) === tail) {
@@ -1547,7 +1594,30 @@ export class HeartbeatMonitor {
     return operation;
   }
 
+  /**
+   * FNXC:HeartbeatRecovery 2026-10-08-01:34:
+   * Release the start-lock slot held by a run that unresponsive recovery terminated, so the resumed run is not starved behind a prompt that never settles.
+   * No-op unless the current holder is bound to exactly `runId`: when dispose() makes the stalled prompt reject at once, the stalled run may already have settled and a queued waiter may hold the slot, and releasing that unrelated holder would overlap two runs.
+   * @returns true when the slot was released for `runId`.
+   */
+  private abandonAgentStartLock(agentId: string, runId: string): boolean {
+    const holder = this.agentStartLockHolders.get(agentId);
+    if (!holder || holder.abandoned || holder.runId !== runId) return false;
+    holder.abandoned = true;
+    this.agentStartLockHolders.delete(agentId);
+    this.clearRunState(agentId);
+    if (this.liveRunIdByAgent.get(agentId) === runId) {
+      this.releaseLiveRun(agentId);
+    }
+    holder.release();
+    return true;
+  }
+
   private markRunLive(agentId: string, runId: string): void {
+    const holder = this.agentStartLockHolders.get(agentId);
+    if (holder && !holder.abandoned) {
+      holder.runId = runId;
+    }
     this.releaseLiveRun(agentId);
     this.liveRunIdByAgent.set(agentId, runId);
     inProcessLiveHeartbeatRunIds.add(runId);
@@ -1651,8 +1721,19 @@ export class HeartbeatMonitor {
       errorMessage?: string;
       /** When true, preserve current agent state instead of forcing a terminal transition. */
       skipStateTransition?: boolean;
+      /** Internal: unresponsive recovery's own terminal write for a run it has fenced. */
+      bypassRecoveryFence?: boolean;
     }
   ): Promise<void> {
+    /*
+    FNXC:HeartbeatRecovery 2026-10-08-01:34:
+    A run terminated by unresponsive recovery may settle long after recovery resumed the agent.
+    Its late completion must not overwrite the terminated row, reset the shared recovery budget, move the agent to error, end the run again, or fire callbacks; only recovery's own write bypasses the fence.
+    */
+    if (this.recoveryFencedRunIds.has(runId) && !result.bypassRecoveryFence) {
+      heartbeatLog.warn(`Ignoring late ${result.status} completion for ${agentId}/${runId}: run was terminated by unresponsive recovery`);
+      return;
+    }
     // Load and update the run
     const run = await this.store.getRunDetail(agentId, runId);
     if (!run) return;
@@ -1909,6 +1990,11 @@ export class HeartbeatMonitor {
     errorDetail: string,
     stdoutExcerpt?: string,
   ): Promise<void> {
+    // FNXC:HeartbeatRecovery 2026-10-08-01:34: a recovery-fenced run must not park its successor's agent as model-unavailable.
+    if (this.recoveryFencedRunIds.has(runId)) {
+      heartbeatLog.warn(`Ignoring late model-unavailable completion for ${agentId}/${runId}: run was terminated by unresponsive recovery`);
+      return;
+    }
     const detail = buildHeartbeatModelUnavailableDetail(errorDetail);
     await this.completeRun(agentId, runId, {
       status: "completed",
@@ -2096,11 +2182,17 @@ export class HeartbeatMonitor {
   /**
    * Remove an agent from monitoring.
    * Does NOT end the heartbeat run - caller's responsibility.
+   *
+   * FNXC:HeartbeatRecovery 2026-10-08-01:34:
+   * When `runId` is given, only that run's tracking entry is removed and aborted, so a late-settling recovery-abandoned run cannot untrack or abort its successor.
    * @param agentId - The agent ID
+   * @param runId - Optional run scope; ignored entries belong to another run
    */
-  untrackAgent(agentId: string): void {
+  untrackAgent(agentId: string, runId?: string): void {
     const tracked = this.trackedAgents.get(agentId);
-    tracked?.abortController?.abort();
+    if (!tracked) return;
+    if (runId !== undefined && tracked.runId !== runId) return;
+    tracked.abortController?.abort();
     this.trackedAgents.delete(agentId);
   }
 
@@ -4032,7 +4124,7 @@ export class HeartbeatMonitor {
           await flushAgentLogger();
           // Defensively untrack the agent — wrap in try/catch to guarantee cleanup
           // can't be blocked by an exception in untrackAgent itself.
-          try { this.untrackAgent(agentId); } catch (untrackErr) {
+          try { this.untrackAgent(agentId, run.id); } catch (untrackErr) {
             heartbeatLog.warn(`untrackAgent failed for ${agentId}: ${untrackErr instanceof Error ? untrackErr.message : String(untrackErr)}`);
           }
           try {
@@ -4580,58 +4672,138 @@ export class HeartbeatMonitor {
     this.onMissed?.(tracked.agentId, reason);
   }
 
+  /**
+   * FNXC:HeartbeatRecovery 2026-10-08-01:34:
+   * KB-016: unresponsive terminations share the durable-agent `heartbeatErrorRecovery` budget with the error-state, run-failure and model-unavailable paths.
+   * Once the budget is spent the agent parks `paused` with `error-retry-exhausted` and is not resumed; otherwise a provider that hangs after its first token would be killed and restarted on every poll forever.
+   * The tracked AbortController is aborted before dispose (matching stopRun), and the stalled run is fenced so its late settlement cannot clobber successor state or reset the budget.
+   * The resume must not wait behind the stalled run's start lock: the exact stalled run's slot is released after the park/budget writes, and the resume is dispatched without blocking the poll.
+   * Restart spacing is the 2× heartbeat-timeout detection window each new run must accumulate; no extra delay timer is added.
+   */
   private async recoverUnresponsiveAgent(tracked: TrackedAgent, heartbeatTimeoutMs: number): Promise<void> {
+    // Reentrancy guard: overlapping polls, or a run already replaced/stopped, must not recover or count twice.
+    // Everything up to the first await runs synchronously so the guard holds.
+    if (this.trackedAgents.get(tracked.agentId) !== tracked) return;
+
+    const agentId = tracked.agentId;
+    const runIdToTerminate = tracked.runId;
     const now = Date.now();
     const elapsed = now - tracked.lastSeen;
     const reason = `No heartbeat for ${formatDuration(elapsed)} (2× timeout threshold: ${formatDuration(heartbeatTimeoutMs * 2)})`;
 
-    heartbeatLog.warn(`Recovering unresponsive agent ${tracked.agentId}: ${reason}`);
+    heartbeatLog.warn(`Recovering unresponsive agent ${agentId}: ${reason}`);
 
-    const runIdToTerminate = tracked.runId;
-
+    // Fence before touching the session: a disposed prompt can reject on the next microtask.
+    this.recoveryFencedRunIds.add(runIdToTerminate);
+    tracked.abortController?.abort();
     try {
       tracked.session.dispose();
     } catch (err) {
-      heartbeatLog.warn(`Error disposing session for ${tracked.agentId}: ${err instanceof Error ? err.message : String(err)}`);
+      heartbeatLog.warn(`Error disposing session for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    this.untrackAgent(tracked.agentId);
+    this.untrackAgent(agentId, runIdToTerminate);
 
     // Canonically end the run record. Without this, dispose() relies on the
     // in-flight execution self-completing — which never happens when the run
-    // is actually hung. completeRun also updates agent state, but we still
-    // call pauseAgent below to set `pauseReason="heartbeat-unresponsive"`.
-    // We pass cascadeToTasks:false on both pause and resume — this is an
-    // internal recovery cycle, not a user-initiated pause, and shouldn't
-    // visibly toggle the user's task pause state.
+    // is actually hung. We pass cascadeToTasks:false on both pause and resume —
+    // this is an internal recovery cycle, not a user-initiated pause, and
+    // shouldn't visibly toggle the user's task pause state.
     try {
-      await this.completeRun(tracked.agentId, runIdToTerminate, {
+      await this.completeRun(agentId, runIdToTerminate, {
         status: "terminated",
         stderrExcerpt: reason,
+        bypassRecoveryFence: true,
       });
     } catch (err) {
-      heartbeatLog.warn(`completeRun(terminated) failed for ${tracked.agentId}/${runIdToTerminate}: ${err instanceof Error ? err.message : String(err)}`);
+      heartbeatLog.warn(`completeRun(terminated) failed for ${agentId}/${runIdToTerminate}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Budget decision. Store failures are treated as under budget without a metadata write.
+    let latestAgent: Agent | null = null;
+    let errorRecoveryLimit = MAX_HEARTBEAT_ERROR_RECOVERY_ATTEMPTS;
+    try {
+      latestAgent = await this.store.getAgent(agentId);
+      if (this.taskStore) {
+        errorRecoveryLimit = resolveErrorRecoveryLimit(await this.taskStore.getSettings().catch((settingsErr: unknown) => {
+          heartbeatLog.warn(`Agent ${agentId} error-recovery limit lookup failed: ${settingsErr instanceof Error ? settingsErr.message : String(settingsErr)} — using default limit`);
+          return undefined;
+        }));
+      }
+    } catch (err) {
+      heartbeatLog.warn(`Agent ${agentId} unresponsive recovery budget lookup failed: ${err instanceof Error ? err.message : String(err)} — treating as under budget`);
+    }
+    if (!latestAgent) {
+      heartbeatLog.warn(`Agent ${agentId} not found during unresponsive recovery budget check — treating as under budget`);
+    }
+    const retryCount = latestAgent ? readHeartbeatErrorRetryCount(latestAgent) : 0;
+
+    if (latestAgent && retryCount >= errorRecoveryLimit) {
+      try {
+        await this.store.updateAgentState(agentId, "paused");
+        await this.store.updateAgent(agentId, {
+          pauseReason: HEARTBEAT_ERROR_RETRY_EXHAUSTED_PAUSE_REASON,
+          lastError: reason,
+        });
+      } catch (err) {
+        heartbeatLog.warn(`Error parking exhausted unresponsive agent ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      heartbeatLog.warn(`Agent ${agentId} unresponsive recovery exhausted after ${retryCount}/${errorRecoveryLimit} attempts — pausing`);
+      // Best-effort telemetry: bounded and never awaited, so a hostile sink cannot hold recovery.
+      void emitBoundedRunAudit(this.taskStore, {
+        agentId,
+        runId: runIdToTerminate,
+        domain: "database",
+        mutationType: "agent:error-retry-exhausted",
+        target: agentId,
+        metadata: { agentId, attempts: retryCount, limit: errorRecoveryLimit, source: "heartbeat-unresponsive" },
+      }, { log: heartbeatLog });
+      // Still release so queued waiters drain; they observe the paused agent and return.
+      this.releaseRecoveredRunLock(agentId, runIdToTerminate);
+      return;
+    }
+
+    if (latestAgent) {
+      try {
+        await this.store.updateAgent(agentId, { metadata: incrementHeartbeatErrorRecoveryMetadata(latestAgent) });
+        heartbeatLog.warn(`Agent ${agentId} unresponsive recovery attempt ${retryCount + 1}/${errorRecoveryLimit}`);
+      } catch (err) {
+        heartbeatLog.warn(`Agent ${agentId} unresponsive recovery budget update failed: ${err instanceof Error ? err.message : String(err)} — continuing`);
+      }
     }
 
     try {
-      await this.pauseAgent(tracked.agentId, {
+      await this.pauseAgent(agentId, {
         pauseReason: "heartbeat-unresponsive",
         stopActiveRun: false,
         cascadeToTasks: false,
       });
     } catch (err) {
-      heartbeatLog.warn(`Error pausing unresponsive agent ${tracked.agentId}: ${err instanceof Error ? err.message : String(err)}`);
+      heartbeatLog.warn(`Error pausing unresponsive agent ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    try {
-      await this.resumeAgent(tracked.agentId, {
-        triggerDetail: "unresponsive-recovery",
-        triggerSource: "heartbeat-unresponsive",
-        clearPauseReason: true,
-        cascadeToTasks: false,
-      });
-    } catch (err) {
-      heartbeatLog.warn(`Error resuming unresponsive agent ${tracked.agentId}: ${err instanceof Error ? err.message : String(err)}`);
+    this.releaseRecoveredRunLock(agentId, runIdToTerminate);
+
+    // Do not await a whole new heartbeat run inside the poll.
+    void this.resumeAgent(agentId, {
+      triggerDetail: "unresponsive-recovery",
+      triggerSource: "heartbeat-unresponsive",
+      clearPauseReason: true,
+      cascadeToTasks: false,
+    }).catch((err: unknown) => {
+      heartbeatLog.warn(`Error resuming unresponsive agent ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
+  /**
+   * FNXC:HeartbeatRecovery 2026-10-08-01:34:
+   * Release the stalled run's start-lock slot. When the run already settled on its own (or was never under the lock),
+   * nothing holds the slot for it, so the fence is dropped here to keep the set bounded.
+   */
+  private releaseRecoveredRunLock(agentId: string, runId: string): void {
+    if (this.abandonAgentStartLock(agentId, runId)) return;
+    if (this.agentStartLockHolders.get(agentId)?.runId !== runId) {
+      this.recoveryFencedRunIds.delete(runId);
     }
   }
 }
