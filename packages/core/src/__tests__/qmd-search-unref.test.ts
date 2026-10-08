@@ -99,6 +99,7 @@ describe("qmd search does not keep a short-lived caller alive (symptom)", () => 
     // models a qmd child that keeps running past searchWithQmd's own 4s internal
     // timeout kill attempt, so only a properly unref'd child+stdio (not a merely
     // "timed-out" JS promise) lets the caller process exit promptly.
+    // FNXC:ProjectMemory 2026-10-08-01:40: the stub leaves the project root before sleeping. It outlives the test by design, and on Windows a live process's working directory cannot be deleted, so cleanup failed while the modeled symptom (a long-lived child holding the caller's pipes) never needed the directory.
     const stubPath = join(stubDir, "qmd");
     writeFileSync(
       stubPath,
@@ -107,7 +108,7 @@ describe("qmd search does not keep a short-lived caller alive (symptom)", () => 
         "trap '' TERM",
         'case "$1" in',
         "  search)",
-        "    sleep 8",
+        "    cd / && sleep 8",
         "    echo '[]'",
         "    ;;",
         "  *)",

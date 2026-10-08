@@ -59,6 +59,7 @@ describe("qmd background refresh does not keep a short-lived caller alive (sympt
     // (long-sleeping qmd child) without a real multi-second wait dominating the test
     // budget on the assertion side; only the *stub* sleeps long, the *test* just
     // measures how fast the fixture process exits.
+    // FNXC:ProjectMemory 2026-10-08-01:40: the stub leaves the project root before sleeping. It outlives the test by design, and on Windows a live process's working directory cannot be deleted, so cleanup failed while the modeled symptom (a long-lived child holding the caller's pipes) never needed the directory.
     const stubPath = join(stubDir, "qmd");
     writeFileSync(
       stubPath,
@@ -66,7 +67,7 @@ describe("qmd background refresh does not keep a short-lived caller alive (sympt
         "#!/usr/bin/env bash",
         'case "$1" in',
         "  update|embed)",
-        "    sleep 8",
+        "    cd / && sleep 8",
         "    ;;",
         "esac",
         "exit 0",
