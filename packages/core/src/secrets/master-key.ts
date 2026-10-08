@@ -232,6 +232,11 @@ export class MasterKeyManager {
   The key is staged in an owner-only temp file and only then published under master.key, so a key whose protection failed never exists for the next read to accept, and a failed rotation leaves the current key intact.
   Owner-only means POSIX mode 0600, verified by stat, or on Windows an ACL with inheritance removed that grants only the current user (POSIX mode bits always read 0666 there).
   A first write publishes with link(), which fails if a racing writer published first; rotation publishes with rename().
+
+  FNXC:SecretsMasterKey 2026-10-08-15:29:
+  KB-073: an elevated Windows token (e.g. the GitHub windows-latest `runneradmin`) stamps its default DACL onto new files as EXPLICIT ACEs (SYSTEM, Administrators, user).
+  `/inheritance:r` drops only inherited ACEs and `/grant:r` replaces only the named principal, so those extras survived and the key stayed readable by SYSTEM and every administrator.
+  The staging file is therefore first `/reset` (DACL becomes inherited-only), then stripped of inheritance and granted to the current user alone; either call failing is fail-closed and nothing is published.
   */
   private async writeFileKey(value: Buffer, options: { overwrite: boolean }): Promise<void> {
     await this.fsModule.mkdir(this.globalDir, { recursive: true });
@@ -258,14 +263,15 @@ export class MasterKeyManager {
 
   private async restrictToOwner(path: string): Promise<void> {
     if (this.platform === "win32") {
-      const { exitCode, stderr } = await this.windowsAclRunner([
-        path,
-        "/inheritance:r",
-        "/grant:r",
-        `${currentWindowsPrincipal()}:F`,
-      ]);
-      if (exitCode !== 0) {
-        throw new MasterKeyPermissionError(`master key file ACL could not be restricted to the current user: ${stderr.trim() || `icacls exit ${exitCode}`}`);
+      const commands = [
+        [path, "/reset"],
+        [path, "/inheritance:r", "/grant:r", `${currentWindowsPrincipal()}:F`],
+      ];
+      for (const args of commands) {
+        const { exitCode, stderr } = await this.windowsAclRunner(args);
+        if (exitCode !== 0) {
+          throw new MasterKeyPermissionError(`master key file ACL could not be restricted to the current user: ${stderr.trim() || `icacls exit ${exitCode}`}`);
+        }
       }
       return;
     }

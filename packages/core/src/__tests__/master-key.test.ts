@@ -34,14 +34,15 @@ const unavailableKeychain: KeytarLike = {
   },
 };
 
-/** Principals named in an icacls listing, e.g. `DOMAIN\user` from `DOMAIN\user:(F)`. */
-async function listAclPrincipals(path: string): Promise<string[]> {
+/** The raw icacls listing of `path` plus the principals it names, e.g. `DOMAIN\user` from `DOMAIN\user:(F)`. */
+async function listAclPrincipals(path: string): Promise<{ stdout: string; principals: string[] }> {
   const { stdout } = await execFileAsync("icacls", [path], { windowsHide: true });
-  return stdout
+  const principals = stdout
     .split(/\r?\n/)
     .map((line) => (line.startsWith(path) ? line.slice(path.length) : line).trim())
     .filter((line) => line.includes(":("))
     .map((line) => line.slice(0, line.indexOf(":(")).toLowerCase());
+  return { stdout, principals };
 }
 
 /*
@@ -50,9 +51,12 @@ The file-backed master key must be readable only by its owner, enforced with the
 */
 async function expectOwnerOnly(path: string): Promise<void> {
   if (process.platform === "win32") {
-    const principals = await listAclPrincipals(path);
-    expect(principals.length).toBeGreaterThan(0);
-    for (const principal of principals) expect(principal.endsWith(`\\${userInfo().username.toLowerCase()}`)).toBe(true);
+    const { stdout, principals } = await listAclPrincipals(path);
+    const user = userInfo().username.toLowerCase();
+    // A failure must show who can read the key, so the message carries the raw listing and the expected identity.
+    const context = `icacls ${path}:\n${stdout}\nexpected only the current user (USERDOMAIN=${process.env.USERDOMAIN ?? ""}, USERNAME=${process.env.USERNAME ?? ""}, userInfo=${userInfo().username})`;
+    expect(principals.length, context).toBeGreaterThan(0);
+    expect(principals.filter((principal) => !principal.endsWith(`\\${user}`)), context).toEqual([]);
     return;
   }
   expect((await fs.stat(path)).mode & 0o777).toBe(0o600);
@@ -253,15 +257,86 @@ describe("MasterKeyManager", () => {
     try {
       const key = await manager.getOrCreateKey();
       expect(key).toHaveLength(32);
-      expect(calls).toHaveLength(1);
-      const [target, ...flags] = calls[0];
+      expect(calls).toHaveLength(2);
+      const target = calls[0][0];
       expect(target).not.toBe(join(globalDir, MASTER_KEY_FILENAME));
       expect(target.startsWith(join(globalDir, MASTER_KEY_FILENAME))).toBe(true);
-      expect(flags).toEqual(["/inheritance:r", "/grant:r", `${principal()}:F`]);
+      expect(calls).toEqual([
+        [target, "/reset"],
+        [target, "/inheritance:r", "/grant:r", `${principal()}:F`],
+      ]);
       expect(keyDirEntries(globalDir)).toEqual([MASTER_KEY_FILENAME]);
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+
+  /*
+  FNXC:SecretsMasterKey 2026-10-08-15:29:
+  KB-073 runner shape: on GitHub windows-latest (elevated `runneradmin`) a new file carries EXPLICIT SYSTEM, Administrators and user ACEs from the token default DACL, and the old `/inheritance:r /grant:r` left the first two in place.
+  The fake runner models icacls semantics over that captured ACL so the fix is proven on every platform.
+  */
+  it("leaves only the current user on a staging file that starts with explicit elevated-token ACEs", async () => {
+    vi.stubEnv("USERDOMAIN", "runnervmfi6oq");
+    vi.stubEnv("USERNAME", "runneradmin");
+    type Ace = { principal: string; inherited: boolean };
+    const parentInheritable = ["NT AUTHORITY\\SYSTEM", "BUILTIN\\Administrators", "runnervmfi6oq\\runneradmin"];
+    const acls = new Map<string, Ace[]>();
+    const aclOf = (path: string): Ace[] => acls.get(path)
+      ?? parentInheritable.map((principal) => ({ principal, inherited: false }));
+    let publishedAcl: Ace[] | undefined;
+    const manager = new MasterKeyManager({
+      globalDir,
+      keytarModule: unavailableKeychain,
+      platform: "win32",
+      fsModule: {
+        ...fs,
+        link: async (from, to) => {
+          publishedAcl = aclOf(String(from));
+          await fs.link(from, to);
+        },
+      },
+      windowsAclRunner: async ([path, ...flags]) => {
+        let acl = aclOf(path);
+        for (let i = 0; i < flags.length; i += 1) {
+          if (flags[i] === "/reset") acl = parentInheritable.map((principal) => ({ principal, inherited: true }));
+          if (flags[i] === "/inheritance:r") acl = acl.filter((ace) => !ace.inherited);
+          if (flags[i] === "/grant:r") {
+            const principal = flags[++i].replace(/:F$/, "");
+            acl = [...acl.filter((ace) => ace.principal !== principal), { principal, inherited: false }];
+          }
+        }
+        acls.set(path, acl);
+        return { exitCode: 0, stderr: "" };
+      },
+    });
+
+    try {
+      await manager.getOrCreateKey();
+      expect(publishedAcl).toEqual([{ principal: "runnervmfi6oq\\runneradmin", inherited: false }]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each([
+    { name: "the explicit-ACE reset", failingCall: 0, expectedCalls: 1 },
+    { name: "the owner-only grant", failingCall: 1, expectedCalls: 2 },
+  ])("publishes no Windows key file when $name fails", async ({ failingCall, expectedCalls }) => {
+    const calls: string[][] = [];
+    const manager = new MasterKeyManager({
+      globalDir,
+      keytarModule: unavailableKeychain,
+      platform: "win32",
+      windowsAclRunner: async (args) => {
+        calls.push(args);
+        return calls.length - 1 === failingCall ? { exitCode: 5, stderr: "Access is denied." } : { exitCode: 0, stderr: "" };
+      },
+    });
+
+    await expect(manager.getOrCreateKey()).rejects.toBeInstanceOf(MasterKeyPermissionError);
+    expect(calls).toHaveLength(expectedCalls);
+    expect(keyDirEntries(globalDir)).toEqual([]);
   });
 
   it("publishes no Windows key file when the ACL cannot be applied", async () => {

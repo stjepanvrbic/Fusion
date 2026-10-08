@@ -479,6 +479,23 @@ jobs:
         shell: bash
         run: node scripts/check-windows-known-failing.mjs --package ${{ matrix.suite }} --label "${{ matrix.lane }}" --report .windows-lane/${{ matrix.lane }}.json --exit-code .windows-lane/${{ matrix.lane }}.exit
 
+      # FNXC:CI 2026-10-08-15:29:
+      # The lanes write a JSON reporter, so assertion text never reaches the job log; KB-073 could not see
+      # which ACL principals failed master-key.test.ts until a scratch diagnostic run. Each leg uploads its
+      # report and exit code as windows-lane-reports-<lane> so known and unexpected failure messages can be read.
+      # .windows-lane is a dot-directory, which upload-artifact skips unless hidden files are included.
+      - name: Upload Windows lane reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-lane-reports-${{ matrix.lane }}
+          path: |
+            .windows-lane/*.json
+            .windows-lane/*.exit
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 14
+
   # FNXC:PipelineSmoke 2026-08-23-14:52:
   # FN-182 runs the deterministic full-pipeline composition only after merge.
   # It receives an isolated PostgreSQL service and a full clone for disposable
