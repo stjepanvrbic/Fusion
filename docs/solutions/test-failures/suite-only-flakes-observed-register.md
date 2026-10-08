@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 32, 33, 35, 36, 37, and 38): ten **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, 18, and 27 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **21 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 32, 33, 35, 36, 37, and 38): ten **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, 18, and 27 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **22 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -371,6 +371,8 @@ The subprocess-guard line deserves a product look. It means a real PostgreSQL ch
 
 KB-052 makes each cache entry owner-scoped and liveness-checked, so a dead entry is discarded and the stale-pid path starts a new owned postmaster. An exit listener on the owned postmaster clears the entry and reports an unexpected exit, the dead-child stop guard is cross-platform, and a join whose database check is refused re-checks liveness and restarts once when the postmaster is proven dead. Mocked regression suites in `packages/core/src/__tests__/postgres/embedded-lifecycle.test.ts` fail when the cache liveness check is reverted. The CLI test file is unchanged; no timeout, retry, or assertion changed. A new sighting re-opens normal escalation.
 
+**Cross-reference (KB-081):** archived entry 39 (`extension.test.ts`, run 37758138036) had the same timeout-then-left-running-postmaster shape, but it was a fresh embedded boot by an orphaned continuation of a timed-out test, not a join of a dead postmaster; it is not a sighting of this record.
+
 ### 32. System controls rebuild output stream subscription
 
 - **Status:** Active first sighting — recorded 2026-10-08, unattributed.
@@ -545,6 +547,25 @@ Source: [Runfusion/Fusion issue #2862](https://github.com/Runfusion/Fusion/issue
 ## Archive — closed records
 
 Archived records are historical evidence only and never authorize a quarantine decision.
+
+<!--
+FNXC:TestFlakeRegister 2026-10-08-15:40:
+KB-081 records a first sighting in the CLI extension suite that shared entry 27's timeout and left-running-postmaster shape but had a different cause. It closes on a structural test-harness fix, so no quarantine was needed. No timeout, retry, or assertion was widened.
+-->
+### 39. CLI extension github-tracking create timeout and orphaned embedded PostgreSQL boot
+
+- **Status:** Closed 2026-10-08 — structurally resolved on first sighting by KB-081 (test and harness fix); no quarantine.
+- **File:** `packages/cli/src/__tests__/extension.test.ts`
+- **Exact tests:** `fn pi extension (runnable structured-output regression slice) > fn_task_create persists per-task github tracking overrides from github_tracking/github_repo` (`Test timed out in 5000ms`) and `fn pi extension (runnable structured-output regression slice) > fn_task_update rejects reviewer assignment for implementation tasks` (`Test subprocess guard detected unsafe child-process usage`: an embedded `postgres` on the worker test home's default embedded data directory, port 44409, left running).
+- **Observed tree/SHA:** fork Full Suite run [37758138036](https://github.com/stjepanvrbic/Fusion/actions/runs/37758138036) at `2f807ed88` (push to main, Linux `ubuntu-latest`), job `Test shard 3/4` (`113247693003`), `@runfusion/fusion` slice.
+- **Observed frequency:** 1 run, 2 failures.
+
+The two failures are one chain with two links. It is not entry 27's dead-joiner bug: the postmaster logged a fresh start and ready on port 44409 while the second test was current.
+
+1. **Slow link.** `fn_task_create` awaits the task-created hook, and the GitHub tracking hook resolves gh-cli auth through the `@fusion/core` barrel's `isGhAvailable`/`isGhAuthenticated`. The file only mocked the `@fusion/core/gh-cli` subpath, so a real synchronous `gh --version` and `gh auth status` ran. The CI log shows `auth unavailable (gh_not_authenticated)` although the subpath mock returned authenticated. On a loaded runner this pushed the case past 5 s.
+2. **Cascade link.** After the timeout, `afterEach` emptied the extension store cache, but the timed-out test body kept running. Its next tool call found no cached store, cold-booted `createTaskStoreForBackend`, and with no `DATABASE_URL` started embedded PostgreSQL in the worker home. The subprocess guard attributes a child to the test that is current at spawn time, so it failed the next test.
+
+**Structural fix (KB-081).** `extension.test.ts` now mocks the barrel gh predicates as installed-but-unauthenticated, and the github-tracking case asserts that the mock was called and that a `github-issue-skipped` activity with reason `gh_not_authenticated` was recorded. The shared `pg-extension-harness.ts` installs a fail-fast store boot factory in `beforeAll` and every `beforeEach`, so any cold-cache boot rejects immediately with `PG extension harness: cold-cache TaskStore boot is forbidden` instead of starting a postmaster. A regression case in the same slice empties the cache mid-test and asserts that fail-fast error. All harness consumers pass. No timeout, retry, or assertion was widened, and no product code changed. A new sighting re-opens normal escalation.
 
 <!--
 FNXC:DesktopTestQuarantine 2026-09-24-07:48:

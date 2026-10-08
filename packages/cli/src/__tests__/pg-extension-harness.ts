@@ -27,7 +27,9 @@ import {
   createSharedPgTaskStoreTestHarness,
 } from "../../../core/src/__test-utils__/pg-test-harness.js";
 import kbExtension, {
+  __clearExtensionStoreBootStateForTesting,
   __setCachedStoreForTesting,
+  __setExtensionStoreBootFactoryForTesting,
   closeCachedStores,
 } from "../extension.js";
 import { SecretsStore, type TaskStore } from "@fusion/core";
@@ -113,6 +115,23 @@ export interface PgExtensionHarness {
   readonly afterAll: () => Promise<void>;
 }
 
+/** Marker carried by every cold-cache boot the harness refuses; asserted by regression tests. */
+export const PG_HARNESS_COLD_BOOT_FORBIDDEN = "PG extension harness: cold-cache TaskStore boot is forbidden";
+
+/*
+FNXC:CliTests 2026-10-08-15:30:
+KB-081: Full Suite run 37758138036 (Linux, Test shard 3/4) showed a timed-out test body keep running after afterEach's closeCachedStores() emptied the extension cache.
+Its next fn_* tool call cold-booted createTaskStoreForBackend, which started embedded PostgreSQL in the worker HOME, and the subprocess guard blamed the NEXT test for a left-running postmaster.
+Harness consumers must never cold-boot a backend: every tool call resolves the injected store, so any cold-cache boot (orphaned continuation, foreign cwd, cache gap) rejects immediately with a clearly worded error.
+A test that genuinely needs a boot must set its own factory via __setExtensionStoreBootFactoryForTesting; never weaken this guard to make a consumer pass.
+*/
+const forbidColdCacheBoot: Parameters<typeof __setExtensionStoreBootFactoryForTesting>[0] = async (options) => {
+  throw new Error(
+    `${PG_HARNESS_COLD_BOOT_FORBIDDEN} for ${options.rootDir} \u2014 it would start embedded PostgreSQL; ` +
+      "inject the store for this root or set an explicit boot factory",
+  );
+};
+
 /**
  * Build a CLI extension test harness backed by an isolated PostgreSQL database.
  * The store is injected into the extension cache so `getStore(rootDir)` returns
@@ -136,8 +155,14 @@ export function createPgExtensionHarness(prefix: string): PgExtensionHarness {
   return {
     rootDir: pg.rootDir,
     store: pg.store,
-    beforeAll: pg.beforeAll,
+    beforeAll: async () => {
+      __setExtensionStoreBootFactoryForTesting(forbidColdCacheBoot);
+      await pg.beforeAll();
+    },
     beforeEach: async () => {
+      // Drop any stale inflight/cooldown from a previous test (the clear also resets the factory), then re-arm the guard.
+      __clearExtensionStoreBootStateForTesting();
+      __setExtensionStoreBootFactoryForTesting(forbidColdCacheBoot);
       await pg.beforeEach();
       __setCachedStoreForTesting(pg.rootDir(), pg.store());
     },
@@ -145,7 +170,13 @@ export function createPgExtensionHarness(prefix: string): PgExtensionHarness {
       await closeCachedStores();
       await pg.afterEach();
     },
-    afterAll: pg.afterAll,
+    afterAll: async () => {
+      try {
+        await pg.afterAll();
+      } finally {
+        __setExtensionStoreBootFactoryForTesting();
+      }
+    },
   };
 }
 

@@ -17,17 +17,30 @@ vi.mock("@fusion/core/gh-cli", () => ({
   getGhErrorMessage: vi.fn((error: unknown) => (error instanceof Error ? error.message : String(error))),
 }));
 
+/*
+FNXC:CliTests 2026-10-08-15:24:
+KB-081: Full Suite run 37758138036 (Linux, Test shard 3/4) timed out `fn_task_create persists per-task github tracking overrides` because the GitHub tracking taskCreatedHook resolved gh-cli auth through the `@fusion/core` BARREL (dashboard `github-auth.ts`), which the `@fusion/core/gh-cli` subpath mock above does not cover, so a real synchronous `gh --version` / `gh auth status` ran inside task creation.
+CLI extension tests must never run the real `gh`: mock the barrel predicates too. Defaults model an installed-but-unauthenticated gh so the hook records `github-issue-skipped` without any subprocess or network call.
+*/
+vi.mock("@fusion/core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@fusion/core")>()),
+  isGhAvailable: vi.fn(() => true),
+  isGhAuthenticated: vi.fn(() => false),
+}));
+
 vi.mock("../commands/task.js", () => ({
   runTaskPlan: vi.fn(),
 }));
 
 import { __setCachedStoreForTesting, closeCachedStores, resolveTaskListFormatter } from "../extension.js";
+import { isGhAvailable as coreIsGhAvailable, isGhAuthenticated as coreIsGhAuthenticated } from "@fusion/core";
 import { TaskStore, AgentStore, MANUAL_RETRY_RESET_COUNTER_KEYS, MAX_TASK_LIST_TEXT_CHARS, MAX_TASK_MESSAGE_LENGTH, MissionBlockedClearConflictError, formatTaskListText, COLUMN_LABELS, drizzleSql } from "@fusion/core";
 import type { WorkflowIr } from "@fusion/core";
 import { isGhAvailable, isGhAuthenticated, runGhJsonAsync } from "@fusion/core/gh-cli";
 import { runTaskPlan } from "../commands/task.js";
 import { pgDescribe } from "../../../core/src/__test-utils__/pg-test-harness.js";
 import {
+  PG_HARNESS_COLD_BOOT_FORBIDDEN,
   createPgExtensionHarness,
   createMockApi,
   registerExtension,
@@ -289,6 +302,9 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
     vi.mocked(isGhAuthenticated).mockReturnValue(true);
     vi.mocked(runGhJsonAsync).mockReset();
     vi.mocked(runTaskPlan).mockReset();
+    // FNXC:CliTests 2026-10-08-15:24: KB-081 barrel gh predicates reached by the tracking hook; reset per test so call history and overrides never leak.
+    vi.mocked(coreIsGhAvailable).mockReset().mockReturnValue(true);
+    vi.mocked(coreIsGhAuthenticated).mockReset().mockReturnValue(false);
 
     tmpDir = h.rootDir();
     api = createMockApi() as unknown as LegacyApi;
@@ -2916,6 +2932,9 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
     vi.mocked(isGhAuthenticated).mockReturnValue(true);
     vi.mocked(runGhJsonAsync).mockReset();
     vi.mocked(runTaskPlan).mockReset();
+    // FNXC:CliTests 2026-10-08-15:24: KB-081 barrel gh predicates reached by the tracking hook; reset per test so call history and overrides never leak.
+    vi.mocked(coreIsGhAvailable).mockReset().mockReturnValue(true);
+    vi.mocked(coreIsGhAuthenticated).mockReset().mockReturnValue(false);
 
     tmpDir = h.rootDir();
     api = createMockApi();
@@ -3578,6 +3597,11 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
     const task = await h.store().getTask(result.details.taskId);
     expect(task.githubTracking?.enabled).toBe(true);
     expect(task.githubTracking?.repoOverride).toBe("acme/widgets");
+    // KB-081: the tracking hook ran through the mocked barrel predicate, not a real `gh` subprocess.
+    expect(vi.mocked(coreIsGhAuthenticated)).toHaveBeenCalled();
+    const trackingActivity = await h.store().getActivityLog({ taskId: task.id });
+    expect(trackingActivity.some((entry) =>
+      entry.metadata?.type === "github-issue-skipped" && entry.metadata?.reason === "gh_not_authenticated")).toBe(true);
 
     const invalid = await createTool.execute(
       "create-gh-bad-repo",
@@ -3616,6 +3640,24 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
     } finally {
       await h.store().updateSettings({ githubTrackingEnabledByDefault: false });
     }
+  });
+
+  it("cold-cache tool call after harness cache teardown fails fast instead of booting embedded PostgreSQL", async () => {
+    /*
+    FNXC:CliTests 2026-10-08-15:30:
+    KB-081 cascade link: an orphaned continuation of a timed-out test runs its next tool call after afterEach's closeCachedStores().
+    Reproduce that empty-cache window mid-test and require the call to settle as the harness fail-fast error rather than start an embedded postmaster.
+    */
+    await closeCachedStores();
+    const listTool = api.tools.get("fn_task_list")!;
+    const startedAt = Date.now();
+    const outcome = await listTool.execute("cold-cache-list", {}, undefined, undefined, makeCtx(tmpDir)).then(
+      (result) => ({ isError: result.isError === true, text: result.content.map((part) => part.text).join("\n") }),
+      (error: unknown) => ({ isError: true, text: error instanceof Error ? error.message : String(error) }),
+    );
+    expect(outcome.isError).toBe(true);
+    expect(outcome.text).toContain(PG_HARNESS_COLD_BOOT_FORBIDDEN);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
   it("fn_task_update rejects reviewer assignment for implementation tasks", async () => {
