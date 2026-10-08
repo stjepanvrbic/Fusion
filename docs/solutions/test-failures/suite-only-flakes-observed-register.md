@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **8 active observation records** (entries 2, 13, 20, 21, 25, 26, 27, and 29), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **16 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **10 active observation records** (entries 2, 13, 20, 21, 25, 26, 27, 29, 30, and 31), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **16 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -362,6 +362,30 @@ The subprocess-guard line deserves a product look. It means a real PostgreSQL ch
 The first case failed at its second reconcile click with `AssertionError: expected "vi.fn()" to be called 2 times, but got 1 times`, raised by the `waitFor` on `reconcileMission` at line 179. The second case failed with `TestingLibraryElementError: Unable to find an element by: [data-testid="mission-reconcile-apply"]`, raised by the `findByTestId` at line 190 after the first click on the reconcile control. Both are default-timeout Testing Library waits that expired while the rendered `MissionManager` still showed the mission list and had not yet produced the expected reconcile call or panel. This reads the log; no reproduction was attempted, and the log does not show whether the two failures share a cause or whether the component was slow to commit the click or the test shell was starved.
 
 No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the dashboard vitest config. Before quarantining, look at the product code: both cases exercise the mission-switch window in `MissionManager`, where the reconcile panel is released synchronously on a row event, so check whether the reconcile click can be dropped or the panel withheld when a fetch for the other mission is still pending.
+
+### 30. Instance-scoped OAuth refresh hanging-request bound
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/engine/src/__tests__/auth-storage-durability.test.ts`
+- **Exact test:** `instance-scoped OAuth refresh > bounds a hanging refresh request instead of waiting on it indefinitely`.
+- **Observed tree/SHA:** fork Full Suite run [37725718700](https://github.com/stjepanvrbic/Fusion/actions/runs/37725718700) at `b2dfb6316` (Linux, `ubuntu-latest`), job `Test shard 1/4` (`113143293387`), project `engine-default`. That commit changed only a register entry. The file passed in the Full Suite runs 37718606719 (`0bcb53f96`) and 37720328009 (`9e948d488`); neither run's failed-job log names it. The test came from audit PR #7 (`01a945ee9`, operator CLI, credentials and agent shell boundaries).
+- **Observed frequency:** 1 run, 1 failure entry. The shard otherwise passed (576 files, 7450 tests).
+
+The case failed with `AssertionError: expected "vi.fn()" to be called 1 times, but got 0 times` at the `expect(fetchMock).toHaveBeenCalledTimes(1)` on line 160. The test fakes only `setTimeout` and `clearTimeout`, starts `getApiKey` on an expiring OAuth instance, then advances fake time in 5 ms steps for at most 200 iterations while waiting for the mocked `fetch` to be invoked. The loop ended with no call, so the refresh path never reached `fetch` within those iterations. This reads the log; no reproduction was attempted. The loop is a bounded count of microtask-yielding advances rather than a wall-clock wait, so it can run out when the real work between the call and `fetch` (instance read, lock acquisition, file I/O) is starved of event-loop turns.
+
+The Full Suite was under heavy load that hour: several Full Suite runs were queued or in progress at once on the fork. No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the engine vitest config. Before quarantining, look at the product code: check whether the refresh path performs real file or lock I/O before calling `fetch`, which a fake-timer polling loop cannot wait out deterministically.
+
+### 31. Mailbox paging production surfaces 120-message inbox desktop paging
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/dashboard/app/components/__tests__/MailboxPaging.surfaces.test.tsx`
+- **Exact test:** `mailbox paging production surfaces > pages a 120-message inbox in %s %s until the last message is reachable` (parameterized `it.each`; the failing row was `MailboxView desktop`, and the CI log prints it as `...inbox in MailboxView desktop until the last message is reachable`).
+- **Observed tree/SHA:** fork Full Suite run [37725718700](https://github.com/stjepanvrbic/Fusion/actions/runs/37725718700) at `b2dfb6316` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113143293384`), project `dashboard-app-quality-backfill` (`--shard=4/4`). That commit changed only a register entry. The file passed in the Full Suite runs 37718606719 (`0bcb53f96`) and 37720328009 (`9e948d488`); neither run's failed-job log names it. The test came from audit PR #24 (`b2baf33d5`, operator messaging delivery, mailbox and recommendations UI, inbound webhook auth).
+- **Observed frequency:** 1 run, 1 failure entry. The sibling mobile and other host cases of the same `it.each` passed (175 of 176 files passed in the shard).
+
+The case failed with `TestingLibraryElementError: Unable to find an element by: [data-testid="mailbox-item-in-99"]`, raised by the `findByTestId` on line 88 after the click on `mailbox-inbox-load-more`. The first page (`mailbox-item-in-49`) had already rendered, so the first load-more click did not produce the second page of 50 rows within the default Testing Library timeout. This reads the log; no reproduction was attempted, and the log does not show whether the click was dropped, the second `fetchInbox` resolved late, or the rendered list was slow to commit 100 rows.
+
+The Full Suite was under heavy load that hour: several Full Suite runs were queued or in progress at once on the fork. No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the dashboard vitest config. Before quarantining, look at the product code: check whether `MailboxView` can ignore or drop a load-more click while the previous inbox request or a background refresh is in flight.
 
 ### Common shape and investigated result
 
