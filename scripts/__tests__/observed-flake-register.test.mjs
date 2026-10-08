@@ -224,6 +224,10 @@ test("observed-flake register active count, escalation state, and owners stay sy
       heading: "31. Mailbox paging production surfaces 120-message inbox desktop paging",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
+    {
+      heading: "32. System controls rebuild output stream subscription",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+    },
   ]);
 });
 

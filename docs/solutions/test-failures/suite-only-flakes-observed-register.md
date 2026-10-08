@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **10 active observation records** (entries 2, 13, 20, 21, 25, 26, 27, 29, 30, and 31), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **16 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 26, 27, 29, 30, 31, and 32), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **16 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -386,6 +386,28 @@ The Full Suite was under heavy load that hour: several Full Suite runs were queu
 The case failed with `TestingLibraryElementError: Unable to find an element by: [data-testid="mailbox-item-in-99"]`, raised by the `findByTestId` on line 88 after the click on `mailbox-inbox-load-more`. The first page (`mailbox-item-in-49`) had already rendered, so the first load-more click did not produce the second page of 50 rows within the default Testing Library timeout. This reads the log; no reproduction was attempted, and the log does not show whether the click was dropped, the second `fetchInbox` resolved late, or the rendered list was slow to commit 100 rows.
 
 The Full Suite was under heavy load that hour: several Full Suite runs were queued or in progress at once on the fork. No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the dashboard vitest config. Before quarantining, look at the product code: check whether `MailboxView` can ignore or drop a load-more click while the previous inbox request or a background refresh is in flight.
+
+### 32. System controls rebuild output stream subscription
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/dashboard/app/components/command-center/__tests__/SystemControlsArea.test.tsx`
+- **Exact test:** `SystemControlsArea layout integration > keeps manually scrolled rebuild output in place while SSE lines grow`.
+- **Observed tree/SHA:** fork Full Suite (non-blocking) run [37730530935](https://github.com/stjepanvrbic/Fusion/actions/runs/37730530935/job/113158385793) at `7bab9bce9` (Linux, `ubuntu-latest`), job `Test shard 1/4` (`113158385793`), command `@fusion/dashboard run test:quality:app:backfill-1`, project `dashboard-app-quality-backfill`. The preceding Full Suite run 37730005153 at `a3d4e3d65` passed this shard. The only commit between them, `7bab9bce9` (#46), changed ledger data under `scripts/lib` and `packages/engine/vitest.config.ts`, nothing under `packages/dashboard`.
+- **Observed frequency:** 1 run, 1 failure entry. The other 16 cases in the file passed, and the dashboard command reported 2291 tests with this one failure.
+
+The job's live log is truncated before the dashboard command, so the failure is read from the verified `test-timings-shard-1` artifact (`packages/dashboard/.timings/timings-shard1-2.json`). The case failed after 183 ms with `AssertionError: expected undefined to be defined`, raised by `expect(call).toBeDefined()` in the file's `getStreamEvents` helper (line 383) and called from line 394. The helper searches `subscribeSseMock.mock.calls` for `/api/system/jobs/job-1/stream` and found no call, so the component had not subscribed to the job stream when the test read the mock. The run was not reproduced.
+
+The commit that made the capability probe retry (`c8dfb4717`) is not the cause. The job stream subscription is not gated on the probe. It is made by the effect at `SystemControlsArea.tsx:397-432`, which depends only on `job?.id` and `job?.status` and returns early unless the job is `running`. The failure is also after the test's `findByTestId` for the rebuild card (line 390), and that card stays hidden until the probe lands (`showRebuildControls`, line 742). A slow probe would have failed at line 390, not at line 394. The 183 ms duration agrees: no Testing Library wait ran to its timeout.
+
+Hypothesis, not measured: the `job` state is set by `adoptJob` after `startSystemRebuild` resolves (line 550), and the output section renders in the same commit (line 1092). The subscription is made in a passive effect, which React can flush a scheduler turn after that commit. `findByTestId("cc-system-rebuild-output")` resolves as soon as the DOM node exists, and the test reads the mock immediately, so a starved shard could observe the DOM before the effect has run. The other case in this file that reads `getStreamEvents`, `keeps manually scrolled live server logs in place while SSE lines grow`, has the same shape and passed in the run (176 ms).
+
+| run | result |
+|---|---|
+| Full Suite 37730005153 (`a3d4e3d65`), shard 1/4 | passed |
+| Full Suite 37730530935 (`7bab9bce9`), shard 1/4 | **failed** (this case) |
+| `pnpm --filter @fusion/dashboard exec vitest run app/components/command-center/__tests__/SystemControlsArea.test.tsx --project dashboard-app-quality-backfill`, local Windows, `0c50dbd0f` | passed, 17 tests, 24.7 s wall (tests 11.4 s) |
+
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the dashboard vitest config. Before quarantining, a fix should wait on the subscription itself, for example by asserting on `subscribeSseMock` inside `waitFor`, rather than on the rendered output.
 
 ### Common shape and investigated result
 
