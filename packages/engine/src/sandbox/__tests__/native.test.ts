@@ -35,9 +35,10 @@ describe("NativeSandboxBackend", () => {
     expect(result.bufferExceeded).toBe(false);
   });
 
+  // FNXC:ProcessLifecycle 2026-10-08-01:40: the command never ends on its own, so only the timeout kill can settle it; a short-lived command could exit naturally before Windows' asynchronous tree kill and report exit code 0.
   it("maps timeout failures", async () => {
     const backend = new NativeSandboxBackend();
-    const result = await backend.run("node -e \"setTimeout(() => {}, 1000)\"", {
+    const result = await backend.run("node -e \"setInterval(() => {}, 1000)\"", {
       cwd: cwd(),
       timeoutMs: 50,
       maxBuffer: 1024 * 1024,
@@ -124,9 +125,15 @@ setInterval(() => {}, 1000);
     expect(result.timedOut).toBe(false);
   });
 
+  /*
+  FNXC:ProcessLifecycle 2026-10-07-23:34:
+  Overflowing maxBuffer kills the command. The command keeps running after it overflows, so the kill, not a natural exit, ends it on every platform.
+  A command that exits on its own right after writing races Windows' asynchronous tree kill and truthfully reports its own exit code.
+  */
   it("maps maxBuffer failures", async () => {
     const backend = new NativeSandboxBackend();
-    const result = await backend.run("node -e \"process.stdout.write('x'.repeat(5000))\"", {
+    const startedAt = Date.now();
+    const result = await backend.run("node -e \"process.stdout.write('x'.repeat(5000)); setInterval(() => {}, 1000)\"", {
       cwd: cwd(),
       timeoutMs: 5_000,
       maxBuffer: 512,
@@ -134,7 +141,11 @@ setInterval(() => {}, 1000);
     });
 
     expect(result.bufferExceeded).toBe(true);
+    expect(result.stdout).toBe("x".repeat(512));
+    expect(result.timedOut).toBe(false);
     expect(result.exitCode).toBeNull();
+    expect(result.signal).toBe("SIGTERM");
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
   });
 
   it("prepare/dispose are idempotent no-ops", async () => {

@@ -60,9 +60,15 @@ describe("searchWithQmd routes through the hardened default executor (unit)", ()
     tempDirs.push(rootDir);
     mkdirSync(join(rootDir, ".fusion", "memory"), { recursive: true });
 
-    const { QmdMemoryBackend } = await import("../memory/memory-backend.js");
+    const { QmdMemoryBackend, refreshQmdProjectMemoryIndex } = await import("../memory/memory-backend.js");
     const backend = new QmdMemoryBackend();
     const results = await backend.search(rootDir, { query: "unit-test-query", limit: 5 });
+    /*
+    FNXC:ProjectMemory 2026-10-07-23:34:
+    The search also schedules a fire-and-forget index refresh whose children run with the project root as their working directory.
+    Joining that in-flight refresh before cleanup keeps Windows from refusing to delete a directory a live child still uses.
+    */
+    await refreshQmdProjectMemoryIndex(rootDir);
 
     expect(Array.isArray(results)).toBe(true);
     // Both the collection-add and the qmd search calls must go through the mocked
