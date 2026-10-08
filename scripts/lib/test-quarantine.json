@@ -35,6 +35,11 @@
       "file": "packages/engine/src/__tests__/auth-storage-durability.test.ts",
       "reason": "Second sighting of one case, identical assertion at line 160 (fetch mock called 0 times, expected 1): https://github.com/stjepanvrbic/Fusion/actions/runs/37725718700 (b2dfb6316) and https://github.com/stjepanvrbic/Fusion/actions/runs/37756067075 (b4ffbded6), both Linux Test shard 1/4 engine-default; the fake-timer poll for the hanging-refresh fetch ran out before the refresh path reached fetch; register entry 30.",
       "quarantinedAt": "2026-10-08"
+    },
+    {
+      "file": "packages/dashboard/app/components/__tests__/MailboxPaging.surfaces.test.tsx",
+      "reason": "Second sighting of one parameterized row, identical assertion at line 88 (MailboxView desktop, mailbox-item-in-99 never rendered after the first load-more click): https://github.com/stjepanvrbic/Fusion/actions/runs/37725718700 (b2dfb6316) and https://github.com/stjepanvrbic/Fusion/actions/runs/37763234227 (bfe6023d4, Test shard 4/4), both Linux dashboard-app-quality-backfill via test:quality:app:backfill-4; register entry 31.",
+      "quarantinedAt": "2026-10-08"
     }
   ]
 }
