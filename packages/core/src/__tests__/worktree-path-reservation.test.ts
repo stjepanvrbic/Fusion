@@ -5,10 +5,20 @@ import {join, sep} from "node:path";
 import {afterEach, describe, expect, it, vi} from "vitest";
 
 const fsFaults = vi.hoisted(() => ({writeFile: undefined as Error | undefined, rename: undefined as Error | undefined}));
+/** One-shot faults raised only when the call targets the `claim` directory itself. */
+const claimFaults = vi.hoisted(() => ({lstat: undefined as Error | undefined, readdir: undefined as Error | undefined, stat: undefined as Error | undefined}));
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const onClaim = <F extends (path: never, ...rest: never[]) => Promise<unknown>>(name: keyof typeof claimFaults, fn: F): F => (async (path: unknown, ...rest: unknown[]) => {
+    const fault = claimFaults[name];
+    if (fault && /[\\/]claim$/.test(String(path))) { claimFaults[name] = undefined; throw fault; }
+    return (fn as unknown as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
+  }) as unknown as F;
   return {
     ...actual,
+    lstat: onClaim("lstat", actual.lstat),
+    readdir: onClaim("readdir", actual.readdir),
+    stat: onClaim("stat", actual.stat),
     writeFile: (async (...args: Parameters<typeof actual.writeFile>) => {
       const fault = fsFaults.writeFile;
       if (fault) { fsFaults.writeFile = undefined; throw fault; }
@@ -35,6 +45,7 @@ async function fixture() {
 afterEach(async () => {
   fsFaults.writeFile = undefined;
   fsFaults.rename = undefined;
+  claimFaults.lstat = claimFaults.readdir = claimFaults.stat = undefined;
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, {recursive: true, force: true})));
 });
 
@@ -250,6 +261,40 @@ describe("worktree path reservation: competing reclaimers", () => {
       await handle.release();
     }));
     expect(maxInside).toBe(1);
+  });
+
+  /*
+  FNXC:WorkflowLifecycle 2026-10-08-04:11:
+  Windows reports a claim directory that a competing reclaimer is deleting (delete-pending) or that antivirus holds open as EPERM/EACCES/EBUSY on lstat, readdir and stat.
+  That denial is neither proof of absence nor proof of a live owner, so the acquirer must re-poll within its timeout instead of crashing or stealing.
+  */
+  const CLAIM_PROBES = ["lstat", "readdir", "stat"] as const;
+  const transient = (code: string) => Object.assign(new Error(`injected ${code}`), {code});
+
+  it("keeps polling instead of failing when a contended claim is transiently unreadable", async () => {
+    for (const probe of CLAIM_PROBES) {
+      for (const code of ["EPERM", "EACCES", "EBUSY"]) {
+        const options = await fixture();
+        await plantDeadOwnerClaim(options);
+        claimFaults[probe] = transient(code);
+        const next = await acquireWorktreePathReservation({...options, acquireTimeoutMs: 1_000, pollMs: 1});
+        expect(claimFaults[probe], `${probe} ${code} fault was not exercised`).toBeUndefined();
+        expect(next.state).toBe("held");
+        await next.release();
+      }
+    }
+  });
+
+  it("never takes a live owner's claim because a probe of it was transiently denied", async () => {
+    for (const probe of CLAIM_PROBES) {
+      const options = await fixture();
+      const holder = await acquireWorktreePathReservation(options);
+      claimFaults[probe] = transient("EPERM");
+      await expect(acquireWorktreePathReservation({...options, acquireTimeoutMs: 50, pollMs: 1})).rejects.toThrow("Timed out acquiring worktree reservation");
+      expect(claimFaults[probe], `${probe} fault was not exercised`).toBeUndefined();
+      expect(await readWorktreePathReservation(options)).toMatchObject({state: "held", token: holder.token});
+      await holder.release();
+    }
   });
 
   it("a released owner whose claim was reclaimed does not disturb the successor", async () => {
