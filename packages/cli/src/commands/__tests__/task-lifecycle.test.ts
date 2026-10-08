@@ -313,7 +313,7 @@ describe("processPullRequestMergeTask", () => {
 
     expect(store._updates).not.toContainEqual({ id: task.id, patch: { status: "awaiting-pr-checks" } });
     expect(store.updatePrInfo).toHaveBeenCalledWith(task.id, expect.objectContaining({ status: "merged" }));
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "done");
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "done", { moveSource: "engine", bypassGuards: false });
     expect(github.mergePr).not.toHaveBeenCalled();
   });
 
@@ -1006,8 +1006,8 @@ describe("processPullRequestMergeTask", () => {
     const result = await processPullRequestMergeTask(store as never, "/repo", taskA.id, github as never, () => undefined);
 
     expect(result).toBe("merged");
-    expect(store.moveTask).toHaveBeenCalledWith(taskA.id, "done");
-    expect(store.moveTask).toHaveBeenCalledWith(taskB.id, "done");
+    expect(store.moveTask).toHaveBeenCalledWith(taskA.id, "done", { moveSource: "engine", bypassGuards: false });
+    expect(store.moveTask).toHaveBeenCalledWith(taskB.id, "done", { moveSource: "engine", bypassGuards: false });
     expect(store.updateBranchGroup).toHaveBeenCalledWith("BG-4", expect.objectContaining({
       status: "finalized",
       prState: "merged",
@@ -1436,7 +1436,7 @@ describe("processPullRequestMergeTask", () => {
       status: null,
       mergeRetries: 0,
     });
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "done");
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "done", { moveSource: "engine", bypassGuards: false });
     expect(store.updateTask).not.toHaveBeenCalledWith(
       task.id,
       expect.objectContaining({ status: "failed" }),
@@ -1491,7 +1491,7 @@ describe("processPullRequestMergeTask", () => {
     expect(result).toBe("merged");
     expect(github.mergePr).not.toHaveBeenCalled();
     expect(store.updateTask).toHaveBeenCalledWith("FN-9004", { status: null, mergeRetries: 0 });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-9004", "done");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-9004", "done", { moveSource: "engine", bypassGuards: false });
   });
 
   it("reconciles to done when PR merges after readiness check but before merge command completes", async () => {
@@ -1564,7 +1564,7 @@ describe("processPullRequestMergeTask", () => {
     expect(store.updatePrInfo).toHaveBeenLastCalledWith("FN-9104", expect.objectContaining({ status: "merged" }));
     expect(store.updateTask).toHaveBeenCalledWith("FN-9104", { mergeRetries: 0 });
     expect(store.updateTask).toHaveBeenCalledWith("FN-9104", { status: null, mergeRetries: 0 });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-9104", "done");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-9104", "done", { moveSource: "engine", bypassGuards: false });
     expect(store.logEntry).toHaveBeenCalledWith(
       "FN-9104",
       "Pull request already merged after merge command failed; reconciled task state from GitHub",
@@ -2059,7 +2059,7 @@ describe("processPullRequestMergeTask", () => {
 
     await expect(processPullRequestMergeTask(store as never, "/repo", task.id, github as never, () => undefined)).resolves.toBe("merged");
     expect(github.mergePr).toHaveBeenCalledWith(expect.objectContaining({ auto: true }));
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "done");
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "done", { moveSource: "engine", bypassGuards: false });
   });
 
   it("keeps the per-task head fence when native auto-merge is disabled", async () => {
@@ -2125,7 +2125,7 @@ describe("processPullRequestMergeTask", () => {
 
     await expect(processPullRequestMergeTask(store as never, "/repo", task.id, github as never, () => undefined)).resolves.toBe("merged");
     expect(github.mergePr).toHaveBeenCalledWith(expect.objectContaining({ auto: true }));
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "done");
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "done", { moveSource: "engine", bypassGuards: false });
     expect(store.updateBranchGroup).toHaveBeenCalledWith("BG-native-merged", expect.objectContaining({ status: "finalized", prState: "merged" }));
   });
 
