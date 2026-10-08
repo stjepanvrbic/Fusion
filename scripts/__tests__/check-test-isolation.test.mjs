@@ -7,63 +7,73 @@ import { spawnSync, spawn } from "node:child_process";
 
 const scriptPath = path.resolve("scripts/check-test-isolation.mjs");
 
+/*
+FNXC:TestIsolation 2026-10-08-06:54:
+The checker scans the system temp root for `fusion-test-*` directories, and sibling node:test files run concurrently in one invocation and mint such directories there. Measured in Full Suite run 37731492884: a concurrent test-feedback-baseline case leaked into this file's final pass and failed an unrelated case.
+Each fixture therefore owns its temp root, and every spawned checker resolves `os.tmpdir()` to it, so these tests only ever observe directories they create themselves. Leak-injection cases must create their fake leaks under `tmp`, never the global temp root.
+Helper child processes run from the test's own cwd, because on Windows a just-killed child still locks its cwd and blocks fixture removal.
+*/
 function withFixture(fn) {
-  const cwd = mkdtempSync(path.join(tmpdir(), "check-isolation-cwd-"));
-  const home = mkdtempSync(path.join(tmpdir(), "check-isolation-home-"));
+  const tmp = mkdtempSync(path.join(tmpdir(), "check-isolation-tmp-"));
+  const cwd = mkdtempSync(path.join(tmp, "check-isolation-cwd-"));
+  const home = mkdtempSync(path.join(tmp, "check-isolation-home-"));
   mkdirSync(path.join(cwd, ".fusion"), { recursive: true });
   mkdirSync(path.join(home, ".fusion"), { recursive: true });
   try {
-    fn({ cwd, home });
+    fn({ cwd, home, tmp });
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
-    rmSync(home, { recursive: true, force: true });
+    rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+function childEnv({ home, tmp }) {
+  return { ...process.env, HOME: home, USERPROFILE: home, TMPDIR: tmp, TEMP: tmp, TMP: tmp };
 }
 
 function runScript(args, options) {
   return spawnSync(process.execPath, [scriptPath, ...args], {
     cwd: options.cwd,
-    env: { ...process.env, HOME: options.home, USERPROFILE: options.home },
+    env: childEnv(options),
     encoding: "utf8",
   });
 }
 
 test("passes when baseline and current state match", () => {
-  withFixture(({ cwd, home }) => {
-    const before = runScript(["--before"], { cwd, home });
+  withFixture(({ cwd, home, tmp }) => {
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
-    const after = runScript([], { cwd, home });
+    const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 0);
   });
 });
 
 test("fails when a tracked temp leak appears after baseline", () => {
-  withFixture(({ cwd, home }) => {
-    const before = runScript(["--before"], { cwd, home });
+  withFixture(({ cwd, home, tmp }) => {
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
-    mkdirSync(path.join(tmpdir(), "fusion-test-leak-check-script"), { recursive: true });
-    const after = runScript([], { cwd, home });
+    mkdirSync(path.join(tmp, "fusion-test-leak-check-script"), { recursive: true });
+    const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 1);
     assert.match(after.stderr, /leaked temp director/i);
-    rmSync(path.join(tmpdir(), "fusion-test-leak-check-script"), { recursive: true, force: true });
+    rmSync(path.join(tmp, "fusion-test-leak-check-script"), { recursive: true, force: true });
   });
 });
 
 test("ignores tracked temp dirs that disappear during the settle window", () => {
-  withFixture(({ cwd, home }) => {
-    const before = runScript(["--before"], { cwd, home });
+  withFixture(({ cwd, home, tmp }) => {
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
 
     const transientName = `fusion-test-transient-worker-${process.pid}`;
-    const transientPath = path.join(tmpdir(), transientName);
+    const transientPath = path.join(tmp, transientName);
     mkdirSync(transientPath, { recursive: true });
     const cleanup = spawn(process.execPath, ["-e", `setTimeout(() => require("node:fs").rmSync(process.argv[1], { recursive: true, force: true }), 100)`, transientPath], {
-      cwd,
-      env: { ...process.env, HOME: home, USERPROFILE: home },
+      cwd: process.cwd(),
+      env: childEnv({ home, tmp }),
       stdio: "ignore",
     });
     try {
-      const after = runScript([], { cwd, home });
+      const after = runScript([], { cwd, home, tmp });
       assert.equal(after.status, 0, after.stderr || after.stdout);
     } finally {
       cleanup.kill("SIGTERM");
@@ -73,21 +83,21 @@ test("ignores tracked temp dirs that disappear during the settle window", () => 
 });
 
 test("ignores active fusion-test-workers roots created after baseline", () => {
-  withFixture(({ cwd, home }) => {
-    const before = runScript(["--before"], { cwd, home });
+  withFixture(({ cwd, home, tmp }) => {
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
 
-    const activeRoot = path.join(tmpdir(), `fusion-test-workers-active-check-${process.pid}`);
+    const activeRoot = path.join(tmp, `fusion-test-workers-active-check-${process.pid}`);
     const owner = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], {
-      cwd,
-      env: { ...process.env, HOME: home, USERPROFILE: home },
+      cwd: process.cwd(),
+      env: childEnv({ home, tmp }),
       stdio: "ignore",
     });
     mkdirSync(activeRoot, { recursive: true });
     writeFileSync(path.join(activeRoot, ".fusion-test-worker-root-owner"), `${owner.pid}\n`);
 
     try {
-      const after = runScript([], { cwd, home });
+      const after = runScript([], { cwd, home, tmp });
       assert.equal(after.status, 0, after.stderr || after.stdout);
     } finally {
       owner.kill("SIGTERM");
@@ -97,16 +107,16 @@ test("ignores active fusion-test-workers roots created after baseline", () => {
 });
 
 test("fails stale fusion-test-workers roots created after baseline", () => {
-  withFixture(({ cwd, home }) => {
-    const before = runScript(["--before"], { cwd, home });
+  withFixture(({ cwd, home, tmp }) => {
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
 
-    const staleRoot = path.join(tmpdir(), `fusion-test-workers-stale-check-${process.pid}`);
+    const staleRoot = path.join(tmp, `fusion-test-workers-stale-check-${process.pid}`);
     mkdirSync(staleRoot, { recursive: true });
     writeFileSync(path.join(staleRoot, ".fusion-test-worker-root-owner"), "424242424\n");
 
     try {
-      const after = runScript([], { cwd, home });
+      const after = runScript([], { cwd, home, tmp });
       assert.equal(after.status, 1);
       assert.match(after.stderr, /leaked temp director/i);
     } finally {
@@ -116,24 +126,19 @@ test("fails stale fusion-test-workers roots created after baseline", () => {
 });
 
 test("ignores leaked temp dirs whose basenames appear in FUSION_TEST_ISOLATION_IGNORE_NAMES", () => {
-  withFixture(({ cwd, home }) => {
-    const before = runScript(["--before"], { cwd, home });
+  withFixture(({ cwd, home, tmp }) => {
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
 
     // Simulate a fusion-test-home-root-* dir that survived cleanup. Without the
     // env allow-list this would trip the leak guard; with it, the check passes.
     const leakedName = `fusion-test-home-root-flake-${process.pid}`;
-    const leakedPath = path.join(tmpdir(), leakedName);
+    const leakedPath = path.join(tmp, leakedName);
     mkdirSync(leakedPath, { recursive: true });
     try {
       const result = spawnSync(process.execPath, [scriptPath], {
         cwd,
-        env: {
-          ...process.env,
-          HOME: home,
-          USERPROFILE: home,
-          FUSION_TEST_ISOLATION_IGNORE_NAMES: leakedName,
-        },
+        env: { ...childEnv({ home, tmp }), FUSION_TEST_ISOLATION_IGNORE_NAMES: leakedName },
         encoding: "utf8",
       });
       assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -144,34 +149,34 @@ test("ignores leaked temp dirs whose basenames appear in FUSION_TEST_ISOLATION_I
 });
 
 test("fails when protected repo .fusion data changes after baseline", () => {
-  withFixture(({ cwd, home }) => {
-    const before = runScript(["--before"], { cwd, home });
+  withFixture(({ cwd, home, tmp }) => {
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
     writeFileSync(path.join(cwd, ".fusion", "mutated.txt"), "x");
-    const after = runScript([], { cwd, home });
+    const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 1);
     assert.match(after.stderr, /protected live \.fusion data changed/i);
   });
 });
 
 test("fails when protected HOME .fusion data changes after baseline", () => {
-  withFixture(({ cwd, home }) => {
-    const before = runScript(["--before"], { cwd, home });
+  withFixture(({ cwd, home, tmp }) => {
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
     writeFileSync(path.join(home, ".fusion", "home-mutated.txt"), "x");
-    const after = runScript([], { cwd, home });
+    const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 1);
     assert.match(after.stderr, /protected live \.fusion data changed/i);
   });
 });
 
 test("fails when protected .fusion existence changes after baseline", () => {
-  withFixture(({ cwd, home }) => {
+  withFixture(({ cwd, home, tmp }) => {
     rmSync(path.join(cwd, ".fusion"), { recursive: true, force: true });
-    const before = runScript(["--before"], { cwd, home });
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
     mkdirSync(path.join(cwd, ".fusion"), { recursive: true });
-    const after = runScript([], { cwd, home });
+    const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 1);
     assert.match(after.stderr, /protected live \.fusion data changed/i);
   });
@@ -182,16 +187,16 @@ FNXC:TestIsolation 2026-10-07-18:04:
 A workspace package never owns a `.fusion` directory. A test that passed `rootDir: process.cwd()` from a threads-pool lane created `packages/engine/.fusion/worktrees/...` in the checkout, and the next run treated that package as a protected repo root. A package-level `.fusion` that appears during a run must fail that run, across every workspace package parent.
 */
 test("fails when a workspace package .fusion directory appears during the run", () => {
-  withFixture(({ cwd, home }) => {
+  withFixture(({ cwd, home, tmp }) => {
     for (const parent of ["packages/engine", "plugins/fusion-plugin-demo", "plugins/examples/fusion-plugin-sample"]) {
       mkdirSync(path.join(cwd, parent), { recursive: true });
     }
-    const before = runScript(["--before"], { cwd, home });
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0, before.stderr || before.stdout);
     for (const parent of ["packages/engine", "plugins/fusion-plugin-demo", "plugins/examples/fusion-plugin-sample"]) {
       mkdirSync(path.join(cwd, parent, ".fusion", "worktrees"), { recursive: true });
     }
-    const after = runScript([], { cwd, home });
+    const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 1, after.stdout);
     assert.match(after.stderr, /workspace package \.fusion/i);
     for (const parent of ["packages/engine", "plugins/fusion-plugin-demo", "plugins/examples/fusion-plugin-sample"]) {
@@ -201,11 +206,11 @@ test("fails when a workspace package .fusion directory appears during the run", 
 });
 
 test("warns without failing for a workspace package .fusion directory that predates the run", () => {
-  withFixture(({ cwd, home }) => {
+  withFixture(({ cwd, home, tmp }) => {
     mkdirSync(path.join(cwd, "packages", "engine", ".fusion"), { recursive: true });
-    const before = runScript(["--before"], { cwd, home });
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0, before.stderr || before.stdout);
-    const after = runScript([], { cwd, home });
+    const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 0, after.stderr || after.stdout);
     assert.match(after.stderr, /workspace package \.fusion/i);
   });
@@ -216,19 +221,19 @@ test("warns without failing for a workspace package .fusion directory that preda
 // ---------------------------------------------------------------------------
 
 test("--before-fast still detects an injected temp leak (guard strength preserved)", () => {
-  withFixture(({ cwd, home }) => {
+  withFixture(({ cwd, home, tmp }) => {
     // Prime a full baseline so --before-fast has a prior unstable classification.
-    assert.equal(runScript(["--before"], { cwd, home }).status, 0);
+    assert.equal(runScript(["--before"], { cwd, home, tmp }).status, 0);
     // Fast before-pass (reuses prior classification, skips the 2s probe).
-    const fast = runScript(["--before-fast"], { cwd, home });
+    const fast = runScript(["--before-fast"], { cwd, home, tmp });
     assert.equal(fast.status, 0);
     assert.match(fast.stdout, /Baseline recorded \(fast\)/);
 
     // Inject a leak after the fast baseline.
-    const leak = path.join(tmpdir(), `fusion-test-leak-fast-${process.pid}`);
+    const leak = path.join(tmp, `fusion-test-leak-fast-${process.pid}`);
     mkdirSync(leak, { recursive: true });
     try {
-      const after = runScript([], { cwd, home });
+      const after = runScript([], { cwd, home, tmp });
       assert.equal(after.status, 1, after.stdout);
       assert.match(after.stderr, /leaked temp director/i);
     } finally {
@@ -238,31 +243,31 @@ test("--before-fast still detects an injected temp leak (guard strength preserve
 });
 
 test("--before-fast still detects a protected .fusion mutation after baseline", () => {
-  withFixture(({ cwd, home }) => {
-    assert.equal(runScript(["--before"], { cwd, home }).status, 0);
-    assert.equal(runScript(["--before-fast"], { cwd, home }).status, 0);
+  withFixture(({ cwd, home, tmp }) => {
+    assert.equal(runScript(["--before"], { cwd, home, tmp }).status, 0);
+    assert.equal(runScript(["--before-fast"], { cwd, home, tmp }).status, 0);
     writeFileSync(path.join(cwd, ".fusion", "fast-mutated.txt"), "x");
-    const after = runScript([], { cwd, home });
+    const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 1);
     assert.match(after.stderr, /protected live \.fusion data changed/i);
   });
 });
 
 test("--before-fast falls back to the full probe when no prior baseline exists", () => {
-  withFixture(({ cwd, home }) => {
+  withFixture(({ cwd, home, tmp }) => {
     // No --before has run for this cwd-namespaced baseline; --before-fast must
     // still produce a usable baseline (full path) and the after-check passes.
-    const fast = runScript(["--before-fast"], { cwd, home });
+    const fast = runScript(["--before-fast"], { cwd, home, tmp });
     assert.equal(fast.status, 0);
     // Full fallback prints the non-fast baseline message.
     assert.match(fast.stdout, /Baseline recorded:/);
-    const after = runScript([], { cwd, home });
+    const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 0);
   });
 });
 
 test("passes when HOME .fusion is externally active during baseline and check", () => {
-  withFixture(({ cwd, home }) => {
+  withFixture(({ cwd, home, tmp }) => {
     const churnScript = `
       const fs = require("node:fs");
       const path = require("node:path");
@@ -279,14 +284,14 @@ test("passes when HOME .fusion is externally active during baseline and check", 
     `;
 
     const churn = spawn(process.execPath, ["-e", churnScript, home], {
-      cwd,
-      env: { ...process.env, HOME: home, USERPROFILE: home },
+      cwd: process.cwd(),
+      env: childEnv({ home, tmp }),
       stdio: "ignore",
     });
 
-    const before = runScript(["--before"], { cwd, home });
+    const before = runScript(["--before"], { cwd, home, tmp });
     assert.equal(before.status, 0);
-    const after = runScript([], { cwd, home });
+    const after = runScript([], { cwd, home, tmp });
     assert.equal(after.status, 0);
 
     churn.kill("SIGTERM");
