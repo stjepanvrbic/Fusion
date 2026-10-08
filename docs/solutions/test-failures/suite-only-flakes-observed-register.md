@@ -564,6 +564,9 @@ This is the third quarantine in the Planning Mode subsystem after entries 22 and
 <!--
 FNXC:TestFlakeRegister 2026-10-08-08:41:
 Entry 29 recorded a second Full Suite sighting on the fork: the same two switch-window cases failed again on shard 3. Quarantine is file-level, so the whole file is excluded through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
+
+FNXC:TestFlakeRegister 2026-10-08-13:35:
+KB-063 investigated the product code before the deletion deadline and found a deterministic test-readiness defect plus a mock-leak cascade, not a product race. The closing paragraph records the verdicts and the proposed test-only rescue so whoever reaches the deadline can rescue rather than delete.
 -->
 ### 29. MissionManager reconcile control switch-window cases
 
@@ -582,7 +585,24 @@ Both are default-timeout Testing Library waits that expired while the rendered `
 
 No timeout, retry, or assertion changed. The whole file is excluded from the dashboard projects. It is not in the thin merge gate, so no gate eviction was needed.
 
-Before the deletion deadline, inspect how `MissionManager` releases the reconcile panel and handles a reconcile click while a fetch for another mission is still pending. No product code changed in this quarantine.
+**Investigation (KB-063): test defect, no product race.** A later reproduction found a deterministic test defect and no product race:
+
+- **Readiness signal (confirmed defect):** `findByText("Mission two")` cannot prove that M-2 committed.
+  - Before the commit, only the list-row title matches, so the wait resolves on its first check while the reconcile button is still disabled.
+  - After the commit, three elements match (list row, mobile header, detail heading), so the query can only ever succeed before the commit.
+  - The case passes only when React commits inside Testing Library's post-wait drain. When the commit lands later under shard load, the next reconcile click hits the disabled button and `reconcileMission` stays at 1 call.
+- **Second case (confirmed cascade):** the first case's unconsumed `mockReturnValueOnce(rejected.promise)` survives `vi.clearAllMocks()`. The next case's first reconcile click therefore receives a never-settling promise, and the apply control never renders. That is why the two cases always fail together.
+- **Product race (not supported):** refusing a reconcile click while selection intent is ahead of the committed detail is the designed `MissionReconcileControl` behavior. Only selection boundaries invalidate a request.
+
+A scratch copy that delayed only the first case's M-2 commit past the readiness wait reproduced both CI failures exactly. The unmodified copy passed.
+
+The proposed rescue is test-only:
+
+1. Wait on a commit-proving signal, such as the level-3 detail heading or the reconcile button becoming enabled.
+2. Reset `reconcileMission` once-implementations between cases.
+3. Remove the ledger row and the dashboard exclude in lockstep when the fix lands.
+
+The executing session could not create tasks, so the rescue was raised as a KB-063 completion recommendation. No product code changed.
 
 <!--
 FNXC:TestFlakeRegister 2026-10-08-11:22:
