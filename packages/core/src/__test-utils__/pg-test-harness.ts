@@ -1244,6 +1244,64 @@ export interface SharedPgTaskStoreHarness {
   readonly createTestTask: () => Promise<import("../types.js").Task>;
   readonly createTaskWithSteps: () => Promise<import("../types.js").Task>;
   readonly teardown: () => Promise<void>;
+  /**
+   * FNXC:ExecutorLifecycle 2026-10-08-08:13 (KB-049):
+   * Registers an object (typically an engine TaskExecutor) to be disposed in afterEach, before the per-test listener reset.
+   * Duck-typed because @fusion/core must never import @fusion/engine.
+   */
+  readonly trackDisposable: (disposable: HarnessDisposable) => void;
+}
+
+/** Anything the shared harness can tear down after a test (KB-049). */
+export interface HarnessDisposable {
+  dispose(): void | Promise<void>;
+}
+
+/** Minimal EventEmitter surface the listener reset seam needs. */
+export interface ListenerResettableEmitter {
+  eventNames(): Array<string | symbol>;
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type -- mirrors EventEmitter.rawListeners
+  rawListeners(event: string | symbol): Function[];
+  removeListener(event: string | symbol, listener: (...args: unknown[]) => void): unknown;
+  activityListenersWired?: boolean;
+}
+
+/** Point-in-time copy of an emitter's raw listeners plus its lazy activity-wiring flag. */
+export interface StoreListenerSnapshot {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type -- mirrors EventEmitter.rawListeners
+  readonly listeners: ReadonlyMap<string | symbol, readonly Function[]>;
+  readonly activityListenersWired: boolean | undefined;
+}
+
+/**
+ * FNXC:ExecutorLifecycle 2026-10-08-08:13 (KB-049):
+ * Captures every raw listener (including `once` wrappers) per event, plus the store's
+ * `activityListenersWired` flag when present, so {@link restoreStoreListeners} can later
+ * remove exactly what was added after this point.
+ */
+export function snapshotStoreListeners(store: ListenerResettableEmitter): StoreListenerSnapshot {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type -- mirrors EventEmitter.rawListeners
+  const listeners = new Map<string | symbol, readonly Function[]>();
+  for (const event of store.eventNames()) listeners.set(event, [...store.rawListeners(event)]);
+  return { listeners, activityListenersWired: store.activityListenersWired };
+}
+
+/**
+ * FNXC:ExecutorLifecycle 2026-10-08-08:13 (KB-049):
+ * Removes, by identity, every raw listener absent from the snapshot; snapshot listeners and their order are never touched.
+ * Unlike the legacy SQLite helper's `removeAllListeners()` (store-test-helpers.ts), this never strips listeners wired at store init.
+ * If the lazily wired activity listeners were armed during the test (flag false at snapshot, true now), their listeners are removed with the rest and the flag is reset to false, so the next setupActivityLogListeners() call re-wires them instead of leaving them permanently disabled.
+ */
+export function restoreStoreListeners(store: ListenerResettableEmitter, snapshot: StoreListenerSnapshot): void {
+  for (const event of store.eventNames()) {
+    const kept = new Set(snapshot.listeners.get(event) ?? []);
+    for (const listener of store.rawListeners(event)) {
+      if (!kept.has(listener)) store.removeListener(event, listener as (...args: unknown[]) => void);
+    }
+  }
+  if (snapshot.activityListenersWired === false && store.activityListenersWired === true) {
+    store.activityListenersWired = false;
+  }
 }
 
 // Eagerly compute the TRUNCATE SQL once (table set is fixed per schema version).
@@ -1307,10 +1365,19 @@ export function createSharedPgTaskStoreTestHarness(options?: {
   provisioning during AgentStore.init() has a bound projectId.
   */
   readonly projectId?: string;
+  /**
+   * FNXC:ExecutorLifecycle 2026-10-08-08:13 (KB-049):
+   * Default true: afterEach disposes tracked disposables and restores the store's listeners to the snapshot taken at the end of beforeEach, so one test's executors/listeners cannot act on the next test's tasks.
+   * Set false only for a suite that deliberately shares per-test listeners across tests, with a justification comment.
+   */
+  readonly resetListenersAfterEach?: boolean;
 }): SharedPgTaskStoreHarness {
   const boundProjectId = options?.projectId ?? "";
+  const resetListenersAfterEach = options?.resetListenersAfterEach ?? true;
   let harness: PgTestHarness | null = null;
   let store: TaskStore | null = null;
+  let listenerSnapshot: StoreListenerSnapshot | null = null;
+  const disposables: HarnessDisposable[] = [];
   let bodyHandle: import("./pg-timeout-boundary-observer.js").PgTimeoutBoundaryHandle | null = null;
   // Lazily import DEFAULT_PROJECT_SETTINGS to avoid pulling the full types
   // graph at module load in environments that only use createTaskStoreForTest.
@@ -1443,6 +1510,8 @@ export function createSharedPgTaskStoreTestHarness(options?: {
       // can observe the test body without charging reset/setup to it.
       const testFile = vitestExpect.getState().testPath ?? "unknown-test-file";
       bodyHandle = harness.timeoutObserver.openBoundary("body", "shared.body", `${process.pid}:${process.env.VITEST_WORKER_ID ?? "main"}:${testFile}`);
+      // FNXC:ExecutorLifecycle 2026-10-08-08:13: snapshot last, so beforeAll and store-init listeners are the baseline afterEach restores to.
+      listenerSnapshot = resetListenersAfterEach ? snapshotStoreListeners(store as unknown as ListenerResettableEmitter) : null;
     },
     afterEach: async () => {
       // Close before watcher cleanup so teardown work is never body cost.
@@ -1457,6 +1526,21 @@ export function createSharedPgTaskStoreTestHarness(options?: {
           // best-effort
         }
       }
+      // FNXC:ExecutorLifecycle 2026-10-08-08:13: dispose tracked engine objects first, then drop every listener the test added.
+      for (const disposable of disposables.splice(0)) {
+        try {
+          await disposable.dispose();
+        } catch {
+          // best-effort: one failing dispose must not strand the rest
+        }
+      }
+      if (store && listenerSnapshot) {
+        restoreStoreListeners(store as unknown as ListenerResettableEmitter, listenerSnapshot);
+      }
+      listenerSnapshot = null;
+    },
+    trackDisposable: (disposable: HarnessDisposable) => {
+      disposables.push(disposable);
     },
     afterAll: async () => {
       if (harness) {

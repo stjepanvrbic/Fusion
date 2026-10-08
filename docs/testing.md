@@ -64,6 +64,19 @@ The configured identity follows `postgres@3.4.9`: role is URL username, then `PG
 
 `FUSION_PG_TEST_URL_BASE` is shared by `up`, `status`, and `down`; export the same non-default URL for all three. A path-bearing URL is provisionable but reports `harness-url-concat`, since `${PG_TEST_URL_BASE}/${dbName}` corrupts the 24 harness URL constructions. The script refuses URL/`--port` conflicts and `PGHOST`/`PGPORT` endpoint divergence. It reuses healthy servers, never mutates a foreign server's roles or databases, and requires a proven data-directory/PID ownership chain before `--replace` can stop a broken PostgreSQL server. `pg_ctl` daemonizes the postmaster, avoiding detached process spawning. A skipped `pgDescribe` block is not PostgreSQL verification evidence.
 
+### Shared PostgreSQL harness listener reset
+
+<!-- FNXC:ExecutorLifecycle 2026-10-08-08:26: KB-049 made per-test listener isolation a shared harness guarantee instead of a per-file workaround. -->
+
+`createSharedPgTaskStoreTestHarness` keeps one `TaskStore` for the whole file, so anything a test subscribes to that store would otherwise keep running in later tests. That is how a `TaskExecutor` from one test once started a real execution on the next test's `KB-001`.
+
+- **Listener reset (default on).** At the end of `beforeEach` the harness snapshots the store's raw listeners. `afterEach` removes, by identity, every listener added since, including `once` listeners. Listeners registered in `beforeAll` and the activity listeners wired at store init are part of the snapshot and survive. The helpers are `snapshotStoreListeners` / `restoreStoreListeners` in `packages/core/src/__test-utils__/pg-test-harness.ts`.
+- **Lazily wired listeners are re-armed, not disabled.** If `activityListenersWired` was `false` at the snapshot and became `true` during the test, the restore resets the flag to `false`, so the next `setupActivityLogListeners()` wires them again. Unlike the legacy `removeAllListeners()` in `store-test-helpers.ts`, the reset never strips listeners that a one-shot flag would then refuse to re-add.
+- **`trackDisposable(d)`.** Core cannot import `@fusion/engine`, so register engine objects built on the shared store (for example `h.trackDisposable(new TaskExecutor(h.store(), root))`). `afterEach` awaits each `dispose()` (failures are isolated) before restoring listeners. Outside the shared harness, call `executor.dispose()` in a `finally`.
+- **Opt-out.** Pass `resetListenersAfterEach: false` only with a justification comment for a suite that deliberately carries a listener across tests.
+
+`TaskExecutor.dispose()` is idempotent. It removes the executor's four store listeners (`task:moved`, `task:deleted`, `task:updated`, `settings:updated`), its task-move/archive disposer registrations, and its chat-memory capture, and it fences any handler that was already captured. It does not abort sessions; `abortAllInFlight` still does that. `InProcessRuntime.stop()` always disposes the executor, even when the abort fails, and replacing an executor at start disposes the previous one.
+
 ### PostgreSQL setup-boundary participation and measurement
 
 <!-- FNXC:PgTestPreAdmission 2026-08-17-03:20: FN-9139 requires the shared Vitest setup path to remain connectionless for every non-PostgreSQL lane. Participation is an explicit environment signal, rather than a reachability probe, because importing the harness itself performs a TCP probe. -->

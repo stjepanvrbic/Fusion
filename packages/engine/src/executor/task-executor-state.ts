@@ -91,6 +91,10 @@ export abstract class TaskExecutorState {
   protected unregisterTaskMoveDisposer: (() => void) | undefined;
   protected unregisterArchiveWorktreeDisposer: (() => void) | undefined;
   protected unregisterArchiveWorkspaceWorktreeDisposer: (() => void) | undefined;
+  /** FNXC:ExecutorLifecycle 2026-10-08-07:20: removes this executor's store event listeners; set by wireTaskExecutorLifecycle. */
+  protected unregisterStoreListeners: (() => void) | undefined;
+  /** FNXC:ExecutorLifecycle 2026-10-08-07:20: true once dispose() ran; makes dispose idempotent. */
+  protected disposed = false;
   protected activeSessions = new Map<string, ActiveExecutorSessionState>();
   protected activeStepExecutors = new Map<string, StepSessionExecutor>();
   protected activeStepExecutorSeenSteeringIds = new Map<string, Set<string>>();

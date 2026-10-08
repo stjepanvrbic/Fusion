@@ -267,27 +267,10 @@ pgDescribe("engine agent activity durable writer", () => {
   afterAll(h.afterAll);
 
   /*
-  FNXC:AgentActivityStream 2026-10-08-00:26:
-  Every test here reuses task id KB-001 on one shared store, and TaskExecutor subscribes to that store's
-  task:moved/task:updated/task:deleted/settings:updated events with no teardown. A test that constructs an
-  executor must not leave it subscribed: the next test's move into in-progress would start a real execution
-  that writes the new KB-001 row and outlives the test (the gate attempt counter read 1, a git subprocess
-  survived the test, and queries ran after pool teardown). Detach every listener a test added once it ends.
+  FNXC:AgentActivityStream 2026-10-08-08:26:
+  Every test here reuses task id KB-001 on one shared store. A stale executor left subscribed would start a real execution on the next test's KB-001.
+  Teardown is now owned by TaskExecutor.dispose() (each executor is registered with h.trackDisposable) plus the shared harness's per-test listener reset (KB-049), so this file no longer detaches listeners by hand.
   */
-  let listenerBaseline = new Map<string | symbol, Function[]>();
-  beforeEach(() => {
-    const store = h.store();
-    listenerBaseline = new Map(store.eventNames().map((name) => [name, [...store.rawListeners(name as never)]]));
-  });
-  afterEach(() => {
-    const store = h.store();
-    for (const name of store.eventNames()) {
-      const baseline = listenerBaseline.get(name) ?? [];
-      for (const listener of store.rawListeners(name as never)) {
-        if (!baseline.includes(listener)) store.removeListener(name as never, listener as never);
-      }
-    }
-  });
 
   /*
   FNXC:AgentActivityStream 2026-08-09-21:19:
@@ -307,20 +290,13 @@ pgDescribe("engine agent activity durable writer", () => {
     const liveTask = await h.store().updateTask(task.id, { dependencies: [blocker.id] }) as any;
     const store = Object.create(h.store()) as any;
     const executor = new TaskExecutor(store, h.rootDir());
+    h.trackDisposable(executor);
     const workEngine = vi.spyOn(executor as any, "maybeDispatchWorkflowWorkEngine").mockResolvedValue(false);
 
     try {
       await (executor as any).runImplementation(liveTask, vi.fn());
     } finally {
       workEngine.mockRestore();
-      /*
-      FNXC:AgentActivityStream 2026-08-09-21:19:
-      Constructor listeners are production lifecycle resources; remove them in this direct
-      implementation-path test so the shared harness cannot retain a stale executor.
-      */
-      (executor as any).unregisterTaskMoveDisposer?.();
-      (executor as any).unregisterArchiveWorktreeDisposer?.();
-      (executor as any).unregisterArchiveWorkspaceWorktreeDisposer?.();
     }
 
     const { events } = await queryAgentActivityEvents(h.layer(), { taskId: task.id, type: "task:started" });
@@ -338,6 +314,7 @@ pgDescribe("engine agent activity durable writer", () => {
     const task = await h.createTestTask();
     const executableTask = await h.store().moveTask(task.id, "in-progress", { moveSource: "agent" });
     const executor = new TaskExecutor(h.store(), h.rootDir());
+    h.trackDisposable(executor);
 
     await (executor as any).handoffTaskToReview(executableTask, "review-handoff-requested", "exec-KB-001-1234567890-abcd");
 
@@ -384,6 +361,7 @@ pgDescribe("engine agent activity durable writer", () => {
       listWorkflowWorkItemsForTask: vi.fn().mockResolvedValue([]),
     }) as any;
     const executor = new TaskExecutor(store, h.rootDir());
+    h.trackDisposable(executor);
     const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockImplementation(async function (_task, _settings, _startNode, context) {
       await (this as any).deps.recordWorkflowStepResult(task.id, {
         workflowStepId: "code-review",

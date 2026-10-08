@@ -162,6 +162,7 @@ pgTest("review remediation claim against the real fenced tier (PostgreSQL)", () 
     const store = h.store();
     const task = await seedReviewedTask("FN-275");
     const executor = new TaskExecutor(store as never, "/tmp/test");
+    h.trackDisposable(executor);
 
     await (executor as never as { handleGraphFailure(t: unknown, r: unknown): Promise<void> })
       .handleGraphFailure(task, {

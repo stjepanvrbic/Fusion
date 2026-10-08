@@ -400,7 +400,9 @@ export default defineConfig({
             */
             /*
             FNXC:AgentActivityStream 2026-10-08-00:26:
-            agent-activity-writers.test.ts is rescued into engine-default (not re-admitted to engine-core). Its sightings were cross-test leakage: executors left subscribed to the shared PostgreSQL store acted on the next test's KB-001, plus a completion fixture that predated the confirmed-merge finalizer. The file now detaches per-test store listeners; the exclude and ledger row were removed in lockstep.
+            agent-activity-writers.test.ts is rescued into engine-default (not re-admitted to engine-core). Its sightings were cross-test leakage: executors left subscribed to the shared PostgreSQL store acted on the next test's KB-001, plus a completion fixture that predated the confirmed-merge finalizer. The exclude and ledger row were removed in lockstep.
+            FNXC:AgentActivityStream 2026-10-08-08:26:
+            KB-049 replaced the file's manual per-test listener detach: TaskExecutor.dispose() plus the shared PG harness's per-test listener reset and trackDisposable registry now own that teardown.
             */
             /*
             FNXC:ExecutorPauseResumeQuarantine 2026-10-08-06:34:

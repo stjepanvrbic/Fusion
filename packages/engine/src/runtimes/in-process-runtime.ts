@@ -1864,20 +1864,21 @@ export class InProcessRuntime
         },
       };
 
-      this.executor = new TaskExecutor(
+      const executor = new TaskExecutor(
         this.taskStore,
         this.config.workingDirectory,
         executorOptions
       );
+      this.replaceExecutor(executor);
 
       /* FNXC:LifecycleContainment 2026-10-07-18:04: mission retries happen in place; let the autopilot arm the executor's guarded re-dispatch. */
 
       this.missionAutopilot?.setResumeExecutionInPlace((taskId) => this.executor?.scheduleInPlaceExecutionResume(taskId));
       if (this.mergeRequester) {
-        this.executor.setMergeRequester(this.mergeRequester);
+        executor.setMergeRequester(this.mergeRequester);
       }
       if (this.failedNoVerdictPreMergeReviewRerouter) {
-        this.executor.setFailedNoVerdictPreMergeReviewRerouter(this.failedNoVerdictPreMergeReviewRerouter);
+        executor.setFailedNoVerdictPreMergeReviewRerouter(this.failedNoVerdictPreMergeReviewRerouter);
       }
 
       await yieldEventLoop();
@@ -2616,10 +2617,16 @@ export class InProcessRuntime
       if (this.executor) {
         try {
           await this.executor.abortAllInFlight("engine stop");
-          this.executor.disposeStoreLifecycleDisposers();
           runtimeLog.log("Aborted in-flight executor AI sessions");
         } catch (err) {
           runtimeLog.warn(`Failed to abort in-flight executor AI sessions: ${err}`);
+        } finally {
+          /*
+          FNXC:ExecutorLifecycle 2026-10-08-08:13:
+          The task store may be the engine-owned externalTaskStore, which outlives this runtime across a restart in place.
+          Dispose in a finally so the executor's store listeners and disposer registrations are released even when the abort rejects; a stopped runtime's executor must never react to the next run's store events.
+          */
+          this.disposeExecutor(this.executor);
         }
       }
 
@@ -2833,6 +2840,31 @@ export class InProcessRuntime
    */
   getExecutor(): TaskExecutor | undefined {
     return this.executor;
+  }
+
+  /**
+   * FNXC:ExecutorLifecycle 2026-10-08-08:13:
+   * Installs a new executor, disposing the previous one first.
+   * Covers a start that follows a stop which failed before step 7c: two executors must never listen on the same store.
+   */
+  private replaceExecutor(next: TaskExecutor): void {
+    const previous = this.executor as TaskExecutor | undefined;
+    if (previous && previous !== next) this.disposeExecutor(previous);
+    this.executor = next;
+  }
+
+  /**
+   * FNXC:ExecutorLifecycle 2026-10-08-08:13:
+   * Best-effort executor dispose: a throw (or a test double without dispose) only warn-logs, never aborts stop/start.
+   */
+  private disposeExecutor(executor: TaskExecutor | undefined): void {
+    if (!executor) return;
+    try {
+      if (typeof executor.dispose === "function") executor.dispose();
+      else executor.disposeStoreLifecycleDisposers?.();
+    } catch (err) {
+      runtimeLog.warn(`Failed to dispose executor store subscriptions: ${err}`);
+    }
   }
 
   /**
