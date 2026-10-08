@@ -35,6 +35,15 @@ KB-061: every case used to build its own ~25-spawn git fixture (bare remote, two
 The base fixture is now built ONCE per file as a template and each case gets a recursive copy, so per-case cost is one copy plus the git work the case itself asserts on.
 Copies are isolated: each clone's origin URL is rewritten to the copy's own bare remote, so a case can never touch the template or another case's remote.
 Background gc/maintenance is disabled in the template repositories so no git call forks maintenance work.
+
+FNXC:CliTests 2026-10-08-19:20:
+KB-091: the one-time template build still spawned about 25 git processes, two clones and two pushes among them, each starting its own upload-pack/receive-pack transport.
+On the GitHub Windows runner (one worker) that exceeded the 10 s beforeAll hook budget and lost every case in the file.
+The template is now built with local plumbing only: three `git init`, one `git fast-import` per repository from a shared stream with a fixed identity and timestamp (so base, feature and sentinel have the same SHAs in every repository), config written with fs, and one `git reset --hard` per working repository.
+No clone or push transport runs, and the hook timeout is unchanged.
+The "template matches the clone/push fixture topology" case pins the refs, upstreams, contents, origin URLs and clean trees the old build produced.
+The old build never had refs/remotes/origin/HEAD (the bare remote's HEAD named the host default branch, not main) and the product never reads it, so the new build does not write one.
+core.autocrlf is pinned false so checkout yields the same LF files the old build wrote, whatever the host default is.
 */
 const TEMPLATE_HEAD = "fusion/fn-refresh-fixture";
 let templateRoot = "";
@@ -44,40 +53,76 @@ function gitUrl(path: string): string {
   return path.split(sep).join("/");
 }
 
+type TemplateCommit = "base" | "feature" | "sentinel";
+
+/** The three fixture commits, with the messages, paths and LF contents the clone/push build created. */
+const TEMPLATE_COMMITS: Record<TemplateCommit, { mark: number; parent?: TemplateCommit; message: string; path: string; content: string }> = {
+  base: { mark: 1, message: "base\n", path: "base.txt", content: "base\n" },
+  feature: { mark: 2, parent: "base", message: "feature\n", path: "feature.txt", content: "feature\n" },
+  sentinel: { mark: 3, parent: "base", message: "security sentinel\n", path: "sentinel.txt", content: "late integration security fix\n" },
+};
+/** Fixed identity and timestamp, so every repository gets byte-identical commits and therefore identical SHAs. */
+const TEMPLATE_IDENT = "Fusion Test <test@example.com> 1700000000 +0000";
+
+function fastImportData(text: string): string {
+  return `data ${Buffer.byteLength(text, "utf8")}\n${text}`;
+}
+
+/** A `git fast-import` stream that creates the needed commits and points each ref at its commit. */
+function templateStream(refs: Record<string, TemplateCommit>): string {
+  const needed = new Set<TemplateCommit>(["base", ...Object.values(refs)]);
+  let stream = "";
+  for (const name of ["base", "feature", "sentinel"] as const) {
+    if (!needed.has(name)) continue;
+    const commit = TEMPLATE_COMMITS[name];
+    // Every requested ref map includes main, so writing on main (or the feature branch) leaves no extra ref once the resets below run.
+    const home = name === "feature" ? `refs/heads/${TEMPLATE_HEAD}` : "refs/heads/main";
+    stream += `commit ${home}\nmark :${commit.mark}\n`;
+    stream += `author ${TEMPLATE_IDENT}\ncommitter ${TEMPLATE_IDENT}\n${fastImportData(commit.message)}`;
+    if (commit.parent) stream += `from :${TEMPLATE_COMMITS[commit.parent].mark}\n`;
+    stream += `M 100644 inline ${commit.path}\n${fastImportData(commit.content)}\n`;
+  }
+  for (const [ref, name] of Object.entries(refs)) stream += `reset ${ref}\nfrom :${TEMPLATE_COMMITS[name].mark}\n\n`;
+  return stream;
+}
+
+function fastImport(repo: string, refs: Record<string, TemplateCommit>): void {
+  execFileSync("git", ["fast-import", "--quiet"], { cwd: repo, input: templateStream(refs) });
+}
+
+/** Local config the clone/push build produced, written with fs instead of one `git config` spawn per key. */
+function appendTemplateConfig(gitDir: string, origin?: string): void {
+  let config = "[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n";
+  if (origin !== undefined) {
+    config += `[remote "origin"]\n\turl = ${gitUrl(origin)}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n`;
+    config += "[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n";
+    config += "[user]\n\temail = test@example.com\n\tname = Fusion Test\n";
+    // longpaths: rebase state under a deep temp root can exceed Git for Windows' MAX_PATH; it is a no-op elsewhere.
+    config += "[core]\n\tautocrlf = false\n\tlongpaths = true\n";
+  }
+  const configPath = join(gitDir, "config");
+  writeFileSync(configPath, readFileSync(configPath, "utf8") + config);
+}
+
 function buildTemplate(): string {
   const root = mkdtempSync(join(tmpdir(), "fusion-pr-refresh-template-"));
   const remote = join(root, "remote.git");
   const project = join(root, "project");
   const integration = join(root, "integration");
-  git(root, "init", "--bare", remote);
-  git(remote, "config", "gc.auto", "0");
-  git(remote, "config", "maintenance.auto", "false");
-  git(root, "clone", gitUrl(remote), project);
-  git(project, "config", "gc.auto", "0");
-  git(project, "config", "maintenance.auto", "false");
-  git(project, "config", "user.email", "test@example.com");
-  git(project, "config", "user.name", "Fusion Test");
-  writeFileSync(join(project, "base.txt"), "base\n");
-  git(project, "add", "base.txt");
-  git(project, "commit", "-m", "base");
-  git(project, "branch", "-M", "main");
-  git(project, "push", "-u", "origin", "main");
-  git(project, "checkout", "-b", TEMPLATE_HEAD);
-  writeFileSync(join(project, "feature.txt"), "feature\n");
-  git(project, "add", "feature.txt");
-  git(project, "commit", "-m", "feature");
-  git(project, "checkout", "main");
-
-  git(root, "clone", gitUrl(remote), integration);
-  git(integration, "config", "gc.auto", "0");
-  git(integration, "config", "maintenance.auto", "false");
-  git(integration, "config", "user.email", "test@example.com");
-  git(integration, "config", "user.name", "Fusion Test");
-  git(integration, "checkout", "main");
-  writeFileSync(join(integration, "sentinel.txt"), "late integration security fix\n");
-  git(integration, "add", "sentinel.txt");
-  git(integration, "commit", "-m", "security sentinel");
-  git(integration, "push", "origin", "main");
+  git(root, "init", "--quiet", "--bare", "-b", "main", remote);
+  git(root, "init", "--quiet", "-b", "main", project);
+  git(root, "init", "--quiet", "-b", "main", integration);
+  // Remote: main carries the late security sentinel; the automated head was never pushed.
+  fastImport(remote, { "refs/heads/main": "sentinel" });
+  // Project: main and origin/main sit at base, and the automated head is a local-only branch off base.
+  fastImport(project, { "refs/heads/main": "base", "refs/remotes/origin/main": "base", [`refs/heads/${TEMPLATE_HEAD}`]: "feature" });
+  // Integration: the clone that pushed the sentinel, so main and origin/main both sit at it.
+  fastImport(integration, { "refs/heads/main": "sentinel", "refs/remotes/origin/main": "sentinel" });
+  appendTemplateConfig(remote);
+  appendTemplateConfig(join(project, ".git"), remote);
+  appendTemplateConfig(join(integration, ".git"), remote);
+  git(project, "reset", "--quiet", "--hard");
+  git(integration, "reset", "--quiet", "--hard");
   return root;
 }
 
@@ -155,7 +200,46 @@ function makeLifecycleStore(task: Record<string, unknown>) {
   };
 }
 
+function gitSucceeds(cwd: string, ...args: string[]): boolean {
+  try {
+    execFileSync("git", args, { cwd, stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 describe("refreshAutomatedPrHead local git fixture", () => {
+  it("template matches the clone/push fixture topology", () => {
+    const { root, remote, integration, head } = makeFixture();
+    const base = git(root, "rev-parse", "refs/heads/main");
+    const sentinel = git(remote, "rev-parse", "refs/heads/main");
+
+    expect(git(root, "rev-parse", "refs/remotes/origin/main")).toBe(base);
+    expect(git(root, "rev-parse", `refs/heads/${head}^`)).toBe(base);
+    expect(git(remote, "rev-parse", "refs/heads/main^")).toBe(base);
+    expect(git(integration, "rev-parse", "refs/heads/main")).toBe(sentinel);
+    expect(git(integration, "rev-parse", "refs/remotes/origin/main")).toBe(sentinel);
+
+    expect(git(root, "show", "refs/heads/main:base.txt")).toBe("base");
+    expect(git(root, "show", `refs/heads/${head}:feature.txt`)).toBe("feature");
+    expect(git(remote, "show", "refs/heads/main:sentinel.txt")).toBe("late integration security fix");
+    expect(git(remote, "show", "refs/heads/main:base.txt")).toBe("base");
+
+    expect(git(root, "rev-parse", "--abbrev-ref", "main@{upstream}")).toBe("origin/main");
+    expect(git(integration, "rev-parse", "--abbrev-ref", "main@{upstream}")).toBe("origin/main");
+    expect(gitSucceeds(root, "rev-parse", "--abbrev-ref", `${head}@{upstream}`)).toBe(false);
+    expect(gitSucceeds(remote, "show-ref", "--verify", "--quiet", `refs/heads/${head}`)).toBe(false);
+
+    for (const repo of [root, integration]) {
+      expect(git(repo, "branch", "--show-current")).toBe("main");
+      expect(git(repo, "status", "--porcelain")).toBe("");
+      expect(git(repo, "config", "remote.origin.url")).toBe(gitUrl(remote));
+    }
+    expect(readFileSync(join(root, "base.txt"), "utf8")).toBe("base\n");
+    expect(readFileSync(join(integration, "sentinel.txt"), "utf8")).toBe("late integration security fix\n");
+  });
+
   it("publishes a stale automated head only after it contains the late integration sentinel", async () => {
     const { root, remote, head } = makeFixture();
 
