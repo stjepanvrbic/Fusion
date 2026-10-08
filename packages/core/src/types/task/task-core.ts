@@ -72,6 +72,17 @@ export interface MergeDetails {
     recordedAt: string;
   };
   /**
+   * FNXC:PostMergeRecovery 2026-10-08-08:35:
+   * Last post-merge evidence deferral the finalizer reported to the task log. Every finalizer pass (merge pump, self-healing, graph re-entry) re-evaluates the same blocker, so this dedupes the operator log per gate, landed commit, and blocker.
+   * It never grants or withholds approval; the run-audit row stays per pass.
+   */
+  postMergeDeferral?: {
+    gateId: string;
+    commitSha: string | null;
+    blocker: string;
+    recordedAt: string;
+  };
+  /**
    * FNXC:WorkflowMergeRecovery 2026-09-21-10:40:
    * Missing merge proof is repairable only while durable execution evidence changes.
    * This JSON-backed marker keys a bounded retry ladder to that evidence so restart and

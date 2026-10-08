@@ -670,7 +670,7 @@ shares ONE definition with this sweep. Previously the manual gate hardcoded its 
 and refused to retry ANY merge-active status, so an orphaned `landing` stamp was un-retryable by
 hand while this sweep cleared it automatically minutes later.
 */
-import { ACTIVE_MERGE_STATUSES, DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS, isMergeActiveStatus, isStaleMergeActiveStatus, shouldClearOrphanedMergeStamp } from "./merge/merge-active-status.js";
+import { ACTIVE_MERGE_STATUSES, DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS, isConfirmedLandingMergeStamp, isMergeActiveStatus, isStaleMergeActiveStatus, shouldClearOrphanedMergeStamp } from "./merge/merge-active-status.js";
 export { ACTIVE_MERGE_STATUSES, DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS, isMergeActiveStatus, isStaleMergeActiveStatus } from "./merge/merge-active-status.js";
 const STRANDED_COMPLETED_TODO_ACTIVE_STATUSES = new Set([
   "in-progress",
@@ -4091,9 +4091,14 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           let previousStatus: string | null | undefined;
           const clearIfStillStale = (live: Task): boolean => {
             const currentActiveMergeTaskId = getActiveMergeTaskId();
+            /*
+            FNXC:PostMergeRecovery 2026-10-08-08:35:
+            A stale stamp on a confirmed landing is residue the finalizer would clear; this sweep must agree rather than skip it forever.
+            It is cleared in place under the same no-live-owner and age proof, and the confirmed guard below keeps it out of the merge queue.
+            */
             if (
               (live.paused === true && !canClearPausedMergeDeadlockStamp(live))
-              || !shouldClearOrphanedMergeStamp(live)
+              || !(shouldClearOrphanedMergeStamp(live) || isConfirmedLandingMergeStamp(live))
               || !isStaleMergeActiveStatus(live, {
                 activeMergeTaskId: currentActiveMergeTaskId,
                 nowMs: Date.now(),
@@ -12989,12 +12994,15 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             log: (message) => log.warn(message),
           });
           if (finalization.outcome === "blocked") {
-            await this.store.logEntry(
-              task.id,
-              finalization.resumedPostMergeEvidence
-                ? `Auto-recovery resumed graph-owned post-merge verification — ${finalization.reason ?? "unknown"}`
-                : `Auto-recovery skipped: merge confirmed but finalization blocked — ${finalization.reason ?? "unknown"}`,
-            );
+            // FNXC:PostMergeRecovery 2026-10-08-08:35: an unchanged post-merge deferral was already reported; every 5-minute sweep must not repeat it.
+            if (!finalization.repeatedDeferral) {
+              await this.store.logEntry(
+                task.id,
+                finalization.resumedPostMergeEvidence
+                  ? `Auto-recovery resumed graph-owned post-merge verification — ${finalization.reason ?? "unknown"}`
+                  : `Auto-recovery skipped: merge confirmed but finalization blocked — ${finalization.reason ?? "unknown"}`,
+              );
+            }
             continue;
           }
           this.emitTaskMerged(finalization.task, { mergeConfirmed: true });

@@ -6041,13 +6041,73 @@
       "followUpTaskId": "none:out-of-frontier"
     },
     {
+      "callSiteId": "packages/engine/src/merge/auto-merge-finalization.ts::claimPostMergeDeferralReport>claim::store.updateTaskAtomic::#1",
+      "callSiteFingerprint": "store.updateTaskAtomic(taskId,(live) => { if (!live.mergeDetails || (!report.resumed && isReported(live))) return null; claimed = true; return { merge)",
+      "file": "packages/engine/src/merge/auto-merge-finalization.ts",
+      "enclosingSymbolPath": "claimPostMergeDeferralReport>claim",
+      "writer": "store.updateTaskAtomic",
+      "ordinal": 1,
+      "lineHint": 253,
+      "owningEntryPoint": "runAiMerge>finalizeTask>finalizeProvenAutoMergeTask",
+      "reachableDataStates": [
+        "Confirmed merge whose required post-merge evidence gate is absent, pending, or rejected; the finalizer records the deferral marker once per gate, landed commit, and blocker."
+      ],
+      "axis1": "checkpoint-covered",
+      "axis1Evidence": "Runs inside the caller-supplied merge ownership fence (fence.write finalization) when one is supplied; the updateTaskAtomic re-reads the live row and writes only mergeDetails.postMergeDeferral when the same deferral is not already recorded, never status, column, or merge proof.",
+      "axis2Provisional": "already-fenced",
+      "axis2Final": "already-fenced",
+      "observedInSuite": "layerB-observed",
+      "executionProof": "behavioral: confirmed-landing-merge-stamp.test.ts proves one deferral line across repeated finalizer, workflow-graph, and self-healing passes and a fresh report when the blocker changes.",
+      "followUpTaskId": "none:no-follow-up-required"
+    },
+    {
+      "callSiteId": "packages/engine/src/merge/auto-merge-finalization.ts::clearConfirmedLandingMergeStamp>clear::store.updateTaskAtomic::#1",
+      "callSiteFingerprint": "store.updateTaskAtomic(task.id,(live) => { if (!isConfirmedLandingMergeStamp(live)) return null; clearedStatus = live.status ?? undefined; return { sta)",
+      "file": "packages/engine/src/merge/auto-merge-finalization.ts",
+      "enclosingSymbolPath": "clearConfirmedLandingMergeStamp>clear",
+      "writer": "store.updateTaskAtomic",
+      "ordinal": 1,
+      "lineHint": 282,
+      "owningEntryPoint": "runAiMerge>finalizeTask>finalizeProvenAutoMergeTask",
+      "reachableDataStates": [
+        "Confirmed merge still stamped merging, merging-pr, merging-fix, reviewing, or landing while the finalizer defers for required post-merge evidence."
+      ],
+      "axis1": "checkpoint-covered",
+      "axis1Evidence": "Runs inside the caller-supplied merge ownership fence (fence.write finalization) when one is supplied; the updateTaskAtomic re-reads the live row and clears only status, and only while the row is still merge-confirmed with a merge-active stamp.",
+      "axis2Provisional": "already-fenced",
+      "axis2Final": "already-fenced",
+      "observedInSuite": "layerB-observed",
+      "executionProof": "behavioral: confirmed-landing-merge-stamp.test.ts proves every merge-active stamp is cleared in place for absent, pending, and failed gates while column, error, merge proof, and evidence are unchanged.",
+      "followUpTaskId": "none:no-follow-up-required"
+    },
+    {
+      "callSiteId": "packages/engine/src/merge/auto-merge-finalization.ts::clearConfirmedLandingMergeStamp>record::store.logEntry::#1",
+      "callSiteFingerprint": "store.logEntry(task.id,message)",
+      "file": "packages/engine/src/merge/auto-merge-finalization.ts",
+      "enclosingSymbolPath": "clearConfirmedLandingMergeStamp>record",
+      "writer": "store.logEntry",
+      "ordinal": 1,
+      "lineHint": 291,
+      "owningEntryPoint": "runAiMerge>finalizeTask>finalizeProvenAutoMergeTask",
+      "reachableDataStates": [
+        "Confirmed merge whose leftover merge-active stamp this finalizer call just cleared."
+      ],
+      "axis1": "checkpoint-covered",
+      "axis1Evidence": "Written through the caller-supplied merge ownership fence (fence.write log) when one is supplied, and only after this call's own locked clear landed, so it is written once per cleared stamp.",
+      "axis2Provisional": "already-fenced",
+      "axis2Final": "already-fenced",
+      "observedInSuite": "layerB-observed",
+      "executionProof": "behavioral: confirmed-landing-merge-stamp.test.ts proves the clear and its single log line; a repeated deferral adds no task-log line.",
+      "followUpTaskId": "none:no-follow-up-required"
+    },
+    {
       "callSiteId": "packages/engine/src/merge/auto-merge-finalization.ts::finalizeProvenAutoMergeTask::store.logEntry::#1",
       "callSiteFingerprint": "store.logEntry(taskId,`Auto-merge finalization repaired column mismatch: ${latest.column} → ${completeColumn} after proven merge; cleared stal)",
       "file": "packages/engine/src/merge/auto-merge-finalization.ts",
       "enclosingSymbolPath": "finalizeProvenAutoMergeTask",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 535,
+      "lineHint": 616,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -6067,7 +6127,7 @@
       "enclosingSymbolPath": "finalizeProvenAutoMergeTask>cleanupLandedWorktree",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 335,
+      "lineHint": 416,
       "owningEntryPoint": "runAiMerge",
       "reachableDataStates": [
         "single-repository merge finalization or fenced merge-failure recovery"
@@ -6087,7 +6147,7 @@
       "enclosingSymbolPath": "finalizeProvenAutoMergeTask>cleanupLandedWorktree",
       "writer": "store.logEntry",
       "ordinal": 2,
-      "lineHint": 337,
+      "lineHint": 418,
       "owningEntryPoint": "finalizeProvenAutoMergeTask",
       "reachableDataStates": [
         "proven landing finalization without a merge write fence"
@@ -6107,7 +6167,7 @@
       "enclosingSymbolPath": "finalizeProvenAutoMergeTask>finalized",
       "writer": "store.updateTaskAtomic",
       "ordinal": 1,
-      "lineHint": 503,
+      "lineHint": 584,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -6127,7 +6187,7 @@
       "enclosingSymbolPath": "finalizeProvenAutoMergeTask>move",
       "writer": "store.moveTaskIf",
       "ordinal": 1,
-      "lineHint": 462,
+      "lineHint": 543,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -6147,7 +6207,7 @@
       "enclosingSymbolPath": "finalizeProvenAutoMergeTask>persistProof",
       "writer": "store.updateTaskAtomic",
       "ordinal": 1,
-      "lineHint": 271,
+      "lineHint": 337,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -10917,7 +10977,7 @@
       "enclosingSymbolPath": "releaseFileScopeWaitingContinuations>transitioned",
       "writer": "store.transitionWorkflowWorkItem",
       "ordinal": 1,
-      "lineHint": 927,
+      "lineHint": 943,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -10937,7 +10997,7 @@
       "enclosingSymbolPath": "recoverApprovedStrandedAiMergeCommit>finalized",
       "writer": "finalizeProvenAutoMergeTask",
       "ordinal": 1,
-      "lineHint": 14119,
+      "lineHint": 14127,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -10957,7 +11017,7 @@
       "enclosingSymbolPath": "recoverMergedReviewTasks>finalization",
       "writer": "finalizeProvenAutoMergeTask",
       "ordinal": 1,
-      "lineHint": 12981,
+      "lineHint": 12986,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"

@@ -4589,7 +4589,11 @@ describe("SelfHealingManager", () => {
       managerWithRecovery.stop();
     });
 
-    it("clears but does not enqueue auto-merge-off or workspace tasks, and preserves confirmed finalization", async () => {
+    /*
+    FNXC:PostMergeRecovery 2026-10-08-08:35:
+    A stale stamp on a confirmed landing used to be preserved here, which left it counted as a live merge forever (KB-032, KB-036). It is now cleared in place like any orphaned stamp and still never re-enters the merge queue.
+    */
+    it("clears but does not enqueue auto-merge-off, workspace, or confirmed-landing tasks", async () => {
       const enqueueMerge = vi.fn();
       const managerWithRecovery = new SelfHealingManager(store, {
         rootDir: "/tmp/test-project",
@@ -4646,10 +4650,10 @@ describe("SelfHealingManager", () => {
       ]);
       (store.getTask as ReturnType<typeof vi.fn>).mockImplementation(async (id: string) => currentById.get(id));
 
-      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(2);
-      expect(store.updateTask).toHaveBeenCalledTimes(2);
+      expect(await managerWithRecovery.recoverStaleMergingStatus()).toBe(3);
+      expect(store.updateTask).toHaveBeenCalledTimes(3);
+      expect(store.updateTask).toHaveBeenCalledWith("FN-8912-confirmed", { status: null });
       expect(enqueueMerge).not.toHaveBeenCalled();
-      expect(currentById.get("FN-8912-confirmed")?.status).toBe("merging");
       managerWithRecovery.stop();
     });
 

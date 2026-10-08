@@ -522,9 +522,13 @@ export interface DuePlanningContinuationDrainDeps {
   ) => Promise<void>;
   /** `item` is passed only so the caller's failure log can keep naming the work
    *  item verbatim; the extraction is otherwise a byte-for-byte body move. */
-  /** Return false when shared capacity rejected this item; later FIFO items
-   *  cannot fit either, so the bounded pass stops without repeating snapshots. */
-  dispatch: (task: Task, item: WorkflowWorkItem) => boolean | void | Promise<boolean | void>;
+  /** Return false when shared capacity rejected this item. Later FIFO items are then offered with
+   *  `sameSlotOnly`: a new admission cannot fit either, but a live task's handoff needs no new slot. */
+  dispatch: (
+    task: Task,
+    item: WorkflowWorkItem,
+    options?: { sameSlotOnly?: boolean },
+  ) => boolean | void | Promise<boolean | void>;
   nowMs: () => number;
   warn: (message: string) => void;
 }
@@ -552,6 +556,7 @@ export async function drainDuePlanningContinuations(
   deps: DuePlanningContinuationDrainDeps,
 ): Promise<void> {
   const items = await deps.listDue();
+  let capacityRejected = false;
   for (const item of items) {
     let task: Task | undefined;
     let taskLookupFailed = false;
@@ -579,7 +584,15 @@ export async function drainDuePlanningContinuations(
     const deferral = resolveParkedContinuationDeferral(resolved, deps.nowMs());
     if (deferral) await deps.defer(deferral);
     if (resolved.kind !== "actionable") continue;
-    if (await deps.dispatch(resolved.task, resolved.item) === false) break;
+    /*
+    FNXC:ContinuationDispatch 2026-10-08-08:35:
+    A capacity rejection used to end the pass. The admission provider leaves live tasks to this drain, so a live task's continuation behind an older over-capacity row was never reached.
+    KB-032 and KB-036 held their own slot with a runnable post-merge gate for hours while nine older plan-review rows were rejected first on every pass.
+    After a rejection the pass continues for same-slot handoffs only; new admissions still wait for capacity.
+    */
+    if (await deps.dispatch(resolved.task, resolved.item, capacityRejected ? { sameSlotOnly: true } : undefined) === false) {
+      capacityRejected = true;
+    }
   }
 }
 
@@ -628,6 +641,8 @@ export async function admitPlanningContinuation(input: {
   dispatch: () => Promise<void>;
   /** The continuation's admission lane; resolved from the task's workflow when omitted. */
   lane?: AdmissionLane;
+  /** Dispatch only a same-slot handoff of an already-live task; never request a new slot. */
+  sameSlotOnly?: boolean;
 }): Promise<boolean> {
   const runKey = continuationRunKey(input.projectId, input.task.id);
   // A task owns one top-level slot regardless of how many durable continuation
@@ -660,6 +675,7 @@ export async function admitPlanningContinuation(input: {
     void input.dispatch().catch(() => {});
     return true;
   }
+  if (input.sameSlotOnly) return false;
   const lane = input.lane ?? await resolveContinuationAdmissionLaneForTask(input.store, input.task.id, input.item.nodeId);
   // This snapshot is intentionally created lazily inside the coordinator drain.
   // A prior lane may have been finishing its own handoff before this task's
@@ -972,14 +988,15 @@ export function createPlanningContinuationRun(input: PlanningContinuationRunInpu
 
 export function createPlanningContinuationDispatcher(input: PlanningContinuationRunInput & {
   projectId: string;
-}): (task: Task, item: WorkflowWorkItem) => Promise<boolean> {
+}): (task: Task, item: WorkflowWorkItem, options?: { sameSlotOnly?: boolean }) => Promise<boolean> {
   const run = createPlanningContinuationRun(input);
-  return (task, item) => admitPlanningContinuation({
+  return (task, item, options) => admitPlanningContinuation({
     store: input.store,
     projectId: input.projectId,
     task,
     item,
     dispatch: () => run(task, item),
+    sameSlotOnly: options?.sameSlotOnly,
   });
 }
 
@@ -3199,9 +3216,9 @@ export class InProcessRuntime
           this.markWorkflowContinuationDrainProgress(drainGeneration, "defer");
           return this.deferParkedWorkflowWorkItem(deferral);
         },
-        dispatch: (task, item) => {
+        dispatch: (task, item, options) => {
           this.markWorkflowContinuationDrainProgress(drainGeneration, "dispatch");
-          return dispatch(task, item);
+          return dispatch(task, item, options);
         },
         nowMs: () => Date.now(),
         warn: (message) => runtimeLog.warn(message),
