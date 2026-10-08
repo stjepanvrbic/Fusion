@@ -5,6 +5,10 @@ TaskStore writer surface, with declared boundaries. It runs in engine affected/f
 not the curated blocking engine-core gate; a hand-written writer list or textual scanner would be
 a blind spot.
 
+FNXC:MergeReliability 2026-10-08-02:04:
+KB-012: it is also a changed-only `pnpm test` guard companion (scripts/test-changed.mjs GUARD_COMPANION_TESTS),
+so engine merge, heartbeat and dashboard route edits run it. Manifest entries never persist `lineHint`.
+
 FNXC:MergeReliability 2026-08-11-21:59:
 Run `FUSION_UPDATE_MERGE_INVENTORY=1 pnpm --filter @fusion/engine exec vitest run
 src/__tests__/merge-orphan-durable-write-inventory-drift.test.ts` to update derivable structure.
@@ -15,7 +19,7 @@ import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import rawManifest from "./fixtures/merge-orphan-durable-write-inventory.json";
-import { assertInventoryRegenerationInputs, buildInventoryManifest, classifyReceiverForTest, deriveDurableWriterSurface, deriveMergeDurableWriteCallSites, deriveMergeReachableModules, type InventoryEntry, type InventoryManifest } from "./_merge-durable-write-callsites.js";
+import { assertInventoryRegenerationInputs, buildInventoryManifest, classifyReceiverForTest, deriveDurableWriterSurface, deriveMergeDurableWriteCallSites, deriveMergeReachableModules, deriveReceiverCensus, receiverSuspectsForTest, type InventoryEntry, type InventoryManifest } from "./_merge-durable-write-callsites.js";
 
 const taskId = /^FN-\d+$/;
 const manifest = rawManifest as InventoryManifest;
@@ -66,6 +70,44 @@ describe("FN-8923 orphan durable-write inventory drift guard", () => {
     expect(classifyReceiverForTest("const { updateTask } = options.store; updateTask()"), "destructured receiver fails closed").toBe("suspect");
     expect(classifyReceiverForTest("options.store[\"updateTask\"]()"), "computed receiver fails closed").toBe("suspect");
   });
+  /*
+  FNXC:MergeDurableWriteInventory 2026-10-08-05:21:
+  KB-047: `this.store` and the other census-confirmed receivers are provable task-store receivers; any receiver in
+  neither reviewed table fails closed, and a reviewed table entry that stops matching code is stale.
+  */
+  it("recognises reviewed task-store receiver shapes and fails closed on unreviewed receivers", () => {
+    expect(classifyReceiverForTest("this.store.updateTask()"), "this.store is a reviewed task-store receiver").toBe("provable");
+    expect(classifyReceiverForTest("const s = this.store; s.updateTask()"), "alias of a new shape stays provable").toBe("provable");
+    expect(classifyReceiverForTest("this.store?.updateTask?.()"), "optional chains normalise to the same shape").toBe("provable");
+    expect(classifyReceiverForTest("const { updateTask } = this.store"), "destructured new-shape receiver fails closed").toBe("suspect");
+    expect(classifyReceiverForTest("this.store[\"updateTask\"]()"), "computed new-shape receiver fails closed").toBe("suspect");
+    expect(classifyReceiverForTest("fooBar.updateTask()"), "unreviewed receiver fails closed").toBe("suspect");
+    expect(receiverSuspectsForTest("fooBar.updateTask()").map((suspect) => suspect.reason)).toEqual(["unreviewed task-store receiver shape fooBar"]);
+    expect(receiverSuspectsForTest("fooBar.getTask()"), "non-writer methods are outside the census").toEqual([]);
+    expect(receiverSuspectsForTest("extensionRunner.emit()", "packages/engine/src/pi.ts"), "reviewed non-store receiver is exempt in its module").toEqual([]);
+    expect(receiverSuspectsForTest("extensionRunner.emit()", "packages/engine/src/other.ts").map((suspect) => suspect.reason), "non-store exemptions are module-scoped").toEqual(["unreviewed task-store receiver shape extensionRunner"]);
+  });
+  it("has no unreviewed receivers or stale reviewed receiver entries on the real tree", () => {
+    expect(deriveReceiverCensus()).toEqual({ unreviewed: [], staleNonStoreEntries: [], staleTaskStoreShapes: [] });
+  });
+  it("inventories notification-service wedge-notification writes made through this.store", () => {
+    const file = "packages/engine/src/notification/notification-service.ts";
+    const sites = deriveMergeDurableWriteCallSites().callSites.filter((site) => site.file === file);
+    const expectedWriters = ["markTaskWedgeNotificationPending", "claimTaskWedgeNotificationEpisode", "clearTaskWedgeNotificationPending", "acknowledgeTaskWedgeNotificationDelivery", "markTerminalFailureAutoRecoveryEscalationDelivered", "markTerminalFailureAutoRecoveryBudgetExhausted"].map((method) => `this.store.${method}`);
+    for (const writer of expectedWriters) expect(sites.some((site) => site.writer === writer), `${writer} has a derived call site`).toBe(true);
+    for (const site of sites) {
+      const entry = currentManifest.entries.find((candidate) => candidate.callSiteId === site.callSiteId);
+      expect(entry, `${site.callSiteId} has a manifest verdict`).toBeDefined();
+      assertInventoryEntry(entry!);
+    }
+  });
+  it("keeps every legacy store.* call-site id and fingerprint stable", () => {
+    const derived = new Map(deriveMergeDurableWriteCallSites().callSites.map((site) => [site.callSiteId, site.callSiteFingerprint]));
+    const legacy = currentManifest.entries.filter((entry) => entry.writer.startsWith("store."));
+    expect(legacy.length).toBeGreaterThan(0);
+    expect(legacy.filter((entry) => !derived.has(entry.callSiteId)).map((entry) => entry.callSiteId), "legacy store.* id disappeared").toEqual([]);
+    expect(legacy.filter((entry) => derived.get(entry.callSiteId) !== entry.callSiteFingerprint).map((entry) => entry.callSiteId), "legacy store.* fingerprint changed").toEqual([]);
+  });
   it("enforces final lifecycle, axes, observations, proofs, and out-of-frontier tuple", () => {
     expect(currentManifest.inventoryStatus).toBe("final");
     for (const entry of currentManifest.entries) assertInventoryEntry(entry);
@@ -89,7 +131,14 @@ describe("FN-8923 orphan durable-write inventory drift guard", () => {
     const expectedVerdict = revised.entries[0]!;
     for (const field of ["owningEntryPoint", "reachableDataStates", "axis1", "axis1Evidence", "axis2Provisional", "axis2Final", "observedInSuite", "executionProof", "followUpTaskId"] as const) expect(result[field]).toEqual(expectedVerdict[field]);
     const derived = deriveMergeDurableWriteCallSites().callSites.find((site) => site.callSiteId === prior.callSiteId)!;
-    expect({ callSiteId: result.callSiteId, callSiteFingerprint: result.callSiteFingerprint, file: result.file, enclosingSymbolPath: result.enclosingSymbolPath, writer: result.writer, ordinal: result.ordinal, lineHint: result.lineHint }).toEqual(derived);
+    const { lineHint: _lineHint, ...derivedIdentity } = derived;
+    expect({ callSiteId: result.callSiteId, callSiteFingerprint: result.callSiteFingerprint, file: result.file, enclosingSymbolPath: result.enclosingSymbolPath, writer: result.writer, ordinal: result.ordinal }).toEqual(derivedIdentity);
+  });
+  it("never persists a line position in manifest entries", () => {
+    const rebuilt = buildInventoryManifest(manifest);
+    expect(rebuilt.entries.filter((entry) => "lineHint" in entry).map((entry) => entry.callSiteId)).toEqual([]);
+    const pending = buildInventoryManifest({ ...manifest, entries: manifest.entries.slice(1) }).entries[0]!;
+    expect("lineHint" in pending).toBe(false);
   });
   it("refuses regeneration when classification or receiver derivation is incomplete", () => {
     expect(() => assertInventoryRegenerationInputs({ unclassified: ["newWriter"], suspects: [] })).toThrow("unclassified TaskStore methods");

@@ -7,6 +7,12 @@ from a comment or retain an enclosing closure when formatting changes.
 The alias rule is deliberately narrow. A single-assignment local initialized from `store` or
 `options.store` is a provable task-store alias; computed and destructured receivers fail closed
 as suspects rather than being silently omitted from the frontier.
+
+FNXC:MergeDurableWriteInventory 2026-10-08-05:21:
+KB-047 superseded the `store`/`options.store`-only receiver rule. Receivers come from the reviewed
+`TASK_STORE_RECEIVER_SHAPES` and per-module `NON_TASK_STORE_RECEIVERS` tables, aliases of any recognised shape
+stay provable, and any other receiver in front of a writer-named method fails closed as an unreviewed suspect.
+Legacy shapes keep the `store.<method>` writer label so pre-KB-047 call-site ids never change.
 */
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -956,13 +962,188 @@ function unwrapStoreExpr(expr: ts.Expression): ts.Expression {
   }
   return expr;
 }
-function isStoreExpr(expr: ts.Expression, aliases: Set<string>): boolean {
+/*
+FNXC:MergeDurableWriteInventory 2026-10-08-05:21:
+KB-047: the scanner used to recognise only `store`, `options.store`, `deps.store` and their aliases, so every
+write through `this.store` (including notification-service wedge-notification state) and other store-holding
+receivers had no inventory row and no human verdict. Receivers are now reviewed tables, never a name heuristic:
+agent, mission and plugin stores share writer method names such as `emit`, so "ends in store" would be wrong.
+- `TASK_STORE_RECEIVER_SHAPES`: receiver shapes whose declared type is a TaskStore or a TaskStore-shaped subset.
+- `NON_TASK_STORE_RECEIVERS`: per-module receivers proven NOT to be a TaskStore; a per-module entry wins over a
+  global shape so a single mis-typed module can be excluded precisely.
+- Census rule: any other receiver in front of a writer-named method fails closed as the suspect
+  `unreviewed task-store receiver shape <shape>`, and a non-store entry that is no longer observed is stale.
+Id stability: legacy shapes (and their aliases) keep the writer label `store.<method>` so the pre-KB-047 rows keep
+byte-identical ids; new shapes use `<shape>.<method>`, and an alias of a new shape uses its root shape. Ordinals
+are counted per `path::writer`, so a new-shape row can never shift a legacy row's ordinal.
+*/
+
+/** Receivers whose rows keep the historical `store.<method>` writer label (id stability). */
+const LEGACY_STORE_SHAPES: ReadonlySet<string> = new Set(["store", "options.store", "deps.store"]);
+
+/** Reviewed receiver shapes whose declared type is a TaskStore (or a TaskStore-shaped subset). */
+export const TASK_STORE_RECEIVER_SHAPES: readonly { shape: string; reason: string }[] = Object.freeze([
+  { shape: "store", reason: "legacy FN-8923 receiver: TaskStore parameter or local" },
+  { shape: "options.store", reason: "legacy FN-8923 receiver: TaskStore option field" },
+  { shape: "deps.store", reason: "legacy FN-8923 receiver: TaskStore dependency field" },
+  { shape: "this.store", reason: "class field typed TaskStore, or a TaskStore-shaped subset (NotificationServiceStore, OverseerLogStore)" },
+  { shape: "ctx.store", reason: "merger.ts and agent-usage-telemetry.ts contexts declare `store: TaskStore`" },
+  { shape: "input.store", reason: "merge/executor/runtime input objects declare `store: TaskStore` or a Pick of it" },
+  { shape: "opts.store", reason: "merger.ts and workspace-base-branch.ts options declare `store: TaskStore` or `Pick<TaskStore, \"logEntry\">`" },
+  { shape: "params.store", reason: "merger-ai-squash-gates.ts and merger-file-scope.ts params declare `store: TaskStore`" },
+  { shape: "this.taskStore", reason: "agent-heartbeat, mission-autopilot and in-process-runtime class field typed TaskStore" },
+  { shape: "taskStore", reason: "agent-heartbeat and agent-tools parameters typed TaskStore" },
+  { shape: "this.options.taskStore", reason: "mesh-lease-manager and routine-runner options declare `taskStore: TaskStore`" },
+  { shape: "deps.taskStore", reason: "foreign-only-contamination dependencies declare `taskStore: TaskStore`" },
+  { shape: "callbackStore", reason: "worktree-acquisition.ts `new Proxy(store, ...)` over the TaskStore; a Proxy initializer is not an alias" },
+]);
+
+/** Reviewed receivers in front of writer-named methods that are proven NOT to be a TaskStore, per module. */
+export const NON_TASK_STORE_RECEIVERS: readonly { module: string; shape: string; reason: string }[] = Object.freeze([
+  { module: "packages/engine/src/cli-agent/adapters/codex.ts", shape: "this", reason: "CodexWaitingAnalyzer's own adapter-event emit" },
+  { module: "packages/engine/src/cli-agent/adapters/generic.ts", shape: "this", reason: "GenericHeuristicAnalyzer's own adapter-event emit" },
+  { module: "packages/engine/src/missions/mission-execution-loop.ts", shape: "this", reason: "MissionExecutionLoop extends EventEmitter; in-process event emit" },
+  { module: "packages/engine/src/runtimes/in-process-runtime.ts", shape: "this", reason: "InProcessRuntime's private recordActivity and EventEmitter emit" },
+  { module: "packages/engine/src/scheduler.ts", shape: "this", reason: "Scheduler's private transitionQueuedEpisode; its TaskStore writes are inventoried at this.store call sites" },
+  { module: "packages/engine/src/self-healing.ts", shape: "this", reason: "SelfHealingManager.reconcileStaleSymbolLocks; its TaskStore writes are inventoried at this.store call sites" },
+  { module: "packages/engine/src/workflows/workflow-graph-task-runner.ts", shape: "this", reason: "WorkflowGraphTaskRunner's private telemetry emit" },
+  { module: "packages/engine/src/execution/step-session-executor.ts", shape: "stuckTaskDetector", reason: "StuckTaskDetector.recordActivity in-memory heartbeat" },
+  { module: "packages/engine/src/triage.ts", shape: "stuckDetector", reason: "StuckTaskDetector.recordActivity in-memory heartbeat" },
+  { module: "packages/engine/src/pi.ts", shape: "extensionRunner", reason: "pi ExtensionRunner session_shutdown event emit" },
+  { module: "packages/engine/src/scheduler.ts", shape: "this.options.prMonitor", reason: "PrMonitor.updatePrInfo in-memory PR tracking" },
+  { module: "packages/engine/src/credential-instance-rotation.ts", shape: "this.options", reason: "injected RotationAudit callback option, not a TaskStore receiver" },
+  { module: "packages/engine/src/merge/merge-write-fence.ts", shape: "recorder", reason: "OrphanFenceAuditRecorder for the fence's own merge:orphan-write-fenced row; production callers inject the function form" },
+  { module: "packages/engine/src/workflows/workflow-column-boundary.ts", shape: "deps", reason: "injected WorkflowColumnMove seam (deps.moveTask), not a TaskStore receiver" },
+]);
+
+const TASK_STORE_SHAPE_SET: ReadonlySet<string> = new Set(TASK_STORE_RECEIVER_SHAPES.map((entry) => entry.shape));
+const NON_TASK_STORE_KEYS: ReadonlySet<string> = new Set(NON_TASK_STORE_RECEIVERS.map((entry) => `${entry.module}::${entry.shape}`));
+
+/** Normalised receiver shape: an unwrapped `this`/identifier property chain, `?.` folded into `.`. */
+function receiverShape(expr: ts.Expression): string | undefined {
   expr = unwrapStoreExpr(expr);
-  return ts.isIdentifier(expr) && (expr.text === "store" || aliases.has(expr.text))
-    || ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.expression) && ["options", "deps"].includes(expr.expression.text) && expr.name.text === "store";
+  if (ts.isIdentifier(expr)) return expr.text;
+  if (expr.kind === ts.SyntaxKind.ThisKeyword) return "this";
+  if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.name)) {
+    const inner = receiverShape(expr.expression);
+    return inner === undefined ? undefined : `${inner}.${expr.name.text}`;
+  }
+  return undefined;
 }
 
-export type InventoryEntry = DerivedCallSite & {
+/** Census text for a receiver that is not a simple chain (call results, element access, ...). */
+function receiverCensusText(expr: ts.Expression, sf: ts.SourceFile): string {
+  return receiverShape(expr) ?? unwrapStoreExpr(expr).getText(sf).replace(/\s+/g, "").replaceAll("?.", ".");
+}
+
+/**
+ * Resolves a receiver to its root task-store shape, or undefined when it is not a reviewed task store.
+ * Legacy shapes win over aliases so a `const store = this.store` never relabels legacy rows.
+ */
+function storeRoot(expr: ts.Expression, aliases: ReadonlyMap<string, string>, module: string): string | undefined {
+  const shape = receiverShape(expr);
+  if (shape === undefined || NON_TASK_STORE_KEYS.has(`${module}::${shape}`)) return undefined;
+  if (LEGACY_STORE_SHAPES.has(shape)) return shape;
+  return aliases.get(shape) ?? (TASK_STORE_SHAPE_SET.has(shape) ? shape : undefined);
+}
+
+function writerLabel(root: string, method: string): string {
+  return LEGACY_STORE_SHAPES.has(root) ? `store.${method}` : `${root}.${method}`;
+}
+
+type FileScan = { callSites: DerivedCallSite[]; suspects: Suspect[]; observedNonStore: Set<string>; observedStoreShapes: Set<string> };
+
+/** The single receiver-rule implementation shared by the production derivation and the test seam. */
+function scanSourceFile(sf: ts.SourceFile, entry: string, writers: ReadonlySet<string>): FileScan {
+  const callSites: DerivedCallSite[] = []; const suspects: Suspect[] = [];
+  const observedNonStore = new Set<string>(); const observedStoreShapes = new Set<string>();
+  const aliases = new Map<string, string>(); const paths: string[] = []; const ordinals = new Map<string, number>();
+  const line = (node: ts.Node) => sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
+  const root = (expr: ts.Expression): string | undefined => {
+    const resolved = storeRoot(expr, aliases, entry);
+    if (resolved !== undefined) observedStoreShapes.add(resolved);
+    return resolved;
+  };
+  const pushSite = (node: ts.CallExpression, writer: string): void => {
+    const path = paths.join(">") || "<module>"; const key = `${path}::${writer}`; const ordinal = (ordinals.get(key) ?? 0) + 1; ordinals.set(key, ordinal);
+    callSites.push({ callSiteId: `${entry}::${path}::${writer}::#${ordinal}`, callSiteFingerprint: fingerprint(node, sf), file: entry, enclosingSymbolPath: path, writer, ordinal, lineHint: line(node) });
+  };
+  // A local alias is provable only when it has one declaration and no later write. Keeping
+  // this conservative turns reassignments into suspects instead of guessing their receiver.
+  const writes = new Map<string, number>();
+  const countWrites = (node: ts.Node): void => {
+    if (ts.isBinaryExpression(node) && ts.isIdentifier(node.left)
+      && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+      && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
+      writes.set(node.left.text, (writes.get(node.left.text) ?? 0) + 1);
+    }
+    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && ts.isIdentifier(node.operand)
+      && [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator)) {
+      writes.set(node.operand.text, (writes.get(node.operand.text) ?? 0) + 1);
+    }
+    ts.forEachChild(node, countWrites);
+  };
+  countWrites(sf);
+  const visit = (node: ts.Node): void => {
+    let pushed: string | undefined;
+    if ((ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isVariableDeclaration(node)) && node.name && ts.isIdentifier(node.name)) { pushed = node.name.text; paths.push(pushed); }
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      const aliasRoot = root(node.initializer);
+      if (aliasRoot !== undefined) {
+        const declarationList = node.parent;
+        const isConstOrLet = ts.isVariableDeclarationList(declarationList)
+          && declarationList.flags !== ts.NodeFlags.None;
+        if (isConstOrLet && (writes.get(node.name.text) ?? 0) === 0) aliases.set(node.name.text, aliasRoot);
+        else suspects.push({ file: entry, line: line(node), text: node.getText(sf), reason: `non-single-assignment task-store alias ${node.name.text}` });
+      }
+    }
+    if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer && root(node.initializer) !== undefined) {
+      for (const element of node.name.elements) {
+        const name = element.name.getText(sf);
+        const property = element.propertyName?.getText(sf) ?? name;
+        if (writers.has(property)) suspects.push({ file: entry, line: line(node), text: node.getText(sf), reason: `destructured task-store writer ${property}` });
+      }
+    }
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      if (ts.isIdentifier(callee) && EXTRA_WRITERS.includes(callee.text as (typeof EXTRA_WRITERS)[number])) {
+        pushSite(node, callee.text);
+      } else if (ts.isIdentifier(callee) && writers.has(callee.text) && !NOT_A_DURABLE_WRITE[callee.text]) {
+        suspects.push({ file: entry, line: line(node), text: node.getText(sf), reason: `unbound task-store writer identifier ${callee.text}` });
+      }
+      if (ts.isElementAccessExpression(callee) && root(callee.expression) !== undefined) suspects.push({ file: entry, line: line(node), text: node.getText(sf), reason: "computed task-store receiver" });
+      if (ts.isPropertyAccessExpression(callee) && writers.has(callee.name.text)) {
+        const storeShape = root(callee.expression);
+        if (storeShape !== undefined) pushSite(node, writerLabel(storeShape, callee.name.text));
+        else {
+          const shape = receiverCensusText(callee.expression, sf);
+          const nonStoreKey = `${entry}::${shape}`;
+          if (NON_TASK_STORE_KEYS.has(nonStoreKey)) observedNonStore.add(nonStoreKey);
+          else suspects.push({ file: entry, line: line(node), text: node.getText(sf), reason: `unreviewed task-store receiver shape ${shape}` });
+        }
+      }
+    }
+    ts.forEachChild(node, visit); if (pushed) paths.pop();
+  }; visit(sf);
+  return { callSites, suspects, observedNonStore, observedStoreShapes };
+}
+
+/*
+FNXC:MergeReliability 2026-10-08-02:04:
+KB-012: inventory identity is `callSiteId` + `callSiteFingerprint`; line position must never be persisted.
+A persisted `lineHint` was a line pin in disguise: any unrelated edit above a merge-reachable write turned the
+"rebuilds a current manifest" guard red. `DerivedCallSite.lineHint` stays for diagnostics only.
+*/
+/** Derived call-site fields that are persisted in the inventory manifest (never the diagnostic `lineHint`). */
+export type PersistedCallSite = Omit<DerivedCallSite, "lineHint">;
+
+/** Strip diagnostic-only fields so a manifest entry never carries a line pin. */
+function toPersistedEntry<T extends PersistedCallSite & { lineHint?: number }>(entry: T): Omit<T, "lineHint"> {
+  const { lineHint: _lineHint, ...persisted } = entry;
+  return persisted;
+}
+
+export type InventoryEntry = PersistedCallSite & {
   owningEntryPoint: string;
   reachableDataStates: string[];
   axis1: string;
@@ -983,66 +1164,39 @@ export type InventoryManifest = {
   entries: InventoryEntry[];
 };
 
-export function deriveMergeDurableWriteCallSites(): { callSites: DerivedCallSite[]; suspects: Suspect[]; scannedModules: string[]; closureBoundary: { module: string; reason: string }[]; writerSurface: string[]; writerSurfaceSource: string } {
-  const surface = deriveDurableWriterSurface(); const closure = deriveMergeReachableModules();
+type ClosureScan = { callSites: DerivedCallSite[]; suspects: Suspect[]; observedNonStore: Set<string>; observedStoreShapes: Set<string>; scannedModules: string[]; closureBoundary: { module: string; reason: string }[]; writerSurface: string[]; writerSurfaceSource: string };
+
+function scanMergeClosure(): ClosureScan {
+  const surface = deriveDurableWriterSurface(); const closure = deriveMergeReachableModules(); const writers = new Set(surface.writers);
   const callSites: DerivedCallSite[] = []; const suspects: Suspect[] = [];
+  const observedNonStore = new Set<string>(); const observedStoreShapes = new Set<string>();
   for (const entry of closure.modules) {
-    const file = resolve(ROOT, entry); const sf = source(file); const aliases = new Set<string>(); const paths: string[] = []; const ordinals = new Map<string, number>();
-    // A local alias is provable only when it has one declaration and no later write. Keeping
-    // this conservative turns reassignments into suspects instead of guessing their receiver.
-    const writes = new Map<string, number>();
-    const countWrites = (node: ts.Node): void => {
-      if (ts.isBinaryExpression(node) && ts.isIdentifier(node.left)
-        && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
-        && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
-        writes.set(node.left.text, (writes.get(node.left.text) ?? 0) + 1);
-      }
-      if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && ts.isIdentifier(node.operand)
-        && [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator)) {
-        writes.set(node.operand.text, (writes.get(node.operand.text) ?? 0) + 1);
-      }
-      ts.forEachChild(node, countWrites);
-    };
-    countWrites(sf);
-    const visit = (node: ts.Node): void => {
-      let pushed: string | undefined;
-      if ((ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isVariableDeclaration(node)) && node.name && ts.isIdentifier(node.name)) { pushed = node.name.text; paths.push(pushed); }
-      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && isStoreExpr(node.initializer, aliases)) {
-        const declarationList = node.parent;
-        const isConstOrLet = ts.isVariableDeclarationList(declarationList)
-          && declarationList.flags !== ts.NodeFlags.None;
-        if (isConstOrLet && (writes.get(node.name.text) ?? 0) === 0) aliases.add(node.name.text);
-        else suspects.push({ file: entry, line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1, text: node.getText(sf), reason: `non-single-assignment task-store alias ${node.name.text}` });
-      }
-      if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer && isStoreExpr(node.initializer, aliases)) {
-        for (const element of node.name.elements) {
-          const name = element.name.getText(sf);
-          const property = element.propertyName?.getText(sf) ?? name;
-          if (surface.writers.includes(property)) suspects.push({ file: entry, line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1, text: node.getText(sf), reason: `destructured task-store writer ${property}` });
-        }
-      }
-      if (ts.isCallExpression(node)) {
-        const callee = node.expression;
-        if (ts.isIdentifier(callee) && EXTRA_WRITERS.includes(callee.text as (typeof EXTRA_WRITERS)[number])) {
-          const path = paths.join(">") || "<module>";
-          const writer = callee.text;
-          const key = `${path}::${writer}`;
-          const ordinal = (ordinals.get(key) ?? 0) + 1;
-          ordinals.set(key, ordinal);
-          callSites.push({ callSiteId: `${entry}::${path}::${writer}::#${ordinal}`, callSiteFingerprint: fingerprint(node, sf), file: entry, enclosingSymbolPath: path, writer, ordinal, lineHint: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1 });
-        } else if (ts.isIdentifier(callee) && surface.writers.includes(callee.text) && !NOT_A_DURABLE_WRITE[callee.text]) {
-          suspects.push({ file: entry, line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1, text: node.getText(sf), reason: `unbound task-store writer identifier ${callee.text}` });
-        }
-        if (ts.isElementAccessExpression(callee) && isStoreExpr(callee.expression, aliases)) suspects.push({ file: entry, line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1, text: node.getText(sf), reason: "computed task-store receiver" });
-        if (ts.isPropertyAccessExpression(callee) && isStoreExpr(callee.expression, aliases) && surface.writers.includes(callee.name.text)) {
-          const path = paths.join(">") || "<module>"; const writer = `store.${callee.name.text}`; const key = `${path}::${writer}`; const ordinal = (ordinals.get(key) ?? 0) + 1; ordinals.set(key, ordinal);
-          callSites.push({ callSiteId: `${entry}::${path}::${writer}::#${ordinal}`, callSiteFingerprint: fingerprint(node, sf), file: entry, enclosingSymbolPath: path, writer, ordinal, lineHint: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1 });
-        }
-      }
-      ts.forEachChild(node, visit); if (pushed) paths.pop();
-    }; visit(sf);
+    const scan = scanSourceFile(source(resolve(ROOT, entry)), entry, writers);
+    callSites.push(...scan.callSites); suspects.push(...scan.suspects);
+    for (const key of scan.observedNonStore) observedNonStore.add(key);
+    for (const shape of scan.observedStoreShapes) observedStoreShapes.add(shape);
   }
-  return { callSites: callSites.sort((a, b) => a.callSiteId.localeCompare(b.callSiteId)), suspects, scannedModules: closure.modules, closureBoundary: closure.boundary, writerSurface: surface.writers, writerSurfaceSource: surface.source };
+  return { callSites: callSites.sort((a, b) => a.callSiteId.localeCompare(b.callSiteId)), suspects, observedNonStore, observedStoreShapes, scannedModules: closure.modules, closureBoundary: closure.boundary, writerSurface: surface.writers, writerSurfaceSource: surface.source };
+}
+
+export function deriveMergeDurableWriteCallSites(): { callSites: DerivedCallSite[]; suspects: Suspect[]; scannedModules: string[]; closureBoundary: { module: string; reason: string }[]; writerSurface: string[]; writerSurfaceSource: string } {
+  const { observedNonStore: _observedNonStore, observedStoreShapes: _observedStoreShapes, ...derived } = scanMergeClosure();
+  return derived;
+}
+
+/**
+ * FNXC:MergeDurableWriteInventory 2026-10-08-05:21:
+ * KB-047 receiver census over the merge closure. `unreviewed` lists writer-named calls behind a receiver that is
+ * in neither reviewed table; `staleNonStoreEntries` and `staleTaskStoreShapes` list reviewed entries that are no
+ * longer observed, so the tables cannot silently outlive the code they describe.
+ */
+export function deriveReceiverCensus(): { unreviewed: Suspect[]; staleNonStoreEntries: string[]; staleTaskStoreShapes: string[] } {
+  const scan = scanMergeClosure();
+  return {
+    unreviewed: scan.suspects.filter((suspect) => suspect.reason.startsWith("unreviewed task-store receiver shape ")),
+    staleNonStoreEntries: [...NON_TASK_STORE_KEYS].filter((key) => !scan.observedNonStore.has(key)).sort(),
+    staleTaskStoreShapes: [...TASK_STORE_SHAPE_SET].filter((shape) => !scan.observedStoreShapes.has(shape)).sort(),
+  };
 }
 
 /**
@@ -1056,7 +1210,7 @@ export function assertInventoryRegenerationInputs(input: { unclassified: string[
 
 function pendingInventoryEntry(site: DerivedCallSite): InventoryEntry {
   return {
-    ...site,
+    ...toPersistedEntry(site),
     owningEntryPoint: "indeterminate",
     reachableDataStates: ["unobservable:human classification required for new durable write"],
     axis1: "indeterminate",
@@ -1091,25 +1245,23 @@ export function buildInventoryManifest(previous: InventoryManifest): InventoryMa
     writerSurfaceClassification: surface.classified,
     entries: derived.callSites.map((site) => {
       const prior = priorEntries.get(site.callSiteId);
-      return prior ? { ...prior, ...site } : pendingInventoryEntry(site);
+      return prior ? toPersistedEntry({ ...prior, ...site }) : pendingInventoryEntry(site);
     }),
   };
 }
 
-/** Test seam for direct alias-split assertions. It runs the same AST shapes, not a regex. */
-export function classifyReceiverForTest(code: string): "provable" | "suspect" {
-  const sf = ts.createSourceFile("alias-fixture.ts", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const aliases = new Set<string>();
-  let result: "provable" | "suspect" = "suspect";
-  const visit = (node: ts.Node): void => {
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && isStoreExpr(node.initializer, aliases)) aliases.add(node.name.text);
-    if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer && isStoreExpr(node.initializer, aliases)) result = "suspect";
-    if (ts.isCallExpression(node)) {
-      if (ts.isElementAccessExpression(node.expression) && isStoreExpr(node.expression.expression, aliases)) result = "suspect";
-      if (ts.isPropertyAccessExpression(node.expression) && isStoreExpr(node.expression.expression, aliases)) result = "provable";
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
-  return result;
+/**
+ * Test seam for direct receiver assertions. It runs the production `scanSourceFile` rules, not a regex:
+ * any suspect (destructured, computed, unreviewed receiver) wins; otherwise a derived call site is provable.
+ */
+export function classifyReceiverForTest(code: string, module = "alias-fixture.ts"): "provable" | "suspect" {
+  const sf = ts.createSourceFile(module, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const scan = scanSourceFile(sf, module, new Set(deriveDurableWriterSurface().writers));
+  return scan.suspects.length === 0 && scan.callSites.length > 0 ? "provable" : "suspect";
+}
+
+/** Test seam exposing the suspects (with reasons) that the production receiver rules raise for a snippet. */
+export function receiverSuspectsForTest(code: string, module = "alias-fixture.ts"): Suspect[] {
+  const sf = ts.createSourceFile(module, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  return scanSourceFile(sf, module, new Set(deriveDurableWriterSurface().writers)).suspects;
 }
