@@ -1,9 +1,5 @@
-import { exec } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { promisify } from "node:util";
-
-const execAsync = promisify(exec);
 
 export interface DetectedCommand {
   name: string;
@@ -42,15 +38,17 @@ export function detectFramework(scriptCommand: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Reads and parses a package.json, returning null when it is missing or malformed.
+ *
+ * FNXC:DevServerDetect 2026-10-08-17:49:
+ * KB-087: the previous implementation shelled out to `node -e '...'`. cmd.exe does not treat single quotes as quoting, so every read failed on Windows and detection always returned no scripts.
+ * Read the file directly in-process: no shell, no quoting, identical behavior on every platform. The catch → null contract (skip unreadable or malformed packages) is preserved.
+ */
 async function readPackageJson(packagePath: string): Promise<PackageJsonShape | null> {
   try {
-    const escapedPath = JSON.stringify(packagePath);
-    const { stdout } = await execAsync(
-      `node -e 'process.stdout.write(require("node:fs").readFileSync(${escapedPath}, "utf8"))'`,
-      { maxBuffer: 1024 * 1024 },
-    );
-
-    return JSON.parse(stdout) as PackageJsonShape;
+    const raw = await readFile(packagePath, "utf8");
+    return JSON.parse(raw) as PackageJsonShape;
   } catch {
     return null;
   }

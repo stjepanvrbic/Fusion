@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Request, Response } from "express";
-import { superviseSpawn, AgentStore } from "@fusion/core";
+import { superviseSpawn, AgentStore, resolveShellFreeLaunch } from "@fusion/core";
 import { ApiError, badRequest, notFound } from "../api-error.js";
 import {
   runLinkLocalFnBinary,
@@ -537,10 +537,13 @@ export function registerSystemRoutes(ctx: ApiRoutesContext, deps: SystemRouteDep
       appendJobLine(job, "system", "Installing workspace dependencies (pnpm install)…");
       let install: ReturnType<typeof superviseSpawn>;
       try {
-        install = superviseSpawn(process.env.FUSION_SYSTEM_PNPM_BIN ?? "pnpm", [...pnpmPreArgs, "install"], {
-          ...spawnOptions,
-          shell: process.platform === "win32",
-        });
+        /*
+        FNXC:SystemPanel 2026-10-08-17:49:
+        KB-087: the install used to spawn with `shell: true` on Windows. cmd.exe splits an unquoted command path at its first space (for example a pnpm under C:\Program Files), so the install failed and the build never ran; a shell launch is also an injection surface.
+        Launch shell-free through resolveShellFreeLaunch, which resolves bare `pnpm` via PATH/PATHEXT and unwraps the .cmd shim (identity on POSIX). An UnlaunchableCommandError lands in this catch and fails the job before any build or restart.
+        */
+        const launch = resolveShellFreeLaunch(process.env.FUSION_SYSTEM_PNPM_BIN ?? "pnpm", [...pnpmPreArgs, "install"]);
+        install = superviseSpawn(launch.command, launch.args, spawnOptions);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         appendJobLine(job, "system", `Failed to spawn dependency install: ${message}`);
@@ -678,10 +681,20 @@ export function registerSystemRoutes(ctx: ApiRoutesContext, deps: SystemRouteDep
         return;
       }
 
-      const install = await runJobStep(job, "pnpm install", pnpmBin, [...pnpmPrefix, "install"], {
-        ...spawnOptions,
-        shell: process.platform === "win32",
-      });
+      /*
+      FNXC:SystemPanel 2026-10-08-17:49:
+      KB-087: same shell-free launch as the full rebuild install (no `shell: true`, which broke spaced command paths under cmd.exe). A command only a shell could run fails this step and the job, with no build or restart.
+      */
+      let installLaunch: ReturnType<typeof resolveShellFreeLaunch>;
+      try {
+        installLaunch = resolveShellFreeLaunch(pnpmBin, [...pnpmPrefix, "install"]);
+      } catch (err) {
+        const detail = `pnpm install could not start: ${err instanceof Error ? err.message : String(err)}`;
+        appendJobLine(job, "system", detail);
+        finishJob(job, "failed", { error: detail });
+        return;
+      }
+      const install = await runJobStep(job, "pnpm install", installLaunch.command, installLaunch.args, spawnOptions);
       if (!install.ok) {
         finishJob(job, "failed", { error: install.detail });
         return;

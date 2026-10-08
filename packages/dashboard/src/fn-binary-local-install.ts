@@ -191,12 +191,22 @@ export function resolveBunExecutable(): string {
  * Copy the built standalone binary + co-located client/runtime assets into
  * `~/.local/share/fusion` and point `~/.local/bin/{fn,fusion}` at it.
  */
+/**
+ * File name of the Bun-compiled standalone binary in `packages/cli/dist`.
+ *
+ * FNXC:SystemPanelFnBinary 2026-10-08-17:49:
+ * KB-087: Bun emits `fn.exe` on Windows and `fn` elsewhere. Exported so tests build fixtures with the exact name the installer reads and cannot drift from it.
+ */
+export function fnBinaryFileName(platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? "fn.exe" : "fn";
+}
+
 export function installLocalFnBinary(
   distDir: string,
   onLog: FnBinaryLogFn,
   paths: FnBinaryLocalPaths = resolveFnBinaryLocalPaths(),
 ): void {
-  const srcBinary = join(distDir, process.platform === "win32" ? "fn.exe" : "fn");
+  const srcBinary = join(distDir, fnBinaryFileName());
   const srcClient = join(distDir, "client");
   const srcRuntime = join(distDir, "runtime");
 

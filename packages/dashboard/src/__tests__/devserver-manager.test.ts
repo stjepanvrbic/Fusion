@@ -91,12 +91,25 @@ function makeConfig(id = "dev-1", command = "npm run dev"): DevServerConfig {
   };
 }
 
+/*
+FNXC:WindowsTestPortability 2026-10-08-17:49:
+KB-087: DevServerManager reads process.platform in its constructor, and its win32 branch calls the real process.kill(child.pid).
+With mock children carrying fake pids (1000+) that could signal an unrelated real process, so every test pins a platform before constructing a manager.
+The default pin is linux (POSIX SIGTERM/SIGKILL assertions); win32 cases pin win32 and spy process.kill so no real signal is ever sent.
+*/
+const ORIGINAL_PLATFORM = Object.getOwnPropertyDescriptor(process, "platform")!;
+
+function setPlatform(platform: NodeJS.Platform): void {
+  Object.defineProperty(process, "platform", { ...ORIGINAL_PLATFORM, value: platform });
+}
+
 describe("devserver-manager", () => {
   let manager: DevServerManager;
   let nextPid: number;
   let children: MockChildProcess[];
 
   beforeEach(() => {
+    setPlatform("linux");
     nextPid = 1000;
     children = [];
     spawnMock.mockReset();
@@ -123,6 +136,7 @@ describe("devserver-manager", () => {
     manager.destroy();
     destroyAllDevServerManagers();
     vi.useRealTimers();
+    Object.defineProperty(process, "platform", ORIGINAL_PLATFORM);
   });
 
   it("startServer spawns child process and transitions starting to running on output", async () => {
@@ -249,6 +263,60 @@ describe("devserver-manager", () => {
 
     await vi.runAllTimersAsync();
     await stopPromise;
+  });
+
+  it("stopServer on win32 terminates via process.kill(pid) without POSIX signals", async () => {
+    setPlatform("win32");
+    const winManager = new DevServerManager("/project");
+    const killSpy = vi.spyOn(process, "kill").mockImplementation((pid: number) => {
+      const target = children.find((child) => child.pid === pid);
+      setImmediate(() => target?.emit("close", 0));
+      return true;
+    });
+    try {
+      const config = makeConfig("win-stop");
+      await winManager.startServer(config);
+      children[0].stdout.emit("data", "ready");
+
+      await winManager.stopServer(config.id);
+
+      expect(killSpy).toHaveBeenCalledTimes(1);
+      expect(killSpy).toHaveBeenCalledWith(children[0].pid);
+      expect(children[0].kill).not.toHaveBeenCalled();
+      expect(winManager.getSession(config.id)?.status).toBe("stopped");
+    } finally {
+      winManager.destroy();
+      killSpy.mockRestore();
+    }
+  });
+
+  it("stopServer on win32 escalates with a second process.kill(pid) after timeout", async () => {
+    vi.useFakeTimers();
+    setPlatform("win32");
+    const winManager = new DevServerManager("/project");
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      const config = makeConfig("win-escalate");
+      await winManager.startServer(config);
+      children[0].stdout.emit("data", "ready");
+
+      const stopPromise = winManager.stopServer(config.id);
+      expect(killSpy).toHaveBeenCalledTimes(1);
+      expect(killSpy).toHaveBeenLastCalledWith(children[0].pid);
+
+      await vi.advanceTimersByTimeAsync(5001);
+      expect(killSpy).toHaveBeenCalledTimes(2);
+      expect(killSpy).toHaveBeenLastCalledWith(children[0].pid);
+      expect(children[0].kill).not.toHaveBeenCalled();
+
+      children[0].emit("close", 0);
+      await vi.runAllTimersAsync();
+      await stopPromise;
+      expect(winManager.getSession(config.id)?.status).toBe("stopped");
+    } finally {
+      winManager.destroy();
+      killSpy.mockRestore();
+    }
   });
 
   it("marks session failed on non-zero exit", async () => {

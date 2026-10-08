@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs";
+import { resolve } from "node:path";
 import * as nodePty from "node-pty";
 import {
   READY_QUIET_WINDOW_MS,
@@ -68,10 +69,16 @@ const ORIGINAL_SHELL = process.env.SHELL;
 
 describe("TerminalService", () => {
   let service: TerminalService;
-  const projectRoot = "/test/project";
+  /*
+  FNXC:WindowsTestPortability 2026-10-08-17:49:
+  KB-087: TerminalService resolves projectRoot and cwd with path.resolve, which is drive-qualified on Windows.
+  Expectations use the same resolve, and beforeEach pins a POSIX platform so shell/signal assertions do not pick up the host win32 branch; explicit win32 tests override the pin.
+  */
+  const projectRoot = resolve("/test/project");
 
   beforeEach(() => {
     vi.clearAllMocks();
+    __setTerminalPlatformForTests("linux");
     service = new TerminalService(projectRoot, 10);
     vi.mocked(nodePty.spawn).mockImplementation(() => mockPtyProcess as never);
     mockLoadPtyModule.mockResolvedValue(nodePty);
@@ -229,7 +236,7 @@ describe("TerminalService", () => {
 
       expect(result.success).toBe(true);
       if (!result.success) throw new Error("Expected terminal session creation to succeed");
-      expect(result.session.cwd).toBe("/tmp/fusion-worktrees/FN-7253");
+      expect(result.session.cwd).toBe(resolve("/tmp/fusion-worktrees/FN-7253"));
     });
 
     it("refreshes the registered-worktree allowlist after a cached miss", async () => {
@@ -243,10 +250,10 @@ describe("TerminalService", () => {
 
       expect(beforeRefresh.success).toBe(true);
       if (!beforeRefresh.success) throw new Error("Expected first terminal session creation to succeed");
-      expect(beforeRefresh.session.cwd).toBe("/tmp/fusion-worktrees/FN-7253");
+      expect(beforeRefresh.session.cwd).toBe(resolve("/tmp/fusion-worktrees/FN-7253"));
       expect(afterRefresh.success).toBe(true);
       if (!afterRefresh.success) throw new Error("Expected second terminal session creation to succeed");
-      expect(afterRefresh.session.cwd).toBe("/tmp/fusion-worktrees/FN-7253");
+      expect(afterRefresh.session.cwd).toBe(resolve("/tmp/fusion-worktrees/FN-7253"));
       expect(runGitCommand).toHaveBeenCalledTimes(3);
     });
 
@@ -260,7 +267,7 @@ describe("TerminalService", () => {
 
       expect(beforeRemoval.success).toBe(true);
       if (!beforeRemoval.success) throw new Error("Expected first terminal session creation to succeed");
-      expect(beforeRemoval.session.cwd).toBe("/tmp/fusion-worktrees/stale");
+      expect(beforeRemoval.session.cwd).toBe(resolve("/tmp/fusion-worktrees/stale"));
       expect(afterRemoval).toEqual({
         success: false,
         code: "invalid_cwd",

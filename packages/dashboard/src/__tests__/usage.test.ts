@@ -14,10 +14,20 @@ const nodePtyMocks = vi.hoisted(() => ({
   spawn: vi.fn(),
 }));
 
+/*
+FNXC:WindowsTestPortability 2026-10-08-17:49:
+KB-087: the product joins credential paths with path.join, which uses backslashes on Windows.
+Every mocked path consumer normalizes separators to "/" once here so per-test matchers such as `includes(".codex/auth.json")` hold on win32; this is the identity on POSIX.
+*/
+const { toPosixPath } = vi.hoisted(() => ({
+  toPosixPath: (filePath: unknown): string => String(filePath).replaceAll("\\", "/"),
+}));
+
 vi.mock("@fusion/core", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@fusion/core")>()),
   choosePreferredStoredCredential: coreInteropMocks.choosePreferredStoredCredential,
-  readStoredCredentialsFromAuthFile: coreInteropMocks.readStoredCredentialsFromAuthFile,
+  readStoredCredentialsFromAuthFile: (filePath: unknown, ...rest: unknown[]) =>
+    coreInteropMocks.readStoredCredentialsFromAuthFile(toPosixPath(filePath), ...rest),
 }));
 
 import {
@@ -48,8 +58,8 @@ vi.mock("node:https", () => ({
 // Mock fs/promises
 const mockReadFile = vi.fn();
 vi.mock("node:fs/promises", () => ({
-  readFile: (...args: any[]) => mockReadFile(...args),
-  default: { readFile: (...args: any[]) => mockReadFile(...args) },
+  readFile: (filePath: unknown, ...rest: any[]) => mockReadFile(toPosixPath(filePath), ...rest),
+  default: { readFile: (filePath: unknown, ...rest: any[]) => mockReadFile(toPosixPath(filePath), ...rest) },
 }));
 
 // Mock child_process

@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import express from "express";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Task, TaskStore } from "@fusion/core";
@@ -380,23 +380,27 @@ describe("POST /tasks/:id/reset", () => {
     expect(store.updateTask).toBeUndefined();
   });
 
+  /*
+  FNXC:WindowsTestPortability 2026-10-08-17:49:
+  KB-087: Windows ignores directory permission bits, so a chmod 0o500 task dir never failed the seed write there and the route correctly returned 200.
+  The fault is now a regular FILE where the task directory is expected: writePromptFileAtomic's mkdir fails on every platform, exercising the same fail-closed seed-write path.
+  */
   it("fails closed when the bootstrap seed cannot be written", async () => {
     const root = await mkdtemp(join(tmpdir(), "fusion-reset-route-seed-write-fence-"));
-    const taskDir = join(root, ".fusion", "tasks", "FN-400");
-    await mkdir(taskDir, { recursive: true });
-    await chmod(taskDir, 0o500);
+    const tasksDir = join(root, ".fusion", "tasks");
+    const taskDir = join(tasksDir, "FN-400");
+    await mkdir(tasksDir, { recursive: true });
+    await writeFile(taskDir, "not a directory", "utf8");
     const task = { ...taskFixture(""), worktree: undefined, branch: undefined };
     const publication = vi.fn().mockResolvedValue({ ...task, column: "triage", status: undefined });
     const store = createStore(root, task, [], publication);
 
-    try {
-      const res = await performRequest(createApp(store), "POST", "/api/tasks/FN-400/reset", JSON.stringify({ confirm: true }), { "content-type": "application/json" });
-      expect(res.status).toBe(409);
-      expect(res.body.error).toMatch(/partial cleanup; retry Reset/i);
-      expect(publication).not.toHaveBeenCalled();
-    } finally {
-      await chmod(taskDir, 0o700);
-    }
+    const res = await performRequest(createApp(store), "POST", "/api/tasks/FN-400/reset", JSON.stringify({ confirm: true }), { "content-type": "application/json" });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/partial cleanup; retry Reset/i);
+    expect(publication).not.toHaveBeenCalled();
+    expect((await stat(taskDir)).isFile()).toBe(true);
+    await expect(stat(join(taskDir, "PROMPT.md"))).rejects.toMatchObject({ code: expect.stringMatching(/^(ENOENT|ENOTDIR)$/) });
   });
 
   it("admission blocks a foreign-held task branch without destroying anything", async () => {

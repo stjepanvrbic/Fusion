@@ -166,6 +166,32 @@ function configureFakePnpmInstall(root: string): void {
   process.env.FUSION_SYSTEM_PNPM_ARGS = JSON.stringify([fakeInstall]);
 }
 
+/*
+FNXC:SystemPanel 2026-10-08-17:49:
+KB-087: the pnpm install used to launch with `shell: true` on Windows, so cmd.exe split a command path containing a space and the install never ran.
+These helpers point the pnpm seam at a fake bin inside a directory whose name contains a space (a script, which the shell-free launch runs under node on every platform), or at a shell script (not executable, not a Windows-launchable type) that only a shell could run.
+*/
+function configureSpacedFakePnpmBin(): void {
+  const spacedDir = mkdtempSync(join(tmpdir(), "fusion pnpm "));
+  tempRoots.push(spacedDir);
+  const fakeBin = join(spacedDir, "fake pnpm.mjs");
+  writeFileSync(
+    fakeBin,
+    "console.log('FAKE_PNPM_INSTALL_OK');\nif (process.argv[process.argv.length - 1] !== 'install') process.exit(9);\n",
+  );
+  process.env.FUSION_SYSTEM_PNPM_BIN = fakeBin;
+  delete process.env.FUSION_SYSTEM_PNPM_ARGS;
+}
+
+function configureShellOnlyPnpmBin(): void {
+  const dir = mkdtempSync(join(tmpdir(), "fusion-shell-only-pnpm-"));
+  tempRoots.push(dir);
+  const shellOnly = join(dir, "pnpm-shell-only.sh");
+  writeFileSync(shellOnly, "echo FAKE_PNPM_INSTALL_OK\n");
+  process.env.FUSION_SYSTEM_PNPM_BIN = shellOnly;
+  delete process.env.FUSION_SYSTEM_PNPM_ARGS;
+}
+
 afterEach(() => {
   delete process.env.FUSION_SYSTEM_PNPM_BIN;
   delete process.env.FUSION_SYSTEM_PNPM_ARGS;
@@ -362,6 +388,53 @@ describe("POST /system/rebuild", () => {
     expect(lineTexts).toContain("FAKE_PNPM_INSTALL_OK");
     expect(lineTexts).not.toContain("FAKE_BUILD_RAN");
     expect(requestRestart).not.toHaveBeenCalled();
+  });
+
+  it("runs the full-rebuild install shell-free through a command path that contains a space", async () => {
+    const root = createFakeSourceCheckout("console.log('APP_BUILD_RAN');\n", "console.log('FAKE_BUILD_RAN');\n");
+    configureSpacedFakePnpmBin();
+    const requestRestart = vi.fn(() => true);
+    const { app } = createApp({
+      options: { systemControl: { supervised: true, requestRestart, sourceWorkspaceRoot: root } },
+    });
+
+    expect((await postJson(app, "/api/system/rebuild", { scope: "full", restart: true })).status).toBe(202);
+    await vi.waitFor(async () => {
+      const current = await getJson(app, "/api/system/rebuild/current");
+      expect(["succeeded", "failed"]).toContain(current.body.job.status);
+    }, { timeout: 10_000, interval: 100 });
+
+    const current = await getJson(app, "/api/system/rebuild/current");
+    expect(current.body.job.status).toBe("succeeded");
+    const lineTexts = current.body.job.lines.map((line: { text: string }) => line.text);
+    expect(lineTexts.indexOf("FAKE_PNPM_INSTALL_OK")).toBeGreaterThanOrEqual(0);
+    expect(lineTexts.indexOf("FAKE_PNPM_INSTALL_OK")).toBeLessThan(lineTexts.indexOf("FAKE_BUILD_RAN"));
+    expect(requestRestart).toHaveBeenCalledWith("rebuild:full");
+  });
+
+  it("fails a full rebuild without building or restarting when pnpm cannot be launched shell-free", async () => {
+    const root = createFakeSourceCheckout("console.log('APP_BUILD_RAN');\n", "console.log('FAKE_BUILD_RAN');\n");
+    configureShellOnlyPnpmBin();
+    const requestRestart = vi.fn(() => true);
+    const { app } = createApp({
+      options: { systemControl: { supervised: true, requestRestart, sourceWorkspaceRoot: root } },
+    });
+
+    await postJson(app, "/api/system/rebuild", { scope: "full", restart: true });
+    await vi.waitFor(async () => {
+      const current = await getJson(app, "/api/system/rebuild/current");
+      expect(current.body.job.status).toBe("failed");
+    }, { timeout: 10_000, interval: 100 });
+
+    const current = await getJson(app, "/api/system/rebuild/current");
+    const lineTexts = current.body.job.lines.map((line: { text: string }) => line.text);
+    expect(lineTexts).not.toContain("FAKE_PNPM_INSTALL_OK");
+    expect(lineTexts).not.toContain("FAKE_BUILD_RAN");
+    expect(requestRestart).not.toHaveBeenCalled();
+    if (process.platform === "win32") {
+      // Windows refuses the .sh file before spawn instead of handing it to cmd.exe.
+      expect(current.body.job.error).toMatch(/without a command shell/);
+    }
   });
 
   it("keeps app and plugins rebuilds as single build commands", async () => {
@@ -1028,6 +1101,39 @@ describe("POST /system/source/update", () => {
     expect(job.status).toBe("failed");
     expect(job.lines.map((line) => line.text)).not.toContain("SOURCE_UPDATE_BUILD_RAN");
     expect(requestRestart).not.toHaveBeenCalled();
+  });
+
+  it("runs the install shell-free through a command path that contains a space", async () => {
+    const root = createFakeGitCheckout();
+    configureSpacedFakePnpmBin();
+    const { app, requestRestart } = sourceUpdateApp(root);
+
+    expect((await postJson(app, "/api/system/source/update", { restart: true })).status).toBe(202);
+    const job = await waitForFinishedJob(app);
+
+    expect(job.status).toBe("succeeded");
+    const texts = job.lines.map((line) => line.text);
+    expect(texts.indexOf("FAKE_PNPM_INSTALL_OK")).toBeGreaterThanOrEqual(0);
+    expect(texts.indexOf("FAKE_PNPM_INSTALL_OK")).toBeLessThan(texts.indexOf("SOURCE_UPDATE_BUILD_RAN"));
+    expect(requestRestart).toHaveBeenCalledWith("source-update");
+  });
+
+  it("fails without building or restarting when pnpm cannot be launched shell-free", async () => {
+    const root = createFakeGitCheckout();
+    configureShellOnlyPnpmBin();
+    const { app, requestRestart } = sourceUpdateApp(root);
+
+    expect((await postJson(app, "/api/system/source/update")).status).toBe(202);
+    const job = await waitForFinishedJob(app);
+
+    expect(job.status).toBe("failed");
+    const texts = job.lines.map((line) => line.text);
+    expect(texts).not.toContain("FAKE_PNPM_INSTALL_OK");
+    expect(texts).not.toContain("SOURCE_UPDATE_BUILD_RAN");
+    expect(requestRestart).not.toHaveBeenCalled();
+    if (process.platform === "win32") {
+      expect(job.error).toMatch(/pnpm install could not start: .*without a command shell/);
+    }
   });
 
   it("409s a concurrent invocation so two contributors cannot interleave builds on one checkout", async () => {

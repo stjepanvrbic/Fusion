@@ -136,6 +136,24 @@ describe("devserver-detect", () => {
     expect(detected).toEqual([]);
   });
 
+  /*
+  FNXC:DevServerDetect 2026-10-08-17:49:
+  KB-087: package.json is read in-process (the old quoted `node -e` shell failed on Windows); an unreadable nested package must still be skipped without hiding the root's scripts.
+  */
+  it("skips a malformed nested package.json while still detecting root scripts", async () => {
+    const root = await createTempRoot("devserver-detect-");
+    await writePackageJson(root, { scripts: { dev: "vite" } });
+    const nestedPath = join(root, "packages", "x", "package.json");
+    await mkdir(dirname(nestedPath), { recursive: true });
+    await writeFile(nestedPath, '{ "invalid json', "utf-8");
+
+    const detected = await detectDevServerCommands(root);
+
+    expect(detected).toHaveLength(1);
+    expect(detected[0]?.scriptName).toBe("dev");
+    expect(detected[0]?.cwd).toBe(root);
+  });
+
   it("deeply nested package.json (2+ levels) is NOT scanned", async () => {
     const root = await createTempRoot("devserver-detect-");
     await writePackageJson(root, { scripts: {} });

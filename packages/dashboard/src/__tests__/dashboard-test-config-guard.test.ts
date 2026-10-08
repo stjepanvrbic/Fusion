@@ -2,8 +2,9 @@
 
 import { globSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { resolveShellFreeLaunch } from "@fusion/core";
 import { describe, expect, it } from "vitest";
 import { dashboardQualityProjectGlobs } from "../../vitest.config";
 
@@ -40,11 +41,20 @@ function projectNameForLane(lane: QualityLane): string {
   return projectName;
 }
 
+/*
+FNXC:WindowsTestPortability 2026-10-08-17:49:
+KB-087: relative() yields backslash-separated paths on Windows, so the expanded sets never matched the forward-slash spec literals.
+Expanded paths are normalized to "/" (identity on POSIX); vitest list is launched shell-free through resolveShellFreeLaunch because a bare spawnSync("pnpm") cannot run the pnpm.cmd shim on Windows; and vitest's reported file paths are compared after the same normalization.
+*/
+function toForwardSlashes(filePath: string): string {
+  return filePath.split(sep).join("/");
+}
+
 function expandDashboardGlobs(patterns: readonly string[]): Set<string> {
   return new Set(
     patterns.flatMap((pattern) =>
       globSync(pattern, { cwd: dashboardRoot, nodir: true }).map((file) =>
-        relative(dashboardRoot, join(dashboardRoot, file)),
+        toForwardSlashes(relative(dashboardRoot, join(dashboardRoot, file))),
       ),
     ),
   );
@@ -61,19 +71,22 @@ function expandProjectFiles(projectName: keyof typeof dashboardQualityProjectGlo
 }
 
 function listTouchGeometryProjectsWithDeepEnv(): string[] {
+  const launch = resolveShellFreeLaunch("pnpm", [
+    "exec",
+    "vitest",
+    "list",
+    touchGeometrySpec,
+    "--project",
+    "dashboard-browser-touch",
+    "--project",
+    "dashboard-api",
+    // FNXC:WindowsTestPortability 2026-10-08-17:49: KB-087: project membership is a file-level question; --filesOnly answers it without importing the spec, whose describe.runIf(Chromium) would otherwise list zero tests (or throw under CI) on hosts without a discovered browser such as Windows.
+    "--filesOnly",
+    "--json",
+  ]);
   const result = spawnSync(
-    "pnpm",
-    [
-      "exec",
-      "vitest",
-      "list",
-      touchGeometrySpec,
-      "--project",
-      "dashboard-browser-touch",
-      "--project",
-      "dashboard-api",
-      "--json",
-    ],
+    launch.command,
+    launch.args,
     {
       cwd: dashboardRoot,
       encoding: "utf8",
@@ -82,7 +95,14 @@ function listTouchGeometryProjectsWithDeepEnv(): string[] {
   );
   expect(result.status, result.stderr).toBe(0);
   const rows = JSON.parse(result.stdout) as { file: string; projectName: string }[];
-  return [...new Set(rows.filter((row) => row.file === touchGeometrySpecPath).map((row) => row.projectName))];
+  const expectedFile = toForwardSlashes(resolve(touchGeometrySpecPath));
+  return [
+    ...new Set(
+      rows
+        .filter((row) => toForwardSlashes(resolve(row.file)) === expectedFile)
+        .map((row) => row.projectName),
+    ),
+  ];
 }
 
 describe("dashboard test config guard", () => {

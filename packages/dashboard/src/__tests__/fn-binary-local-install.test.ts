@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  fnBinaryFileName,
   installLocalFnBinary,
   removeLocalFnShims,
   resolveFnBinaryLocalPaths,
@@ -37,8 +38,9 @@ describe("fn-binary-local-install", () => {
     const dist = makeTemp("fn-bin-dist-");
     const logs: string[] = [];
 
-    writeFileSync(join(dist, "fn"), "#!/bin/sh\necho ok\n");
-    chmodSync(join(dist, "fn"), 0o755);
+    // FNXC:SystemPanelFnBinary 2026-10-08-17:49: KB-087: fixtures use the platform binary name (fn.exe on Windows) the installer reads.
+    writeFileSync(join(dist, fnBinaryFileName()), "#!/bin/sh\necho ok\n");
+    chmodSync(join(dist, fnBinaryFileName()), 0o755);
     mkdirSync(join(dist, "client"), { recursive: true });
     writeFileSync(join(dist, "client", "index.html"), "<html></html>");
     mkdirSync(join(dist, "runtime", "darwin-arm64"), { recursive: true });
@@ -57,7 +59,7 @@ describe("fn-binary-local-install", () => {
     const dist = makeTemp("fn-bin-dist-rm-");
     const logs: string[] = [];
 
-    writeFileSync(join(dist, "fn"), "bin");
+    writeFileSync(join(dist, fnBinaryFileName()), "bin");
     mkdirSync(join(dist, "client"), { recursive: true });
     writeFileSync(join(dist, "client", "index.html"), "<html></html>");
 
