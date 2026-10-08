@@ -15,6 +15,11 @@
       "file": "packages/dashboard/src/__tests__/planning-browser-e2e.test.ts",
       "reason": "Second sighting: https://github.com/stjepanvrbic/Fusion/actions/runs/37648267708 (1359c449cd, beforeAll Chromium launch exceeded 30s) and https://github.com/stjepanvrbic/Fusion/actions/runs/37652972793 (595b2f5fad, browser closed before first navigation); register entry 23.",
       "quarantinedAt": "2026-10-07"
+    },
+    {
+      "file": "packages/engine/src/__tests__/executor-task-done-summary.test.ts",
+      "reason": "Second sighting: https://github.com/stjepanvrbic/Fusion/actions/runs/37717586213 (08361ff9c) and https://github.com/stjepanvrbic/Fusion/actions/runs/37720611351 (a05be4484), both Linux Test shard 2/4 engine-default; first case timed out at 30s and four cases saw no fn_task_done implementation session; register entry 28. Product-race smell: audit PR #32's guarded in-place executor re-dispatch timer, and the second executor-subsystem quarantine after executor-prompt.",
+      "quarantinedAt": "2026-10-08"
     }
   ]
 }

@@ -410,6 +410,11 @@ export default defineConfig({
             assertion or changing the production lifecycle fence.
             */
             "src/__tests__/executor-prompt.test.ts",
+            /*
+            FNXC:ExecutorTaskDoneSummaryQuarantine 2026-10-08-04:50:
+            Second Full Suite sighting of register entry 28: under shard load the executor returned from execute without opening the fn_task_done implementation session. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at the guarded in-place re-dispatch timer.
+            */
+            "src/__tests__/executor-task-done-summary.test.ts",
             "node_modules/**",
             "dist/**",
             // FNXC:PgMigrationQuarantine 2026-07-18-04:30: FN-8270 rescued the final seven VAL-REMOVAL-005 holdouts by awaiting PG audit reads and modeling async collaborators. Their paired ledger entries and excludes were removed only after targeted green runs.

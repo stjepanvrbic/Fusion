@@ -29,10 +29,10 @@ type LedgerRow = { file: string; line: number; bucket: Bucket; expression: strin
 const LEDGER: LedgerRow[] = [
   ["packages/engine/src/executor/resolve-mcp-servers.ts",32,"A","deps.store","TaskStore","executor TaskStore"],
   ["packages/engine/src/execution/reviewer.ts",580,"A","options.store","TaskStore","reviewer TaskStore"],
-  ["packages/engine/src/merger.ts",392,"A","store","TaskStore","merger TaskStore"],
+  ["packages/engine/src/merger.ts",398,"A","store","TaskStore","merger TaskStore"],
   ["packages/engine/src/merge/merger-ai.ts",629,"A","store","TaskStore","merger AI TaskStore"],
   ["packages/engine/src/merge/merger-ai.ts",703,"A","store","TaskStore","merger AI TaskStore"],
-  ["packages/engine/src/merge/pr-response-run-ops.ts",112,"A","store","TaskStore","PR response TaskStore"],
+  ["packages/engine/src/merge/pr-response-run-ops.ts",113,"A","store","TaskStore","PR response TaskStore"],
   ["packages/engine/src/agent-heartbeat.ts",242,"A","taskStore","nullable-root","heartbeat accepts a nullable root"],
   ["packages/engine/src/triage.ts",3556,"A","this.store","TaskStore","triage TaskStore"],
   ["packages/engine/src/scheduling/cron-runner.ts",1073,"A","store","TaskStore","cron TaskStore"],
