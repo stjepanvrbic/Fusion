@@ -181,6 +181,10 @@ Entry 29 was sighted a second time on the fork's Full Suite (the same two switch
 ratchet moves it to the archive. The archived record must keep both run identifiers and both unchanged assertion
 messages so a rescue starts from MissionManager's reconcile panel release rather than a timeout.
 
+FNXC:TestFlakeRegister 2026-10-08-17:49:
+KB-086 rescued entry 29 with a test-only root-cause fix, so the archived record must also name the rescue and its
+task while keeping every quarantine-evidence string and the Closed status prefix.
+
 FNXC:TestFlakeRegister 2026-10-08-08:12:
 Entries 33 and 34 record first sightings from the fork's Full Suite: an AutomationStore due-run claim that
 straddled a cron minute edge, and an AgentDetailView log-stream subscription read before its effect flushed.
@@ -407,6 +411,8 @@ test("archived MissionManager reconcile quarantine retains both-sighting evidenc
     'Unable to find an element by: [data-testid="mission-reconcile-apply"]',
     "quarantined 2026-10-08",
     "deletion deadline 2026-10-22",
+    "Rescued",
+    "KB-086",
   ]) {
     assert.ok(entry.includes(evidence), `Archived MissionManager reconcile entry is missing ${evidence}`);
   }

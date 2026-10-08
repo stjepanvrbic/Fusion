@@ -643,10 +643,13 @@ Entry 29 recorded a second Full Suite sighting on the fork: the same two switch-
 
 FNXC:TestFlakeRegister 2026-10-08-13:35:
 KB-063 investigated the product code before the deletion deadline and found a deterministic test-readiness defect plus a mock-leak cascade, not a product race. The closing paragraph records the verdicts and the proposed test-only rescue so whoever reaches the deadline can rescue rather than delete.
+
+FNXC:TestFlakeRegister 2026-10-08-17:49:
+KB-086 rescued entry 29 with the test-only root-cause fix KB-063 proposed, plus a deterministic regression that fails with the old wait. The ledger row and dashboard exclude were removed in the same commit as the fix; MissionManager.tsx did not change.
 -->
 ### 29. MissionManager reconcile control switch-window cases
 
-- **Status:** Closed — quarantined 2026-10-08 after a second Full Suite sighting; deletion deadline 2026-10-22.
+- **Status:** Closed — quarantined 2026-10-08 after a second Full Suite sighting; deletion deadline 2026-10-22. **Rescued 2026-10-08 by KB-086** (resolution below); the ledger row and dashboard exclude were removed in lockstep with the fix, and the file runs in `dashboard-app-quality-backfill` again.
 - **File:** `packages/dashboard/app/components/__tests__/MissionManager.reconcile.test.tsx`
 - **Exact tests:** two cases in `MissionManager reconcile control`: `silently discards preview resolution and rejection in the pre-commit switch window` and `refuses a same-batch retained-panel apply click so no write reaches the abandoned mission`.
 - **Observed trees/SHAs:** fork Full Suite runs [37720328009](https://github.com/stjepanvrbic/Fusion/actions/runs/37720328009) at `9e948d488` (job `113126258105`) and [37742324890](https://github.com/stjepanvrbic/Fusion/actions/runs/37742324890) at `668244c5e` (job `113195660160`), both Linux `ubuntu-latest`, job `Test shard 3/4`, project `dashboard-app-quality-backfill`.
@@ -679,6 +682,16 @@ The proposed rescue is test-only:
 3. Remove the ledger row and the dashboard exclude in lockstep when the fix lands.
 
 The executing session could not create tasks, so the rescue was raised as a KB-063 completion recommendation. No product code changed.
+
+**Resolution (KB-086, 2026-10-08).** KB-086 landed the proposed test-only rescue:
+
+- **Commit-proving wait:** every mission-switch readiness wait (the `openM2` helper, both deep-link waits, and the four switch-window cases) now uses a `findCommittedMission` helper that waits for the level-3 detail heading. That heading renders only from the committed `selectedMission`, so the wait cannot resolve on the list row.
+- **Leak fix:** `beforeEach` calls `reconcileMission.mockReset()` after `vi.clearAllMocks()`, so a queued once-implementation cannot reach the next case. `vi.resetAllMocks()` was avoided because it would also reset the inline mocks in the `../../api` factory.
+- **Regression:** a new case, `waits for the switched mission's detail to commit before treating it as ready`, holds M-2's `fetchMission` pending, yields real time, and asserts that the readiness wait has not settled and the reconcile control is still disabled. With the helper swapped back to `findByText(title)`, it failed deterministically at that pending-window assertion; with the heading wait it passes.
+- **Leak proof:** a scratch unconsumed `mockReturnValueOnce(new Promise(() => {}))` at the end of the switch-window case reproduced the retained-panel failure (`Unable to find an element by: [data-testid="mission-reconcile-apply"]`) without the reset and passed with it.
+- **Stability:** 18/18 cases passed in 10 sequential runs and 3 `--sequence.shuffle` runs of the file in `dashboard-app-quality-backfill` on Windows.
+
+No product code, timeout, retry, or assertion changed; the scratch proofs were not committed.
 
 <!--
 FNXC:TestFlakeRegister 2026-10-08-11:22:

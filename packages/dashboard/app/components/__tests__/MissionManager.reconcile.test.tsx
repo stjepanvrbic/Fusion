@@ -60,6 +60,12 @@ describe("MissionManager reconcile control", () => {
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 1280 });
     window.dispatchEvent(new Event("resize"));
     vi.clearAllMocks();
+    /*
+    FNXC:MissionReconcileControl 2026-10-08-17:40:
+    KB-086: vi.clearAllMocks() keeps queued once-implementations and persistent implementations, so an unconsumed reconcileMission.mockReturnValueOnce cascaded a never-settling preview into the next case.
+    Reset only reconcileMission; vi.resetAllMocks() would also wipe the inline vi.fn() mocks inside the api mock factory.
+    */
+    reconcileMission.mockReset();
     fetchMissions.mockResolvedValue([mission("M-1"), mission("M-2")].map((item) => ({ ...item, milestones: [] })));
     fetchMission.mockImplementation(async (id: string) => mission(id));
     fetchMissionsHealth.mockResolvedValue({}); fetchMissionEvents.mockResolvedValue([]); fetchAssertions.mockResolvedValue([]);
@@ -121,17 +127,43 @@ describe("MissionManager reconcile control", () => {
     return { promise, resolve, reject };
   }
 
+  /**
+   * FNXC:MissionReconcileControl 2026-10-08-17:40:
+   * KB-086: a mission-title text match resolves on the list row before the selected detail commits, so it cannot prove a mission switch finished.
+   * The level-3 detail heading renders only from the committed selectedMission, and the reconcile button is gated on committed selection matching intent, so tests must wait on the heading before clicking reconcile.
+   */
+  function findCommittedMission(title: string) {
+    return screen.findByRole("heading", { level: 3, name: title });
+  }
+
   async function openM2() {
     fireEvent.click(screen.getByRole("button", { name: "Open mission Mission two" }));
-    await screen.findByText("Mission two");
+    await findCommittedMission("Mission two");
   }
+
+  it("waits for the switched mission's detail to commit before treating it as ready", async () => {
+    const m2 = deferred<ReturnType<typeof mission>>();
+    reconcileMission.mockResolvedValue(result());
+    fetchMission.mockImplementation((id: string) => id === "M-2" ? m2.promise : Promise.resolve(mission(id)));
+    renderManager(); await screen.findByText("Feature title");
+    fireEvent.click(screen.getByRole("button", { name: "Open mission Mission two" }));
+    let settled = false;
+    const ready = findCommittedMission("Mission two").then(() => { settled = true; });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    expect(settled).toBe(false);
+    expect(screen.getByTestId("mission-reconcile-now")).toBeDisabled();
+    m2.resolve(mission("M-2")); await ready;
+    expect(screen.getByTestId("mission-reconcile-now")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("mission-reconcile-now"));
+    await waitFor(() => expect(reconcileMission).toHaveBeenCalledWith("M-2", { dryRun: true }, "p1"));
+  });
 
   it("updates reconcile intent when a target mission deep link changes", async () => {
     reconcileMission.mockResolvedValue(result());
     const { rerender } = renderManager();
-    await screen.findByText("Mission one");
+    await findCommittedMission("Mission one");
     rerender(<ConfirmDialogProvider><MissionManager isOpen isInline onClose={() => {}} addToast={vi.fn()} projectId="p1" targetMissionId="M-2" /></ConfirmDialogProvider>);
-    await screen.findByText("Mission two");
+    await findCommittedMission("Mission two");
     expect(screen.getByTestId("mission-reconcile-now")).toBeEnabled();
     fireEvent.click(screen.getByTestId("mission-reconcile-now"));
     await waitFor(() => expect(reconcileMission).toHaveBeenCalledWith("M-2", { dryRun: true }, "p1"));
@@ -149,7 +181,7 @@ describe("MissionManager reconcile control", () => {
     await act(async () => { fireEvent.click(button); });
     expect(reconcileMission).not.toHaveBeenCalled();
     expect(container.querySelector(".mission-detail__reconcile-panel")).toBeNull();
-    m2.resolve(mission("M-2")); await screen.findByText("Mission two");
+    m2.resolve(mission("M-2")); await findCommittedMission("Mission two");
     expect(screen.getByTestId("mission-reconcile-now")).toBeEnabled();
   });
 
@@ -161,7 +193,7 @@ describe("MissionManager reconcile control", () => {
     const button = screen.getByTestId("mission-reconcile-now");
     await act(async () => { fireEvent.click(row); fireEvent.click(button); });
     expect(reconcileMission).not.toHaveBeenCalledWith("M-1", expect.anything(), "p1");
-    m2.resolve(mission("M-2")); await screen.findByText("Mission two");
+    m2.resolve(mission("M-2")); await findCommittedMission("Mission two");
   });
 
   it("silently discards preview resolution and rejection in the pre-commit switch window", async () => {
@@ -173,7 +205,7 @@ describe("MissionManager reconcile control", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open mission Mission two" }));
     preview.resolve(result()); await act(async () => {});
     expect(container.querySelector(".mission-detail__reconcile-panel")).toBeNull(); expect(addToast).not.toHaveBeenCalled();
-    m2.resolve(mission("M-2")); await screen.findByText("Mission two");
+    m2.resolve(mission("M-2")); await findCommittedMission("Mission two");
 
     const rejected = deferred<ReturnType<typeof result>>(); reconcileMission.mockReturnValueOnce(rejected.promise);
     fireEvent.click(screen.getByTestId("mission-reconcile-now")); await waitFor(() => expect(reconcileMission).toHaveBeenCalledTimes(2));
@@ -194,7 +226,7 @@ describe("MissionManager reconcile control", () => {
     // reachable production path that still invokes the old handler before React re-renders it.
     await act(async () => { fireEvent.click(row); fireEvent.click(apply); });
     expect(reconcileMission).not.toHaveBeenCalledWith("M-1", { dryRun: false }, "p1");
-    m2.resolve(mission("M-2")); await screen.findByText("Mission two");
+    m2.resolve(mission("M-2")); await findCommittedMission("Mission two");
   });
 
   it("releases abandoned busy state but does not let a stale finally clobber a newer request", async () => {

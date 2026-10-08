@@ -17,11 +17,6 @@
       "quarantinedAt": "2026-10-08"
     },
     {
-      "file": "packages/dashboard/app/components/__tests__/MissionManager.reconcile.test.tsx",
-      "reason": "Second sighting, same two cases both times: https://github.com/stjepanvrbic/Fusion/actions/runs/37720328009 (9e948d488) and https://github.com/stjepanvrbic/Fusion/actions/runs/37742324890 (668244c5e), both Linux Test shard 3/4 dashboard-app-quality-backfill; the switch-window case saw one reconcileMission call instead of two and the retained-panel case never rendered the apply control; register entry 29.",
-      "quarantinedAt": "2026-10-08"
-    },
-    {
       "file": "packages/dashboard/app/components/__tests__/agent-detail-log-history.test.tsx",
       "reason": "Second sighting of one case, identical assertion at line 217: https://github.com/stjepanvrbic/Fusion/actions/runs/37739564135 (7fcb6ea1c, Test shard 3/4) and https://github.com/stjepanvrbic/Fusion/actions/runs/37747085495 (628231a55, Test shard 4/4), both Linux dashboard-app-quality-backfill via test:quality:app:backfill-4; the latest-run log stream was read from the SSE subscribe mock before it had been subscribed; register entry 34.",
       "quarantinedAt": "2026-10-08"

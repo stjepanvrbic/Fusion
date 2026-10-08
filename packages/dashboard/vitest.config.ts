@@ -375,10 +375,9 @@ const quarantinedDashboardTests: string[] = [
   */
   "app/components/__tests__/PlanningModeModal.ui-interactions.test.tsx",
   /*
-  FNXC:DashboardTestQuarantine 2026-10-08-08:41:
-  Second Full Suite sighting of register entry 29: both switch-window cases failed again under dashboard-app-quality-backfill shard 3 load, one with a missing second reconcileMission call and one with no apply control after the first click. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at how MissionManager releases the reconcile panel during a mission switch.
+  FNXC:DashboardTestQuarantine 2026-10-08-17:40:
+  KB-086 re-admits MissionManager.reconcile (register entry 29) after a test-only root-cause fix: mission switches now wait on the committed level-3 detail heading instead of the list-row title, and reconcileMission once-implementations are reset between cases. Its ledger row was removed in lockstep; no timeout, retry, or assertion changed.
   */
-  "app/components/__tests__/MissionManager.reconcile.test.tsx",
   /*
   FNXC:DashboardTestQuarantine 2026-10-08-09:18:
   Second Full Suite sighting of register entry 34: the SSE suspend and reopen case read the latest-run log stream from the subscribe mock before the subscribing effect had run, on two different shards of the backfill-4 command. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at when AgentDetailView subscribes after the run log entries render.
