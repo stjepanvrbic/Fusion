@@ -2,11 +2,6 @@
   "$comment": "Flaky-test quarantine ledger (deletion ratchet \u2014 see AGENTS.md 'Flaky tests: quarantine on sight' and docs/testing.md 'Quarantine ledger and the deletion ratchet'). A test observed failing without a corresponding real bug is quarantined ON SIGHT: add an entry here AND a matching one-line `exclude` entry in that package's vitest config, in the same commit. Every entry needs a non-empty `reason` (link the failing run) and a `quarantinedAt` date \u2014 the entry expires 14 days later, at which point the test file is DELETED unless someone rescues it with evidence it catches real regressions plus a root-cause fix (never appeasement). scripts/check-quarantine-ledger.mjs mechanically verifies this ledger and concrete `exclude:` array entries stay in lockstep.",
   "entries": [
     {
-      "file": "packages/engine/src/__tests__/executor-prompt.test.ts",
-      "reason": "Second sightings: https://github.com/Runfusion/Fusion/actions/runs/33034719148 (5769d5cd610e8830be24c4ede6eb79b38d2143c1) and https://github.com/Runfusion/Fusion/actions/runs/37339500295 (1a648d35d3987a6722b221e37df3084f75df6f0d); TaskExecutor pause-resume agent-creation count was zero only in shard/multi-file execution.",
-      "quarantinedAt": "2026-10-05"
-    },
-    {
       "file": "packages/dashboard/app/components/__tests__/PlanningModeModal.planning-flow.test.tsx",
       "reason": "Re-sighted after FN-9116 closed register entry 8: https://github.com/stjepanvrbic/Fusion/actions/runs/37648267708 (1359c449cd, desktop duplicate-response reconciliation, Proceed stayed disabled) after two moving-case lane-runner sightings at c82e420ba0; register entry 22.",
       "quarantinedAt": "2026-10-07"
