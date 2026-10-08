@@ -3217,6 +3217,38 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     await engine.stop();
   });
 
+  /*
+  FNXC:ConcurrencyAdmission 2026-10-08-09:31:
+  A continuation run that reaches its graph merge node keeps its coordinator reservation while the merge pump runs the merge. The pump's
+  admission must treat that reservation as the merge's own slot, and must leave it with the continuation run when the merge body ends.
+  */
+  it("admits the graph-owned merge of a running continuation into its own reserved slot", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true, maxConcurrent: 1, maxWorktrees: 1 });
+    mockStore.store.getTask.mockResolvedValue({
+      id: "FN-GRAPH-MERGE",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      branch: "fusion/fn-graph-merge",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+    mockStore.store.listTasks.mockResolvedValue([]);
+    projectAdmissionCoordinator.clearReservationsForTests();
+    expect(await projectAdmissionCoordinator.reserveIfAvailable({ projectId: "/tmp/proj_test", taskId: "FN-GRAPH-MERGE", maxConcurrent: 1, claimed: () => 0 })).toBe(true);
+
+    engine.enqueueMerge("FN-GRAPH-MERGE");
+
+    await vi.waitFor(() => expect(mocks.runAiMerge).toHaveBeenCalledWith(mockStore.store, "/tmp/proj_test", "FN-GRAPH-MERGE", expect.any(Object)));
+    await vi.waitFor(() => expect((engine as unknown as { mergeActive: Set<string> }).mergeActive.has("FN-GRAPH-MERGE")).toBe(false));
+    expect(projectAdmissionCoordinator.inspectProjectStateForTests("/tmp/proj_test").reservedCount).toBe(1);
+    projectAdmissionCoordinator.clearReservationsForTests();
+    await engine.stop();
+  });
+
   it("does not admit a merge over a pending optional workflow-step lease", async () => {
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true, maxConcurrent: 1, maxWorktrees: 1 });
     mockStore.store.getTask.mockResolvedValue({

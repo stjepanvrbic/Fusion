@@ -1502,6 +1502,48 @@ describe("ProjectAdmissionCoordinator", () => {
     expect(started).toEqual(["merge"]);
   });
 
+  /*
+  FNXC:ConcurrencyAdmission 2026-10-08-09:31:
+  A candidate whose own task already holds a coordinator reservation is a same-slot handoff: it is measured against occupancy without
+  its own id. A claimed holder without a reservation is a different lane's live agent and is not exempt. Live deadlock: continuation runs held their reservations while waiting for their graph merge,
+  and the merge pump counted each run's reservation against its own merge, so no merge could ever be admitted.
+  */
+  it("admits a same-slot candidate whose own reservation fills the last slot, and keeps that reservation on decline", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const projectId = "project-same-slot";
+    expect(await coordinator.reserveIfAvailable({ projectId, taskId: "KB-008", maxConcurrent: 4, claimed: () => 0 })).toBe(true);
+    const claimedIds = ["KB-019", "KB-049", "KB-050"];
+    const full = { projectId, maxConcurrent: 4, claimed: () => claimedIds.length, claimedTaskIds: () => claimedIds };
+    const handoffs: unknown[] = [];
+
+    // (b) another task is still refused while every slot is occupied.
+    expect(await coordinator.admitNext({ ...full, refresh: async () => [{ taskId: "KB-060", projectId, lane: "review", start: async () => true }] })).toBeUndefined();
+    expect(await coordinator.reserveIfAvailable({ ...full, taskId: "KB-060" })).toBe(false);
+
+    // A declining same-slot start must not release the reservation its continuation run still owns.
+    await coordinator.admitNext({ ...full, refresh: async () => [{ taskId: "KB-008", projectId, lane: "review", start: async () => false }] });
+    expect(coordinator.inspectProjectStateForTests(projectId).reservedCount).toBe(1);
+
+    // (a) the task's own merge is admitted although every other slot is full, and learns it reused the slot.
+    expect(await coordinator.admitNext({
+      ...full,
+      refresh: async () => [
+        { taskId: "KB-060", projectId, lane: "review", createdAt: "2026-10-08T06:00:00.000Z", start: async () => true },
+        { taskId: "KB-008", projectId, lane: "review", createdAt: "2026-10-08T07:00:00.000Z", start: async (handoff) => { handoffs.push(handoff); return true; } },
+      ],
+    })).toBe("KB-008");
+    expect(handoffs).toEqual([{ reusedReservation: true }]);
+    expect(coordinator.inspectProjectStateForTests(projectId).reservedCount).toBe(1);
+
+    // A claimed holder without a reservation belongs to another lane's live agent: no second agent for it at a full cap.
+    expect(await coordinator.reserveIfAvailable({ ...full, taskId: "KB-019" })).toBe(false);
+    // Once the reserved task's row is durably claimed, its reservation is still counted once and still exempt for itself.
+    const durable = { ...full, claimed: () => 4, claimedTaskIds: () => [...claimedIds, "KB-008"] };
+    expect(await coordinator.admitNext({ ...durable, refresh: async () => [{ taskId: "KB-008", projectId, lane: "review", start: async () => true }] })).toBe("KB-008");
+    expect(await coordinator.admitNext({ ...durable, refresh: async () => [{ taskId: "KB-060", projectId, lane: "review", start: async () => true }] })).toBeUndefined();
+    coordinator.releaseReservation("KB-008");
+  });
+
   it("uses oldest valid age then task ID only within one lifecycle lane", () => {
     const ordered = [
       { taskId: "bad", lane: "execute" as const, createdAt: "not-a-date" },
