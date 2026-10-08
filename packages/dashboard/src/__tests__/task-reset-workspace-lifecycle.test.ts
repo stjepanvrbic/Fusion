@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import express from "express";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
 import type { Task, TaskStore } from "@fusion/core";
 import { buildBootstrapPrompt, registerTaskMoveDisposer, registerTaskResetDisposer } from "@fusion/core";
@@ -12,6 +12,8 @@ import {
   activeSessionRegistry,
   deleteTaskResetBranches,
   getRegisteredWorktreeBranches,
+  getRegisteredWorktreePaths,
+  WorktreeRegistrationUnknownError,
   planTaskResetBranchCleanup,
   pruneWorktreeAdminEntries,
   reconcileTaskResetSessionRoot,
@@ -36,6 +38,7 @@ vi.mock("@fusion/engine", async () => {
     })),
     pruneWorktreeAdminEntries: vi.fn().mockResolvedValue(undefined),
     getRegisteredWorktreeBranches: vi.fn().mockResolvedValue([]),
+    getRegisteredWorktreePaths: vi.fn(async (rootDir: string) => await actual.getRegisteredWorktreePaths(rootDir)),
     planTaskResetBranchCleanup: vi.fn().mockResolvedValue({ deleted: [], retained: [], blocked: [] }),
     deleteTaskResetBranches: vi.fn().mockResolvedValue({ deleted: [], retained: [], blocked: [] }),
   };
@@ -116,7 +119,8 @@ function createStore(root: string, initialTask: Task, otherTasks: Task[] = []) {
 
 function registerWorkspaceBranches(root: string, task: Task) {
   vi.mocked(getRegisteredWorktreeBranches).mockImplementation(async (repoRoot) => {
-    const repoRel = repoRoot.slice(root.length + 1);
+    // Workspace keys are POSIX-relative; derive them separator-neutrally so win32 roots match too.
+    const repoRel = relative(root, repoRoot).split(sep).join("/");
     const entry = task.workspaceWorktrees?.[repoRel];
     return entry ? [{ branch: entry.branch, worktreePath: entry.worktreePath }] : [];
   });
@@ -187,6 +191,45 @@ describe("POST /api/tasks/:id/reset workspace lifecycle", () => {
     expect(deleteTaskResetBranches).toHaveBeenCalledWith(expect.objectContaining({ targets: cleanupTargets }));
     for (const entry of Object.values(task.workspaceWorktrees ?? {})) await expect(stat(entry.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(promptPath, "utf8")).resolves.toBe(buildBootstrapPrompt(task.id, task.title, task.description));
+  });
+
+  /*
+  FNXC:TaskReset 2026-10-08-07:40:
+  The registered-path list is only Reset's fallback ownership proof. A branch-proven reset never depends on it, and a registration probe that cannot run refuses with 409 instead of a 500.
+  */
+  it("completes a branch-proven reset even when the fallback registration probe cannot run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-workspace-reset-"));
+    const task = workspaceTask(root);
+    await createWorkspace(root, task);
+    registerWorkspaceBranches(root, task);
+    vi.mocked(getRegisteredWorktreePaths).mockRejectedValue(new WorktreeRegistrationUnknownError(root, new Error("index.lock exists")));
+    const { store, publication } = createStore(root, task);
+    try {
+      const res = await reset(store);
+      expect(res.status).toBe(200);
+      expect(publication).toHaveBeenCalled();
+    } finally {
+      vi.mocked(getRegisteredWorktreePaths).mockReset().mockImplementation(async (rootDir: string) => await (await vi.importActual<typeof import("@fusion/engine")>("@fusion/engine")).getRegisteredWorktreePaths(rootDir));
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses with 409 and keeps workspace state when the registration probe cannot run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-workspace-reset-"));
+    const task = workspaceTask(root);
+    await createWorkspace(root, task);
+    vi.mocked(getRegisteredWorktreeBranches).mockRejectedValue(new WorktreeRegistrationUnknownError(root, new Error("index.lock exists")));
+    const { store, publication } = createStore(root, task);
+    try {
+      const res = await reset(store);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/ownership cannot be proven/i);
+      expect(publication).not.toHaveBeenCalled();
+      for (const entry of Object.values(task.workspaceWorktrees ?? {})) expect(existsSync(entry.worktreePath)).toBe(true);
+    } finally {
+      vi.mocked(getRegisteredWorktreeBranches).mockReset().mockResolvedValue([]);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("refuses a live coordinator session at admission without deleting workspace state", async () => {
@@ -340,7 +383,8 @@ describe("POST /api/tasks/:id/reset workspace lifecycle", () => {
 
       activeSessionRegistry.unregisterPath(taskDir);
       vi.mocked(getRegisteredWorktreeBranches).mockImplementation(async (repoRoot) => {
-        const repoRel = repoRoot.slice(root.length + 1);
+        // Workspace keys are POSIX-relative; derive them separator-neutrally so win32 roots match too.
+    const repoRel = relative(root, repoRoot).split(sep).join("/");
         const entry = task.workspaceWorktrees?.[repoRel];
         return entry && existsSync(entry.worktreePath) ? [{ branch: entry.branch, worktreePath: entry.worktreePath }] : [];
       });
