@@ -56,7 +56,7 @@ import { DatabaseSync } from "../db/sqlite-adapter.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { applySchemaBaseline } from "./schema-applier.js";
 import { acquireSqliteMigrationStateLock } from "./advisory-locks.js";
@@ -225,12 +225,16 @@ export interface SqliteMigrationSource {
  * is migrated before the project database when foreign-key relationships
  * exist, but since the three schemas are isolated (no cross-schema FKs) the
  * order is not load-bearing.
+ *
+ * FNXC:PostgresMigration 2026-10-08-14:29:
+ * KB-069: build every path with the platform joiner, never `${dir}/file`.
+ * These paths are persisted as `sqliteMigrationNotice.sqliteBackups`, shown verbatim to the operator, and compared against native paths; a template string produced mixed separators on Windows and a doubled separator for a trailing-separator input.
  */
 export function defaultMigrationSources(fusionDir: string, globalDir: string): readonly SqliteMigrationSource[] {
   return [
-    { sqlitePath: `${fusionDir}/archive.db`, pgSchema: ARCHIVE_SCHEMA },
-    { sqlitePath: `${fusionDir}/fusion.db`, pgSchema: PROJECT_SCHEMA, projectPath: resolve(dirname(fusionDir)) },
-    { sqlitePath: `${globalDir}/fusion-central.db`, pgSchema: CENTRAL_SCHEMA },
+    { sqlitePath: join(fusionDir, "archive.db"), pgSchema: ARCHIVE_SCHEMA },
+    { sqlitePath: join(fusionDir, "fusion.db"), pgSchema: PROJECT_SCHEMA, projectPath: resolve(dirname(fusionDir)) },
+    { sqlitePath: join(globalDir, "fusion-central.db"), pgSchema: CENTRAL_SCHEMA },
   ];
 }
 

@@ -16,7 +16,7 @@ import {
 import { resolveProject } from "../project-context.js";
 import { existsSync } from "node:fs";
 import { copyFile, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 function formatBytes(bytes: number): string {
   if (bytes <= 0) return "0 B";
@@ -359,8 +359,13 @@ function describeBackendSafe(
  * path for display. This is the operator safety net: the migration never
  * deletes or modifies the SQLite source files, and a verbatim copy is kept
  * in case a rollback to the SQLite backend is needed.
+ *
+ * FNXC:PostgresMigration 2026-10-08-14:29:
+ * KB-069: name each copy with `basename`. `split("/")` broke once `defaultMigrationSources` returned native paths, because on Windows it yielded the whole source path and produced an invalid backup destination.
+ *
+ * @internal — exported for tests
  */
-async function createPreMigrationBackup(
+export async function createPreMigrationBackup(
   fusionDir: string,
   globalDir: string,
   sources: readonly { sqlitePath: string }[],
@@ -374,7 +379,7 @@ async function createPreMigrationBackup(
   await mkdir(backupDir, { recursive: true });
   for (const s of sources) {
     if (existsSync(s.sqlitePath)) {
-      const dest = join(backupDir, s.sqlitePath.split("/").pop() ?? "source.db");
+      const dest = join(backupDir, basename(s.sqlitePath) || "source.db");
       await copyFile(s.sqlitePath, dest);
     }
   }
