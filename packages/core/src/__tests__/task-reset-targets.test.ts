@@ -7,6 +7,11 @@ import {
 } from "../tasks/task-reset-targets.js";
 import { resolveWorktreesDirLayout, resolveWorkspaceTaskWorktreeDir } from "../tasks/worktree-layout.js";
 
+/*
+FNXC:TestInfraWindows 2026-10-08-07:11:
+Canonical reset targets are `resolve`d, so the POSIX-rooted fixture gains a drive letter on Windows.
+Canonical expectations use `resolve` from the same inputs; on Linux they equal the former literals ("/managed-worktrees/fn-203").
+*/
 const rootDir = "/workspace";
 const taskId = "FN-203";
 
@@ -46,11 +51,11 @@ describe("buildTaskResetWorktreePlan", () => {
   });
 
   it("plans the canonical singular target without a recorded worktree", () => {
-    const canonicalPath = join(rootDir, ".fusion", "worktrees", "fn-203");
+    const canonicalPath = resolve(rootDir, ".fusion", "worktrees", "fn-203");
     const plan = buildTaskResetWorktreePlan(task({}), { rootDir, settings: {} });
     expect(plan.canonicalSingularWorktreePath).toBe(canonicalPath);
     expect(plan.targets).toEqual([expect.objectContaining({
-      worktreePath: canonicalPath,
+      worktreePath: join(rootDir, ".fusion", "worktrees", "fn-203"),
       canonicalPath,
       repoRel: SINGULAR_RESET_WORKTREE_REPO_REL,
     })]);
@@ -58,7 +63,7 @@ describe("buildTaskResetWorktreePlan", () => {
   });
 
   it("deduplicates a recorded canonical singular worktree", () => {
-    const canonicalPath = join(rootDir, ".fusion", "worktrees", "fn-203");
+    const canonicalPath = resolve(rootDir, ".fusion", "worktrees", "fn-203");
     const plan = buildTaskResetWorktreePlan(task({ worktree: canonicalPath }), { rootDir, settings: {} });
     expect(plan.targets).toHaveLength(1);
     expect(plan.targets[0]?.canonicalPath).toBe(canonicalPath);
@@ -71,8 +76,8 @@ describe("buildTaskResetWorktreePlan", () => {
       branch: " fusion/fn-203 ",
     }), { rootDir, settings: {} });
     expect(plan.targets.map((target) => target.canonicalPath)).toEqual([
-      join(rootDir, ".fusion", "worktrees", "fn-203"),
-      legacyPath,
+      resolve(rootDir, ".fusion", "worktrees", "fn-203"),
+      resolve(legacyPath),
     ]);
     expect(plan.branchCleanupTargets).toEqual([{ repoRootDir: rootDir, recordedBranches: ["fusion/fn-203"] }]);
   });
@@ -82,10 +87,10 @@ describe("buildTaskResetWorktreePlan", () => {
       rootDir,
       settings: { worktreesDir: "/managed-worktrees" },
     });
-    expect(plan.canonicalSingularWorktreePath).toBe("/managed-worktrees/fn-203");
+    expect(plan.canonicalSingularWorktreePath).toBe(resolve("/managed-worktrees", "fn-203"));
     expect(plan.targets).toEqual([expect.objectContaining({
-      canonicalPath: "/managed-worktrees/fn-203",
-      containmentRoot: "/managed-worktrees",
+      canonicalPath: resolve("/managed-worktrees", "fn-203"),
+      containmentRoot: resolve("/managed-worktrees"),
     })]);
   });
 
@@ -180,7 +185,7 @@ describe("buildTaskResetWorktreePlan", () => {
     const plan = buildTaskResetWorktreePlan(task({ workspaceWorktrees: {
       "apps/web": { worktreePath: join(taskDir, "apps/web"), branch: "fusion/fn-203" },
     } }), { rootDir, settings: {} });
-    expect(plan.targets[0]).toMatchObject({ repoRootDir: join(rootDir, "apps/web"), canonicalPath: join(taskDir, "apps/web") });
+    expect(plan.targets[0]).toMatchObject({ repoRootDir: join(rootDir, "apps/web"), canonicalPath: resolve(taskDir, "apps/web") });
   });
 
   it("rejects a repository path that escapes the workspace root", () => {

@@ -1,8 +1,9 @@
-import * as childProcess from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import zlib from "node:zlib";
+
+import { create as createTarArchive } from "tar";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -37,10 +38,14 @@ function writeTextFile(path: string, content: string): void {
   writeFileSync(path, content, "utf-8");
 }
 
+/**
+ * FNXC:TestInfraWindows 2026-10-08-07:11:
+ * Build .tgz fixtures in-process with the `tar` package (a core dependency) instead of shelling out to GNU tar.
+ * Git Bash tar reads a drive-letter archive path such as "C:\..." as a remote host and fails on Windows.
+ * Fixture creation now spawns nothing, so the "never invokes the host tar binary" assertion stays meaningful.
+ */
 function createTarFixture(archivePath: string, cwd: string, rootEntry: string): void {
-  childProcess.execSync(
-    `tar czf ${JSON.stringify(archivePath)} -C ${JSON.stringify(cwd)} ${JSON.stringify(rootEntry)}`,
-  );
+  createTarArchive({ gzip: true, file: archivePath, cwd, sync: true }, [rootEntry]);
 }
 
 // Keep ZIP fixtures fully deterministic and self-contained without relying on

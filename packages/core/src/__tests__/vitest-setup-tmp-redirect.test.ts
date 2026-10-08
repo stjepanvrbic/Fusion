@@ -97,18 +97,37 @@ describe("vitest setup tmpdir mkdtemp redirect", () => {
     expect(existsSync(sink)).toBe(true);
   });
 
+  /*
+  FNXC:TestInfraWindows 2026-10-08-07:11:
+  Windows refuses to delete a live process's working directory (EPERM), so the doomed-cwd half of this case is POSIX-only.
+  HOME, tmpdir-redirect, SQLite, and git revalidation after mid-run cleanup still run on every platform.
+  The case restores the entry cwd so later cases never inherit a cwd inside a deleted sink.
+  */
+  const deletesLiveCwd = process.platform !== "win32";
+
   it("revalidates cwd, HOME, tmpdir redirect, and SQLite opens after mid-run cleanup", () => {
     const originalHome = process.env.HOME;
     expect(originalHome).toBeTruthy();
     expect(existsSync(originalHome!)).toBe(true);
+    const entryCwd = process.cwd();
 
+    try {
+      revalidateAfterMidRunCleanup(originalHome!);
+    } finally {
+      if (existsSync(entryCwd)) process.chdir(entryCwd);
+    }
+  });
+
+  function revalidateAfterMidRunCleanup(originalHome: string): void {
     const sink = __fusionTmpdirRedirectTestHooks.sinkForPid(process.pid);
-    const doomedCwd = remember(mkdtempSync(join(tmpdir(), "fn-redirect-cwd-")));
-    process.chdir(doomedCwd);
+    if (deletesLiveCwd) {
+      const doomedCwd = remember(mkdtempSync(join(tmpdir(), "fn-redirect-cwd-")));
+      process.chdir(doomedCwd);
+    }
     rmSync(sink, { recursive: true, force: true });
-    rmSync(originalHome!, { recursive: true, force: true });
+    rmSync(originalHome, { recursive: true, force: true });
     expect(existsSync(sink)).toBe(false);
-    expect(existsSync(originalHome!)).toBe(false);
+    expect(existsSync(originalHome)).toBe(false);
 
     const sqliteProject = remember(mkdtempSync(join(tmpdir(), "fn-redirect-sqlite-")));
     const fusionDir = join(sqliteProject, ".fusion");
@@ -119,14 +138,17 @@ describe("vitest setup tmpdir mkdtemp redirect", () => {
     expect(db.prepare("SELECT id FROM smoke").get()).toEqual({ id: "ok" });
     db.close();
 
-    const output = execSync("git config --global user.name fusion-test && git config --global --get user.name && pwd", { encoding: "utf8" });
+    const output = execSync(
+      `git config --global user.name fusion-test && git config --global --get user.name${deletesLiveCwd ? " && pwd" : ""}`,
+      { encoding: "utf8" },
+    );
 
     expect(output).toContain("fusion-test");
-    expect(output).toContain(process.env.FUSION_TEST_WORKER_ROOT!);
+    if (deletesLiveCwd) expect(output).toContain(process.env.FUSION_TEST_WORKER_ROOT!);
     expect(process.env.HOME).toBe(originalHome);
     expect(existsSync(process.env.HOME!)).toBe(true);
     expect(existsSync(sink)).toBe(true);
-  });
+  }
 
   it("sweeps only dead redirect sinks and preserves current or alive pids", () => {
     const { registryPath, resetSweepForTest, sinkForPid, sweepDeadTmpdirRedirectSinks } = __fusionTmpdirRedirectTestHooks;

@@ -26,8 +26,22 @@ function makeExecFileMock(responses: { pgrep?: string; ps?: string; pgrepError?:
   return { impl, calls };
 }
 
+/**
+ * FNXC:TestInfraWindows 2026-10-08-07:11:
+ * `findVitestProcessIds` is a win32 no-op, so the pgrep/ps parsing cases run under a stubbed "linux" platform.
+ * They then exercise the POSIX logic on every host instead of failing (or silently skipping) on Windows.
+ */
+async function onLinux(body: () => Promise<void>): Promise<void> {
+  const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+  try {
+    await body();
+  } finally {
+    platformSpy.mockRestore();
+  }
+}
+
 describe("findVitestProcessIds", () => {
-  it("returns only pids whose executable is node — wrapper shells and monitors are spared", async () => {
+  it("returns only pids whose executable is node — wrapper shells and monitors are spared", () => onLinux(async () => {
     const { impl, calls } = makeExecFileMock({
       // pgrep -f vitest matches the runner, two workers, a zsh wrapper whose
       // command line contains "npx vitest run", and a watch loop grepping for
@@ -48,9 +62,9 @@ describe("findVitestProcessIds", () => {
     expect(calls[0]).toEqual({ cmd: "pgrep", args: ["-f", "vitest"] });
     expect(calls[1]?.cmd).toBe("ps");
     expect(calls[1]?.args).toEqual(["-o", "pid=,comm=", "-p", "101,102,103,104,105"]);
-  });
+  }));
 
-  it("always excludes the calling process and any caller-supplied pids", async () => {
+  it("always excludes the calling process and any caller-supplied pids", () => onLinux(async () => {
     const self = process.pid;
     const { impl } = makeExecFileMock({
       pgrep: `${self}\n201\n202\n`,
@@ -60,9 +74,9 @@ describe("findVitestProcessIds", () => {
     const pids = await findVitestProcessIds({ execFileImpl: impl, excludePids: [202] });
 
     expect(pids).toEqual([201]);
-  });
+  }));
 
-  it("returns empty when pgrep finds nothing (non-zero exit)", async () => {
+  it("returns empty when pgrep finds nothing (non-zero exit)", () => onLinux(async () => {
     const { impl, calls } = makeExecFileMock({ pgrepError: true });
 
     const pids = await findVitestProcessIds({ execFileImpl: impl });
@@ -70,7 +84,7 @@ describe("findVitestProcessIds", () => {
     expect(pids).toEqual([]);
     // ps must not run with an empty pid list.
     expect(calls.map((c) => c.cmd)).toEqual(["pgrep"]);
-  });
+  }));
 
   it("returns empty on win32 without spawning anything", async () => {
     const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("win32");

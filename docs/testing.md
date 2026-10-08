@@ -60,6 +60,10 @@ The initial harness wiring made a 27-worker PostgreSQL directory run worse, even
 
 Use `pnpm pg:test:up`, `pnpm pg:test:status`, and `pnpm pg:test:down`; forward flags as `pnpm pg:test:up -- --replace` and `pnpm pg:test:down -- --purge`. The script stages the pinned embedded PostgreSQL binaries under `~/.fusion/pg-test-server` (or `FUSION_PG_TEST_SERVER_HOME`) and never starts a relative or worktree-native executable. `dynamic_library_path` cannot repair `$libdir/plpgsql` because PostgreSQL resolves that path from its executable.
 
+<!-- FNXC:PgTestProvisioning 2026-10-08-09:20: KB-050 adds win32-x64 provisioning and makes `status` platform-independent. -->
+
+Provisioning (`up`/`down`) is supported on linux x64/arm64 and win32-x64 (from the installed `@embedded-postgres/windows-x64` payload). `pnpm pg:test:status` probes and reports on every platform. On an unsupported platform (darwin, win32-arm64) or when no payload is installed, `up`/`down` print manual-provisioning instructions (a Docker `postgres:16-alpine` container or a locally installed PostgreSQL service, plus the `FUSION_PG_TEST_URL_BASE` export) and exit 1. Off linux the script has no process-ownership proof, so it refuses to stop or replace any PostgreSQL it did not provision.
+
 The configured identity follows `postgres@3.4.9`: role is URL username, then `PGUSERNAME`, `PGUSER`, and the OS user; password is URL password then `PGPASSWORD`; database is URL path, then `PGDATABASE`, then the role name. A role-only repair therefore still fails when its role-named database is absent. The readiness gate runs configured login, PL/pgSQL, maintenance, and admin-DDL probes. A bare or CI-shaped probe is diagnostic-only unless its independently resolved role/database is one the script provisions; no harness connect dials a path-less base URL.
 
 `FUSION_PG_TEST_URL_BASE` is shared by `up`, `status`, and `down`; export the same non-default URL for all three. A path-bearing URL is provisionable but reports `harness-url-concat`, since `${PG_TEST_URL_BASE}/${dbName}` corrupts the 24 harness URL constructions. The script refuses URL/`--port` conflicts and `PGHOST`/`PGPORT` endpoint divergence. It reuses healthy servers, never mutates a foreign server's roles or databases, and requires a proven data-directory/PID ownership chain before `--replace` can stop a broken PostgreSQL server. `pg_ctl` daemonizes the postmaster, avoiding detached process spawning. A skipped `pgDescribe` block is not PostgreSQL verification evidence.
@@ -1034,6 +1038,8 @@ the cache useful across a normal work week.
 ## Windows Full Suite lane
 
 The non-blocking `test-windows` job runs the merge gate plus the full core and engine suites on `windows-latest`. Some files still fail on Windows only; they are listed in `scripts/lib/windows-known-failing-tests.json`. Each lane writes a Vitest JSON report, and `scripts/check-windows-known-failing.mjs` fails the job only when a file outside that list fails, the report is missing, or the lane exits nonzero with no failing file. The job summary lists every result. A listed file that now passes produces a warning: remove it and lower the ledger's `ceiling`. The ledger may only shrink; a new Windows-only failure is fixed or quarantined under the normal rules.
+
+Core tests must stay Windows-runnable: a fake native client (such as `pg_dump`) is a Node script launched through `packages/core/src/__tests__/_fake-pg-client.ts`, not an extensionless shebang file, and tests must not shell out to `psql` or GNU `tar` (use the harness admin helper and the `tar` npm package).
 
 To run the engine census locally, use Git Bash at the repository root on a Windows host:
 

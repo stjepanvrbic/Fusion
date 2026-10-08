@@ -2,9 +2,9 @@
  * Tests for the PostgreSQL backup manager (pg_dump/pg_restore).
  *
  * FNXC:PostgresBackup 2026-06-24-21:40:
- * These tests use fake pg_dump/pg_restore shell scripts (written to temp
- * files and invoked by absolute path) so they run without a real PostgreSQL
- * server. They verify:
+ * These tests use fake pg_dump/pg_restore Node scripts (written to temp
+ * files by `_fake-pg-client.ts` and invoked by absolute path) so they run
+ * without a real PostgreSQL server, on Linux and Windows. They verify:
  *   - createBackup produces two timestamped dump files (project + central).
  *   - listBackups returns the pairs newest-first.
  *   - cleanupOldBackups respects retention.
@@ -21,45 +21,41 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chmodSync } from "node:fs";
-import { PgBackupManager, parsePgUrl } from "../../postgres/pg-backup.js";
+import { PgBackupManager, parsePgUrl, type PgClientExec } from "../../postgres/pg-backup.js";
+import { writeFakePgClient } from "../_fake-pg-client.js";
 
 function pgUrl(password: string, user = "user", host = "localhost", port = 5432, database = "fusion"): string {
   return ["postgresql://", user, ":", password, "@", host, ":", String(port), "/", database].join("");
 }
 
-/** Write a fake pg_dump script that creates the output file and records invocation. */
-function writeFakePgDump(dir: string): string {
-  const scriptPath = join(dir, "fake-pg_dump");
-  // The script writes the --file target path to an empty file and appends
-  // each invocation to a sidecar (append so tests can inspect multiple runs).
-  const script = `#!/bin/bash
-# Append invocation for assertions.
-echo "--- ARGS: $@" >> "${dir}/pg_dump-invocations.log"
-env | grep -E '^PG' | sort >> "${dir}/pg_dump-invocations.log"
-# Extract the --file path and create it.
-for arg in "$@"; do
-  if [ "$prev" = "--file" ]; then
-    echo "fake-pg-dump-content" > "$arg"
-  fi
-  prev="$arg"
-done
-exit 0
-`;
-  writeFileSync(scriptPath, script, { mode: 0o755 });
-  return scriptPath;
+/*
+FNXC:TestInfraWindows 2026-10-08-07:11:
+Fakes are Node scripts from `_fake-pg-client.ts` so they launch on Windows as well as Linux.
+Each keeps the former shell fake's behavior and log format exactly; `fakeClientExec` is undefined on POSIX, so the production `execFile` path still runs there.
+*/
+
+/** Write a fake pg_dump that creates the --file output and appends each invocation (args + sorted PG* env) to a sidecar log. */
+function writeFakePgDump(dir: string): { path: string; clientExec: PgClientExec | undefined } {
+  const log = JSON.stringify(join(dir, "pg_dump-invocations.log"));
+  return writeFakePgClient({
+    dir,
+    name: "fake-pg_dump",
+    script: [
+      `fs.appendFileSync(${log}, ["--- ARGS: " + argv.join(" "), ...pgEnvLines()].join("\\n") + "\\n");`,
+      'const output = argAfter("--file");',
+      'if (output) fs.writeFileSync(output, "fake-pg-dump-content\\n");',
+    ].join("\n"),
+  });
 }
 
-/** Write a fake pg_restore script that records invocation. */
-function writeFakePgRestore(dir: string): string {
-  const scriptPath = join(dir, "fake-pg_restore");
-  const script = `#!/bin/bash
-echo "ARGS: $@" > "${dir}/pg_restore-invocation.txt"
-env | grep -E '^PG' | sort >> "${dir}/pg_restore-invocation.txt"
-exit 0
-`;
-  writeFileSync(scriptPath, script, { mode: 0o755 });
-  return scriptPath;
+/** Write a fake pg_restore that records its latest invocation (args + sorted PG* env). */
+function writeFakePgRestore(dir: string): { path: string; clientExec: PgClientExec | undefined } {
+  const log = JSON.stringify(join(dir, "pg_restore-invocation.txt"));
+  return writeFakePgClient({
+    dir,
+    name: "fake-pg_restore",
+    script: `fs.writeFileSync(${log}, ["ARGS: " + argv.join(" "), ...pgEnvLines()].join("\\n") + "\\n");`,
+  });
 }
 
 describe("PgBackupManager", () => {
@@ -67,13 +63,16 @@ describe("PgBackupManager", () => {
   let fusionDir: string;
   let pgDumpPath: string;
   let pgRestorePath: string;
+  let fakeClientExec: PgClientExec | undefined;
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "fusion-pg-backup-"));
     fusionDir = join(tempDir, "project", ".fusion");
     mkdirSync(fusionDir, { recursive: true });
-    pgDumpPath = writeFakePgDump(tempDir);
-    pgRestorePath = writeFakePgRestore(tempDir);
+    const fakeDump = writeFakePgDump(tempDir);
+    pgDumpPath = fakeDump.path;
+    pgRestorePath = writeFakePgRestore(tempDir).path;
+    fakeClientExec = fakeDump.clientExec;
   });
 
   afterEach(() => {
@@ -84,7 +83,7 @@ describe("PgBackupManager", () => {
     const manager = new PgBackupManager(
       pgUrl("secret"),
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
     const pair = await manager.createBackup();
     expect(pair.project).toBeDefined();
@@ -100,7 +99,7 @@ describe("PgBackupManager", () => {
     const manager = new PgBackupManager(
       pgUrl("secret"),
       fusionDir,
-      { pgDumpPath, pgRestorePath, includeCentral: false },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec, includeCentral: false },
     );
     const pair = await manager.createBackup();
     expect(pair.project).toBeDefined();
@@ -112,7 +111,7 @@ describe("PgBackupManager", () => {
     const manager = new PgBackupManager(
       pgUrl("supersecret", "postgres", "localhost", 55432),
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
     await manager.createBackup();
 
@@ -135,7 +134,7 @@ describe("PgBackupManager", () => {
     const manager = new PgBackupManager(
       pgUrl("supersecret", "postgres", "localhost", 55432),
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
     const pair = await manager.createBackup();
     expect(pair.project).toBeDefined();
@@ -154,29 +153,20 @@ describe("PgBackupManager", () => {
 
   it("removes the orphaned project dump when the central dump fails (P1 #25)", async () => {
     // A pg_dump that fails ONLY for the central schema.
-    const failingCentralDump = join(tempDir, "fake-pg_dump-fail-central");
-    const script = `#!/bin/bash
-for arg in "$@"; do
-  if [ "$prev" = "--schema" ] && [ "$arg" = "central" ]; then
-    echo "central dump failed" >&2
-    exit 1
-  fi
-  prev="$arg"
-done
-for arg in "$@"; do
-  if [ "$prev" = "--file" ]; then
-    echo "fake-pg-dump-content" > "$arg"
-  fi
-  prev="$arg"
-done
-exit 0
-`;
-    writeFileSync(failingCentralDump, script, { mode: 0o755 });
+    const failingCentralDump = writeFakePgClient({
+      dir: tempDir,
+      name: "fake-pg_dump-fail-central",
+      script: [
+        'if (argAfter("--schema") === "central") { process.stderr.write("central dump failed\\n"); process.exit(1); }',
+        'const output = argAfter("--file");',
+        'if (output) fs.writeFileSync(output, "fake-pg-dump-content\\n");',
+      ].join("\n"),
+    }).path;
 
     const manager = new PgBackupManager(
       "postgresql://localhost:5432/fusion",
       fusionDir,
-      { pgDumpPath: failingCentralDump, pgRestorePath },
+      { pgDumpPath: failingCentralDump, pgRestorePath, clientExec: fakeClientExec },
     );
 
     await expect(manager.createBackup()).rejects.toThrow(/pg_dump failed/);
@@ -194,7 +184,7 @@ exit 0
     const manager = new PgBackupManager(
       "postgresql://localhost:5432/fusion",
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
     await manager.createBackup();
 
@@ -210,7 +200,7 @@ exit 0
     const manager = new PgBackupManager(
       "postgresql://localhost:5432/fusion",
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
 
     await expect(manager.listBackups()).resolves.toEqual([]);
@@ -220,7 +210,7 @@ exit 0
     const manager = new PgBackupManager(
       "postgresql://localhost:5432/fusion",
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
     const backupDirPath = join(fusionDir, "..", ".fusion", "backups");
     mkdirSync(backupDirPath, { recursive: true });
@@ -255,7 +245,7 @@ exit 0
       const manager = new PgBackupManager(
         "postgresql://localhost:5432/fusion",
         fusionDir,
-        { pgDumpPath, pgRestorePath },
+        { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
       );
 
       const first = await manager.createBackup();
@@ -277,7 +267,7 @@ exit 0
     const manager = new PgBackupManager(
       "postgresql://localhost:5432/fusion",
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
     const backupDirPath = join(fusionDir, "..", ".fusion", "backups");
     mkdirSync(backupDirPath, { recursive: true });
@@ -298,7 +288,7 @@ exit 0
     const manager = new PgBackupManager(
       "postgresql://localhost:5432/fusion",
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
     // Create two backup pairs directly with distinct timestamps to avoid
     // sub-second timestamp collisions.
@@ -327,7 +317,7 @@ exit 0
     const manager = new PgBackupManager(
       "postgresql://localhost:5432/fusion",
       fusionDir,
-      { pgDumpPath, pgRestorePath, retention: 2 },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec, retention: 2 },
     );
     // Create 3 backup pairs directly with distinct timestamps to avoid
     // sub-second timestamp collisions.
@@ -348,7 +338,7 @@ exit 0
     const manager = new PgBackupManager(
       pgUrl("secret"),
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
     const pair = await manager.createBackup();
 
@@ -361,15 +351,18 @@ exit 0
   });
 
   it("a corrupt archive fails validation before any destructive restore", async () => {
-    const rejectingRestore = join(tempDir, "fake-pg_restore-invalid-list");
-    writeFileSync(rejectingRestore, `#!/bin/bash
-if [ "$1" = "--list" ]; then echo "truncated archive" >&2; exit 1; fi
-echo "$@" >> "${tempDir}/destructive-restore.log"
-`, { mode: 0o755 });
+    const rejectingRestore = writeFakePgClient({
+      dir: tempDir,
+      name: "fake-pg_restore-invalid-list",
+      script: [
+        'if (argv[0] === "--list") { process.stderr.write("truncated archive\\n"); process.exit(1); }',
+        `fs.appendFileSync(${JSON.stringify(join(tempDir, "destructive-restore.log"))}, argv.join(" ") + "\\n");`,
+      ].join("\n"),
+    }).path;
     const manager = new PgBackupManager(
       "postgresql://localhost:5432/fusion",
       fusionDir,
-      { pgDumpPath, pgRestorePath: rejectingRestore },
+      { pgDumpPath, pgRestorePath: rejectingRestore, clientExec: fakeClientExec },
     );
     const dumpPath = join(tempDir, "corrupt.dump");
     writeFileSync(dumpPath, "truncated");
@@ -385,7 +378,7 @@ echo "$@" >> "${tempDir}/destructive-restore.log"
       const manager = new PgBackupManager(
         "postgresql://localhost:5432/fusion",
         fusionDir,
-        { pgDumpPath, pgRestorePath, retention: 1 },
+        { pgDumpPath, pgRestorePath, clientExec: fakeClientExec, retention: 1 },
       );
       const backupDirPath = join(fusionDir, "..", ".fusion", "backups");
       mkdirSync(backupDirPath, { recursive: true });
@@ -417,7 +410,7 @@ echo "$@" >> "${tempDir}/destructive-restore.log"
     const manager = new PgBackupManager(
       pgUrl("secret"),
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
     const pair = await manager.createBackup();
     expect(pair.project).toBeDefined();
@@ -459,18 +452,17 @@ echo "$@" >> "${tempDir}/destructive-restore.log"
   });
 
   it("native restore spawn failures redact passwords from child errors", async () => {
-    const leakingRestore = join(tempDir, "fake-pg_restore-secret-error");
-    writeFileSync(
-      leakingRestore,
-      `#!/bin/bash\necho '${["postgresql://", "user", ":", "spawn-secret", "@", "localhost/fusion PGPASSWORD=spawn-secret"].join("")}' >&2\nexit 1\n`,
-      { mode: 0o755 },
-    );
+    const leakingRestore = writeFakePgClient({
+      dir: tempDir,
+      name: "fake-pg_restore-secret-error",
+      script: `process.stderr.write(${JSON.stringify(["postgresql://", "user", ":", "spawn-secret", "@", "localhost/fusion PGPASSWORD=spawn-secret"].join("") + "\n")}); process.exit(1);`,
+    }).path;
     const dumpPath = join(tempDir, "valid.dump");
     writeFileSync(dumpPath, "dump");
     const manager = new PgBackupManager(
       pgUrl("spawn-secret"),
       fusionDir,
-      { pgDumpPath, pgRestorePath: leakingRestore },
+      { pgDumpPath, pgRestorePath: leakingRestore, clientExec: fakeClientExec },
     );
 
     await expect(manager.validateBackup(dumpPath)).rejects.not.toThrow(/spawn-secret/);
@@ -481,7 +473,7 @@ echo "$@" >> "${tempDir}/destructive-restore.log"
     const manager = new PgBackupManager(
       "postgresql://localhost:5432/fusion",
       fusionDir,
-      { pgDumpPath, pgRestorePath },
+      { pgDumpPath, pgRestorePath, clientExec: fakeClientExec },
     );
     await expect(manager.restoreBackup(join(tempDir, "nonexistent.dump"))).rejects.toThrow(
       /not found/,
@@ -501,7 +493,7 @@ echo "$@" >> "${tempDir}/destructive-restore.log"
   });
 
   it("claims concurrent stems exclusively, publishes by rename, and leaves no residue", async () => {
-    const manager = new PgBackupManager(pgUrl("secret"), fusionDir, { pgDumpPath, pgRestorePath });
+    const manager = new PgBackupManager(pgUrl("secret"), fusionDir, { pgDumpPath, pgRestorePath, clientExec: fakeClientExec });
     const [first, second] = await Promise.all([manager.createBackup(), manager.createBackup()]);
     const paths = [first.project?.path, first.central && "path" in first.central ? first.central.path : undefined,
       second.project?.path, second.central && "path" in second.central ? second.central.path : undefined];
@@ -515,7 +507,7 @@ echo "$@" >> "${tempDir}/destructive-restore.log"
     vi.setSystemTime(new Date("2026-01-01T00:00:01Z"));
     try {
       const manager = new PgBackupManager(pgUrl("secret"), fusionDir, {
-        pgDumpPath, pgRestorePath, includeCentral: false, retention: 2,
+        pgDumpPath, pgRestorePath, clientExec: fakeClientExec, includeCentral: false, retention: 2,
       });
       const first = await manager.createBackup();
       const second = await manager.createBackup();
@@ -535,7 +527,7 @@ echo "$@" >> "${tempDir}/destructive-restore.log"
   });
 
   it("ignores live in-progress artifacts for listing, restore selection, and retention", async () => {
-    const manager = new PgBackupManager(pgUrl("secret"), fusionDir, { pgDumpPath, pgRestorePath, retention: 1 });
+    const manager = new PgBackupManager(pgUrl("secret"), fusionDir, { pgDumpPath, pgRestorePath, clientExec: fakeClientExec, retention: 1 });
     const backupDir = join(fusionDir, "..", ".fusion", "backups");
     mkdirSync(backupDir, { recursive: true });
     const stem = "20260101-000001";
@@ -548,7 +540,7 @@ echo "$@" >> "${tempDir}/destructive-restore.log"
   });
 
   it("sweeps only abandoned reservations and their partial dumps", async () => {
-    const manager = new PgBackupManager(pgUrl("secret"), fusionDir, { pgDumpPath, pgRestorePath, clientTimeoutMs: 20 });
+    const manager = new PgBackupManager(pgUrl("secret"), fusionDir, { pgDumpPath, pgRestorePath, clientExec: fakeClientExec, clientTimeoutMs: 20 });
     const backupDir = join(fusionDir, "..", ".fusion", "backups");
     mkdirSync(backupDir, { recursive: true });
     const stale = "fusion-pg-20260101-000001.dump";

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { resolvePluginSkillBodyPath } from "../plugins/plugin-skill-paths.js";
 import type { PluginSkillContribution } from "../plugins/plugin-types.js";
 
@@ -56,7 +56,9 @@ describe("resolvePluginSkillBodyPath", () => {
     );
 
     expect(result.relativePath).toBe("skills/entity-framework-core/SKILL.md");
-    expect(result.absolutePath.startsWith(`${pluginRoot}/`)).toBe(true);
+    // FNXC:TestInfraWindows 2026-10-08-07:11: containment uses the native separator so the guard also holds on Windows.
+    expect(result.absolutePath.startsWith(`${pluginRoot}${sep}`)).toBe(true);
+    expect(result.absolutePath).toBe(join(pluginRoot, "skills/entity-framework-core/SKILL.md"));
   });
 
   it("uses only skillFiles[0] as the authoritative body path", () => {

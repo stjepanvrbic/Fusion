@@ -420,6 +420,16 @@ async function gatedDdl(client: ReturnType<typeof postgres>, statement: string):
   await client.unsafe(statement);
 }
 
+/**
+ * FNXC:TestInfraWindows 2026-10-08-08:20:
+ * Exported admin DDL entry point for PostgreSQL tests that manage their own databases (CREATE/DROP DATABASE).
+ * Tests must use it instead of shelling out to `psql`, which is absent on Windows hosts and on Windows CI PATH.
+ * It is a thin wrapper over the internal maintenance-connection executor; behavior is unchanged.
+ */
+export async function execPgAdminStatement(statement: string, timeoutMs?: number): Promise<void> {
+  await adminExecAsync(statement, timeoutMs);
+}
+
 async function adminExecAsync(statement: string, timeoutMs = 15_000): Promise<void> {
   let timedOut = false;
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
