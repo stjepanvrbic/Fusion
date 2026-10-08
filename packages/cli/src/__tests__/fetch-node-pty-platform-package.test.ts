@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { basename, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -28,7 +28,8 @@ function createTarball(root: string, token: string, assets: string[]): string {
     writeFileSync(destination, asset);
   }
   const tarball = join(root, `${token}.tgz`);
-  execFileSync("tar", ["-czf", tarball, "-C", join(root, "tarball"), "package"]);
+  // FNXC:Terminal 2026-10-08-18:26: Paths are cwd-relative because Git Bash GNU tar reads a `C:` archive path as a remote host and unquotes backslashes in `-C`.
+  execFileSync("tar", ["-czf", basename(tarball), "-C", "tarball", "package"], { cwd: root });
   return tarball;
 }
 

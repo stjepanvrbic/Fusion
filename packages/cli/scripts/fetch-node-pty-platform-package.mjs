@@ -8,7 +8,7 @@ release either carries the matching PTY payload or fails explicitly.
 */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -53,7 +53,13 @@ try {
   if (actual !== integrity) throw new Error(`Integrity mismatch for ${packageName}@${version}; expected lockfile sha512.`);
   rmSync(cacheDir, { recursive: true, force: true });
   mkdirSync(cacheDir, { recursive: true });
-  execFileSync("tar", ["-xzf", tempTarball, "--strip-components=1", "-C", cacheDir]);
+  /*
+  FNXC:Terminal 2026-10-08-18:26:
+  On a Windows build host under Git Bash, GNU tar comes first on PATH and parses an archive name containing `C:` as a remote `host:path`.
+  GNU tar also unquotes backslash escapes in a `-C` operand, so a Windows directory segment such as `out\b` is mangled into a backspace.
+  The archive and the extraction directory are siblings, so run tar in their parent and pass both by basename. `--force-local` is not used because Windows bsdtar (System32 tar.exe) rejects it.
+  */
+  execFileSync("tar", ["-xzf", basename(tempTarball), "--strip-components=1", "-C", basename(cacheDir)], { cwd: dirname(cacheDir) });
   console.log(cacheDir);
 } catch (error) {
   rmSync(cacheDir, { recursive: true, force: true });

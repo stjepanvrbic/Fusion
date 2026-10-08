@@ -47,6 +47,11 @@ export type DroidCliExtensionResolution =
  * dependency. We look for that bundled copy first by walking up from this
  * module's location, and fall back to `require.resolve` for monorepo
  * dev/test runs where this file executes from `src/` rather than `dist/`.
+ *
+ * FNXC:DroidCli 2026-10-08-18:26:
+ * KB-088 found source runs (`tsx src/bin.ts`, vitest) resolving `@fusion/droid-cli` only through the `NODE_PATH` that pnpm `.bin` shims export, so any launch without that shim reported `not-installed`.
+ * Source runs must resolve through the declared `workspace:*` devDependency in `packages/cli/package.json` (stripped from the published manifest) and never through a shim `NODE_PATH`.
+ * The bundled `dist/droid-cli` lookup stays first; the `require.resolve` fallback is only for `src/` runs.
  */
 export function resolveDroidCliExtensionFromModuleUrl(
   moduleUrl: string,

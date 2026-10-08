@@ -106,6 +106,7 @@
   "devDependencies": {
     "@fusion/core": "workspace:*",
     "@fusion/dashboard": "workspace:*",
+    "@fusion/droid-cli": "workspace:*",
     "@fusion/engine": "workspace:*",
     "@fusion/i18n": "workspace:*",
     "@fusion/pi-claude-cli": "workspace:*",

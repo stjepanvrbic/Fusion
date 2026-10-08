@@ -23,6 +23,7 @@ export function applyPrepackTransform(pkg) {
   const devDependencies = { ...(pkg.devDependencies || {}) };
   delete devDependencies["@fusion/core"];
   delete devDependencies["@fusion/dashboard"];
+  delete devDependencies["@fusion/droid-cli"];
   delete devDependencies["@fusion/engine"];
   delete devDependencies["@fusion/i18n"];
   delete devDependencies["@fusion/pi-claude-cli"];

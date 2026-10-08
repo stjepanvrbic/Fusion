@@ -29,12 +29,21 @@ function toRepoRelativePath(absolutePath: string): string {
   return relative(workspaceRoot, absolutePath).split(sep).join("/");
 }
 
-function gitTracks(relativePath: string): boolean {
-  const output = execFileSync("git", ["ls-files", "--", relativePath], {
+/*
+FNXC:DocsScreenshots 2026-10-08-18:26:
+KB-088: one `git ls-files` spawn per reference (18 serial spawns) timed out under Windows worker load, where process creation is expensive.
+Ask git once for every unique referenced path and answer tracking by set membership; the tracking assertion itself is unchanged.
+*/
+function gitTrackedPaths(relativePaths: readonly string[]): Set<string> {
+  const uniquePaths = [...new Set(relativePaths)];
+  if (uniquePaths.length === 0) {
+    return new Set();
+  }
+  const output = execFileSync("git", ["ls-files", "-z", "--", ...uniquePaths], {
     cwd: workspaceRoot,
     encoding: "utf8",
-  }).trim();
-  return output.length > 0;
+  });
+  return new Set(output.split("\0").filter((path) => path.length > 0));
 }
 
 describe("docs screenshot links", () => {
@@ -93,8 +102,9 @@ describe("docs screenshot links", () => {
     const missingFiles = screenshotReferences
       .filter(({ resolvedPath }) => !existsSync(resolvedPath))
       .map(({ source, target, repoPath }) => `${source} -> ${target} (${repoPath})`);
+    const trackedPaths = gitTrackedPaths(screenshotReferences.map(({ repoPath }) => repoPath));
     const untrackedFiles = screenshotReferences
-      .filter(({ repoPath }) => !gitTracks(repoPath))
+      .filter(({ repoPath }) => !trackedPaths.has(repoPath))
       .map(({ source, target, repoPath }) => `${source} -> ${target} (${repoPath})`);
 
     expect(missingFiles).toEqual([]);

@@ -329,7 +329,11 @@ describe("CLI package.json publishing config", () => {
   it("prepack manifest rewrite strips workspace-only plugin/tooling devDependencies", () => {
     expect(prepackScript).toContain('delete devDependencies["@fusion/pi-claude-cli"]');
     expect(prepackScript).toContain('delete devDependencies["@fusion/pi-llama-cpp"]');
+    expect(prepackScript).toContain('delete devDependencies["@fusion/droid-cli"]');
     expect(prepackScript).toContain('delete devDependencies["@fusion-plugin-examples/roadmap"]');
+    // FNXC:DroidCli 2026-10-08-18:26: KB-088 declares the private droid-cli workspace package for source runs; it must never reach the published manifest.
+    expect(pkg.devDependencies).toHaveProperty("@fusion/droid-cli", "workspace:*");
+    expect(applyPrepackTransform(pkg).devDependencies).not.toHaveProperty("@fusion/droid-cli");
   });
 
   // Generalized guard derived from tsup.config.ts. Any non-builtin module

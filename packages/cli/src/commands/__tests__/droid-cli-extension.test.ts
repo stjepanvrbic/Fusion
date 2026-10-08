@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -27,6 +28,28 @@ describe("resolveDroidCliExtension", () => {
       // suffix (e.g. 0.11.57-beta.6); still require a full X.Y.Z core.
       expect(result.packageVersion).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
     }
+  });
+
+  /*
+  FNXC:DroidCli 2026-10-08-18:26:
+  KB-088: source runs resolved @fusion/droid-cli only via the NODE_PATH exported by pnpm .bin shims, so a launch without the shim reported not-installed.
+  Resolve from the resolver module's own location in a child with every case spelling of NODE_PATH removed; this proves the declared workspace devDependency, not the shim, makes the package reachable.
+  */
+  it("resolves @fusion/droid-cli from the resolver module without NODE_PATH", () => {
+    const resolverUrl = new URL("../droid-cli-extension.ts", import.meta.url).href;
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const key of Object.keys(env)) {
+      if (/^node_path$/i.test(key)) delete env[key];
+    }
+    const code = [
+      'import { createRequire } from "node:module";',
+      `process.stdout.write(createRequire(${JSON.stringify(resolverUrl)}).resolve("@fusion/droid-cli/package.json"));`,
+    ].join("\n");
+
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], { env, encoding: "utf8" });
+
+    expect(child.status, child.stderr).toBe(0);
+    expect(child.stdout.replace(/\\/g, "/")).toMatch(/droid-cli\/package\.json$/);
   });
 });
 

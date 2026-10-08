@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { writeFileSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
-import { execSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { AgentStore } from "@fusion/core";
 
@@ -14,6 +14,18 @@ vi.mock("../../project-context.js", () => ({
 }));
 
 import { runAgentImport } from "../agent-import.js";
+
+/**
+ * FNXC:AgentImport 2026-10-08-18:26:
+ * Windows Full Suite runs these tests under Git Bash, where GNU tar comes first on PATH and parses a `C:` archive name as a remote host.
+ * GNU tar also unquotes backslash escapes in a `-C` operand, which mangles Windows directories.
+ * Pass both paths relative to the tar process cwd (shell-less, `/`-separated) so GNU tar, Windows bsdtar and Linux tar all accept them; `--force-local` is avoided because bsdtar rejects it.
+ */
+function createTarGz(archivePath: string, sourceDir: string): void {
+  const cwd = dirname(archivePath);
+  const relativeSource = relative(cwd, sourceDir).split(sep).join("/") || ".";
+  execFileSync("tar", ["czf", basename(archivePath), "-C", relativeSource, "."], { cwd });
+}
 
 function makeAgentManifest(options: {
   name: string;
@@ -343,7 +355,7 @@ describe("agent-import", () => {
     const companyDir = createCompanyDirectory(join(tmpDir, "company-archive-src"), "Archive CEO");
     const archivePath = join(tmpDir, "company.tar.gz");
 
-    execSync(`tar czf ${JSON.stringify(archivePath)} -C ${JSON.stringify(companyDir)} .`);
+    createTarGz(archivePath, companyDir);
 
     await runAgentImport(archivePath);
 
@@ -609,7 +621,7 @@ describe("agent-import", () => {
         [{ name: "Archived Skill", instructionBody: "From archive" }],
       );
       const archivePath = join(tmpDir, "company-with-skills.tar.gz");
-      execSync(`tar czf ${JSON.stringify(archivePath)} -C ${JSON.stringify(companyDir)} .`);
+      createTarGz(archivePath, companyDir);
 
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
       await runAgentImport(archivePath);
