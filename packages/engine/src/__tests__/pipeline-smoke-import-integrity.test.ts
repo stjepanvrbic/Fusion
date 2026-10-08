@@ -1,9 +1,10 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const ENGINE_SOURCE_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..");
+// FNXC:TestInfraWindows 2026-10-08-06:50: `URL.pathname` is `/C:/...` on win32, which resolve() turned into `C:\C:\...`; fileURLToPath is the cross-platform spelling.
+const ENGINE_SOURCE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PIPELINE_SMOKE_ROOT = resolve(ENGINE_SOURCE_ROOT, "__tests__/pipeline-smoke");
 
 type NamedImport = {

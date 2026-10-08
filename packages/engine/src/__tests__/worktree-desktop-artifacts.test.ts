@@ -1,7 +1,7 @@
 import { mkdtempSync, mkdirSync, existsSync } from "node:fs";
 import type { PathLike } from "node:fs";
 import * as fsPromises from "node:fs/promises";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("node:fs/promises", async () => {
@@ -66,7 +66,8 @@ describe("removeDesktopBuildArtifacts", () => {
       mkdirSync(join(root, path), { recursive: true });
     }
     const rmSpy = vi.mocked(fsPromises.rm).mockImplementation(async (pathLike: PathLike) => {
-      if (String(pathLike).endsWith("packages/desktop/dist")) {
+      // FNXC:TestInfraWindows 2026-10-08-07:05: rm receives a native path (backslashed on win32); match the artifact in forward-slash spelling.
+      if (String(pathLike).split(sep).join("/").endsWith("packages/desktop/dist")) {
         throw new Error("boom");
       }
     });

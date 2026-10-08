@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import { createSourceFile, forEachChild, isCallExpression, isIdentifier, isNewExpression, ScriptKind, ScriptTarget } from "typescript";
 import { describe, expect, it } from "vitest";
 
@@ -75,7 +75,8 @@ describe("FN-8868 agent usage telemetry wiring", () => {
 
     for (const file of files(sourceRoot)) {
       const source = readFileSync(file, "utf8");
-      const relativeFile = relative(sourceRoot, file);
+      // FNXC:TestInfraWindows 2026-10-08-06:50: inventory keys are POSIX-spelled, so normalize the native relative path (win32 yields `executor\x.ts`).
+      const relativeFile = relative(sourceRoot, file).split(sep).join("/");
       const { loggers, attaches, preResolutionAttaches, lineAt } = collectSites(source);
       if (loggers.length === 0) continue;
 

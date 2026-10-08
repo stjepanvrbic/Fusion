@@ -24,21 +24,22 @@ function createMockSettings(overrides: Partial<Settings> = {}): Settings {
 }
 
 describe("getPromptPath", () => {
+  // FNXC:TestInfraWindows 2026-10-08-06:25: getPromptPath uses node:path join, so expectations are the native join of the POSIX literal (identity off Windows).
   it("returns absolute path to PROMPT.md for a task", () => {
     const tasksDir = "/project/.fusion/tasks";
     const taskId = "FN-001";
     expect(getPromptPath(tasksDir, taskId)).toBe(
-      "/project/.fusion/tasks/FN-001/PROMPT.md",
+      join("/project/.fusion/tasks/FN-001/PROMPT.md"),
     );
   });
 
   it("handles task IDs with different formats", () => {
     const tasksDir = "/project/.fusion/tasks";
     expect(getPromptPath(tasksDir, "KB-042")).toBe(
-      "/project/.fusion/tasks/KB-042/PROMPT.md",
+      join("/project/.fusion/tasks/KB-042/PROMPT.md"),
     );
     expect(getPromptPath(tasksDir, "TASK-999")).toBe(
-      "/project/.fusion/tasks/TASK-999/PROMPT.md",
+      join("/project/.fusion/tasks/TASK-999/PROMPT.md"),
     );
   });
 });

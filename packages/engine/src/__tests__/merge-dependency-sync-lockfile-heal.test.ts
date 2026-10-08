@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
@@ -11,6 +11,7 @@ import {
   isOutdatedLockfileError,
   readInstallMarker,
 } from "../merge/merge-dependency-sync.js";
+import { installPathShim, writeShimFiles, type PathShim } from "./_path-shim.js";
 
 /*
 FNXC:AIMerge 2026-07-02-14:05 (lockfile auto-heal):
@@ -36,16 +37,18 @@ function tmp(prefix: string): string {
 
 /**
  * Install a fake `pnpm` that logs each invocation's args and, when `--frozen-lockfile` is present, exits
- * non-zero with the canonical pnpm outdated-lockfile stderr. `--no-frozen-lockfile` succeeds. Returns the
- * prior PATH so the caller can restore it.
+ * non-zero with the canonical pnpm outdated-lockfile stderr. `--no-frozen-lockfile` succeeds. Call
+ * `restore()` on the returned shim to put PATH back.
+ *
+ * FNXC:TestInfraWindows 2026-10-08-05:48: installed through _path-shim so the product's native `exec` (cmd.exe on
+ * Windows) resolves the fake via its `.cmd` wrapper; an extensionless script alone let the REAL pnpm run there.
  */
-function installFakePnpm(logPath: string): string {
-  const binDir = tmp("fusion-heal-fake-bin-");
-  const script = join(binDir, "pnpm");
-  writeFileSync(
-    script,
-    `#!/usr/bin/env node
-const fs = require('fs');
+function installFakePnpm(logPath: string): PathShim {
+  return installPathShim({
+    name: "pnpm",
+    kind: "node",
+    dir: tmp("fusion-heal-fake-bin-"),
+    body: `const fs = require('fs');
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(args) + '\\n');
 if (args.includes('--frozen-lockfile')) {
@@ -54,11 +57,7 @@ if (args.includes('--frozen-lockfile')) {
 }
 process.exit(0);
 `,
-  );
-  chmodSync(script, 0o755);
-  const previousPath = process.env.PATH ?? "";
-  process.env.PATH = `${binDir}${delimiter}${previousPath}`;
-  return previousPath;
+  });
 }
 
 function readLog(path: string): string[][] {
@@ -75,6 +74,23 @@ env-dependent path.
 function restoreEnv(key: string, value: string | undefined): void {
   if (value === undefined) delete process.env[key];
   else process.env[key] = value;
+}
+
+/*
+FNXC:TestInfraWindows 2026-10-08-06:10:
+A Vitest worker's process.env is a case-sensitive object, and pnpm on Windows hands it both `npm_config_registry` and `NPM_CONFIG_REGISTRY`.
+The product forwards `{ ...process.env }`, and Windows collapses the duplicate spellings in the child env block (the upper-case one wins), so overriding only the lower-case key never reached the child.
+Override or delete EVERY case spelling of the var, and restore each one exactly (absent keys are deleted, never assigned `undefined`).
+Off Windows only the exact key exists, so this is the previous single-key behavior.
+*/
+function overrideEnvAllCases(key: string, value: string | undefined): () => void {
+  const prior = Object.entries(process.env).filter(([name]) => name.toUpperCase() === key.toUpperCase());
+  for (const [name] of prior) delete process.env[name];
+  if (value !== undefined) process.env[key] = value;
+  return () => {
+    for (const name of Object.keys(process.env)) if (name.toUpperCase() === key.toUpperCase()) delete process.env[name];
+    for (const [name, priorValue] of prior) restoreEnv(name, priorValue);
+  };
 }
 
 describe("buildNonFrozenRetryCommand", () => {
@@ -110,8 +126,7 @@ describe("installWorktreeDependencies lockfile auto-heal", () => {
     writeFileSync(join(dir, "pyproject.toml"), '[project]\nrequires-python = ">=3.99"\n[tool.uv]\npython-downloads = "never"\n');
     const bin = tmp("fusion-uv-incompatible-bin-");
     writeFileSync(join(bin, "python3.11"), "");
-    const previousPath = process.env.PATH;
-    process.env.PATH = bin;
+    const restorePath = overrideEnvAllCases("PATH", bin);
     try {
       await expect(installWorktreeDependencies({ cwd: dir, taskId: "FN-9438" })).rejects.toSatisfy((error: unknown) => {
         expect(error).toBeInstanceOf(DependencyBootstrapConfigurationError);
@@ -122,7 +137,7 @@ describe("installWorktreeDependencies lockfile auto-heal", () => {
         return true;
       });
     } finally {
-      restoreEnv("PATH", previousPath);
+      restorePath();
     }
   });
 
@@ -134,10 +149,9 @@ describe("installWorktreeDependencies lockfile auto-heal", () => {
     const bin = tmp("fusion-mixed-lockfile-bin-");
     const logPath = join(tmp("fusion-mixed-lockfile-log-"), "install.log");
     writeFileSync(join(bin, "python3.11"), "");
-    writeFileSync(join(bin, "pnpm"), `#!/bin/sh\nprintf 'started\\n' >> ${JSON.stringify(logPath)}\n`);
-    chmodSync(join(bin, "pnpm"), 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = bin;
+    // FNXC:TestInfraWindows 2026-10-08-05:48: writeShimFiles adds the win32 `.cmd` wrapper, so "no install started" is also proven on Windows, where cmd.exe never runs an extensionless script.
+    writeShimFiles(bin, { name: "pnpm", kind: "sh", body: `printf 'started\\n' >> ${JSON.stringify(logPath)}` });
+    const restorePath = overrideEnvAllCases("PATH", bin);
     try {
       await expect(installWorktreeDependencies({ cwd: dir, taskId: "FN-9438" })).rejects.toSatisfy((error: unknown) => {
         expect(error).toBeInstanceOf(DependencyBootstrapConfigurationError);
@@ -148,7 +162,7 @@ describe("installWorktreeDependencies lockfile auto-heal", () => {
       });
       expect(() => readFileSync(logPath, "utf8")).toThrow();
     } finally {
-      restoreEnv("PATH", previousPath);
+      restorePath();
     }
   });
 
@@ -157,7 +171,7 @@ describe("installWorktreeDependencies lockfile auto-heal", () => {
     writeFileSync(join(dir, "uv.lock"), "version = 1\n");
     writeFileSync(join(dir, "pyproject.toml"), '[project]\nrequires-python = ">=3.99"\n[tool.uv]\npython-downloads = "never"\n');
     const logPath = join(tmp("fusion-uv-configured-log-"), "install.log");
-    const previousPath = installFakePnpm(logPath);
+    const pnpmShim = installFakePnpm(logPath);
     try {
       const result = await installWorktreeDependencies({
         cwd: dir,
@@ -167,7 +181,7 @@ describe("installWorktreeDependencies lockfile auto-heal", () => {
       expect(result.configured).toBe(true);
       expect(readLog(logPath)).toEqual([["install"]]);
     } finally {
-      restoreEnv("PATH", previousPath);
+      pnpmShim.restore();
     }
   });
 
@@ -176,7 +190,7 @@ describe("installWorktreeDependencies lockfile auto-heal", () => {
     writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfile: {}\n");
     mkdirSync(join(dir, "node_modules"), { recursive: true }); // a real install creates this; the marker lives under it
     const logPath = join(tmp("fusion-heal-log-"), "install.log");
-    const previousPath = installFakePnpm(logPath);
+    const pnpmShim = installFakePnpm(logPath);
     try {
       const result = await installWorktreeDependencies({ cwd: dir, taskId: "FN-1" });
       expect(result.healed).toBe(true);
@@ -186,7 +200,7 @@ describe("installWorktreeDependencies lockfile auto-heal", () => {
       // Marker reflects the current lockfile so the next merge can legitimately skip when unchanged.
       expect(readInstallMarker(dir)).toBe(computeLockfileHash(dir));
     } finally {
-      process.env.PATH = previousPath;
+      pnpmShim.restore();
     }
 
     const calls = readLog(logPath);
@@ -199,7 +213,7 @@ describe("installWorktreeDependencies lockfile auto-heal", () => {
     const dir = tmp("fusion-heal-configured-");
     writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfile: {}\n");
     const logPath = join(tmp("fusion-heal-log-"), "install.log");
-    const previousPath = installFakePnpm(logPath);
+    const pnpmShim = installFakePnpm(logPath);
     try {
       await expect(
         installWorktreeDependencies({
@@ -209,7 +223,7 @@ describe("installWorktreeDependencies lockfile auto-heal", () => {
         }),
       ).rejects.toThrow(/Dependency sync failed for FN-1.*OUTDATED_LOCKFILE/);
     } finally {
-      process.env.PATH = previousPath;
+      pnpmShim.restore();
     }
     // Only the single frozen attempt ran; no non-frozen retry.
     expect(readLog(logPath)).toEqual([["install", "--frozen-lockfile"]]);
@@ -228,40 +242,34 @@ describe("installWorktreeDependencies env passthrough", () => {
    * the child process receives the expected environment. Writes a JSON object with
    * the requested env var values.
    */
-  function installEnvLoggingPnpm(envVars: string[], logPath: string): string {
-    const binDir = tmp("fusion-env-fake-bin-");
-    const script = join(binDir, "pnpm");
+  function installEnvLoggingPnpm(envVars: string[], logPath: string): PathShim {
     const varsJson = JSON.stringify(envVars);
-    writeFileSync(
-      script,
-      `#!/usr/bin/env node
-const fs = require('fs');
+    return installPathShim({
+      name: "pnpm",
+      kind: "node",
+      dir: tmp("fusion-env-fake-bin-"),
+      body: `const fs = require('fs');
 const vars = ${varsJson};
 const env = {};
 for (let v of vars) env[v] = process.env[v];
 fs.writeFileSync(${JSON.stringify(logPath)}, JSON.stringify(env));
 `,
-    );
-    chmodSync(script, 0o755);
-    const previousPath = process.env.PATH ?? "";
-    process.env.PATH = `${binDir}${delimiter}${previousPath}`;
-    return previousPath;
+    });
   }
 
   it("passes COREPACK_HOME, PNPM_HOME, and npm_config_registry through to exec", async () => {
     // Set the env vars so the passthrough has values to forward
-    const origCorepackHome = process.env.COREPACK_HOME;
-    const origPnpmHome = process.env.PNPM_HOME;
-    const origNpmRegistry = process.env.npm_config_registry;
-    process.env.COREPACK_HOME = "/tmp/fake-corepack";
-    process.env.PNPM_HOME = "/tmp/fake-pnpm";
-    process.env.npm_config_registry = "https://fake.registry/";
+    const restoreEnvVars = [
+      overrideEnvAllCases("COREPACK_HOME", "/tmp/fake-corepack"),
+      overrideEnvAllCases("PNPM_HOME", "/tmp/fake-pnpm"),
+      overrideEnvAllCases("npm_config_registry", "https://fake.registry/"),
+    ];
 
     const dir = tmp("fusion-env-repo-");
     writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfile: {}\n");
 
     const logPath = join(tmp("fusion-env-log-"), "env.json");
-    const previousPath = installEnvLoggingPnpm(
+    const pnpmShim = installEnvLoggingPnpm(
       ["COREPACK_HOME", "PNPM_HOME", "npm_config_registry"],
       logPath,
     );
@@ -273,10 +281,8 @@ fs.writeFileSync(${JSON.stringify(logPath)}, JSON.stringify(env));
       expect(captured.PNPM_HOME).toBe("/tmp/fake-pnpm");
       expect(captured.npm_config_registry).toBe("https://fake.registry/");
     } finally {
-      process.env.PATH = previousPath;
-      restoreEnv("COREPACK_HOME", origCorepackHome);
-      restoreEnv("PNPM_HOME", origPnpmHome);
-      restoreEnv("npm_config_registry", origNpmRegistry);
+      pnpmShim.restore();
+      for (const restoreVar of restoreEnvVars) restoreVar();
     }
   });
 
@@ -285,7 +291,7 @@ fs.writeFileSync(${JSON.stringify(logPath)}, JSON.stringify(env));
     writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfile: {}\n");
 
     const logPath = join(tmp("fusion-env-log2-"), "env.json");
-    const previousPath = installEnvLoggingPnpm(
+    const pnpmShim = installEnvLoggingPnpm(
       ["PATH", "HOME", "SHELL"],
       logPath,
     );
@@ -299,24 +305,23 @@ fs.writeFileSync(${JSON.stringify(logPath)}, JSON.stringify(env));
       expect(captured.HOME).toBe(process.env.HOME);
       expect(captured.SHELL).toBe(process.env.SHELL);
     } finally {
-      process.env.PATH = previousPath;
+      pnpmShim.restore();
     }
   });
 
   it("handles undefined corepack/pnpm env vars gracefully", async () => {
     // Clear the env vars
-    const origCorepackHome = process.env.COREPACK_HOME;
-    const origPnpmHome = process.env.PNPM_HOME;
-    const origNpmRegistry = process.env.npm_config_registry;
-    delete process.env.COREPACK_HOME;
-    delete process.env.PNPM_HOME;
-    delete process.env.npm_config_registry;
+    const restoreEnvVars = [
+      overrideEnvAllCases("COREPACK_HOME", undefined),
+      overrideEnvAllCases("PNPM_HOME", undefined),
+      overrideEnvAllCases("npm_config_registry", undefined),
+    ];
 
     const dir = tmp("fusion-env-repo3-");
     writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfile: {}\n");
 
     const logPath = join(tmp("fusion-env-log3-"), "env.json");
-    const previousPath = installEnvLoggingPnpm(
+    const pnpmShim = installEnvLoggingPnpm(
       ["COREPACK_HOME", "PNPM_HOME", "npm_config_registry", "PATH"],
       logPath,
     );
@@ -332,10 +337,8 @@ fs.writeFileSync(${JSON.stringify(logPath)}, JSON.stringify(env));
       // PATH should still be present
       expect(captured.PATH).toBeDefined();
     } finally {
-      process.env.PATH = previousPath;
-      restoreEnv("COREPACK_HOME", origCorepackHome);
-      restoreEnv("PNPM_HOME", origPnpmHome);
-      restoreEnv("npm_config_registry", origNpmRegistry);
+      pnpmShim.restore();
+      for (const restoreVar of restoreEnvVars) restoreVar();
     }
   });
 });

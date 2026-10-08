@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { join } from "node:path";
 import { canonicalStepInstanceBranchName, planTaskWorktreePath, resolveTaskWorkingBranch } from "../worktree/worktree-names.js";
 
 describe("resolveTaskWorkingBranch", () => {
@@ -27,7 +28,7 @@ describe("planTaskWorktreePath", () => {
       { id: "FN-258", description: "unused" },
       "/repo",
       new Set(["gentle-panda"]),
-    )).toBe("/repo/.fusion/worktrees/fn-258");
+    )).toBe(join("/repo/.fusion/worktrees/fn-258")); // FNXC:TestInfraWindows 2026-10-08-06:25: native join spelling (identity off Windows).
   });
 
   it("preserves an existing task worktree pointer until acquisition corrects it", () => {

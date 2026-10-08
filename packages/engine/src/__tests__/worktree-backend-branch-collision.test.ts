@@ -9,13 +9,16 @@ import { BranchWorktreeAutoRecoveryHandler } from "../auto-recovery-handlers/bra
 import { acquireTaskWorktree } from "../worktree/worktree-acquisition.js";
 import { NativeWorktreeBackend } from "../worktree/worktree-backend.js";
 
+// FNXC:TestInfraWindows 2026-10-08-06:45: `git worktree list --porcelain` prints forward slashes on every platform, so native paths are compared in that spelling (a no-op on Linux).
+const gitPorcelainPath = (path: string): string => path.replace(/\\/g, "/");
+
 function git(repo: string, command: string): string {
   return execSync(command, { cwd: repo, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
 }
 
 function assertRegisteredWorktree(repo: string, worktreePath: string, branch: string): void {
   const porcelain = git(repo, "git worktree list --porcelain");
-  expect(porcelain).toContain(`worktree ${realpathSync(worktreePath)}`);
+  expect(porcelain).toContain(`worktree ${gitPorcelainPath(realpathSync(worktreePath))}`);
   expect(porcelain).toContain(`branch refs/heads/${branch}`);
 }
 

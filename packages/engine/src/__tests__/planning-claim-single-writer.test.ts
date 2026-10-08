@@ -39,7 +39,7 @@ Cheap by construction (FN-5048): grep-level over production source, no engine bo
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../../../..");
 
@@ -242,7 +242,8 @@ function scanFor(
   const hits: string[] = [];
   for (const root of roots ?? sourceRoots(base)) {
     for (const file of sourceFiles(root, base)) {
-      const rel = file.slice(base.length + 1);
+      // FNXC:TestInfraWindows 2026-10-08-06:50: allowlists are POSIX-spelled, so the relative path is normalized to forward slashes; on win32 every exclusion and allowlist key otherwise missed.
+      const rel = file.slice(base.length + 1).split(sep).join("/");
       if (NON_TASK_STATUS_MODULES.includes(rel)) continue;
       if (matches(executableSource(file))) hits.push(rel);
     }

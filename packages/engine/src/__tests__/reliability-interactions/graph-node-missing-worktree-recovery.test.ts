@@ -17,6 +17,7 @@ import {
   resetExecutorMocks,
 } from "../executor-test-helpers.js";
 import { MAX_WORKTREE_SESSION_RETRIES } from "../../self-healing.js";
+import { posixFixturePath } from "../_posix-fixture-path.js";
 
 /*
 FNXC:MissingWorktreeRecovery 2026-07-16-18:40:
@@ -385,9 +386,11 @@ describe("Plan Review missing-worktree repo-root fallback (FN-7996)", () => {
 
     expect(result.outcome).toBe("success");
     // Not the stale path, and — the point of the change — not the shared repo root either.
-    expect(captured.worktreePath).not.toBe("/tmp/stale-wt");
-    expect(captured.worktreePath).not.toBe("/tmp/test");
-    expect(captured.worktreePath).toContain("/tmp/test/.fusion/worktrees/");
+    // FNXC:TestInfraWindows 2026-10-08-06:20: the executor derives the path with node:path (`\tmp\test\...` on win32), so compare in the POSIX namespace; posixFixturePath is the identity off Windows.
+    const reacquired = posixFixturePath(captured.worktreePath);
+    expect(reacquired).not.toBe("/tmp/stale-wt");
+    expect(reacquired).not.toBe("/tmp/test");
+    expect(reacquired).toContain("/tmp/test/.fusion/worktrees/");
     expect(store.logEntry).toHaveBeenCalledWith(
       live.id,
       expect.stringContaining("requires a task worktree — acquiring worktree before node execution"),

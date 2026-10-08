@@ -4,6 +4,7 @@
 
 import { resolvePluginSkillEnabled } from "@fusion/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { posixFixturePath } from "./_posix-fixture-path.js";
 
 /*
 FNXC:EngineTests 2026-07-18-04:35:
@@ -36,16 +37,22 @@ import {
 
 // ── Mock Setup ───────────────────────────────────────────────────────────────
 
+/*
+FNXC:TestInfraWindows 2026-10-08-07:00:
+The mock filesystem is keyed by POSIX fixture literals while the product resolve()s paths (drive-qualified, backslashed on win32).
+Every lookup goes through posixFixturePath so the keys match on every platform; it is the identity off Windows.
+*/
 vi.mock("node:fs", async () => {
   const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+  const { posixFixturePath: key } = await import("./_posix-fixture-path.js");
   return {
     ...actual,
-    existsSync: (path: unknown) => mockFiles.has(String(path)) || mockDirs.has(String(path)),
-    readFileSync: (path: unknown) => mockFiles.get(String(path)) ?? "{}",
+    existsSync: (path: unknown) => mockFiles.has(key(path)) || mockDirs.has(key(path)),
+    readFileSync: (path: unknown) => mockFiles.get(key(path)) ?? "{}",
     mkdtempSync: () => `/tmp/skill-resolver-mock-${++mockDirCounter.value}`,
-    writeFileSync: (path: unknown, content: unknown) => mockFiles.set(String(path), String(content)),
+    writeFileSync: (path: unknown, content: unknown) => mockFiles.set(key(path), String(content)),
     rmSync: (path: unknown) => {
-      const pathStr = String(path);
+      const pathStr = key(path);
       for (const key of mockFiles.keys()) {
         if (key.startsWith(pathStr)) mockFiles.delete(key);
       }
@@ -77,7 +84,7 @@ describe("resolveProjectRoot", () => {
     const dir = `/tmp/skill-resolver-mock-${++mockDirCounter.value}`;
     mockDirs.add(`${dir}/.fusion`);
 
-    expect(resolveProjectRoot(dir)).toBe(dir);
+    expect(posixFixturePath(resolveProjectRoot(dir))).toBe(dir);
   });
 
   it("prefers parent repo root for worktree paths when both parent and worktree have .fusion", () => {
@@ -86,7 +93,7 @@ describe("resolveProjectRoot", () => {
     mockDirs.add(`${projectDir}/.fusion`);
     mockDirs.add(`${worktreeDir}/.fusion`);
 
-    expect(resolveProjectRoot(`${worktreeDir}/sub`)).toBe(projectDir);
+    expect(posixFixturePath(resolveProjectRoot(`${worktreeDir}/sub`))).toBe(projectDir);
   });
 
   it("falls back to legacy walk when parent repo .fusion is missing", () => {
@@ -94,7 +101,7 @@ describe("resolveProjectRoot", () => {
     const worktreeDir = `${projectDir}/.worktrees/swift-falcon`;
     mockDirs.add(`${worktreeDir}/.fusion`);
 
-    expect(resolveProjectRoot(`${worktreeDir}/sub`)).toBe(worktreeDir);
+    expect(posixFixturePath(resolveProjectRoot(`${worktreeDir}/sub`))).toBe(worktreeDir);
   });
 
   it("walks up from deeply nested path", () => {
@@ -102,14 +109,14 @@ describe("resolveProjectRoot", () => {
     const nestedDir = `${projectDir}/.worktrees/task-branch/src/components`;
     mockDirs.add(`${projectDir}/.fusion`);
 
-    expect(resolveProjectRoot(nestedDir)).toBe(projectDir);
+    expect(posixFixturePath(resolveProjectRoot(nestedDir))).toBe(projectDir);
   });
 
   it("returns cwd when no .fusion directory found anywhere", () => {
     const dir = `/tmp/skill-resolver-mock-${++mockDirCounter.value}`;
 
     // No .fusion set up anywhere
-    expect(resolveProjectRoot(dir)).toBe(dir);
+    expect(posixFixturePath(resolveProjectRoot(dir))).toBe(dir);
   });
 
   it("returns cwd when .fusion is in a sibling directory (not ancestor)", () => {
@@ -119,7 +126,7 @@ describe("resolveProjectRoot", () => {
     mockDirs.add(`${siblingDir}/.fusion`);
 
     // Walking up from dir should not find sibling's .fusion
-    expect(resolveProjectRoot(dir)).toBe(dir);
+    expect(posixFixturePath(resolveProjectRoot(dir))).toBe(dir);
   });
 });
 

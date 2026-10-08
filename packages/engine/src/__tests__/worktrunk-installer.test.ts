@@ -3,6 +3,9 @@ import type { WorktrunkSettings } from "@fusion/core";
 import type { AgentActionGateContext } from "../agents/agent-action-gate.js";
 import type { RunAuditor } from "../util/run-audit.js";
 
+// FNXC:TestInfraWindows 2026-10-08-07:00: installed binary paths are native (backslashed on win32), so the basename check accepts either separator.
+const BINARY_WT_SUFFIX = /[\\/]wt$/;
+
 vi.mock("node:child_process", () => ({
   exec: vi.fn(),
 }));
@@ -438,11 +441,11 @@ describe("worktrunk-installer", () => {
 
       const installEvent = gitEvents.find((event) => event.type === "worktree:worktrunk-install");
       expect(installEvent).toBeDefined();
-      expect(installEvent?.target).toContain("/wt");
+      expect(installEvent?.target).toMatch(BINARY_WT_SUFFIX);
       expect(installEvent?.metadata).toEqual(
         expect.objectContaining({
           op: "install",
-          binaryPath: expect.stringContaining("/wt"),
+          binaryPath: expect.stringMatching(BINARY_WT_SUFFIX),
           installSource: expectedSource,
           durationMs: expect.any(Number),
           taskId: "FN-4711",

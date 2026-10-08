@@ -32,7 +32,7 @@ describe("worktree-paths", () => {
   });
 
   it("supports absolute path", () => {
-    expect(resolveWorktreesDir(rootDir, { worktreesDir: "/var/tmp/fn-worktrees" } as any)).toBe("/var/tmp/fn-worktrees");
+    expect(resolveWorktreesDir(rootDir, { worktreesDir: "/var/tmp/fn-worktrees" } as any)).toBe(resolve("/var/tmp/fn-worktrees")); // FNXC:TestInfraWindows 2026-10-08-06:25: absolute worktreesDir is resolve()d (drive-qualified on win32).
   });
 
   it("supports ~ expansion", () => {
@@ -58,7 +58,7 @@ describe("worktree-paths", () => {
   });
 
   it("builds the AI-merge root under an absolute custom worktrees dir", () => {
-    expect(resolveAiMergeRootPath(rootDir, { worktreesDir: "/tmp/ext-worktrees" } as any)).toBe(join("/tmp/ext-worktrees", AI_MERGE_DIRNAME));
+    expect(resolveAiMergeRootPath(rootDir, { worktreesDir: "/tmp/ext-worktrees" } as any)).toBe(resolve("/tmp/ext-worktrees", AI_MERGE_DIRNAME));
   });
 
   it("searches current, legacy, and historic AI-merge roots without configured worktrees", () => {
@@ -78,7 +78,7 @@ describe("worktree-paths", () => {
 
   it("does not search the historic root for an external configured worktrees dir", () => {
     expect(resolveAiMergeSearchRoots(rootDir, { worktreesDir: "/abs/elsewhere" } as any)).toEqual([
-      join("/abs/elsewhere", AI_MERGE_DIRNAME),
+      resolve("/abs/elsewhere", AI_MERGE_DIRNAME),
       resolveLegacyAiMergeRootPath(rootDir),
     ]);
   });

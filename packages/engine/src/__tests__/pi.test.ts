@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { describeModel, formatModelMarkerDetails, compactSessionContext, COMPACTION_FALLBACK_INSTRUCTIONS, createFnAgent, createPiAgentSessionRaw, getProjectRootFromWorktree, isModelAuthTierIncompatibilityError, isRetryableModelSelectionError, promptWithFallback, type AgentOptions } from "../pi.js";
 import { createAgentSession, ModelRegistry, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { piLog } from "../logger.js";
+import { nativeFixturePath, posixFixturePath } from "./_posix-fixture-path.js";
 
 const { resourceLoaderOptions } = vi.hoisted(() => ({
   resourceLoaderOptions: { current: undefined as Record<string, unknown> | undefined },
@@ -101,16 +102,17 @@ describe("getProjectRootFromWorktree", () => {
   });
 
   it("supports configured candidate worktrees dir paths", () => {
+    // FNXC:TestInfraWindows 2026-10-08-06:55: candidates are resolve()d, so win32 answers drive-qualified; compare in the POSIX namespace (identity off Windows).
     expect(
-      getProjectRootFromWorktree("/tmp/.fn-worktrees/repo/fn-001/src", {
+      posixFixturePath(getProjectRootFromWorktree("/tmp/.fn-worktrees/repo/fn-001/src", {
         worktreesDirCandidates: ["/tmp/.fn-worktrees/repo"],
-      }),
+      })),
     ).toBe("/tmp/.fn-worktrees");
 
     expect(
-      getProjectRootFromWorktree("/tmp/repo.worktrees/fn-001", {
+      posixFixturePath(getProjectRootFromWorktree("/tmp/repo.worktrees/fn-001", {
         worktreesDirCandidates: ["/tmp/repo.worktrees"],
-      }),
+      })),
     ).toBe("/tmp");
   });
 });
@@ -450,7 +452,7 @@ describe("createFnAgent skills parameter", () => {
     // Verify resolveSessionSkills was called with auto-derived context
     expect(mockResolveSessionSkills).toHaveBeenCalledTimes(1);
     const callArgs = mockResolveSessionSkills.mock.calls[0]![0];
-    expect(callArgs.projectRootDir).toBe("/test/project");
+    expect(callArgs.projectRootDir).toBe(nativeFixturePath("/test/project")); // FNXC:TestInfraWindows 2026-10-08-06:55: the root is resolve()d (drive-qualified on win32).
     expect(callArgs.requestedSkillNames).toEqual(["review", "fusion"]);
     expect(callArgs.sessionPurpose).toBe("executor");
   });
@@ -532,7 +534,7 @@ describe("createFnAgent skills parameter", () => {
     // No .fusion is found in the test filesystem, so it returns /project/subdirectory.
     expect(mockResolveSessionSkills).toHaveBeenCalledTimes(1);
     const callArgs = mockResolveSessionSkills.mock.calls[0]![0];
-    expect(callArgs.projectRootDir).toBe("/project/subdirectory");
+    expect(callArgs.projectRootDir).toBe(nativeFixturePath("/project/subdirectory"));
     expect(callArgs.requestedSkillNames).toEqual(["fusion"]);
   });
 

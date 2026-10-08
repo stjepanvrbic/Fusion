@@ -8,6 +8,9 @@ import { acquireWorktreePathReservation, type Settings, type Task, type TaskStor
 import { SelfHealingManager, STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS } from "../../self-healing.js";
 import { activeSessionRegistry } from "../../agents/active-session-registry.js";
 
+// FNXC:TestInfraWindows 2026-10-08-06:45: `git worktree list --porcelain` prints forward slashes on every platform, so native paths are compared in that spelling (a no-op on Linux).
+const gitPorcelainPath = (path: string): string => path.replace(/\\/g, "/");
+
 function sh(command: string, cwd: string): string {
   return String(execSync(command, { cwd, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }) ?? "");
 }
@@ -221,7 +224,7 @@ describe("FN-4924 / FN-4949: reclaim-stale-active-branches defers in-flight exec
     try {
       await expect(manager.reclaimStaleActiveBranches()).resolves.toBe(0);
       expect(() => sh(`git rev-parse --verify ${branch}`, repo)).not.toThrow();
-      expect(sh("git worktree list --porcelain", repo)).toContain(`worktree ${realpathSync(worktree)}`);
+      expect(sh("git worktree list --porcelain", repo)).toContain(`worktree ${gitPorcelainPath(realpathSync(worktree))}`);
       expect((store.updateTask as any).mock.calls.some((call: any[]) => call[1]?.branch === null)).toBe(false);
       expect(store.auditEvents.some((event) => event.mutationType === "branch:stale-active-reclaim-deferred" && event.metadata?.reason === "path-reservation")).toBe(true);
     } finally {
@@ -294,7 +297,7 @@ describe("FN-4924 / FN-4949: reclaim-stale-active-branches defers in-flight exec
 
     try {
       await expect((manager as any).cleanupOrphans()).resolves.toBe(0);
-      expect(sh("git worktree list --porcelain", repo)).toContain(`worktree ${realpathSync(worktree)}`);
+      expect(sh("git worktree list --porcelain", repo)).toContain(`worktree ${gitPorcelainPath(realpathSync(worktree))}`);
     } finally {
       await reservation.release();
       manager.stop();

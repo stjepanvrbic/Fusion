@@ -26,7 +26,7 @@ and the literal only answers when resolution produced nothing.
 import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const SRC = fileURLToPath(new URL("..", import.meta.url));
 
@@ -115,7 +115,8 @@ describe("a function that resolves lanes does not also compare a column id", () 
   });
 
   for (const path of files) {
-    const name = path.split("/").pop()!;
+    // FNXC:TestInfraWindows 2026-10-08-06:50: basename, not split("/"): on win32 the split kept the whole native path, so no ALLOWED entry ever matched.
+    const name = basename(path);
     const allowance = ALLOWED.find((entry) => entry.file === name);
 
     it(`${name} keeps no literal beside a resolved read`, () => {

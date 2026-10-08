@@ -1,10 +1,18 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { dirname, extname, join, relative } from "node:path";
+import { dirname, extname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const ENGINE_SRC = fileURLToPath(new URL("..", import.meta.url));
-const GUARD_FILE = relative(ENGINE_SRC, fileURLToPath(import.meta.url));
+/*
+FNXC:TestHarnessIntegrity 2026-10-08-07:10:
+On win32 `relative()` yields `__tests__\\x.test.ts`, so the literal `"__tests__/"` filter skipped every file and this guard scanned nothing there.
+Relative names are normalized to forward slashes (the identity on Linux) before filtering, self-exclusion and allowlist keys, and the scan must inspect a real number of test files so it can never go vacuous again.
+*/
+const toPosixRelative = (path: string): string => path.split(sep).join("/");
+const GUARD_FILE = toPosixRelative(relative(ENGINE_SRC, fileURLToPath(import.meta.url)));
+/** Conservative floor, well below the ~1200 engine test-tree files present on 2026-10-08. */
+const MIN_SCANNED_TEST_FILES = 500;
 
 /*
 FNXC:TestHarnessIntegrity 2026-08-10-10:32:
@@ -260,11 +268,13 @@ describe("relative engine test specifiers", () => {
     const allowed = new Set(KNOWN_DEAD_SPECIFIERS.map((entry) => `${entry.file}\0${entry.specifier}`));
     const observedDead = new Set<string>();
     const inspectionFailures: string[] = [];
+    let scannedTestFiles = 0;
 
     for (const file of walk(ENGINE_SRC)) {
       if (![".ts", ".tsx"].includes(extname(file))) continue;
-      const fileName = relative(ENGINE_SRC, file);
+      const fileName = toPosixRelative(relative(ENGINE_SRC, file));
       if (fileName === GUARD_FILE || !fileName.includes("__tests__/")) continue;
+      scannedTestFiles += 1;
       for (const entry of testSpecifierExpressions(readFileSync(file, "utf8"))) {
         const specifier = literalExpression(entry.expression);
         if (!specifier) {
@@ -280,6 +290,7 @@ describe("relative engine test specifiers", () => {
       }
     }
 
+    expect(scannedTestFiles, "the specifier scan inspected too few test files (vacuous sweep)").toBeGreaterThan(MIN_SCANNED_TEST_FILES);
     for (const entry of KNOWN_DEAD_SPECIFIERS) {
       const key = `${entry.file}\0${entry.specifier}`;
       expect(observedDead, `Remove stale allowlist entry ${entry.file}: ${entry.specifier}`).toContain(key);

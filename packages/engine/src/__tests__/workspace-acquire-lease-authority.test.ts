@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { join, sep } from "node:path";
 import type { Settings, Task, TaskStore } from "@fusion/core";
 import { ActiveSessionRegistry } from "../agents/active-session-registry.js";
 import { acquireWorkspaceRepoWorktree, WorkspacePreparationError, WorkspaceRepoAcquireBusyError } from "../worktree/worktree-acquisition.js";
@@ -72,14 +73,15 @@ describeIfGit("workspace acquire durable lease authority", () => {
     const durable = makeLeaseStore(task("MRG-050"));
     await (durable.store as any).acquireWorkspaceLease({ leaseKey: "repo:repo-a", kind: "acquire", owner: { taskId: "MRG-050" }, leaseMs: 5 * 60_000 });
     const registry = new ActiveSessionRegistry();
-    const path = `${fixture.rootDir}/repo-a`;
+    const path = join(fixture.rootDir, "repo-a");
     registry.registerPath(path, { taskId: "MRG-050", kind: "workspace-repo-acquire", ownerKey: "workspace-repo-acquire" });
     await vi.advanceTimersByTimeAsync(5 * 60_000 + 1);
 
     const acquired = await acquireWorkspaceRepoWorktree({ repoRelPath: "repo-a", workspaceRootDir: fixture.rootDir, task: task("MRG-051"), store: durable.store, settings, registry, holderLiveProbe: () => true });
 
     // FNXC:WorkspaceWorktree 2026-10-04-14:59: Per-repository acquisition now uses the repository-local Fusion worktree root, not the retired dot-worktrees location.
-    expect(acquired.worktreePath).toContain(".fusion/worktrees");
+    // FNXC:TestInfraWindows 2026-10-08-06:20: worktreePath is native (`\` on win32); compare with forward slashes so the assertion holds on every platform.
+    expect(acquired.worktreePath.split(sep).join("/")).toContain(".fusion/worktrees");
     expect((durable.store as any).acquireWorkspaceLease).toHaveBeenCalledTimes(2);
     expect(registry.lookupByPath(path)).toBeNull();
   }, 30_000);

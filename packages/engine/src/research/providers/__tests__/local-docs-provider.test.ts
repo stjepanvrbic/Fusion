@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import os from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { LocalDocsProvider } from "../local-docs-provider.js";
@@ -27,7 +27,8 @@ describe("LocalDocsProvider", () => {
 
     const results = await provider.search("provider confidence", {});
     expect(results.length).toBeGreaterThan(0);
-    expect(results[0]?.reference).toContain("docs/guide.md");
+    // FNXC:TestInfraWindows 2026-10-08-07:00: the reference is a native relative path (`docs\guide.md` on win32); compare with forward slashes.
+    expect(results[0]?.reference?.split(sep).join("/")).toContain("docs/guide.md");
   });
 
   it("fetches local file content", async () => {

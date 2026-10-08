@@ -1,10 +1,11 @@
-import { access, chmod, mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { NativeWorktreeBackend, RemovalReason, removeWorktree } from "../../worktree/worktree-backend.js";
 import { git, hasGit } from "./_helpers.js";
+import { installPathShim, realCommandPath, type PathShim } from "../_path-shim.js";
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -17,15 +18,12 @@ async function pathExists(path: string): Promise<boolean> {
 
 describe.skipIf(!hasGit)("reliability interactions: worktree remove non-empty recovery", () => {
   const roots: string[] = [];
-  let originalPath: string | undefined;
+  let gitShim: PathShim | undefined;
   let originalFailPath: string | undefined;
 
   afterEach(async () => {
-    if (originalPath === undefined) {
-      delete process.env.PATH;
-    } else {
-      process.env.PATH = originalPath;
-    }
+    gitShim?.restore();
+    gitShim = undefined;
     if (originalFailPath === undefined) {
       delete process.env.FUSION_FAIL_GIT_WORKTREE_REMOVE_PATH;
     } else {
@@ -57,27 +55,32 @@ describe.skipIf(!hasGit)("reliability interactions: worktree remove non-empty re
     targetPath: string,
     stderr = "error: failed to delete '$4': Directory not empty",
   ): Promise<void> {
-    const realGit = git(process.cwd(), "command -v git");
-    const shimDir = await mkdtemp(join(tmpdir(), "fusion-fake-git-"));
-    roots.push(shimDir);
-    const shimPath = join(shimDir, "git");
-    await writeFile(
-      shimPath,
-      `#!/bin/sh\nif [ "$1" = "worktree" ] && [ "$2" = "remove" ] && [ "$3" = "--force" ] && [ "$4" = "$FUSION_FAIL_GIT_WORKTREE_REMOVE_PATH" ]; then\n  echo ${JSON.stringify(stderr)} >&2\n  exit 1\nfi\nexec ${JSON.stringify(realGit)} "$@"\n`,
-      "utf-8",
-    );
-    await chmod(shimPath, 0o755);
-    originalPath = process.env.PATH;
+    /*
+    FNXC:TestInfraWindows 2026-10-08-05:48:
+    The shim is installed through _path-shim so the backend's POSIX-seam `git worktree remove` reaches it on Windows too (was `command -v` plus a `:`-joined PATH).
+    The backend passes the native worktree path as $4 and the env var carries the same native spelling, so the comparison needs no normalization.
+    */
+    const realGit = realCommandPath("git");
+    gitShim = installPathShim({
+      name: "git",
+      kind: "sh",
+      body: `if [ "$1" = "worktree" ] && [ "$2" = "remove" ] && [ "$3" = "--force" ] && [ "$4" = "$FUSION_FAIL_GIT_WORKTREE_REMOVE_PATH" ]; then
+  echo ${JSON.stringify(stderr)} >&2
+  exit 1
+fi
+exec ${JSON.stringify(realGit)} "$@"`,
+    });
     originalFailPath = process.env.FUSION_FAIL_GIT_WORKTREE_REMOVE_PATH;
-    process.env.PATH = `${shimDir}${process.env.PATH ? `:${process.env.PATH}` : ""}`;
     process.env.FUSION_FAIL_GIT_WORKTREE_REMOVE_PATH = targetPath;
   }
 
   async function expectWorktreeRemoved(root: string, worktreePath: string): Promise<void> {
     expect(await pathExists(worktreePath)).toBe(false);
+    // FNXC:TestInfraWindows 2026-10-08-05:48: git prints forward slashes on Windows, so compare forward-slashed spellings; a native `C:\...` needle would make these negative checks vacuous there.
+    const forward = (path: string) => path.replace(/\\/g, "/");
     const porcelain = git(root, "git worktree list --porcelain");
-    expect(porcelain).not.toContain(`worktree ${worktreePath}`);
-    expect(porcelain).not.toContain(`worktree ${await realpath(dirname(worktreePath)).catch(() => dirname(worktreePath))}/${worktreePath.split("/").pop()}`);
+    expect(porcelain).not.toContain(`worktree ${forward(worktreePath)}`);
+    expect(porcelain).not.toContain(`worktree ${forward(await realpath(dirname(worktreePath)).catch(() => dirname(worktreePath)))}/${basename(worktreePath)}`);
   }
 
   it("removes and prunes a worktree with untracked-only content when git remove reports Directory not empty", async () => {

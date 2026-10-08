@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TaskStore } from "@fusion/core";
 import { recordCommitAssociationFromHead } from "../merger.js";
+import { installPathShim, realCommandPath, type PathShim } from "./_path-shim.js";
 
 const hasGit = spawnSync("git", ["--version"], { stdio: "pipe" }).status === 0;
 const describeIfGit = hasGit ? describe : describe.skip;
@@ -40,10 +41,11 @@ function makeStore(): Pick<TaskStore, "upsertTaskCommitAssociation"> {
 
 describeIfGit("recordCommitAssociationFromHead", () => {
   const cleanup: string[] = [];
-  let originalPath: string | undefined;
+  let gitShim: PathShim | undefined;
 
   afterEach(() => {
-    if (originalPath !== undefined) process.env.PATH = originalPath;
+    gitShim?.restore();
+    gitShim = undefined;
     while (cleanup.length > 0) {
       rmSync(cleanup.pop()!, { recursive: true, force: true });
     }
@@ -67,14 +69,18 @@ describeIfGit("recordCommitAssociationFromHead", () => {
 
   it("persists the association without stats when shortstat capture fails", async () => {
     const repo = makeRepo();
-    const fakeBin = mkdtempSync(join(tmpdir(), "fusion-fake-git-"));
-    cleanup.push(repo, fakeBin);
-    const realGit = execSync("command -v git", { encoding: "utf-8" }).trim();
-    const fakeGit = join(fakeBin, "git");
-    writeFileSync(fakeGit, `#!/bin/sh\nif [ "$1" = "show" ] && [ "$2" = "--shortstat" ]; then\n  echo shortstat failed >&2\n  exit 42\nfi\nexec ${realGit} "$@"\n`);
-    chmodSync(fakeGit, 0o755);
-    originalPath = process.env.PATH;
-    process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
+    cleanup.push(repo);
+    // FNXC:TestInfraWindows 2026-10-08-05:48: the shim goes through _path-shim so the merger's POSIX-seam git call hits it on Windows too (was `command -v` + a `:`-joined PATH).
+    const realGit = realCommandPath("git");
+    gitShim = installPathShim({
+      name: "git",
+      kind: "sh",
+      body: `if [ "$1" = "show" ] && [ "$2" = "--shortstat" ]; then
+  echo shortstat failed >&2
+  exit 42
+fi
+exec ${JSON.stringify(realGit)} "$@"`,
+    });
     const store = makeStore();
 
     await recordCommitAssociationFromHead(store as TaskStore, repo, "FN-6704", "lineage-1");

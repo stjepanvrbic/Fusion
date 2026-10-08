@@ -1022,6 +1022,21 @@ the cache useful across a normal work week.
 
 The non-blocking `test-windows` job runs the merge gate plus the full core and engine suites on `windows-latest`. Some files still fail on Windows only; they are listed in `scripts/lib/windows-known-failing-tests.json`. Each lane writes a Vitest JSON report, and `scripts/check-windows-known-failing.mjs` fails the job only when a file outside that list fails, the report is missing, or the lane exits nonzero with no failing file. The job summary lists every result. A listed file that now passes produces a warning: remove it and lower the ledger's `ceiling`. The ledger may only shrink; a new Windows-only failure is fixed or quarantined under the normal rules.
 
+To run the engine census locally, use Git Bash at the repository root on a Windows host:
+
+```bash
+pnpm --filter @fusion/engine test --reporter=json --outputFile.json=../../.windows-lane/engine.json; echo $? > .windows-lane/engine.exit
+node scripts/check-windows-known-failing.mjs --package @fusion/engine --report .windows-lane/engine.json --exit-code .windows-lane/engine.exit
+```
+
+`.windows-lane/` is gitignored. To check only the ledgered files, pass them to `pnpm --filter @fusion/engine exec vitest run <files> --reporter=json --outputFile.json=<report>` and run the comparator on that report.
+
+Windows-safe test conventions:
+
+- **Fake commands on PATH:** use `packages/engine/src/__tests__/_path-shim.ts` (`installPathShim`, `writeShimFiles`, `realCommandPath`). It writes a shebang script for Git Bash (the POSIX seam) and, on Windows, a `<name>.cmd` wrapper for cmd.exe (native `exec`). It joins PATH with `path.delimiter`, finds the PATH key case-insensitively (`PATH`/`Path`), and `restore()` puts the exact prior value back. Do not use `command -v`, a `:`-joined PATH, or a bare extensionless script.
+- **Shell-less `execFile`:** on Windows it resolves only `.exe`/`.com`, so a script shim cannot intercept it. Mock the module seam instead.
+- **Path comparisons:** use `posixFixturePath`/`nativeFixturePath` from `_posix-fixture-path.ts`, or compare `git worktree list --porcelain` and relative paths with forward slashes. Every one of these is the identity on Linux.
+
 ## No live provider credentials in test workers
 
 The shared Vitest setup removes provider credentials from every worker before any test runs: every `*_API_KEY`/`API_KEY_*` variable plus the provider token and cloud-credential names pi-ai resolves. A test that reaches a model session must mock the session seam, for example `reviewStep`, instead of relying on whatever keys the operator's shell exports. A deliberate live-provider run sets `FUSION_TEST_ALLOW_LIVE_PROVIDER_CREDENTIALS=1`. The same setup also drops `DATABASE_URL`.

@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, afterAll } from "vitest";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
 
 import { runAiMerge } from "../merge/merger-ai.js";
 import { computeLockfileHash, INSTALL_MARKER_RELPATH } from "../merge/merge-dependency-sync.js";
+import { installPathShim, writeShimFiles, type PathShim } from "./_path-shim.js";
 
 const RM = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as const;
 const tracked = new Set<string>();
@@ -99,18 +100,18 @@ function readInstallLog(path: string): string[] {
   return readFileSync(path, "utf-8").trim().split("\n").filter(Boolean);
 }
 
-function installFakePackageManagerBins(_dir: string): string {
+/*
+FNXC:TestInfraWindows 2026-10-08-06:10:
+The fake package managers go through _path-shim so the clean room's native `exec` (cmd.exe on Windows) resolves them via `.cmd` wrappers; an extensionless script alone let the REAL pnpm/npm run there.
+Call `restore()` on the returned shim to put PATH back.
+*/
+function installFakePackageManagerBins(_dir: string): PathShim {
   const binDir = mkdtempSync(join(tmpdir(), "fusion-ai-fake-bin-"));
   tracked.add(binDir);
-  mkdirSync(binDir, { recursive: true });
-  for (const bin of ["pnpm", "npm", "yarn", "bun"]) {
-    const script = join(binDir, bin);
-    writeFileSync(script, `#!/usr/bin/env node\nconst fs = require('fs');\nfs.appendFileSync(process.env.FN_INSTALL_LOG, JSON.stringify({ bin: ${JSON.stringify(bin)}, args: process.argv.slice(2), cwd: process.cwd() }) + '\\n');\nprocess.exit(Number(process.env.FN_INSTALL_EXIT || 0));\n`);
-    chmodSync(script, 0o755);
-  }
-  const previousPath = process.env.PATH ?? "";
-  process.env.PATH = `${binDir}${delimiter}${previousPath}`;
-  return previousPath;
+  const body = (bin: string) =>
+    `const fs = require('fs');\nfs.appendFileSync(process.env.FN_INSTALL_LOG, JSON.stringify({ bin: ${JSON.stringify(bin)}, args: process.argv.slice(2), cwd: process.cwd() }) + '\\n');\nprocess.exit(Number(process.env.FN_INSTALL_EXIT || 0));\n`;
+  for (const bin of ["npm", "yarn", "bun"]) writeShimFiles(binDir, { name: bin, kind: "node", body: body(bin) });
+  return installPathShim({ name: "pnpm", kind: "node", body: body("pnpm"), dir: binDir });
 }
 
 function commitWarmInstallMarker(dir: string): void {
@@ -159,7 +160,7 @@ describe("runAiMerge dependency install", () => {
       git(dir, `add ${testCase.lockfile}`);
       git(dir, `commit -q -m 'add ${testCase.lockfile}'`);
       const installLog = makeInstallLog();
-      const previousPath = installFakePackageManagerBins(dir);
+      const packageManagerShim = installFakePackageManagerBins(dir);
       process.env.FN_INSTALL_LOG = installLog;
       try {
         await runAiMerge(makeStore(), dir, "FN-1", { manual: true }, {
@@ -167,7 +168,7 @@ describe("runAiMerge dependency install", () => {
           reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
         });
       } finally {
-        process.env.PATH = previousPath;
+        packageManagerShim.restore();
         delete process.env.FN_INSTALL_LOG;
       }
 
@@ -204,7 +205,7 @@ describe("runAiMerge dependency install", () => {
     git(dir, "commit -q -m 'add pnpm lock'");
     commitWarmInstallMarker(dir);
     const installLog = makeInstallLog();
-    const previousPath = installFakePackageManagerBins(dir);
+    const packageManagerShim = installFakePackageManagerBins(dir);
     process.env.FN_INSTALL_LOG = installLog;
     try {
       await runAiMerge(makeStore(), dir, "FN-1", { manual: true }, {
@@ -212,7 +213,7 @@ describe("runAiMerge dependency install", () => {
         reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
       });
     } finally {
-      process.env.PATH = previousPath;
+      packageManagerShim.restore();
       delete process.env.FN_INSTALL_LOG;
     }
     expect(readInstallLog(installLog)).toHaveLength(0);

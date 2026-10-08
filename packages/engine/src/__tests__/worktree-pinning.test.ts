@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { workspaceRepoSegment, workspaceWorktreeGroupSegment } from "@fusion/core";
 import {
   isTaskPinnedWorktreeNaming,
@@ -32,9 +32,10 @@ describe("worktree-pinning", () => {
     });
 
     it("respects a configured worktreesDir with {repo} token", () => {
+      // FNXC:TestInfraWindows 2026-10-08-06:25: a configured worktreesDir is path.resolve()d (drive-qualified on win32), so absolute expectations use resolve; identical off Windows.
       expect(
         pinnedWorktreePathForTask("FN-1", { worktreesDir: "../wt/{repo}" }, "/home/me/myrepo"),
-      ).toBe(join("/home/me/wt/myrepo", "fn-1"));
+      ).toBe(resolve("/home/me/wt/myrepo", "fn-1"));
     });
 
     it("respects a ~-expanded worktreesDir", () => {
@@ -60,20 +61,21 @@ describe("worktree-pinning", () => {
         workspaceRootDir: workspaceRoot,
         repoRelPath: "web",
       });
-      expect(api).toBe(join("/shared/worktrees", workspaceWorktreeGroupSegment(workspaceRoot), workspaceRepoSegment("api"), "fn-9162"));
-      expect(web).toBe(join("/shared/worktrees", workspaceWorktreeGroupSegment(workspaceRoot), workspaceRepoSegment("web"), "fn-9162"));
+      expect(api).toBe(resolve("/shared/worktrees", workspaceWorktreeGroupSegment(workspaceRoot), workspaceRepoSegment("api"), "fn-9162"));
+      expect(web).toBe(resolve("/shared/worktrees", workspaceWorktreeGroupSegment(workspaceRoot), workspaceRepoSegment("web"), "fn-9162"));
       expect(api).not.toBe(web);
     });
   });
 
   describe("preservedWorktreeTargetPathForTask", () => {
+    // FNXC:TestInfraWindows 2026-10-08-06:25: the target is a node:path join, so expectations are the native join of the POSIX literal.
     it("uses the task ID regardless of stale source metadata", () => {
       expect(preservedWorktreeTargetPathForTask(
         "FN-8400",
         "/legacy/recover-fn-8400",
         {},
         "/repo",
-      )).toBe("/repo/.fusion/worktrees/fn-8400");
+      )).toBe(join("/repo/.fusion/worktrees/fn-8400"));
     });
 
     it("does not preserve a legacy basename", () => {
@@ -82,7 +84,7 @@ describe("worktree-pinning", () => {
         "/legacy/recover-fn-8400",
         {},
         "/repo",
-      )).toBe("/repo/.fusion/worktrees/fn-8400");
+      )).toBe(join("/repo/.fusion/worktrees/fn-8400"));
     });
   });
 });

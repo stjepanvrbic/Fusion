@@ -68,6 +68,17 @@ vi.mock("../worktree/worktree-prune.js", () => ({
   pruneWorktreeAdminEntries: vi.fn().mockResolvedValue(undefined),
 }));
 
+/*
+FNXC:TestInfraWindows 2026-10-08-06:40:
+The remove-checkout seam inspects the checkout with node:fs/promises after a failed `git worktree remove`.
+Unmocked, that probe hit the host filesystem: on Linux `/root` is unreadable for a non-root runner ("unknown", failure kept), while on Windows `\\root\\...` is simply absent ("missing", treated as removed), so the remove-failure test only passed by host accident.
+The passthrough mock lets that test state its fixture explicitly: the checkout is still present and linked after git's failure.
+*/
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, lstat: vi.fn(actual.lstat), readFile: vi.fn(actual.readFile) };
+});
+
 import * as desktopArtifacts from "../worktree/worktree-desktop-artifacts.js";
 import * as worktreePrune from "../worktree/worktree-prune.js";
 import {
@@ -83,7 +94,9 @@ import { BranchConflictError } from "../execution/branch-conflicts.js";
 import * as branchConflictModule from "../execution/branch-conflicts.js";
 import { execSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import type { Task, Column } from "@fusion/core";
+import { posixFixturePath } from "./_posix-fixture-path.js";
 
 const mockedExecSync = vi.mocked(execSync);
 const mockedExistsSync = vi.mocked(existsSync);
@@ -187,7 +200,7 @@ describe("scanIdleWorktrees", () => {
       makeTask("FN-002", "done", "/root/.worktrees/calm-river"),
     ]);
 
-    const idle = await scanIdleWorktrees("/root", store);
+    const idle = (await scanIdleWorktrees("/root", store)).map(posixFixturePath);
 
     expect(store.listTasks).toHaveBeenCalledWith({ slim: true, includeArchived: false, startupMemo: true });
     expect(idle).toContain("/root/.worktrees/calm-river");
@@ -200,9 +213,9 @@ describe("scanIdleWorktrees", () => {
     mockRegisteredWorktrees("/root", ["review-wt", "idle-wt"]);
     const store = createMockStore([]);
 
-    const idle = await scanIdleWorktrees("/root", store, undefined, {
+    const idle = (await scanIdleWorktrees("/root", store, undefined, {
       isPathLive: async (path) => path.endsWith("review-wt"),
-    });
+    })).map(posixFixturePath);
 
     expect(idle).toEqual(["/root/.worktrees/idle-wt"]);
   });
@@ -211,7 +224,7 @@ describe("scanIdleWorktrees", () => {
     mockedReaddirSync.mockReturnValue([] as any);
     const store = createMockStore([]);
 
-    const idle = await scanIdleWorktrees("/root", store);
+    const idle = (await scanIdleWorktrees("/root", store)).map(posixFixturePath);
     expect(idle).toEqual([]);
   });
 
@@ -219,7 +232,7 @@ describe("scanIdleWorktrees", () => {
     mockedExistsSync.mockReturnValue(false);
     const store = createMockStore([]);
 
-    const idle = await scanIdleWorktrees("/root", store);
+    const idle = (await scanIdleWorktrees("/root", store)).map(posixFixturePath);
     expect(idle).toEqual([]);
   });
 
@@ -233,7 +246,7 @@ describe("scanIdleWorktrees", () => {
       makeTask("FN-010", "in-review", "/root/.worktrees/review-wt"),
     ]);
 
-    const idle = await scanIdleWorktrees("/root", store);
+    const idle = (await scanIdleWorktrees("/root", store)).map(posixFixturePath);
     expect(idle).not.toContain("/root/.worktrees/review-wt");
   });
 
@@ -246,7 +259,7 @@ describe("scanIdleWorktrees", () => {
 
     const store = createMockStore([]);
 
-    const idle = await scanIdleWorktrees("/root", store);
+    const idle = (await scanIdleWorktrees("/root", store)).map(posixFixturePath);
     expect(idle).toHaveLength(2);
     expect(idle).toContain("/root/.worktrees/wt-1");
     expect(idle).toContain("/root/.worktrees/wt-2");
@@ -258,7 +271,7 @@ describe("scanIdleWorktrees", () => {
     });
     const store = createMockStore([]);
 
-    const idle = await scanIdleWorktrees("/root", store);
+    const idle = (await scanIdleWorktrees("/root", store)).map(posixFixturePath);
     expect(idle).toEqual([]);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("[worktree-pool] Failed to read worktrees directory /root/.worktrees: Permission denied"),
@@ -279,7 +292,7 @@ describe("scanIdleWorktrees", () => {
 
     const store = createMockStore([]);
 
-    const idle = await scanIdleWorktrees("/root", store);
+    const idle = (await scanIdleWorktrees("/root", store)).map(posixFixturePath);
     expect(idle).toEqual(["/root/.worktrees/registered-wt"]);
     expect(idle).not.toContain("/root/.worktrees/.ai-merge");
     expect(idle).not.toContain("/root/.worktrees/.fusion-recovery");
@@ -296,7 +309,7 @@ describe("scanIdleWorktrees", () => {
       makeTask("FN-001", "in-progress", "/root/.worktrees/broken-wt"),
     ]);
 
-    const idle = await scanIdleWorktrees("/root", store);
+    const idle = (await scanIdleWorktrees("/root", store)).map(posixFixturePath);
     expect(idle).toEqual(["/root/.worktrees/registered-wt"]);
   });
 });
@@ -327,8 +340,10 @@ describe("cleanupOrphanedWorktrees", () => {
       (c) => typeof c[0] === "string" && (c[0] as string).includes("worktree remove"),
     );
     expect(removeCalls).toHaveLength(2);
-    expect(removeCalls[0][0]).toContain("/root/.worktrees/orphan-1");
-    expect(removeCalls[1][0]).toContain("/root/.worktrees/orphan-2");
+    // FNXC:TestInfraWindows 2026-10-08-06:30: the remove command embeds a node:path spelling (backslashes, possibly quote-escaped, on win32); fold each backslash run to `/` so the assertion holds on every platform (no-op on Linux).
+    const forwardSlashed = (command: unknown) => String(command).replace(/\\+/g, "/");
+    expect(forwardSlashed(removeCalls[0][0])).toContain("/root/.worktrees/orphan-1");
+    expect(forwardSlashed(removeCalls[1][0])).toContain("/root/.worktrees/orphan-2");
   });
 
   it("preserves worktrees assigned to in-progress/in-review tasks", async () => {
@@ -383,12 +398,29 @@ describe("cleanupOrphanedWorktrees", () => {
       return Buffer.from("");
     });
 
+    // The failed checkout is still on disk and linked after git's failure, so the removal must stay failed.
+    const failedCheckout = (path: unknown) => String(path).includes("fail-wt");
+    vi.mocked(fsPromises.lstat).mockImplementation((async (path: unknown) => {
+      if (!failedCheckout(path)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      const isDotGitFile = String(path).replace(/\\/g, "/").endsWith("/.git");
+      return { isDirectory: () => !isDotGitFile, isFile: () => isDotGitFile, isSymbolicLink: () => false };
+    }) as never);
+    vi.mocked(fsPromises.readFile).mockImplementation((async (path: unknown) => {
+      if (failedCheckout(path)) return "gitdir: /root/.git/worktrees/fail-wt\n";
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    }) as never);
+
     const store = createMockStore([]);
 
-    const cleaned = await cleanupOrphanedWorktrees("/root", store);
+    try {
+      const cleaned = await cleanupOrphanedWorktrees("/root", store);
 
-    // Only 1 cleaned (the other failed), but no throw
-    expect(cleaned).toBe(1);
+      // Only 1 cleaned (the other failed), but no throw
+      expect(cleaned).toBe(1);
+    } finally {
+      vi.mocked(fsPromises.lstat).mockReset();
+      vi.mocked(fsPromises.readFile).mockReset();
+    }
   });
 
   it("no-ops when .worktrees/ doesn't exist", async () => {

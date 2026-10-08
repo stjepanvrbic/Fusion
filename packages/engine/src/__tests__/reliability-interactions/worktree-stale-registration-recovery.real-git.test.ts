@@ -5,6 +5,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { NativeWorktreeBackend } from "../../worktree/worktree-backend.js";
 import { git, hasGit } from "./_helpers.js";
 
+// FNXC:TestInfraWindows 2026-10-08-06:45: `git worktree list --porcelain` prints forward slashes on every platform, so native paths are compared in that spelling (a no-op on Linux).
+const gitPorcelainPath = (path: string): string => path.replace(/\\/g, "/");
+
 describe.skipIf(!hasGit)("reliability interactions: worktree stale registration recovery", () => {
   const roots: string[] = [];
 
@@ -55,7 +58,7 @@ describe.skipIf(!hasGit)("reliability interactions: worktree stale registration 
 
     const porcelain = git(root, "git worktree list --porcelain");
     const resolvedWorktreePath = await realpath(worktreePath);
-    expect(porcelain).toContain(`worktree ${resolvedWorktreePath}`);
+    expect(porcelain).toContain(`worktree ${gitPorcelainPath(resolvedWorktreePath)}`);
   });
 
 });
