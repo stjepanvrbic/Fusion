@@ -10,7 +10,7 @@ FN-6444 confirmed this ChatManager API-path suite is deterministic under dashboa
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { runWithFusionSessionIdentity, resolveFusionSessionPrincipal, type Settings } from "@fusion/core";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
   ChatManager,
@@ -1651,7 +1651,7 @@ describe("ChatManager.sendMessage", () => {
       metadata: { skills: ["agent-debug", "ce-debug"] },
     });
     const pluginRoot = "/tmp/plugin-chat-skills";
-    const pluginSkillDir = join(pluginRoot, "skills", "ce-debug");
+    const pluginSkillDir = resolve(pluginRoot, "skills", "ce-debug");
     const pluginRunner = {
       getPluginSkills: vi.fn(() => [
         { pluginId: "fusion-plugin-compound-engineering", pluginRoot, skill: { name: "ce-debug", enabled: true } },
@@ -1691,7 +1691,7 @@ describe("ChatManager.sendMessage", () => {
       };
     });
     const pluginRoot = "/tmp/plugin-quick-chat-skills";
-    const pluginSkillDir = join(pluginRoot, "skills", "ce-debug");
+    const pluginSkillDir = resolve(pluginRoot, "skills", "ce-debug");
     const pluginRunner = {
       getPluginSkills: vi.fn(() => [
         { pluginId: "fusion-plugin-compound-engineering", pluginRoot, skill: { name: "ce-debug" } },
@@ -4652,7 +4652,7 @@ describe("ChatManager generation isolation", () => {
       };
     });
     const pluginRoot = "/tmp/plugin-room-chat-skills";
-    const pluginSkillDir = join(pluginRoot, "skills", "ce-debug");
+    const pluginSkillDir = resolve(pluginRoot, "skills", "ce-debug");
     const pluginRunner = {
       getPluginSkills: vi.fn(() => [
         { pluginId: "fusion-plugin-compound-engineering", pluginRoot, skill: { name: "ce-debug", enabled: true } },

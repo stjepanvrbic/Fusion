@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { builtinModules } from "node:module";
 import { execFileSync } from "node:child_process";
 import { parse } from "yaml";
+import { resolveShellFreeLaunch } from "@fusion/core";
 import { applyPrepackTransform } from "../../scripts/prepare-publish-manifest.mjs";
 
 const workspaceRoot = join(__dirname, "..", "..", "..", "..");
@@ -635,7 +636,13 @@ describe("shipped agent skills", () => {
        * multi-megabyte built CLI and dashboard bundles. Source presence is still proven by cpSync. */
       writeFileSync(join(packFixture, "package.json"), JSON.stringify(cli));
       cpSync(join(packageDir, "skill"), join(packFixture, "skill"), { recursive: true });
-      const packed = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+      /*
+      FNXC:WindowsNpmLaunch 2026-10-08-06:19:
+      npm is a `.cmd` batch shim on Windows, so a bare `execFileSync("npm")` fails with ENOENT and `shell: true` is forbidden.
+      `resolveShellFreeLaunch` unwraps the shim to `node npm-cli.js` on win32 and is the identity launch on POSIX.
+      */
+      const npmLaunch = resolveShellFreeLaunch("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"]);
+      const packed = JSON.parse(execFileSync(npmLaunch.command, npmLaunch.args, {
         cwd: packFixture,
         encoding: "utf8",
       })) as Array<{ files: Array<{ path: string }> }>;

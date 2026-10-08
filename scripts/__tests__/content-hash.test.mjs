@@ -9,6 +9,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 import { computeContentHash, createRepoContentSnapshot } from "../lib/content-hash.mjs";
 
 /**
@@ -47,9 +48,13 @@ function fakeGit(tree) {
 }
 
 const readBytes = (contentByPath) => (absPath) => {
-  // absPath is rootDir + "/" + relPath; match on suffix.
+  /*
+  FNXC:WindowsPortableTests 2026-10-08-06:19:
+  absPath is `path.join(rootDir, relPath)`, which is `\`-separated on Windows. The product only uses it for fs access
+  (the hashed key stays git's `/` path), so match on the native-joined suffix rather than the POSIX literal.
+  */
   for (const [rel, content] of Object.entries(contentByPath)) {
-    if (absPath.endsWith(rel)) return Buffer.from(content);
+    if (absPath.endsWith(path.join(rel))) return Buffer.from(content);
   }
   throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
 };

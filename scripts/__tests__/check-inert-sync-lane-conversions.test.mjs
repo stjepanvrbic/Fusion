@@ -123,7 +123,12 @@ test("the gate scans a staged source even with a zero baseline", () => {
     `export function probe(store: unknown, id: string, column: string) { return column === localSync(store, id).hold; }`,
     "",
   ].join("\n"));
-  try { assert.equal(liveCounts().byFile["packages/engine/src/__probe-inert-scan.ts"], 1); }
+  try {
+    const counts = liveCounts();
+    assert.equal(counts.byFile["packages/engine/src/__probe-inert-scan.ts"], 1);
+    /* FNXC:InertSyncLane 2026-10-08-06:19: keys are `/`-separated on every platform so a Windows run matches the committed baseline. */
+    assert.deepEqual(Object.keys(counts.byFile).filter((key) => key.includes("\\")), []);
+  }
   finally { rmSync(probe, { force: true }); }
 });
 
