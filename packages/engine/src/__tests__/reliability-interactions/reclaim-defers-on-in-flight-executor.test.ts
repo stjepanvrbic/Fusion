@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
@@ -223,6 +223,49 @@ describe("FN-4924 / FN-4949: reclaim-stale-active-branches defers in-flight exec
       expect(() => sh(`git rev-parse --verify ${branch}`, repo)).not.toThrow();
       expect(sh("git worktree list --porcelain", repo)).toContain(`worktree ${realpathSync(worktree)}`);
       expect((store.updateTask as any).mock.calls.some((call: any[]) => call[1]?.branch === null)).toBe(false);
+      expect(store.auditEvents.some((event) => event.mutationType === "branch:stale-active-reclaim-deferred" && event.metadata?.reason === "path-reservation")).toBe(true);
+    } finally {
+      await reservation.release();
+      manager.stop();
+    }
+  });
+
+  it("honors a live reservation recorded under another spelling of the same checkout", async () => {
+    /*
+    FNXC:PreReleaseWorktreeLiveness 2026-10-07-23:40:
+    The reservation record keeps the holder's own spelling of the path, while the scanner derives
+    another (case on Windows, a symlinked parent elsewhere). Path identity, not string equality,
+    decides whether the reservation covers this checkout.
+    */
+    const repo = makeRepo();
+    tempRoots.push(repo);
+    const branch = createFusionBranch(repo, "FN-9385");
+    const legacyWorktreesDir = join(repo, ".worktrees");
+    const worktree = join(legacyWorktreesDir, "fn-9385");
+    mkdirSync(legacyWorktreesDir, { recursive: true });
+    sh(`git worktree add ${JSON.stringify(worktree)} ${branch}`, repo);
+    let aliasWorktree: string;
+    if (process.platform === "win32") {
+      aliasWorktree = worktree.toUpperCase();
+    } else {
+      const aliasRoot = join(repo, "alias-root");
+      symlinkSync(legacyWorktreesDir, aliasRoot, "dir");
+      aliasWorktree = join(aliasRoot, "fn-9385");
+    }
+    expect(aliasWorktree).not.toBe(worktree);
+    const task = makeTask("FN-9385", branch, null, "");
+    task.column = "todo";
+    const store = makeStore(task);
+    const manager = new SelfHealingManager(store as any, { rootDir: repo } as any);
+    const reservation = await acquireWorktreePathReservation({
+      canonicalPath: aliasWorktree,
+      worktreesDir: legacyWorktreesDir,
+      rootDir: repo,
+    });
+
+    try {
+      await expect(manager.reclaimStaleActiveBranches()).resolves.toBe(0);
+      expect(() => sh(`git rev-parse --verify ${branch}`, repo)).not.toThrow();
       expect(store.auditEvents.some((event) => event.mutationType === "branch:stale-active-reclaim-deferred" && event.metadata?.reason === "path-reservation")).toBe(true);
     } finally {
       await reservation.release();
