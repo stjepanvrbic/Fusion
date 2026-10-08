@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **13 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, 34, 35, and 36), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **18 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, 35, and 36), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **19 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -403,27 +403,6 @@ Hypothesis, not measured: `claimDueSchedule` in `automation-store.ts` computes t
 
 The local runs did not land on a minute edge, so they neither confirm nor refute the hypothesis. No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting and the file carries 37 other cases. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the core vitest config. A fix should pin the clock with fake timers, or build the schedule so its next occurrence cannot be the boundary the claim computes.
 
-### 34. AgentDetailView log history SSE suspend and reopen subscription
-
-- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
-- **File:** `packages/dashboard/app/components/__tests__/agent-detail-log-history.test.tsx`
-- **Exact test:** `AgentDetailView — agent log history is windowed, not discarded > converges after an SSE suspend/reopen cycle without losing lines`.
-- **Observed tree/SHA:** fork Full Suite (non-blocking) run [37739564135](https://github.com/stjepanvrbic/Fusion/actions/runs/37739564135/job/113186875691) at `7fcb6ea1cee6a4c2e16cceb9c67f13b131c1afa6` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113186875691`), command `@fusion/dashboard run test:quality:app:backfill-4`, project `dashboard-app-quality-backfill`. The shard-3 jobs of the two preceding Full Suite runs (37739288627 at `cd7130a99` and 37736870698 at `0c50dbd0f`) passed. The diff `cd7130a99..7fcb6ea1c` touches engine code, engine tests, and one docs line, and no dashboard file.
-- **Observed frequency:** 1 failure, in a command that reported 2274 tests (1 failed, 2268 passed, 5 skipped).
-
-The failure was `AssertionError: the latest-run log stream must be subscribed: expected undefined to be truthy` at `agent-detail-log-history.test.tsx:217`. The case reads `mockSubscribeSse.mock.calls.find(...)` for `/api/agents/agent-001/runs/<run>/logs/stream` right after `await waitFor(() => expect(renderedEntryTexts()).toHaveLength(WINDOW))`, and found no call. The earlier case in the same file that needs this subscription (line 183) wraps the same lookup in `waitFor`; this one does not.
-
-This shares a mechanism with entry 32 (`SystemControlsArea`, PR 50), where the test read the SSE subscribe mock before the subscribing effect had flushed. Hypothesis, not measured: the rendered log entries come from the `fetchAgentRunLogs` response, while the subscription is made by a passive effect in `AgentDetailView.tsx` (near line 2210) that returns early until `selectedRunId` is set and `selectedRunStatus` is `active`. Those values come from the runs fetch, so on a starved shard the entries can render before that effect has run, and the unguarded read sees an empty mock. The mechanism is unmeasured for both entries and is cited here only as a common shape.
-
-| run | result |
-|---|---|
-| Full Suite 37736870698 (`0c50dbd0f`), shard 3/4 | passed |
-| Full Suite 37739288627 (`cd7130a99`), shard 3/4 | passed |
-| Full Suite 37739564135 (`7fcb6ea1c`), shard 3/4 | **failed** (this case) |
-| `pnpm exec vitest run app/components/__tests__/agent-detail-log-history.test.tsx --project dashboard-app-quality-backfill` in `packages/dashboard`, local Windows, `628231a55` | passed, 9 tests, 11.3 s wall (tests 1.9 s) |
-
-No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. A fix should wait on the subscription itself, by asserting on `mockSubscribeSse` inside `waitFor` as the case at line 183 already does, rather than reading it once.
-
 ### 35. Durable agent Activity analytics heartbeat session count and usage-event identity
 
 - **Status:** Active first sighting — recorded 2026-10-08, unattributed.
@@ -573,6 +552,27 @@ Both are default-timeout Testing Library waits that expired while the rendered `
 No timeout, retry, or assertion changed. The whole file is excluded from the dashboard projects. It is not in the thin merge gate, so no gate eviction was needed.
 
 Before the deletion deadline, inspect how `MissionManager` releases the reconcile panel and handles a reconcile click while a fetch for another mission is still pending. No product code changed in this quarantine.
+
+<!--
+FNXC:TestFlakeRegister 2026-10-08-09:18:
+Entry 34 recorded a second Full Suite sighting on the fork: the same case failed at the same assertion on a different shard. Quarantine is file-level, so the whole file is excluded through the dated ledger and the literal dashboard exclude in one commit. Rescue requires a root-cause fix; a widened timeout, retry, or weakened assertion is not a rescue.
+-->
+### 34. AgentDetailView log history SSE suspend and reopen subscription
+
+- **Status:** Closed — quarantined 2026-10-08 after a second Full Suite sighting; deletion deadline 2026-10-22.
+- **File:** `packages/dashboard/app/components/__tests__/agent-detail-log-history.test.tsx`
+- **Exact test:** `AgentDetailView — agent log history is windowed, not discarded > converges after an SSE suspend/reopen cycle without losing lines`.
+- **Observed trees/SHAs:** fork Full Suite runs [37739564135](https://github.com/stjepanvrbic/Fusion/actions/runs/37739564135/job/113186875691) at `7fcb6ea1c` (Test shard 3/4, job `113186875691`) and [37747085495](https://github.com/stjepanvrbic/Fusion/actions/runs/37747085495/job/113211010537) at `628231a55` (Test shard 4/4, job `113211010537`), both Linux `ubuntu-latest`, command `@fusion/dashboard run test:quality:app:backfill-4`, project `dashboard-app-quality-backfill`. The shard-3 jobs of the Full Suite runs for `0c50dbd0f` and `cd7130a99` passed.
+- **Observed frequency:** 2 runs, the same case and the same assertion each time, in a command that reported 2274 tests with 1 failed.
+
+| run | result |
+|---|---|
+| 37739564135 | `AssertionError: the latest-run log stream must be subscribed: expected undefined to be truthy` at `agent-detail-log-history.test.tsx:217` |
+| 37747085495 | the same message at the same line |
+
+The case reads `mockSubscribeSse.mock.calls.find(...)` for `/api/agents/agent-001/runs/<run>/logs/stream` right after `await waitFor(() => expect(renderedEntryTexts()).toHaveLength(WINDOW))` and found no call. The earlier case in the same file that needs this subscription wraps the same lookup in `waitFor`; this one does not. This shares a shape with entry 32, where the test read the SSE subscribe mock before the subscribing effect had flushed. The mechanism is unmeasured for both entries. A local Windows run passed (9 tests).
+
+No timeout, retry, or assertion changed. The whole file is excluded from the dashboard projects. It is not in the thin merge gate, so no gate eviction was needed. Before the deletion deadline, inspect when `AgentDetailView` subscribes to the latest-run log stream relative to the rendering of the fetched entries, or make the case wait on the subscription as its neighbour does. No product code changed in this quarantine.
 
 <!--
 FNXC:TestFlakeRegister 2026-10-08-04:50:
