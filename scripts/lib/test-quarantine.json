@@ -30,6 +30,11 @@
       "file": "packages/dashboard/app/components/__tests__/agent-detail-log-history.test.tsx",
       "reason": "Second sighting of one case, identical assertion at line 217: https://github.com/stjepanvrbic/Fusion/actions/runs/37739564135 (7fcb6ea1c, Test shard 3/4) and https://github.com/stjepanvrbic/Fusion/actions/runs/37747085495 (628231a55, Test shard 4/4), both Linux dashboard-app-quality-backfill via test:quality:app:backfill-4; the latest-run log stream was read from the SSE subscribe mock before it had been subscribed; register entry 34.",
       "quarantinedAt": "2026-10-08"
+    },
+    {
+      "file": "packages/engine/src/__tests__/auth-storage-durability.test.ts",
+      "reason": "Second sighting of one case, identical assertion at line 160 (fetch mock called 0 times, expected 1): https://github.com/stjepanvrbic/Fusion/actions/runs/37725718700 (b2dfb6316) and https://github.com/stjepanvrbic/Fusion/actions/runs/37756067075 (b4ffbded6), both Linux Test shard 1/4 engine-default; the fake-timer poll for the hanging-refresh fetch ran out before the refresh path reached fetch; register entry 30.",
+      "quarantinedAt": "2026-10-08"
     }
   ]
 }

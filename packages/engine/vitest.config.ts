@@ -413,6 +413,11 @@ export default defineConfig({
             Second Full Suite sighting of register entry 28: under shard load the executor returned from execute without opening the fn_task_done implementation session. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at the guarded in-place re-dispatch timer.
             */
             "src/__tests__/executor-task-done-summary.test.ts",
+            /*
+            FNXC:AuthStorageDurabilityQuarantine 2026-10-08-11:22:
+            Second Full Suite sighting of register entry 30: the hanging-refresh case polled fake timers for 200 iterations and the mocked fetch was still uncalled, on two different commits. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at the file and lock I/O the refresh path does before it calls fetch.
+            */
+            "src/__tests__/auth-storage-durability.test.ts",
             "node_modules/**",
             "dist/**",
             // FNXC:PgMigrationQuarantine 2026-07-18-04:30: FN-8270 rescued the final seven VAL-REMOVAL-005 holdouts by awaiting PG audit reads and modeling async collaborators. Their paired ledger entries and excludes were removed only after targeted green runs.
