@@ -35,27 +35,70 @@ describe("TaskContextMenu shared task action model", () => {
     expect(actionIds(makeTask({ column: "archived" }), { onRetry, onReset: vi.fn() })).toEqual(["delete"]);
   });
 
-  it("offers Bypass failed review for live and eligible archived pre-merge failures only", () => {
+  /*
+  FNXC:ReviewLaneBypass 2026-10-08-02:27:
+  KB-019: bypass is offered iff the server reported a bypassable step id. The model must not re-derive eligibility from `workflowStepResults` or the client lane role.
+  */
+  it("offers Bypass failed review exactly when the server reported a bypassable step id", () => {
     const onBypassReview = vi.fn();
-    const archivedFailure = {
-      workflowStepId: "plan-review",
+    const failedResult = {
+      workflowStepId: "code-review",
+      workflowStepName: "Code Review",
       phase: "pre-merge" as const,
-      status: "skipped" as const,
-      remediationArchivedAt: "2026-09-02T00:00:00.000Z",
-      remediationArchivedFromStatus: "failed" as const,
+      status: "failed" as const,
     };
-    const withBypass = (workflowStepResults: Task["workflowStepResults"], overrides: Partial<Task> = {}) => actionIds(
-      makeTask({ column: "in-review", workflowStepResults, ...overrides }),
-      { onBypassReview },
-    );
 
-    expect(withBypass([archivedFailure])).toContain("bypass-review");
-    expect(withBypass([{ ...archivedFailure, status: "failed", remediationArchivedAt: undefined }])).toContain("bypass-review");
-    expect(withBypass([{ ...archivedFailure, bypassedBy: "operator" }])).not.toContain("bypass-review");
-    expect(withBypass([{ ...archivedFailure, remediationArchivedFromStatus: "passed" }])).not.toContain("bypass-review");
-    expect(withBypass([{ ...archivedFailure, phase: "post-merge" }])).not.toContain("bypass-review");
-    expect(withBypass([archivedFailure], { column: "in-progress" })).not.toContain("bypass-review");
-    expect(actionIds(makeTask({ column: "in-review", workflowStepResults: [archivedFailure] }))).not.toContain("bypass-review");
+    // The reported symptom: a required gate that never ran (no result rows at all).
+    const absentGate = buildTaskActionMenuModel({
+      task: makeTask({ column: "in-review", workflowStepResults: [] }),
+      t,
+      onBypassReview,
+      bypassableReviewStepId: "plan-review",
+    });
+    const bypass = absentGate.actions.find((action) => action.id === "bypass-review");
+    expect(bypass).toMatchObject({ label: "Bypass failed review" });
+    // A `note` renders as an inert span and can never be selected, so the operator action must not use it.
+    expect(bypass?.tone).not.toBe("note");
+    bypass?.onSelect?.();
+    expect(onBypassReview).toHaveBeenCalledTimes(1);
+
+    // A custom lane the server resolved as a review lane, with no client role flags.
+    expect(actionIds(makeTask({ column: "landing" as Task["column"] }), {
+      onBypassReview,
+      currentColumnFlags: {},
+      bypassableReviewStepId: "code-review",
+    })).toContain("bypass-review");
+
+    // A failed pre-merge result alone no longer offers it without the server's answer.
+    for (const bypassableReviewStepId of [null, undefined, ""]) {
+      expect(actionIds(makeTask({ column: "in-review", workflowStepResults: [failedResult] }), {
+        onBypassReview,
+        bypassableReviewStepId,
+      })).not.toContain("bypass-review");
+    }
+
+    // Hosts that do not wire the handler (Board, List) never show it.
+    expect(actionIds(makeTask({ column: "in-review", workflowStepResults: [] }), {
+      bypassableReviewStepId: "plan-review",
+    })).not.toContain("bypass-review");
+  });
+
+  it("changes nothing but the bypass item between bypassable and non-bypassable models", () => {
+    const base = {
+      task: makeTask({ column: "in-review", workflowStepResults: [] }),
+      t,
+      onBypassReview: vi.fn(),
+      onRetry: vi.fn(),
+      onReset: vi.fn(),
+      onOpenRefine: vi.fn(),
+    };
+    const offered = buildTaskActionMenuModel({ ...base, bypassableReviewStepId: "plan-review" });
+    const withheld = buildTaskActionMenuModel({ ...base, bypassableReviewStepId: null });
+
+    expect(offered.shouldShowActionsMenu).toBe(withheld.shouldShowActionsMenu);
+    expect(offered.actions.map((action) => action.id).filter((id) => id !== "bypass-review"))
+      .toEqual(withheld.actions.map((action) => action.id));
+    expect(withheld.actions.some((action) => action.id === "bypass-review")).toBe(false);
   });
 
   it("offers exactly the supported recovery actions", () => {

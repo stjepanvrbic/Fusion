@@ -42,7 +42,7 @@ import {
   isWipColumnRole,
 } from "../utils/columnRoles";
 import { resolveEffectiveAutoMerge } from "../../../core/src/merge/task-merge";
-import { uploadAttachment, deleteAttachment, updateTask, repairOverlapBlocker, fetchOverlapBlockerReport, fetchTaskDetail, fetchTaskPrompt, fetchSpecLock, fetchTaskVerificationRequest, fetchSettings, fetchTaskEffectiveSettings, fetchGlobalSettings, requestSpecRevision, rebuildTaskSpec, approvePlan, rejectPlan, refineTask, fetchWorkflowResults, assignTask, fetchAgents, fetchAgent, refreshPrStatus, fetchBoardWorkflows, updateTaskCustomFields, summarizeTitle, fetchWorkflowSettingValues, nudgeOverseer, stopOverseer, explainOverseer, fetchModels, fetchNodes, fetchRecommendationEligibility, api } from "../api";
+import { uploadAttachment, deleteAttachment, updateTask, repairOverlapBlocker, fetchOverlapBlockerReport, fetchTaskDetail, fetchTaskPrompt, fetchSpecLock, fetchTaskVerificationRequest, fetchSettings, fetchTaskEffectiveSettings, fetchGlobalSettings, requestSpecRevision, rebuildTaskSpec, approvePlan, rejectPlan, refineTask, fetchWorkflowResults, assignTask, fetchAgents, fetchAgent, refreshPrStatus, fetchBoardWorkflows, updateTaskCustomFields, summarizeTitle, fetchWorkflowSettingValues, nudgeOverseer, stopOverseer, explainOverseer, fetchModels, fetchNodes, fetchRecommendationEligibility, fetchReviewBypassEligibility, api } from "../api";
 import type { RevertTaskOptions, RevertTaskResult, ModelInfo, NodeInfo, SpecLockResponse, TaskOverlapBlockerReport } from "../api";
 import type { BoardWorkflowsPayload, WorkflowFieldDefinition, CustomFieldRejection } from "../api";
 import { WorkflowIcon } from "./WorkflowIcon";
@@ -4388,6 +4388,57 @@ export function TaskDetailContent({
     ? t("taskDetail.error.retryHint", "Consider retrying with a different model or node.")
     : null;
 
+  /*
+  FNXC:ReviewLaneBypass 2026-10-08-06:10:
+  KB-019: "Bypass failed review" is offered only when `GET /tasks/:id/bypass-review` (the store's shared bypass evaluator) reports `bypassable: true`, including a required pre-merge gate that never produced a result.
+  The answer is keyed on the live (SSE-updated) inputs to the server rule — id, lane, pause, enabled gates, and a compact result signature — so a change such as unpause, a landed reseed result, or a column move refetches it.
+  A field on the detail payload would go stale because `mergeTaskSnapshot` keeps detail-only fields across live updates.
+  A pending, refused, failed, or stale (other key) answer offers nothing, so the menu never shows an action the store would refuse.
+  */
+  const bypassEligibilityKey = useMemo(() => {
+    if (!onBypassReview) return null;
+    const resultSignature = (task.workflowStepResults ?? []).map((result) => [
+      result.workflowStepId,
+      result.phase ?? "",
+      result.status,
+      result.bypassedBy ?? "",
+      result.remediationArchivedAt ?? "",
+      result.supersededAt ?? "",
+      (result.findings ?? []).filter((finding) => finding.resolution === undefined || finding.resolution === "open").length,
+    ].join("|"));
+    return JSON.stringify([
+      task.id,
+      task.column,
+      Boolean(task.paused),
+      task.enabledWorkflowSteps ?? null,
+      resultSignature,
+    ]);
+  }, [onBypassReview, task.id, task.column, task.paused, task.enabledWorkflowSteps, task.workflowStepResults]);
+  const [bypassEligibility, setBypassEligibility] = useState<{ key: string; workflowStepId: string | null } | null>(null);
+  useEffect(() => {
+    if (!active || !bypassEligibilityKey) return;
+    let cancelled = false;
+    const key = bypassEligibilityKey;
+    const taskId = task.id;
+    // A synchronous throw from the client becomes a rejection, so it fails closed like any unreadable answer.
+    Promise.resolve()
+      .then(() => fetchReviewBypassEligibility(taskId, projectId))
+      .then((response) => {
+        if (cancelled) return;
+        const stepId = response?.bypassable === true && typeof response.workflowStepId === "string" ? response.workflowStepId : null;
+        setBypassEligibility({ key, workflowStepId: stepId });
+      })
+      .catch(() => {
+        if (!cancelled) setBypassEligibility({ key, workflowStepId: null });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [active, bypassEligibilityKey, task.id, projectId]);
+  const bypassableReviewStepId = bypassEligibilityKey !== null && bypassEligibility?.key === bypassEligibilityKey
+    ? bypassEligibility.workflowStepId
+    : null;
+
   const taskActionMenuModel = useMemo(() => buildTaskActionMenuModel({
     task,
     t,
@@ -4417,6 +4468,7 @@ export function TaskDetailContent({
     onStartPrReview: handleStartPrReviewMenuItemClick,
     onCheckPrStatus: handleCheckPrStatus,
     onBypassReview: handleBypassReview,
+    bypassableReviewStepId,
   }), [
     task,
     t,
@@ -4425,6 +4477,7 @@ export function TaskDetailContent({
     onRetryTask,
     onResetTask,
     onBypassReview,
+    bypassableReviewStepId,
     mergeStrategy,
     effectiveAutoMerge,
     prAutomationLabel,

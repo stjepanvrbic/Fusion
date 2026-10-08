@@ -3950,6 +3950,24 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
     }
   });
 
+  /*
+  FNXC:ReviewLaneBypass 2026-10-08-02:27:
+  KB-019: read-only bypass eligibility, answered by the same store evaluator the POST below uses.
+  The dashboard menu consumes this as the ONLY bypass-eligibility authority; no client surface may re-derive the rule (the old client predicate missed a required gate that never ran and over-offered refused cases).
+  Kept off the `GET /tasks/:id` payload on purpose: Task Detail merges that payload with SSE snapshots, so a detail-only field would go stale after unpause, a reseed result, or a column move.
+  */
+  router.get("/tasks/:id/bypass-review", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      res.json(await scopedStore.getReviewBypassEligibility(req.params.id));
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      if (isTaskLookupMiss(err) || /^Task .* not found$/.test(message)) throw notFound(message);
+      rethrowAsApiError(err);
+    }
+  });
+
   router.post("/tasks/:id/bypass-review", async (req, res) => {
     try {
       const { store: scopedStore } = await getProjectContext(req);

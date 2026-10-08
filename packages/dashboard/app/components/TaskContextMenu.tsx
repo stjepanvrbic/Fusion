@@ -2,40 +2,13 @@ import "./TaskContextMenu.css";
 import type { KeyboardEvent, PointerEvent as ReactPointerEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { TFunction } from "i18next";
-import type { ColumnId, Task, TaskDetail, WorkflowStepResult } from "@fusion/core";
-import { isReviewColumnRole } from "../utils/columnRoles";
+import type { ColumnId, Task, TaskDetail } from "@fusion/core";
 
 /*
 FNXC:TaskRecoveryVocabulary 2026-08-28-00:38:
 FN-206 makes dashboard task recovery Retry, Reset, and Delete. Retry repeats the current stage
 in place; Reset abandons task state; Delete removes the card.
 */
-
-/*
-FNXC:ReviewLaneBypass 2026-07-09-00:00:
-Dashboard app code only imports TYPES from @fusion/core (Vite aliases
-"@fusion/core" straight to packages/core/src/types.ts to avoid bundling the
-full core runtime into the client) — see vite.config.ts. So the bypass
-affordance's failed-pre-merge-step selection predicate is duplicated here in
-miniature rather than imported from packages/core/src/task-merge.ts's
-getLatestFailedPreMergeReviewStep. Keep this in lockstep with that function
-and self-healing.ts's latestFailedPreMergeStep (FN-7720): most-recent
-phase!=="post-merge" result with status==="failed".
-*/
-/*
-FNXC:ReviewLaneBypass 2026-09-06-00:47:
-Dashboard imports only core types, so this predicate mirrors the core selector. An archived failed
-carrier retains history yet must stay reachable by the audited operator bypass.
-*/
-function hasFailedPreMergeReviewStep(task: Pick<Task, "workflowStepResults">): boolean {
-  return (task.workflowStepResults ?? []).some((result: WorkflowStepResult) =>
-    (result.phase || "pre-merge") === "pre-merge"
-    && (result.status === "failed" || (result.remediationArchivedAt != null
-      && (result.remediationArchivedFromStatus === "failed" || result.remediationArchivedFromStatus === "advisory_failure")
-      && !result.bypassedBy
-      && !result.supersededAt)),
-  );
-}
 
 export type TaskMenuActionTone = "default" | "danger" | "note";
 
@@ -133,6 +106,13 @@ export interface BuildTaskActionMenuModelOptions {
   task-detail actions surface intentionally.
   */
   onBypassReview?: () => void;
+  /*
+  FNXC:ReviewLaneBypass 2026-10-08-02:27:
+  KB-019: the server-selected step id from `GET /tasks/:id/bypass-review` (store `getReviewBypassEligibility`).
+  Only a non-empty string offers "Bypass failed review"; null/undefined/"" (pending, refused, or failed fetch) offers nothing.
+  The server is the sole eligibility authority, so this model never re-derives the rule from `workflowStepResults`.
+  */
+  bypassableReviewStepId?: string | null;
 }
 
 export function getTaskPrAutomationLabel(t: TFunction<"app">, status?: string): string | undefined {
@@ -314,23 +294,35 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
   FNXC:ReviewLaneBypass 2026-07-09-00:00:
   Policy-gated escape hatch (FN-7720) for a card stranded in `in-review`
   solely by a failed pre-merge review step (leading real-world cause:
-  Runfusion/Fusion#1946's no-verdict dispatch defect). Shown only when the
-  task is `in-review` and carries a failed pre-merge `WorkflowStepResult`, so
-  it never renders as an empty/dead affordance for tasks blocked by other
-  reasons or already recovered.
+  Runfusion/Fusion#1946's no-verdict dispatch defect). It never renders as
+  an empty/dead affordance for tasks blocked by other reasons or already
+  recovered; eligibility is server-owned (see the KB-019 entry below).
   */
   /*
-  FNXC:WorkflowResolvedColumns 2026-07-30-23:50 (batch-dashboard-app):
+  FNXC:WorkflowResolvedColumns 2026-07-30-23:50 (batch-dashboard-app) (superseded by KB-019 below):
   REVIEW role, resolved from `currentColumnFlags` — which this function already receives and already
   uses for the archived check ~15 lines up. Keyed on the literal, the "Bypass failed review" action
   never appeared on a renamed board, so an operator with a genuinely failed pre-merge review step had
   no way to clear it from the menu and the card stayed merge-blocked with no affordance.
   */
-  if (hasBypassReviewHandler && isReviewColumnRole(currentColumnFlags, task.column) && hasFailedPreMergeReviewStep(task)) {
+  /*
+  FNXC:ReviewLaneBypass 2026-10-08-02:27:
+  KB-019 deleted the client predicate `hasFailedPreMergeReviewStep` and the client review-role lane check.
+  The copy missed a required pre-merge gate that never produced a result (which the store accepts) and over-offered cases the store refuses (paused card, open findings, lanes outside the store's resolved review set).
+  The action is now offered exactly when the server reported a bypassable step id; otherwise no descriptor is pushed (no disabled shell).
+  */
+  if (
+    hasBypassReviewHandler
+    && typeof options.bypassableReviewStepId === "string"
+    && options.bypassableReviewStepId.length > 0
+  ) {
     actions.push({
       id: "bypass-review",
       label: t("taskDetail.bypassReview.btn", "Bypass failed review"),
-      tone: "note",
+      /*
+      FNXC:ReviewLaneBypass 2026-10-08-06:20:
+      KB-019: default tone, not `note`. TaskContextMenu renders a `note` as an inert `<span role="note">` and `selectAction` ignores it, so the action was visible but could never be selected.
+      */
       onSelect: options.onBypassReview,
     });
   }

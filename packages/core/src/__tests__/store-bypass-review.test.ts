@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { WorkflowStepResult } from "../types.js";
 import {
   pgDescribe,
@@ -332,5 +332,132 @@ pgDescribe("TaskStore.bypassFailedPreMergeReviewStep", () => {
     await expect(
       store().bypassFailedPreMergeReviewStep("FN-RENAMED", { reason: "operator override" } as never),
     ).rejects.toThrow(/must be in 'validating'/);
+  });
+
+  /*
+  FNXC:ReviewLaneBypass 2026-10-08-02:27:
+  KB-019: `getReviewBypassEligibility` and the bypass mutation share one evaluator, so the dashboard menu offers bypass exactly when the store accepts it.
+  The agreement table proves that invariant across every target shape, including the resultless required gate the old client predicate missed.
+  */
+  describe("getReviewBypassEligibility", () => {
+    type Fixture = { id: string; seed: () => Promise<unknown> };
+    const fixtures: Record<string, Fixture> = {
+      failed: { id: "FN-ELIG-FAILED", seed: () => seedInReviewTask("FN-ELIG-FAILED", { workflowStepResults: [failedStep()] }) },
+      archived: {
+        id: "FN-ELIG-ARCHIVED",
+        seed: () => seedInReviewTask("FN-ELIG-ARCHIVED", {
+          workflowId: "builtin:coding",
+          workflowStepResults: [
+            failedStep({
+              workflowStepId: "plan-review",
+              workflowStepName: "Plan Review",
+              status: "skipped",
+              reviewKind: "plan",
+              remediationArchivedAt: "2026-09-04T19:28:37.579Z",
+              remediationArchivedFromStatus: "failed",
+            }),
+            failedStep({ status: "passed", verdict: "APPROVE", reviewKind: "code" }),
+          ],
+        }),
+      },
+      absent: { id: "FN-ELIG-ABSENT", seed: () => seedInReviewTask("FN-ELIG-ABSENT", { workflowStepResults: [], workflowId: "builtin:coding" }) },
+      finding: {
+        id: "FN-ELIG-FINDING",
+        seed: () => seedInReviewTask("FN-ELIG-FINDING", {
+          workflowStepResults: [failedStep({
+            findings: [{ id: "open-finding", title: "Open", body: "Still open.", severity: "critical", resolution: "open" }],
+          })],
+        }),
+      },
+      paused: { id: "FN-ELIG-PAUSED", seed: () => seedInReviewTask("FN-ELIG-PAUSED", { workflowStepResults: [failedStep()], paused: true }) },
+      todo: {
+        id: "FN-ELIG-TODO",
+        seed: () => store().createTaskWithReservedId(
+          { description: "todo task", column: "todo" },
+          { taskId: "FN-ELIG-TODO", applyDefaultWorkflowSteps: false },
+        ),
+      },
+      none: {
+        id: "FN-ELIG-NONE",
+        seed: async () => {
+          await seedInReviewTask("FN-ELIG-NONE", { workflowStepResults: [failedStep({ status: "passed" })] });
+          await store().updateTask("FN-ELIG-NONE", { enabledWorkflowSteps: [] });
+        },
+      },
+    };
+
+    it("reports a live failed result", async () => {
+      await fixtures.failed.seed();
+      await expect(store().getReviewBypassEligibility(fixtures.failed.id)).resolves.toEqual({
+        bypassable: true,
+        workflowStepId: "code-review",
+        workflowStepName: "Code Review",
+        source: "failed",
+        reason: null,
+      });
+    });
+
+    it("reports an archived failed carrier", async () => {
+      await fixtures.archived.seed();
+      await expect(store().getReviewBypassEligibility(fixtures.archived.id)).resolves.toMatchObject({
+        bypassable: true,
+        workflowStepId: "plan-review",
+        source: "archived-failed",
+        reason: null,
+      });
+    });
+
+    it("reports a required gate that never produced a result", async () => {
+      await fixtures.absent.seed();
+      await expect(store().getReviewBypassEligibility(fixtures.absent.id)).resolves.toMatchObject({
+        bypassable: true,
+        workflowStepId: "plan-review",
+        source: "absent",
+        reason: null,
+      });
+    });
+
+    it.each([
+      ["finding", /failed review has open findings/],
+      ["paused", /paused/],
+      ["todo", /must be in 'in-review'/],
+      ["none", /no failed pre-merge review step/],
+    ] as const)("refuses the %s case with the mutation's refusal text", async (key, reason) => {
+      await fixtures[key].seed();
+      const eligibility = await store().getReviewBypassEligibility(fixtures[key].id);
+      expect(eligibility).toMatchObject({ bypassable: false, workflowStepId: null, source: null });
+      expect(eligibility.reason).toMatch(reason);
+    });
+
+    it("rejects an unknown task id with the store's lookup miss", async () => {
+      // Same read path as the mutation: a missing task surfaces as an ENOENT/not-found lookup miss (the route maps it to 404).
+      await expect(store().getReviewBypassEligibility("FN-ELIG-MISSING")).rejects.toThrow(/not found|ENOENT/i);
+    });
+
+    it("agrees with the mutation for every target shape", async () => {
+      for (const fixture of Object.values(fixtures)) {
+        await fixture.seed();
+        const eligibility = await store().getReviewBypassEligibility(fixture.id);
+        const outcome = await store()
+          .bypassFailedPreMergeReviewStep(fixture.id, { reason: "agreement check", actor: "operator-agree" })
+          .then((task) => ({ ok: true as const, task }), (error: unknown) => ({ ok: false as const, error }));
+        expect({ id: fixture.id, accepted: outcome.ok }).toEqual({ id: fixture.id, accepted: eligibility.bypassable });
+        if (outcome.ok) {
+          const bypassed = (outcome.task.workflowStepResults ?? []).filter((result) => result.bypassedBy === "operator-agree");
+          expect(bypassed.map((result) => result.workflowStepId)).toEqual([eligibility.workflowStepId]);
+        } else {
+          expect((outcome.error as Error).message).toBe(eligibility.reason);
+        }
+      }
+    });
+
+    it("writes nothing", async () => {
+      await fixtures.failed.seed();
+      const before = await store().getTask(fixtures.failed.id);
+      await store().getReviewBypassEligibility(fixtures.failed.id);
+      const after = await store().getTask(fixtures.failed.id);
+      expect(after.updatedAt).toBe(before.updatedAt);
+      expect(after.workflowStepResults).toEqual(before.workflowStepResults);
+    });
   });
 });

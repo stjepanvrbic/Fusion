@@ -1707,6 +1707,22 @@ export interface TaskDetail extends Task {
   retrySummary?: RetrySummary;
 }
 
+/**
+ * FNXC:ReviewLaneBypass 2026-10-08-02:27:
+ * Server-owned answer to "would the audited review bypass be accepted right now?".
+ * Produced by the same store evaluator the bypass mutation uses, so the dashboard menu offers the action exactly when the store accepts it, including a required pre-merge gate that never produced a result (`source: "absent"`).
+ */
+export interface ReviewBypassEligibility {
+  bypassable: boolean;
+  /** Step the bypass would rewrite; null when not bypassable. */
+  workflowStepId: string | null;
+  workflowStepName: string | null;
+  /** `failed` live result, `archived-failed` remediation carrier, or `absent` required gate with no result. */
+  source: "failed" | "archived-failed" | "absent" | null;
+  /** Store refusal message when not bypassable; null when bypassable. */
+  reason: string | null;
+}
+
 /** A task candidate from the inbox-lite work selection, with metadata about why it was selected. */
 export interface InboxTask {
   task: Task;

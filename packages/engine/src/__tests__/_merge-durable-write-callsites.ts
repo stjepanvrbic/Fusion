@@ -568,6 +568,7 @@ const NON_WRITER_REASONS: Record<string, string> = Object.fromEntries([
   "getPrEntityByNumber",
   "getPrThreadState",
   "getResearchStore",
+  "getReviewBypassEligibility",
   "getRootDir",
   "getRunAuditEvents",
   "getRunAuditEventsAsync",

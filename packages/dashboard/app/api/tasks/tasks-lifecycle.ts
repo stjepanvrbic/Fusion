@@ -10,6 +10,7 @@ import type {
   BranchGroupPrState,
   PlannerOverseerRuntimeSnapshot,
   PlannerInterventionEntry,
+  ReviewBypassEligibility,
 } from "@fusion/core";
 import { api } from "../client/client.js";
 import { withProjectId } from "../client/health.js";
@@ -155,6 +156,15 @@ export function bypassReview(id: string, reason: string, projectId?: string): Pr
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ reason }),
   });
+}
+
+/*
+FNXC:ReviewLaneBypass 2026-10-08-02:40:
+KB-019: read-only bypass eligibility from `GET /tasks/:id/bypass-review`, answered by the same store evaluator as `bypassReview`.
+The Task Detail menu offers "Bypass failed review" only when this reports `bypassable: true`; the client never re-derives the rule.
+*/
+export function fetchReviewBypassEligibility(id: string, projectId?: string): Promise<ReviewBypassEligibility> {
+  return api<ReviewBypassEligibility>(withProjectId(`/tasks/${id}/bypass-review`, projectId));
 }
 
 /*

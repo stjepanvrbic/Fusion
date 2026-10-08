@@ -655,6 +655,7 @@ import type {
   TaskVerificationResultSummary,
   TaskVerificationRequest,
   TaskDetail,
+  ReviewBypassEligibility,
   InboxTask,
   TaskCreateInput,
 } from "./types/task/task-core.js";
@@ -711,6 +712,7 @@ export type {
   TaskVerificationResultSummary,
   TaskVerificationRequest,
   TaskDetail,
+  ReviewBypassEligibility,
   InboxTask,
   TaskCreateInput,
 };

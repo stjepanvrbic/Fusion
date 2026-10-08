@@ -81,6 +81,8 @@ vi.mock("../../api", async (importOriginal) => {
     fetchWorkflowOptionalSteps: vi.fn().mockResolvedValue([]),
     // FNXC:TaskRecommendations 2026-10-08-01:10: KB-011 task detail asks the server eligibility route before showing Recommendations; default to actionable.
     fetchRecommendationEligibility: vi.fn().mockResolvedValue({ actionable: true, reason: null }),
+    // FNXC:ReviewLaneBypass 2026-10-08-06:10: KB-019 task detail asks the server bypass-eligibility route before offering "Bypass failed review"; default to not bypassable.
+    fetchReviewBypassEligibility: vi.fn().mockResolvedValue({ bypassable: false, workflowStepId: null, workflowStepName: null, source: null, reason: "not eligible" }),
     fetchWorkflow: vi.fn().mockResolvedValue({ id: "builtin:coding", name: "Coding", ir: { version: 1, nodes: [], edges: [] } }),
     selectTaskWorkflow: vi.fn().mockResolvedValue({ workflowId: null, enabledWorkflowSteps: [] }),
     submitTaskWorkflowInput: vi.fn().mockResolvedValue({ ok: true }),

@@ -2480,6 +2480,136 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   }
 
   /*
+   * FNXC:ReviewLaneBypass 2026-10-08-02:27:
+   * KB-019: the single review-bypass eligibility decision, shared by the bypass mutation and the read-only `getReviewBypassEligibility`.
+   * Checks run in the mutation's established order (review lane, pause, failed/archived target, absent required gate, open findings) and refusals carry the mutation's exact error text, which CLI and route error mapping depend on.
+   * The absent-path IR resolution is deliberately NOT caught here so the mutation keeps propagating an IR failure; the read fails closed instead.
+   */
+  private async evaluateReviewBypassEligibility(task: Task): Promise<
+    | {
+      eligible: true;
+      failedTarget?: import("./types.js").WorkflowStepResult;
+      absentStepId?: string;
+      workflowStepId: string;
+      workflowStepName: string;
+      source: "failed" | "archived-failed" | "absent";
+    }
+    | { eligible: false; refusal: string }
+  > {
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-01:10 (PR #2709 review — greptile):
+    THE MESSAGE MUST NAME THE COLUMN THE CHECK ACTUALLY USED. The guard was converted to the
+    resolved review lane while the rejection still said `in-review`, so on a custom board an
+    operator was told to move the card to a column their board does not have — through both the
+    CLI and the dashboard, with no way to discover the real answer from the error.
+
+    Wrong guidance is worse than an unconverted guard: an inert guard fails visibly, while this
+    one refuses correctly and then sends the operator somewhere that does not exist. Resolved once
+    into a local so the check and the message cannot drift apart again.
+    */
+    /*
+    FNXC:WorkflowLifecycleColumns 2026-07-30-16:05 (PR #2718 review — greptile, on the guard I
+    converted in #2709):
+    EVERY REVIEW LANE, because `.review` is the single `mergeOrchestration` column. A board hosting
+    review on a `humanReview`- or `mergeBlocker`-only lane failed this check, so `TaskContextMenu`
+    offered "Bypass failed review" (it asks by ROLE) and the store refused it — the operator's only
+    escape from a stranded failed pre-merge step returned a conflict.
+
+    THE BROAD SET IS RIGHT HERE, and that is a decision rather than a default: this guard REFUSES or
+    PERMITS an operator action and moves nothing, so admitting every lane where review happens cannot
+    send a card anywhere the engine disagrees with. #2750 documents the split — a caller that admits
+    and then MOVES wants the narrow single lane instead.
+
+    The message names the lanes the check actually used, keeping #2709's fix: telling an operator to
+    move to a column their board does not have is worse than refusing.
+    */
+    /*
+    FNXC:WorkflowResolvedColumns 2026-07-30-15:20 (#2819 review — the same empty-set hole, found by
+    sweeping every `resolveReviewColumns` call site rather than only the one the reviewer named):
+    A v1-upgraded board resolves to an EMPTY review set while its `in-review` column plainly exists,
+    so this guard would refuse the operator's bypass on every pre-v2 project with the unhelpful
+    message "must be in a review lane".
+    */
+    const id = task.id;
+    const reviewIr = await resolveWorkflowIrForTask(this, task.id).catch(() => undefined);
+    const reviewColumns = reviewIr === undefined || !declaresAnyLifecycleTrait(reviewIr)
+      ? ["in-review"]
+      : resolveReviewColumns(reviewIr);
+    if (!reviewColumns.includes(task.column)) {
+      const named = reviewColumns.length > 0 ? reviewColumns.map((c: string) => `'${c}'`).join(" or ") : "a review lane";
+      return { eligible: false, refusal: `Cannot bypass review lane for ${id}: task is in '${task.column}', must be in ${named}` };
+    }
+    if (task.paused) {
+      return { eligible: false, refusal: `Cannot bypass review lane for ${id}: task is paused` };
+    }
+
+    const results = task.workflowStepResults ?? [];
+    const failedTarget = getLatestFailedPreMergeReviewStep(task);
+    const reviewIrForBypass = failedTarget
+      ? undefined
+      : await resolveWorkflowIrForTask(this, task.id);
+    const absentStepId = reviewIrForBypass
+      ? [...resolveRequiredPreMergeStepIds(reviewIrForBypass, task.enabledWorkflowSteps, task)]
+        .find((workflowStepId) => !results.some((result) => result.workflowStepId === workflowStepId))
+      : undefined;
+    if (!failedTarget && !absentStepId) {
+      // Preserve the established refusal for cards with neither escape target.
+      return { eligible: false, refusal: `Cannot bypass review lane for ${id}: no failed pre-merge review step found` };
+    }
+    /*
+    FNXC:NoVerdictReviewRecovery 2026-09-23-19:58:
+    An audited bypass is an outage escape hatch, never a way to erase a real review finding.
+    Keep failed evidence with any open finding merge-blocking so the operator must obtain a fresh
+    review result; resolved and superseded findings remain historical and do not trigger this guard.
+    */
+    if (failedTarget?.findings?.some((finding) => finding.resolution === undefined || finding.resolution === "open")) {
+      return { eligible: false, refusal: `Cannot bypass review lane for ${id}: failed review has open findings` };
+    }
+    if (failedTarget) {
+      return {
+        eligible: true,
+        failedTarget,
+        workflowStepId: failedTarget.workflowStepId,
+        workflowStepName: failedTarget.workflowStepName,
+        source: failedTarget.status === "failed" ? "failed" : "archived-failed",
+      };
+    }
+    return { eligible: true, absentStepId: absentStepId!, workflowStepId: absentStepId!, workflowStepName: absentStepId!, source: "absent" };
+  }
+
+  /**
+   * FNXC:ReviewLaneBypass 2026-10-08-02:27:
+   * KB-019: read-only answer to "would `bypassFailedPreMergeReviewStep` accept this task now?".
+   * This read and the mutation share one evaluator, so the dashboard menu offers "Bypass failed review" exactly when the store accepts it, including a required pre-merge gate that never produced a result.
+   * A missing task rejects (not-found propagates to the route's 404 mapping). An evaluator failure such as unresolvable workflow IR fails closed as not bypassable. Performs no write, takes no task lock, and emits no run-audit event.
+   */
+  async getReviewBypassEligibility(id: string): Promise<import("./types.js").ReviewBypassEligibility> {
+    const task = await this.readTaskJson(this.taskDir(id));
+    let eligibility: Awaited<ReturnType<TaskStore["evaluateReviewBypassEligibility"]>>;
+    try {
+      eligibility = await this.evaluateReviewBypassEligibility(task);
+    } catch {
+      return {
+        bypassable: false,
+        workflowStepId: null,
+        workflowStepName: null,
+        source: null,
+        reason: `Cannot determine bypass eligibility for ${id}`,
+      };
+    }
+    if (!eligibility.eligible) {
+      return { bypassable: false, workflowStepId: null, workflowStepName: null, source: null, reason: eligibility.refusal };
+    }
+    return {
+      bypassable: true,
+      workflowStepId: eligibility.workflowStepId,
+      workflowStepName: eligibility.workflowStepName,
+      source: eligibility.source,
+      reason: null,
+    };
+  }
+
+  /*
    * FNXC:ReviewLaneBypass 2026-07-09-00:00:
    * Operator/privileged-only escape hatch for a card stranded in `in-review`
    * solely by a failed pre-merge review lane (leading real-world cause: the
@@ -2509,74 +2639,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       const dir = this.taskDir(id);
       const task = await this.readTaskJson(dir);
 
-      /*
-      FNXC:WorkflowLifecycleColumns 2026-07-30-01:10 (PR #2709 review — greptile):
-      THE MESSAGE MUST NAME THE COLUMN THE CHECK ACTUALLY USED. The guard was converted to the
-      resolved review lane while the rejection still said `in-review`, so on a custom board an
-      operator was told to move the card to a column their board does not have — through both the
-      CLI and the dashboard, with no way to discover the real answer from the error.
-
-      Wrong guidance is worse than an unconverted guard: an inert guard fails visibly, while this
-      one refuses correctly and then sends the operator somewhere that does not exist. Resolved once
-      into a local so the check and the message cannot drift apart again.
-      */
-      /*
-      FNXC:WorkflowLifecycleColumns 2026-07-30-16:05 (PR #2718 review — greptile, on the guard I
-      converted in #2709):
-      EVERY REVIEW LANE, because `.review` is the single `mergeOrchestration` column. A board hosting
-      review on a `humanReview`- or `mergeBlocker`-only lane failed this check, so `TaskContextMenu`
-      offered "Bypass failed review" (it asks by ROLE) and the store refused it — the operator's only
-      escape from a stranded failed pre-merge step returned a conflict.
-
-      THE BROAD SET IS RIGHT HERE, and that is a decision rather than a default: this guard REFUSES or
-      PERMITS an operator action and moves nothing, so admitting every lane where review happens cannot
-      send a card anywhere the engine disagrees with. #2750 documents the split — a caller that admits
-      and then MOVES wants the narrow single lane instead.
-
-      The message names the lanes the check actually used, keeping #2709's fix: telling an operator to
-      move to a column their board does not have is worse than refusing.
-      */
-      /*
-      FNXC:WorkflowResolvedColumns 2026-07-30-15:20 (#2819 review — the same empty-set hole, found by
-      sweeping every `resolveReviewColumns` call site rather than only the one the reviewer named):
-      A v1-upgraded board resolves to an EMPTY review set while its `in-review` column plainly exists,
-      so this guard would refuse the operator's bypass on every pre-v2 project with the unhelpful
-      message "must be in a review lane".
-      */
-      const reviewIr = await resolveWorkflowIrForTask(this, task.id).catch(() => undefined);
-      const reviewColumns = reviewIr === undefined || !declaresAnyLifecycleTrait(reviewIr)
-        ? ["in-review"]
-        : resolveReviewColumns(reviewIr);
-      if (!reviewColumns.includes(task.column)) {
-        const named = reviewColumns.length > 0 ? reviewColumns.map((c: string) => `'${c}'`).join(" or ") : "a review lane";
-        throw new Error(`Cannot bypass review lane for ${id}: task is in '${task.column}', must be in ${named}`);
+      const eligibility = await this.evaluateReviewBypassEligibility(task);
+      if (!eligibility.eligible) {
+        throw new Error(eligibility.refusal);
       }
-      if (task.paused) {
-        throw new Error(`Cannot bypass review lane for ${id}: task is paused`);
-      }
-
       const results = task.workflowStepResults ?? [];
-      const failedTarget = getLatestFailedPreMergeReviewStep(task);
-      const reviewIrForBypass = failedTarget
-        ? undefined
-        : await resolveWorkflowIrForTask(this, task.id);
-      const absentStepId = reviewIrForBypass
-        ? [...resolveRequiredPreMergeStepIds(reviewIrForBypass, task.enabledWorkflowSteps, task)]
-          .find((workflowStepId) => !results.some((result) => result.workflowStepId === workflowStepId))
-        : undefined;
-      if (!failedTarget && !absentStepId) {
-        // Preserve the established refusal for cards with neither escape target.
-        throw new Error(`Cannot bypass review lane for ${id}: no failed pre-merge review step found`);
-      }
-      /*
-      FNXC:NoVerdictReviewRecovery 2026-09-23-19:58:
-      An audited bypass is an outage escape hatch, never a way to erase a real review finding.
-      Keep failed evidence with any open finding merge-blocking so the operator must obtain a fresh
-      review result; resolved and superseded findings remain historical and do not trigger this guard.
-      */
-      if (failedTarget?.findings?.some((finding) => finding.resolution === undefined || finding.resolution === "open")) {
-        throw new Error(`Cannot bypass review lane for ${id}: failed review has open findings`);
-      }
+      const { failedTarget, absentStepId } = eligibility;
 
       const target = failedTarget ?? {
         workflowStepId: absentStepId!,
