@@ -2379,6 +2379,10 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
   FNXC:TaskRecommendations 2026-10-07-19:59:
   One eligibility answer for a recommendation source, shared by the create route and the read-only eligibility route.
   Every surface must enable Create task exactly when the create route would accept it, so the mailbox asks this rule instead of re-deriving workflow lanes client-side.
+
+  FNXC:TaskRecommendations 2026-10-08-01:10:
+  KB-011: task detail, the mailbox, and the create route all consume this one rule (task detail and the mailbox via GET /tasks/:id/recommendations/eligibility; Insights via its SQL twin over the same resolved lanes).
+  No surface may re-derive review lanes client-side: task detail's former copy accepted only mergeBlocker/humanReview and hid landed cards in merge-orchestration-only lanes.
   */
   async function resolveRecommendationSourceEligibility(scopedStore: TaskStore, parent: Task): Promise<{
     actionable: boolean;

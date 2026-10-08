@@ -65,11 +65,12 @@ describe("TaskDetailModal Summary tab", () => {
     }
   });
 
-  it("places captured recommendations under Summary without restoring a Recommendations tab", () => {
+  // FNXC:TaskRecommendations 2026-10-08-01:10: KB-011 visibility waits on the server eligibility answer (shared helper mocks actionable), so these assertions are async.
+  it("places captured recommendations under Summary without restoring a Recommendations tab", async () => {
     render(modal(doneTask({ recommendations: [{ id: "REC-244", title: "Audit a related path", description: "Optional future work.", category: "improvement" }] })));
 
+    expect(await screen.findByRole("heading", { name: "Recommendations", level: 3 })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Recommendations" })).toBeNull();
-    expect(screen.getByRole("heading", { name: "Recommendations", level: 3 })).toBeInTheDocument();
     expect(screen.getByText("Audit a related path")).toBeInTheDocument();
   });
 
@@ -80,7 +81,7 @@ describe("TaskDetailModal Summary tab", () => {
     expect(screen.queryByRole("button", { name: "Recommendations" })).toBeNull();
   });
 
-  it("renders Merge Details as the final Summary block after recommendations", () => {
+  it("renders Merge Details as the final Summary block after recommendations", async () => {
     render(modal(doneTask({
       mergeDetails: { commitSha: "abcdef1234567890", mergedAt: "2026-08-29T03:00:00.000Z" },
       recommendations: [{ id: "REC-256", title: "Optional follow-up", description: "Keep this non-blocking work visible.", category: "improvement" }],
@@ -91,6 +92,7 @@ describe("TaskDetailModal Summary tab", () => {
       ],
     })));
 
+    expect(await screen.findByRole("heading", { name: "Recommendations", level: 3 })).toBeInTheDocument();
     const summarySection = screen.getByTestId("task-summary-tab").closest(".detail-section--summary");
     const mergeCard = summarySection?.querySelector(".merge-details-card");
     const mergePanel = mergeCard?.closest(".detail-section");

@@ -167,7 +167,7 @@ untraited `archived` live lane while retaining undeclared legacy tombstone cover
 function installCustomRecommendationWorkflow(
   store: Partial<TaskStore>,
   taskIds: readonly string[],
-  options: { declareLegacyArchivedAsLive?: boolean } = {},
+  options: { declareLegacyArchivedAsLive?: boolean; mergeOrchestrationLane?: boolean } = {},
 ): void {
   Object.assign(store, {
     getTaskWorkflowSelection: vi.fn((id: string) => taskIds.includes(id) ? { workflowId: "recommendation-workflow", stepIds: [] } : undefined),
@@ -186,6 +186,9 @@ function installCustomRecommendationWorkflow(
           { id: "backlog", name: "Backlog", traits: [{ trait: "intake" }] },
           { id: "queued", name: "Queued", traits: [{ trait: "hold" }] },
           { id: "building", name: "Building", traits: [{ trait: "wip" }] },
+          ...(options.mergeOrchestrationLane
+            ? [{ id: "landing", name: "Landing", traits: [{ trait: "merge" }] }]
+            : []),
           { id: "shipped", name: "Shipped", traits: [{ trait: "complete" }] },
           ...(options.declareLegacyArchivedAsLive
             ? [{ id: "archived", name: "Live archived", traits: [] }]
@@ -650,6 +653,9 @@ describe("recommendation task creation route", () => {
   /*
   FNXC:TaskRecommendations 2026-10-07-19:59:
   The eligibility route is what lets the mailbox disable Create task before landing, so it must agree with the create route on every source shape.
+
+  FNXC:TaskRecommendations 2026-10-08-01:10:
+  KB-011: a custom review lane carrying only the merge-orchestration trait is a review lane (REVIEW_ROLES), so a landed card there is actionable; task detail now reads this same route.
   */
   it.each([
     { name: "complete lane", seed: () => parent(), custom: false, expected: true },
@@ -660,9 +666,16 @@ describe("recommendation task creation route", () => {
     { name: "unlanded review parent", seed: () => parent({ column: "in-review", mergeDetails: { mergeConfirmed: false } }), custom: false, expected: false },
     { name: "review parent without merge details", seed: () => parent({ column: "in-review" }), custom: false, expected: false },
     { name: "todo parent", seed: () => parent({ column: "todo" }), custom: false, expected: false },
+    { name: "landed merge-orchestration-only lane", seed: () => parent({ column: "landing" as Column, mergeDetails: { mergeConfirmed: true, commitSha: "8ff7e7ae7" } }), custom: "merge-orchestration" as const, expected: true },
+    { name: "unlanded merge-orchestration-only lane", seed: () => parent({ column: "landing" as Column, mergeDetails: { mergeConfirmed: false } }), custom: "merge-orchestration" as const, expected: false },
   ])("reports eligibility that matches the create route for a $name", async ({ seed, custom, expected }) => {
     const built = buildApp([seed()]);
-    if (custom) installCustomRecommendationWorkflow(built.store, ["FN-1"], custom === "live-archived" ? { declareLegacyArchivedAsLive: true } : {});
+    if (custom) {
+      installCustomRecommendationWorkflow(built.store, ["FN-1"], {
+        declareLegacyArchivedAsLive: custom === "live-archived",
+        mergeOrchestrationLane: custom === "merge-orchestration",
+      });
+    }
 
     const eligibility = await performRequest(built.app, "GET", "/api/tasks/FN-1/recommendations/eligibility");
     expect(eligibility.status).toBe(200);

@@ -42,7 +42,7 @@ import {
   isWipColumnRole,
 } from "../utils/columnRoles";
 import { resolveEffectiveAutoMerge } from "../../../core/src/merge/task-merge";
-import { uploadAttachment, deleteAttachment, updateTask, repairOverlapBlocker, fetchOverlapBlockerReport, fetchTaskDetail, fetchTaskPrompt, fetchSpecLock, fetchTaskVerificationRequest, fetchSettings, fetchTaskEffectiveSettings, fetchGlobalSettings, requestSpecRevision, rebuildTaskSpec, approvePlan, rejectPlan, refineTask, fetchWorkflowResults, assignTask, fetchAgents, fetchAgent, refreshPrStatus, fetchBoardWorkflows, updateTaskCustomFields, summarizeTitle, fetchWorkflowSettingValues, nudgeOverseer, stopOverseer, explainOverseer, fetchModels, fetchNodes, api } from "../api";
+import { uploadAttachment, deleteAttachment, updateTask, repairOverlapBlocker, fetchOverlapBlockerReport, fetchTaskDetail, fetchTaskPrompt, fetchSpecLock, fetchTaskVerificationRequest, fetchSettings, fetchTaskEffectiveSettings, fetchGlobalSettings, requestSpecRevision, rebuildTaskSpec, approvePlan, rejectPlan, refineTask, fetchWorkflowResults, assignTask, fetchAgents, fetchAgent, refreshPrStatus, fetchBoardWorkflows, updateTaskCustomFields, summarizeTitle, fetchWorkflowSettingValues, nudgeOverseer, stopOverseer, explainOverseer, fetchModels, fetchNodes, fetchRecommendationEligibility, api } from "../api";
 import type { RevertTaskOptions, RevertTaskResult, ModelInfo, NodeInfo, SpecLockResponse, TaskOverlapBlockerReport } from "../api";
 import type { BoardWorkflowsPayload, WorkflowFieldDefinition, CustomFieldRejection } from "../api";
 import { WorkflowIcon } from "./WorkflowIcon";
@@ -1374,12 +1374,37 @@ export function TaskDetailContent({
   workflow lane carrying the archived trait. The archive marker proves the task left the live row;
   without it, a custom archived-role lane would render a Create task action that the API must refuse.
 
-  FNXC:TaskRecommendations 2026-10-07-12:56:
-  A landed (merge-confirmed) card waiting in review is an actionable source too, matching the create route's isRecommendationSourceActionable rule.
+  FNXC:TaskRecommendations 2026-10-08-01:10:
+  KB-011: task detail no longer derives recommendation eligibility. It shows Recommendations only when the server eligibility route says the source is actionable — the same rule the create route, the mailbox, and Insights use (complete lanes, landed cards in any review lane, physically archived sources).
+  The former client copy used isReviewColumnRole (mergeBlocker/humanReview only) and hid landed cards in merge-orchestration-only review lanes while Insights and the mailbox offered Create task.
+  A pending or unreadable answer hides the section, so the UI never offers an action the server may refuse.
+  The answer is tagged with its task id so a late response for a previously opened task is never applied to another card.
   */
-  const isLandedReviewSource = isReviewColumn && (workingTask.mergeDetails ?? task.mergeDetails)?.mergeConfirmed === true;
-  const hasRecommendations = (isDoneColumn || isLandedReviewSource || (isArchivedColumn && typeof task.archivedAt === "string"))
-    && (taskOwnedRecommendations?.length ?? 0) > 0;
+  const hasTaskOwnedRecommendations = (taskOwnedRecommendations?.length ?? 0) > 0;
+  const effectiveMergeConfirmed = (workingTask.mergeDetails ?? task.mergeDetails)?.mergeConfirmed === true;
+  const [recommendationEligibility, setRecommendationEligibility] = useState<{ taskId: string; actionable: boolean } | null>(null);
+  useEffect(() => {
+    setRecommendationEligibility(null);
+    if (!hasTaskOwnedRecommendations) return;
+    let active = true;
+    const taskId = task.id;
+    // A synchronous throw from the client becomes a rejection, so it fails closed like any unreadable answer.
+    Promise.resolve()
+      .then(() => fetchRecommendationEligibility(taskId, projectId))
+      .then((response) => {
+        if (active) setRecommendationEligibility({ taskId, actionable: response?.actionable === true });
+      })
+      .catch(() => {
+        if (active) setRecommendationEligibility({ taskId, actionable: false });
+      });
+    return () => {
+      active = false;
+    };
+    // Re-ask whenever a live input to the server rule changes (lane, landing, archive), keyed on booleans to avoid refetch loops on snapshot merges.
+  }, [task.id, projectId, task.column, effectiveMergeConfirmed, task.archivedAt, hasTaskOwnedRecommendations]);
+  const hasRecommendations = hasTaskOwnedRecommendations
+    && recommendationEligibility?.taskId === task.id
+    && recommendationEligibility.actionable;
   // Reset planner-chat focus when the operator opens a different task.
   useEffect(() => {
     setPlannerChatExpanded(false);

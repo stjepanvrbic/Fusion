@@ -1,19 +1,21 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskRecommendationsTab } from "../TaskRecommendationsTab";
 import { TaskDetailContent } from "../TaskDetailModal";
 import type { Task } from "@fusion/core";
 import { ApiRequestError } from "../../api/client/client";
 
-const { createTaskFromRecommendation, fetchBoardWorkflows } = vi.hoisted(() => ({
+const { createTaskFromRecommendation, fetchBoardWorkflows, fetchRecommendationEligibility } = vi.hoisted(() => ({
   createTaskFromRecommendation: vi.fn(),
   fetchBoardWorkflows: vi.fn(),
+  fetchRecommendationEligibility: vi.fn(),
 }));
 vi.mock("../../api", async (importOriginal) => {
   const { createDashboardApiMock } = await import("../../test/mockApi");
   return createDashboardApiMock(() => importOriginal<typeof import("../../api")>(), {
     createTaskFromRecommendation,
     fetchBoardWorkflows,
+    fetchRecommendationEligibility,
   });
 });
 
@@ -42,33 +44,131 @@ const sharedDetailProps = {
   addToast: vi.fn(),
 };
 
-describe("TaskRecommendationsTab", () => {
-  it("does not show recommendations for a live custom archived-role lane", async () => {
-    fetchBoardWorkflows.mockResolvedValue({
-      flagEnabled: true,
-      defaultWorkflowId: "custom-workflow",
-      taskWorkflowIds: { "FN-8829": "custom-workflow" },
-      workflows: [{
-        id: "custom-workflow",
-        name: "Custom workflow",
-        columns: [{ id: "boxed", name: "Boxed", flags: { archived: true } }],
-      }],
-    } as never);
+/*
+FNXC:TaskRecommendations 2026-10-08-01:10:
+KB-011: task detail shows Recommendations exactly when the server eligibility route says the source is actionable.
+These cases drive visibility through that server answer (never a client copy of the lane rule) across lane shapes, pending, rejected, empty, and task-switch states.
+*/
+function mockSingleLaneWorkflow(column: { id: string; name: string; flags: Record<string, boolean> }): void {
+  fetchBoardWorkflows.mockResolvedValue({
+    flagEnabled: true,
+    defaultWorkflowId: "custom-workflow",
+    taskWorkflowIds: { "FN-8829": "custom-workflow", "FN-8840": "custom-workflow" },
+    workflows: [{ id: "custom-workflow", name: "Custom workflow", columns: [column] }],
+  } as never);
+}
 
-    render(
-      <TaskDetailContent
-        {...sharedDetailProps}
-        embedded
-        task={{
-          ...task,
-          column: "boxed",
-          prompt: "",
-          recommendations: task.recommendations,
-        }}
-      />,
-    );
+const landingLane = { id: "landing", name: "Landing", flags: { mergeOrchestration: true } };
+const landedTask: Task = { ...task, column: "landing" as Task["column"], prompt: "", mergeDetails: { mergeConfirmed: true } };
+
+type EligibilityAnswer = { actionable: boolean; reason: string | null };
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+describe("TaskDetailContent recommendations eligibility", () => {
+  beforeEach(() => {
+    fetchRecommendationEligibility.mockReset();
+    fetchRecommendationEligibility.mockResolvedValue({ actionable: true, reason: null });
+    mockSingleLaneWorkflow(landingLane);
+  });
+
+  it("shows recommendations for a landed card in a merge-orchestration-only review lane when the server says actionable", async () => {
+    render(<TaskDetailContent {...sharedDetailProps} embedded task={landedTask} />);
 
     expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Custom workflow");
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    expect(await screen.findByRole("heading", { name: "Recommendations" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create task" })).toBeEnabled();
+    expect(fetchRecommendationEligibility).toHaveBeenCalledWith("FN-8829", undefined);
+  });
+
+  it("hides recommendations when the server says the source is not actionable", async () => {
+    fetchRecommendationEligibility.mockResolvedValue({ actionable: false, reason: "Recommendations from FN-8829 can be filed as tasks after FN-8829 lands or completes" });
+    const { container } = render(<TaskDetailContent {...sharedDetailProps} embedded task={{ ...landedTask, mergeDetails: { mergeConfirmed: false } }} />);
+
+    expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Custom workflow");
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    await waitFor(() => expect(fetchRecommendationEligibility).toHaveBeenCalledWith("FN-8829", undefined));
+    await act(async () => {});
+    expect(screen.queryByRole("heading", { name: "Recommendations" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create task" })).not.toBeInTheDocument();
+    expect(container.querySelector(".task-summary-section--recommendations")).toBeNull();
+  });
+
+  it("hides recommendations with no empty section shell when the eligibility request rejects", async () => {
+    fetchRecommendationEligibility.mockRejectedValue(new Error("network down"));
+    const { container } = render(<TaskDetailContent {...sharedDetailProps} embedded task={landedTask} />);
+
+    expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Custom workflow");
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    await waitFor(() => expect(fetchRecommendationEligibility).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByRole("heading", { name: "Recommendations" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create task" })).not.toBeInTheDocument();
+    expect(container.querySelector(".task-summary-section--recommendations")).toBeNull();
+  });
+
+  it("keeps recommendations hidden while the eligibility answer is pending", async () => {
+    const pending = deferred<EligibilityAnswer>();
+    fetchRecommendationEligibility.mockReturnValue(pending.promise);
+    const { container } = render(<TaskDetailContent {...sharedDetailProps} embedded task={landedTask} />);
+
+    expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Custom workflow");
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    await waitFor(() => expect(fetchRecommendationEligibility).toHaveBeenCalled());
+    expect(container.querySelector(".task-summary-section--recommendations")).toBeNull();
+
+    await act(async () => { pending.resolve({ actionable: true, reason: null }); });
+    expect(await screen.findByRole("heading", { name: "Recommendations" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["empty", []],
+  ] as const)("does not ask the server and hides the section for %s recommendations", async (_label, recommendations) => {
+    mockSingleLaneWorkflow({ id: "done", name: "Done", flags: { complete: true } });
+    const { container } = render(<TaskDetailContent {...sharedDetailProps} embedded task={{ ...task, prompt: "", recommendations: recommendations as Task["recommendations"] }} />);
+
+    expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Custom workflow");
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    await act(async () => {});
+    expect(fetchRecommendationEligibility).not.toHaveBeenCalled();
+    expect(container.querySelector(".task-summary-section--recommendations")).toBeNull();
+  });
+
+  it("ignores a stale eligibility answer for a previously opened task", async () => {
+    const first = deferred<EligibilityAnswer>();
+    const second = deferred<EligibilityAnswer>();
+    fetchRecommendationEligibility.mockImplementation((taskId: string) => (taskId === "FN-8829" ? first.promise : second.promise));
+    const { container, rerender } = render(<TaskDetailContent {...sharedDetailProps} embedded task={landedTask} />);
+
+    expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Custom workflow");
+    fireEvent.click(screen.getByRole("button", { name: "Summary" }));
+    await waitFor(() => expect(fetchRecommendationEligibility).toHaveBeenCalledWith("FN-8829", undefined));
+
+    rerender(<TaskDetailContent {...sharedDetailProps} embedded task={{ ...landedTask, id: "FN-8840" }} />);
+    await waitFor(() => expect(fetchRecommendationEligibility).toHaveBeenCalledWith("FN-8840", undefined));
+
+    await act(async () => { first.resolve({ actionable: true, reason: null }); });
+    expect(container.querySelector(".task-summary-section--recommendations")).toBeNull();
+
+    await act(async () => { second.resolve({ actionable: false, reason: "not yet" }); });
+    expect(container.querySelector(".task-summary-section--recommendations")).toBeNull();
+  });
+
+  it("follows the server answer, not a client lane rule, for a live custom archived-role lane", async () => {
+    mockSingleLaneWorkflow({ id: "boxed", name: "Boxed", flags: { archived: true } });
+    fetchRecommendationEligibility.mockResolvedValue({ actionable: false, reason: "not actionable" });
+
+    render(<TaskDetailContent {...sharedDetailProps} embedded task={{ ...task, column: "boxed", prompt: "" }} />);
+
+    expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Custom workflow");
+    await waitFor(() => expect(fetchRecommendationEligibility).toHaveBeenCalledWith("FN-8829", undefined));
+    await act(async () => {});
     expect(screen.queryByRole("heading", { name: "Recommendations" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Create task" })).not.toBeInTheDocument();
   });
@@ -76,37 +176,33 @@ describe("TaskRecommendationsTab", () => {
   it.each([
     ["shows", true],
     ["hides", false],
-  ] as const)("%s recommendations for a review-lane card when merge confirmed is %s", async (_verb, mergeConfirmed) => {
-    fetchBoardWorkflows.mockResolvedValue({
-      flagEnabled: true,
-      defaultWorkflowId: "review-workflow",
-      taskWorkflowIds: { "FN-8829": "review-workflow" },
-      workflows: [{
-        id: "review-workflow",
-        name: "Review workflow",
-        columns: [{ id: "in-review", name: "In Review", flags: { mergeBlocker: true } }],
-      }],
-    } as never);
+  ] as const)("%s recommendations for a mergeBlocker review-lane card when the server answers actionable=%s", async (_verb, actionable) => {
+    mockSingleLaneWorkflow({ id: "in-review", name: "In Review", flags: { mergeBlocker: true } });
+    fetchRecommendationEligibility.mockResolvedValue({ actionable, reason: actionable ? null : "not yet" });
 
     render(
       <TaskDetailContent
         {...sharedDetailProps}
         embedded
-        task={{ ...task, column: "in-review", prompt: "", mergeDetails: { mergeConfirmed } }}
+        task={{ ...task, column: "in-review", prompt: "", mergeDetails: { mergeConfirmed: actionable } }}
       />,
     );
 
-    expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Review workflow");
+    expect(await screen.findByTestId("task-detail-workflow-badge")).toHaveTextContent("Custom workflow");
     fireEvent.click(screen.getByRole("button", { name: "Summary" }));
-    if (mergeConfirmed) {
+    await waitFor(() => expect(fetchRecommendationEligibility).toHaveBeenCalledWith("FN-8829", undefined));
+    if (actionable) {
       expect(await screen.findByRole("heading", { name: "Recommendations" })).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Create task" })).toBeEnabled();
     } else {
+      await act(async () => {});
       expect(screen.queryByRole("heading", { name: "Recommendations" })).not.toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Create task" })).not.toBeInTheDocument();
     }
   });
+});
 
+describe("TaskRecommendationsTab", () => {
   it("renders one accessible empty message with no action for undefined or empty recommendations", () => {
     const view = render(<TaskRecommendationsTab task={{ ...task, recommendations: undefined }} projectId="project-a" />);
 
