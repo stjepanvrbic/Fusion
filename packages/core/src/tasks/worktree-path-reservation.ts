@@ -18,6 +18,10 @@ import {normalizeAbsolutePath, pathIdentityKey} from "../fs/path-identity.js";
  * `state.json` remains the diagnostic and quarantine record beside the claim; self-healing reads it as liveness evidence, so its shape and `canonicalPath` spelling are unchanged.
  * Ownerless empty claims (legacy layout, or residue of an interrupted release or reclaim) are reclaimable after a short grace period unless a legacy held record names a live local process; a malformed owner needs the TTL plus proof the worktree is not live.
  *
+ * FNXC:WorkflowLifecycle 2026-10-08-04:11:
+ * On Windows a claim that a competing reclaimer is deleting (delete-pending) or that antivirus holds open answers lstat, readdir and stat with EPERM/EACCES/EBUSY.
+ * That answer proves neither absence nor a live owner, so the acquirer neither publishes nor reclaims on it: it re-polls until its acquire timeout.
+ *
  * FNXC:PathIdentity 2026-10-07-18:06:
  * The lock key hashes `pathIdentityKey`, so case, separator, extended-length and junction/symlink spellings of one checkout contend for one claim, including before the checkout exists.
  * Lock directories keyed by the pre-identity `resolve()` spelling are adopted once: a held or quarantined record there is treated as the prior state of the new key.
@@ -115,6 +119,13 @@ async function exists(path: string): Promise<boolean> {
     throw error;
   }
 }
+/** A transiently denied probe counts as present: absence is only proven by ENOENT/ENOTDIR. */
+async function claimMayExist(claim: string): Promise<boolean> {
+  try { return await exists(claim); } catch (error) {
+    if (TRANSIENT_FS_CODES.has(errorCode(error) ?? "")) return true;
+    throw error;
+  }
+}
 async function removeEmptyClaim(claim: string): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try { await rmdir(claim); return; } catch (error) {
@@ -136,6 +147,7 @@ const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 
 type ClaimObservation =
   | {kind: "absent"}
+  | {kind: "unobservable"}
   | {kind: "present"; entries: string[]; owner: OwnerRecord | null; ageMs: number};
 
 async function observeClaim(claim: string): Promise<ClaimObservation> {
@@ -147,6 +159,7 @@ async function observeClaim(claim: string): Promise<ClaimObservation> {
     return {kind: "present", entries, owner, ageMs: Date.now() - claimStat.mtimeMs};
   } catch (error) {
     if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return {kind: "absent"};
+    if (TRANSIENT_FS_CODES.has(errorCode(error) ?? "")) return {kind: "unobservable"};
     throw error;
   }
 }
@@ -155,7 +168,7 @@ type PublishOutcome = "acquired" | "contended" | "retry";
 
 async function publishClaim(layout: ReturnType<typeof paths>, owner: OwnerRecord): Promise<PublishOutcome> {
   // An existing claim, even an empty legacy one, is never replaced: POSIX rename would silently overwrite an empty directory.
-  if (await exists(layout.claim)) return "contended";
+  if (await claimMayExist(layout.claim)) return "contended";
   const pending = join(layout.container, `.pending-${owner.token}`);
   await mkdir(pending);
   try {
@@ -166,7 +179,7 @@ async function publishClaim(layout: ReturnType<typeof paths>, owner: OwnerRecord
     await rm(pending, {recursive: true, force: true}).catch(() => undefined);
     const code = errorCode(error) ?? "";
     if (code === "EEXIST" || code === "ENOTEMPTY" || TRANSIENT_FS_CODES.has(code)) {
-      if (await exists(layout.claim)) return "contended";
+      if (await claimMayExist(layout.claim)) return "contended";
       if (TRANSIENT_FS_CODES.has(code)) return "retry";
     }
     throw error;
@@ -318,7 +331,7 @@ export async function acquireWorktreePathReservation(options: WorktreePathReserv
     if (outcome === "contended") {
       const observation = await observeClaim(layout.claim);
       if (observation.kind === "absent") continue;
-      if (await isStaleClaim(observation, layout, options, canonicalPath, ttlMs)) {
+      if (observation.kind === "present" && await isStaleClaim(observation, layout, options, canonicalPath, ttlMs)) {
         await options.__beforeReclaimForTest?.();
         await reclaimObservedGeneration(layout, observation.entries);
         continue;
