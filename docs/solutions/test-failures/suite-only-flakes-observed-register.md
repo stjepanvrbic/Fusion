@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, and 34), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **18 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, 34, and 35), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **18 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -423,6 +423,25 @@ This shares a mechanism with entry 32 (`SystemControlsArea`, PR 50), where the t
 | `pnpm exec vitest run app/components/__tests__/agent-detail-log-history.test.tsx --project dashboard-app-quality-backfill` in `packages/dashboard`, local Windows, `628231a55` | passed, 9 tests, 11.3 s wall (tests 1.9 s) |
 
 No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. A fix should wait on the subscription itself, by asserting on `mockSubscribeSse` inside `waitFor` as the case at line 183 already does, rather than reading it once.
+
+### 35. Durable agent Activity analytics heartbeat session count and usage-event identity
+
+- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **File:** `packages/core/src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts`
+- **Exact tests:** two cases in `durable agent Activity analytics`: `turns a production durable no-task heartbeat into Activity sessions and tool usage` and `sums CLI and agent sessions, honors the range, and isolates the bound project`.
+- **Observed tree/SHA:** fork Full Suite (non-blocking) run [37742324890](https://github.com/stjepanvrbic/Fusion/actions/runs/37742324890) at `668244c5ed0e2b23eee7e0c9814d82a0f5e3587e`, job `Windows tests` (`113195659917`), `@fusion/core`. The Windows lane flagged the file as outside its known-failing list. The same file is not excluded on Linux, and no Linux shard of that run failed it. The file was never in the Windows ledger, and the KB-035 commit did not touch the core entries.
+- **Observed frequency:** 2 failures in the 4 cases of the file, both assertion or query failures, not timeouts. The file did not appear among the unexpected failures of Windows runs 37720328009, 37720611351, or 37735335086.
+
+The first case ran the production heartbeat to `completed` (the log shows one tool call), then failed `expect(activity.sessions).toBeGreaterThan(0)` with `expected 0 to be greater than 0` at test line 129. The second case failed at its first statement, the insert into `project.usage_events` at line 145, with `duplicate key value violates unique constraint "usage_events_pkey"` and `Key (project_id, id)=(durable-project, 2) already exists`. That column is `generatedAlwaysAsIdentity` and the insert supplies no id, so the identity counter had handed out an id that a row for the same project already held.
+
+Hypothesis, not measured: both failures are one defect in the usage-event identity state of the shared database. A pre-existing row at id 2 for `durable-project` would explain the rejected insert, and a rejected or misattributed heartbeat write would explain zero sessions. The first case's log shows no insert error, so the link between the two is unproven. The `Windows tests` job connects to the runner's PostgreSQL service on port 5432, a path the Linux lanes do not use, so a runner-specific database state is also possible.
+
+| run | result |
+|---|---|
+| Full Suite 37742324890 (`668244c5e`), Windows `@fusion/core` | **failed** (both cases) |
+| `pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts --reporter=dot` with `FUSION_PG_TEST_URL_BASE=postgresql://postgres:postgres@localhost:55432`, local Windows, `c89b0ea0b` plus the quarantine commit | passed, 4 tests |
+
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the core vitest config. Before quarantining, check whether the harness database for these cases can carry rows from an earlier case or a prior run, and whether the heartbeat's usage-event write can be rejected without failing the heartbeat.
 
 ### Common shape and investigated result
 

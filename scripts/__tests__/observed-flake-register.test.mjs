@@ -186,6 +186,11 @@ Entries 33 and 34 record first sightings from the fork's Full Suite: an Automati
 straddled a cron minute edge, and an AgentDetailView log-stream subscription read before its effect flushed.
 Both stay active first sightings with their mechanisms marked unmeasured, so a second appearance follows the
 file-level quarantine rule instead of a timeout, retry, or weakened assertion.
+
+FNXC:TestFlakeRegister 2026-10-08-08:41:
+Entry 35 records a first sighting from the fork's Windows lane: two assertion or query failures in the durable agent
+Activity analytics file, which is outside the Windows ledger and passes on Linux. The mechanism is marked unmeasured,
+so a second appearance follows the file-level quarantine rule instead of a timeout, retry, or weakened assertion.
 */
 test("observed-flake register active count, escalation state, and owners stay synchronized", () => {
   const register = readFileSync(registerPath, "utf8");
@@ -242,6 +247,10 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "34. AgentDetailView log history SSE suspend and reopen subscription",
+      status: "Active first sighting — recorded 2026-10-08, unattributed.",
+    },
+    {
+      heading: "35. Durable agent Activity analytics heartbeat session count and usage-event identity",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
   ]);
