@@ -1499,51 +1499,92 @@ export class AgentStore extends EventEmitter {
       if (!agent) {
         throw new Error(`Agent ${agentId} not found`);
       }
-
-      const currentState = agent.state;
-
-      // Validate transition
-      if (currentState === newState) {
-        return agent; // No change needed
-      }
-
-      const validTransitions = AGENT_VALID_TRANSITIONS[currentState];
-      if (!validTransitions.includes(newState)) {
-        throw new Error(
-          `Invalid state transition: ${currentState} -> ${newState}. Valid transitions: ${validTransitions.join(", ")}`
-        );
-      }
-
-      /*
-       * FNXC:AgentStore 2026-07-24-12:00:
-       * FN-8569 observed CEO Reports Health rows with a live state and stale
-       * `error-unrecoverable` marker. Resuming from paused/error performs
-       * best-effort pauseReason cleanup only; it is not an atomicity guarantee
-       * because independent updateAgent marker writes can recreate desync. The
-       * engine-side reports-health classifier remains the authoritative defense.
-       * Preserve lastError as diagnostic history for operator triage.
-       */
-      const clearsPauseReasonOnResume = (currentState === "paused" || currentState === "error")
-        && (newState === "active" || newState === "idle" || newState === "running");
-      const updated: Agent = {
-        ...agent,
-        state: newState,
-        ...(clearsPauseReasonOnResume && { pauseReason: undefined }),
-        updatedAt: new Date().toISOString(),
-      };
-
-      await this.writeAgent(updated, undefined, agent);
-      this.emit("agent:stateChanged", agentId, currentState, newState);
-      /*
-      FNXC:AgentActivityStream 2026-08-14-19:18:
-      FN-9041 removes roster state churn from the durable work-activity feed. State remains
-      observable through the roster and this live agent:stateChanged event without consuming
-      outbox retention reserved for task and workflow activity.
-      */
-      this.emit("agent:updated", updated, currentState);
-
-      return updated;
+      return this.applyAgentStateTransition(agent, newState);
     });
+  }
+
+  /**
+   * Conditionally update an agent's state: write `newState` only when the
+   * persisted state still equals `expectedState`.
+   *
+   * FNXC:AgentHeartbeat 2026-10-08-02:00:
+   * KB-015: a governance-skipped heartbeat must undo its `startRun` flip
+   * (`active -> running`) without clobbering a concurrent park or operator pause.
+   * A read-then-`updateAgentState("active")` is unsafe because `paused -> active`
+   * is a valid transition and would silently un-pause the agent. The check and
+   * the write happen inside the same per-agent mutation lock, so a state written
+   * by another writer in between always wins. Validation, pauseReason resume
+   * cleanup, and emits are shared with `updateAgentState` via
+   * `applyAgentStateTransition` so the two cannot drift.
+   *
+   * @returns The updated agent (unchanged when `expectedState === newState`),
+   * or `null` with no write and no emit when the agent is missing or its state
+   * differs from `expectedState`.
+   * @throws Error if the state matches but the transition is invalid.
+   */
+  async updateAgentStateIfCurrent(
+    agentId: string,
+    expectedState: AgentState,
+    newState: AgentState,
+  ): Promise<Agent | null> {
+    return this.withAgentMutation(agentId, async () => {
+      const agent = await this.getAgent(agentId);
+      if (!agent || agent.state !== expectedState) {
+        return null;
+      }
+      return this.applyAgentStateTransition(agent, newState);
+    });
+  }
+
+  /**
+   * Shared validate + write + emit body for agent state transitions. Callers
+   * must hold the agent's mutation lock and pass a freshly read agent.
+   */
+  private async applyAgentStateTransition(agent: Agent, newState: AgentState): Promise<Agent> {
+    const agentId = agent.id;
+    const currentState = agent.state;
+
+    // Validate transition
+    if (currentState === newState) {
+      return agent; // No change needed
+    }
+
+    const validTransitions = AGENT_VALID_TRANSITIONS[currentState];
+    if (!validTransitions.includes(newState)) {
+      throw new Error(
+        `Invalid state transition: ${currentState} -> ${newState}. Valid transitions: ${validTransitions.join(", ")}`
+      );
+    }
+
+    /*
+     * FNXC:AgentStore 2026-07-24-12:00:
+     * FN-8569 observed CEO Reports Health rows with a live state and stale
+     * `error-unrecoverable` marker. Resuming from paused/error performs
+     * best-effort pauseReason cleanup only; it is not an atomicity guarantee
+     * because independent updateAgent marker writes can recreate desync. The
+     * engine-side reports-health classifier remains the authoritative defense.
+     * Preserve lastError as diagnostic history for operator triage.
+     */
+    const clearsPauseReasonOnResume = (currentState === "paused" || currentState === "error")
+      && (newState === "active" || newState === "idle" || newState === "running");
+    const updated: Agent = {
+      ...agent,
+      state: newState,
+      ...(clearsPauseReasonOnResume && { pauseReason: undefined }),
+      updatedAt: new Date().toISOString(),
+    };
+
+    await this.writeAgent(updated, undefined, agent);
+    this.emit("agent:stateChanged", agentId, currentState, newState);
+    /*
+    FNXC:AgentActivityStream 2026-08-14-19:18:
+    FN-9041 removes roster state churn from the durable work-activity feed. State remains
+    observable through the roster and this live agent:stateChanged event without consuming
+    outbox retention reserved for task and workflow activity.
+    */
+    this.emit("agent:updated", updated, currentState);
+
+    return updated;
   }
 
   /**

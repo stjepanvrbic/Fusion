@@ -6,6 +6,8 @@ export function createMockStore(overrides: Partial<AgentStore> = {}): AgentStore
   return {
     recordHeartbeat: vi.fn().mockResolvedValue(undefined),
     updateAgentState: vi.fn().mockResolvedValue(undefined),
+    // FNXC:AgentHeartbeat 2026-10-08-02:00: KB-015 skip completions restore running -> active via this compare-and-set.
+    updateAgentStateIfCurrent: vi.fn().mockResolvedValue(null),
     getAgentsByReportsTo: vi.fn().mockResolvedValue([]),
     ...overrides,
   } as unknown as AgentStore;

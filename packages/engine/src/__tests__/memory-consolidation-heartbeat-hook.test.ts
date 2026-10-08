@@ -34,6 +34,12 @@ function fixture(enabled: unknown, metadata: Record<string, unknown> = {}) {
   const store = {
     getAgent: vi.fn(async () => agent), getCachedAgent: vi.fn(() => agent), listAgents: vi.fn(async () => [agent]), on: vi.fn(), off: vi.fn(),
     updateAgentState: vi.fn(async (_id: string, state: Agent["state"]) => { agent.state = state; }),
+    // FNXC:AgentHeartbeat 2026-10-08-02:00: KB-015 skip completions restore running -> active via this compare-and-set.
+    updateAgentStateIfCurrent: vi.fn(async (_id: string, expected: Agent["state"], next: Agent["state"]) => {
+      if (agent.state !== expected) return null;
+      agent.state = next;
+      return agent;
+    }),
     updateAgent: vi.fn(async (_id: string, patch: Partial<Agent>) => Object.assign(agent, patch, patch.metadata ? { metadata: patch.metadata } : {})),
     startHeartbeatRun: vi.fn(async () => { const run = { id: `run-${++sequence}`, agentId: agent.id, source: "timer", startedAt: new Date().toISOString(), endedAt: null, status: "active" } as AgentHeartbeatRun; runs.set(run.id, run); return run; }),
     saveRun: vi.fn(async (run: AgentHeartbeatRun) => runs.set(run.id, run)), getRunDetail: vi.fn(async (_id: string, runId: string) => runs.get(runId) ?? null), endHeartbeatRun: vi.fn(), appendRunLog: vi.fn(), getBudgetStatus: vi.fn(async () => ({ allowed: true })), getActiveHeartbeatRun: vi.fn(async () => null),
@@ -54,6 +60,7 @@ describe("Memory Keeper heartbeat hook", () => {
     expect(result?.status).toBe("completed"); expect(memory.resolve).not.toHaveBeenCalled(); expect(memory.run).not.toHaveBeenCalled();
     expect(f.audits).toEqual([expect.objectContaining({ mutationType: "memory:consolidation-skipped", target: "memory", metadata: expect.objectContaining({ agentId: "memory", reason: "disabled" }) })]);
     expect(vi.mocked(f.taskStore.getSettings)).toHaveBeenCalledTimes(1);
+    expect(f.agent.state).toBe("active");
   });
 
   it("treats an unavailable adapter environment as a successful audited skip", async () => {
@@ -61,6 +68,7 @@ describe("Memory Keeper heartbeat hook", () => {
     const f = fixture(true); const result = await monitor(f).executeHeartbeat({ agentId: "memory", source: "timer" });
     expect(result?.status).toBe("completed"); expect(memory.run).not.toHaveBeenCalled();
     expect(f.audits).toEqual([expect.objectContaining({ mutationType: "memory:consolidation-skipped", target: "memory", metadata: expect.objectContaining({ agentId: "memory", reason: "unavailable", unavailableReason: "no-data-layer" }) })]);
+    expect(f.agent.state).toBe("active");
   });
 
   it("emits changed and in-progress production outcomes with their fixed audit shapes", async () => {
@@ -69,6 +77,7 @@ describe("Memory Keeper heartbeat hook", () => {
     const f = fixture(true); const first = await monitor(f).executeHeartbeat({ agentId: "memory", source: "timer" });
     const second = await monitor(f).executeHeartbeat({ agentId: "memory", source: "timer" });
     expect(first?.status).toBe("completed"); expect(second?.status).toBe("completed");
+    expect(f.agent.state).toBe("active");
     expect(memory.run).toHaveBeenCalledWith({ agentId: "memory", projectId: "resolved-project" });
     expect(f.audits).toEqual(expect.arrayContaining([
       expect.objectContaining({ mutationType: "memory:semantics-inferred", target: "memory", metadata: expect.objectContaining({ agentId: "memory", edgesWritten: 1, edgesDeduped: 2, edgesDroppedUnresolved: 3 }) }),

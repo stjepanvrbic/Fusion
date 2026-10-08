@@ -192,6 +192,8 @@ describe("executeHeartbeat", () => {
     return {
       recordHeartbeat: vi.fn().mockResolvedValue(undefined),
       updateAgentState: vi.fn().mockResolvedValue(undefined),
+      // FNXC:AgentHeartbeat 2026-10-08-02:00: KB-015 skip completions restore running -> active via this compare-and-set.
+      updateAgentStateIfCurrent: vi.fn().mockResolvedValue(null),
       updateAgent: vi.fn().mockResolvedValue(undefined),
       getAgent: vi.fn().mockResolvedValue(mockAgent),
       assignTask: vi.fn().mockImplementation(async (_agentId: string, taskId: string | undefined) => {
@@ -4742,6 +4744,7 @@ describe("executeHeartbeat", () => {
       expect(result.resultJson).toMatchObject({ reason: "budget_exhausted", budgetStatus });
       expect(mockedCreateFnAgent).not.toHaveBeenCalled();
       expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "active");
+      expect(store.updateAgentStateIfCurrent).toHaveBeenCalledWith("agent-001", "running", "active");
     });
 
     it("skips heartbeat when agent is over budget (on_demand)", async () => {
@@ -4755,6 +4758,7 @@ describe("executeHeartbeat", () => {
 
       expect(result.resultJson).toMatchObject({ reason: "budget_exhausted" });
       expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(store.updateAgentStateIfCurrent).toHaveBeenCalledWith("agent-001", "running", "active");
     });
 
     it("skips heartbeat when agent is over budget (assignment)", async () => {
@@ -4768,6 +4772,7 @@ describe("executeHeartbeat", () => {
 
       expect(result.resultJson).toMatchObject({ reason: "budget_exhausted" });
       expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(store.updateAgentStateIfCurrent).toHaveBeenCalledWith("agent-001", "running", "active");
     });
 
     it("skips timer heartbeat when agent is over threshold but not over budget", async () => {
@@ -4787,6 +4792,7 @@ describe("executeHeartbeat", () => {
 
       expect(result.resultJson).toMatchObject({ reason: "budget_threshold_exceeded", budgetStatus });
       expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(store.updateAgentStateIfCurrent).toHaveBeenCalledWith("agent-001", "running", "active");
     });
 
     it("allows on_demand heartbeat when agent is over threshold", async () => {
@@ -4861,6 +4867,7 @@ describe("executeHeartbeat", () => {
       expect(result.status).toBe("completed");
       expect(result.resultJson).toMatchObject({ reason: "global_pause", source: "timer" });
       expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(store.updateAgentStateIfCurrent).toHaveBeenCalledWith("agent-001", "running", "active");
     });
 
     it("skips heartbeat on global pause for assignment source", async () => {
@@ -4875,6 +4882,7 @@ describe("executeHeartbeat", () => {
       expect(result.status).toBe("completed");
       expect(result.resultJson).toMatchObject({ reason: "global_pause", source: "assignment" });
       expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(store.updateAgentStateIfCurrent).toHaveBeenCalledWith("agent-001", "running", "active");
     });
 
     it("skips timer heartbeat on engine pause but allows assignment", async () => {
@@ -4889,6 +4897,8 @@ describe("executeHeartbeat", () => {
       expect(timerResult.status).toBe("completed");
       expect(timerResult.resultJson).toMatchObject({ reason: "engine_paused", source: "timer" });
       expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(timerStore.updateAgentStateIfCurrent).toHaveBeenCalledWith("agent-001", "running", "active");
+      expect(timerStore.updateAgentState).not.toHaveBeenCalledWith("agent-001", "active");
 
       const assignmentStore = createStoreWithAgentForExec();
       const mockSession = createMockAgentSession();

@@ -1264,11 +1264,13 @@ export class HeartbeatMonitor {
     }
     // Warm heartbeat multiplier cache for sync health paths before reconcile.
     void this.warmHeartbeatMultiplierCache();
+    // FNXC:AgentHeartbeat 2026-10-08-02:00:
     // Reconcile any agents stuck in `state="running"` with no active run.
-    // Past versions of governance-skip paths (budget/global-pause) called
-    // completeRun with skipStateTransition=true after startRun had already
-    // moved the agent to "running", leaving the row stuck. New runs no
-    // longer leak this way, but pre-existing rows need a one-shot fix.
+    // Skip exits (completeRun with skipStateTransition=true) now restore
+    // running -> active in completeRun itself (KB-015). This start-time
+    // reconcile, repeated every poll (pollIntervalMs, default one hour),
+    // remains a backstop for crashed processes and rows written by older
+    // versions.
     void this.reconcileOrphanedRunningAgents();
     this.pollInterval = setInterval(() => {
       void this.checkMissedHeartbeats();
@@ -1321,9 +1323,12 @@ export class HeartbeatMonitor {
    *   (b) it is not in this monitor's in-memory tracked set AND its
    *       lastHeartbeatAt is older than 3× the configured timeout.
    *
-   * Case (a) covers historical bypass paths (governance-skip, supersede-on-
-   * startRun, safety-net run termination) that ended the run record but
-   * never propagated the agent-state transition. Case (b) covers a process
+   * Case (a) covers bypass paths that ended the run record but never
+   * propagated the agent-state transition: supersede-on-startRun,
+   * safety-net run termination, and rows left by older versions. The
+   * governance-skip leak is fixed at its source (KB-015): completeRun's
+   * skipStateTransition branch restores running -> active before the run
+   * row closes. Case (b) covers a process
    * that crashed mid-run, leaving both the run row and the agent row stuck.
    *
    * Called on monitor start AND periodically from the polling loop to keep
@@ -1859,6 +1864,25 @@ export class HeartbeatMonitor {
         }
       } catch (stateTransErr) {
         heartbeatLog.warn(`Agent ${agentId} state transition failed: ${stateTransErr instanceof Error ? stateTransErr.message : String(stateTransErr)} — continuing`);
+      }
+    } else {
+      /*
+      FNXC:AgentHeartbeat 2026-10-08-02:00:
+      KB-015 invariant: agent state `running` implies an active heartbeat run row.
+      `startRun` flips the agent to `running` before governance runs, and every `skipStateTransition` exit (budget exhausted/threshold, global pause, engine pause, Memory Keeper disabled/unavailable/success, `invalid_state`, worktree base-refresh/acquisition, model-unavailable, error parks) relies on this seam to undo that flip.
+      Before this branch, those exits closed the run row but left the agent `running` until the hourly orphan reconcile, so the roster and Reports Health showed RUNNING with no work.
+      The target is always `active`: `AGENT_VALID_TRANSITIONS` makes `running` reachable only from `active`, so an agent left `running` by a skip was `active` before the run (or a stale `running`, which should also become `active`).
+      It is a compare-and-set (`running -> active` only if still `running`) so a park or operator pause written during the run always wins; an unconditional `updateAgentState("active")` would un-pause it.
+      It runs before `endHeartbeatRun` so `running` never outlives its run row, and it deliberately leaves `lastError`, error-recovery metadata, and `pauseReason` untouched.
+      */
+      try {
+        if (typeof this.store.updateAgentStateIfCurrent === "function") {
+          await this.store.updateAgentStateIfCurrent(agentId, "running", "active");
+        } else {
+          heartbeatLog.debug(`Agent ${agentId} store lacks updateAgentStateIfCurrent — skipping skip-path running-state restore`);
+        }
+      } catch (restoreErr) {
+        heartbeatLog.warn(`Agent ${agentId} skip-path running-state restore failed: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)} — continuing`);
       }
     }
 
