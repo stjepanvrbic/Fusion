@@ -20,7 +20,7 @@ npx runfusion.ai --help              # → fn --help
 
 ## How it relates to `@runfusion/fusion`
 
-This package is a ~1 KB alias. It declares `@runfusion/fusion` as a dependency and its `bin` delegates to the same entrypoint. Use whichever name reads better:
+This package is a ~1 KB alias. It declares `@runfusion/fusion` as a dependency and forwards to the same `fn` CLI. The `runfusion.ai` and `runfusion` commands have their own tiny entry that defaults to `dashboard` when run with no arguments (on Windows, macOS and Linux alike), while the `fn` and `fusion` commands it also installs forward arguments verbatim. Use whichever name reads better:
 
 ```bash
 npx runfusion.ai

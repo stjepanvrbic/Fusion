@@ -22,13 +22,15 @@
   ],
   "type": "module",
   "bin": {
-    "runfusion.ai": "index.js",
-    "runfusion": "index.js",
+    "runfusion.ai": "runfusion.js",
+    "runfusion": "runfusion.js",
     "fn": "index.js",
     "fusion": "index.js"
   },
   "files": [
     "index.js",
+    "launcher.js",
+    "runfusion.js",
     "README.md"
   ],
   "publishConfig": {
