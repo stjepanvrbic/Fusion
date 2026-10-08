@@ -163,6 +163,7 @@
     "packages/engine/src/merge/already-merged-detector.ts",
     "packages/engine/src/merge/auto-merge-fact-providers.ts",
     "packages/engine/src/merge/auto-merge-finalization.ts",
+    "packages/engine/src/merge/engine-shutdown-error.ts",
     "packages/engine/src/merge/group-merge-coordinator.ts",
     "packages/engine/src/merge/integration-branch.ts",
     "packages/engine/src/merge/landed-commit-publication.ts",
@@ -10935,7 +10936,7 @@
       "enclosingSymbolPath": "recoverApprovedStrandedAiMergeCommit>finalized",
       "writer": "finalizeProvenAutoMergeTask",
       "ordinal": 1,
-      "lineHint": 14112,
+      "lineHint": 14119,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -10955,7 +10956,7 @@
       "enclosingSymbolPath": "recoverMergedReviewTasks>finalization",
       "writer": "finalizeProvenAutoMergeTask",
       "ordinal": 1,
-      "lineHint": 12974,
+      "lineHint": 12981,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
