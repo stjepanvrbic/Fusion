@@ -3430,13 +3430,33 @@
   ],
   "entries": [
     {
+      "callSiteId": "packages/engine/src/agent-tools.ts::carryCanonicalTaskRouting::store.logEntry::#1",
+      "callSiteFingerprint": "store.logEntry(task.id,\"Delegation kept task in place\",`${input.column} (${error.rejection.code})`)",
+      "file": "packages/engine/src/agent-tools.ts",
+      "enclosingSymbolPath": "carryCanonicalTaskRouting",
+      "writer": "store.logEntry",
+      "ordinal": 1,
+      "lineHint": 1343,
+      "owningEntryPoint": "other",
+      "reachableDataStates": [
+        "unobservable:closure-wide production fixture pending"
+      ],
+      "axis1": "out-of-frontier",
+      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to carryCanonicalTaskRouting; this imported module belongs to the legacy/independent subsystem closure.",
+      "axis2Provisional": "out-of-frontier",
+      "axis2Final": "out-of-frontier",
+      "observedInSuite": "out-of-frontier",
+      "executionProof": "none:out-of-frontier",
+      "followUpTaskId": "none:out-of-frontier"
+    },
+    {
       "callSiteId": "packages/engine/src/agent-tools.ts::carryCanonicalTaskRouting::store.moveTask::#1",
-      "callSiteFingerprint": "store.moveTask(task.id,input.column)",
+      "callSiteFingerprint": "store.moveTask(task.id,input.column,{moveSource})",
       "file": "packages/engine/src/agent-tools.ts",
       "enclosingSymbolPath": "carryCanonicalTaskRouting",
       "writer": "store.moveTask",
       "ordinal": 1,
-      "lineHint": 1333,
+      "lineHint": 1340,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3476,7 +3496,7 @@
       "enclosingSymbolPath": "createAgentTask>createdTask",
       "writer": "store.createTask",
       "ordinal": 1,
-      "lineHint": 1556,
+      "lineHint": 1571,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3494,7 +3514,7 @@
       "enclosingSymbolPath": "createChatTaskDocumentTools>document",
       "writer": "store.upsertTaskDocument",
       "ordinal": 1,
-      "lineHint": 2565,
+      "lineHint": 2580,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3512,7 +3532,7 @@
       "enclosingSymbolPath": "createInstallWorktreeDependenciesTool",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 2295,
+      "lineHint": 2310,
       "owningEntryPoint": "other",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3530,7 +3550,7 @@
       "enclosingSymbolPath": "createInstallWorktreeDependenciesTool",
       "writer": "store.logEntry",
       "ordinal": 2,
-      "lineHint": 2340,
+      "lineHint": 2355,
       "owningEntryPoint": "other",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3548,7 +3568,7 @@
       "enclosingSymbolPath": "createPatchnodeReadTool>result",
       "writer": "store.listPatchnodeEntries",
       "ordinal": 1,
-      "lineHint": 1867,
+      "lineHint": 1882,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3566,7 +3586,7 @@
       "enclosingSymbolPath": "createTaskAddDepTool",
       "writer": "store.updateTask",
       "ordinal": 1,
-      "lineHint": 3803,
+      "lineHint": 3818,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3586,7 +3606,7 @@
       "enclosingSymbolPath": "createTaskArchiveTool>task",
       "writer": "store.archiveTask",
       "ordinal": 1,
-      "lineHint": 3440,
+      "lineHint": 3455,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3604,7 +3624,7 @@
       "enclosingSymbolPath": "createTaskDeleteTool>task",
       "writer": "store.deleteTask",
       "ordinal": 1,
-      "lineHint": 3487,
+      "lineHint": 3502,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3622,7 +3642,7 @@
       "enclosingSymbolPath": "createTaskDocumentWriteTool>document",
       "writer": "store.upsertTaskDocument",
       "ordinal": 1,
-      "lineHint": 2199,
+      "lineHint": 2214,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3640,7 +3660,7 @@
       "enclosingSymbolPath": "createTaskDuplicateTool>task",
       "writer": "store.duplicateTask",
       "ordinal": 1,
-      "lineHint": 3677,
+      "lineHint": 3692,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3658,7 +3678,7 @@
       "enclosingSymbolPath": "createTaskFileScopeAddTool",
       "writer": "store.appendAgentLog",
       "ordinal": 1,
-      "lineHint": 2522,
+      "lineHint": 2537,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3678,7 +3698,7 @@
       "enclosingSymbolPath": "createTaskFileScopeAddTool",
       "writer": "store.updateTask",
       "ordinal": 1,
-      "lineHint": 2521,
+      "lineHint": 2536,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3698,7 +3718,7 @@
       "enclosingSymbolPath": "createTaskLogTool",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 1962,
+      "lineHint": 1977,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3718,7 +3738,7 @@
       "enclosingSymbolPath": "createTaskLogToolWithContext",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 2000,
+      "lineHint": 2015,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3738,7 +3758,7 @@
       "enclosingSymbolPath": "createTaskPauseTool>task",
       "writer": "store.pauseTask",
       "ordinal": 1,
-      "lineHint": 3643,
+      "lineHint": 3658,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3756,7 +3776,7 @@
       "enclosingSymbolPath": "createTaskPromptWriteTool",
       "writer": "store.reconcileSpecDriftWhilePlanningLocked",
       "ordinal": 1,
-      "lineHint": 2411,
+      "lineHint": 2426,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3776,7 +3796,7 @@
       "enclosingSymbolPath": "createTaskPromptWriteTool",
       "writer": "store.updateTask",
       "ordinal": 1,
-      "lineHint": 2421,
+      "lineHint": 2436,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3796,7 +3816,7 @@
       "enclosingSymbolPath": "createTaskPromptWriteTool>updated",
       "writer": "store.updateTaskUnlocked",
       "ordinal": 1,
-      "lineHint": 2409,
+      "lineHint": 2424,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3816,7 +3836,7 @@
       "enclosingSymbolPath": "createTaskRetryTool",
       "writer": "store.logEntry",
       "ordinal": 1,
-      "lineHint": 3548,
+      "lineHint": 3563,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3836,7 +3856,7 @@
       "enclosingSymbolPath": "createTaskRetryTool",
       "writer": "store.logEntry",
       "ordinal": 2,
-      "lineHint": 3602,
+      "lineHint": 3617,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -3856,7 +3876,7 @@
       "enclosingSymbolPath": "createTaskRetryTool",
       "writer": "store.logEntry",
       "ordinal": 3,
-      "lineHint": 3626,
+      "lineHint": 3641,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
@@ -3876,7 +3896,7 @@
       "enclosingSymbolPath": "createTaskRetryTool",
       "writer": "store.moveTask",
       "ordinal": 1,
-      "lineHint": 3625,
+      "lineHint": 3640,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3896,7 +3916,7 @@
       "enclosingSymbolPath": "createTaskRetryTool",
       "writer": "store.updateTask",
       "ordinal": 1,
-      "lineHint": 3612,
+      "lineHint": 3627,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3916,7 +3936,7 @@
       "enclosingSymbolPath": "createTaskUnarchiveTool>task",
       "writer": "store.unarchiveTask",
       "ordinal": 1,
-      "lineHint": 3464,
+      "lineHint": 3479,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3934,7 +3954,7 @@
       "enclosingSymbolPath": "createTaskUnpauseTool>task",
       "writer": "store.pauseTask",
       "ordinal": 1,
-      "lineHint": 3660,
+      "lineHint": 3675,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3952,7 +3972,7 @@
       "enclosingSymbolPath": "createTaskUpdateTool",
       "writer": "store.updateTask",
       "ordinal": 1,
-      "lineHint": 3744,
+      "lineHint": 3759,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -3972,7 +3992,7 @@
       "enclosingSymbolPath": "createTaskUpdateTool>res",
       "writer": "store.updateTaskCustomFields",
       "ordinal": 1,
-      "lineHint": 3723,
+      "lineHint": 3738,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -3990,7 +4010,7 @@
       "enclosingSymbolPath": "createTaskUpdateTool>task",
       "writer": "store.updateStep",
       "ordinal": 1,
-      "lineHint": 3748,
+      "lineHint": 3763,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -4008,7 +4028,7 @@
       "enclosingSymbolPath": "createTaskUpdateTool>task",
       "writer": "store.updateStep",
       "ordinal": 2,
-      "lineHint": 3749,
+      "lineHint": 3764,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -4026,7 +4046,7 @@
       "enclosingSymbolPath": "createWorkflowCreateTool>created",
       "writer": "store.createWorkflowDefinition",
       "ordinal": 1,
-      "lineHint": 4019,
+      "lineHint": 4034,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -4044,7 +4064,7 @@
       "enclosingSymbolPath": "createWorkflowDeleteTool",
       "writer": "store.deleteWorkflowDefinition",
       "ordinal": 1,
-      "lineHint": 4147,
+      "lineHint": 4162,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -4062,7 +4082,7 @@
       "enclosingSymbolPath": "createWorkflowSelectTool",
       "writer": "store.selectTaskWorkflowAndReconcile",
       "ordinal": 1,
-      "lineHint": 3307,
+      "lineHint": 3322,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -4080,7 +4100,7 @@
       "enclosingSymbolPath": "createWorkflowSettingsTool>next",
       "writer": "store.updateWorkflowSettingValues",
       "ordinal": 1,
-      "lineHint": 4285,
+      "lineHint": 4300,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -4098,7 +4118,7 @@
       "enclosingSymbolPath": "createWorkflowUpdateTool>updated",
       "writer": "store.updateWorkflowDefinition",
       "ordinal": 1,
-      "lineHint": 4087,
+      "lineHint": 4102,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -4116,7 +4136,7 @@
       "enclosingSymbolPath": "registerArtifactForAgent>artifact",
       "writer": "store.registerArtifact",
       "ordinal": 1,
-      "lineHint": 2737,
+      "lineHint": 2752,
       "owningEntryPoint": "none:out-of-frontier",
       "reachableDataStates": [],
       "axis1": "out-of-frontier",
@@ -11178,7 +11198,7 @@
       "enclosingSymbolPath": "releaseFileScopeWaitingContinuations>transitioned",
       "writer": "store.transitionWorkflowWorkItem",
       "ordinal": 1,
-      "lineHint": 943,
+      "lineHint": 945,
       "owningEntryPoint": "indeterminate",
       "reachableDataStates": [
         "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo"
