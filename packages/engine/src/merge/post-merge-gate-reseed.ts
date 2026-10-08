@@ -170,6 +170,12 @@ then 30 and 60 minutes, with further checks capped at one per hour. CI and follo
 arrive after the early retries; a total attempt cap would strand their evidence permanently.
 Durable result history survives restart and task-log updates cannot shorten the wait. Missing
 timestamps, duplicate evidence and live owners fail closed.
+
+FNXC:PostMergeRecovery 2026-10-08-07:08:
+KB-042: a workspace landing's per-repository `post-merge-checkout-missing-landed-commit` failure (a dirty,
+branch-mismatched or unrecoverable repository checkout) uses this same 15/30/60-then-hourly ladder. Workspace
+landings skip the publication probe (`requiresPublishedLanding`), so this check alone governs their recheck, and
+each recheck reruns the per-repository in-place recovery in `runGraphCustomNode`.
 */
 function isRejectedGateRecheckDue(result: WorkflowStepResult): boolean {
   const failures = (result.priorAttempts ?? []).filter((entry) => entry.status === "failed").length;

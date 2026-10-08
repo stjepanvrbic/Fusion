@@ -55,6 +55,7 @@ import { resolveContentReviewInputProof } from "../worktree/review-diff-fingerpr
 import { closeFusionBrowserSession } from "../agent-browser-lifecycle.js";
 import { classifyTaskWorktree } from "../worktree/worktree-pool.js";
 import { resolveIntegrationBranch } from "../merge/integration-branch.js";
+import { resolveWorkspaceRepoBaseBranch } from "../worktree/workspace-base-branch.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -668,17 +669,69 @@ export async function runGraphCustomNode(
       FNXC:PostMergeRecovery 2026-10-07-19:40:
       A landed workspace task carries one landed SHA per repository. Every configured repository checkout must contain
       its own landed SHA before a post-merge reviewer starts, on every attempt, or the gate fails closed.
+      FNXC:PostMergeRecovery 2026-10-08-07:08:
+      KB-042 extends the single-repository in-place recovery to every workspace repository, independently.
+      Each repository lacking its own `workspaceLandedShas` entry runs `recoverCheckoutToLandedCommit` against its own
+      repository root and its landed branch, resolved in recorded mode from the entry's `baseBranch` exactly as
+      `landWorkspaceTask` resolved the land target (never `task.baseBranch`; a legacy entry uses the repo integration branch).
+      Every repository is evaluated, so a clean sibling is recovered even when another repository is dirty: detaching a
+      clean checkout at its landed tip is safe, idempotent, and shrinks the next retry. A repository is refused, and never
+      touched, when it has no recorded checkout, has uncommitted changes, its landed commit is not on its landed branch, or
+      recovery/branch resolution fails. Any refusal returns the unchanged `post-merge-checkout-missing-landed-commit`
+      failure, so workspace landings share the rejected-gate recheck ladder (15, 30, 60 minutes, then hourly).
+      Worktree pointers, task branches and `mergeDetails` are never changed here.
       */
       if (isLandedPostMergeNode) {
+        const refusals: Array<{ repository: string; path: string | undefined; landedSha: string; reason: string }> = [];
         for (const [repository, landedSha] of Object.entries(executionTarget.mergeDetails?.workspaceLandedShas ?? {})) {
-          const path = executionTarget.workspaceWorktrees?.[repository]?.worktreePath;
-          if (typeof path === "string" && await checkoutContainsCommit(path, landedSha)) continue;
-          await deps.store.logEntry(
-            live.id,
-            `Workflow node '${node.id}' workspace checkout '${repository}' does not contain landed commit ${landedSha}; the gate will be rechecked later`,
+          const entry = executionTarget.workspaceWorktrees?.[repository];
+          const path = entry?.worktreePath;
+          if (typeof path !== "string") {
+            refusals.push({ repository, path: undefined, landedSha, reason: "no recorded checkout" });
+            continue;
+          }
+          if (await checkoutContainsCommit(path, landedSha)) continue;
+          const repoRootDir = join(deps.rootDir, repository);
+          let landedBranch: string | undefined;
+          let recovery: Awaited<ReturnType<typeof recoverCheckoutToLandedCommit>>;
+          try {
+            landedBranch = (await resolveWorkspaceRepoBaseBranch({
+              mode: "recorded",
+              repoRootDir,
+              repoRelPath: repository,
+              task: executionTarget,
+              settings,
+              recordedBaseBranch: entry?.baseBranch,
+            })).branch;
+            recovery = await recoverCheckoutToLandedCommit(repoRootDir, path, landedSha, landedBranch);
+          } catch (error) {
+            recovery = { recovered: false, reason: `automatic recovery failed: ${error instanceof Error ? error.message : String(error)}` };
+          }
+          if (recovery.recovered && await checkoutContainsCommit(path, landedSha)) {
+            await deps.store.logEntry(
+              live.id,
+              `Workflow node '${node.id}' detached ${path} (workspace repository '${repository}') at the tip of ${landedBranch}, which contains landed commit ${landedSha}; the task branch was left unchanged`,
+              undefined,
+              deps.getRunContextFor(live.id),
+            );
+            continue;
+          }
+          refusals.push({
+            repository,
             path,
-            deps.getRunContextFor(live.id),
-          );
+            landedSha,
+            reason: recovery.recovered ? "the recovered checkout still lacks it" : recovery.reason,
+          });
+        }
+        if (refusals.length > 0) {
+          for (const refusal of refusals) {
+            await deps.store.logEntry(
+              live.id,
+              `Workflow node '${node.id}' workspace checkout '${refusal.repository}' (${refusal.path ?? "no recorded checkout"}) does not contain landed commit ${refusal.landedSha} and could not be moved to it: ${refusal.reason}. The gate will be rechecked later`,
+              undefined,
+              deps.getRunContextFor(live.id),
+            );
+          }
           return { outcome: "failure", value: "post-merge-checkout-missing-landed-commit" };
         }
       }

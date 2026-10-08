@@ -300,6 +300,52 @@ describe("missing post-merge continuation recovery", () => {
     expect(store.updateTaskAtomic).not.toHaveBeenCalled();
   });
 
+  /*
+  FNXC:PostMergeRecovery 2026-10-08-07:08:
+  KB-042: a workspace landing whose gate failed because a repository checkout could not be moved to its landed SHA
+  is rechecked on the same 15/30/60-then-hourly ladder as a single-repository landing, with no publication probe.
+  */
+  it.each([
+    { priorFailures: 0, notDueMinutes: 14, dueMinutes: 16 },
+    { priorFailures: 1, notDueMinutes: 29, dueMinutes: 31 },
+    { priorFailures: 2, notDueMinutes: 59, dueMinutes: 61 },
+    { priorFailures: 3, notDueMinutes: 59, dueMinutes: 61 },
+    { priorFailures: 6, notDueMinutes: 59, dueMinutes: 61 },
+  ])("rechecks a workspace missing-landed-commit rejection on the shared ladder: %j", async ({ priorFailures, notDueMinutes, dueMinutes }) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { task, store, items } = recoveryFixture();
+      const failedAt = Date.parse("2026-10-08T07:00:00.000Z");
+      Object.assign(task, {
+        workspaceWorktrees: {
+          "repo-a": { worktreePath: "/ws/.fusion/worktrees/fn-9368/repo-a", branch: "fusion/fn-9368-repo-a" },
+          "repo-b": { worktreePath: "/ws/.fusion/worktrees/fn-9368/repo-b", branch: "fusion/fn-9368-repo-b" },
+        },
+        mergeDetails: { mergeConfirmed: true, commitSha: "a".repeat(40), workspaceLandedShas: { "repo-a": "a".repeat(40), "repo-b": "b".repeat(40) } },
+      });
+      const rejection = { workflowStepId: "post-merge-verification", phase: "post-merge", status: "failed", verdict: "post-merge-checkout-missing-landed-commit", completedAt: new Date(failedAt).toISOString() };
+      task.workflowStepResults = [{ ...rejection, priorAttempts: Array(priorFailures).fill(rejection) }] as Task["workflowStepResults"];
+      const evidence = structuredClone(task.workflowStepResults);
+      const gitRun = vi.fn();
+
+      vi.setSystemTime(failedAt + notDueMinutes * 60_000);
+      await expect(resumeMissingPostMergeGate(store, task.id, { git: gitRun as never })).resolves.toEqual({ outcome: "not-resumable" });
+      expect(items).toHaveLength(0);
+
+      vi.setSystemTime(failedAt + dueMinutes * 60_000);
+      await expect(resumeMissingPostMergeGate(store, task.id, { git: gitRun as never })).resolves.toMatchObject({ outcome: "resumed" });
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({ nodeId: "post-merge-verification", sourceColumn: "in-review", targetColumn: "in-review" });
+
+      expect(gitRun).not.toHaveBeenCalled();
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(task.column).toBe("in-review");
+      expect(task.workflowStepResults).toEqual(evidence);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     { status: "failed", error: "Execution failed: database unavailable" },
     { status: "awaiting-approval", error: "Post-merge verification needs remediation: waiting for CI" },
