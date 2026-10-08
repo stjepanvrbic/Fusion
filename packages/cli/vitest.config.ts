@@ -109,10 +109,10 @@ const quarantinedCliTests: string[] = [
   /*
   FNXC:CliTests 2026-09-29-17:01:
   FN-9425 quarantines skills-get.test.ts after two independent non-blocking Full Suite timeouts.
-  Keep the 14-day deletion ratchet and direct-file diagnostic bypass; do not appease this with timeout,
-  retry, or assertion changes. This is not an engine-core merge-gate eviction.
+
+  FNXC:CliTests 2026-10-08-00:26:
+  Rescued before its deletion deadline. Root cause: one test spawned three cold full-CLI processes (~2s each on an idle host), so it exceeded the default 5s budget by construction. The launcher's routing predicate now lives in skills-get-route.mjs and is asserted in-process; the exclusion and ledger row were removed in lockstep. Do not re-add a full-CLI spawn to that file.
   */
-  "src/commands/__tests__/skills-get.test.ts",
 ];
 
 /*
