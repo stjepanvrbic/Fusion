@@ -319,11 +319,6 @@ export class ProjectAdmissionCoordinator {
     };
   }
 
-  /** Whether `taskId` currently holds this project's coordinator reservation. */
-  holdsReservation(projectId: string, taskId: string): boolean {
-    return this.reservations.get(projectId)?.has(taskId) === true;
-  }
-
   private reservationCount(projectId: string): number {
     return this.reservations.get(projectId)?.size ?? 0;
   }

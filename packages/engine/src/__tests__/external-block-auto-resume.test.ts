@@ -9,16 +9,19 @@ import { isRunningAgentTask, type Task, type TaskExternalBlock, type WorkflowWor
 import {
   clearExternalBlockForAdmittedResume,
   isExternalBlockResumeWorkItem,
+  isQueuedExternalBlockResume,
   parkTaskOnExternalObstacle,
   requestExternalBlockResume,
   resumeDueExternalBlocks,
 } from "../external-block/external-block-lifecycle.js";
+import { EventEmitter } from "node:events";
 import {
+  InProcessRuntime,
   admitPlanningContinuation,
   createPlanningContinuationRun,
   resolvePlanningContinuationCandidate,
 } from "../runtimes/in-process-runtime.js";
-import { projectAdmissionCoordinator, projectCapacityHoldersFromStore } from "../concurrency/concurrency.js";
+import { projectAdmissionCoordinator } from "../concurrency/concurrency.js";
 import { deferReviewStepOnProviderRateLimit } from "../external-block/provider-rate-limit-deferral.js";
 
 const IR = {
@@ -204,29 +207,18 @@ describe("rate-limit freeze automatic resume", () => {
     expect(env.logs.some((entry) => entry.message.includes("Automatic resume"))).toBe(false);
   });
 
-  /*
-  FNXC:ExternalBlockResume 2026-10-08-12:10:
-  Operator Retry with a free running-agent slot admits synchronously and leaves the card unfrozen when it returns; at a full cap it
-  stays queued (covered by the admission test below). Both paths clear the automatic budget.
-  */
-  it("lets operator Retry resume at any time, unfreezing at once when a slot is free, and clears the automatic budget", async () => {
+  it("lets operator Retry resume at any time and clears the automatic budget", async () => {
     const env = createStore([card("KB-048", { externalBlockAutoResumeCount: 3 })]);
     await park(env, "KB-048", "RATE_LIMIT");
     expect(env.rows.get("KB-048")!.externalBlock?.autoResume?.attempt).toBe(4);
 
     const result = await requestExternalBlockResume({ store: env.store as never, taskId: "KB-048", trigger: "operator" });
     expect(result).toMatchObject({ kind: "requested", nodeId: "implement" });
-    const resumed = env.rows.get("KB-048")!;
-    expect(resumed.externalBlockAutoResumeCount).toBe(0);
-    expect(resumed.externalBlock).toBeUndefined();
-    expect(resumed.status).toBeUndefined();
-    expect(resumed.paused).toBe(false);
-    expect((await projectCapacityHoldersFromStore(env.store as never, [resumed])).runningTaskIds).toEqual(["KB-048"]);
-    // The bridging reservation was handed to the now-live row, not leaked.
-    expect(projectAdmissionCoordinator.inspectProjectStateForTests("/project").reservedCount).toBe(0);
-    expect(env.audits.find((event) => event.mutationType === "task:external-block-cleared")!.metadata).toMatchObject({ trigger: "operator" });
-    // A second click finds the resume continuation pending and replays nothing.
-    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-048", trigger: "operator" })).toEqual({ kind: "not-blocked", resumePending: true });
+    const requested = env.rows.get("KB-048")!;
+    expect(requested.externalBlockAutoResumeCount).toBe(0);
+    expect(requested.externalBlock?.autoResume).toBeUndefined();
+    expect(requested.externalBlock?.resumeRequest?.trigger).toBe("operator");
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-048", trigger: "operator" })).toMatchObject({ kind: "already-requested" });
     expect(env.items).toHaveLength(1);
   });
 
@@ -251,9 +243,8 @@ describe("rate-limit freeze automatic resume", () => {
     await resumeDueExternalBlocks({ store: env.store as never, tasks: [env.rows.get("KB-049")!] });
     expect(env.rows.get("KB-049")!.externalBlockAutoResumeCount).toBe(3);
 
-    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-049", trigger: "operator" })).toMatchObject({ kind: "requested", nodeId: "implement" });
-    // A free slot lets the operator's takeover unfreeze the card at once, on the already-published continuation.
-    expect(env.rows.get("KB-049")!.externalBlock).toBeUndefined();
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-049", trigger: "operator" })).toMatchObject({ kind: "requested" });
+    expect(env.rows.get("KB-049")!.externalBlock?.resumeRequest?.trigger).toBe("operator");
     expect(env.rows.get("KB-049")!.externalBlockAutoResumeCount).toBe(0);
     expect(env.items).toHaveLength(1);
   });
@@ -344,3 +335,39 @@ describe("a resumed frozen card re-enters through project admission", () => {
     expect(executed[0]!.externalBlock).toBeUndefined();
   });
 });
+
+/*
+FNXC:ExternalBlockResume 2026-10-08-17:40:
+Operator Retry only queues the resume (KB-083's S21 harness owns the admission definition), so the task update that records the request
+must kick the continuation drain: a free slot then clears the card within about one drain tick instead of at the next periodic pass.
+*/
+describe("a queued external-block resume kicks the continuation drain", () => {
+  it("kicks on the update that records the request, and only for a queued freeze", async () => {
+    const env = createStore([card("KB-050")]);
+    await park(env, "KB-050", "RATE_LIMIT");
+    const frozen = structuredClone(env.rows.get("KB-050")!);
+    await requestExternalBlockResume({ store: env.store as never, taskId: "KB-050", trigger: "operator" });
+    const queued = structuredClone(env.rows.get("KB-050")!);
+    expect(isQueuedExternalBlockResume(frozen)).toBe(false);
+    expect(isQueuedExternalBlockResume(queued)).toBe(true);
+    expect(isQueuedExternalBlockResume({ ...queued, status: undefined })).toBe(false);
+
+    const store = new EventEmitter();
+    const runtime = new InProcessRuntime({
+      projectId: "test-project",
+      projectName: "Test",
+      workingDirectory: "/test/project",
+      isolationMode: "in-process",
+    }, {} as never);
+    (runtime as unknown as { taskStore: unknown }).taskStore = store;
+    const kick = vi.spyOn(runtime as never, "kickWorkflowContinuationProcessor").mockImplementation(() => undefined);
+    (runtime as unknown as { setupEventForwarding(): void }).setupEventForwarding();
+
+    store.emit("task:updated", frozen);
+    store.emit("task:updated", card("KB-051"));
+    expect(kick).not.toHaveBeenCalled();
+    store.emit("task:updated", queued);
+    expect(kick).toHaveBeenCalledOnce();
+  });
+});
+

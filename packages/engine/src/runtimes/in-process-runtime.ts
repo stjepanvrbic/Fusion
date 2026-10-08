@@ -32,7 +32,7 @@ import {
   resolveTaskLifecycleColumns,
   resolveLifecycleColumns,
 } from "@fusion/core";
-import { clearExternalBlockForAdmittedResume, isExternalBlockResumeWorkItem } from "../external-block/external-block-lifecycle.js";
+import { clearExternalBlockForAdmittedResume, isExternalBlockResumeWorkItem, isQueuedExternalBlockResume } from "../external-block/external-block-lifecycle.js";
 import { Scheduler } from "../scheduler.js";
 import { registerDefaultAgentPluginRunner, unregisterDefaultAgentPluginRunner } from "../pi.js";
 import type { PrMonitor, PrComment } from "../merge/pr-monitor.js";
@@ -3506,6 +3506,8 @@ export class InProcessRuntime
     // Forward task:updated events
     this.taskStore.on("task:updated", (task: Task) => {
       this.recordActivity();
+      // A queued external-block resume enters admission now instead of at the next periodic drain tick.
+      if (isQueuedExternalBlockResume(task)) this.kickWorkflowContinuationProcessor();
       if (task.status === "awaiting-approval") {
         this.approvalHeldTaskIds.add(task.id);
         this.approvalReleasedTaskIds.delete(task.id);

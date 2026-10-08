@@ -17,9 +17,11 @@ FNXC:ExternalBlockResume 2026-10-08-08:29:
 Operator Retry delegates to the engine's single resume owner. A frozen card holds no running-agent slot, so Retry records the request and
 the card stays frozen until project admission grants its resumed run a slot; Retry also clears the automatic-resume budget.
 
-FNXC:ExternalBlockResume 2026-10-08-12:10:
-With a free running-agent slot the engine admits the Retry synchronously, so the card is unfrozen in the response; only a full cap leaves
-it queued behind admission.
+FNXC:ExternalBlockResume 2026-10-08-17:40:
+Retry only queues the resume, never clears the freeze in-request. The pipeline-smoke S21 harness (KB-083) owns the admission definition:
+admission is the continuation run (`admitPlanningContinuation` + `createPlanningContinuationRun`), and the freeze must clear inside that
+admitted run. The response is the task with its operator `resumeRequest`, which the dashboard renders as "Waiting for a free agent slot…";
+the recorded request kicks the continuation drain, so a free slot clears the card within about one drain tick.
 */
 export async function resumeExternallyBlockedTask(params: {
   store: TaskStore;
