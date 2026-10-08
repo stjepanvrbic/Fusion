@@ -921,3 +921,140 @@ describe("NotificationService workflow transition notifications", () => {
     await service.stop();
   });
 });
+
+/*
+FNXC:NotificationDedupe 2026-10-08-01:34:
+KB-017: the in-memory dedupe collection is a bounded LRU with refresh-on-hit. These cases pin the bound,
+eviction order, sticky-key survival on the production task:updated path, failure release, and the
+default-capacity fallback for absent/invalid options.
+*/
+describe("NotificationService notified-event dedupe bound (KB-017)", () => {
+  // The settings-driven ntfy provider must not reach the network: a non-retryable 400 makes it a
+  // deterministic non-delivery, so only the mock provider decides delivery outcomes here.
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 400, statusText: "stubbed" })));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  async function setup(
+    options: { notifiedEventsMaxEntries?: number } = {},
+    send: () => Promise<{ success: boolean; providerId: string }> = async () => ({ success: true, providerId: "mock" }),
+  ) {
+    const store = createStore();
+    const sendNotification = vi.fn(send);
+    const provider: NotificationProvider = {
+      getProviderId: () => "mock",
+      isEventSupported: () => true,
+      sendNotification,
+    };
+    const service = new NotificationService(store as any, options);
+    service.registerProvider(provider);
+    await service.start();
+    return { store, service, sendNotification };
+  }
+
+  function keyed(key: string): NotificationPayload {
+    return { event: "cli-agent-awaiting-input", metadata: { notificationDedupeKey: key } };
+  }
+
+  it("never remembers more keys than its capacity while still delivering each distinct key once", async () => {
+    const { service, sendNotification } = await setup({ notifiedEventsMaxEntries: 3 });
+    for (let i = 0; i < 50; i += 1) {
+      await service.dispatch("cli-agent-awaiting-input", keyed(`flood-${i}`));
+    }
+    expect(service.getNotifiedEventCount()).toBe(3);
+    expect(sendNotification).toHaveBeenCalledTimes(50);
+    await service.stop();
+  });
+
+  it("evicts the oldest idle key first", async () => {
+    const { service, sendNotification } = await setup({ notifiedEventsMaxEntries: 2 });
+    await service.dispatch("cli-agent-awaiting-input", keyed("A"));
+    await service.dispatch("cli-agent-awaiting-input", keyed("B"));
+    await service.dispatch("cli-agent-awaiting-input", keyed("C"));
+    expect(sendNotification).toHaveBeenCalledTimes(3);
+
+    await service.dispatch("cli-agent-awaiting-input", keyed("C"));
+    expect(sendNotification).toHaveBeenCalledTimes(3);
+    await service.dispatch("cli-agent-awaiting-input", keyed("A"));
+    expect(sendNotification).toHaveBeenCalledTimes(4);
+    await service.stop();
+  });
+
+  it("refreshes recency on a suppressed hit so a re-checked key outlives idle keys", async () => {
+    const { service, sendNotification } = await setup({ notifiedEventsMaxEntries: 2 });
+    await service.dispatch("cli-agent-awaiting-input", keyed("A"));
+    await service.dispatch("cli-agent-awaiting-input", keyed("B"));
+    await service.dispatch("cli-agent-awaiting-input", keyed("A"));
+    expect(sendNotification).toHaveBeenCalledTimes(2);
+
+    await service.dispatch("cli-agent-awaiting-input", keyed("C"));
+    expect(sendNotification).toHaveBeenCalledTimes(3);
+    await service.dispatch("cli-agent-awaiting-input", keyed("A"));
+    expect(sendNotification).toHaveBeenCalledTimes(3);
+    await service.dispatch("cli-agent-awaiting-input", keyed("B"));
+    expect(sendNotification).toHaveBeenCalledTimes(4);
+    await service.stop();
+  });
+
+  it("keeps a sticky awaiting-approval key suppressed through a flood of unique keys", async () => {
+    const { store, service, sendNotification } = await setup({ notifiedEventsMaxEntries: 5 });
+    const waiting = task({ id: "FN-9901", status: "awaiting-approval", column: "triage" } as Partial<Task>);
+    const approvalPushes = () => sendNotification.mock.calls.filter(
+      ([event, payload]: any[]) => event === "awaiting-approval" && payload?.taskId === "FN-9901",
+    ).length;
+
+    store.emit("task:updated", waiting);
+    await vi.waitFor(() => expect(approvalPushes()).toBe(1));
+
+    for (let i = 0; i < 40; i += 1) {
+      await service.dispatch("cli-agent-awaiting-input", keyed(`message-${i}`));
+      store.emit("task:updated", waiting);
+      await flushAsyncHandlers();
+    }
+
+    expect(approvalPushes()).toBe(1);
+    expect(service.getNotifiedEventCount()).toBeLessThanOrEqual(5);
+    await service.stop();
+  });
+
+  it("releases the key when delivery fails or throws so a retry dispatches again", async () => {
+    let mode: "fail" | "throw" | "ok" = "fail";
+    const { service, sendNotification } = await setup({ notifiedEventsMaxEntries: 10 }, async () => {
+      if (mode === "throw") throw new Error("provider down");
+      return { success: mode === "ok", providerId: "mock" };
+    });
+    const before = service.getNotifiedEventCount();
+
+    await service.dispatch("cli-agent-awaiting-input", keyed("K"));
+    expect(service.getNotifiedEventCount()).toBe(before);
+
+    mode = "throw";
+    await service.dispatch("cli-agent-awaiting-input", keyed("K"));
+    expect(service.getNotifiedEventCount()).toBe(before);
+
+    mode = "ok";
+    await service.dispatch("cli-agent-awaiting-input", keyed("K"));
+    expect(sendNotification).toHaveBeenCalledTimes(3);
+    expect(service.getNotifiedEventCount()).toBe(before + 1);
+    await service.stop();
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["zero", 0],
+    ["NaN", Number.NaN],
+  ])("falls back to the default capacity when the option is %s", async (_label, max) => {
+    const { service, sendNotification } = await setup(max === undefined ? {} : { notifiedEventsMaxEntries: max });
+    await service.dispatch("cli-agent-awaiting-input", keyed("repeat"));
+    await service.dispatch("cli-agent-awaiting-input", keyed("other"));
+    await service.dispatch("cli-agent-awaiting-input", keyed("repeat"));
+    expect(sendNotification).toHaveBeenCalledTimes(2);
+    expect(service.getNotifiedEventCount()).toBe(2);
+    await service.stop();
+  });
+});

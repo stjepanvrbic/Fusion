@@ -60,6 +60,57 @@ async function confirmWithin(delivery: Promise<boolean>, timeoutMs: number): Pro
   }
 }
 
+/** Default capacity of the in-memory notification dedupe collection (see `BoundedRecencySet`). */
+export const NOTIFIED_EVENTS_MAX_ENTRIES = 10_000;
+
+/**
+ * FNXC:NotificationDedupe 2026-10-08-01:34:
+ * KB-017: `NotificationService.notifiedEvents` used to be a plain Set that was never pruned, so a long-running engine kept one entry per message, wedge episode, and task event forever.
+ * It is now a fixed-capacity LRU whose recency is refreshed on every `has` hit, with eviction inline on `add` (no timers or sweeps).
+ * LRU with refresh-on-hit was chosen over an insertion-time TTL because sticky task-state keys (awaiting-approval, awaiting-user-review, failed, workflow-transition) need an indefinite horizon while their state persists; they are re-checked on every `task:updated`, so they stay warm while unique, never-re-checked message/episode keys age out first.
+ * Durable horizons do not depend on this collection: wedge episodes are deduped by the store CAS with a 6h cooldown, and OAuth expiry alerts by the monitor's own 12h cooldown.
+ * Capacity is far above per-task key counts, so only keys idle across thousands of newer keys are forgotten.
+ */
+class BoundedRecencySet {
+  /** Map insertion order is recency order: the first key is the least recently used. */
+  private readonly entries = new Map<string, true>();
+  private readonly maxEntries: number;
+
+  constructor(maxEntries?: number) {
+    this.maxEntries = typeof maxEntries === "number" && Number.isInteger(maxEntries) && maxEntries >= 1
+      ? maxEntries
+      : NOTIFIED_EVENTS_MAX_ENTRIES;
+  }
+
+  /** Membership check; a hit refreshes the key's recency so live sticky keys are not evicted. */
+  has(key: string): boolean {
+    if (!this.entries.has(key)) return false;
+    this.entries.delete(key);
+    this.entries.set(key, true);
+    return true;
+  }
+
+  /** Inserts or refreshes a key, evicting the least recently used keys beyond capacity. */
+  add(key: string): void {
+    this.entries.delete(key);
+    this.entries.set(key, true);
+    while (this.entries.size > this.maxEntries) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.entries.delete(oldest);
+    }
+  }
+
+  /** Releases a key; a no-op when the key was already evicted. */
+  delete(key: string): void {
+    this.entries.delete(key);
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+}
+
 export interface NotificationServiceOptions {
   /** Project identifier for notification deep links */
   projectId?: string;
@@ -75,6 +126,8 @@ export interface NotificationServiceOptions {
   failedNotificationGraceMs?: number;
   /** Test hook for the durable terminal-wedge settle window. */
   wedgeNotificationSettleMs?: number;
+  /** Test hook to override the dedupe collection capacity (default `NOTIFIED_EVENTS_MAX_ENTRIES`); invalid values fall back to the default. */
+  notifiedEventsMaxEntries?: number;
 }
 
 interface NotificationServiceStoreEvents {
@@ -154,7 +207,8 @@ export interface NotificationChatStore {
 
 export class NotificationService {
   private readonly dispatcher = new NotificationDispatcher();
-  private readonly notifiedEvents = new Set<string>();
+  /** Bounded LRU of dispatched dedupe keys; see `BoundedRecencySet` (KB-017). */
+  private readonly notifiedEvents: BoundedRecencySet;
   private started = false;
   private chatStore: NotificationChatStore | undefined;
   private notificationsEnabled = false;
@@ -243,6 +297,7 @@ export class NotificationService {
     private readonly options: NotificationServiceOptions = {},
   ) {
     this.chatStore = options.chatStore;
+    this.notifiedEvents = new BoundedRecencySet(options.notifiedEventsMaxEntries);
     this.failedNotificationGraceMs = options.failedNotificationGraceMs ?? 60_000;
     this.failureNotificationDelayMs = this.failedNotificationGraceMs;
     this.wedgeNotificationSettleMs = options.wedgeNotificationSettleMs ?? 300_000;
@@ -1616,6 +1671,11 @@ export class NotificationService {
 
   getPendingFailureCount(): number {
     return this.pendingFailureNotifications.size;
+  }
+
+  /** Number of dedupe keys currently remembered; never exceeds the configured capacity. */
+  getNotifiedEventCount(): number {
+    return this.notifiedEvents.size;
   }
 
   private isMergeBackedTerminalTask(task: Task): boolean {
