@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **6 active observation records** (entries 2, 13, 20, 21, 25, and 26), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **7 active observation records** (entries 2, 13, 20, 21, 25, 26, and 27), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **15 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -334,6 +334,22 @@ The failure was `TestingLibraryElementError: Unable to find an element by: [data
 No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`.
 
 The Planning Mode subsystem already carries quarantined entries (entry 22 for `PlanningModeModal.planning-flow` and entry 23 for `planning-browser-e2e`) plus closed entries 4, 5, 8, and 10. Under the AGENTS.md rule that a repeated quarantine in one subsystem is a product-race smell, this sighting is a reason to look at the product code before the entry 22 deletion deadline. Start with how `QuestionForm` in `PlanningModeModal` commits the Other selection and renders the Other input after a radio change, and whether that state is set asynchronously.
+
+### 27. ensureCwdProjectRegistered embedded PostgreSQL startup cascade
+
+- **Status:** Active first sighting — recorded 2026-10-07, unattributed.
+- **File:** `packages/cli/src/commands/__tests__/ensure-project-registered.test.ts`
+- **Exact tests:** all five cases in `ensureCwdProjectRegistered`: `returns existing registered project without writing files`, `auto-registers unregistered project when enabled and persists identity`, `reattaches using stored identity when central row was wiped`, `returns null and does not write when autoRegister is false`, and `returns null and logs error when registration throws`.
+- **Observed tree/SHA:** fork Full Suite run [37710916510](https://github.com/stjepanvrbic/Fusion/actions/runs/37710916510) at `c024d8213` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113096379129`). That commit changed only a register entry and its validator test, so the failure is load- or environment-shaped.
+- **Observed frequency:** 1 run, 10 failure entries across the 5 cases. The same file reported no failure in the Full Suite test shards for the neighbouring commits `c53017ac7` (run 37710548191) and `677ca1403` (run 37710543465).
+
+The first case failed with `Error: Test timed out in 5000ms` and, in the same case, `Error: Test subprocess guard detected unsafe child-process usage`. The guard reported the embedded PostgreSQL `postgres` process for port 46431 as left running at the end of that case. The other four cases each failed twice with `Error: connect ECONNREFUSED ::1:46431` and `Error: connect ECONNREFUSED 127.0.0.1:46431`.
+
+The log shows one embedded PostgreSQL data directory, under the worker's test home, used by all five cases. The first case ran `initdb` and started the server, which logged ready on port 46431. About five seconds later the server logged `terminating connection due to unexpected postmaster exit`, matching the first case's 5 s timeout and teardown. Each later case then logged `could not verify database "fusion" on joined instance at port 46431` and was refused on that port. The later failures are a cascade from the first case, not five independent failures. This reads the log; no reproduction was attempted.
+
+No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the CLI vitest config.
+
+The subprocess-guard line deserves a product look. It means a real PostgreSQL child reached a CLI unit test that does not obviously need one, and a startup that outlives its test left a stale port recorded as a joined instance for later cases. Start with how the embedded PostgreSQL startup records and joins an existing instance for a shared data directory, and whether `CentralCore` initialization in this file should use an in-memory or harness-provided store.
 
 ### Common shape and investigated result
 
