@@ -42,19 +42,24 @@ describe("reliability interactions: in-review stall deadlock disposition", () =>
     vi.useRealTimers();
   });
 
+  /*
+  FNXC:MergeRestartDeferral 2026-10-08-06:10:
+  The deadlock brake is for a card the merge door refuses while nothing marks it failed. This fixture used to be a `failed` park, which is already
+  the terminal operator-visible outcome and is no longer a stall; a review card with an unfinished step is the genuine non-failed deadlock.
+  */
   it("FN-4885: auto-disposes repeated merge-blocker stalls once, then no-ops", async () => {
     const task = {
       id: "FN-4860",
       column: "in-review",
       paused: false,
       userPaused: false,
-      status: "failed",
-      error: "Failed to create worktree after 3 attempts: Branch fusion/fn-4860 conflict could not be auto-resolved",
+      status: null,
+      error: null,
       branch: "fusion/fn-4860",
       worktree: "/tmp/missing-fn-4860",
       mergeDetails: {},
       mergeRetries: 0,
-      steps: [{ name: "merge", status: "done" }],
+      steps: [{ name: "merge", status: "in-progress" }],
       workflowStepResults: [],
       updatedAt: "2026-01-01T00:00:00.000Z",
       log: [],
@@ -111,6 +116,85 @@ describe("reliability interactions: in-review stall deadlock disposition", () =>
       (event) => event.mutationType === "task:in-review-stall-deadlock-disposed",
     );
     expect(disposeAuditsAfterFourth).toHaveLength(auditCountBeforeFourth);
+
+    manager.stop();
+  });
+
+  /*
+  FNXC:MergeRestartDeferral 2026-10-08-06:10:
+  Original symptom (KB-020, KB-024): a restart parked approved cards `AUTO_MERGE_RETRY_REJECTED:`, then this sweep logged "In-review stall surfaced"
+  three times and paused each card `in-review-stall-deadlock`, hiding it from every automatic recovery. A review card whose merge blocker is its
+  own `failed` status is already the terminal operator-visible outcome: never surfaced, never counted, never paused.
+  */
+  it.for([
+    { label: "retry rejected by a shutdown", error: "AUTO_MERGE_RETRY_REJECTED: Engine shutting down — merge for KB-020 aborted" },
+    { label: "retry rejected by an enqueue refusal", error: "AUTO_MERGE_RETRY_REJECTED: Merge enqueue rejected for KB-024" },
+    { label: "retry boundary failure", error: "AUTO_MERGE_RETRY_FAILED: boundary store down" },
+    { label: "any other failed park", error: "Failed to create worktree after 3 attempts: Branch fusion/fn-4860 conflict could not be auto-resolved" },
+  ])("never surfaces or pauses a failed park as a stall ($label)", async ({ error }) => {
+    const task = {
+      id: "KB-020",
+      column: "in-review",
+      paused: false,
+      userPaused: false,
+      status: "failed",
+      error,
+      branch: "fusion/kb-020",
+      worktree: "/tmp/kb-020",
+      mergeDetails: {},
+      mergeRetries: 0,
+      steps: [{ name: "merge", status: "done" }],
+      workflowStepResults: [],
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      log: [],
+    } as any satisfies Task;
+
+    const store = createStore(task);
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/repo" });
+
+    for (const timestamp of ["2026-01-01T00:10:00.000Z", "2026-01-01T00:27:00.000Z", "2026-01-01T00:44:00.000Z", "2026-01-01T01:01:00.000Z"]) {
+      vi.setSystemTime(new Date(timestamp));
+      expect(await manager.surfaceInReviewStalls()).toBe(0);
+    }
+
+    expect(task).toMatchObject({ paused: false, status: "failed", error });
+    expect(task.pausedReason).toBeUndefined();
+    expect((store.updateTask as any).mock.calls).toHaveLength(0);
+    expect(task.log.some((entry: { action: string }) => entry.action.startsWith("In-review stall"))).toBe(false);
+    expect(((store as any).__auditEvents as any[])).toHaveLength(0);
+
+    manager.stop();
+  });
+
+  it("still disposes a card whose auto-merge retries are exhausted without a failed park", async () => {
+    const task = {
+      id: "FN-EXHAUSTED",
+      column: "in-review",
+      paused: false,
+      userPaused: false,
+      status: null,
+      error: null,
+      branch: "fusion/fn-exhausted",
+      worktree: "/tmp/fn-exhausted",
+      mergeDetails: {},
+      mergeRetries: 3,
+      steps: [{ name: "merge", status: "done" }],
+      workflowStepResults: [],
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      log: [],
+    } as any satisfies Task;
+
+    const store = createStore(task);
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/repo" });
+
+    for (const timestamp of ["2026-01-01T00:10:00.000Z", "2026-01-01T00:12:00.000Z", "2026-01-01T00:14:00.000Z"]) {
+      vi.setSystemTime(new Date(timestamp));
+      expect(await manager.surfaceInReviewStalls()).toBe(1);
+    }
+
+    expect(task.paused).toBe(true);
+    expect(task.pausedReason).toBe("in-review-stall-deadlock");
+    expect(task.log.filter((entry: { action: string }) => entry.action.startsWith("In-review stall auto-disposed [merge-retries-exhausted]:"))).toHaveLength(1);
 
     manager.stop();
   });
@@ -266,7 +350,12 @@ describe("reliability interactions: in-review stall deadlock disposition", () =>
     manager.stop();
   });
 
-  it("FN-6113: retryable provider errors still use repeated-stall deadlock disposition", async () => {
+  /*
+  FNXC:MergeRestartDeferral 2026-10-08-06:10:
+  A retryable provider error parked `failed` is a visible failed park, not a stall: it is neither surfaced nor paused. Only the non-retryable
+  provider classification keeps its single-cycle terminal disposition and wedge notification.
+  */
+  it("FN-6113: a failed park with a retryable provider error is not a stall and is never paused", async () => {
     const task = {
       id: "FN-6113-RETRYABLE",
       column: "in-review",
@@ -287,20 +376,14 @@ describe("reliability interactions: in-review stall deadlock disposition", () =>
     const store = createStore(task);
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/repo" });
 
-    vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
-    expect(await manager.surfaceInReviewStalls()).toBe(1);
-    expect(task.paused).toBe(false);
-    vi.setSystemTime(new Date("2026-01-01T00:12:00.000Z"));
-    expect(await manager.surfaceInReviewStalls()).toBe(1);
-    expect(task.paused).toBe(false);
-    vi.setSystemTime(new Date("2026-01-01T00:14:00.000Z"));
-    expect(await manager.surfaceInReviewStalls()).toBe(1);
+    for (const timestamp of ["2026-01-01T00:10:00.000Z", "2026-01-01T00:12:00.000Z", "2026-01-01T00:14:00.000Z", "2026-01-01T00:16:00.000Z"]) {
+      vi.setSystemTime(new Date(timestamp));
+      expect(await manager.surfaceInReviewStalls()).toBe(0);
+    }
 
-    expect(task.paused).toBe(true);
-    expect(task.pausedReason).toBe("in-review-stall-deadlock");
-    expect(task.log.filter((entry: { action: string }) => entry.action.startsWith("In-review stall surfaced [merge-blocker]:"))).toHaveLength(2);
-    expect(task.log.filter((entry: { action: string }) => entry.action.startsWith("In-review stall auto-disposed [merge-blocker]:"))).toHaveLength(1);
-    expect(task.log.some((entry: { action: string }) => entry.action.startsWith("In-review stall terminal disposed ["))).toBe(false);
+    expect(task).toMatchObject({ paused: false, status: "failed", error: "HTTP 503 service unavailable" });
+    expect((store.updateTask as any).mock.calls).toHaveLength(0);
+    expect(task.log).toHaveLength(0);
 
     manager.stop();
   });

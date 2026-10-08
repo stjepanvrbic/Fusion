@@ -10988,6 +10988,13 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           engineActivationGraceMs: settings.engineActivationGraceMs,
         });
         if (!signal) continue;
+        /*
+        FNXC:MergeRestartDeferral 2026-10-08-06:10:
+        A review card whose merge blocker is its own `failed` status is a visible failed park, the terminal operator-visible outcome, not a stall.
+        Counting it toward the deadlock threshold re-parked KB-020 and KB-024 as paused `in-review-stall-deadlock` after a restart, which hid them from every automatic recovery.
+        The non-retryable provider classification keeps its own single-cycle disposition and notification; other codes keep the deadlock brake.
+        */
+        if (signal.code === "merge-blocker" && task.status === "failed") continue;
         if (await this.isMergeLaneOwned(task.id)) continue;
 
         if (Date.parse(task.updatedAt) >= cycleStartMs) {
