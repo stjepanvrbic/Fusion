@@ -281,6 +281,23 @@ describe("workflow continuations compete in every project admission pass", () =>
     expect(candidates.map((candidate) => candidate.taskId)).toEqual(["KB-READY"]);
   });
 
+  it("treats a card in a renamed board's complete column as terminal, not as admissible work", async () => {
+    const shipped = task("KB-101", { column: "shipped" });
+    const live = task("KB-102", { column: "qa" });
+    const candidates = await listContinuationAdmissionCandidates({
+      store: fakeStore({
+        tasks: [shipped, live],
+        items: [workItem("KB-101", "after-ship"), workItem("KB-102", "after-ship")],
+        workflowByTask: { "KB-101": "custom:renamed", "KB-102": "custom:renamed" },
+        definitions: { "custom:renamed": RENAMED_WORKFLOW_IR },
+      }),
+      projectId: PROJECT_ID,
+      isDispatchOpen: () => true,
+      run: async () => {},
+    });
+    expect(candidates.map((candidate) => candidate.taskId)).toEqual(["KB-102"]);
+  });
+
   it("unregisters with the drain", () => {
     const unregister = registerContinuationAdmissionProvider({
       store: fakeStore({ tasks: [], items: [] }),
