@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 32, 33, 35, 36, 37, and 38): eleven **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **21 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **11 active observation records** (entries 2, 13, 20, 21, 25, 32, 33, 35, 36, 37, and 38): ten **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, 18, and 27 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **21 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -353,7 +353,7 @@ The failure was `Hook timed out in 15000ms` in the file's top-level `afterEach`,
 
 ### 27. ensureCwdProjectRegistered embedded PostgreSQL startup cascade
 
-- **Status:** Active first sighting — recorded 2026-10-07, unattributed.
+- **Status:** Closed 2026-10-08 — structurally resolved on first sighting by KB-052 (product fix); no quarantine.
 - **File:** `packages/cli/src/commands/__tests__/ensure-project-registered.test.ts`
 - **Exact tests:** all five cases in `ensureCwdProjectRegistered`: `returns existing registered project without writing files`, `auto-registers unregistered project when enabled and persists identity`, `reattaches using stored identity when central row was wiped`, `returns null and does not write when autoRegister is false`, and `returns null and logs error when registration throws`.
 - **Observed tree/SHA:** fork Full Suite run [37710916510](https://github.com/stjepanvrbic/Fusion/actions/runs/37710916510) at `c024d8213` (Linux, `ubuntu-latest`), job `Test shard 3/4` (`113096379129`). That commit changed only a register entry and its validator test, so the failure is load- or environment-shaped.
@@ -366,6 +366,10 @@ The log shows one embedded PostgreSQL data directory, under the worker's test ho
 No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the CLI vitest config.
 
 The subprocess-guard line deserves a product look. It means a real PostgreSQL child reached a CLI unit test that does not obviously need one, and a startup that outlives its test left a stale port recorded as a joined instance for later cases. Start with how the embedded PostgreSQL startup records and joins an existing instance for a shared data directory, and whether `CentralCore` initialization in this file should use an in-memory or harness-provided store.
+
+**Closed 2026-10-08 (KB-052) — product diagnosis.** The shared data directory is by design: each Vitest worker has one stable test home, and `CentralCore` uses the default embedded data directory under it, so every case in the worker reuses one cluster instead of running `initdb` per case. The defect was in `packages/core/src/postgres/embedded-lifecycle.ts`. The first case's owned start published its port in the in-process `runningInstances` cache, the subprocess guard SIGKILLed the postmaster after the 5 s timeout, and nothing removed the cache entry. Every later lifecycle in the process returned that entry without a liveness check, joined the dead port, and the `startup-factory` joined-instance retries rebuilt lifecycles that hit the same stale entry. The existing stale-`postmaster.pid` recovery never ran because the cache was consulted first. A second latent wedge: on Linux and macOS, stopping an owned postmaster that had already exited called the library `stop()`, which waits forever for an `exit` event that already fired, leaving its runtime-registry generation `stopping`.
+
+KB-052 makes each cache entry owner-scoped and liveness-checked, so a dead entry is discarded and the stale-pid path starts a new owned postmaster. An exit listener on the owned postmaster clears the entry and reports an unexpected exit, the dead-child stop guard is cross-platform, and a join whose database check is refused re-checks liveness and restarts once when the postmaster is proven dead. Mocked regression suites in `packages/core/src/__tests__/postgres/embedded-lifecycle.test.ts` fail when the cache liveness check is reverted. The CLI test file is unchanged; no timeout, retry, or assertion changed. A new sighting re-opens normal escalation.
 
 ### 32. System controls rebuild output stream subscription
 

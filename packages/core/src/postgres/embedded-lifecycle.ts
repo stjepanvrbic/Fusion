@@ -1005,6 +1005,7 @@ type PostmasterChildLike = {
   readonly exitCode: number | null;
   readonly signalCode: NodeJS.Signals | string | null;
   readonly spawnfile: string;
+  readonly pid?: number;
   once(event: "exit", listener: () => void): unknown;
   removeListener(event: "exit", listener: () => void): unknown;
 };
@@ -1263,8 +1264,21 @@ function normalizeBundledMacosDylibs(onLog: (message: string) => void): void {
  * When start() detects an already-running instance for the same data dir, it
  * reads the port from postmaster.pid and returns a connection URL without
  * starting a new postmaster process.
+ *
+ * FNXC:PostgresEmbedded 2026-10-08-08:28:
+ * KB-052 (flake register entry 27): an entry outlived its postmaster after a SIGKILL, and every later lifecycle in the process joined the dead port with ECONNREFUSED.
+ * Invariant: a joiner never returns a URL for a proven-dead postmaster.
+ * Each entry therefore carries its owning lifecycle's token (only that owner may delete it, so a stale owner's late stop cannot erase a newer owner's entry) and a liveness check read before any join.
  */
-const runningInstances = new Map<string, { port: number; database: string }>();
+type PublishedInstance = {
+  port: number;
+  database: string;
+  /** Per-lifecycle token of the owner that published this entry. */
+  owner: object;
+  /** False once the published postmaster is proven to have exited. */
+  isAlive: () => boolean;
+};
+const runningInstances = new Map<string, PublishedInstance>();
 
 /**
  * Read the port from a postmaster.pid file. The standard PostgreSQL format is:
@@ -1536,7 +1550,17 @@ async function isAlreadyRunning(
 ): Promise<{ port: number; database: string } | null> {
   // Check in-process registry first.
   const cached = runningInstances.get(dataDir);
-  if (cached) return cached;
+  if (cached) {
+    if (cached.isAlive()) return { port: cached.port, database: cached.database };
+    /*
+    FNXC:PostgresEmbedded 2026-10-08-08:28:
+    KB-052: a dead in-process entry must never be joined. Discard it and fall through to the postmaster.pid branch, which starts an owned postmaster for a dead or absent pid and still joins a live postgres started by another process.
+    */
+    runningInstances.delete(dataDir);
+    onLog?.(
+      `embedded postgres: the in-process postmaster for ${dataDir} on port ${cached.port} has exited; not joining it`,
+    );
+  }
 
   const pidPath = join(dataDir, "postmaster.pid");
   if (!existsSync(pidPath)) return null;
@@ -1564,6 +1588,26 @@ async function isAlreadyRunning(
     `embedded postgres: postmaster.pid is present but its port could not be read after ${POSTMASTER_PID_READ_ATTEMPTS} attempts; a second postmaster will not be started (data dir ${dataDir})`,
   );
 }
+
+/**
+ * True only when the postmaster a joiner just failed to reach is proven dead.
+ *
+ * FNXC:PostgresEmbedded 2026-10-08-08:28:
+ * KB-052: a join whose database verify was refused re-checks liveness before handing back its URL.
+ * Proven dead means no live in-process entry AND postmaster.pid is absent or names a pid that is not a running postgres process.
+ * An unreadable pid or an unknowable image probe is not proof, so those keep the historical optimistic join.
+ */
+async function isJoinedPostmasterProvenDead(dataDir: string): Promise<boolean> {
+  const cached = runningInstances.get(dataDir);
+  if (cached?.isAlive()) return false;
+  if (!existsSync(join(dataDir, "postmaster.pid"))) return true;
+  const pid = readPidFromPostmasterPid(dataDir);
+  if (pid === null) return false;
+  return !(await isRecordedPostmasterLive(pid));
+}
+
+/** Outcome of the best-effort database verify on a joined instance. */
+type JoinedDatabaseVerify = "verified" | "unverified-socket" | "unverified-other";
 
 /**
  * Find a free TCP port on 127.0.0.1 by binding to port 0 and reading the
@@ -1649,6 +1693,14 @@ export class EmbeddedPostgresLifecycle {
   private recoveryAttempts = 0;
   private recoveryInFlight: Promise<void> | null = null;
   private stopRequested = false;
+  /** Identity of this lifecycle in {@link runningInstances}; see {@link clearPublishedInstance}. */
+  private readonly instanceToken = {};
+  /** The `exit` listener attached to the owned library postmaster child, removed by every deliberate stop path. */
+  private childExitWatch: { child: PostmasterChildLike; listener: () => void } | null = null;
+  /** True after the owned postmaster exited without a stop, cancel, detach, or recovery request. */
+  private ownedPostmasterExited = false;
+  /** At most one owned restart per start() after a refused join to a proven-dead postmaster. */
+  private deadJoinRestartUsed = false;
 
   constructor(opts: EmbeddedLifecycleOptions) {
     this.options = {
@@ -1672,13 +1724,85 @@ export class EmbeddedPostgresLifecycle {
    */
   private forwardPostgresLog = (message: string): void => {
     this.options.onLog(message);
-    if (process.platform !== "win32" || !this.running || !this.ownsProcess) return;
+    // FNXC:PostgresEmbedded 2026-10-08-08:28: KB-052's exit watch may observe the crashed postmaster exit before its fatal log lines arrive; recovery must still run for that owned cluster.
+    if (process.platform !== "win32" || !(this.running || this.ownedPostmasterExited) || !this.ownsProcess) return;
     if (this.windowsFatalDetector.push(message)) void this.recoverWindowsFatalOnce();
   };
 
   /** The configured or discovered port. Undefined until assigned (explicit or discovered in `start()`). */
   getPort(): number | undefined {
     return this.options.port ?? this.resolvedPort;
+  }
+
+  /**
+   * Delete this lifecycle's published {@link runningInstances} entry, never another owner's.
+   *
+   * FNXC:PostgresEmbedded 2026-10-08-08:28:
+   * KB-052: a stale owner's late stop/detach/cleanup must not erase the entry a newer owned start published for the same data dir.
+   */
+  private clearPublishedInstance(): void {
+    if (runningInstances.get(this.options.dataDir)?.owner === this.instanceToken) {
+      runningInstances.delete(this.options.dataDir);
+    }
+  }
+
+  /**
+   * Publish this lifecycle's owned postmaster for in-process joiners.
+   * The liveness closure reads the CURRENT handles because Windows fatal recovery republishes a new postmaster.
+   */
+  private publishOwnedInstance(port: number): void {
+    runningInstances.set(this.options.dataDir, {
+      port,
+      database: this.options.database,
+      owner: this.instanceToken,
+      isAlive: () => this.isOwnedPostmasterAlive(),
+    });
+  }
+
+  /** Liveness of the owned postmaster; a mock ctor without a child process counts as alive. */
+  private isOwnedPostmasterAlive(): boolean {
+    if (this.nonAdminHandle) {
+      const pid = this.nonAdminHandle.postgresPid;
+      return pid <= 0 || isPostmasterProcessAlive(pid);
+    }
+    if (!this.pg) return false;
+    const child = (this.pg as { process?: PostmasterChildLike }).process;
+    return !child || !hasChildExited(child);
+  }
+
+  /**
+   * Watch the owned library postmaster for an exit nobody requested.
+   *
+   * FNXC:PostgresEmbedded 2026-10-08-08:28:
+   * KB-052: when the owned postmaster dies (crash, SIGKILL from a test guard) the lifecycle clears its published entry and reports the cause, so the next start launches a new postmaster instead of joining a dead port.
+   * It keeps `pg` and `ownsProcess` so a later stop() stays a safe no-op, and never restarts in-line, re-raises, or touches the runtime registry.
+   */
+  private watchOwnedChildExit(pg: EmbeddedPostgresInstance, port: number): void {
+    this.unwatchOwnedChildExit();
+    const child = (pg as { process?: PostmasterChildLike }).process;
+    if (!child || typeof child.once !== "function" || hasChildExited(child)) return;
+    const listener = (): void => {
+      if (this.childExitWatch?.listener === listener) this.childExitWatch = null;
+      if (this.pg !== pg) return;
+      this.running = false;
+      this.ownedPostmasterExited = true;
+      this.clearPublishedInstance();
+      if (this.stopRequested || this.recoveryInFlight) return;
+      const cause = child.signalCode !== null ? `signal ${String(child.signalCode)}` : `exit code ${String(child.exitCode)}`;
+      this.options.onError(
+        `embedded postgres: owned postmaster (pid ${String(child.pid ?? "unknown")}) on port ${port} exited unexpectedly (${cause}); the next start for ${this.options.dataDir} will launch a new postmaster`,
+      );
+    };
+    child.once("exit", listener);
+    this.childExitWatch = { child, listener };
+  }
+
+  /** Remove the unexpected-exit listener before any deliberate stop, cancel, detach, or recovery. */
+  private unwatchOwnedChildExit(): void {
+    const watch = this.childExitWatch;
+    if (!watch) return;
+    this.childExitWatch = null;
+    watch.child.removeListener("exit", watch.listener);
   }
 
   /** True when this lifecycle started the postmaster rather than joining it. */
@@ -1773,6 +1897,7 @@ export class EmbeddedPostgresLifecycle {
     if (this.running) {
       throw new Error("EmbeddedPostgresLifecycle already running");
     }
+    this.deadJoinRestartUsed = false;
 
     // FNXC:PostgresCutover 2026-06-27-11:05:
     // Check if PG is already running for this data dir. If so, reuse it.
@@ -1788,18 +1913,45 @@ export class EmbeddedPostgresLifecycle {
       // database yet — it does so only after its own start() resolves, while the signals
       // that brought us here appear earlier. Verify against the joined instance's port
       // (never getPort(), which prefers our own requested port). See ensureJoinedDatabase.
-      await this.ensureJoinedDatabase(existing.port);
-      const url = this.buildUrl(existing.port, this.options.database);
-      return {
-        mode: "embedded",
-        runtimeUrl: url,
-        migrationUrl: url,
-        migrationUrlOverridden: false,
-        directSessionUrl: url,
-        directSessionProvenance: "embedded-lifecycle",
-      };
+      return this.completeJoin(existing.port, () => this.startBounded());
     }
     return this.startBounded();
+  }
+
+  /**
+   * Verify the joined instance's database and hand back its URL, unless the joined postmaster is proven dead.
+   *
+   * FNXC:PostgresEmbedded 2026-10-08-08:28:
+   * KB-052: a joiner never returns a URL for a proven-dead postmaster. When the verify is refused at the socket level (ECONNREFUSED/ECONNRESET/connect timeout) and liveness proves the postmaster gone, restart through an owned start exactly once per start(); no loop.
+   * Alive or unknowable liveness keeps the historical optimistic join unchanged.
+   */
+  private async completeJoin(
+    port: number,
+    restart: () => Promise<ResolvedBackend>,
+  ): Promise<ResolvedBackend> {
+    const verify = await this.ensureJoinedDatabase(port);
+    if (
+      verify === "unverified-socket"
+      && !this.deadJoinRestartUsed
+      && (await isJoinedPostmasterProvenDead(this.options.dataDir))
+    ) {
+      this.deadJoinRestartUsed = true;
+      this.options.onLog(
+        `embedded postgres: the joined postmaster on port ${port} refused connections and has exited (data dir ${this.options.dataDir}); starting an owned postmaster instead of returning a dead URL`,
+      );
+      this.ownsProcess = true;
+      this.resolvedPort = undefined;
+      return restart();
+    }
+    const url = this.buildUrl(port, this.options.database);
+    return {
+      mode: "embedded",
+      runtimeUrl: url,
+      migrationUrl: url,
+      migrationUrlOverridden: false,
+      directSessionUrl: url,
+      directSessionProvenance: "embedded-lifecycle",
+    };
   }
 
   /**
@@ -1989,16 +2141,8 @@ export class EmbeddedPostgresLifecycle {
       // FNXC:PostgresStartupRace 2026-07-15-20:45: this is the tightest window of all — we
       // lost the race by milliseconds, so the winner's ensureDatabase() is very likely still
       // in flight. Same best-effort verify as the preflight join.
-      await this.ensureJoinedDatabase(existing.port);
-      const runtimeUrl = this.buildUrl(existing.port, this.options.database);
-      return {
-        mode: "embedded",
-        runtimeUrl,
-        migrationUrl: runtimeUrl,
-        migrationUrlOverridden: false,
-        directSessionUrl: runtimeUrl,
-        directSessionProvenance: "embedded-lifecycle",
-      };
+      // FNXC:PostgresEmbedded 2026-10-08-08:28: KB-052 applies the same refused-verify re-probe here; the shared per-start budget bounds it to one owned restart across both join paths.
+      return this.completeJoin(existing.port, () => this.startInternal(signal, preferredPort));
     }
     /*
     FNXC:PostgresResourceLifecycle 2026-07-14-18:42:
@@ -2012,10 +2156,9 @@ export class EmbeddedPostgresLifecycle {
     this.ownsProcess = true;
 
     // Register in the process-level map so other callers can detect us
-    runningInstances.set(this.options.dataDir, {
-      port,
-      database: this.options.database,
-    });
+    this.ownedPostmasterExited = false;
+    this.publishOwnedInstance(port);
+    if (!this.nonAdminHandle) this.watchOwnedChildExit(pg, port);
 
     try {
       /*
@@ -2072,13 +2215,14 @@ export class EmbeddedPostgresLifecycle {
     this.recoveryAttempts += 1;
     this.recoveryInFlight = (async () => {
       this.options.onLog("embedded postgres: detected Windows DLL initialization shutdown; attempting one owned-cluster recovery");
+      this.unwatchOwnedChildExit();
       try {
         if (this.nonAdminHandle) await this.nonAdminHandle.stop();
         else if (this.pg) await this.stopLibraryPostgres(this.pg);
         this.pg = null;
         this.nonAdminHandle = null;
         this.running = false;
-        runningInstances.delete(this.options.dataDir);
+        this.clearPublishedInstance();
         if (this.stopRequested || !this.ownsProcess) return;
         const recoveryPort = this.resolvedPort;
         if (recoveryPort === undefined) {
@@ -2088,7 +2232,7 @@ export class EmbeddedPostgresLifecycle {
         this.options.onLog("embedded postgres: Windows owned-cluster recovery completed; existing pools may reconnect");
       } catch (error) {
         this.running = false;
-        runningInstances.delete(this.options.dataDir);
+        this.clearPublishedInstance();
         this.options.onError(
           `embedded postgres: Windows DLL initialization recovery failed after one retry; restart Fusion and inspect the System log. ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -2103,6 +2247,7 @@ export class EmbeddedPostgresLifecycle {
     // FNXC:WindowsDesktopPackaging 2026-07-15-05:20:
     // Prefer stopping a non-admin handle (if already assigned) before asking
     // embedded-postgres to stop a process it never started.
+    this.unwatchOwnedChildExit();
     if (this.nonAdminHandle) {
       try {
         await this.nonAdminHandle.stop();
@@ -2121,7 +2266,7 @@ export class EmbeddedPostgresLifecycle {
     } finally {
       if (this.pg === pg) this.pg = null;
       this.running = false;
-      runningInstances.delete(this.options.dataDir);
+      this.clearPublishedInstance();
       this.uninstallShutdownHook();
     }
   }
@@ -2170,8 +2315,11 @@ export class EmbeddedPostgresLifecycle {
    * behavior exactly as it was — report it and return the URL, letting the connection layer
    * surface an unreachable cluster as it always has. Never convert an optimistic join into a
    * hard startup failure.
+   *
+   * FNXC:PostgresEmbedded 2026-10-08-08:28:
+   * KB-052: reports its outcome so the caller can re-probe liveness after a socket-level refusal; every log line and the 57P03 bounded wait are unchanged.
    */
-  private async ensureJoinedDatabase(port: number): Promise<void> {
+  private async ensureJoinedDatabase(port: number): Promise<JoinedDatabaseVerify> {
     /*
     FNXC:PostgresEmbedded 2026-07-23-10:40:
     Issue #2411 (beta.4 follow-up): a joined instance can be mid crash-recovery,
@@ -2187,7 +2335,7 @@ export class EmbeddedPostgresLifecycle {
     for (;;) {
       try {
         await this.createDatabaseIfMissing(port);
-        return;
+        return "verified";
       } catch (error) {
         if (isClusterStartingUpError(error) && Date.now() < deadline) {
           if (!announced) {
@@ -2202,7 +2350,9 @@ export class EmbeddedPostgresLifecycle {
         this.options.onLog(
           `embedded postgres: could not verify database "${this.options.database}" on joined instance at port ${port} (${error instanceof Error ? error.message : String(error)}); continuing — the connection layer will report an unreachable cluster`,
         );
-        return;
+        return !isClusterStartingUpError(error) && isClusterNotYetAcceptingError(error)
+          ? "unverified-socket"
+          : "unverified-other";
       }
     }
   }
@@ -2342,12 +2492,13 @@ export class EmbeddedPostgresLifecycle {
   */
   detachWithoutStop(): void {
     this.uninstallShutdownHook();
+    this.unwatchOwnedChildExit();
     this.nonAdminHandle?.stopMonitoring();
     this.pg = null;
     this.nonAdminHandle = null;
     this.running = false;
     this.ownsProcess = false;
-    runningInstances.delete(this.options.dataDir);
+    this.clearPublishedInstance();
   }
 
   /**
@@ -2357,15 +2508,18 @@ export class EmbeddedPostgresLifecycle {
    * embedded-postgres stops Windows postmasters with `taskkill /f /t`, a forced TerminateProcess with no shutdown checkpoint, so every ordinary Fusion stop or restart was a PostgreSQL crash followed by WAL recovery on the next boot.
    * An owned Windows postmaster must stop cleanly on every stop path (stop, signal hook, cancelled start, fatal recovery): run `pg_ctl stop -m fast -w` from the postmaster's own bin directory and force-kill only when pg_ctl cannot stop it.
    * A postmaster child that already exited is never signalled: the library would wait forever for an exit that already happened and taskkill a pid Windows may have recycled.
+   *
+   * FNXC:PostgresEmbedded 2026-10-08-08:28:
+   * KB-052: the exited-child guard is cross-platform. On Linux/macOS the library stop() also waits for an `exit` event that never fires again, so stopping a dead owner hung forever and left its runtime-registry generation `stopping`, wedging every later registration for that URL.
    */
   private async stopLibraryPostgres(pg: EmbeddedPostgresInstance): Promise<void> {
     const gracefulStop = windowsPgCtlStopForTests ?? (process.platform === "win32" ? runWindowsPgCtlFastStop : null);
     const child = (pg as { process?: PostmasterChildLike }).process;
+    if (child && hasChildExited(child)) return;
     if (!gracefulStop || !child) {
       await pg.stop();
       return;
     }
-    if (hasChildExited(child)) return;
     const { status } = await gracefulStop({
       pgCtl: join(dirname(child.spawnfile), "pg_ctl.exe"),
       dataDir: this.options.dataDir,
@@ -2382,6 +2536,7 @@ export class EmbeddedPostgresLifecycle {
   async stop(): Promise<void> {
     this.stopRequested = true;
     this.uninstallShutdownHook();
+    this.unwatchOwnedChildExit();
 
     // FNXC:PostgresCutover 2026-06-27-11:10:
     // If we didn't start the postmaster (detected an already-running instance),
@@ -2404,7 +2559,7 @@ export class EmbeddedPostgresLifecycle {
         this.nonAdminHandle = null;
         this.pg = null;
         this.running = false;
-        runningInstances.delete(this.options.dataDir);
+        this.clearPublishedInstance();
       }
       return;
     }
@@ -2412,7 +2567,7 @@ export class EmbeddedPostgresLifecycle {
     if (!this.pg) {
       this.running = false;
       // Clean up the registry even if pg is null
-      runningInstances.delete(this.options.dataDir);
+      this.clearPublishedInstance();
       return;
     }
     try {
@@ -2422,7 +2577,7 @@ export class EmbeddedPostgresLifecycle {
     } finally {
       this.pg = null;
       this.running = false;
-      runningInstances.delete(this.options.dataDir);
+      this.clearPublishedInstance();
     }
   }
 

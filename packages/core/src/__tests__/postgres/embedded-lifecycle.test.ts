@@ -43,6 +43,7 @@ import {
   isClusterNotYetAcceptingError,
   isClusterStartingUpError,
   isDataDirInitialized,
+  findFreePort,
   isWindowsElevatedAdmin,
   readPidFromPostmasterPid,
   readPostmasterIdentity,
@@ -2271,5 +2272,317 @@ describe("embedded-lifecycle: signal re-raise (P1 #23)", () => {
       (process as unknown as { kill: typeof realKill }).kill = realKill;
       (process as unknown as { exit: typeof realExit }).exit = realExit;
     }
+  });
+});
+
+/*
+FNXC:PostgresEmbedded 2026-10-08-08:28:
+KB-052 (flake register entry 27): after the owned postmaster exited (SIGKILL from the test subprocess guard), the in-process runningInstances entry survived and every later lifecycle for the same data dir joined the dead port with ECONNREFUSED.
+Invariant: a joiner never returns a URL for a proven-dead postmaster; it restarts through an owned start or keeps the optimistic join only when liveness is alive or unknowable.
+Mocked ctors expose a fake postmaster child; the library-faithful stop() waits for an `exit` event exactly like embedded-postgres, so a stop on a dead child would hang without the dead-child guard.
+*/
+type Kb052Child = EventEmitter & { exitCode: number | null; signalCode: string | null; spawnfile: string; pid: number };
+
+function kb052ChildExited(child: Kb052Child): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function setupKb052(options: { withChild?: boolean } = {}) {
+  const dataDir = makeDataDir();
+  writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+  const children: Kb052Child[] = [];
+  const libraryStops: Array<ReturnType<typeof vi.fn>> = [];
+  const ctor = vi.fn();
+  class ChildOwningEmbeddedPostgres {
+    process: Kb052Child | undefined;
+    constructor() {
+      ctor();
+    }
+    initialise = vi.fn(async () => {});
+    start = vi.fn(async () => {
+      if (options.withChild === false) return;
+      const child = Object.assign(new EventEmitter(), {
+        exitCode: null,
+        signalCode: null,
+        spawnfile: join("pg", "native", "bin", "postgres"),
+        pid: 4343 + children.length,
+      }) as Kb052Child;
+      children.push(child);
+      this.process = child;
+    });
+    // Library-faithful: SIGINT the child and wait for its `exit`, which never fires again for a dead child.
+    stop = (() => {
+      const stop = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            const child = this.process;
+            if (!child) {
+              resolve();
+              return;
+            }
+            child.once("exit", () => resolve());
+            if (!kb052ChildExited(child)) {
+              child.signalCode = "SIGINT";
+              child.emit("exit", null, "SIGINT");
+            }
+          }),
+      );
+      libraryStops.push(stop);
+      return stop;
+    })();
+  }
+  __setEmbeddedPostgresCtorForTests(ChildOwningEmbeddedPostgres as never);
+  __setWindowsElevatedAdminForTests(false);
+  const pgCtlStops = vi.fn(async () => {
+    for (const child of children) {
+      if (kb052ChildExited(child)) continue;
+      child.exitCode = 0;
+      child.emit("exit", 0, null);
+    }
+    return { status: 0 };
+  });
+  __setWindowsPgCtlStopForTests(pgCtlStops);
+  vi.spyOn(EmbeddedPostgresLifecycle.prototype, "ensureDatabase").mockResolvedValue(undefined);
+  const ensureJoinedDatabase = vi
+    .spyOn(EmbeddedPostgresLifecycle.prototype as never, "ensureJoinedDatabase")
+    .mockResolvedValue("verified" as never);
+  // An earlier suite's prototype spy may still be installed; vitest reuses it, so start from a clean call history.
+  ensureJoinedDatabase.mockClear();
+  const logs: string[] = [];
+  const errors: string[] = [];
+  const make = (port: number) => {
+    const lifecycle = new EmbeddedPostgresLifecycle({
+      ...baseOptions(dataDir),
+      port,
+      startTimeoutMs: 0,
+      onLog: (message) => logs.push(message),
+      onError: (error) => errors.push(String(error)),
+    });
+    tracked.push({ lifecycle, dataDir });
+    return lifecycle;
+  };
+  return { dataDir, children, libraryStops, ctor, pgCtlStops, ensureJoinedDatabase, logs, errors, make };
+}
+
+describe("embedded-lifecycle: joiner never joins a dead in-process postmaster (KB-052)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each(["dead pid file", "no pid file"] as const)(
+    "lazy surface (%s): a child marked exited without an exit event is not joined",
+    async (pidFile) => {
+      const { dataDir, children, ctor, ensureJoinedDatabase, logs, make } = setupKb052();
+      const owner = make(55470);
+      await owner.start();
+      children[0]!.signalCode = "SIGKILL";
+      if (pidFile === "dead pid file") {
+        writeFileSync(
+          join(dataDir, "postmaster.pid"),
+          [String(provablyDeadPid()), dataDir, "1784424901", "55470", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+        );
+      }
+
+      const joiner = make(55471);
+      const backend = await joiner.start();
+
+      expect(ctor).toHaveBeenCalledTimes(2);
+      expect(ensureJoinedDatabase).not.toHaveBeenCalled();
+      expect(joiner.getOwnsProcess()).toBe(true);
+      expect(backend.runtimeUrl).toContain(":55471/");
+      expect(backend.runtimeUrl).not.toContain(":55470/");
+      expect(logs.some((line) => /has exited; not joining it/.test(line))).toBe(true);
+    },
+  );
+
+  it("control: a live owned child is still joined", async () => {
+    const { ctor, ensureJoinedDatabase, make } = setupKb052();
+    const owner = make(55472);
+    await owner.start();
+    const joiner = make(55473);
+    const backend = await joiner.start();
+    expect(ctor).toHaveBeenCalledOnce();
+    expect(ensureJoinedDatabase).toHaveBeenCalledWith(55472);
+    expect(joiner.getOwnsProcess()).toBe(false);
+    expect(backend.runtimeUrl).toContain(":55472/");
+  });
+
+  it("a ctor instance without a child process keeps today's join", async () => {
+    const { ctor, ensureJoinedDatabase, make } = setupKb052({ withChild: false });
+    const owner = make(55474);
+    await owner.start();
+    const joiner = make(55475);
+    await joiner.start();
+    expect(ctor).toHaveBeenCalledOnce();
+    expect(ensureJoinedDatabase).toHaveBeenCalledWith(55474);
+    expect(joiner.getOwnsProcess()).toBe(false);
+  });
+
+  it("owner scoping: a dead owner's late stop never removes the newer owner's entry", async () => {
+    const { children, ensureJoinedDatabase, libraryStops, make } = setupKb052();
+    const first = make(55476);
+    await first.start();
+    children[0]!.signalCode = "SIGKILL";
+    const second = make(55477);
+    await second.start();
+    expect(second.getOwnsProcess()).toBe(true);
+
+    await first.stop();
+    expect(libraryStops[0]).not.toHaveBeenCalled();
+
+    const third = make(55478);
+    const backend = await third.start();
+    expect(ensureJoinedDatabase).toHaveBeenCalledWith(55477);
+    expect(third.getOwnsProcess()).toBe(false);
+    expect(backend.runtimeUrl).toContain(":55477/");
+  });
+});
+
+describe("embedded-lifecycle: unexpected owner exit and dead-child stop (KB-052)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("eager surface: an exit event reports the cause and the next start launches a new postmaster", async () => {
+    const { children, ctor, ensureJoinedDatabase, errors, make } = setupKb052();
+    const owner = make(55480);
+    await owner.start();
+    const child = children[0]!;
+    child.signalCode = "SIGKILL";
+    child.emit("exit", null, "SIGKILL");
+
+    expect(owner.isRunning()).toBe(false);
+    expect(errors).toEqual([expect.stringMatching(/pid 4343\) on port 55480 exited unexpectedly \(signal SIGKILL\)/)]);
+
+    const joiner = make(55481);
+    await joiner.start();
+    expect(ctor).toHaveBeenCalledTimes(2);
+    expect(ensureJoinedDatabase).not.toHaveBeenCalled();
+    expect(joiner.getOwnsProcess()).toBe(true);
+  });
+
+  it("a deliberate stop is never reported as an unexpected exit", async () => {
+    const { children, errors, make } = setupKb052();
+    const owner = make(55482);
+    await owner.start();
+    await owner.stop();
+    expect(kb052ChildExited(children[0]!)).toBe(true);
+    children[0]!.emit("exit", 0, null);
+    expect(errors).toEqual([]);
+  });
+
+  it.each(["library stop (no pg_ctl seam)", "windows pg_ctl stub"] as const)(
+    "%s: stop() on an already-exited owned child resolves without signalling it",
+    async (stopPath) => {
+      const { children, libraryStops, pgCtlStops, make } = setupKb052();
+      const owner = make(55483);
+      await owner.start();
+      if (stopPath === "library stop (no pg_ctl seam)") __setWindowsPgCtlStopForTests(null);
+      children[0]!.signalCode = "SIGKILL";
+
+      await owner.stop();
+
+      expect(libraryStops[0]).not.toHaveBeenCalled();
+      expect(pgCtlStops).not.toHaveBeenCalled();
+      expect(owner.isRunning()).toBe(false);
+    },
+  );
+});
+
+describe("embedded-lifecycle: refused join verify re-probes liveness (KB-052)", () => {
+  it("restarts through an owned start when the joined postmaster died between detection and verify", async () => {
+    const dataDir = makeDataDir();
+    writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+    const deadPort = await findFreePort();
+    writeFileSync(
+      join(dataDir, "postmaster.pid"),
+      [String(process.pid), dataDir, "1784424901", String(deadPort), "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+    );
+    let probes = 0;
+    __setPostmasterImageProbeForTests(async () => (probes++ === 0 ? "postgres" : "other"));
+    const ctor = vi.fn();
+    const ownedStartReached = new Error("owned start reached");
+    class OwnedStartEmbeddedPostgres {
+      constructor() {
+        ctor();
+      }
+      initialise = vi.fn(async () => {});
+      start = vi.fn(async () => {
+        throw ownedStartReached;
+      });
+      stop = vi.fn(async () => {});
+    }
+    __setEmbeddedPostgresCtorForTests(OwnedStartEmbeddedPostgres as never);
+    __setWindowsElevatedAdminForTests(false);
+    const logs: string[] = [];
+    try {
+      const lifecycle = new EmbeddedPostgresLifecycle({
+        ...baseOptions(dataDir),
+        startTimeoutMs: 0,
+        onLog: (message) => logs.push(message),
+      });
+      await expect(lifecycle.start()).rejects.toBe(ownedStartReached);
+      expect(ctor).toHaveBeenCalledOnce();
+      expect(logs.some((line) => /refused connections and has exited/.test(line))).toBe(true);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the optimistic join when the recorded postmaster is still a live postgres", async () => {
+    const dataDir = makeDataDir();
+    writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+    const refusedPort = await findFreePort();
+    writeFileSync(
+      join(dataDir, "postmaster.pid"),
+      [String(process.pid), dataDir, "1784424901", String(refusedPort), "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+    );
+    const ctor = vi.fn();
+    class UnexpectedEmbeddedPostgres {
+      constructor() {
+        ctor();
+      }
+      initialise = vi.fn(async () => {});
+      start = vi.fn(async () => {});
+      stop = vi.fn(async () => {});
+    }
+    __setEmbeddedPostgresCtorForTests(UnexpectedEmbeddedPostgres as never);
+    try {
+      const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), startTimeoutMs: 0 });
+      await expect(lifecycle.start()).resolves.toMatchObject({
+        runtimeUrl: expect.stringContaining(`:${refusedPort}/`),
+      });
+      expect(ctor).not.toHaveBeenCalled();
+      expect(lifecycle.getOwnsProcess()).toBe(false);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("embedded-lifecycle: a dead owner's lease release cannot wedge the runtime registry (KB-052)", () => {
+  afterEach(() => {
+    clearActiveEmbeddedRuntimeUrl();
+    vi.restoreAllMocks();
+  });
+
+  it("releases a dead owner's generation and lets a replacement postmaster register", async () => {
+    const { children, libraryStops, make } = setupKb052();
+    __setWindowsPgCtlStopForTests(null);
+    const owner = make(55490);
+    const backend = await owner.start();
+    const url = backend.runtimeUrl!;
+    const joinerLease = registerEmbeddedRuntimeUrl(url, { ownsProcess: false, postmasterIdentity: "111:1" });
+    const ownerLease = registerEmbeddedRuntimeUrl(url, { ownsProcess: true, postmasterIdentity: "111:1" });
+
+    children[0]!.signalCode = "SIGKILL";
+    children[0]!.emit("exit", null, "SIGKILL");
+
+    await releaseEmbeddedRuntimeLease(joinerLease);
+    await releaseEmbeddedRuntimeLease(ownerLease, { stopOwner: () => owner.stop() });
+
+    expect(libraryStops[0]).not.toHaveBeenCalled();
+    expect(getActiveEmbeddedRuntimeUrl()).toBeUndefined();
+    expect(() => registerEmbeddedRuntimeUrl(url, { ownsProcess: true, postmasterIdentity: "222:2" })).not.toThrow();
   });
 });

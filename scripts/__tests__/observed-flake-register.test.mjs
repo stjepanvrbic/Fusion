@@ -225,6 +225,11 @@ Entry 38 records a first sighting from the fork's Full Suite: the ModelOnboardin
 clipboard mock before the auto-copy effect's call was observable. The commit under test touched no dashboard app file and
 the mechanism is unmeasured, so a second appearance follows the file-level quarantine rule instead of a timeout, retry,
 or weakened assertion.
+
+FNXC:TestFlakeRegister 2026-10-08-08:50:
+KB-052 closed entry 27 in place on its first sighting with a product fix: embedded PostgreSQL no longer joins a
+dead in-process postmaster. The active inventory drops entry 27 and the stated count drops to 11 at merge; the record keeps
+its evidence and diagnosis in the active section, like closed entry 18.
 */
 /*
 FNXC:TestFlakeRegister 2026-10-08-01:13:
@@ -261,10 +266,6 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "25. Signal-ingest incident capture PostgreSQL teardown hook",
-      status: "Active first sighting — recorded 2026-10-07, unattributed.",
-    },
-    {
-      heading: "27. ensureCwdProjectRegistered embedded PostgreSQL startup cascade",
       status: "Active first sighting — recorded 2026-10-07, unattributed.",
     },
     {
