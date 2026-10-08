@@ -8,8 +8,13 @@
  * Acquires an exclusive lock at ~/.fusion/test.lock before running the
  * underlying test command, then releases it on exit. macOS uses an O_EXLOCK
  * file lock; Linux and Windows use an atomic O_CREAT|O_EXCL create. While
- * waiting it prints the PID and worktree path of the lock holder so the
- * developer knows who is blocking.
+ * waiting it prints the PID and worktree path of the lock holder and the lock
+ * file path so the developer knows who is blocking.
+ *
+ * Stale locks: on Linux and Windows a runner killed with SIGKILL leaves its
+ * lock file behind. A waiter reclaims it only when the recorded runner PID and
+ * the recorded test-child PID are both dead, under a `test.lock.reclaim` guard,
+ * and deletes only the exact record it judged dead.
  *
  * Usage:  pnpm test:locked [extra args passed to pnpm test:full]
  * e.g.:   pnpm test:locked --filter @fusion/core
@@ -20,6 +25,15 @@ FNXC:TestLockOwnership 2026-10-07-18:03:
 The lock must stay mutually exclusive across cancellation. A waiter that receives Ctrl-C must exit without touching the holder's lock or metadata; before, its signal handler unlinked the lock file and the meta file unconditionally, so a third runner could start a second full suite while the first was still running.
 Release is owner-only and idempotent: only the acquisition that created the lock removes it, after checking the lock file still carries its own token.
 A holder that is signalled while its test child runs forwards the signal and releases only after the child has exited.
+
+FNXC:TestLockOwnership 2026-10-08-05:12:
+SIGKILL bypasses the signal handlers, so an O_EXCL lock file can outlive its runner and every later `pnpm test:locked` waited forever.
+A lock is reclaimable only when the runner AND its recorded test child are both dead; the child PID is recorded as a fourth line once spawned, so a second suite never starts beside an orphaned `pnpm test:full`.
+An unparseable lock (creator between create and write, or died before writing) is reclaimable only after a grace period; a parseable record is never reclaimed by age alone.
+Reclaim runs under an exclusive `.reclaim` guard and deletes only the exact record it judged dead, so two waiters cannot both reclaim and neither can delete a fresh successor's lock.
+A guard left by a dead waiter is removed (only if unchanged) and the reclaim retried on a later poll.
+Known limit: PID reuse makes a dead owner look alive, so the waiter keeps waiting, which is the safe direction; the waiting message names the lock path so a human can remove it.
+macOS keeps O_EXLOCK, whose flock the kernel drops on process death, so no reclaim runs there.
 */
 
 import fs from "node:fs";
@@ -34,6 +48,40 @@ import { describeSpawnFailure, resolveCommandInvocation } from "./lib/pnpm-invoc
 const POLL_MS = 1_500;
 // O_EXLOCK is a BSD/Darwin extension; value 0x20 on macOS.
 const O_EXLOCK = 0x20;
+const MALFORMED_GRACE_MS = 30_000;
+
+/**
+ * Whether `pid` names a live process. Errors other than ESRCH count as alive, so an unknown state never triggers a reclaim.
+ *
+ * @param {number} pid
+ * @param {{ kill?: (pid: number, signal: number) => unknown }} [options]
+ * @returns {boolean}
+ */
+export function isProcessAlive(pid, { kill = process.kill } = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code !== "ESRCH";
+  }
+}
+
+/**
+ * Parse an owner record `pid\ncwd\ntoken[\nchildPid]`.
+ *
+ * @param {string} text
+ * @returns {{ pid: number, worktree: string, token: string, childPid: number | null } | null}
+ */
+export function parseLockRecord(text) {
+  const lines = String(text ?? "").replace(/\r/g, "").split("\n");
+  if (lines.length < 3) return null;
+  const pid = Number(lines[0]);
+  const token = lines[2].trim();
+  if (!Number.isInteger(pid) || pid <= 0 || token === "") return null;
+  const childPid = lines.length > 3 && /^\d+$/.test(lines[3].trim()) ? Number(lines[3].trim()) : null;
+  return { pid, worktree: lines[1] || "(unknown)", token, childPid: childPid && childPid > 0 ? childPid : null };
+}
 
 /**
  * Create one lock handle. Each handle represents at most one acquisition.
@@ -46,34 +94,151 @@ const O_EXLOCK = 0x20;
  *   pid?: number,
  *   cwd?: string,
  *   token?: string,
+ *   isProcessAlive?: (pid: number) => boolean,
+ *   now?: () => number,
+ *   malformedGraceMs?: number,
  * }} options
  */
-export function createTestLock({ lockFile, metaFile, fsImpl = fs, platform = process.platform, pid = process.pid, cwd = process.cwd(), token = randomUUID() }) {
+export function createTestLock({
+  lockFile,
+  metaFile,
+  fsImpl = fs,
+  platform = process.platform,
+  pid = process.pid,
+  cwd = process.cwd(),
+  token = randomUUID(),
+  isProcessAlive: alive = (candidate) => isProcessAlive(candidate),
+  now = Date.now,
+  malformedGraceMs = MALFORMED_GRACE_MS,
+}) {
   const isMacOS = platform === "darwin";
-  const ownerRecord = `${pid}\n${cwd}\n${token}`;
+  const guardFile = `${lockFile}.reclaim`;
+  let ownerRecord = `${pid}\n${cwd}\n${token}`;
   let lockFd = -1;
   let owned = false;
+  let lastReclaimInfo = null;
+
+  function readOrNull(file) {
+    try {
+      return fsImpl.readFileSync(file, "utf8");
+    } catch (err) {
+      if (err?.code === "ENOENT") return null;
+      throw err;
+    }
+  }
 
   function readHolder() {
     try {
-      const [pidStr, ...rest] = fsImpl.readFileSync(metaFile, "utf8").trim().split("\n");
-      return { pid: Number(pidStr), worktree: rest[0] || "(unknown)" };
+      const record = parseLockRecord(fsImpl.readFileSync(metaFile, "utf8").trim());
+      return record ? { pid: record.pid, worktree: record.worktree } : null;
     } catch {
       return null;
     }
+  }
+
+  /** Whether `file`'s mtime is older than the malformed-content grace period. Missing counts as old. */
+  function olderThanGrace(file) {
+    try {
+      return now() - fsImpl.statSync(file).mtimeMs > malformedGraceMs;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Remove a guard left by a dead or never-finished waiter, only if its content is unchanged. */
+  function clearDeadGuard() {
+    const guardText = readOrNull(guardFile);
+    if (guardText === null) return;
+    const [guardPidText, guardToken] = guardText.replace(/\r/g, "").split("\n");
+    const guardPid = Number(guardPidText);
+    const parseable = Number.isInteger(guardPid) && guardPid > 0 && Boolean(guardToken);
+    const dead = parseable ? !alive(guardPid) : olderThanGrace(guardFile);
+    if (!dead) return;
+    if (readOrNull(guardFile) === guardText) {
+      try { fsImpl.unlinkSync(guardFile); } catch { /* already gone */ }
+    }
+  }
+
+  /**
+   * Remove the lock when its owner is provably dead.
+   * Returns "gone" when no lock exists, "reclaimed" after removing a dead lock, or false when the lock must be left alone.
+   */
+  function reclaimIfStale() {
+    const observed = readOrNull(lockFile);
+    if (observed === null) return "gone";
+    const record = parseLockRecord(observed);
+    const stale = record
+      ? !alive(record.pid) && (record.childPid === null || !alive(record.childPid))
+      : olderThanGrace(lockFile);
+    if (!stale) return false;
+
+    const guardRecord = `${pid}\n${token}`;
+    let guardFd;
+    try {
+      guardFd = fsImpl.openSync(guardFile, fsImpl.constants.O_CREAT | fsImpl.constants.O_EXCL | fsImpl.constants.O_RDWR);
+    } catch (err) {
+      if (err?.code !== "EEXIST") throw err;
+      // Another waiter is reclaiming; back off this poll, clearing its guard only if that waiter is dead.
+      clearDeadGuard();
+      return false;
+    }
+    try {
+      fsImpl.writeFileSync(guardFd, guardRecord, "utf8");
+      const current = readOrNull(lockFile);
+      if (current === null) return "gone";
+      if (current !== observed) return false;
+      try { fsImpl.unlinkSync(lockFile); } catch { /* already gone */ }
+      if (readOrNull(metaFile) === observed) {
+        try { fsImpl.unlinkSync(metaFile); } catch { /* already gone */ }
+      }
+      lastReclaimInfo = record ? { pid: record.pid, worktree: record.worktree } : { pid: null, worktree: "(unknown)" };
+      return "reclaimed";
+    } finally {
+      try { fsImpl.closeSync(guardFd); } catch { /* ignore */ }
+      if (readOrNull(guardFile) === guardRecord) {
+        try { fsImpl.unlinkSync(guardFile); } catch { /* already gone */ }
+      }
+    }
+  }
+
+  function openLock() {
+    return isMacOS
+      ? fsImpl.openSync(lockFile, fsImpl.constants.O_CREAT | fsImpl.constants.O_RDWR | O_EXLOCK | fsImpl.constants.O_NONBLOCK)
+      : fsImpl.openSync(lockFile, fsImpl.constants.O_CREAT | fsImpl.constants.O_EXCL | fsImpl.constants.O_RDWR);
+  }
+
+  function isContention(err) {
+    return err?.code === "EEXIST" || err?.code === "EWOULDBLOCK" || err?.code === "EAGAIN";
   }
 
   /** Try once to take the lock. Returns true only when THIS handle now owns it. */
   function tryAcquire() {
     if (owned) return true;
     fsImpl.mkdirSync(path.dirname(lockFile), { recursive: true });
+    lastReclaimInfo = null;
     try {
-      lockFd = isMacOS
-        ? fsImpl.openSync(lockFile, fsImpl.constants.O_CREAT | fsImpl.constants.O_RDWR | O_EXLOCK | fsImpl.constants.O_NONBLOCK)
-        : fsImpl.openSync(lockFile, fsImpl.constants.O_CREAT | fsImpl.constants.O_EXCL | fsImpl.constants.O_RDWR);
+      lockFd = openLock();
     } catch (err) {
-      if (err?.code === "EEXIST" || err?.code === "EWOULDBLOCK" || err?.code === "EAGAIN") return false;
-      throw err;
+      if (!isContention(err)) throw err;
+      if (isMacOS) return false;
+      let reclaim;
+      try {
+        reclaim = reclaimIfStale();
+      } catch {
+        // An unreadable lock or guard is never proof of a dead owner; keep waiting.
+        reclaim = false;
+      }
+      if (!reclaim) return false;
+      try {
+        lockFd = openLock();
+      } catch (retryErr) {
+        if (isContention(retryErr)) {
+          // Another waiter won the freed lock; the reclaim is not ours to report.
+          lastReclaimInfo = null;
+          return false;
+        }
+        throw retryErr;
+      }
     }
     owned = true;
     if (!isMacOS) fsImpl.writeFileSync(lockFd, ownerRecord, "utf8");
@@ -87,6 +252,20 @@ export function createTestLock({ lockFile, metaFile, fsImpl = fs, platform = pro
     } catch {
       return false;
     }
+  }
+
+  /** Extend the owner record with the test child's PID so a SIGKILLed runner's live child still holds the lock. */
+  function recordChild(childPid) {
+    if (!owned || !Number.isInteger(childPid) || childPid <= 0) return false;
+    const next = `${pid}\n${cwd}\n${token}\n${childPid}`;
+    if (!isMacOS && lockFd >= 0 && stillOurs(lockFile)) {
+      // Rewrite through the held fd so the lock inode never changes.
+      fsImpl.writeSync(lockFd, next, 0, "utf8");
+      fsImpl.ftruncateSync(lockFd, Buffer.byteLength(next, "utf8"));
+    }
+    if (stillOurs(metaFile)) fsImpl.writeFileSync(metaFile, next, "utf8");
+    ownerRecord = next;
+    return true;
   }
 
   /** Release this handle's acquisition. A no-op when it never acquired or already released. */
@@ -107,7 +286,15 @@ export function createTestLock({ lockFile, metaFile, fsImpl = fs, platform = pro
     return true;
   }
 
-  return { tryAcquire, release, readHolder, isOwned: () => owned };
+  return {
+    tryAcquire,
+    release,
+    readHolder,
+    recordChild,
+    lastReclaim: () => lastReclaimInfo,
+    isOwned: () => owned,
+    lockFile,
+  };
 }
 
 /**
@@ -167,12 +354,17 @@ export async function runLocked({
   while (!lock.tryAcquire()) {
     if (!waited) {
       const holder = lock.readHolder();
+      const where = lock.lockFile ? ` (lock file: ${lock.lockFile})` : "";
       log(holder
-        ? `[test-with-lock] waiting for test lock held by PID ${holder.pid} (worktree: ${holder.worktree})`
-        : "[test-with-lock] waiting for test lock…");
+        ? `[test-with-lock] waiting for test lock held by PID ${holder.pid} (worktree: ${holder.worktree})${where}`
+        : `[test-with-lock] waiting for test lock…${where}`);
       waited = true;
     }
     await sleep(pollMs);
+  }
+  const reclaimed = lock.lastReclaim?.();
+  if (reclaimed) {
+    log(`[test-with-lock] reclaimed stale test lock from dead PID ${reclaimed.pid ?? "(unknown)"} (worktree: ${reclaimed.worktree})`);
   }
   if (waited) log("[test-with-lock] lock acquired, starting tests.");
 
@@ -188,6 +380,7 @@ export async function runLocked({
     finish(1);
     return;
   }
+  if (Number.isInteger(child?.pid) && child.pid > 0) lock.recordChild(child.pid);
   child.on("close", (code) => finish(code ?? 1));
   child.on("error", (err) => {
     errorLog(`[test-with-lock] failed to spawn pnpm: ${describeSpawnFailure({ status: null, error: err })}`);

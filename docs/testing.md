@@ -319,6 +319,9 @@ pnpm --filter @fusion/dashboard test:browser-smoke  # local browser CSS/layout s
 pnpm --filter @fusion/dashboard test:build          # built client output contract
 ```
 
+<!-- FNXC:WindowsTestScripts 2026-10-08-05:12: KB-037 makes env-setting scripts portable because cmd.exe rejects POSIX `NAME=value cmd` syntax, and makes `pnpm test:locked` reclaim a lock left by a SIGKILLed runner. -->
+Scripts that set environment variables (the deep lanes above, plus root `test:serial` and `test:fast`) run through `node scripts/run-with-env.mjs NAME=value -- command …`, a shell-free wrapper that works the same under `cmd.exe` on Windows and `sh` on macOS/Linux. Bare `NAME=value command` script syntax is forbidden in every workspace `package.json` by `scripts/__tests__/package-scripts-portable-env.test.mjs`; use double-quoted arguments in scripts, because `cmd.exe` passes single quotes literally. `pnpm test:locked` reclaims a stale `~/.fusion/test.lock` only when its recorded runner and test child are both dead, so a hard-killed run no longer blocks later runs, and a live run is never interrupted.
+
 Run `test:deep` when changing broad dashboard architecture, shared modal/view infrastructure, or route registration. Run `test:browser-smoke` for layout/responsive/navigation/modal/CSS changes. Run `test:build` for Vite output, lazy-loading, chunking, or client-dist changes.
 
 <!-- FNXC:DashboardStyling 2026-06-19-00:00: FN-6693 promotes the dashboard-wide raw-CSS token-validity guard because jsdom does not resolve custom properties; run `app/__tests__/dashboard-css-token-validity.css.test.ts` with the CSS contract tests when adding component CSS variables or remapping design tokens. -->
