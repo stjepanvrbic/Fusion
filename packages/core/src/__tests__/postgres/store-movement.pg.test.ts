@@ -111,7 +111,9 @@ pgTest("TaskStore moveTask column transitions (PostgreSQL)", () => {
 
     await expect(store.moveTask(task.id, "triage")).rejects.toThrow(/Unknown column for this workflow/);
 
-    const moved = await store.moveTask(task.id, "todo");
+    // FNXC:LifecycleContainment 2026-10-08-06:02: KB-045 judges an absent source as an engine move, so this
+    // backward reopen names the human operator route that FN-207 containment exempts.
+    const moved = await store.moveTask(task.id, "todo", { moveSource: "operator" });
     expect(moved.column).toBe("todo");
   });
 

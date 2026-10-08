@@ -190,7 +190,8 @@ pgDescribe("merge queue on traitless and unresolvable workflows", () => {
     const wf = await seedRenamedWorkflow();
     const id = await seedRenamedTaskInReview(wf);
     await h.store().enqueueMergeQueue(id);
-    await h.store().moveTask(id, "building" as never);
+    // FNXC:LifecycleContainment 2026-10-08-06:02: KB-045 judges an absent source as engine; a review -> WIP pull-back names the exempt operator route.
+    await h.store().moveTask(id, "building" as never, { moveSource: "operator" });
     h.store().taskCache.delete(id);
 
     await h.store().acquireMergeQueueLease("worker-1", { leaseDurationMs: 60_000 });

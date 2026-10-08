@@ -52,6 +52,13 @@ export const TRIAGE_DEFAULT_ROUTE_COLUMN = "todo";
 /** Column an inbound PR routed for review lands in. */
 export const TRIAGE_REVIEW_COLUMN = "in-review";
 
+/*
+FNXC:LifecycleContainment 2026-10-08-05:43:
+KB-045 decision for automatic triage routing. A card leaving a triage column comes from the intake role (the trait flags intake), and the route targets resolve to the hold role (`todo`) and the review role (`in-review`) on every built-in board, so each move is a forward engine move that needs no lifecycle reason.
+On a custom board whose target resolves to the intake role, rule F1 refuses the move with a TransitionRejectionError; the existing catch parks the card in triage with a diagnostic, which is the intended containment outcome.
+*/
+const TRIAGE_MOVE_OPTIONS = { moveSource: "engine" } as const;
+
 /** Metadata key marking a task as a triage product (a decomposed child). */
 const TRIAGE_PARENT_META_KEY = "triageParentTaskId";
 /** Metadata key recording that a task has been triaged (idempotency). */
@@ -311,7 +318,7 @@ export async function runTriageOnEnter(task: Task, deps: TriageDeps): Promise<Tr
       if (classification.dependencyBump) {
         // Dependency bumps are mechanical → route straight to review.
         await stampTriaged(store, task, classification, { triagePrRoute: "review" });
-        await store.moveTask(task.id, TRIAGE_REVIEW_COLUMN);
+        await store.moveTask(task.id, TRIAGE_REVIEW_COLUMN, TRIAGE_MOVE_OPTIONS);
         return { kind: "pr-review", taskId: task.id, routedColumn: TRIAGE_REVIEW_COLUMN };
       }
       // Feature/other inbound PR → open a follow-up review task linked to the PR
@@ -320,7 +327,7 @@ export async function runTriageOnEnter(task: Task, deps: TriageDeps): Promise<Tr
       const followUp = await store.createTask(
         buildFollowUpTaskInput(task, classification, subject.prEntityId),
       );
-      await store.moveTask(task.id, TRIAGE_REVIEW_COLUMN);
+      await store.moveTask(task.id, TRIAGE_REVIEW_COLUMN, TRIAGE_MOVE_OPTIONS);
       return { kind: "pr-follow-up", followUpTaskId: followUp.id, routedColumn: TRIAGE_REVIEW_COLUMN };
     } catch (err) {
       return parkInTriage(store, task, err, "pr-route");
@@ -344,7 +351,7 @@ export async function runTriageOnEnter(task: Task, deps: TriageDeps): Promise<Tr
   const routeColumn = TRIAGE_DEFAULT_ROUTE_COLUMN;
   try {
     await stampTriaged(store, task, classification, { triageClassified: true });
-    await store.moveTask(task.id, routeColumn);
+    await store.moveTask(task.id, routeColumn, TRIAGE_MOVE_OPTIONS);
   } catch (err) {
     return parkInTriage(store, task, err, "passthrough");
   }

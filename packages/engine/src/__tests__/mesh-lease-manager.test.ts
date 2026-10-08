@@ -44,8 +44,8 @@ describe("MeshLeaseManager", () => {
     expect(result).toEqual({ recoverable: true, reason: "owner_node_offline" });
   });
 
-  it("emits unreachable audit for recovered-to-todo path", async () => {
-    const currentTask = task({ column: "in-progress" });
+  it("emits unreachable audit for recovered-to-todo path (forward intake card)", async () => {
+    const currentTask = task({ column: "triage" });
     const recordRunAuditEvent = vi.fn().mockResolvedValue(undefined);
     const updateTask = vi.fn().mockResolvedValue(currentTask);
     const moveTask = vi.fn().mockResolvedValue(currentTask);
@@ -68,7 +68,7 @@ describe("MeshLeaseManager", () => {
     const ok = await manager.recoverAbandonedLease("FN-1", "scheduler detected stale todo lease");
 
     expect(ok).toBe(true);
-    expect(moveTask).toHaveBeenCalledWith("FN-1", "todo", expect.any(Object));
+    expect(moveTask).toHaveBeenCalledWith("FN-1", "todo", expect.objectContaining({ moveSource: "engine" }));
     const event = recordRunAuditEvent.mock.calls
       .map((call) => call[0] as RunAuditEventInput)
       .find((candidate) => candidate.mutationType === "task:auto-recover-node-unreachable");
@@ -77,7 +77,7 @@ describe("MeshLeaseManager", () => {
       ownerNodeId: "node-a",
       ownerNodeHealth: "offline",
       previousOwnerAgentId: "agent-1",
-      previousColumn: "in-progress",
+      previousColumn: "triage",
       newColumn: "todo",
       leaseEpoch: 2,
       recoveryReason: "scheduler detected stale todo lease",
@@ -85,6 +85,42 @@ describe("MeshLeaseManager", () => {
       handoffAction: "reassign-any",
       handoffReason: expect.any(String),
       decisionPath: "lease-recovered-to-todo",
+    });
+  });
+
+  it("recovers an abandoned WIP lease in place instead of stepping back to todo", async () => {
+    // FNXC:LifecycleContainment 2026-10-08-05:45: KB-045 — WIP→hold is F5 and lease recovery is not a revision.
+    const currentTask = task({ column: "in-progress" });
+    const recordRunAuditEvent = vi.fn().mockResolvedValue(undefined);
+    const updateTask = vi.fn().mockResolvedValue(currentTask);
+    const moveTask = vi.fn().mockResolvedValue(currentTask);
+    const taskStore = {
+      getTask: vi.fn().mockResolvedValue(currentTask),
+      updateTask,
+      moveTask,
+      logEntry: vi.fn().mockResolvedValue(undefined),
+      recordRunAuditEvent,
+    } as unknown as TaskStore;
+
+    const manager = new MeshLeaseManager({
+      taskStore,
+      nodeHealthMonitor: { getNodeHealth: () => "offline" } as any,
+      getHandoffPolicy: vi.fn().mockResolvedValue("reassign-any-healthy"),
+      localNodeId: "local",
+    });
+
+    const ok = await manager.recoverAbandonedLease("FN-1", "stale lease");
+
+    expect(ok).toBe(true);
+    expect(moveTask).not.toHaveBeenCalled();
+    expect(updateTask).toHaveBeenCalledWith("FN-1", expect.objectContaining({ checkedOutBy: null, checkoutLeaseEpoch: 2 }), undefined);
+    const event = recordRunAuditEvent.mock.calls
+      .map((call) => call[0] as RunAuditEventInput)
+      .find((candidate) => candidate.mutationType === "task:auto-recover-node-unreachable");
+    expect(event?.metadata).toMatchObject({
+      previousColumn: "in-progress",
+      newColumn: "in-progress",
+      decisionPath: "lease-recovered-in-place",
     });
   });
 
@@ -307,7 +343,7 @@ describe("MeshLeaseManager", () => {
   });
 
   it("single-node fallback keeps recovery local-only", async () => {
-    const currentTask = task({ currentStep: 2, steps: [{ status: "done" } as any] });
+    const currentTask = task({ column: "triage", currentStep: 2, steps: [{ status: "done" } as any] });
     const recordRunAuditEvent = vi.fn().mockResolvedValue(undefined);
     const taskStore = {
       getTask: vi.fn().mockResolvedValue(currentTask),
@@ -320,7 +356,7 @@ describe("MeshLeaseManager", () => {
     const manager = new MeshLeaseManager({ taskStore });
     const ok = await manager.recoverAbandonedLease("FN-1", "stale-heartbeat", { preserveProgress: true });
     expect(ok).toBe(true);
-    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-1", "todo", { preserveProgress: true });
+    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-1", "todo", { moveSource: "engine", preserveProgress: true });
     expect(recordRunAuditEvent.mock.calls.some((call) => String(call[0].mutationType).includes("task:auto-recover-lease-"))).toBe(false);
   });
 

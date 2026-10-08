@@ -101,7 +101,8 @@ pgDescribe("getTask PROMPT.md read resilience (task-write-API 500 regression)", 
       // in `triage`, so step through todo → in-progress → todo.)
       await expect(store.moveTask(task.id, "todo")).resolves.toBeTruthy();
       await expect(store.moveTask(task.id, "in-progress")).resolves.toBeTruthy();
-      await expect(store.moveTask(task.id, "todo")).resolves.toBeTruthy();
+      // FNXC:LifecycleContainment 2026-10-08-06:02: KB-045 judges an absent source as engine, so this backward reopen names the exempt operator route.
+      await expect(store.moveTask(task.id, "todo", { moveSource: "operator" })).resolves.toBeTruthy();
 
       // Directly updating a step whose definition lives only in the unreadable
       // PROMPT.md genuinely cannot succeed, but the error must name the real

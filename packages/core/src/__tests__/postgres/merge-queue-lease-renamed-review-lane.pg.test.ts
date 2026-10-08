@@ -139,7 +139,8 @@ pgDescribe("merge-queue lease acquisition under a renamed review lane", () => {
   it("renamed vocabulary: a card moved BACK out of the review lane is not leaseable", async () => {
     const wf = await seedRenamedWorkflow();
     const id = await seedQueuedTask(["drafting", "building", "checking"], wf);
-    await h.store().moveTask(id, "building" as never);
+    // FNXC:LifecycleContainment 2026-10-08-06:02: KB-045 judges an absent source as engine; a review -> WIP pull-back names the exempt operator route.
+    await h.store().moveTask(id, "building" as never, { moveSource: "operator" });
     h.store().taskCache.delete(id);
 
     const lease = await h

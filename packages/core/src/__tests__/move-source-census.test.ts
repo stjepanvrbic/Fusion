@@ -6,6 +6,11 @@ ratchet toward treating an absent source as "engine": every production `.moveTas
 or through the options object it passes. The remaining unattributed calls are listed exactly, with the reason each is still
 open, so a new omission fails here and a fixed site must be removed from the list. When the list is empty, the absent
 source can be flipped in resolveDirectionPolicySource.
+
+FNXC:LifecycleContainment 2026-10-08-05:54:
+KB-045 made the remaining containment decisions (triage routing, abandoned-lease recovery, agent canonical routing) and
+flipped resolveDirectionPolicySource: an absent source is now judged as "engine". The census now asserts that no decision
+is pending and also scans `.moveTaskIf(` (options at argument index 3), so a new unsourced move fails here.
 */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
@@ -28,17 +33,10 @@ const FORWARDS_CALLER_OPTIONS: Readonly<Record<string, number>> = {
 };
 
 /**
- * Automatic moves the direction policy would refuse once their source is named. Each needs a containment decision (stay
- * in the current role, or a registered revision reason) before it can say "engine".
+ * Automatic moves still waiting on a containment decision (stay in the current role, or a registered revision reason).
+ * Must stay empty: an absent source is judged as "engine", so a new mover decides its containment before it lands.
  */
-const PENDING_CONTAINMENT_DECISION: Readonly<Record<string, number>> = {
-  // Automatic triage routing lands cards in the default board's intake-role lane (rule F1).
-  "packages/dashboard/src/triage-trait.ts": 3,
-  // Abandoned-lease recovery rebounds a WIP card to the hold lane (rule F5).
-  "packages/engine/src/project/mesh-lease-manager.ts": 1,
-  // Agent-requested column routing of an existing canonical task may step it backward.
-  "packages/engine/src/agent-tools.ts": 1,
-};
+const PENDING_CONTAINMENT_DECISION: Readonly<Record<string, number>> = {};
 
 /** Calls that are not TaskStore moves. */
 const NOT_A_STORE_MOVE: Readonly<Record<string, number>> = {
@@ -124,6 +122,26 @@ function namesMoveSource(source: string, callStart: number, options: string | un
   return /\bmoveSource\s*:/.test(source.slice(literalOpen, closingIndex(source, literalOpen) + 1));
 }
 
+/** Store move methods and the argument index that carries their options. */
+const MOVE_METHODS: ReadonlyArray<{ call: string; optionsIndex: number }> = [
+  { call: ".moveTask(", optionsIndex: 2 },
+  { call: ".moveTaskIf(", optionsIndex: 3 },
+];
+
+/** Count calls in `source` (comments already stripped) that do not name a move source. */
+function countUnattributed(source: string): number {
+  let count = 0;
+  for (const { call, optionsIndex } of MOVE_METHODS) {
+    let cursor = 0;
+    while ((cursor = source.indexOf(call, cursor)) >= 0) {
+      const open = cursor + call.length - 1;
+      if (!namesMoveSource(source, cursor, callArguments(source, open)[optionsIndex])) count++;
+      cursor = open;
+    }
+  }
+  return count;
+}
+
 function unattributedMoveCalls(): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const sourceRoot of SOURCE_ROOTS) {
@@ -135,16 +153,10 @@ function unattributedMoveCalls(): Record<string, number> {
         continue;
       }
       for (const file of productionFiles(srcDirectory)) {
-        const source = stripComments(readFileSync(file, "utf8"));
-        let cursor = 0;
-        while ((cursor = source.indexOf(".moveTask(", cursor)) >= 0) {
-          const open = cursor + ".moveTask".length;
-          const args = callArguments(source, open);
-          if (!namesMoveSource(source, cursor, args[2])) {
-            const key = relative(ROOT, file).split(sep).join("/");
-            counts[key] = (counts[key] ?? 0) + 1;
-          }
-          cursor = open;
+        const count = countUnattributed(stripComments(readFileSync(file, "utf8")));
+        if (count > 0) {
+          const key = relative(ROOT, file).split(sep).join("/");
+          counts[key] = (counts[key] ?? 0) + count;
         }
       }
     }
@@ -153,10 +165,13 @@ function unattributedMoveCalls(): Record<string, number> {
 }
 
 describe("moveTask source census", () => {
-  it("every production moveTask call names its source except the listed open sites", () => {
+  it("has no automatic move waiting on a containment decision", () => {
+    expect(PENDING_CONTAINMENT_DECISION).toEqual({});
+  });
+
+  it("every production moveTask and moveTaskIf call names its source except the structural exceptions", () => {
     expect(unattributedMoveCalls()).toEqual({
       ...FORWARDS_CALLER_OPTIONS,
-      ...PENDING_CONTAINMENT_DECISION,
       ...NOT_A_STORE_MOVE,
     });
   });
@@ -177,5 +192,16 @@ describe("moveTask source census", () => {
       cursor = open;
     }
     expect(verdicts).toEqual([true, true, false]);
+  });
+
+  it("recognizes a moveTaskIf source at its fourth argument", () => {
+    const sample = stripComments([
+      "const moveOptions = { moveSource: \"scheduler\" as const };",
+      "await store.moveTaskIf(id, column, predicate, moveOptions);",
+      "await store.moveTaskIf(id, column, (task) => task.column === \"todo\", { moveSource: \"engine\" });",
+      "await store.moveTaskIf(id, column, predicate);",
+      "await store.moveTask(id, column);",
+    ].join("\n"));
+    expect(countUnattributed(sample)).toBe(2);
   });
 });

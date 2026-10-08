@@ -15,6 +15,11 @@ The rule is now structural in the default-workflow hooks: a non-user move (engin
 never clears an operator pause; only a user move or an explicit `pauseTask(id, false)` lifts it.
 Legal backward moves used here: engine wip -> hold names the registered `plan-review-revise-replan`
 reason; `operator` and absent sources are exempt from the direction policy, so they can reopen from review.
+
+FNXC:LifecycleContainment 2026-10-08-06:02:
+KB-045 judges an absent source as an automatic engine move, so a sourceless wip -> hold reopen is now
+refused by FN-207 containment; the card stays in WIP and the operator park survives. Only `operator` and
+`user` sources remain exempt from the direction policy.
 */
 pgDescribe("operator pause survives non-user reopens into planning (KB-013)", () => {
   const harness = createSharedPgTaskStoreTestHarness({ prefix: "fusion_user_pause_reopen" });
@@ -64,12 +69,15 @@ pgDescribe("operator pause survives non-user reopens into planning (KB-013)", ()
     expect(Boolean(row?.userPaused)).toBe(false);
   });
 
-  it("keeps the pause across an absent-source wip -> hold reopen", async () => {
+  it("refuses an absent-source wip -> hold reopen and keeps the card parked in place", async () => {
     const store = harness.store();
     const id = await pausedInProgress(store, "Operator paused, then sourceless requeue");
 
-    await store.moveTask(id, "todo");
-    await expectParked(store, id);
+    await expect(store.moveTask(id, "todo")).rejects.toThrow(/Forbidden lifecycle path/);
+    const row = await readTaskRow(store.asyncLayer!, id);
+    expect(row?.column).toBe("in-progress");
+    expect(Boolean(row?.paused)).toBe(true);
+    expect(Boolean(row?.userPaused)).toBe(true);
   });
 
   it("keeps the pause across an operator-source review -> hold reopen", async () => {

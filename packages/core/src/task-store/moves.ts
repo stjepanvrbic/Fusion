@@ -748,6 +748,10 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         FNXC:LifecycleContainment 2026-10-07-21:40:
         Operator surfaces now say "operator", which is exempt like "user". resolveDirectionPolicySource is the single place
         that decides which requested sources the containment policy judges.
+
+        FNXC:LifecycleContainment 2026-10-08-05:54:
+        KB-045 retired the fail-open legacy route described above: an absent option now resolves to "engine" and is judged
+        like any automatic move. Human surfaces must say "user" or "operator" to stay exempt.
         */
         const decision = evaluateTransitionInvariants({
           taskId: id,

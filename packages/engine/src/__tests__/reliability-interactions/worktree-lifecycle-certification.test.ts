@@ -117,7 +117,11 @@ describeCertification("worktree lifecycle certification", () => {
     await expectHeld(cert, "after idle-in-review maintenance sweeps");
 
     // The reported boundary: review rebounds back to in-progress. The checkout must survive.
-    await cert.fx.store.moveTask(cert.taskId, "in-progress");
+    // FNXC:LifecycleContainment 2026-10-08-06:02: KB-045 judges an absent source as engine, so the rebound names the registered Code Review REVISE reason.
+    await cert.fx.store.moveTask(cert.taskId, "in-progress", {
+      moveSource: "engine",
+      lifecycleReason: "code-review-revise-remediation",
+    });
     await expectHeld(cert, "after rebound to in-progress");
 
     // And forward into review again.

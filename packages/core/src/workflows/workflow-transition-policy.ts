@@ -64,6 +64,11 @@ semantics. Lifecycle containment governs automatic moves only, so the direction 
 at. "operator" names the operator case explicitly. It resolves to the same emitted source, guards and side effects as an
 absent source did, and it is exempt from the direction policy like "user". Once every caller names its source, an absent
 source is treated as "engine" by resolveDirectionPolicySource.
+
+FNXC:LifecycleContainment 2026-10-08-05:54:
+KB-045 flipped the absent source to fail closed. Every production mover now names its source (the move-source census asserts
+no open decisions remain), so an absent moveSource is an automatic engine move and lifecycle containment judges it. Only
+"user" and "operator" are exempt; trait-less columns remain unjudged because they carry no lifecycle role.
 */
 export type RequestedMoveSource = "user" | "engine" | "scheduler" | "operator";
 export type ResolvedMoveSource = "user" | "engine" | "scheduler";
@@ -73,9 +78,12 @@ export function resolveMoveSource(requested: RequestedMoveSource | undefined): R
   return requested === undefined || requested === "operator" ? "engine" : requested;
 }
 
-/** The source the lifecycle-direction postcondition judges; undefined means the move is exempt. */
+/**
+ * The source the lifecycle-direction postcondition judges; undefined means the move is exempt.
+ * An absent source fails closed as "engine"; "operator" is exempt, and "user" passes through (the policy exempts it).
+ */
 export function resolveDirectionPolicySource(requested: RequestedMoveSource | undefined): ResolvedMoveSource | undefined {
-  return requested === "operator" ? undefined : requested;
+  return requested === "operator" ? undefined : (requested ?? "engine");
 }
 
 /** Input to the shared invariant policy. `mergeBlockerReason` is the caller's

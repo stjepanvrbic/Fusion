@@ -25,6 +25,9 @@ describe the same decision. The column actually used travels in `newColumn`. Thi
 suite pins that split so a future "cleanup" cannot quietly rename the discriminator.
 
 No git anywhere in this path; MeshLeaseManager takes a TaskStore.
+
+FNXC:LifecycleContainment 2026-10-08-05:45:
+KB-045 keeps lease recovery in the card's current lifecycle role. A WIP card now stays in WIP with its lease released, and the audit reports `lease-recovered-in-place` with the persisted column. An intake card still rebounds forward to the workflow's own hold column, which is where the legacy `lease-recovered-to-todo` discriminator remains pinned.
 */
 import { beforeAll, beforeEach, afterEach, afterAll, describe, expect, it } from "vitest";
 import "@fusion/core"; // registers the built-in column traits
@@ -61,14 +64,19 @@ pgDescribe("live lease-rebound E2E: where a recovered lease lands, and what the 
    *  admin client because these are lease-bookkeeping fields the store stamps on its
    *  own terms — and the seed is asserted below, so a silently-dropped write cannot
    *  make the recovery look declined. */
-  async function seedStaleLease(taskId: string, v: Vocabulary, workflowId: string): Promise<void> {
+  async function seedStaleLease(
+    taskId: string,
+    v: Vocabulary,
+    workflowId: string,
+    at: "wip" | "intake" = "wip",
+  ): Promise<void> {
     const store = h.store();
     await store.createTaskWithReservedId(
-      { description: `lease ${taskId}`, column: v.hold } as never,
+      { description: `lease ${taskId}`, column: at === "intake" ? v.intake : v.hold } as never,
       { taskId, applyDefaultWorkflowSteps: false } as never,
     );
     await store.writeTaskWorkflowSelection(taskId, workflowId, []);
-    await store.moveTask(taskId, v.wip, { moveSource: "user" } as never);
+    if (at === "wip") await store.moveTask(taskId, v.wip, { moveSource: "user" } as never);
 
     const longAgo = new Date(Date.now() - 60 * 60_000).toISOString();
     await h.adminSql()`
@@ -80,7 +88,7 @@ pgDescribe("live lease-rebound E2E: where a recovered lease lands, and what the 
 
     const seeded = await store.getTask(taskId);
     expect(seeded.checkedOutBy).toBe("agent-gone");
-    expect(seeded.column).toBe(v.wip);
+    expect(seeded.column).toBe(at === "intake" ? v.intake : v.wip);
   }
 
   async function persistedColumn(taskId: string): Promise<string> {
@@ -93,7 +101,7 @@ pgDescribe("live lease-rebound E2E: where a recovered lease lands, and what the 
     { label: "RENAMED vocabulary", vocab: RENAMED_VOCAB, key: "renamed" },
     { label: "DEFAULT vocabulary (regression floor)", vocab: DEFAULT_VOCAB, key: "default" },
   ])("$label", ({ vocab, key }) => {
-    it("rebounds a recovered lease to the workflow's own rebound column", async () => {
+    it("recovers an abandoned WIP lease in place instead of stepping back to hold", async () => {
       const taskId = `FN-LR-${key}-1`;
       const workflowId = await seedWorkflow(vocab, `${key}-1`);
       await seedStaleLease(taskId, vocab, workflowId);
@@ -102,7 +110,7 @@ pgDescribe("live lease-rebound E2E: where a recovered lease lands, and what the 
       const recovered = await manager.recoverAbandonedLease(taskId, "e2e-stale-lease");
 
       expect(recovered).toBe(true);
-      expect(await persistedColumn(taskId)).toBe(vocab.hold);
+      expect(await persistedColumn(taskId)).toBe(vocab.wip);
       // The lease itself is released, not merely the column changed.
       h.store().taskCache.delete(taskId);
       expect((await h.store().getTask(taskId)).checkedOutBy ?? null).toBeNull();
@@ -130,8 +138,23 @@ pgDescribe("live lease-rebound E2E: where a recovered lease lands, and what the 
         | Record<string, unknown>
         | undefined;
 
-      expect(metadata?.newColumn).toBe(vocab.hold);
+      expect(metadata?.newColumn).toBe(vocab.wip);
       expect(metadata?.newColumn).toBe(await persistedColumn(taskId));
+      expect(metadata?.decisionPath).toBe("lease-recovered-in-place");
+    });
+
+    it("rebounds an abandoned intake lease forward to the workflow's own hold column", async () => {
+      const taskId = `FN-LR-${key}-3`;
+      const workflowId = await seedWorkflow(vocab, `${key}-3`);
+      await seedStaleLease(taskId, vocab, workflowId, "intake");
+
+      const manager = new MeshLeaseManager({ taskStore: h.store() });
+      const recovered = await manager.recoverAbandonedLease(taskId, "e2e-stale-intake-lease");
+
+      expect(recovered).toBe(true);
+      expect(await persistedColumn(taskId)).toBe(vocab.hold);
+      h.store().taskCache.delete(taskId);
+      expect((await h.store().getTask(taskId)).checkedOutBy ?? null).toBeNull();
     });
   });
 
@@ -142,7 +165,7 @@ pgDescribe("live lease-rebound E2E: where a recovered lease lands, and what the 
        vocabulary "cleanup" from renaming a field that is not a column at all. */
     const taskId = "FN-LR-PATH";
     const workflowId = await seedWorkflow(RENAMED_VOCAB, "path");
-    await seedStaleLease(taskId, RENAMED_VOCAB, workflowId);
+    await seedStaleLease(taskId, RENAMED_VOCAB, workflowId, "intake");
 
     const manager = new MeshLeaseManager({
       taskStore: h.store(),
@@ -156,10 +179,11 @@ pgDescribe("live lease-rebound E2E: where a recovered lease lands, and what the 
       | Record<string, unknown>
       | undefined;
 
-    // The card moved wip -> backlog, so this is the "not in place" discriminator...
+    // The card moved inbox -> backlog, so this is the "not in place" discriminator...
     expect(metadata?.decisionPath).toBe("lease-recovered-to-todo");
     // ...while the column it actually reached is the renamed one.
     expect(metadata?.newColumn).toBe(RENAMED_VOCAB.hold);
+    expect(metadata?.newColumn).toBe(await persistedColumn(taskId));
   });
 
   it("does NOT recover a lease that is still fresh", async () => {

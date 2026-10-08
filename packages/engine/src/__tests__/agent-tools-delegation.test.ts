@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Agent, AgentStore, TaskStore, Task, TaskCreateInput } from "@fusion/core";
+import { TransitionRejectionError, makeTransitionRejection } from "@fusion/core";
 import { createAgentTask, createListAgentsTool, createDelegateTaskTool, createTaskCreateTool } from "../agent-tools.js";
 import { RENAMED_VOCAB, lifecycleIr } from "./_workflow-vocabulary-fixture.js";
 
@@ -290,7 +291,7 @@ describe("createDelegateTaskTool", () => {
     }, undefined as any, undefined as any, undefined as any);
 
     expect(taskStore.updateTask).toHaveBeenCalledWith("FN-duplicate", { assignedAgentId: "agent-002" });
-    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-duplicate", "todo");
+    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-duplicate", "todo", { moveSource: "engine" });
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("Delegated to Rita (agent-002): Linked existing FN-duplicate");
     expect(text).toContain("picked up by Rita on their next heartbeat cycle");
@@ -328,7 +329,89 @@ describe("createDelegateTaskTool", () => {
       mission_lineage: APPROVED_LINEAGE,
     }, undefined as any, undefined as any, undefined as any);
 
-    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-duplicate-renamed", "backlog");
+    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-duplicate-renamed", "backlog", { moveSource: "engine" });
+  });
+
+  /*
+  FNXC:LifecycleContainment 2026-10-08-05:52:
+  KB-045: a delegating agent must not pull an in-flight canonical back to the ready lane. Only the store's typed
+  transition refusal is absorbed (card kept in place and logged); every other move failure still propagates.
+  */
+  it("keeps an in-flight duplicate canonical in place when containment refuses the backward move", async () => {
+    const agent = createAgent({ id: "agent-002", name: "Rita" });
+    const existing = {
+      id: "FN-duplicate-wip",
+      description: "Write tests",
+      mission_lineage: APPROVED_LINEAGE,
+      dependencies: [],
+      column: "in-progress" as const,
+      assignedAgentId: "agent-001",
+      steps: [],
+      currentStep: 0,
+      log: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const reassigned = { ...existing, assignedAgentId: "agent-002" };
+    const logEntry = vi.fn().mockResolvedValue(undefined);
+    (taskStore as unknown as { logEntry: typeof logEntry }).logEntry = logEntry;
+    vi.mocked(agentStore.getAgent).mockResolvedValue(agent);
+    vi.mocked(taskStore.findRecentTasksByContentFingerprint).mockResolvedValue([existing]);
+    vi.mocked(taskStore.updateTask).mockResolvedValue(reassigned);
+    vi.mocked(taskStore.moveTask).mockRejectedValue(
+      new TransitionRejectionError(
+        makeTransitionRejection("guard-rejected", "transition.rejected.forbiddenLifecyclePath", false, "F5"),
+        "Cannot move FN-duplicate-wip to 'todo': Forbidden lifecycle path",
+      ),
+    );
+
+    const result = await createDelegateTaskTool(agentStore, taskStore).execute("session-1", {
+      agent_id: "agent-002",
+      description: "Write tests",
+      mission_lineage: APPROVED_LINEAGE,
+    }, undefined as any, undefined as any, undefined as any);
+
+    expect(taskStore.updateTask).toHaveBeenCalledWith("FN-duplicate-wip", { assignedAgentId: "agent-002" });
+    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-duplicate-wip", "todo", { moveSource: "engine" });
+    expect(logEntry).toHaveBeenCalledWith("FN-duplicate-wip", "Delegation kept task in place", "todo (guard-rejected)");
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("Delegated to Rita (agent-002): Linked existing FN-duplicate-wip");
+    expect(result.isError).toBeFalsy();
+
+    // The routed task is reported in its original lane, with the new assignee.
+    const routed = await createAgentTask(taskStore, {
+      description: "Write tests",
+      mission_lineage: APPROVED_LINEAGE,
+      column: "todo",
+      assignedAgentId: "agent-002",
+    });
+    expect(routed.task).toMatchObject({ id: "FN-duplicate-wip", column: "in-progress", assignedAgentId: "agent-002" });
+  });
+
+  it("propagates a non-transition move failure when routing a duplicate canonical", async () => {
+    const existing = {
+      id: "FN-duplicate-broken",
+      description: "Write tests",
+      mission_lineage: APPROVED_LINEAGE,
+      dependencies: [],
+      column: "triage" as const,
+      assignedAgentId: "agent-001",
+      steps: [],
+      currentStep: 0,
+      log: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    vi.mocked(taskStore.findRecentTasksByContentFingerprint).mockResolvedValue([existing]);
+    vi.mocked(taskStore.updateTask).mockResolvedValue({ ...existing, assignedAgentId: "agent-002" });
+    vi.mocked(taskStore.moveTask).mockRejectedValue(new Error("database unavailable"));
+
+    await expect(createAgentTask(taskStore, {
+      description: "Write tests",
+      mission_lineage: APPROVED_LINEAGE,
+      column: "todo",
+      assignedAgentId: "agent-002",
+    })).rejects.toThrow("database unavailable");
   });
 
   it("does not mutate a same-owner duplicate canonical task", async () => {
@@ -918,7 +1001,7 @@ describe("createDelegateTaskTool", () => {
     expect(result.wasDuplicate).toBe(true);
     expect(result.task).toBe(moved);
     expect(taskStore.updateTask).toHaveBeenCalledWith("FN-old", { assignedAgentId: "agent-002" });
-    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-old", "todo");
+    expect(taskStore.moveTask).toHaveBeenCalledWith("FN-old", "todo", { moveSource: "engine" });
     /* FNXC:MissionAdmission 2026-07-23-17:20: post-create archival reconciliation must validate its returned canonical before duplicate success. */
     expect(validateDuplicateCanonical).toHaveBeenCalledWith(moved);
   });

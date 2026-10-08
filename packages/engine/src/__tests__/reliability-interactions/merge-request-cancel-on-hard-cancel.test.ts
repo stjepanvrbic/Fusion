@@ -13,7 +13,8 @@ describe("FN-5743 hard-cancel merge-request cutover", () => {
     const fixture = await makeReliabilityFixture();
     try {
       const { store, task } = fixture;
-      await store.moveTask(task.id, "todo");
+      // FNXC:LifecycleContainment 2026-10-08-06:02: KB-045 judges an absent source as engine; this fixture seed reopen names the exempt operator route.
+      await store.moveTask(task.id, "todo", { moveSource: "operator" });
       await store.moveTask(task.id, "in-progress");
       await store.handoffToReview(task.id, {
         ownerAgentId: "agent",

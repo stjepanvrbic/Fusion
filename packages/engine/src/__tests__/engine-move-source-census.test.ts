@@ -11,12 +11,16 @@ import { fileURLToPath } from "node:url";
  * slip past containment. A call may pass the source through an options object declared in the same
  * function (the identifier's literal must carry `moveSource`). The allowlist below is a shrinking list
  * of call sites owned by other in-flight changes; adding an entry needs a written owner and reason.
+ *
+ * FNXC:LifecycleContainment 2026-10-08-05:54:
+ * KB-045 flipped the absent source to fail closed: an optionless move is now judged as an engine move, not
+ * fail-open. Naming the source stays mandatory so every mover records a deliberate containment decision.
+ * agent-tools.ts and project/mesh-lease-manager.ts now name "engine" and left the allowlist; only the
+ * column-boundary wrapper, which is not a store call, remains.
  */
 const ENGINE_SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const ALLOWLIST: Record<string, string> = {
-  "agent-tools.ts": "agent/operator tool moves; owned by the cli-and-agent-boundary change",
-  "project/mesh-lease-manager.ts": "cross-node lease recovery rebound; needs mesh ownership semantics before it can stay in place",
   // `deps.moveTask` here is the graph boundary's own wrapper, not TaskStore.moveTask; it supplies the source.
   "workflows/workflow-column-boundary.ts": "graph column-boundary wrapper, not a store call",
 };

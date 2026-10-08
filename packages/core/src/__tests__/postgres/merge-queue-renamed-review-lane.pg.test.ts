@@ -75,7 +75,8 @@ pgDescribe("merge queue fills and drains on a renamed review lane", () => {
     */
     expect(await store.getMergeQueuedTaskIdsAsync()).toContain(task.id);
 
-    await store.moveTask(task.id, "building" as never, { bypassGuards: true } as never);
+    // FNXC:LifecycleContainment 2026-10-08-06:02: KB-045 judges an absent source as engine; this review -> WIP pull-back names the exempt operator route.
+    await store.moveTask(task.id, "building" as never, { bypassGuards: true, moveSource: "operator" } as never);
 
     /*
     Half two, and the one that fails independently: with dequeue on the literal, `previousColumn !==

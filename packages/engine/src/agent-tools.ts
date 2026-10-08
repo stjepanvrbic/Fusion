@@ -1329,8 +1329,23 @@ async function carryCanonicalTaskRouting(
   if (input.assignedAgentId !== canonical.assignedAgentId) {
     task = await store.updateTask(canonical.id, { assignedAgentId: input.assignedAgentId });
   }
+  /*
+  FNXC:LifecycleContainment 2026-10-08-05:52:
+  KB-045 decision for agent canonical routing. An agent is an automatic actor, so the move is an engine move judged by lifecycle containment, not an operator move.
+  Delegation requests the workflow's hold/ready lane, so a canonical still in intake moves forward as before.
+  A canonical already in WIP, review, or a terminal lane must not be pulled back to the ready lane: the store refuses that move, and only that typed refusal is absorbed here. The card stays in place, one task-log line names the refused target and rejection code, and the assignee update above still applies. Any other error propagates.
+  */
   if (input.column !== undefined && input.column !== task.column) {
-    task = await store.moveTask(task.id, input.column);
+    try {
+      task = await store.moveTask(task.id, input.column, { moveSource: "engine" });
+    } catch (error) {
+      if (!(error instanceof fusionCore.TransitionRejectionError)) throw error;
+      await store.logEntry(
+        task.id,
+        "Delegation kept task in place",
+        `${input.column} (${error.rejection.code})`,
+      );
+    }
   }
   return task;
 }

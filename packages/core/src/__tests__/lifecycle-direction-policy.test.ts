@@ -114,6 +114,20 @@ describe("workflow lifecycle direction", () => {
     expect(backwardFromWip("scheduler")?.messageKey).toBe("transition.rejected.forbiddenLifecyclePath");
   });
 
+  /*
+  FNXC:LifecycleContainment 2026-10-08-05:54:
+  KB-045 fails closed: an absent source is an automatic engine move, so the direction policy judges it.
+  */
+  it("judges an absent source as an engine move", () => {
+    expect(resolveDirectionPolicySource(undefined)).toBe("engine");
+    expect(resolveDirectionPolicySource("operator")).toBeUndefined();
+    expect(resolveDirectionPolicySource("user")).toBe("user");
+    const backwardFromWip = evaluateLifecycleDirectionPostcondition(policyInput({ countsTowardWip: true }, { hold: true }, {
+      moveSource: resolveDirectionPolicySource(undefined),
+    }));
+    expect(backwardFromWip?.messageKey).toBe("transition.rejected.forbiddenLifecyclePath");
+  });
+
   it("admits every retained reason only for its declared role pairs", () => {
     expect(isSanctionedEngineBackwardMove("plan-review-revise-replan", "wip", "hold")).toBe(true);
     for (const reason of ["code-review-revise-remediation", "verification-failure-remediation", "merge-fix-remediation", "merge-boundary-evidence-recovery"]) {

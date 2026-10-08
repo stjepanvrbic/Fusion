@@ -40,4 +40,33 @@ pgDescribe("operator move source (PostgreSQL)", () => {
 
     await expect(store.moveTask(task.id, "todo", { moveSource: "engine" })).rejects.toThrow(/Forbidden lifecycle path/);
   });
+
+  /*
+  FNXC:LifecycleContainment 2026-10-08-05:54:
+  KB-045 fails closed: a move that names no source is an automatic engine move, so the same backward path is refused,
+  while an explicit operator move still passes. A forward unsourced handoff to review is unaffected.
+  */
+  it("refuses an unsourced backward move from WIP while an operator move still passes", async () => {
+    const store = harness.store();
+    const task = await store.createTask({ description: "unsourced rebound target" });
+    await store.moveTask(task.id, "in-progress", { bypassGuards: true } as never);
+
+    await expect(store.moveTask(task.id, "todo")).rejects.toThrow(/Forbidden lifecycle path/);
+    store.taskCache.delete(task.id);
+    expect((await store.getTask(task.id)).column).toBe("in-progress");
+
+    const moved = await store.moveTask(task.id, "todo", { moveSource: "operator" });
+    expect(moved.column).toBe("todo");
+  });
+
+  it("still lands an unsourced handoff of a WIP card in review", async () => {
+    const store = harness.store();
+    const task = await store.createTask({ description: "unsourced handoff target" });
+    await store.moveTask(task.id, "in-progress", { bypassGuards: true } as never);
+
+    await store.handoffToReview(task.id, { ownerAgentId: null, evidence: { reason: "kb-045-unsourced-handoff" } });
+
+    store.taskCache.delete(task.id);
+    expect((await store.getTask(task.id)).column).toBe("in-review");
+  });
 });

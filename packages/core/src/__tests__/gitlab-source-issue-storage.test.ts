@@ -111,7 +111,8 @@ pgTest("TaskStore GitLab source issue storage", () => {
       const reopened = (await second.listTasks()).find((task) => task.description === "Disk GitLab");
       expect(reopened?.sourceIssue).toEqual(groupIssue);
 
-      await second.moveTask(reopened!.id, "todo");
+      // FNXC:LifecycleContainment 2026-10-08-06:02: KB-045 judges an absent source as engine, so this done -> todo reopen names the exempt operator route.
+      await second.moveTask(reopened!.id, "todo", { moveSource: "operator" });
       expect((await second.getTask(reopened!.id)).sourceIssue).toEqual(groupIssue);
 
       await second.archiveTask(reopened!.id, false);

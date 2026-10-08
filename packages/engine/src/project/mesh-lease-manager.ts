@@ -1,6 +1,14 @@
-import { resolveReboundTarget, resolveWorkflowIrForTask } from "@fusion/core";
+import {
+  classifyLifecycleDirection,
+  classifyLifecycleRole,
+  evaluateForbiddenLifecyclePath,
+  getTraitRegistry,
+  resolveReboundTarget,
+  resolveWorkflowIrForTask,
+} from "@fusion/core";
 import type {
   AgentStore,
+  WorkflowIr,
   CentralClaimStore,
   OwningNodeHandoffPolicy,
   RunMutationContext,
@@ -31,13 +39,12 @@ export interface LeaseRecoveryContext {
   preserveProgress?: boolean;
 }
 
-/*
-FNXC:WorkflowLifecycleColumns 2026-07-27-23:20 (Phase B / U5):
-The legacy rebound target — the builtin coding workflow's hold column. Used only
-when the task's workflow resolves to no column vocabulary at all, where the
-conservative choice is to preserve today's behavior exactly rather than guess.
-*/
-const LEGACY_REBOUND_COLUMN = "todo";
+/** Lifecycle role of a column in `ir`, or undefined when the column is unknown or trait-less. */
+function lifecycleRoleOf(ir: WorkflowIr, columnId: string) {
+  const columns = ir.version === "v2" ? ir.columns : [];
+  const column = columns.find((candidate) => candidate.id === columnId);
+  return column ? classifyLifecycleRole(getTraitRegistry().resolveColumnFlags(column)) : undefined;
+}
 
 export class MeshLeaseManager {
   constructor(private readonly options: MeshLeaseManagerOptions) {}
@@ -53,15 +60,26 @@ export class MeshLeaseManager {
   could disagree, which is how the audit came to claim a card landed in `todo`
   when the workflow has no such column.
 
-  Fail-soft: any resolution failure falls back to the legacy literal, since a
-  lease recovery must not be abandoned because a workflow lookup failed.
+  FNXC:LifecycleContainment 2026-10-08-05:45:
+  KB-045 decision. Lease recovery is not a revision, so it must stay in the card's current lifecycle role (FN-207).
+  The lease is always released, but the card moves to the rebound target only when that move is not backward and not a forbidden lifecycle path (for example F1 into an intake-only lane, or the F5 WIP→hold rebound).
+  Otherwise the card is recovered in place and the audit reports `lease-recovered-in-place` with the unchanged column.
+  A failed workflow lookup also recovers in place instead of guessing the legacy `todo` literal, since a lease recovery must not be abandoned and must not invent a backward route.
+  Trait-less roles keep the move, matching the direction policy, which does not judge them.
+  The only production caller (scheduler dispatch of a stale todo lease) operates on hold-column cards, which already sit in the rebound target and never move.
   */
-  private async resolveReboundColumn(taskId: string): Promise<string> {
+  private async resolveReboundColumn(task: Task): Promise<string> {
     try {
-      const ir = await resolveWorkflowIrForTask(this.options.taskStore, taskId);
-      return resolveReboundTarget(ir) ?? LEGACY_REBOUND_COLUMN;
+      const ir = await resolveWorkflowIrForTask(this.options.taskStore, task.id);
+      const target = resolveReboundTarget(ir);
+      if (!target || target === task.column) return task.column;
+      const fromRole = lifecycleRoleOf(ir, task.column);
+      const toRole = lifecycleRoleOf(ir, target);
+      if (classifyLifecycleDirection(fromRole, toRole) === "backward") return task.column;
+      if (evaluateForbiddenLifecyclePath(fromRole, toRole)) return task.column;
+      return target;
     } catch {
-      return LEGACY_REBOUND_COLUMN;
+      return task.column;
     }
   }
 
@@ -183,6 +201,7 @@ export class MeshLeaseManager {
     );
     if (task.column !== reboundColumn) {
       await this.options.taskStore.moveTask(task.id, reboundColumn, {
+        moveSource: "engine",
         preserveProgress:
           context.preserveProgress ??
           (task.currentStep > 0 || task.steps.some((step) => step.status !== "pending")),
@@ -486,7 +505,7 @@ export class MeshLeaseManager {
     Resolved once here so the move below and the unreachable audit further down
     report the SAME column. Two independent resolutions could disagree.
     */
-    const reboundColumn = await this.resolveReboundColumn(task.id);
+    const reboundColumn = await this.resolveReboundColumn(task);
 
     try {
       await this.clearLocalLease(task, `${reason} (${stale.reason ?? "stale"})`, context, nextEpoch, reboundColumn);

@@ -5,6 +5,11 @@
  * Migrated from `createSharedTaskStoreTestHarness` (SQLite) to
  * `createSharedPgTaskStoreTestHarness`. Validates that moveTask preserveStatus
  * semantics work identically against PostgreSQL backend mode.
+ *
+ * FNXC:LifecycleContainment 2026-10-08-06:02:
+ * KB-045 judges an absent move source as an automatic engine move, so the backward
+ * reopens under test name the `operator` source, which keeps the legacy absent-route
+ * semantics (recorded as engine, guards kept) while staying exempt from FN-207 containment.
  */
 import { afterEach, beforeEach, describe, expect, it, beforeAll, afterAll } from "vitest";
 import {
@@ -35,7 +40,7 @@ pgTest("TaskStore moveTask preserveStatus (PostgreSQL)", () => {
       error: "boom",
     });
 
-    const moved = await store.moveTask(task.id, "todo");
+    const moved = await store.moveTask(task.id, "todo", { moveSource: "operator" });
     expect(moved.status).toBeUndefined();
     expect(moved.error).toBeUndefined();
   });
@@ -50,7 +55,7 @@ pgTest("TaskStore moveTask preserveStatus (PostgreSQL)", () => {
       error: "branch conflict",
     });
 
-    const moved = await store.moveTask(task.id, "todo", { preserveStatus: true });
+    const moved = await store.moveTask(task.id, "todo", { preserveStatus: true, moveSource: "operator" });
     expect(moved.status).toBe("failed");
     expect(moved.error).toBe("branch conflict");
   });
@@ -66,7 +71,7 @@ pgTest("TaskStore moveTask preserveStatus (PostgreSQL)", () => {
       error: "recovery exhausted",
     });
 
-    const moved = await store.moveTask(task.id, "todo", { preserveStatus: true });
+    const moved = await store.moveTask(task.id, "todo", { preserveStatus: true, moveSource: "operator" });
     expect(moved.status).toBe("failed");
     expect(moved.error).toBe("recovery exhausted");
   });

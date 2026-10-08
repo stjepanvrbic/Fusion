@@ -21,6 +21,9 @@ These tests were written against the literal implementation and observed
 FAILING first. The rebound target is the KTD-10 `resolveReboundTarget` ordering
 (hold → intake → first column) already used by self-healing.ts:714, not a new
 rule invented here.
+
+FNXC:LifecycleContainment 2026-10-08-05:45:
+KB-045 keeps lease recovery in the card's current lifecycle role: a WIP card is recovered in place (WIP→hold is F5), an unresolvable workflow recovers in place instead of guessing `todo`, and only a forward move (for example intake→hold) still rebounds, as an engine move.
 */
 import { describe, expect, it, vi } from "vitest";
 import type { RunAuditEventInput, Task, TaskStore, WorkflowIr } from "@fusion/core";
@@ -114,31 +117,29 @@ function harness(currentTask: Task, ir: WorkflowIr | undefined) {
 }
 
 describe("MeshLeaseManager lease rebound under a renamed column vocabulary", () => {
-  it("rebounds an abandoned lease to the workflow's HOLD column, not the literal todo", async () => {
+  it("recovers an abandoned WIP lease in place instead of stepping back to the renamed hold column", async () => {
     const current = task({ column: "building" });
     const h = harness(current, renamedIr());
 
     const ok = await h.manager.recoverAbandonedLease("FN-1", "stale lease");
 
     expect(ok).toBe(true);
-    // The failure this pins: the card was previously shoved into a column id the
-    // workflow does not define.
-    expect(h.moveTask).toHaveBeenCalledWith("FN-1", "drafting", expect.any(Object));
-    expect(h.moveTask).not.toHaveBeenCalledWith("FN-1", "todo", expect.any(Object));
+    // KB-045: WIP→hold is a backward F5 move and lease recovery is not a revision.
+    expect(h.moveTask).not.toHaveBeenCalled();
   });
 
-  it("records the column it ACTUALLY rebounded to in the unreachable audit", async () => {
+  it("records the column the card ACTUALLY stayed in for an in-place WIP recovery", async () => {
     const current = task({ column: "building" });
     const h = harness(current, renamedIr());
 
     await h.manager.recoverAbandonedLease("FN-1", "stale lease");
 
-    /* The audit is the only post-hoc record of a lease recovery; asserting
-       `todo` when the move went elsewhere makes it actively misleading. */
+    /* The audit is the only post-hoc record of a lease recovery; it must name
+       the column the card is really in. */
     expect(h.unreachableEvent()?.metadata).toMatchObject({
       previousColumn: "building",
-      newColumn: "drafting",
-      decisionPath: "lease-recovered-to-todo",
+      newColumn: "building",
+      decisionPath: "lease-recovered-in-place",
     });
   });
 
@@ -156,43 +157,81 @@ describe("MeshLeaseManager lease rebound under a renamed column vocabulary", () 
     });
   });
 
-  it("falls back to the hold column when the card sits in intake", async () => {
+  it("moves an intake card forward to the renamed hold column as an engine move", async () => {
     /* Intake is not the rebound target — KTD-10 prefers hold, and only falls
-       back to intake when the workflow declares no hold column. */
+       back to intake when the workflow declares no hold column. Intake→hold is
+       forward, so the move stays. */
     const current = task({ column: "inbox" });
     const h = harness(current, renamedIr());
 
     await h.manager.recoverAbandonedLease("FN-1", "stale lease");
 
-    expect(h.moveTask).toHaveBeenCalledWith("FN-1", "drafting", expect.any(Object));
+    expect(h.moveTask).toHaveBeenCalledWith("FN-1", "drafting", expect.objectContaining({ moveSource: "engine" }));
+    expect(h.moveTask).not.toHaveBeenCalledWith("FN-1", "todo", expect.any(Object));
+    expect(h.unreachableEvent()?.metadata).toMatchObject({
+      previousColumn: "inbox",
+      newColumn: "drafting",
+      decisionPath: "lease-recovered-to-todo",
+    });
   });
 
-  it("keeps the legacy todo target when the workflow cannot be resolved", async () => {
-    /* Conservative fallback: an unresolvable workflow must behave exactly as it
-       did before this conversion rather than guess. */
+  it("recovers in place when the workflow cannot be resolved", async () => {
+    /* KB-045: an unresolvable workflow must not invent the legacy todo route,
+       which would be a backward move for a WIP card. */
     const current = task({ column: "in-progress" });
     const h = harness(current, undefined);
 
     await h.manager.recoverAbandonedLease("FN-1", "stale lease");
 
-    expect(h.moveTask).toHaveBeenCalledWith("FN-1", "todo", expect.any(Object));
+    expect(h.moveTask).not.toHaveBeenCalled();
     expect(h.unreachableEvent()?.metadata).toMatchObject({
-      newColumn: "todo",
-      decisionPath: "lease-recovered-to-todo",
+      newColumn: "in-progress",
+      decisionPath: "lease-recovered-in-place",
     });
   });
 
-  it("is byte-identical for the builtin coding workflow (regression floor)", async () => {
+  it("recovers a WIP card in place when the workflow selection read throws", async () => {
+    /* The resolver degrades a throwing selection read to the default coding IR;
+       the WIP card must still stay put rather than rebound to its todo lane. */
+    const current = task({ column: "in-progress" });
+    const h = harness(current, renamedIr());
+    const failingStore = (h.manager as unknown as { options: { taskStore: Record<string, unknown> } }).options.taskStore;
+    failingStore.getTaskWorkflowSelectionAsync = vi.fn(async () => {
+      throw new Error("selection read failed");
+    });
+    failingStore.getTaskWorkflowSelection = vi.fn(() => {
+      throw new Error("selection read failed");
+    });
+
+    await h.manager.recoverAbandonedLease("FN-1", "stale lease");
+
+    expect(h.moveTask).not.toHaveBeenCalled();
+    expect(h.unreachableEvent()?.metadata).toMatchObject({
+      newColumn: "in-progress",
+      decisionPath: "lease-recovered-in-place",
+    });
+  });
+
+  it("keeps a builtin-coding WIP card in place (regression floor)", async () => {
     const current = task({ column: "in-progress" });
     const h = harness(current, defaultIr());
 
     await h.manager.recoverAbandonedLease("FN-1", "stale lease");
 
-    expect(h.moveTask).toHaveBeenCalledWith("FN-1", "todo", expect.any(Object));
+    expect(h.moveTask).not.toHaveBeenCalled();
     expect(h.unreachableEvent()?.metadata).toMatchObject({
       previousColumn: "in-progress",
-      newColumn: "todo",
-      decisionPath: "lease-recovered-to-todo",
+      newColumn: "in-progress",
+      decisionPath: "lease-recovered-in-place",
     });
+  });
+
+  it("moves a builtin-coding intake card forward to todo as an engine move", async () => {
+    const current = task({ column: "triage" });
+    const h = harness(current, defaultIr());
+
+    await h.manager.recoverAbandonedLease("FN-1", "stale lease");
+
+    expect(h.moveTask).toHaveBeenCalledWith("FN-1", "todo", expect.objectContaining({ moveSource: "engine" }));
   });
 });
