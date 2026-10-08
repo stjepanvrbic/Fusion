@@ -326,6 +326,11 @@ describe("worktrees-off is structural: no unaudited maxWorktrees bound", () => {
     FNXC:WorktreeCapacity 2026-10-08-08:29:
     The shared builder is now `projectCapacityAdmissionLimits`, which carries both ceilings (running agents, and worktrees including
     frozen external-block checkouts). The four top-level admission owners must all use it.
+
+    FNXC:WorktreeCapacity 2026-10-08-17:10:
+    The fifth owner is the synchronous operator-Retry resume of an external-block freeze (`admitOperatorResumeNow` in
+    external-block-lifecycle.ts). It reserves through the coordinator with the same shared builder, so worktrees-off still builds no
+    worktree ceiling there.
     */
     const { execFileSync } = await import("node:child_process");
     const { resolve } = await import("node:path");
@@ -339,6 +344,7 @@ describe("worktrees-off is structural: no unaudited maxWorktrees bound", () => {
 
     expect([...owners].sort()).toEqual([
       "packages/engine/src/concurrency/concurrency.ts",
+      "packages/engine/src/external-block/external-block-lifecycle.ts",
       "packages/engine/src/project-engine.ts",
       "packages/engine/src/runtimes/in-process-runtime.ts",
       "packages/engine/src/scheduler.ts",
