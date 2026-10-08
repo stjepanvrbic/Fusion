@@ -59,6 +59,9 @@ TWO REFINEMENTS to the above, both measured rather than argued.
 The first site is deliberately left: wiring a parameter into a function nothing calls would be an
 unwired parameter, which is the anti-pattern the caller audit (#2803) removed five of.
 
+FNXC:WorkflowScheduling 2026-10-08-13:51:
+The call-site table above is historical. A third classifier caller now exists: the production continuation admission provider `listContinuationAdmissionCandidates` (628231a55), which threads resolved terminal columns like the drain. The AUDIT case pins all three sites by enclosing function.
+
 LANE. `.pg.test.ts`, skipped via `pgDescribe` when no PostgreSQL is reachable, so the merge gate is
 unaffected. Throwaway per-file database; never port 4040.
 */
@@ -254,6 +257,11 @@ pgDescribe("planning-continuation terminal columns, measured on a live store", (
     The separate classifier census above deliberately retains the remaining unthreaded drain call.
     A legacy-only predicate call would make a renamed completed lane dispatchable again, so retain
     this structural census alongside the live behavioral cases.
+
+    FNXC:WorkflowScheduling 2026-10-08-13:51:
+    Correction to the note above: the drain is threaded, not unthreaded.
+    The classifier census pins three sites by enclosing function: `drainDuePlanningContinuations` and the continuation admission provider `listContinuationAdmissionCandidates` (added in 628231a55) both pass resolved terminal columns.
+    The only unthreaded classifier call is the unwired `selectActionablePlanningContinuations` helper, which is what CONTROL and CHARACTERIZATION exercise.
     */
     const innerCalls = callArguments("isPlanningContinuationTaskDispatchable");
     expect(innerCalls).toHaveLength(2);
