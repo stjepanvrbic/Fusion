@@ -120,6 +120,7 @@ export function buildResetTask(
     planReviewReplanCount: 0,
     recoveryRetryCount: undefined,
     sessionContentionHoldCount: 0,
+    externalBlockAutoResumeCount: 0,
     sessionContentionWaitReason: undefined,
     taskDoneRetryCount: 0,
     bulkCompletionRefusalAt: undefined,

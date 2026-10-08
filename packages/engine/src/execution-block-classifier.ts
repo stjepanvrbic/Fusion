@@ -1,5 +1,5 @@
 import type { TaskExternalBlockOrigin } from "@fusion/core";
-import { isUsageLimitError } from "./errors/usage-limit-detector.js";
+import { isBillingOrQuotaError, isUsageLimitError } from "./errors/usage-limit-detector.js";
 import {
   isOperatorActionableAgentError,
   isTransientAuthCredentialError,
@@ -65,7 +65,14 @@ export function classifyExternalObstacle(message: string): ExternalObstacleClass
   }
   if (/socket hang up/i.test(normalized)) return { origin: "network", code: "SOCKET_HANG_UP" };
   if (isTransientAuthCredentialError(normalized)) return undefined;
-  if (isUsageLimitError(normalized)) return { origin: "model-provider", code: "USAGE_LIMIT" };
+  /*
+  FNXC:ExternalBlockAutoResume 2026-10-08-08:29:
+  RATE_LIMIT is the only transient freeze code (automatic resume with backoff); USAGE_LIMIT now means quota, billing, or credit
+  exhaustion, which stays frozen until an operator acts.
+  */
+  if (isUsageLimitError(normalized)) {
+    return { origin: "model-provider", code: isBillingOrQuotaError(normalized) ? "USAGE_LIMIT" : "RATE_LIMIT" };
+  }
   if (isOperatorActionableAgentError(normalized)) return { origin: "credentials", code: "CREDENTIALS" };
   return undefined;
 }

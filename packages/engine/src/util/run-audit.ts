@@ -590,7 +590,13 @@ export type DatabaseMutationType =
   | "task:checkout"
   /* FNXC:ExternalBlock 2026-08-28-04:08: external-block telemetry contains ids and fixed classifications only; raw obstacle prose stays on the task. */
   | "task:external-block-parked"
+  /** Metadata: { taskId, origin, code, source, column, resumeNodeId, trigger }; emitted when admission clears the freeze for a resumed run. */
   | "task:external-block-cleared"
+  /* FNXC:ExternalBlockAutoResume 2026-10-08-08:29: automatic resume of a transient freeze; ids/counts/fixed outcomes only. */
+  /** Metadata: { taskId, code, attempt, budget, delayMs, outcome: "scheduled" | "budget-exhausted" } */
+  | "task:external-block-auto-resume-scheduled"
+  /** Metadata: { taskId, origin, code, attempt, budget, column, resumeNodeId } */
+  | "task:external-block-auto-resume-executed"
   /** Metadata: { taskId, column, trigger, outcome, completedStepCount } */
   | "task:step-session-abort-contained"
   /** Metadata: { taskId, artifactKeys, owner, source, action, attempt, maxAttempts, nodeId? } */
@@ -1110,7 +1116,7 @@ export type DatabaseMutationType =
    * (`allowsAutoMergeProcessing`). Emitted at most once per
    * (taskId, withheld reason) transition — not on every poll while the
    * withheld state persists unchanged.
-   * Metadata: { taskId: string; reason: "user-paused" | "auto-merge-off-human-review"; stage?: string; oversightLevel?: string }
+   * Metadata: { taskId: string; reason: "user-paused" | "approval-blocked" | "external-block" | "auto-merge-off-human-review"; stage?: string; oversightLevel?: string }
    */
   | "overseer:oversight-withheld-human-control"
   /**

@@ -2,9 +2,11 @@ import {
   compareTaskIdNumeric,
   countRunningAgentTasks,
   enrichRunningAgentTaskShape,
+  isExternallyFrozenCheckoutHolder,
   isRunningAgentTask,
   resolveEffectiveConcurrency,
   resolveWorkflowIrForTask,
+  type ConcurrencySettingsInput,
   type Task,
   type WorkflowIrResolverStore,
 } from "@fusion/core";
@@ -21,17 +23,14 @@ export const PRIORITY_SPECIFY = 0;
 
 /*
 FNXC:WorktreeCapacity 2026-08-01-04:38:
-Agent concurrency and worktree capacity count the same canonical live-task
-population. Collapse them to one project admission ceiling so planning, execute,
-and merge cannot each observe and claim the final worktree slot independently.
+Agent concurrency and worktree capacity are judged inside one serialized project admission pass so planning, execute, and merge
+cannot each observe and claim the final slot independently.
+
+FNXC:WorktreeCapacity 2026-10-08-08:29:
+The single collapsed ceiling (`resolveActiveTaskCapacityLimit`, min of the two knobs over one population) is deleted: a frozen
+external-block park holds a checkout but no running agent, so the knobs now count different populations. Admission owners build both
+ceilings through `projectCapacityAdmissionLimits` below.
 */
-export function resolveActiveTaskCapacityLimit(params: {
-  maxConcurrent?: unknown;
-  maxWorktrees?: unknown;
-  worktreeLimitEnabled?: unknown;
-}): number {
-  return resolveEffectiveConcurrency(params).effectiveLimit;
-}
 
 /**
  * FNXC:WorktreeCapacity 2026-08-08-04:27:
@@ -39,18 +38,105 @@ export function resolveActiveTaskCapacityLimit(params: {
  * shared live-task ceiling is full. Retained directories are not holders: report only canonical
  * live task IDs, and name `maxWorktrees` only when it is the binding configured ceiling.
  */
+/*
+FNXC:WorktreeCapacity 2026-10-08-08:29:
+Two populations, one diagnostic. `claimed`/`holderTaskIds` are the running-agent population (maxConcurrent); frozen external-block
+parks that retain a checkout are `checkoutOnlyHolderTaskIds` and count only toward maxWorktrees. The reason names the knob that is
+actually exhausted and that knob's holders, so a frozen card is never reported as holding a running-agent slot.
+With no frozen card the output is byte-identical to the single-ceiling form.
+*/
 export function formatAdmissionCapacityQueuedReason(params: {
   maxConcurrent: number;
   maxWorktrees: number;
   worktreeLimitEnabled?: boolean;
   claimed: number;
   holderTaskIds: Iterable<string>;
+  checkoutOnlyHolderTaskIds?: Iterable<string>;
 }): string {
   const concurrency = resolveEffectiveConcurrency(params);
-  const limit = concurrency.effectiveLimit;
-  const gate = concurrency.bindingKnob;
-  const holders = [...new Set(params.holderTaskIds)].sort();
-  return `queued — ${gate} capacity exhausted: used=${params.claimed}/${limit}; effectiveLimit=${limit}; bindingKnob=${gate}; holders=${holders.join(",") || "none"}`;
+  const running = [...new Set(params.holderTaskIds)];
+  const runningIds = new Set(running);
+  const checkoutOnly = [...new Set(params.checkoutOnlyHolderTaskIds ?? [])].filter((id) => !runningIds.has(id));
+  const worktreeLimit = concurrency.worktreeLimit;
+  const worktreeUsed = params.claimed + checkoutOnly.length;
+  const worktreeExhausted = worktreeLimit !== null && worktreeUsed >= worktreeLimit;
+  const runningExhausted = params.claimed >= concurrency.maxConcurrent;
+  if (!worktreeExhausted && !runningExhausted) {
+    // Neither knob is full: keep the single-ceiling wording for callers that format without a fresh exhaustion proof.
+    const limit = concurrency.effectiveLimit;
+    const gate = concurrency.bindingKnob;
+    return `queued — ${gate} capacity exhausted: used=${params.claimed}/${limit}; effectiveLimit=${limit}; bindingKnob=${gate}; holders=${running.sort().join(",") || "none"}`;
+  }
+  const reportWorktrees = worktreeExhausted && (concurrency.bindingKnob === "maxWorktrees" || !runningExhausted);
+  const gate = reportWorktrees ? "maxWorktrees" : "maxConcurrent";
+  const limit = reportWorktrees ? worktreeLimit! : concurrency.maxConcurrent;
+  const used = reportWorktrees ? worktreeUsed : params.claimed;
+  const holders = (reportWorktrees ? [...running, ...checkoutOnly] : running).sort();
+  return `queued — ${gate} capacity exhausted: used=${used}/${limit}; effectiveLimit=${limit}; bindingKnob=${gate}; holders=${holders.join(",") || "none"}`;
+}
+
+/** The canonical capacity populations, read from one trait-enriched pass over the board. */
+export interface ProjectCapacityHolders {
+  /** Live top-level agents: the maxConcurrent population. */
+  runningTaskIds: string[];
+  /** Frozen external-block parks that retain a checkout: maxWorktrees occupants that hold no running-agent slot. */
+  checkoutOnlyHolderTaskIds: string[];
+}
+
+/** Worktree dimension of project admission; absent when worktrees are not a capacity dimension. */
+export interface WorktreeAdmissionCapacity {
+  limit: number;
+  checkoutOnlyHolderTaskIds: () => Promise<Iterable<string>> | Iterable<string>;
+}
+
+/*
+FNXC:WorktreeCapacity 2026-10-08-08:29:
+Every production admission owner builds its coordinator ceilings here, so planning, execute, review, and continuation lanes cannot
+disagree about which population each knob counts. maxConcurrent binds on running agents; maxWorktrees (when enabled) also counts
+frozen checkouts. The holder read is lazy and shared, so the coordinator still reads one fresh snapshot inside its serialized drain.
+*/
+export function projectCapacityAdmissionLimits(
+  settings: ConcurrencySettingsInput,
+  getHolders: () => Promise<ProjectCapacityHolders>,
+): {
+  maxConcurrent: number;
+  claimed: () => Promise<number>;
+  claimedTaskIds: () => Promise<string[]>;
+  worktreeCapacity?: WorktreeAdmissionCapacity;
+} {
+  const { maxConcurrent, worktreeLimit } = resolveEffectiveConcurrency(settings);
+  return {
+    maxConcurrent,
+    claimed: async () => (await getHolders()).runningTaskIds.length,
+    claimedTaskIds: async () => (await getHolders()).runningTaskIds,
+    ...(worktreeLimit === null
+      ? {}
+      : { worktreeCapacity: { limit: worktreeLimit, checkoutOnlyHolderTaskIds: async () => (await getHolders()).checkoutOnlyHolderTaskIds } }),
+  };
+}
+
+/**
+ * Whether a fresh holder snapshot exhausts either knob, and the operator-facing reason. Callers log the reason only when
+ * `exhausted`, after the coordinator admitted nobody, so a lost priority race is never reported as a full cap.
+ */
+export function evaluateProjectCapacity(
+  settings: ConcurrencySettingsInput,
+  params: { claimed: number; runningTaskIds: Iterable<string>; checkoutOnlyHolderTaskIds?: Iterable<string> },
+): { exhausted: boolean; reason: string } {
+  const concurrency = resolveEffectiveConcurrency(settings);
+  const running = new Set(params.runningTaskIds);
+  const checkoutOnly = [...new Set(params.checkoutOnlyHolderTaskIds ?? [])].filter((id) => !running.has(id));
+  const exhausted = params.claimed >= concurrency.maxConcurrent
+    || (concurrency.worktreeLimit !== null && params.claimed + checkoutOnly.length >= concurrency.worktreeLimit);
+  const reason = formatAdmissionCapacityQueuedReason({
+    maxConcurrent: concurrency.maxConcurrent,
+    maxWorktrees: concurrency.worktreeLimit ?? concurrency.maxConcurrent,
+    worktreeLimitEnabled: concurrency.worktreeLimit !== null,
+    claimed: params.claimed,
+    holderTaskIds: running,
+    checkoutOnlyHolderTaskIds: checkoutOnly,
+  });
+  return { exhausted, reason };
 }
 
 /** Lifecycle lanes ordered by the project admission coordinator. */
@@ -180,20 +266,16 @@ export class ProjectAdmissionCoordinator {
   every merge was deferred until a restart cleared the in-memory reservations.
   A claimed holder WITHOUT a reservation is deliberately not exempt: its slot belongs to an agent already running in another lane, and
   exempting it would let, say, planning start a second agent on a card whose review gate is live.
-  */
-  private async occupiedCountFor(
-    params: { projectId: string; claimed: () => Promise<number> | number; claimedTaskIds?: () => Promise<Iterable<string>> | Iterable<string> },
-  ): Promise<(taskId: string) => number> {
-    const snapshot = await this.occupiedCount(params);
-    // A reservation is counted exactly once, as a claimed holder or as a pending reservation, so excluding it removes one.
-    return (taskId) => snapshot.occupied - (snapshot.reservations.has(taskId) ? 1 : 0);
-  }
 
-  private async occupiedCount(params: {
+  FNXC:WorktreeCapacity 2026-10-08-10:05:
+  The same-slot discount applies to both admission dimensions: `runningFor` is the running occupancy without the candidate's own
+  reservation, and the per-candidate worktree check starts from that same number.
+  */
+  private async occupancy(params: {
     projectId: string;
     claimed: () => Promise<number> | number;
     claimedTaskIds?: () => Promise<Iterable<string>> | Iterable<string>;
-  }): Promise<{ occupied: number; reservations: ReadonlySet<string>; claimedIds?: ReadonlySet<string> }> {
+  }): Promise<{ running: number; reservations: ReadonlySet<string>; runningFor: (taskId: string) => number }> {
     /*
     FNXC:ConcurrencyAdmission 2026-08-01-07:35:
     A durable handoff can release its in-memory reservation while an asynchronous task snapshot is
@@ -205,14 +287,47 @@ export class ProjectAdmissionCoordinator {
     const reservations = new Set(this.reservations.get(params.projectId) ?? []);
     const claimed = await params.claimed();
     for (const taskId of this.reservations.get(params.projectId) ?? []) reservations.add(taskId);
-    if (!params.claimedTaskIds) return { occupied: claimed + reservations.size, reservations };
+    if (!params.claimedTaskIds) {
+      const running = claimed + reservations.size;
+      return { running, reservations, runningFor: (taskId) => running - (reservations.has(taskId) ? 1 : 0) };
+    }
     const claimedIds = new Set(await params.claimedTaskIds());
     for (const taskId of this.reservations.get(params.projectId) ?? []) reservations.add(taskId);
     let pendingReservations = 0;
     for (const taskId of reservations) {
       if (!claimedIds.has(taskId)) pendingReservations += 1;
     }
-    return { occupied: claimed + pendingReservations, reservations, claimedIds };
+    const running = claimed + pendingReservations;
+    // A reservation is counted exactly once, as a claimed holder or as a pending reservation, so excluding it removes one.
+    return { running, reservations, runningFor: (taskId) => running - (reservations.has(taskId) ? 1 : 0) };
+  }
+
+  /*
+  FNXC:WorktreeCapacity 2026-10-08-08:29:
+  The worktree dimension is judged per candidate. After admitting `taskId` the worktree population is the running occupancy plus the
+  new card plus every frozen checkout not already reserved; a candidate that is itself a frozen checkout reuses its own worktree.
+  So a resumed frozen card can re-enter at a full worktree cap it already counts toward, while a card needing a new worktree cannot.
+  `runningWithoutCandidate` excludes the candidate's own reservation, so a same-slot handoff never needs a second worktree either.
+  */
+  private static worktreeAdmits(
+    capacity: { limit: number; checkoutOnly: ReadonlySet<string> } | undefined,
+    runningWithoutCandidate: number,
+    reservations: ReadonlySet<string>,
+    taskId: string,
+  ): boolean {
+    if (!capacity) return true;
+    let unreservedCheckouts = 0;
+    for (const id of capacity.checkoutOnly) {
+      if (id !== taskId && !reservations.has(id)) unreservedCheckouts += 1;
+    }
+    return runningWithoutCandidate + unreservedCheckouts < capacity.limit;
+  }
+
+  private static async readWorktreeCapacity(
+    capacity: WorktreeAdmissionCapacity | undefined,
+  ): Promise<{ limit: number; checkoutOnly: ReadonlySet<string> } | undefined> {
+    if (!capacity) return undefined;
+    return { limit: capacity.limit, checkoutOnly: new Set(await capacity.checkoutOnlyHolderTaskIds()) };
   }
 
   /**
@@ -226,6 +341,7 @@ export class ProjectAdmissionCoordinator {
     maxConcurrent: number;
     claimed: () => Promise<number> | number;
     claimedTaskIds?: () => Promise<Iterable<string>> | Iterable<string>;
+    worktreeCapacity?: WorktreeAdmissionCapacity;
   }): Promise<boolean> {
     const existing = this.draining.get(params.projectId);
     if (existing) await existing;
@@ -236,7 +352,11 @@ export class ProjectAdmissionCoordinator {
         reserved = true;
         return;
       }
-      if ((await this.occupiedCountFor(params))(params.taskId) >= params.maxConcurrent) return;
+      const { runningFor, reservations } = await this.occupancy(params);
+      const runningWithoutCandidate = runningFor(params.taskId);
+      if (runningWithoutCandidate >= params.maxConcurrent) return;
+      const worktrees = await ProjectAdmissionCoordinator.readWorktreeCapacity(params.worktreeCapacity);
+      if (!ProjectAdmissionCoordinator.worktreeAdmits(worktrees, runningWithoutCandidate, reservations, params.taskId)) return;
       this.reserve(params.projectId, params.taskId);
       reserved = true;
     })();
@@ -267,6 +387,8 @@ export class ProjectAdmissionCoordinator {
     claimed: () => Promise<number> | number;
     /** Canonically live task ids, used to de-duplicate reservations after persistence catches up. */
     claimedTaskIds?: () => Promise<Iterable<string>> | Iterable<string>;
+    /** Second ceiling: maxWorktrees over running agents plus frozen checkouts; absent when worktrees are not a capacity dimension. */
+    worktreeCapacity?: WorktreeAdmissionCapacity;
     /** One-shot source for callers that do not hold a durable lane registration. */
     refresh?: () => Promise<AdmissionCandidate[]>;
     semaphore?: Pick<AgentSemaphore, "tryAcquire" | "release">;
@@ -286,7 +408,8 @@ export class ProjectAdmissionCoordinator {
       // Persisted task rows lag a fire-and-forget lane start, so omitting these
       // reservations lets a second coordinator pass over-admit one project.
       if (candidates.length === 0) return;
-      const occupiedFor = await this.occupiedCountFor(params);
+      const { runningFor, reservations } = await this.occupancy(params);
+      const worktrees = await ProjectAdmissionCoordinator.readWorktreeCapacity(params.worktreeCapacity);
       // Older test/runtime semaphore wrappers predate tryAcquire. They still
       // exercise project admission, while production semaphores atomically take
       // the host slot here.
@@ -309,8 +432,11 @@ export class ProjectAdmissionCoordinator {
       this function exists to prevent.
       */
       for (const winner of candidates) {
-        // Same-slot handoffs are measured without their own claim; everyone else needs a genuinely free slot.
-        if (occupiedFor(winner.taskId) >= params.maxConcurrent) continue;
+        // Same-slot handoffs are measured without their own reservation; everyone else needs a genuinely free slot.
+        const runningWithoutCandidate = runningFor(winner.taskId);
+        if (runningWithoutCandidate >= params.maxConcurrent) continue;
+        // A candidate needing a new worktree cannot take a slot a frozen checkout still holds; a frozen card's own resume can.
+        if (!ProjectAdmissionCoordinator.worktreeAdmits(worktrees, runningWithoutCandidate, reservations, winner.taskId)) continue;
         const reusedReservation = this.reservations.get(params.projectId)?.has(winner.taskId) === true;
         const acquiredHostSlot = hasReservableHostSlot
           ? params.semaphore!.tryAcquire()
@@ -544,12 +670,23 @@ async function enrichedTopLevelAgentTasksFromStore(store: WorkflowIrResolverStor
 }
 
 export async function persistedTopLevelAgentTaskIdsFromStore(store: WorkflowIrResolverStore, tasks: Task[]): Promise<string[]> {
+  return (await projectCapacityHoldersFromStore(store, tasks)).runningTaskIds;
+}
+
+/*
+FNXC:WorktreeCapacity 2026-10-08-08:29:
+One enrichment pass yields both capacity populations. A frozen external-block park is identified by its durable marker, never by
+status text, and appears only in `checkoutOnlyHolderTaskIds` while it retains a checkout.
+*/
+export async function projectCapacityHoldersFromStore(store: WorkflowIrResolverStore, tasks: Task[]): Promise<ProjectCapacityHolders> {
   const enriched = await enrichedTopLevelAgentTasksFromStore(store, tasks);
-  const ids: string[] = [];
+  const runningTaskIds: string[] = [];
+  const checkoutOnlyHolderTaskIds: string[] = [];
   for (const task of enriched) {
-    if (isRunningAgentTask(task)) ids.push(task.id);
+    if (isRunningAgentTask(task)) runningTaskIds.push(task.id);
+    else if (isExternallyFrozenCheckoutHolder(task)) checkoutOnlyHolderTaskIds.push(task.id);
   }
-  return ids;
+  return { runningTaskIds, checkoutOnlyHolderTaskIds };
 }
 
 export async function persistedTopLevelAgentSlotsFromStore(store: WorkflowIrResolverStore, tasks: Task[]): Promise<number> {

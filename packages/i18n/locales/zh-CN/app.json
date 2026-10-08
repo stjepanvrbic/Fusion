@@ -8664,7 +8664,9 @@
       "explain": "解释此错误",
       "explainPrompt": "请解释错误 {{error}} 及其解决方法。",
       "resuming": "正在恢复…",
-      "retry": "重试"
+      "retry": "重试",
+      "autoResumeScheduled": "自动重试 {{attempt}}/{{budget}}，时间 {{time}}",
+      "waitingForSlot": "正在等待空闲的智能体槽位…"
     },
     "branch": "分支",
     "branchMetadata": "分支元数据",

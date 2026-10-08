@@ -8664,7 +8664,9 @@
       "explain": "解釋此錯誤",
       "explainPrompt": "請解釋錯誤 {{error}} 及其解決方法。",
       "resuming": "正在恢復…",
-      "retry": "重試"
+      "retry": "重試",
+      "autoResumeScheduled": "自動重試 {{attempt}}/{{budget}}，時間 {{time}}",
+      "waitingForSlot": "正在等待空閒的代理程式槽位…"
     },
     "branch": "分支",
     "branchMetadata": "分支中繼資料",

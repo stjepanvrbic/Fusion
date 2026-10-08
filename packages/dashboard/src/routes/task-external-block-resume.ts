@@ -1,32 +1,10 @@
-import {
-  buildTaskExternalBlockClearPatch,
-  computeWorkflowIrPin,
-  emitBoundedRunAudit,
-  isTaskExternallyBlocked,
-  resolveWorkflowIrForTask,
-  type Task,
-  type TaskStore,
-  type WorkflowWorkItem,
-} from "@fusion/core";
-import { generateSyntheticRunId, resolveColumnResumeNode } from "@fusion/engine";
+import type { Task, TaskStore } from "@fusion/core";
+import { requestExternalBlockResume, type ExternalBlockLifecycleStore } from "@fusion/engine";
 import { conflict, notFound } from "../api-error.js";
-
-const EXTERNAL_BLOCK_RESUME_RUN_SEGMENT = ":external-block-resume:";
-
-type ExternalBlockResumeStore = TaskStore & {
-  listWorkflowWorkItemsForTask(taskId: string): Promise<WorkflowWorkItem[]>;
-};
 
 export type ResumeExternallyBlockedTaskResult =
   | { kind: "not-blocked" }
   | { kind: "resumed"; task: Task; nodeId: string };
-
-function isPendingExternalBlockResume(item: WorkflowWorkItem): boolean {
-  return item.kind === "task"
-    && (item.state === "runnable" || item.state === "running" || item.state === "held")
-    && typeof item.runId === "string"
-    && item.runId.includes(EXTERNAL_BLOCK_RESUME_RUN_SEGMENT);
-}
 
 /*
 FNXC:ExternalBlockResume 2026-08-28-04:56:
@@ -34,79 +12,34 @@ Retry for an external block is a continuation publication, never a stage restart
 implementation artifact, keeps the durable pause raised until the successor continuation exists,
 and refuses a duplicate request while that continuation is still pending so rapid operator clicks
 cannot replay or discard the interrupted step.
+
+FNXC:ExternalBlockResume 2026-10-08-08:29:
+Operator Retry delegates to the engine's single resume owner. A frozen card holds no running-agent slot, so Retry records the request and
+the card stays frozen until project admission grants its resumed run a slot; Retry also clears the automatic-resume budget.
 */
 export async function resumeExternallyBlockedTask(params: {
-  store: ExternalBlockResumeStore;
+  store: TaskStore;
   taskId: string;
 }): Promise<ResumeExternallyBlockedTaskResult> {
-  const { store, taskId } = params;
-  return store.withPlanningLifecycleLock(taskId, async () => {
-    const task = await store.getTask(taskId);
-    if (!task) throw notFound(`Task ${taskId} not found`);
-
-    const existingItems = await store.listWorkflowWorkItemsForTask(taskId);
-    if (!isTaskExternallyBlocked(task)) {
-      if (existingItems.some(isPendingExternalBlockResume)) {
-        throw conflict("External-block Retry has already resumed this task");
-      }
-      return { kind: "not-blocked" };
-    }
-
-    const externalBlock = task.externalBlock;
-    if (!externalBlock) throw conflict("External-block Retry requires durable obstacle metadata");
-    const ir = await resolveWorkflowIrForTask(store, task.id);
-    const resumeNode = externalBlock.resume.nodeId
-      ? ir.nodes.find((node) => node.id === externalBlock.resume.nodeId)
-      : resolveColumnResumeNode(ir, externalBlock.resume.column);
-    if (!resumeNode) {
-      throw conflict(`External-block Retry cannot resolve a workflow node for column ${externalBlock.resume.column}`);
-    }
-
-    const continuationSequence = existingItems.length;
-    const runId = `${taskId}${EXTERNAL_BLOCK_RESUME_RUN_SEGMENT}${resumeNode.id}:${continuationSequence}`;
-
-    // Publish the successor behind the still-intact external-block fence.
-    await store.replaceActiveTaskWorkflowContinuation({
-      taskId,
-      nodeId: resumeNode.id,
-      kind: "task",
-      state: "runnable",
-      waitReason: null,
-      blockedReason: null,
-      leaseOwner: null,
-      leaseExpiresAt: null,
-      lastError: null,
-      retryAfter: null,
-      sourceColumn: task.column,
-      targetColumn: task.column,
-      continuationSequence,
-      stableWorkflowRunId: `${taskId}:${ir.name}`,
-      runId,
-      irHash: computeWorkflowIrPin(ir, resumeNode.id).irHash,
-    });
-
-    // The continuation now owns resumption, so the obstacle and durable pause can clear together.
-    await store.updateTask(taskId, buildTaskExternalBlockClearPatch());
-    await store.logEntry(taskId, `External block cleared by dashboard Retry; resuming workflow at ${resumeNode.id}`);
-    void emitBoundedRunAudit(store, {
-      taskId,
-      agentId: "dashboard-api",
-      runId: generateSyntheticRunId("external-block-resume", taskId),
-      domain: "database",
-      mutationType: "task:external-block-cleared",
-      target: taskId,
-      metadata: {
-        taskId,
-        origin: externalBlock.origin,
-        code: externalBlock.code,
-        source: externalBlock.source,
-        column: task.column,
-        resumeNodeId: resumeNode.id,
-      },
-    });
-
-    const updated = await store.getTask(taskId);
-    if (!updated) throw notFound(`Task ${taskId} not found after external-block Retry`);
-    return { kind: "resumed", task: updated, nodeId: resumeNode.id };
+  const result = await requestExternalBlockResume({
+    store: params.store as unknown as ExternalBlockLifecycleStore,
+    taskId: params.taskId,
+    trigger: "operator",
   });
+  switch (result.kind) {
+    case "not-found":
+      throw notFound(`Task ${params.taskId} not found`);
+    case "not-blocked":
+      if (result.resumePending) throw conflict("External-block Retry has already resumed this task");
+      return { kind: "not-blocked" };
+    case "no-resume-node":
+      throw conflict(`External-block Retry cannot resolve a workflow node for column ${result.column}`);
+    case "already-requested":
+      throw conflict("External-block Retry has already been requested; the task resumes when a running-agent slot is free");
+    case "not-due":
+      // Only an automatic trigger is ever not due; an operator request always proceeds.
+      throw conflict("External-block Retry was not accepted");
+    case "requested":
+      return { kind: "resumed", task: result.task, nodeId: result.nodeId };
+  }
 }

@@ -137,6 +137,39 @@ pgDescribe("U12 taskstore-persistence (PostgreSQL)", () => {
     expect((await storeB.getTask(taskId))?.recoveryDisposition).toBe("verification-pending");
   });
 
+  /*
+  FNXC:ExternalBlockAutoResume 2026-10-08-08:29:
+  The automatic-resume budget and the freeze's schedule/request markers are durable, so an engine restart or a re-freeze cannot reset
+  the six-resume bound or lose a queued resume.
+  */
+  it("round-trips the external-block automatic-resume budget and markers across store instances", async () => {
+    const taskId = "KB-046-AUTO-RESUME";
+    await insertTaskRow(ctx.layer, makeMinimalTask(taskId), { lineageId: null });
+    const writer = new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() });
+    await writer.updateTask(taskId, {
+      externalBlockAutoResumeCount: 3,
+      externalBlock: {
+        origin: "model-provider",
+        code: "RATE_LIMIT",
+        message: "429 rate_limit_error",
+        source: "session-failure",
+        blockedAt: "2026-10-08T07:27:00.000Z",
+        resume: { column: "in-progress", currentStep: 0, worktree: "/worktrees/kb-046" },
+        autoResume: { attempt: 4, budget: 6, resumeAt: "2026-10-08T08:27:00.000Z" },
+        resumeRequest: { requestedAt: "2026-10-08T08:27:05.000Z", trigger: "automatic" },
+      },
+    });
+
+    const reader = new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() });
+    const task = await reader.getTask(taskId);
+    expect(task?.externalBlockAutoResumeCount).toBe(3);
+    expect(task?.externalBlock?.autoResume).toEqual({ attempt: 4, budget: 6, resumeAt: "2026-10-08T08:27:00.000Z" });
+    expect(task?.externalBlock?.resumeRequest).toEqual({ requestedAt: "2026-10-08T08:27:05.000Z", trigger: "automatic" });
+
+    await reader.updateTask(taskId, { externalBlockAutoResumeCount: 0 });
+    expect((await writer.getTask(taskId))?.externalBlockAutoResumeCount).toBe(0);
+  });
+
   it("round-trips JSON columns as JSONB with identical shape (VAL-SCHEMA-004)", async () => {
     // The column descriptors read nested fields (e.g. task.tokenUsage.perModel),
     // so the task record carries the canonical Task shape for JSON-backed columns.

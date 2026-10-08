@@ -12,6 +12,7 @@ export const MANUAL_RETRY_RESET_COUNTER_KEYS = [
   "consecutiveToolFailureRetryCount",
   "recoveryRetryCount",
   "sessionContentionHoldCount",
+  "externalBlockAutoResumeCount",
   "taskDoneRetryCount",
   "worktreeSessionRetryCount",
   "workflowStepRetries",

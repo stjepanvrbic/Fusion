@@ -8665,7 +8665,9 @@
       "explain": "Explicar este error",
       "explainPrompt": "Explica este error {{error}} y cómo resolverlo.",
       "resuming": "Reanudando…",
-      "retry": "Reintentar"
+      "retry": "Reintentar",
+      "autoResumeScheduled": "Reintento automático {{attempt}}/{{budget}} a las {{time}}",
+      "waitingForSlot": "Esperando un espacio de agente libre…"
     },
     "branch": "Rama",
     "branchMetadata": "Metadatos de rama",

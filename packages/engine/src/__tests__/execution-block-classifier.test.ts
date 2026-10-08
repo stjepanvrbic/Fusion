@@ -21,6 +21,30 @@ describe("classifyExternalObstacle", () => {
     expect(classifyExternalObstacle("TransitionRejectionError: Cannot move task")).toBeUndefined();
   });
 
+  /*
+  FNXC:ExternalBlockAutoResume 2026-10-08-08:29:
+  Rate limits (transient, auto-resumed) are a different code from billing/quota exhaustion (operator action), and a billing
+  signal wins when both appear, because providers answer an exhausted quota with HTTP 429 too.
+  */
+  it("splits transient rate limits from billing and quota exhaustion", () => {
+    for (const message of [
+      'Usage limit detected (executor/unknown): 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit"}}',
+      "Too Many Requests",
+      "overloaded_error: Overloaded",
+      "529 server overloaded",
+    ]) {
+      expect(classifyExternalObstacle(message)).toEqual({ origin: "model-provider", code: "RATE_LIMIT" });
+    }
+    for (const message of [
+      "quota exceeded for this billing period",
+      "429 You exceeded your current quota, please check your plan and billing details",
+      "Your credit balance is too low to access the API",
+      "insufficient_quota",
+    ]) {
+      expect(classifyExternalObstacle(message)).toEqual({ origin: "model-provider", code: "USAGE_LIMIT" });
+    }
+  });
+
   it("continues to classify genuine credential failures", () => {
     expect(classifyExternalObstacle("Invalid API key: authentication failed")).toEqual({ origin: "credentials", code: "CREDENTIALS" });
   });

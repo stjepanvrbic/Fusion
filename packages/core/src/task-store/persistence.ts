@@ -69,6 +69,7 @@ export interface TaskRow {
   recoveryRetryCount: number | null;
   recoveryDisposition: string | null;
   sessionContentionHoldCount: number | null;
+  externalBlockAutoResumeCount: number | null;
   sessionContentionWaitReason: string | null;
   taskDoneRetryCount: number | null;
   // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker (ISO timestamp / null).
@@ -321,6 +322,7 @@ export const TASK_COLUMN_DESCRIPTORS: TaskColumnDescriptor[] = [
   defineTaskColumn("recoveryRetryCount", (task) => task.recoveryRetryCount ?? null),
   defineTaskColumn("recoveryDisposition", (task) => task.recoveryDisposition ?? null),
   defineTaskColumn("sessionContentionHoldCount", (task) => task.sessionContentionHoldCount ?? 0),
+  defineTaskColumn("externalBlockAutoResumeCount", (task) => task.externalBlockAutoResumeCount ?? 0),
   defineTaskColumn("sessionContentionWaitReason", (task) => task.sessionContentionWaitReason ?? null),
   defineTaskColumn("taskDoneRetryCount", (task) => task.taskDoneRetryCount ?? 0),
   // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker persisted as nullable ISO timestamp.

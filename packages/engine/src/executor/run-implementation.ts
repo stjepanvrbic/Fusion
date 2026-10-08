@@ -48,7 +48,6 @@ import type {
 } from "@fusion/core";
 import {
   ApprovalRequestStore,
-  buildTaskExternalBlockPatch,
   buildTaskExternalBlockReport,
   DEFAULT_PROVIDER_INSTANCE_ID,
   RetryStormError,
@@ -201,6 +200,7 @@ import { executorLog, formatError } from "../logger.js";
 import { classifyOrphanOurAdvance, rehomeOrphanOntoIntegration } from "../merge/merger-orphan-rehome.js";
 import { isTaskMergeInFlight } from "../merge/merge-execution-exclusion.js";
 import { classifyExternalObstacle } from "../execution-block-classifier.js";
+import { parkTaskOnExternalObstacle } from "../external-block/external-block-lifecycle.js";
 import { compactSessionContext, describeModel, formatModelMarkerDetails, promptWithFallback } from "../pi.js";
 import { resolveDedicatedPlannerColumnsForTask } from "../planner-lane-resolution.js";
 import { mergeEffectiveSettings } from "../project/effective-settings.js";
@@ -367,33 +367,17 @@ export async function parkExternalSessionObstacle(
   Session infrastructure errors freeze only after their established retry owner declines another
   attempt. The shared patch leaves workflow progress and Git pointers untouched; this helper clears
   only the retry schedule whose budget is already exhausted.
+
+  FNXC:ExternalBlockAutoResume 2026-10-08-08:29:
+  The shared park also schedules the automatic resume of a transient (rate-limit) freeze once these in-session retries are spent.
   */
-  await deps.store.updateTask(taskId, {
-    ...buildTaskExternalBlockPatch(externalBlock),
-    recoveryRetryCount: null,
-    nextRecoveryAt: null,
-  });
-  await deps.store.logEntry(
-    taskId,
-    `External session obstacle frozen (${externalBlock.origin}/${externalBlock.code}); resources and execution progress retained for Retry`,
-    undefined,
-    deps.getRunContextFor(taskId),
-  );
-  await emitBoundedRunAudit(deps.store, {
-    taskId,
-    agentId: "executor",
-    runId: generateSyntheticRunId("external-block", taskId),
-    domain: "database",
-    mutationType: "task:external-block-parked",
-    target: taskId,
-    metadata: {
-      taskId,
-      origin: externalBlock.origin,
-      code: externalBlock.code,
-      source: externalBlock.source,
-      column: live.column,
-      resumeNodeId: externalBlock.resume.nodeId,
-    },
+  await parkTaskOnExternalObstacle({
+    store: deps.store,
+    task: live,
+    externalBlock,
+    extraUpdates: { recoveryRetryCount: null, nextRecoveryAt: null },
+    runContext: deps.getRunContextFor(taskId),
+    logMessage: `External session obstacle frozen (${externalBlock.origin}/${externalBlock.code}); worktree and execution progress retained for Retry`,
   });
   return true;
 }

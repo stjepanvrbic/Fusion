@@ -39,6 +39,59 @@ export interface TaskExternalBlock {
   };
   /** Optional for legacy rows; consumers derive a conservative report when absent. */
   report?: TaskExternalBlockReport;
+  /** Scheduled automatic resume for a transient obstacle; absent when the freeze waits for an operator. */
+  autoResume?: TaskExternalBlockAutoResume;
+  /** A published resume (operator Retry or automatic) that is waiting for a running-agent slot. */
+  resumeRequest?: TaskExternalBlockResumeRequest;
+}
+
+export interface TaskExternalBlockAutoResume {
+  /** 1-based automatic resume number within {@link EXTERNAL_BLOCK_AUTO_RESUME_BUDGET}. */
+  attempt: number;
+  budget: number;
+  resumeAt: string;
+}
+
+export interface TaskExternalBlockResumeRequest {
+  requestedAt: string;
+  trigger: "operator" | "automatic";
+}
+
+/*
+FNXC:ExternalBlockAutoResume 2026-10-08-08:29:
+A provider rate limit is transient: after the executor's bounded in-session retries are spent, the freeze schedules an automatic resume.
+Backoff is 5, 15, 30, 60, 120 minutes, then holds at 120, for at most six automatic resumes; operator Retry works at any time and clears the budget.
+Every other code stays frozen until an operator acts: credentials, model access, billing/quota (USAGE_LIMIT), host resources, and network codes.
+*/
+export const TRANSIENT_EXTERNAL_BLOCK_CODES: ReadonlySet<string> = new Set(["RATE_LIMIT"]);
+export const EXTERNAL_BLOCK_AUTO_RESUME_BUDGET = 6;
+const EXTERNAL_BLOCK_AUTO_RESUME_BACKOFF_MINUTES = [5, 15, 30, 60, 120] as const;
+
+/**
+ * Plans the next automatic resume for a freeze, given how many automatic resumes the task has
+ * already spent since the last operator Retry. Returns null for a non-transient code or a spent budget.
+ */
+export function planExternalBlockAutoResume(
+  block: Pick<TaskExternalBlock, "code">,
+  spentAutoResumes: number | null | undefined,
+  nowMs: number,
+): (TaskExternalBlockAutoResume & { delayMs: number }) | null {
+  if (!TRANSIENT_EXTERNAL_BLOCK_CODES.has(block.code)) return null;
+  const spent = Math.max(0, Math.floor(spentAutoResumes ?? 0));
+  if (spent >= EXTERNAL_BLOCK_AUTO_RESUME_BUDGET) return null;
+  const backoff = EXTERNAL_BLOCK_AUTO_RESUME_BACKOFF_MINUTES;
+  const delayMs = backoff[Math.min(spent, backoff.length - 1)] * 60_000;
+  return {
+    attempt: spent + 1,
+    budget: EXTERNAL_BLOCK_AUTO_RESUME_BUDGET,
+    delayMs,
+    resumeAt: new Date(nowMs + delayMs).toISOString(),
+  };
+}
+
+/** The checkout a freeze retains: the task's own worktree pointer, else the freeze's resume pointer. */
+export function externalBlockRetainedCheckout(task: Pick<Task, "worktree" | "externalBlock">): string | undefined {
+  return task.worktree || task.externalBlock?.resume.worktree || undefined;
 }
 
 const REPORT_FIELD_MAX_LENGTH = 320;

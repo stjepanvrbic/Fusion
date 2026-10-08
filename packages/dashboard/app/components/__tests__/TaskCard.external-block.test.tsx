@@ -87,4 +87,45 @@ describe("TaskCard external Blocked overlay", () => {
     expect(screen.queryByRole("button", { name: "Explain this error" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
+
+  /*
+  FNXC:ExternalBlockUx 2026-10-08-08:29:
+  A requested resume waits for a running-agent slot while the card stays frozen, so Retry becomes a disabled "waiting" state on desktop
+  and mobile instead of a button that answers a second click with a conflict. A scheduled automatic resume is announced in the notice.
+  */
+  it.each([1280, 768])("shows a queued resume as waiting for a slot instead of a second Retry at %ipx", (width) => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    const onRetryTask = vi.fn();
+    const queued = task({ externalBlock: { ...task().externalBlock!, resumeRequest: { requestedAt: "2026-10-08T07:30:00.000Z", trigger: "operator" } } });
+    render(<TaskCard task={queued} onOpenDetail={vi.fn()} addToast={vi.fn()} onOpenChatWithPrefill={vi.fn()} onRetryTask={onRetryTask} />);
+
+    const waiting = screen.getByRole("button", { name: "Waiting for a free agent slot…" });
+    expect(waiting).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    fireEvent.click(waiting);
+    expect(onRetryTask).not.toHaveBeenCalled();
+  });
+
+  it("re-renders a memoized card when its resume becomes queued", () => {
+    const props = { onOpenDetail: vi.fn(), addToast: vi.fn(), onOpenChatWithPrefill: vi.fn(), onRetryTask: vi.fn() };
+    const { rerender } = render(<TaskCard task={task()} {...props} />);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+
+    rerender(<TaskCard task={task({ externalBlock: { ...task().externalBlock!, resumeRequest: { requestedAt: "2026-10-08T07:30:00.000Z", trigger: "automatic" } } })} {...props} />);
+    expect(screen.getByRole("button", { name: "Waiting for a free agent slot…" })).toBeDisabled();
+  });
+
+  it("announces a scheduled automatic resume and keeps Retry available", () => {
+    const scheduled = task({
+      externalBlock: {
+        ...task().externalBlock!,
+        code: "RATE_LIMIT",
+        autoResume: { attempt: 2, budget: 6, resumeAt: "2026-10-08T07:42:00.000Z" },
+      },
+    });
+    render(<TaskCard task={scheduled} onOpenDetail={vi.fn()} addToast={vi.fn()} onOpenChatWithPrefill={vi.fn()} onRetryTask={vi.fn()} />);
+
+    expect(screen.getByTestId("external-block-card-FN-209")).toHaveTextContent(/Automatic retry 2\/6 at /);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+  });
 });

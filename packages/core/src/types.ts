@@ -575,8 +575,12 @@ export {
   buildTaskExternalBlockClearPatch,
   buildTaskExternalBlockReport,
   formatTaskExternalBlockReason,
+  planExternalBlockAutoResume,
+  externalBlockRetainedCheckout,
+  TRANSIENT_EXTERNAL_BLOCK_CODES,
+  EXTERNAL_BLOCK_AUTO_RESUME_BUDGET,
 } from "./tasks/task-external-block.js";
-export type { TaskExternalBlock, TaskExternalBlockOrigin, TaskExternalBlockReport } from "./tasks/task-external-block.js";
+export type { TaskExternalBlock, TaskExternalBlockOrigin, TaskExternalBlockReport, TaskExternalBlockAutoResume, TaskExternalBlockResumeRequest } from "./tasks/task-external-block.js";
 
 export type { OverlapWaitPhase, OverlapWaitDecision, OverlapWaitFreshness, OverlapWaitLandedPath, OverlapWaitDeliverySnapshot, OverlapWaitDeliveryProof, OverlapWaitReceipt, TaskOverlapWait, OverlapWaitClaim, OverlapWaitExecutionIdentity } from "./types/task/task-overlap-wait.js";
 

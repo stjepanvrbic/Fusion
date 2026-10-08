@@ -25,13 +25,15 @@ import { join } from "node:path";
 import {
   dropPreHeldExecutorSlot,
   projectAdmissionCoordinator,
-  persistedTopLevelAgentTaskIdsFromStore,
+  projectCapacityAdmissionLimits,
+  projectCapacityHoldersFromStore,
   recoverIdleSemaphoreLeakCandidate,
   registerPreHeldExecutorSlot,
-  resolveActiveTaskCapacityLimit,
   type AgentSemaphore,
+  type ProjectCapacityHolders,
 } from "./concurrency/concurrency.js";
 import { planTaskWorktreePath, resolveTaskWorkingBranch } from "./worktree/worktree-names.js";
+import { resumeDueExternalBlocks } from "./external-block/external-block-lifecycle.js";
 import { schedulerLog } from "./logger.js";
 import { emitBoundedRunAudit } from "./util/emit-bounded-run-audit.js";
 import { createRepeatSuppressedLog } from "./util/repeat-suppressed-log.js";
@@ -2307,6 +2309,17 @@ export class Scheduler {
       }
       this.wasEnginePaused = false;
 
+      /*
+      FNXC:ExternalBlockAutoResume 2026-10-08-08:29:
+      Due automatic resumes of transient (rate-limit) freezes are requested here, after both pause gates, so a paused engine never resumes
+      frozen work. A request only publishes an admission-gated continuation; the card waits for a running-agent slot like any other lane.
+      */
+      try {
+        await resumeDueExternalBlocks({ store: this.store, tasks });
+      } catch (error) {
+        schedulerLog.warn(`External-block automatic resume sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+
       const heartbeatIntervalMs = Math.max(1, settings.pollIntervalMs ?? 15_000);
       if (Date.now() - this.lastHeartbeatWriteMs >= heartbeatIntervalMs) {
         /*
@@ -2473,7 +2486,6 @@ export class Scheduler {
       };
       const maxWorktrees = resolveWorktreeCapacityLimit(capacitySettings);
       const maxConcurrent = resolveMaxConcurrentSetting(capacitySettings);
-      const activeTaskLimit = resolveActiveTaskCapacityLimit(capacitySettings);
       /*
       FNXC:WorkflowScheduling 2026-07-19-02:35 (U4/KTD-9):
       Count active WIP reservations by the `wip` trait, not the literal
@@ -2600,8 +2612,8 @@ export class Scheduler {
           return typeof value === "function" ? value.bind(target) : value;
         },
       });
-      const activeWorktreeTaskIds = await persistedTopLevelAgentTaskIdsFromStore(selectionCachedStore, tasks);
-      let reservedWorktreeSlots = activeWorktreeTaskIds.length;
+      const sweepHolders = await projectCapacityHoldersFromStore(selectionCachedStore, tasks);
+      let reservedWorktreeSlots = sweepHolders.runningTaskIds.length + sweepHolders.checkoutOnlyHolderTaskIds.length;
       let reservedConcurrentSlots = wipTaskIds.length;
       const dispatchPrepByTaskId = new Map<string, {
         baseBranch: string | null;
@@ -3259,28 +3271,25 @@ export class Scheduler {
           claim the final slot. The reservation remains until the executor observes the persisted
           WIP row and takes the handoff.
           */
-          let finalClaimSnapshot: Promise<{ count: number; ids: string[] }> | undefined;
+          let finalClaimSnapshot: Promise<ProjectCapacityHolders> | undefined;
           const getFinalClaimSnapshot = () => finalClaimSnapshot ??= (async () => {
             /*
             FNXC:WorkflowContinuationCapacity 2026-08-01-07:10:
             Worktree preparation and startup recovery can make the sweep's original task list stale
             before this serialized admission point. A planner that became live after that snapshot
-            was absent from `activeWorktreeTaskIds`; once its handoff reservation transferred to the
+            was absent from `sweepHolders`; once its handoff reservation transferred to the
             durable planning status, the coordinator could no longer see either claim and admitted a
             tenth active task against maxWorktrees=9. Re-read full rows lazily inside the coordinator
             drain so pending workflow-step leases and every newly durable lane holder participate in
             the final decision. Same-sweep transient starts remain covered by coordinator reservations.
             */
             const liveTasks = await this.store.listTasks({ slim: false, includeArchived: false });
-            const ids = await persistedTopLevelAgentTaskIdsFromStore(this.store, liveTasks);
-            return { count: ids.length, ids };
+            return projectCapacityHoldersFromStore(this.store, liveTasks);
           })();
           let projectSlotReserved = false;
           const admittedTaskId = await projectAdmissionCoordinator.admitNext({
             projectId: this.store.getRootDir(),
-            maxConcurrent: activeTaskLimit,
-            claimed: async () => (await getFinalClaimSnapshot()).count,
-            claimedTaskIds: async () => (await getFinalClaimSnapshot()).ids,
+            ...projectCapacityAdmissionLimits(capacitySettings, getFinalClaimSnapshot),
             semaphore: this.options.semaphore,
             refresh: async () => [{
               taskId: task.id,
@@ -3305,15 +3314,21 @@ export class Scheduler {
             */
             const freshClaims = await getFinalClaimSnapshot();
             const exhausted = admittedTaskId === undefined;
+            /*
+            FNXC:WorktreeCapacity 2026-10-08-08:29:
+            maxConcurrent reports running agents only; maxWorktrees also names frozen external-block checkouts, which hold a worktree
+            but no running-agent slot.
+            */
+            const freshWorktreeHolders = [...freshClaims.runningTaskIds, ...freshClaims.checkoutOnlyHolderTaskIds];
             const freshDiagnostic = computeConcurrencyGateDiagnostic({
-              agentSlots: freshClaims.count,
+              agentSlots: freshClaims.runningTaskIds.length,
               maxConcurrent,
-              activeWorktrees: freshClaims.count,
+              activeWorktrees: freshWorktreeHolders.length,
               maxWorktrees,
-              worktreeHolderTaskIds: freshClaims.ids,
+              worktreeHolderTaskIds: freshWorktreeHolders,
               semaphore: this.options.semaphore,
-              inProgressTaskIds: freshClaims.ids,
-              topLevelClaimedSlots: freshClaims.count,
+              inProgressTaskIds: freshClaims.runningTaskIds,
+              topLevelClaimedSlots: freshClaims.runningTaskIds.length,
             });
             const reason = exhausted
               ? formatConcurrencyLimitReason(freshDiagnostic)

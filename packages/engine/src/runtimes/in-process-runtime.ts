@@ -27,10 +27,12 @@ import {
   isEphemeralAgent,
   isPlanReviewSatisfied,
   isTaskBlockedOnApproval,
+  isTaskExternallyBlocked,
   resolveWorkflowIrForTask,
   resolveTaskLifecycleColumns,
   resolveLifecycleColumns,
 } from "@fusion/core";
+import { clearExternalBlockForAdmittedResume, isExternalBlockResumeWorkItem } from "../external-block/external-block-lifecycle.js";
 import { Scheduler } from "../scheduler.js";
 import { registerDefaultAgentPluginRunner, unregisterDefaultAgentPluginRunner } from "../pi.js";
 import type { PrMonitor, PrComment } from "../merge/pr-monitor.js";
@@ -73,10 +75,12 @@ import { emitBoundedRunAudit } from "../util/emit-bounded-run-audit.js";
 import { setImmediate as setImmediateCb } from "node:timers";
 import { seedPreReleasePlanReviewContinuation, type PlanReviewSeedBailReason } from "../plan-review-continuation.js";
 import {
-  formatAdmissionCapacityQueuedReason,
+  evaluateProjectCapacity,
   persistedTopLevelAgentTaskIdsFromStore,
   projectAdmissionCoordinator,
-  resolveActiveTaskCapacityLimit,
+  projectCapacityAdmissionLimits,
+  projectCapacityHoldersFromStore,
+  type ProjectCapacityHolders,
   type AdmissionCandidate,
   type AdmissionLane,
 } from "../concurrency/concurrency.js";
@@ -253,6 +257,17 @@ export function resolvePlanningContinuationCandidate(
   */
   if (isTaskBlockedOnApproval(task)) {
     return { kind: "skip", item, reason: "awaiting-approval" };
+  }
+  /*
+  FNXC:ExternalBlockResume 2026-10-08-08:29:
+  A frozen card keeps its pause fence until admission grants its resumed run a slot. Its own resume continuation (operator Retry or a
+  due automatic resume, recorded as `resumeRequest`) is therefore actionable despite the pause; every other continuation of a frozen card
+  stays skipped as paused.
+  */
+  if (isTaskExternallyBlocked(task)) {
+    return task.externalBlock?.resumeRequest && isExternalBlockResumeWorkItem(item)
+      ? { kind: "actionable", item, task }
+      : { kind: "skip", item, reason: "paused" };
   }
   if (task.paused === true || task.userPaused === true) {
     return { kind: "skip", item, reason: "paused" };
@@ -652,7 +667,7 @@ export async function admitPlanningContinuation(input: {
   const settings = await input.store.getSettings();
   let selected = false;
   let duplicateHandled = false;
-  const loadClaimSnapshot = async (): Promise<{ count: number; ids: string[] }> => {
+  const loadClaimSnapshot = async (): Promise<ProjectCapacityHolders> => {
     /*
     FNXC:WorkflowContinuationCapacity 2026-08-01-06:20:
     A dependency-cleared task continuation can resume directly in a same-column Plan Review node.
@@ -663,8 +678,7 @@ export async function admitPlanningContinuation(input: {
     are not a contract for workflowStepResults, while a pending optional-step lease is a live agent.
     */
     const tasks = await input.store.listTasks({ slim: false, includeArchived: false });
-    const ids = await persistedTopLevelAgentTaskIdsFromStore(input.store, tasks);
-    return { count: ids.length, ids };
+    return projectCapacityHoldersFromStore(input.store, tasks);
   };
   // Resuming another node of an already-live task is a same-slot handoff, not a
   // new admission. Check only this fully hydrated task here; the project-wide
@@ -680,19 +694,13 @@ export async function admitPlanningContinuation(input: {
   // This snapshot is intentionally created lazily inside the coordinator drain.
   // A prior lane may have been finishing its own handoff before this task's
   // turn; a pre-drain project snapshot can admit into its newly occupied slot.
-  let admissionSnapshot: Promise<{ count: number; ids: string[] }> | undefined;
+  let admissionSnapshot: Promise<ProjectCapacityHolders> | undefined;
   const getAdmissionSnapshot = () => admissionSnapshot ??= loadClaimSnapshot();
   continuationOneShotOffers.set(runKey, (continuationOneShotOffers.get(runKey) ?? 0) + 1);
   try {
     await projectAdmissionCoordinator.admitNext({
       projectId: input.projectId,
-      maxConcurrent: resolveActiveTaskCapacityLimit({
-        maxConcurrent: settings.maxConcurrent,
-        maxWorktrees: settings.maxWorktrees,
-        worktreeLimitEnabled: settings.worktreeLimitEnabled,
-      }),
-      claimed: async () => (await getAdmissionSnapshot()).count,
-      claimedTaskIds: async () => (await getAdmissionSnapshot()).ids,
+      ...projectCapacityAdmissionLimits(settings, getAdmissionSnapshot),
       refresh: async () => [{
         taskId: input.task.id,
         projectId: input.projectId,
@@ -719,25 +727,19 @@ export async function admitPlanningContinuation(input: {
     return true;
   }
   const snapshot = await getAdmissionSnapshot();
-  const limit = resolveActiveTaskCapacityLimit({
-    maxConcurrent: settings.maxConcurrent,
-    maxWorktrees: settings.maxWorktrees,
-    worktreeLimitEnabled: settings.worktreeLimitEnabled,
+  const capacity = evaluateProjectCapacity(settings, {
+    claimed: snapshot.runningTaskIds.length,
+    runningTaskIds: snapshot.runningTaskIds,
+    checkoutOnlyHolderTaskIds: snapshot.checkoutOnlyHolderTaskIds,
   });
-  if (snapshot.count >= limit) {
+  if (capacity.exhausted) {
     /*
     FNXC:ConcurrencyAdmission 2026-08-08-04:27:
     Direct workflow continuations bypass scheduler task-status handling. A full live-task cap must
     still be visible through the shared task log, using the same canonical-holder diagnostic as
     execute, triage, and merge admission; unchanged retries remain deduplicated.
     */
-    const reason = formatAdmissionCapacityQueuedReason({
-      maxConcurrent: settings.maxConcurrent,
-      maxWorktrees: settings.maxWorktrees,
-      worktreeLimitEnabled: settings.worktreeLimitEnabled,
-      claimed: snapshot.count,
-      holderTaskIds: snapshot.ids,
-    });
+    const reason = capacity.reason;
     if (planningContinuationCapacityReasons.get(runKey) !== reason) {
       planningContinuationCapacityReasons.set(runKey, reason);
       await input.store.logEntry(input.task.id, reason);
@@ -979,8 +981,22 @@ export interface PlanningContinuationRunInput {
  */
 export function createPlanningContinuationRun(input: PlanningContinuationRunInput): (task: Task, item: WorkflowWorkItem) => Promise<void> {
   return async (task, item) => {
-    await input.execute(task).catch((error) => {
-      input.onError?.(task, item, error);
+    /*
+    FNXC:ExternalBlockResume 2026-10-08-08:29:
+    An admitted external-block resume clears the freeze here, inside the coordinator reservation that bridges it to the live row, and runs
+    the cleared task. Ordinary continuations keep calling execute() in the same tick as the run.
+    */
+    let runTask = task;
+    if (isTaskExternallyBlocked(task) && isExternalBlockResumeWorkItem(item)) {
+      const cleared = await clearExternalBlockForAdmittedResume({ store: input.store, taskId: task.id, nodeId: item.nodeId });
+      if (!cleared) {
+        await settlePlanningContinuationDispatch({ store: input.store, taskId: task.id, itemId: item.id, kick: input.kick });
+        return;
+      }
+      runTask = cleared;
+    }
+    await input.execute(runTask).catch((error) => {
+      input.onError?.(runTask, item, error);
     });
     await settlePlanningContinuationDispatch({ store: input.store, taskId: task.id, itemId: item.id, kick: input.kick });
   };

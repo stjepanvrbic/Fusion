@@ -8684,7 +8684,9 @@
       "explain": "Explicar este erro",
       "explainPrompt": "Explique este erro {{error}} e como resolvê-lo.",
       "resuming": "Retomando…",
-      "retry": "Tentar novamente"
+      "retry": "Tentar novamente",
+      "autoResumeScheduled": "Nova tentativa automática {{attempt}}/{{budget}} às {{time}}",
+      "waitingForSlot": "Aguardando um slot de agente livre…"
     },
     "branch": "Branch",
     "branchMetadata": "Metadados do branch",

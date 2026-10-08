@@ -1,13 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { resolveActiveTaskCapacityLimit, formatAdmissionCapacityQueuedReason } from "../concurrency/concurrency.js";
+import { DEFAULT_MAX_WORKTREES } from "@fusion/core";
+import { formatAdmissionCapacityQueuedReason, projectCapacityAdmissionLimits } from "../concurrency/concurrency.js";
 import { formatConcurrencyLimitReason } from "../scheduler.js";
 
 describe("effective concurrency operator surfaces", () => {
-  it("uses one ceiling for unset, configured, and worktree-bound admission", () => {
-    expect(resolveActiveTaskCapacityLimit({})).toBe(2);
-    expect(resolveActiveTaskCapacityLimit({ maxConcurrent: 6, maxWorktrees: 9 })).toBe(6);
-    expect(resolveActiveTaskCapacityLimit({ maxConcurrent: 8, maxWorktrees: 4, worktreeLimitEnabled: true })).toBe(4);
-    expect(resolveActiveTaskCapacityLimit({ maxConcurrent: 8, maxWorktrees: 4, worktreeLimitEnabled: false })).toBe(8);
+  it("builds both admission ceilings for unset, configured, and worktree-bound settings", () => {
+    const holders = async () => ({ runningTaskIds: [], checkoutOnlyHolderTaskIds: [] });
+    const ceilings = (settings: Record<string, unknown>) => {
+      const limits = projectCapacityAdmissionLimits(settings, holders);
+      return { maxConcurrent: limits.maxConcurrent, worktrees: limits.worktreeCapacity?.limit ?? null };
+    };
+    expect(ceilings({})).toEqual({ maxConcurrent: 2, worktrees: DEFAULT_MAX_WORKTREES });
+    expect(ceilings({ maxConcurrent: 6, maxWorktrees: 9 })).toEqual({ maxConcurrent: 6, worktrees: 9 });
+    expect(ceilings({ maxConcurrent: 8, maxWorktrees: 4, worktreeLimitEnabled: true })).toEqual({ maxConcurrent: 8, worktrees: 4 });
+    expect(ceilings({ maxConcurrent: 8, maxWorktrees: 4, worktreeLimitEnabled: false })).toEqual({ maxConcurrent: 8, worktrees: null });
   });
 
   it("names the effective ceiling and binding setting in the shared admission reason", () => {

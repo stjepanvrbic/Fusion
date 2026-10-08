@@ -16,9 +16,9 @@ import {
   persistedTopLevelAgentSlots,
   recoverIdleSemaphoreLeakCandidate,
   registerPreHeldExecutorSlot,
-  resolveActiveTaskCapacityLimit,
   takePreHeldExecutorSlot,
 } from "../concurrency/concurrency.js";
+import { resolveEffectiveConcurrency } from "@fusion/core";
 
 describe("ScopedAgentSemaphore", () => {
   it("returns only this scope's residual slots without clobbering other scopes", async () => {
@@ -1127,11 +1127,11 @@ describe("ProjectAdmissionCoordinator", () => {
   it("shares the final active-task slot across planning, execution, and merge lanes", async () => {
     const coordinator = new ProjectAdmissionCoordinator();
     const started: string[] = [];
-    const activeTaskLimit = resolveActiveTaskCapacityLimit({
+    const activeTaskLimit = resolveEffectiveConcurrency({
       maxConcurrent: 12,
       maxWorktrees: 9,
       worktreeLimitEnabled: true,
-    });
+    }).effectiveLimit;
 
     for (const [lane, taskId, createdAt] of [
       ["planning", "FN-PLANNING", "2026-01-01T00:00:00.000Z"],

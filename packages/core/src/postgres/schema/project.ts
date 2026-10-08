@@ -122,6 +122,7 @@ export const tasks = projectSchema.table("tasks", {
   recoveryRetryCount: integer("recovery_retry_count"),
   recoveryDisposition: text("recovery_disposition"),
   sessionContentionHoldCount: integer("session_contention_hold_count").default(0),
+  externalBlockAutoResumeCount: integer("external_block_auto_resume_count").default(0),
   sessionContentionWaitReason: text("session_contention_wait_reason"),
   taskDoneRetryCount: integer("task_done_retry_count").default(0),
   // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker (nullable ISO timestamp).

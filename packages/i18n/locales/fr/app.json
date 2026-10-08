@@ -8665,7 +8665,9 @@
       "explain": "Expliquer cette erreur",
       "explainPrompt": "Explique moi cette erreur {{error}} et comment la résoudre.",
       "resuming": "Reprise…",
-      "retry": "Réessayer"
+      "retry": "Réessayer",
+      "autoResumeScheduled": "Nouvel essai automatique {{attempt}}/{{budget}} à {{time}}",
+      "waitingForSlot": "En attente d'un emplacement d'agent libre…"
     },
     "branch": "Branche",
     "branchMetadata": "Métadonnées de branche",
