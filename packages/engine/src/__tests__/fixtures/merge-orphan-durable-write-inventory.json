@@ -6998,6 +6998,25 @@
       "followUpTaskId": "FN-8958"
     },
     {
+      "callSiteId": "packages/engine/src/merge/merger-ai-squash-gates.ts::preflightAiMergeSquashFileScope::params.store.updateTask::#1",
+      "callSiteFingerprint": "params.store.updateTask(params.taskId,{aiMergeReviewReconciliation})",
+      "file": "packages/engine/src/merge/merger-ai-squash-gates.ts",
+      "enclosingSymbolPath": "preflightAiMergeSquashFileScope",
+      "writer": "params.store.updateTask",
+      "ordinal": 1,
+      "owningEntryPoint": "landOneRepo",
+      "reachableDataStates": [
+        "pre-land"
+      ],
+      "axis1": "indeterminate",
+      "axis1Evidence": "KB-058: landOneRepo reaches this best-effort `aiMergeReviewReconciliation: null` clear on a pre-review FileScopeViolationError before any clean room, merge agent, or reviewer exists, with no fence.write wrapper or ownership checkpoint; like the sibling post-review clear in enforceAiMergeSquashGates, production-body abort isolation remains unresolved without a test-only export.",
+      "axis2Provisional": "unresolved",
+      "axis2Final": "unresolved",
+      "observedInSuite": "unobservable:production-body harness cannot isolate this call site without a test-only export",
+      "executionProof": "none:production-body harness cannot isolate this call site without a test-only export",
+      "followUpTaskId": "FN-8958"
+    },
+    {
       "callSiteId": "packages/engine/src/merge/merger-ai.ts::finalizeMerged::store.recordBranchGroupMemberLanded::#1",
       "callSiteFingerprint": "(store as { recordBranchGroupMemberLanded?: TaskStore[\"recordBranchGroupMemberLanded\"] }).recordBranchGroupMemberLanded(groupRouting.branchGroup.id,{worktreePath,status})",
       "file": "packages/engine/src/merge/merger-ai.ts",

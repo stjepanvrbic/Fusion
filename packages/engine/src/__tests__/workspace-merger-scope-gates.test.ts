@@ -77,6 +77,42 @@ function squashAgent(branch: string) {
   };
 }
 
+/** Resolve which workspace repository a clean-room cwd belongs to (its shared git dir). */
+function repoOfCwd(cwd: string): string {
+  return execSync("git rev-parse --path-format=absolute --git-common-dir", { cwd, encoding: "utf8" }).trim().replace(/\\/g, "/");
+}
+
+/** KB-058 spy agents: record the repository of every clean room an agent ran in. */
+function recordingAgents() {
+  const mergeRepos: string[] = [];
+  const reviewRepos: string[] = [];
+  const merge = squashAgent(BRANCH);
+  return {
+    mergeRepos,
+    reviewRepos,
+    mergeAgent: async (cwd: string) => { mergeRepos.push(repoOfCwd(cwd)); await merge(cwd); },
+    reviewAgent: async (cwd: string) => {
+      reviewRepos.push(repoOfCwd(cwd));
+      return "REVIEW_VERDICT: approve";
+    },
+  };
+}
+
+function twoRepoTask(fx: WorkspaceFixture, modifiedFiles: string[], overrides: Partial<Task> = {}): Task {
+  const workspaceWorktrees = {
+    "repo-a": { worktreePath: fx.repoPath("repo-a"), branch: BRANCH },
+    "repo-b": { worktreePath: fx.repoPath("repo-b"), branch: BRANCH },
+  };
+  return {
+    id: TASK_ID, title: "workspace pre-review scope", description: "", column: "in-review", branch: BRANCH, enabledWorkflowSteps: [],
+    comments: [], steeringComments: [], dependencies: [], steps: [], log: [], currentStep: 0,
+    workspaceWorktrees,
+    repositoryScope: { repositories: ["repo-a", "repo-b"], state: "confirmed" as const, revision: 1, reviewEvidence: reviewEvidence(workspaceWorktrees) },
+    modifiedFiles,
+    ...overrides,
+  } as Task;
+}
+
 /**
  * FNXC:AIMerge 2026-08-15-05:36:
  * Workspace lands must check each clean-room range against that repository's
@@ -125,18 +161,69 @@ describeIfGit("landWorkspaceTask file-scope gates", () => {
     const store = storeFor(task, ["repo-a/feature.txt"]);
     const beforeA = fx.git("repo-a", "git rev-parse main");
     const beforeB = fx.git("repo-b", "git rev-parse main");
+    const agents = recordingAgents();
 
-    await expect(landWorkspaceTask(store, task, fx.rootDir, {}, {
-      mergeAgent: squashAgent(BRANCH), reviewAgent: async () => "REVIEW_VERDICT: approve",
-    })).rejects.toMatchObject({ name: "FileScopeViolationError" });
+    await expect(landWorkspaceTask(store, task, fx.rootDir, {}, agents)).rejects.toMatchObject({ name: "FileScopeViolationError" });
 
     expect(fx.git("repo-a", "git rev-parse main")).not.toBe(beforeA);
     expect(fx.git("repo-b", "git rev-parse main")).toBe(beforeB);
-    expect(store.audit.some((event) => event.mutationType === "merge:file-scope-violation")).toBe(true);
+    /* FNXC:FileScopeInvariant 2026-10-08-08:58: KB-058 — the refused repository is decided pre-review, so no agent ever ran in its clean room. */
+    expect(agents.mergeRepos.length).toBeGreaterThan(0);
+    expect(agents.mergeRepos.every((repo) => repo.includes("/repo-a/"))).toBe(true);
+    expect(agents.reviewRepos.some((repo) => repo.includes("/repo-b/"))).toBe(false);
+    const violations = store.audit.filter((event) => event.mutationType === "merge:file-scope-violation");
+    expect(violations).toHaveLength(1);
+    expect(violations[0].metadata.scopeCheckPhase).toBe("pre-review");
     const repoBFailure = store.entryPatches.find((entry) => entry.repo === "repo-b" && entry.patch.landFailure)?.patch.landFailure as Record<string, unknown> | undefined;
     expect(repoBFailure).toMatchObject({ category: "review", repository: "repo-b" });
     expect(String(repoBFailure?.technicalDetail)).toContain("File-scope invariant violation");
     expect(store.entryPatches.some((entry) => entry.repo === "repo-a" && entry.patch.landFailure)).toBe(false);
+  });
+
+  /*
+  FNXC:FileScopeInvariant 2026-10-08-08:58:
+  KB-058: an out-of-scope repository in a workspace land is refused before its merge agent or reviewer runs; scopeOverride
+  and an empty declared scope keep landing every repository exactly as before.
+  */
+  it("refuses a repository whose squash misses its local scope before any agent runs in it", async () => {
+    policy.mockResolvedValue({ fileScope: "strict", fileScopeRules: [] });
+    fx = await createWorkspaceFixture(["repo-a", "repo-b"]);
+    addBranch(fx, "repo-a");
+    addBranch(fx, "repo-b", "other.txt");
+    const task = twoRepoTask(fx, ["repo-a/feature.txt", "repo-b/other.txt"]);
+    const store = storeFor(task, ["repo-a/feature.txt", "repo-b/allowed/**"]);
+    const beforeB = fx.git("repo-b", "git rev-parse main");
+    const agents = recordingAgents();
+
+    await expect(landWorkspaceTask(store, task, fx.rootDir, {}, agents)).rejects.toMatchObject({ name: "FileScopeViolationError" });
+
+    expect(fx.git("repo-b", "git rev-parse main")).toBe(beforeB);
+    expect(agents.mergeRepos.some((repo) => repo.includes("/repo-b/"))).toBe(false);
+    expect(agents.reviewRepos.some((repo) => repo.includes("/repo-b/"))).toBe(false);
+    const violation = store.audit.find((event) => event.mutationType === "merge:file-scope-violation");
+    expect(violation?.metadata.scopeCheckPhase).toBe("pre-review");
+  });
+
+  it("lands every repository when scopeOverride waives the out-of-scope repository", async () => {
+    policy.mockResolvedValue({ fileScope: "strict", fileScopeRules: [] });
+    fx = await createWorkspaceFixture(["repo-a", "repo-b"]);
+    addBranch(fx, "repo-a");
+    addBranch(fx, "repo-b", "other.txt");
+    const task = twoRepoTask(fx, ["repo-a/feature.txt", "repo-b/other.txt"], { scopeOverride: true } as Partial<Task>);
+    const store = storeFor(task, ["repo-a/feature.txt", "repo-b/allowed/**"]);
+
+    await expect(landWorkspaceTask(store, task, fx.rootDir, {}, recordingAgents())).resolves.toMatchObject({ allLanded: true });
+  });
+
+  it("lands every repository when the declared scope is empty", async () => {
+    policy.mockResolvedValue({ fileScope: "strict", fileScopeRules: [] });
+    fx = await createWorkspaceFixture(["repo-a", "repo-b"]);
+    addBranch(fx, "repo-a");
+    addBranch(fx, "repo-b", "other.txt");
+    const task = twoRepoTask(fx, ["repo-a/feature.txt", "repo-b/other.txt"]);
+    const store = storeFor(task, []);
+
+    await expect(landWorkspaceTask(store, task, fx.rootDir, {}, recordingAgents())).resolves.toMatchObject({ allLanded: true });
   });
 
   it("refuses landing when an acquired repository changed outside confirmed scope", async () => {

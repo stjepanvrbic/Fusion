@@ -11,6 +11,20 @@ import {
   FileScopeViolationError,
 } from "../merger.js";
 
+/*
+FNXC:FileScopeInvariant 2026-10-08-08:58:
+KB-058 phase tests need `warn`/`off`/`custom` modes. Pass through to the real resolver unless a test sets an override.
+*/
+const policyOverride = vi.hoisted(() => ({ value: undefined as undefined | { fileScope: string; fileScopeRules: string[] } }));
+vi.mock("../merge/merge-trait.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../merge/merge-trait.js")>();
+  return {
+    ...actual,
+    resolveMergePolicy: async (...args: Parameters<typeof actual.resolveMergePolicy>) =>
+      policyOverride.value ?? actual.resolveMergePolicy(...args),
+  };
+});
+
 function createInvariantStore(scope: string[], taskOverrides: Record<string, unknown> = {}) {
   const store = createMockStore(taskOverrides) as unknown as {
     parseFileScopeFromPrompt: ReturnType<typeof vi.fn>;
@@ -508,6 +522,81 @@ describe("file-scope invariant wiring", () => {
     )).rejects.toBeInstanceOf(FileScopeViolationError);
 
     expect(mockedExecSync.mock.calls.some(([cmd]) => String(cmd).includes("git commit "))).toBe(false);
+  });
+});
+
+/*
+FNXC:FileScopeInvariant 2026-10-08-08:58:
+KB-058: the pre-review phase only refuses. `off`, `warn`, and the scopeOverride bypass stay silent so the post-review
+check reports them exactly once; strict/custom refusals carry `scopeCheckPhase:"pre-review"`, while the default phase keeps the
+unchanged audit contract with no `scopeCheckPhase` key.
+*/
+describe("enforceSquashFileScopeInvariant phase semantics", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    policyOverride.value = undefined;
+    mockStagedFiles(["packages/core/src/store.ts"]);
+  });
+
+  async function run(store: ReturnType<typeof createInvariantStore>, auditor: { git: ReturnType<typeof vi.fn> }, phase?: "pre-review" | "post-review") {
+    return enforceSquashFileScopeInvariant({
+      store: store as never,
+      taskId: "FN-4073",
+      rootDir: "/tmp/root",
+      stagedFilesReader,
+      task: await (store as any).getTask("FN-4073"),
+      resetLabel: "phase test",
+      auditor: auditor as any,
+      phase,
+    });
+  }
+
+  it("pre-review scopeOverride bypass resolves without the bypass log", async () => {
+    const store = createInvariantStore(["packages/engine/src/merger.ts"], { scopeOverride: true });
+    const auditor = { git: vi.fn().mockResolvedValue(undefined) };
+    await expect(run(store, auditor, "pre-review")).resolves.toBeUndefined();
+    expect(store.appendAgentLog).not.toHaveBeenCalled();
+    expect(auditor.git).not.toHaveBeenCalled();
+  });
+
+  it("pre-review warn resolves a violation with no log and no audit", async () => {
+    policyOverride.value = { fileScope: "warn", fileScopeRules: [] };
+    const store = createInvariantStore(["packages/engine/src/merger.ts"]);
+    const auditor = { git: vi.fn().mockResolvedValue(undefined) };
+    await expect(run(store, auditor, "pre-review")).resolves.toBeUndefined();
+    expect(store.appendAgentLog).not.toHaveBeenCalled();
+    expect(auditor.git).not.toHaveBeenCalled();
+  });
+
+  it("pre-review off emits no enforcement-disabled row", async () => {
+    policyOverride.value = { fileScope: "off", fileScopeRules: [] };
+    const store = createInvariantStore(["packages/engine/src/merger.ts"]);
+    const auditor = { git: vi.fn().mockResolvedValue(undefined) };
+    await expect(run(store, auditor, "pre-review")).resolves.toBeUndefined();
+    expect(auditor.git).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["strict", { fileScope: "strict", fileScopeRules: [] }],
+    ["custom", { fileScope: "custom", fileScopeRules: ["elsewhere/**"] }],
+  ])("pre-review %s violation rejects and tags the audit row with the phase", async (_label, resolved) => {
+    policyOverride.value = resolved;
+    const store = createInvariantStore(["packages/engine/src/merger.ts"]);
+    const auditor = { git: vi.fn().mockResolvedValue(undefined) };
+    await expect(run(store, auditor, "pre-review")).rejects.toBeInstanceOf(FileScopeViolationError);
+    expect(auditor.git).toHaveBeenCalledTimes(1);
+    expect(auditor.git.mock.calls[0][0]).toMatchObject({
+      type: "merge:file-scope-violation",
+      metadata: { mode: resolved.fileScope, warningOnly: false, scopeCheckPhase: "pre-review" },
+    });
+  });
+
+  it.each([undefined, "post-review" as const])("%s phase strict violation keeps the audit contract without a phase key", async (phase) => {
+    const store = createInvariantStore(["packages/engine/src/merger.ts"]);
+    const auditor = { git: vi.fn().mockResolvedValue(undefined) };
+    await expect(run(store, auditor, phase)).rejects.toBeInstanceOf(FileScopeViolationError);
+    expect(auditor.git).toHaveBeenCalledTimes(1);
+    expect(auditor.git.mock.calls[0][0].metadata).not.toHaveProperty("scopeCheckPhase");
   });
 });
 

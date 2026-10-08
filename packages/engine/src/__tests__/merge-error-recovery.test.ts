@@ -473,7 +473,7 @@ describe("ProjectEngine merge error recovery", () => {
     expect(store.updateTask).not.toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ status: null }));
     expect(store.moveTask).not.toHaveBeenCalled();
     expect(store.logEntry).not.toHaveBeenCalledWith(TASK_ID, expect.any(String), "MergeConflictBounce");
-    expect(store.logEntry).toHaveBeenCalledWith(TASK_ID, expect.stringContaining("file-scope invariant refused the approved squash"), "FileScopeViolationError");
+    expect(store.logEntry).toHaveBeenCalledWith(TASK_ID, expect.stringContaining("file-scope invariant refused the squash"), "FileScopeViolationError");
     expect(setTimeoutSpy).not.toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
     vi.useRealTimers();
   });

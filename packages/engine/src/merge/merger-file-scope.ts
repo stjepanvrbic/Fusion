@@ -5,13 +5,24 @@
  */
 import type { Task, TaskStore } from "@fusion/core";
 import { promisify } from "node:util";
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { matchGlob } from "./merger-glob.js";
 import { mergerLog } from "../logger.js";
 import { resolveMergePolicy, type MergeFileScopeMode } from "./merge-trait.js";
 import type { RunAuditor } from "../util/run-audit.js";
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+/**
+ * FNXC:FileScopeInvariant 2026-10-08-08:58:
+ * KB-058: which merge-time file-scope check is running.
+ * `post-review` (default) is the invariant of record on the approved squash and keeps its exact logs and audit rows.
+ * `pre-review` is an early exit on the mechanical squash before any clean room, install, merge agent, or reviewer is spent.
+ * It only refuses (strict/custom violation, tagged `scopeCheckPhase:"pre-review"`); `off`, `warn`, and the `scopeOverride` bypass stay silent so the post-review check reports them exactly once.
+ * The audit key is `scopeCheckPhase`, not `phase`: the run auditor already stamps `metadata.phase` with the run phase, and a caller-supplied `phase` would overwrite it.
+ */
+export type FileScopeCheckPhase = "pre-review" | "post-review";
 
 export interface DiffFileEntry {
   file: string;
@@ -169,6 +180,35 @@ export function createCommitRangeFilesReader(fromSha: string, toSha: string): St
   };
 }
 
+/**
+ * FNXC:FileScopeInvariant 2026-10-08-08:58:
+ * KB-058: the pre-review check judges the branch's mechanical squash, computed without a clean room:
+ * `git merge-tree --write-tree <tip> <branch>` then `git diff --name-only <tip> <tree>` (the same diff semantics as the post-review commit-range reader).
+ * merge-tree exits 1 on conflicts but still prints the tree OID on line 1; conflicted files are files the squash touches, so that result is accepted.
+ * Returns `null` on any other failure (e.g. git < 2.38, unknown ref) so the caller fails open to the post-review invariant of record.
+ * Accepted tightening: conflict resolution only narrows the file set, so zero overlap here implies zero overlap in any legitimate squash.
+ * Uses argv-only execFile, never a shell string (Windows quoting, KB-025).
+ */
+export async function readMechanicalSquashFiles(repoRoot: string, tipSha: string, branch: string): Promise<string[] | null> {
+  let mergeTreeOut: string;
+  try {
+    const { stdout } = await execFileAsync("git", ["merge-tree", "--write-tree", tipSha, branch], { cwd: repoRoot, encoding: "utf-8" });
+    mergeTreeOut = stdout;
+  } catch (error: unknown) {
+    const err = error as { code?: unknown; stdout?: unknown };
+    if (err.code !== 1 || typeof err.stdout !== "string") return null;
+    mergeTreeOut = err.stdout;
+  }
+  const tree = mergeTreeOut.split("\n")[0]?.trim() ?? "";
+  if (!/^[0-9a-f]{40,64}$/i.test(tree)) return null;
+  try {
+    const { stdout } = await execFileAsync("git", ["diff", "--name-only", tipSha, tree], { cwd: repoRoot, encoding: "utf-8" });
+    return stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
 async function readStagedFileNames(cwd: string): Promise<string[]> {
   const { stdout } = await execAsync("git diff --cached --name-only", {
     cwd,
@@ -199,11 +239,14 @@ export async function assertSquashOverlapsFileScope(params: {
    * declared scope in the violation so operators can correct the task contract.
    */
   forceViolation?: (resolvedScope: string[]) => boolean;
+  /** KB-058: `pre-review` skips the scopeOverride bypass log so the post-review check logs it exactly once. */
+  phase?: FileScopeCheckPhase;
 }): Promise<void> {
   const { store, taskId, rootDir, task, customScopeRules, stagedFilesReader = readStagedFileNames } = params;
   const hasCustomRules = Array.isArray(customScopeRules) && customScopeRules.length > 0;
 
   if (!hasCustomRules && task.scopeOverride === true) {
+    if (params.phase === "pre-review") return;
     const reasonSuffix = task.scopeOverrideReason?.trim()
       ? ` — reason: ${task.scopeOverrideReason.trim()}`
       : "";
@@ -263,13 +306,19 @@ export async function enforceSquashFileScopeInvariant(params: {
   auditor?: RunAuditor;
   scopeTransform?: (scope: string[]) => string[];
   forceViolation?: (resolvedScope: string[]) => boolean;
+  /** KB-058: defaults to `post-review` (unchanged contract); see {@link FileScopeCheckPhase}. */
+  phase?: FileScopeCheckPhase;
 }): Promise<void> {
+  const preReview = params.phase === "pre-review";
   // U7 (R10): resolve the file-scope enforcement mode from the merge trait
   // (flag ON) or settings (back-compat). The lost-work guard trio is NOT gated
   // by this mode — it lives elsewhere in the mechanics and stays enforced for
   // every mode (KTD-6).
   const policy = await resolveMergePolicy(params.store, params.task);
   const mode: MergeFileScopeMode = policy.fileScope;
+
+  // KB-058: pre-review never reports `off`/`warn`; the post-review check emits their single row.
+  if (preReview && (mode === "off" || mode === "warn")) return;
 
   if (mode === "off") {
     // Skip the violation throw, but emit exactly one per-merge audit event
@@ -323,6 +372,7 @@ export async function enforceSquashFileScopeInvariant(params: {
               stagedFileCount: error.stagedFiles.length,
               declaredScopeCount: error.declaredScope.length,
               warningOnly: false,
+              ...(preReview ? { scopeCheckPhase: "pre-review" as const } : {}),
             },
           });
         } catch (auditErr) {

@@ -3,8 +3,8 @@ import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FileScopeViolationError } from "../merge/merger-file-scope.js";
-import { resolveRepoDeclaredScopeTransform } from "../merge/merger-ai-squash-gates.js";
+import { FileScopeViolationError, readMechanicalSquashFiles } from "../merge/merger-file-scope.js";
+import { preflightAiMergeSquashFileScope, resolveRepoDeclaredScopeTransform } from "../merge/merger-ai-squash-gates.js";
 import { extractEffectiveWriteScopeFromPrompt } from "@fusion/core";
 
 const policy = vi.hoisted(() => vi.fn());
@@ -107,6 +107,91 @@ describe("resolveRepoDeclaredScopeTransform", () => {
     const transform = resolveRepoDeclaredScopeTransform({ repoRel: "repo-b", repoKeys: ["repo-a", "repo-b"] });
     expect(transform.transform(["repo-a/src/**"])).toEqual([]);
     expect(transform.describe(["repo-a/src/**"])).toBe("foreign-repo-only");
+  });
+});
+
+/*
+FNXC:FileScopeInvariant 2026-10-08-08:58:
+KB-058: the pre-review check reads the branch's mechanical squash without a clean room. These run with real git
+(the invariant unit file mocks child_process), covering clean, conflicting, already-landed, and unknown-ref branches.
+*/
+describe("readMechanicalSquashFiles", () => {
+  it("returns the files a clean branch squash touches", async () => {
+    const dir = createRepo((root) => {
+      mkdirSync(join(root, "allowed"), { recursive: true });
+      writeFileSync(join(root, "allowed", "a.txt"), "a\n");
+      writeFileSync(join(root, "outside.txt"), "o\n");
+    });
+    const files = await readMechanicalSquashFiles(dir, git(dir, "rev-parse main"), "fusion/fn-9050");
+    expect(files?.sort()).toEqual(["allowed/a.txt", "outside.txt"]);
+  });
+
+  it("includes conflicted files when both sides edit the same file", async () => {
+    const dir = createRepo((root) => writeFileSync(join(root, "base.txt"), "branch\n"));
+    writeFileSync(join(dir, "base.txt"), "main\n");
+    git(dir, "commit -q -am main-edit");
+    const files = await readMechanicalSquashFiles(dir, git(dir, "rev-parse main"), "fusion/fn-9050");
+    expect(files).toContain("base.txt");
+  });
+
+  it("returns an empty list when the branch change is already on the tip", async () => {
+    const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "o\n"));
+    git(dir, "merge -q --no-edit fusion/fn-9050");
+    await expect(readMechanicalSquashFiles(dir, git(dir, "rev-parse main"), "fusion/fn-9050")).resolves.toEqual([]);
+  });
+
+  it("returns null for an unknown ref so the caller fails open", async () => {
+    const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "o\n"));
+    await expect(readMechanicalSquashFiles(dir, git(dir, "rev-parse main"), "fusion/does-not-exist")).resolves.toBeNull();
+  });
+});
+
+describe("preflightAiMergeSquashFileScope", () => {
+  function audit() {
+    return { git: vi.fn(async () => undefined) } as any;
+  }
+
+  it("skips and logs when the squash file list is unavailable", async () => {
+    setPolicy("strict");
+    const { store, task } = makeStore(["allowed/**"]);
+    const log = vi.fn(async () => undefined);
+    await expect(preflightAiMergeSquashFileScope({
+      store, task, taskId: "FN-9050", repoRootDir: "/unused", branch: "b", tipSha: "t", audit: audit(), log,
+      squashFilesReader: async () => null,
+    })).resolves.toBeUndefined();
+    expect(log).toHaveBeenCalledWith("AI merge: pre-review file-scope check skipped \u2014 squash file list unavailable; the post-review check decides");
+    expect(store.parseFileScopeFromPrompt).not.toHaveBeenCalled();
+  });
+
+  it("fails open to the post-review check on a non-violation error", async () => {
+    policy.mockRejectedValue(new Error("policy unavailable"));
+    const { store, task } = makeStore(["allowed/**"]);
+    const log = vi.fn(async () => undefined);
+    await expect(preflightAiMergeSquashFileScope({
+      store, task, taskId: "FN-9050", repoRootDir: "/unused", branch: "b", tipSha: "t", audit: audit(), log,
+      squashFilesReader: async () => ["outside.txt"],
+    })).resolves.toBeUndefined();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("policy unavailable"));
+  });
+
+  it("refuses a strict violation and clears the reconciliation record", async () => {
+    setPolicy("strict");
+    const { store, task } = makeStore(["allowed/**"], { aiMergeReviewReconciliation: { candidateSha: "abc" } });
+    await expect(preflightAiMergeSquashFileScope({
+      store, task, taskId: "FN-9050", repoRootDir: "/unused", branch: "b", tipSha: "t", audit: audit(), log: vi.fn(async () => undefined),
+      squashFilesReader: async () => ["outside.txt"],
+    })).rejects.toBeInstanceOf(FileScopeViolationError);
+    expect(task.aiMergeReviewReconciliation).toBeNull();
+  });
+
+  it("still surfaces the violation when clearing the reconciliation record fails", async () => {
+    setPolicy("strict");
+    const { store, task } = makeStore(["allowed/**"]);
+    store.updateTask.mockRejectedValue(new Error("store down"));
+    await expect(preflightAiMergeSquashFileScope({
+      store, task, taskId: "FN-9050", repoRootDir: "/unused", branch: "b", tipSha: "t", audit: audit(), log: vi.fn(async () => undefined),
+      squashFilesReader: async () => ["outside.txt"],
+    })).rejects.toBeInstanceOf(FileScopeViolationError);
   });
 });
 
@@ -250,10 +335,167 @@ describe("runAiMerge approved-squash gates", () => {
 
     expect(git(cleanRoom, "rev-parse HEAD")).toBe(before);
     task.status = null;
+    /*
+    FNXC:FileScopeInvariant 2026-10-08-08:58:
+    KB-058: the retry no longer reaches the merge agent at all. The out-of-scope branch is refused by the pre-review
+    check before a clean room is built, so the rejected candidate is never re-selected and no merge session is spent.
+    */
     const normalMerge = vi.fn(async () => { throw new Error("normal merge invoked"); });
     await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, {
       mergeAgent: normalMerge, reviewAgent: approve,
-    })).rejects.toThrow("normal merge invoked");
-    expect(normalMerge).toHaveBeenCalledOnce();
+    })).rejects.toBeInstanceOf(FileScopeViolationError);
+    expect(normalMerge).not.toHaveBeenCalled();
+    expect(task.aiMergeReviewReconciliation ?? null).toBeNull();
+  });
+});
+
+/*
+FNXC:FileScopeInvariant 2026-10-08-08:58:
+Symptom (KB-008/KB-058): a genuinely out-of-scope squash ran full AI merge and review cycles before the post-review
+check parked it. Reproduction: strict policy, branch adds only `outside.txt`, scope `allowed/**`, spy agents.
+Assertion: the merge rejects with FileScopeViolationError while neither agent ran, no clean room was built, main is
+unchanged, and exactly one violation row carries `scopeCheckPhase:"pre-review"`. Every waiver mode keeps its single row.
+*/
+describe("runAiMerge pre-review file-scope check", () => {
+  function auditRows(store: any, type: string): any[] {
+    return store.recordRunAuditEvent.mock.calls.map(([event]: any[]) => event).filter((event: any) => event.mutationType === type);
+  }
+
+  function spies(mutate?: (cwd: string) => void) {
+    return {
+      mergeAgent: vi.fn(squashAgent("fusion/fn-9050", mutate)),
+      reviewAgent: vi.fn(approve),
+    };
+  }
+
+  function inScopeRepo(): string {
+    return createRepo((root) => {
+      mkdirSync(join(root, "allowed"), { recursive: true });
+      writeFileSync(join(root, "allowed", "a.txt"), "inside\n");
+    });
+  }
+
+  it("refuses an out-of-scope squash before any merge agent, reviewer, or clean room", async () => {
+    setPolicy("strict");
+    const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "outside\n"));
+    const before = git(dir, "rev-parse main");
+    const { store } = makeStore(["allowed/**"]);
+    const agents = spies();
+
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, agents)).rejects.toBeInstanceOf(FileScopeViolationError);
+
+    expect(agents.mergeAgent).not.toHaveBeenCalled();
+    expect(agents.reviewAgent).not.toHaveBeenCalled();
+    expect(auditRows(store, "merge:ai-clean-room")).toHaveLength(0);
+    expect(git(dir, "rev-parse main")).toBe(before);
+    const violations = auditRows(store, "merge:file-scope-violation");
+    expect(violations).toHaveLength(1);
+    expect(violations[0].metadata.scopeCheckPhase).toBe("pre-review");
+  });
+
+  it("lands an in-scope strict squash through the agents", async () => {
+    setPolicy("strict");
+    const dir = inScopeRepo();
+    const { store } = makeStore(["allowed/**"]);
+    const agents = spies();
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, agents)).resolves.toMatchObject({ merged: true });
+    expect(agents.mergeAgent).toHaveBeenCalled();
+    expect(agents.reviewAgent).toHaveBeenCalled();
+    expect(auditRows(store, "merge:file-scope-violation")).toHaveLength(0);
+  });
+
+  it("lands a scopeOverride squash and logs the bypass exactly once", async () => {
+    setPolicy("strict");
+    const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "outside\n"));
+    const { store } = makeStore(["allowed/**"], { scopeOverride: true });
+    const agents = spies();
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, agents)).resolves.toMatchObject({ merged: true });
+    expect(agents.mergeAgent).toHaveBeenCalled();
+    const bypassLogs = store.appendAgentLog.mock.calls.filter(([, message]: any[]) => String(message).includes("bypassed via scopeOverride"));
+    expect(bypassLogs).toHaveLength(1);
+  });
+
+  it("lands with an empty declared scope", async () => {
+    setPolicy("strict");
+    const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "outside\n"));
+    const { store } = makeStore([]);
+    const agents = spies();
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, agents)).resolves.toMatchObject({ merged: true });
+    expect(agents.mergeAgent).toHaveBeenCalled();
+  });
+
+  it("keeps exactly one warning row under warn", async () => {
+    setPolicy("warn");
+    const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "outside\n"));
+    const { store } = makeStore(["allowed/**"]);
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, spies())).resolves.toMatchObject({ merged: true });
+    const rows = auditRows(store, "merge:file-scope-violation");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].metadata.warningOnly).toBe(true);
+    expect(rows[0].metadata).not.toHaveProperty("scopeCheckPhase");
+  });
+
+  it("keeps exactly one enforcement-disabled row under off", async () => {
+    setPolicy("off");
+    const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "outside\n"));
+    const { store } = makeStore(["allowed/**"]);
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, spies())).resolves.toMatchObject({ merged: true });
+    expect(auditRows(store, "merge:file-scope-enforcement-disabled")).toHaveLength(1);
+  });
+
+  it("refuses custom rules that miss the branch before any agent runs, and lands when they cover it", async () => {
+    policy.mockResolvedValue({ fileScope: "custom", fileScopeRules: ["elsewhere/**"] });
+    const refused = inScopeRepo();
+    const refusedAgents = spies();
+    await expect(runAiMerge(makeStore(["allowed/**"]).store, refused, "FN-9050", { manual: true }, refusedAgents)).rejects.toBeInstanceOf(FileScopeViolationError);
+    expect(refusedAgents.mergeAgent).not.toHaveBeenCalled();
+    expect(refusedAgents.reviewAgent).not.toHaveBeenCalled();
+
+    policy.mockResolvedValue({ fileScope: "custom", fileScopeRules: ["allowed/**"] });
+    const covered = inScopeRepo();
+    await expect(runAiMerge(makeStore(["unrelated/**"]).store, covered, "FN-9050", { manual: true }, spies())).resolves.toMatchObject({ merged: true });
+  });
+
+  it("keeps the post-review check as the invariant of record when the merge agent authors out-of-scope work", async () => {
+    setPolicy("strict");
+    const dir = inScopeRepo();
+    const before = git(dir, "rev-parse main");
+    const { store } = makeStore(["allowed/**"]);
+    const mergeAgent = vi.fn(async (cwd: string) => {
+      writeFileSync(join(cwd, "outside.txt"), "agent\n");
+      git(cwd, "add -A && git commit -q -m squash");
+    });
+    const reviewAgent = vi.fn(approve);
+
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, { mergeAgent, reviewAgent })).rejects.toBeInstanceOf(FileScopeViolationError);
+
+    expect(reviewAgent).toHaveBeenCalled();
+    expect(git(dir, "rev-parse main")).toBe(before);
+    const rows = auditRows(store, "merge:file-scope-violation");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].metadata).not.toHaveProperty("scopeCheckPhase");
+  });
+
+  it("refuses a seeded reconciliation candidate pre-review and clears the record", async () => {
+    setPolicy("strict");
+    const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "outside\n"));
+    const before = git(dir, "rev-parse main");
+    const { store, task } = makeStore(["allowed/**"]);
+    task.aiMergeReviewReconciliation = {
+      sourceSha: git(dir, "rev-parse --verify fusion/fn-9050"),
+      integrationTipSha: before,
+      candidateSha: "0".repeat(40),
+      candidateTreeSha: "0".repeat(40),
+      findings: [],
+      consecutiveCleanApprovals: 1,
+      correctivePasses: 0,
+    };
+    const agents = spies();
+
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, agents)).rejects.toBeInstanceOf(FileScopeViolationError);
+
+    expect(agents.mergeAgent).not.toHaveBeenCalled();
+    expect(agents.reviewAgent).not.toHaveBeenCalled();
+    expect(task.aiMergeReviewReconciliation).toBeNull();
   });
 });

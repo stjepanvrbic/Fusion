@@ -87,7 +87,7 @@ import { isMergeActiveStatus, shouldClearOrphanedMergeStamp } from "./merge-acti
 import { recordWorkspaceBaseBranchDecision, resolveWorkspaceRepoBaseBranch } from "../worktree/workspace-base-branch.js";
 import { captureWorkspaceReviewEvidence } from "../worktree/workspace-review-evidence.js";
 import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
-import { enforceAiMergeSquashGates } from "./merger-ai-squash-gates.js";
+import { enforceAiMergeSquashGates, preflightAiMergeSquashFileScope } from "./merger-ai-squash-gates.js";
 import {
   assertMergeGenerationOwned,
   createMergeWriteFence,
@@ -1238,6 +1238,20 @@ export async function landOneRepo(
       await audit.git({ type: "merge:ai-empty", target: integrationBranch, metadata: { taskId, tipSha } });
       return { outcome: "empty", tipSha, integrationBranch, dependencySyncDecision: "not-run-empty" };
     }
+
+    /*
+    FNXC:FileScopeInvariant 2026-10-08-08:58:
+    KB-058: decide a genuinely out-of-scope squash from the mechanical diff BEFORE the clean room is built, so a true
+    refusal spends no clean room, dependency install, merge agent, or reviewer (KB-008 paid three full cycles).
+    It throws the same FileScopeViolationError the post-review check does, for both single-repo and per-repo workspace lands.
+    The post-review `enforceAiMergeSquashGates` call below remains the invariant of record; this is an early exit only.
+    */
+    const preflightTask = await store.getTask(taskId);
+    if (!preflightTask) throw new Error(`AI merge task ${taskId} disappeared before pre-review file-scope check`);
+    await preflightAiMergeSquashFileScope({
+      store, task: preflightTask, taskId, repoRootDir, branch, tipSha, audit, log,
+      repoRel: ctx.repoRel, repoKeys: ctx.repoKeys,
+    });
 
     // 1. Clean-room worktree at the integration tip.
     let mergeRoot: string | undefined;
@@ -3234,7 +3248,7 @@ export async function landWorkspaceTask(
         await log(`AI merge (workspace): sub-repo ${repoRel} refused by the file-scope invariant: ${err.message}`);
         await persistWorkspaceRepoLandFailure(store, taskId, repoRel, {
           category: "review",
-          message: `Workspace repository ${repoRel} could not land: its approved squash does not overlap the task's declared File Scope.`,
+          message: `Workspace repository ${repoRel} could not land: its squash does not overlap the task's declared File Scope.`,
           at: new Date().toISOString(),
           branch: entry.branch,
           repository: repoRel,

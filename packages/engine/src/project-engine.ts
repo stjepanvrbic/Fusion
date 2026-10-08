@@ -5925,7 +5925,7 @@ export class ProjectEngine {
               });
               await store.logEntry(
                 taskId,
-                "AI merge stopped: the file-scope invariant refused the approved squash; widen the task's File Scope, set scopeOverride with a reason, or refile the out-of-scope work",
+                "AI merge stopped: the file-scope invariant refused the squash; widen the task's File Scope, set scopeOverride with a reason, or refile the out-of-scope work",
                 "FileScopeViolationError",
               );
             } catch (recoveryErr) {

@@ -726,11 +726,32 @@ The revision block replaces any prior revision instructions (no accumulation). P
 
 By default this split-and-fork behavior is enabled through the project setting `workflowRevisionForkOnScopeMismatch`. Set it to `false` to restore the legacy behavior that appends all workflow revision feedback to the original task even when it references files outside the declared File Scope.
 
+### Merge-time File Scope enforcement (KB-058)
+
+<!--
+FNXC:FileScopeInvariant 2026-10-08-08:58:
+KB-058: a genuinely out-of-scope squash used to pay a full clean room, dependency install, merge agent, and review cycle before it parked. The unified AI-merge seam now checks twice: a pre-review early exit and the post-review invariant of record.
+-->
+
+The unified AI-merge seam `landOneRepo` (single-repository lands and every workspace sub-repository land) enforces the task's declared `## File Scope` twice:
+
+1. **Pre-review early exit.** Before any clean room, dependency install, merge agent, or reviewer session, Fusion computes the branch's mechanical squash file list (`git merge-tree --write-tree` from the integration tip and the task branch, then `git diff --name-only`; conflicted files count as touched). If that list has zero overlap with the declared scope, the merge fails with the same `FileScopeViolationError` and parks the card exactly as the post-review check would. A merge agent can only narrow the file set while resolving conflicts, so a zero-overlap mechanical squash cannot become an in-scope one.
+2. **Post-review invariant of record.** After review approves the clean-room squash, the approved commit range is checked again before the integration ref advances. This check is unchanged and still refuses squashes the pre-check passed (for example, a merge agent that authored out-of-scope work).
+
+Pre-review mode semantics:
+
+- **Fail open:** if the mechanical file list cannot be computed (for example git older than 2.38, or another git error), or the pre-check hits any non-violation error, it logs one line and the post-review check decides. An empty list (branch already on the tip) defers to the normal empty-land path.
+- `strict` and `custom` violations are refused pre-review. The `merge:file-scope-violation` audit row carries the existing metadata plus `scopeCheckPhase: "pre-review"`. Post-review rows have no `scopeCheckPhase` key.
+- `warn`, `off`, `task.scopeOverride === true` (without custom rules), and an empty declared scope pass the pre-check silently, so the post-review check still writes their single warning row, enforcement-disabled row, or bypass log, with no duplicates.
+- Workspace lands use the same repository-local scope subset in both checks, including the forced violation for a repository whose declarations all belong to sibling repositories.
+- A pre-review refusal also clears the durable `aiMergeReviewReconciliation` record, because the refusal is a verdict on the candidate.
+
 ### End-of-step file-scope invariant for prompt pre-merge steps (FN-4343)
 
 <!--
 FNXC:WorkflowScopeLeak 2026-06-26-15:00:
 KNOWN FOLLOW-UP: the FN-4343 per-step end-of-step scope-leak invariant (and its `workflowStepScopeEnforcement` setting) has NOT yet been replicated on the graph-native optional-group execution path. The setting is still declared and round-trips, but the graph executor does not run the per-step invariant. Merge-time File Scope enforcement is a separate gate in the unified AI-merge `landOneRepo` seam; it evaluates the approved clean-room squash before the integration ref advances.
+FNXC:FileScopeInvariant 2026-10-08-08:58: KB-058 adds a pre-review early exit on the mechanical squash before that post-review check; see "Merge-time File Scope enforcement (KB-058)".
 -->
 
 > **Known follow-up (not yet on the graph path):** The original FN-4343 per-step invariant ran after each successful prompt-mode pre-merge workflow step under the legacy `runWorkflowSteps` loop. That loop was deleted in the graph-native cutover, and this per-step invariant has **not yet been replicated** on the optional-group graph path. The `workflowStepScopeEnforcement` setting (`"block"` / `"warn"` / `"off"`, default `"block"`) is still declared and round-trips, but the graph executor does not currently enforce it per step. Merge-time File Scope enforcement (`FileScopeViolationError` and squash/file-scope overlap) runs at unified AI-merge `landOneRepo` before landing, so off-scope writes are still caught at merge.
