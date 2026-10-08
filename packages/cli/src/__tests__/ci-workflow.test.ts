@@ -1,5 +1,17 @@
-import { describe, it, expect, beforeAll } from "vitest";
-import { readFileSync, accessSync, constants, existsSync, readdirSync } from "node:fs";
+import { describe, it, expect, beforeAll, afterEach } from "vitest";
+import {
+  readFileSync,
+  accessSync,
+  constants,
+  existsSync,
+  readdirSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parse } from "yaml";
@@ -763,6 +775,91 @@ describe("Version & Release workflow (.github/workflows/version.yml)", () => {
     const steps = workflow.jobs.release.steps;
     const compositeStep = findCompositeSetupStep(steps);
     expect(compositeStep?.with?.["registry-url"]).toBe("https://registry.npmjs.org");
+  });
+
+  /*
+  FNXC:UpdateChannels 2026-10-08-03:34:
+  KB-031: version.yml publishes with the `latest` dist-tag, so it must refuse to run from a changesets pre-mode checkout.
+  The guard must run first after checkout (before any install/build/publish), be unbypassable, and fail whenever .changeset/pre.json exists (mode pre or exit).
+  */
+  describe("pre-mode guard", () => {
+    const GUARD_NAME = "Refuse changesets pre-mode (stable-only workflow)";
+    const tempDirs: string[] = [];
+
+    afterEach(() => {
+      while (tempDirs.length > 0) {
+        const dir = tempDirs.pop()!;
+        try {
+          rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+        } catch (error) {
+          // On Windows hosts whose PATH resolves `bash` to WSL, the WSL VM can keep the
+          // child's cwd open after exit (EPERM). Cleanup is best-effort there: the dir lives
+          // in the per-worker tmpdir redirect sink that the vitest teardown sweeps.
+          if (process.platform !== "win32") throw error;
+        }
+      }
+    });
+
+    function guardStep(): any {
+      return workflow.jobs.release.steps.find((step: any) => step.name === GUARD_NAME);
+    }
+
+    function runGuard(preJson?: string, withChangesetDir = true) {
+      const cwd = mkdtempSync(join(tmpdir(), "kb031-version-guard-"));
+      tempDirs.push(cwd);
+      if (withChangesetDir) mkdirSync(join(cwd, ".changeset"));
+      if (preJson !== undefined) writeFileSync(join(cwd, ".changeset", "pre.json"), preJson);
+      return spawnSync("bash", ["-c", guardStep().run], { cwd, encoding: "utf8" });
+    }
+
+    it("runs immediately after checkout and before any install, build, or publish step", () => {
+      const steps: any[] = workflow.jobs.release.steps;
+      const guardIndex = steps.findIndex((step) => step.name === GUARD_NAME);
+      expect(guardIndex).toBe(1);
+      expect(String(steps[0].uses)).toMatch(/^actions\/checkout/);
+
+      const laterIndexes = steps
+        .map((step, index) => ({ step, index }))
+        .filter(({ step }) => {
+          const run = typeof step.run === "string" ? step.run : "";
+          const uses = typeof step.uses === "string" ? step.uses : "";
+          return (
+            run.includes("pnpm install") ||
+            run.includes("pnpm build") ||
+            run.includes("npm install") ||
+            uses.startsWith("changesets/action")
+          );
+        })
+        .map(({ index }) => index);
+      expect(laterIndexes.length).toBeGreaterThanOrEqual(4);
+      for (const index of laterIndexes) {
+        expect(guardIndex).toBeLessThan(index);
+      }
+    });
+
+    it("uses bash and cannot be bypassed", () => {
+      const step = guardStep();
+      expect(step.shell).toBe("bash");
+      expect(step.if).toBeUndefined();
+      expect(step["continue-on-error"]).toBeUndefined();
+    });
+
+    it("fails with an error annotation when pre-mode is active", () => {
+      const result = runGuard(JSON.stringify({ mode: "pre", tag: "beta", initialVersions: {}, changesets: [] }));
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("::error");
+      expect(result.stdout).toContain("pnpm release");
+    });
+
+    it("fails when pre.json survives in exit mode", () => {
+      const result = runGuard(JSON.stringify({ mode: "exit", tag: "beta", initialVersions: {}, changesets: [] }));
+      expect(result.status).toBe(1);
+    });
+
+    it("passes on the stable track", () => {
+      expect(runGuard().status).toBe(0);
+      expect(runGuard(undefined, false).status).toBe(0);
+    });
   });
 });
 

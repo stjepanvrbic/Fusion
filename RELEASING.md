@@ -48,11 +48,13 @@ When changesets are merged to `main`, the `version.yml` workflow automatically o
 - Generates/updates `CHANGELOG.md` files for affected packages
 - Distills the version's changeset summaries into grouped, end-user-facing release notes in the root `CHANGELOG.md` via Claude (`claude -p --model sonnet`): a **Highlights** section (top 3–5) plus category groups, and prints an engagement-oriented X draft (≤280 chars) after a local release
 
+> **Stable-only guard:** `version.yml` publishes with the npm `latest` dist-tag, so its first step after checkout fails the job whenever `.changeset/pre.json` exists — during a beta cycle (`mode: "pre"`) or with a pending `pre exit` (`mode: "exit"`). Nothing is installed, built, versioned, or published in that state. Use `pnpm release --channel beta` or `pnpm release --channel stable` instead (see [Release tracks](#release-tracks-beta-and-stable)).
+
 ### 3. Merge the Version PR to release
 
 When you merge the Version Packages PR:
 
-- The `version.yml` workflow detects that all changesets have been consumed
+- The `version.yml` workflow detects that all changesets have been consumed (only on the stable track — it refuses to run while `.changeset/pre.json` exists)
 - It builds all packages and publishes them to **npm** with provenance attestation
 - It creates a git tag `v{version}` based on the `kb` CLI package version
 - The tag push triggers `release.yml`, which:
@@ -116,7 +118,7 @@ Commit on `release` (or a worktree branched from it), add a changeset, run `pnpm
 
 | Channel | Workflow | Trigger | Output |
 |---------|----------|---------|--------|
-| npm | `version.yml` (stable only) or `pnpm release` | Manual | npm packages with provenance (CI) |
+| npm | `version.yml` (stable only; fails while `.changeset/pre.json` exists — use `pnpm release --channel beta\|stable` then) or `pnpm release` | Manual | npm packages with provenance (CI) |
 | GitHub Release | `release.yml` | Version tag (`v*`; `v*-beta.N` → prerelease) | Signed platform binaries, Android APK/AAB + checksums |
 
 ## Platform binaries

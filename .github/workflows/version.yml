@@ -11,6 +11,13 @@
 # If beta publishing ever moves to CI, this workflow needs a channel input that
 # threads `--tag beta` into the publish command — do not dispatch it as-is from
 # a pre-mode (.changeset/pre.json) checkout.
+#
+# FNXC:UpdateChannels 2026-10-08-03:34:
+# KB-031: the stable-only rule is now enforced, not just documented. The first
+# step after checkout fails the job whenever .changeset/pre.json exists, before
+# any install, build, version, or publish step runs. It also fails for
+# `mode: "exit"`, because promoting a beta cycle to stable is owned by
+# `pnpm release --channel stable` (cycle rollup + pre.json lifecycle), not CI.
 
 name: Version & Release
 
@@ -31,6 +38,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
+
+      - name: Refuse changesets pre-mode (stable-only workflow)
+        shell: bash
+        run: |
+          if [ -e .changeset/pre.json ]; then
+            echo "::error file=.changeset/pre.json::Changesets pre-mode is active (.changeset/pre.json exists). This workflow publishes with the npm 'latest' dist-tag and is stable-only; running it would publish a prerelease as latest. Release with 'pnpm release --channel beta' or 'pnpm release --channel stable' instead."
+            exit 1
+          fi
+          echo "No .changeset/pre.json — stable track, continuing."
 
       - name: Setup Node and pnpm
         uses: ./.github/actions/setup-node-pnpm
