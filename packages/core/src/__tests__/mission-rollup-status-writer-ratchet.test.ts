@@ -7,9 +7,18 @@ it can bypass shouldApplyRecomputedStatus and clear blocked or archived operator
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../../../..");
+
+/**
+ * FNXC:TestInfraWindows 2026-10-08-07:11:
+ * The audited module lists are forward-slash repo paths on every platform.
+ * The walker collects native paths, so report them `/`-joined; on Windows `slice` kept backslashes and every comparison failed.
+ */
+function repoRelative(base: string, file: string): string {
+  return relative(base, file).split(sep).join("/");
+}
 
 function sourceRoots(base: string = REPO_ROOT): string[] {
   const roots: string[] = [];
@@ -92,7 +101,7 @@ function computedStatusWriters(roots: readonly string[] | undefined = undefined,
   const hits: string[] = [];
   for (const root of roots ?? sourceRoots(base)) {
     for (const file of sourceFiles(root, base)) {
-      if (computedStatusWrites(executableSource(file)).length > 0) hits.push(file.slice(base.length + 1));
+      if (computedStatusWrites(executableSource(file)).length > 0) hits.push(repoRelative(base, file));
     }
   }
   return hits.sort();
@@ -109,7 +118,7 @@ function unguardedComputedStatusWriters(roots: readonly string[] | undefined = u
         writesByFunction.set(fn, (writesByFunction.get(fn) ?? 0) + 1);
       }
       if ([...writesByFunction].some(([fn, writes]) => !fn || (fn.match(/shouldApplyRecomputedStatus/g)?.length ?? 0) < writes)) {
-        hits.push(file.slice(base.length + 1));
+        hits.push(repoRelative(base, file));
       }
     }
   }

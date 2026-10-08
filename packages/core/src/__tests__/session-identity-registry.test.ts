@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmdirSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isTaskExecutionSessionPrincipal } from "../agents/task-execution-task-creation.js";
@@ -100,25 +100,35 @@ describe("session identity registry", () => {
   through a genuine symlink alias and resolve through the real path (and vice
   versa) so the realpath folding is actually exercised. Cleanup removes both
   temporary artifacts.
+
+  FNXC:TestInfraWindows 2026-10-08-07:11:
+  Windows creates the alias as a junction (no symlink privilege needed) and refuses `rmSync` on a directory link ("Path is a directory").
+  Remove only the link itself (`rmdirSync` on win32, `unlinkSync` on POSIX) and prove the real directory survived before removing it.
   */
   it("resolves a symlink alias and its real path to one key", () => {
     const real = realpathSync(mkdtempSync(join(tmpdir(), "fusion-idreg-")));
     const alias = `${real}-alias`;
-    symlinkSync(real, alias, "dir");
+    symlinkSync(real, alias, process.platform === "win32" ? "junction" : "dir");
     try {
-      const dispose = registerFusionSessionIdentity(alias, { agentId: "agent-real" });
-      const viaReal = resolveFusionSessionPrincipal(real);
-      expect(viaReal.kind).toBe("agent");
-      if (viaReal.kind === "agent") {
-        expect(viaReal.identity.agentId).toBe("agent-real");
+      try {
+        const dispose = registerFusionSessionIdentity(alias, { agentId: "agent-real" });
+        const viaReal = resolveFusionSessionPrincipal(real);
+        expect(viaReal.kind).toBe("agent");
+        if (viaReal.kind === "agent") {
+          expect(viaReal.identity.agentId).toBe("agent-real");
+        }
+        const viaAlias = resolveFusionSessionPrincipal(alias);
+        expect(viaAlias.kind).toBe("agent");
+        dispose();
+        expect(resolveFusionSessionPrincipal(real)).toEqual({ kind: "operator" });
+        expect(resolveFusionSessionPrincipal(alias)).toEqual({ kind: "operator" });
+      } finally {
+        if (process.platform === "win32") rmdirSync(alias);
+        else unlinkSync(alias);
       }
-      const viaAlias = resolveFusionSessionPrincipal(alias);
-      expect(viaAlias.kind).toBe("agent");
-      dispose();
-      expect(resolveFusionSessionPrincipal(real)).toEqual({ kind: "operator" });
-      expect(resolveFusionSessionPrincipal(alias)).toEqual({ kind: "operator" });
+      expect(existsSync(alias)).toBe(false);
+      expect(existsSync(real)).toBe(true);
     } finally {
-      rmSync(alias, { force: true });
       rmSync(real, { recursive: true, force: true });
     }
   });

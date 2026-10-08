@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { resolveGlobalDir } from "../config/global-settings.js";
 import { CronExpressionParser } from "cron-parser";
-import { PgBackupManager, type PgBackupPair, type PgDumpResult } from "../postgres/pg-backup.js";
+import { PgBackupManager, type PgBackupPair, type PgClientExec, type PgDumpResult } from "../postgres/pg-backup.js";
 import { resolveBackend } from "../postgres/backend-resolver.js";
 import { getActiveEmbeddedRuntimeUrl } from "../postgres/active-backend-registry.js";
 import { reconcileRestoredSchemaMigrationsFromUrl } from "../postgres/restore-migration-reconcile.js";
@@ -78,6 +78,13 @@ export interface BackupOptions {
   /** Override the bounded native-client timeout. Defaults to 120 seconds. */
   clientTimeoutMs?: number;
   /**
+   * FNXC:PostgresBackup 2026-10-08-07:11:
+   * Embedder/test seam forwarded unchanged to {@link PgBackupOptions.clientExec}.
+   * Windows tests launch Node-script fake clients through it, because shell-free `execFile` cannot start an extensionless shebang file there.
+   * Omitted means the default `execFile` path, so production behavior is unchanged.
+   */
+  clientExec?: PgClientExec;
+  /**
    * FNXC:PostgresBackup 2026-09-04-05:26:
    * Test seam for post-restore rewind/replay. Production reconnects and
    * reconciles `public.fusion_schema_migrations` against restored relations so
@@ -125,6 +132,7 @@ export class BackupManager {
       pgDumpPath: options?.pgDumpPath,
       pgRestorePath: options?.pgRestorePath,
       clientTimeoutMs: options?.clientTimeoutMs,
+      clientExec: options?.clientExec,
     });
   }
 

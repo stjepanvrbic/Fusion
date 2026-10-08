@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
 import {
@@ -28,18 +28,25 @@ describe("getProjectRootFromWorktree", () => {
     expect(getProjectRootFromWorktree("C:\\repo\\.fusion\\worktrees\\fn-001\\src\\file.ts")).toBe("C:\\repo");
   });
 
+  /*
+  FNXC:TestInfraWindows 2026-10-08-07:11:
+  Candidate parents are `resolve`d then `/`-joined, so a POSIX-rooted fixture becomes drive-qualified on Windows ("C:/tmp").
+  Derive the expectation with the same transform; on Linux it is exactly "/tmp/.fn-worktrees" and "/tmp".
+  */
+  const resolvedSlashPath = (path: string): string => resolve(path).split(sep).join("/");
+
   it("supports configured candidate worktrees dir paths", () => {
     expect(
       getProjectRootFromWorktree("/tmp/.fn-worktrees/repo/fn-001/src", {
         worktreesDirCandidates: ["/tmp/.fn-worktrees/repo"],
       }),
-    ).toBe("/tmp/.fn-worktrees");
+    ).toBe(resolvedSlashPath("/tmp/.fn-worktrees"));
 
     expect(
       getProjectRootFromWorktree("/tmp/repo.worktrees/fn-001", {
         worktreesDirCandidates: ["/tmp/repo.worktrees"],
       }),
-    ).toBe("/tmp");
+    ).toBe(resolvedSlashPath("/tmp"));
   });
 
   /*
@@ -106,7 +113,8 @@ describe("getProjectRootFromWorktree", () => {
     const root = mkdtempSync(join(tmpdir(), "fn-6079-root-"));
     const worktreeRoot = mkdtempSync(join(tmpdir(), "fusion-ai-merge-fn-6079-"));
     try {
-      const expectedRoot = realpathSync(root);
+      // FNXC:TestInfraWindows 2026-10-08-08:20: the native realpath expands an 8.3 runner temp spelling (RUNNER~1) the way git reports it; identical on Linux.
+      const expectedRoot = realpathSync.native(root);
       git(root, "init -q -b main");
       git(root, "config user.email test@example.com");
       git(root, "config user.name Test");

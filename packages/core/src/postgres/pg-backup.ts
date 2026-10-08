@@ -126,6 +126,9 @@ export interface PgBackupOptions {
    * FNXC:PostgresBackup 2026-09-04-01:55:
    * An injectable client seam proves timeout and credential redaction behavior
    * without slow wall-clock process fixtures.
+   *
+   * FNXC:PostgresBackup 2026-10-08-07:11:
+   * `BackupOptions.clientExec` forwards here, so tests can run Windows-runnable Node fake clients through `BackupManager` too.
    */
   readonly clientExec?: PgClientExec;
 }

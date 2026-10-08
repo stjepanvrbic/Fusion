@@ -143,6 +143,12 @@ export type WireExecutorLifecycleResult = {
   unregisterTaskMoveDisposer: (() => void) | undefined;
   unregisterArchiveWorktreeDisposer: (() => void) | undefined;
   unregisterArchiveWorkspaceWorktreeDisposer: (() => void) | undefined;
+  /**
+   * FNXC:ExecutorLifecycle 2026-10-08-07:20:
+   * Removes, by identity, every store event listener this executor registered and fences
+   * any already-captured wrapper so it returns without acting. Idempotent.
+   */
+  unregisterStoreListeners: () => void;
 };
 
 /**
@@ -168,6 +174,35 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
   FNXC:EngineDiagnostics 2026-07-26-09:39:
   Executor bookkeeping that fires on every dispatch/session (construct, execute() entry, worktree ready, session create/register, prompt start, graph event stream, column-boundary warns-as-info, model/plugin setup, skip/duplicate/no-op guards) is debug-only (FUSION_DEBUG=executor). Keep log/warn/error for lifecycle outcomes operators act on: Starting task, ✓/✗ completion, failures, requeues, handoffs, stuck kills, verification failures, real moves.
   */
+  /*
+  FNXC:ExecutorLifecycle 2026-10-08-07:20:
+  A replaced executor (engine restart in place, project reload, test teardown) must never react to store events again.
+  Every store listener is registered through this helper: the wrapper is fenced by a disposed flag and otherwise calls the handler synchronously (no added await), so the task:moved in-tick ordering contract below is unchanged.
+  Removal is per-listener by identity (never removeAllListeners) so other subscribers on a shared store survive; fakes without off/removeListener are skipped silently.
+  */
+  let storeListenersDisposed = false;
+  const storeListenerRemovals: Array<() => void> = [];
+  // Typed as TaskStore["on"] so each call site keeps the store's per-event payload typing.
+  const onStore = ((event: string, handler: (...args: any[]) => unknown) => {
+    const wrapper = (...args: any[]): unknown => {
+      if (storeListenersDisposed) return undefined;
+      return handler(...args);
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- duck-typed emitter surface (test fakes may lack off)
+    const emitter = deps.store as any;
+    emitter.on(event, wrapper);
+    storeListenerRemovals.push(() => {
+      if (typeof emitter.off === "function") emitter.off(event, wrapper);
+      else if (typeof emitter.removeListener === "function") emitter.removeListener(event, wrapper);
+    });
+    return deps.store;
+  }) as TaskStore["on"];
+  const unregisterStoreListeners = (): void => {
+    storeListenersDisposed = true;
+    for (const remove of storeListenerRemovals.splice(0)) {
+      try { remove(); } catch (err) { executorLog.warn(`Failed to remove executor store listener: ${err}`); }
+    }
+  };
   executorLog.debug(`TaskExecutor constructed (rootDir=${deps.rootDir}, hasSemaphore=${!!deps.options.semaphore}, hasStuckDetector=${!!deps.options.stuckTaskDetector})`);
   const unregisterTaskMoveDisposer = registerTaskMoveDisposer(deps.store, async (task) => {
     // Start both paths without awaiting between them. Each synchronously
@@ -291,7 +326,7 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
   as a live inertness path rather than defensive dead code.
   */
   /* FNXC:WorkflowResolvedColumns 2026-08-22-00:13: This supersedes the prior residual-risk note: optional emitter payloads now consult TaskLaneCache before legacy ids; making lanes required and bridge forwarding remain separate follow-ups. */
-  deps.store.on("task:moved", ({ task, from, to, source, lanes }) => {
+  onStore("task:moved", ({ task, from, to, source, lanes }) => {
     /*
     FNXC:Diagnostics 2026-08-10-18:32:
     Per-move tracing is DEBUG. This listener fires on every task:moved event — every dispatch,
@@ -421,7 +456,7 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
     }
   });
 
-  deps.store.on("task:deleted", (task) => {
+  onStore("task:deleted", (task) => {
     deps.approvalSuspended.delete(task.id);
     deps.approvalResumeAfterUnwind.delete(task.id);
     deps.trackTaskDisposal(
@@ -441,7 +476,7 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
   //    after the current assistant turn completes (before the next LLM call)
   // 4. Comments are marked as seen BEFORE injection to prevent retry loops on failure
   // 5. Each injection is logged to the task for user visibility
-  deps.store.on("task:updated", async (task) => {
+  onStore("task:updated", async (task) => {
     try {
       // FN-5256: handle pause by synchronously reaping every active session
       // surface in one shot. Awaiting the abort ensures spawned shells are
@@ -848,7 +883,7 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
   });
 
   // When globalPause transitions from false → true, terminate all active agent sessions.
-  deps.store.on("settings:updated", ({ settings, previous }) => {
+  onStore("settings:updated", ({ settings, previous }) => {
     if (settings.globalPause && !previous.globalPause) {
       for (const [taskId, controllers] of deps.activeConfiguredCommandControllers) {
         executorLog.log(`Global pause — aborting configured command(s) for ${taskId}`);
@@ -931,6 +966,7 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
     unregisterTaskMoveDisposer,
     unregisterArchiveWorktreeDisposer,
     unregisterArchiveWorkspaceWorktreeDisposer,
+    unregisterStoreListeners,
   };
 }
 
@@ -949,6 +985,7 @@ export function applyWireExecutorLifecycleDisposers(
   h.unregisterTaskMoveDisposer = wired.unregisterTaskMoveDisposer;
   h.unregisterArchiveWorktreeDisposer = wired.unregisterArchiveWorktreeDisposer;
   h.unregisterArchiveWorkspaceWorktreeDisposer = wired.unregisterArchiveWorkspaceWorktreeDisposer;
+  h.unregisterStoreListeners = wired.unregisterStoreListeners;
 }
 
 /*

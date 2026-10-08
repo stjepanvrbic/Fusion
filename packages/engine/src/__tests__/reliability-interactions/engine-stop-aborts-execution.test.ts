@@ -1,5 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
 import { InProcessRuntime } from "../../runtimes/in-process-runtime.js";
+import { TaskExecutor } from "../../executor.js";
+
+const STORE_EVENTS = ["task:moved", "task:deleted", "task:updated", "settings:updated"] as const;
+
+/** EventEmitter-backed store that a real TaskExecutor can wire onto and a runtime can stop against. */
+function makeEmitterStore() {
+  const emitter = new EventEmitter();
+  return Object.assign(emitter, {
+    logEntry: vi.fn().mockResolvedValue(undefined),
+    getRunContextFor: vi.fn(),
+    getSettings: vi.fn().mockResolvedValue({ runtimeStopDrainMs: 1 }),
+    getTask: vi.fn().mockResolvedValue(undefined),
+  });
+}
+
+function listenerCounts(store: EventEmitter): Record<string, number> {
+  return Object.fromEntries(STORE_EVENTS.map((event) => [event, store.listenerCount(event)]));
+}
 
 function makeExecutor(overrides: Record<string, unknown> = {}) {
   return {
@@ -7,6 +26,7 @@ function makeExecutor(overrides: Record<string, unknown> = {}) {
     abortAllSessionBash: vi.fn(),
     abortAllInFlight: vi.fn().mockResolvedValue(undefined),
     disposeEphemeralTimers: vi.fn(),
+    dispose: vi.fn(),
     ...overrides,
   };
 }
@@ -155,5 +175,79 @@ describe("FN-5403 reliability interactions: engine stop aborts execution", () =>
 
     await runtime.stop().catch(() => undefined);
     expect(backendShutdown).toHaveBeenCalledTimes(1);
+  });
+  /*
+  FNXC:ExecutorLifecycle 2026-10-08-08:13 (KB-049):
+  A stopped or replaced runtime executor must release its store subscriptions, even when aborting in-flight work rejects, because the store can outlive the runtime across a restart in place.
+  */
+  it("KB-049: stop disposes the executor after aborting in-flight work", async () => {
+    const runtime = new InProcessRuntime({ projectId: "p", workingDirectory: "/tmp", isolationMode: "in-process" } as any, {} as any) as any;
+    const order: string[] = [];
+    runtime.status = "active";
+    runtime.taskStore = { getSettings: vi.fn().mockResolvedValue({ runtimeStopDrainMs: 1 }) };
+    runtime.pluginRunner = { shutdown: vi.fn().mockResolvedValue(undefined) };
+    runtime.worktreePool = { drain: vi.fn().mockReturnValue([]) };
+    const executor = makeExecutor({
+      abortAllInFlight: vi.fn().mockImplementation(async () => { order.push("abort"); }),
+      dispose: vi.fn(() => { order.push("dispose"); }),
+    });
+    runtime.executor = executor;
+
+    await runtime.stop();
+    expect(executor.dispose).toHaveBeenCalledOnce();
+    expect(order).toEqual(["abort", "dispose"]);
+  });
+
+  it("KB-049: stop still disposes the executor when abortAllInFlight rejects", async () => {
+    const runtime = new InProcessRuntime({ projectId: "p", workingDirectory: "/tmp", isolationMode: "in-process" } as any, {} as any) as any;
+    runtime.status = "active";
+    runtime.taskStore = { getSettings: vi.fn().mockResolvedValue({ runtimeStopDrainMs: 1 }) };
+    runtime.pluginRunner = { shutdown: vi.fn().mockResolvedValue(undefined) };
+    runtime.worktreePool = { drain: vi.fn().mockReturnValue([]) };
+    const executor = makeExecutor({ abortAllInFlight: vi.fn().mockRejectedValue(new Error("abort failed")) });
+    runtime.executor = executor;
+
+    await runtime.stop();
+    expect(executor.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("KB-049: stop removes a real executor's store listeners and it ignores later moves", async () => {
+    const runtime = new InProcessRuntime({ projectId: "p", workingDirectory: "/tmp", isolationMode: "in-process" } as any, {} as any) as any;
+    const store = makeEmitterStore();
+    const baseline = listenerCounts(store);
+    const executor = new TaskExecutor(store as any, "/tmp/fusion-test-kb049-runtime");
+    for (const event of STORE_EVENTS) expect(store.listenerCount(event)).toBe(baseline[event] + 1);
+    const execute = vi.spyOn(executor as any, "execute").mockResolvedValue(undefined);
+    vi.spyOn(executor as any, "resetMergeStateIfNeeded").mockImplementation(async (task: unknown) => task);
+    runtime.status = "active";
+    runtime.taskStore = store;
+    runtime.pluginRunner = { shutdown: vi.fn().mockResolvedValue(undefined) };
+    runtime.worktreePool = { drain: vi.fn().mockReturnValue([]) };
+    runtime.executor = executor;
+
+    await runtime.stop();
+
+    expect(listenerCounts(store)).toEqual(baseline);
+    store.emit("task:moved", { task: { id: "KB-001", column: "in-progress" }, from: "todo", to: "in-progress", source: "user" });
+    await Promise.resolve();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("KB-049: replacing the executor disposes the previous one", () => {
+    const runtime = new InProcessRuntime({ projectId: "p", workingDirectory: "/tmp", isolationMode: "in-process" } as any, {} as any) as any;
+    const store = makeEmitterStore();
+    const baseline = listenerCounts(store);
+    const previous = new TaskExecutor(store as any, "/tmp/fusion-test-kb049-runtime");
+    runtime.replaceExecutor(previous);
+    const previousMoved = store.rawListeners("task:moved").at(-1);
+    const next = new TaskExecutor(store as any, "/tmp/fusion-test-kb049-runtime");
+
+    runtime.replaceExecutor(next);
+
+    expect(runtime.getExecutor()).toBe(next);
+    for (const event of STORE_EVENTS) expect(store.listenerCount(event)).toBe(baseline[event] + 1);
+    expect(store.rawListeners("task:moved")).not.toContain(previousMoved);
+    next.dispose();
+    expect(listenerCounts(store)).toEqual(baseline);
   });
 });

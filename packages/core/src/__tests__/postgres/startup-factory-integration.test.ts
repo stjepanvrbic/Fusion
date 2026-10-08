@@ -13,7 +13,7 @@
  */
 
 import { afterEach, describe, it, expect } from "vitest";
-import { execSync } from "node:child_process";
+import { execPgAdminStatement } from "../../__test-utils__/pg-test-harness.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -38,12 +38,12 @@ function uniqueDbName(): string {
 /*
 FNXC:PgTestAuthFix 2026-07-14-00:00:
 The inline adminExec used process.env.USER for the psql -U flag, which is 'runner' on GitHub Actions (not 'postgres'). Use the PG_TEST_URL_BASE connection string instead so credentials are always correct.
+
+FNXC:TestInfraWindows 2026-10-08-08:20:
+Admin DDL runs through the shared harness maintenance connection (same PG_TEST_URL_BASE credentials) instead of shelling out to `psql`, which is not on PATH on Windows hosts or Windows CI.
 */
-function adminExec(statement: string): void {
-  execSync(
-    `psql "${PG_TEST_URL_BASE}/postgres" -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`,
-    { stdio: "pipe", env: process.env },
-  );
+async function adminExec(statement: string): Promise<void> {
+  await execPgAdminStatement(statement);
 }
 
 function seedLegacyTask(root: string, taskId: string, title: string): void {
@@ -124,7 +124,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   afterEach(async () => {
     if (dbName) {
       try {
-        adminExec(`DROP DATABASE IF EXISTS "${dbName}"`);
+        await adminExec(`DROP DATABASE IF EXISTS "${dbName}"`);
       } catch {
         // best-effort
       }
@@ -137,7 +137,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   it("boots a PostgreSQL-backed TaskStore and the store reports backend mode", async () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-pg-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
 
     const result = await createTaskStoreForBackend({
@@ -158,7 +158,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   it("applies the schema baseline idempotently on repeated boots", async () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-pg-idem-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
 
     const first = await createTaskStoreForBackend({
@@ -182,7 +182,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   it("lets the restricted runtime role read an existing SQLite migration marker", async () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-migration-marker-role-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
 
     const first = await createTaskStoreForBackend({
@@ -241,7 +241,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   it("grants migration-marker reads when first-boot SQLite migration creates the table", async () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-new-migration-marker-role-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
     seedLegacyTask(rootDir, "FN-MARKER-1", "Migration marker grant");
 
@@ -272,7 +272,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   it("migrates retained plugin rows before returning the restricted runtime store", async () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-plugin-bridge-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
 
     const first = await createTaskStoreForBackend({
@@ -332,7 +332,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-completed-central-"));
     const globalDir = await mkdtemp(join(tmpdir(), "startup-factory-completed-central-global-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
 
     const first = await createTaskStoreForBackend({
@@ -381,7 +381,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-completed-backups-"));
     const globalDir = await mkdtemp(join(tmpdir(), "startup-factory-completed-global-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
     const projectId = "completed-project";
     const first = await createTaskStoreForBackend({
@@ -445,7 +445,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-automig-"));
     const globalDir = join(rootDir, "global");
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
 
     /*
@@ -555,7 +555,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
     const globalDir = join(rootDir, "global");
     const projectId = "project-stale-startup";
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
     seedLegacyRegistry(globalDir, [{ id: projectId, path: rootDir }]);
 
@@ -628,7 +628,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   it("stamps migrated rows with the central-registry project id on a rootDir-only boot", async () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-stamp-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
 
     const fusionDir = join(rootDir, ".fusion");
@@ -767,7 +767,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   it("stampMigratedProjectRows re-keys all partitioned tables to the project id", async () => {
     rootDir = await mkdtemp(join(tmpdir(), "stamp-helper-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
     const fakeRootDir = "/legacy/path/to/project";
 
@@ -904,7 +904,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   it("migrates a second registered rootDir-only project after the first project has rows", async () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-two-projects-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
     const projectA = join(rootDir, "project-a");
     const projectB = join(rootDir, "project-b");
@@ -961,7 +961,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   it("migrates the same legacy task id independently for two projects", async () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-project-collision-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
     const projectA = join(rootDir, "project-a");
     const projectB = join(rootDir, "project-b");
@@ -1002,7 +1002,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
   it("fails closed without a success notice when migration verification fails", async () => {
     rootDir = await mkdtemp(join(tmpdir(), "startup-factory-fail-closed-"));
     dbName = uniqueDbName();
-    adminExec(`CREATE DATABASE "${dbName}"`);
+    await adminExec(`CREATE DATABASE "${dbName}"`);
     const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
     seedLegacyTask(rootDir, "FAIL-1", "Must not be announced as migrated");
     const legacy = new DatabaseSync(join(rootDir, ".fusion", "fusion.db"));

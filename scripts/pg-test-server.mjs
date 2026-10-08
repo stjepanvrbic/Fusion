@@ -3,7 +3,7 @@
 import { cpSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir, userInfo } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { URL, fileURLToPath } from "node:url";
 
@@ -45,9 +45,46 @@ export function parseArgs(argv) {
   return out;
 }
 
+/*
+FNXC:PgTestProvisioning 2026-10-08-08:26:
+KB-050 adds win32-x64 provisioning from the installed `@embedded-postgres/windows-x64` payload; linux x64/arm64 keep their package mapping unchanged.
+Every other platform (darwin, win32-arm64) cannot provision and gets printed manual-provisioning instructions instead of a bare "unsupported" error.
+*/
+export function platformSupport({ platform = process.platform, arch = process.arch } = {}) {
+  if (platform === "linux" && ["arm64", "x64"].includes(arch)) return { provision: true, package: `@embedded-postgres/linux-${arch}` };
+  if (platform === "win32" && arch === "x64") return { provision: true, package: "@embedded-postgres/windows-x64" };
+  return { provision: false, reason: `No embedded PostgreSQL payload is supported for ${platform}-${arch}.` };
+}
+
 function platformPackage(platform, arch) {
-  if (platform !== "linux" || !["arm64", "x64"].includes(arch)) return null;
-  return `@embedded-postgres/${platform}-${arch}`;
+  return platformSupport({ platform, arch }).package ?? null;
+}
+
+/** FNXC:PgTestProvisioning 2026-10-08-08:26: KB-050 — the embedded payload ships `.exe` binaries on win32; every native binary path goes through this. */
+export function nativeBinary(name, platform = process.platform) {
+  return platform === "win32" ? `${name}.exe` : name;
+}
+
+/**
+ * FNXC:PgTestProvisioning 2026-10-08-08:26:
+ * KB-050 replaces the `resolve(home) + "/"` prefix check, which never matched native win32 paths, with a separator-safe containment check.
+ * A sibling-prefix directory such as `<home>-other` is not contained.
+ */
+export function isPathInside(child, parent) {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/** FNXC:PgTestProvisioning 2026-10-08-08:26: KB-050 — printed wherever this script cannot provision, so a developer learns how to supply a server manually. */
+export function describeManualProvisioning({ port = 55432, reason } = {}) {
+  return [
+    ...(reason ? [reason] : []),
+    "Provision a test PostgreSQL manually, for example with Docker:",
+    `  docker run -d --name fusion-pg-test -e POSTGRES_PASSWORD=postgres -p ${port}:5432 postgres:16-alpine`,
+    `  export FUSION_PG_TEST_URL_BASE=postgresql://postgres:postgres@localhost:${port}`,
+    "Alternatively use a locally installed PostgreSQL service (as on Windows CI) and point FUSION_PG_TEST_URL_BASE at it.",
+    "Verify with: pnpm pg:test:status",
+  ].join("\n");
 }
 
 export function resolveNativeRootCandidates({ platform = process.platform, arch = process.arch, requireResolve, env = process.env }) {
@@ -66,7 +103,7 @@ export function resolveNativeRootCandidates({ platform = process.platform, arch 
       if (entry) candidates.push(join(store, entry, "node_modules", ...pkg.split("/"), "native"));
     } catch { /* Continue to the next optional pnpm store location. */ }
   }
-  return [...new Set(candidates)].filter((candidate) => existsSync(join(candidate, "bin", "postgres")));
+  return [...new Set(candidates)].filter((candidate) => existsSync(join(candidate, "bin", nativeBinary("postgres", platform))));
 }
 
 function resolveNativeRoot(opts = {}) {
@@ -140,7 +177,7 @@ export function classifyOwnership(facts = {}) {
   if (!facts.dataDir) return "foreign-unprovable";
   if (facts.runtimeDataDir && resolve(facts.dataDir) === resolve(facts.runtimeDataDir)) return "runtime-app-cluster";
   if (facts.ownerMatches === false) return "foreign-other-user";
-  if (facts.serverHome && facts.markerMatches && resolve(facts.dataDir).startsWith(resolve(facts.serverHome) + "/")) return "script-owned";
+  if (facts.serverHome && facts.markerMatches && isPathInside(facts.dataDir, facts.serverHome)) return "script-owned";
   return "foreign-proven";
 }
 
@@ -167,14 +204,15 @@ export function describeRemediation(status, ctx = {}) {
 function serverHome(env) { return env.FUSION_PG_TEST_SERVER_HOME || join(homedir(), ".fusion", "pg-test-server"); }
 function clusterRoot(target, env) { return join(serverHome(env), "clusters", `${VERSION}-${process.platform}-${process.arch}-${target.port}`); }
 function ownerMarker(dataDir) { return join(dirname(dataDir), OWNER_MARKER); }
-function markerMatches(dataDir, home) { try { const marker = JSON.parse(readFileSync(ownerMarker(dataDir), "utf8")); return marker.dataDir === dataDir && marker.owner === "fusion-pg-test-server" && resolve(dataDir).startsWith(resolve(home) + "/"); } catch { return false; } }
+function markerMatches(dataDir, home) { try { const marker = JSON.parse(readFileSync(ownerMarker(dataDir), "utf8")); return marker.dataDir === dataDir && marker.owner === "fusion-pg-test-server" && isPathInside(dataDir, home); } catch { return false; } }
 function run(bin, args, options = {}) { const result = spawnSync(bin, args, { encoding: "utf8", stdio: "pipe", ...options }); if (result.status !== 0) throw new Error(`${basename(bin)} failed: ${result.stderr || result.stdout}`); return result; }
 function stageNative(source, target) {
   const marker = join(target, MARKER); const expected = JSON.stringify({ source: resolve(source), version: VERSION });
-  if (existsSync(marker) && readFileSync(marker, "utf8") === expected && existsSync(join(target, "bin", "postgres"))) return target;
+  if (existsSync(marker) && readFileSync(marker, "utf8") === expected && existsSync(join(target, "bin", nativeBinary("postgres")))) return target;
   rmSync(target, { recursive: true, force: true }); mkdirSync(target, { recursive: true });
   for (const entry of readdirSync(source)) cpSync(join(source, entry), join(target, entry), { recursive: true, force: true, verbatimSymlinks: true });
-  for (const entry of readdirSync(join(target, "bin"))) chmodSync(join(target, "bin", entry), 0o755);
+  // win32 has no POSIX execute bit; `.exe` files are runnable as copied.
+  if (process.platform !== "win32") for (const entry of readdirSync(join(target, "bin"))) chmodSync(join(target, "bin", entry), 0o755);
   writeFileSync(marker, expected); return target;
 }
 function postgresClient() {
@@ -246,10 +284,18 @@ async function inspectServer(target, home) {
       const pidLines = dataDir ? readFileSync(join(dataDir, "postmaster.pid"), "utf8").split("\n") : [];
       const pid = Number(pidLines[0]); const pidPort = Number(pidLines[3]);
       let pidAlive = Number.isFinite(pid) && pid > 0;
-      let ownerMatches = false;
-      let executableIsPostgres = false;
+      /*
+      FNXC:PgTestProvisioning 2026-10-08-08:26:
+      KB-050: the `/proc` ownership proof exists only on linux. Elsewhere ownership and executable stay unproven (undefined, not false),
+      so a foreign server is never misclassified `not-postgres`, and the stop-then-provision proof chain refuses to signal it.
+      */
+      const procProof = process.platform === "linux";
+      let ownerMatches = procProof ? false : undefined;
+      let executableIsPostgres = procProof ? false : undefined;
       let executablePath = null;
-      if (pidAlive) {
+      if (pidAlive && !procProof) {
+        try { process.kill(pid, 0); } catch { pidAlive = false; }
+      } else if (pidAlive) {
         try {
           process.kill(pid, 0);
           ownerMatches = typeof process.getuid !== "function" || statSync(`/proc/${pid}`).uid === process.getuid();
@@ -280,14 +326,20 @@ function help() { console.log("Usage: pnpm pg:test:up [-- --port N|--replace|--j
 
 async function main() {
   const args = parseArgs(process.argv.slice(2)); if (args.help) return help();
-  if (["darwin", "win32"].includes(process.platform)) throw new Error(`Unsupported platform ${process.platform}; set FUSION_PG_TEST_URL_BASE to a manually provisioned server.`);
   const target = resolveTarget({ argv: args }); if (target.refusal) throw new Error(`${target.refusal}: ${target.message}`);
   const home = serverHome(process.env); const dataDir = join(clusterRoot(target, process.env), "data");
   let health; try { health = await probe(target, markerMatches(dataDir, home) ? "script-owned" : "foreign-proven", { includeDdl: args.command === "up" }); } catch { health = { status: "unreachable", defects: ["unreachable"], notes: [] }; }
   if (args.command === "status") { print({ target, health }, args.json); if (health.status !== "healthy") process.exitCode = 1; return; }
+  /*
+  FNXC:PgTestProvisioning 2026-10-08-08:26:
+  KB-050: `status` probes and reports on every platform; only `up` (provisioning) and `down` (needs the staged pg_ctl) are platform-gated.
+  An unsupported platform prints manual-provisioning instructions and exits 1 instead of throwing a bare error.
+  */
+  const support = platformSupport();
+  if (!support.provision) { console.error(describeManualProvisioning({ port: target.port, reason: support.reason })); process.exitCode = 1; return; }
   if (args.command === "down") {
     if (!markerMatches(dataDir, home)) throw new Error("Refusing to stop foreign PostgreSQL cluster.");
-    const staged = stagedRootFor({ home, version: VERSION, platform: process.platform, arch: process.arch }); run(join(staged, "bin", "pg_ctl"), ["-D", dataDir, "-m", "fast", "stop"]);
+    const staged = stagedRootFor({ home, version: VERSION, platform: process.platform, arch: process.arch }); run(join(staged, "bin", nativeBinary("pg_ctl")), ["-D", dataDir, "-m", "fast", "stop"]);
     if (args.purge) rmSync(dirname(dataDir), { recursive: true, force: true }); return;
   }
   const facts = health.status === "unreachable" ? { dataDir: null, serverHome: home } : await inspectServer(target, home);
@@ -297,12 +349,13 @@ async function main() {
   if (health.status === "unreachable") plan = "provision-fresh";
   if (plan === "reuse") { print({ status: "healthy", target, health, export: `export FUSION_PG_TEST_URL_BASE=${target.urlBase}` }, args.json); return; }
   if (plan === "refuse-foreign-identity-missing" || plan.startsWith("refuse")) throw new Error(`${plan}: ${describeRemediation(health.status, { ownership, ...target })}`);
-  const { source } = resolveNativeRoot(); if (!source) throw new Error("No embedded PostgreSQL payload found. Install dependencies or set FUSION_PG_TEST_NATIVE_ROOT.");
+  const { source } = resolveNativeRoot(); if (!source) { console.error(describeManualProvisioning({ port: target.port, reason: "No embedded PostgreSQL payload found. Install dependencies or set FUSION_PG_TEST_NATIVE_ROOT." })); process.exitCode = 1; return; }
   const staged = stageNative(source, stagedRootFor({ home, version: VERSION, platform: process.platform, arch: process.arch }));
   if (plan === "stop-then-provision") {
+    if (process.platform !== "linux") throw new Error(`Replacing a foreign PostgreSQL is unsupported on ${process.platform} (no process ownership proof); refusing to signal PostgreSQL.\n${describeManualProvisioning({ port: target.port })}`);
     if (!facts.dataDir || !facts.pidAlive || !facts.ownerMatches || !facts.executableIsPostgres || facts.pidPort !== target.port || facts.reportedPort !== target.port) throw new Error("Replacement ownership proof chain failed; refusing to signal PostgreSQL.");
     console.log(`Reclaiming broken PostgreSQL PID ${facts.pid} at ${facts.dataDir} (${facts.executablePath}).`);
-    try { run(join(staged, "bin", "pg_ctl"), ["-D", facts.dataDir, "-m", "fast", "stop"]); }
+    try { run(join(staged, "bin", nativeBinary("pg_ctl")), ["-D", facts.dataDir, "-m", "fast", "stop"]); }
     catch { process.kill(facts.pid, "SIGINT"); }
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) { await new Promise((done) => setTimeout(done, 250)); const next = await probe(target, ownership, { includeDdl: false }); if (next.status === "unreachable") break; }
@@ -315,11 +368,20 @@ async function main() {
   const initialized = existsSync(join(dataDir, "PG_VERSION"));
   if (!initialized) {
     mkdirSync(dataDir, { recursive: true }); const passwordFile = join(dirname(dataDir), `.pw-${process.pid}`); writeFileSync(passwordFile, "postgres\n", { mode: 0o600 });
-    try { run(join(staged, "bin", "initdb"), ["-D", dataDir, "-U", "postgres", `--pwfile=${passwordFile}`, "--auth-local=trust", "--auth-host=trust", "--encoding=UTF8", "--locale=C"]); }
+    try { run(join(staged, "bin", nativeBinary("initdb")), ["-D", dataDir, "-U", "postgres", `--pwfile=${passwordFile}`, "--auth-local=trust", "--auth-host=trust", "--encoding=UTF8", "--locale=C"]); }
     finally { rmSync(passwordFile, { force: true }); }
   }
   if (!initialized || health.status === "unreachable") {
-    run(join(staged, "bin", "pg_ctl"), ["-D", dataDir, "-l", join(dirname(dataDir), "postgres.log"), "-o", `-p ${target.port} -c listen_addresses=localhost`, "start"]);
+    const logFile = join(dirname(dataDir), "postgres.log");
+    const startArgs = ["-D", dataDir, "-l", logFile, "-o", `-p ${target.port} -c listen_addresses=localhost`, "start"];
+    if (process.platform === "win32") {
+      // FNXC:PgTestProvisioning 2026-10-08-08:26: KB-050 — on win32 the postmaster inherits pg_ctl's pipes and keeps spawnSync waiting; ignore stdio, wait (-w) with a bounded timeout, and report the log tail on failure.
+      const started = spawnSync(join(staged, "bin", nativeBinary("pg_ctl")), ["-w", "-t", "60", ...startArgs], { stdio: "ignore", timeout: 90_000, windowsHide: true });
+      if (started.status !== 0) {
+        let tail = ""; try { tail = readFileSync(logFile, "utf8").split(/\r?\n/).slice(-20).join("\n"); } catch { /* No log written yet. */ }
+        throw new Error(`pg_ctl start failed (status ${started.status ?? started.error?.message ?? "timeout"}).\n${tail}\n${describeManualProvisioning({ port: target.port })}`);
+      }
+    } else run(join(staged, "bin", "pg_ctl"), startArgs);
   }
   if (!existsSync(ownerMarker(dataDir))) {
     writeFileSync(ownerMarker(dataDir), JSON.stringify({ owner: "fusion-pg-test-server", version: VERSION, platform: process.platform, arch: process.arch, port: target.port, dataDir, role: target.role, database: target.database, createdAt: new Date().toISOString() }, null, 2));

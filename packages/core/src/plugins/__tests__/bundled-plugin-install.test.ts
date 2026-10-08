@@ -1,4 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { join } from "node:path";
+
+/*
+FNXC:TestInfraWindows 2026-10-08-07:11:
+The installer probes `join(dir, "manifest.json")` and loads native entry paths, so mocked fs keys and expected entry paths use `join` too.
+Template `/` keys never matched on Windows, turning every install outcome into "missing-bundle".
+*/
 
 // ── Mocks ────────────────────────────────────────────────────────────
 // vi.mock factories are hoisted, so we use vi.hoisted() for mock references.
@@ -165,7 +172,7 @@ function setupBundleExists(resolver: BundledPluginDirResolver, manifestOverrides
   const [dir] = resolver(manifest.id ?? BUNDLED_PLUGIN_ID);
   mockExistsSync.mockImplementation((p: string) => {
     if (typeof p !== "string") return false;
-    return p === `${dir}/manifest.json` || p === `${dir}/src/index.ts`;
+    return p === join(dir, "manifest.json") || p === join(dir, "src", "index.ts");
   });
   mockReadFile.mockResolvedValue(JSON.stringify(manifest));
   mockValidatePluginManifest.mockReturnValue({ valid: true, errors: [] });
@@ -205,7 +212,7 @@ describe("ensureBundledPluginInstalled (host-agnostic shared helper)", () => {
 
     expect(result).toBe("installed");
     expect(store.registerPlugin).toHaveBeenCalledWith(
-      expect.objectContaining({ path: `${dir}/src/index.ts`, manifest: expect.objectContaining({ id: BUNDLED_PLUGIN_ID }) }),
+      expect.objectContaining({ path: join(dir, "src", "index.ts"), manifest: expect.objectContaining({ id: BUNDLED_PLUGIN_ID }) }),
     );
     expect(loader.loadPlugin).toHaveBeenCalledWith(BUNDLED_PLUGIN_ID);
   });
@@ -219,7 +226,7 @@ describe("ensureBundledPluginInstalled (host-agnostic shared helper)", () => {
 
     expect(result).toBe("installed");
     expect(store.registerPlugin).toHaveBeenCalledWith(
-      expect.objectContaining({ path: `${dir}/src/index.ts`, manifest: expect.objectContaining({ id: HERMES_PLUGIN_ID }) }),
+      expect.objectContaining({ path: join(dir, "src", "index.ts"), manifest: expect.objectContaining({ id: HERMES_PLUGIN_ID }) }),
     );
     expect(loader.loadPlugin).toHaveBeenCalledWith(HERMES_PLUGIN_ID);
   });
@@ -228,7 +235,7 @@ describe("ensureBundledPluginInstalled (host-agnostic shared helper)", () => {
     const { manifest, dir } = setupBundleExists(cliShapedResolver);
     const store = makePluginStore();
     const loader = makePluginLoader();
-    store._inject(makePlugin({ path: `${dir}/src/index.ts`, version: manifest.version }));
+    store._inject(makePlugin({ path: join(dir, "src", "index.ts"), version: manifest.version }));
 
     const result = await ensureBundledPluginInstalled(store as never, loader as never, BUNDLED_PLUGIN_ID, cliShapedResolver);
 
@@ -249,7 +256,7 @@ describe("ensureBundledPluginInstalled (host-agnostic shared helper)", () => {
     expect(result).toBe("updated");
     expect(store.updatePlugin).toHaveBeenCalledWith(
       BUNDLED_PLUGIN_ID,
-      expect.objectContaining({ path: `${dir}/src/index.ts` }),
+      expect.objectContaining({ path: join(dir, "src", "index.ts") }),
     );
     expect(loader.loadPlugin).toHaveBeenCalledWith(BUNDLED_PLUGIN_ID);
   });
@@ -258,7 +265,7 @@ describe("ensureBundledPluginInstalled (host-agnostic shared helper)", () => {
     const { dir } = setupBundleExists(cliShapedResolver, { version: "0.2.0" });
     const store = makePluginStore();
     const loader = makePluginLoader();
-    store._inject(makePlugin({ path: `${dir}/src/index.ts`, version: "0.1.0" }));
+    store._inject(makePlugin({ path: join(dir, "src", "index.ts"), version: "0.1.0" }));
 
     const result = await ensureBundledPluginInstalled(store as never, loader as never, BUNDLED_PLUGIN_ID, cliShapedResolver);
 
@@ -295,14 +302,14 @@ describe("ensureBundledPluginInstalled (host-agnostic shared helper)", () => {
     expect(result).toBe("updated");
     expect(store.updatePlugin).toHaveBeenCalledWith(
       BUNDLED_PLUGIN_ID,
-      expect.objectContaining({ path: `${dir}/src/index.ts` }),
+      expect.objectContaining({ path: join(dir, "src", "index.ts") }),
     );
     expect(loader.loadPlugin).toHaveBeenCalledWith(BUNDLED_PLUGIN_ID);
   });
 
   it("returns missing-bundle when manifest exists but no loadable entry file exists", async () => {
     const dir = "/cli/dist/plugins/fusion-plugin-dependency-graph";
-    mockExistsSync.mockImplementation((p: string) => typeof p === "string" && p === `${dir}/manifest.json`);
+    mockExistsSync.mockImplementation((p: string) => typeof p === "string" && p === join(dir, "manifest.json"));
     mockReadFile.mockResolvedValue(JSON.stringify(makeManifest()));
     mockValidatePluginManifest.mockReturnValue({ valid: true, errors: [] });
     const store = makePluginStore();
@@ -331,7 +338,7 @@ describe("ensureBundledPluginInstalled (host-agnostic shared helper)", () => {
 
   it("invalid bundled manifest → throws descriptive error", async () => {
     const dir = "/cli/dist/plugins/fusion-plugin-dependency-graph";
-    mockExistsSync.mockImplementation((p: string) => typeof p === "string" && p === `${dir}/manifest.json`);
+    mockExistsSync.mockImplementation((p: string) => typeof p === "string" && p === join(dir, "manifest.json"));
     mockReadFile.mockResolvedValue(JSON.stringify({ id: "bad" }));
     mockValidatePluginManifest.mockReturnValue({ valid: false, errors: ["Missing required field: name"] });
     const store = makePluginStore();

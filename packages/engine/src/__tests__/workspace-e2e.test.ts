@@ -242,6 +242,8 @@ async function approveWorkspaceReview(store: TaskStore, task: Task, workspaceRoo
     expect(reviewStep).toHaveBeenCalledTimes(expectedEpisodes);
   } finally {
     reviewStep.mockRestore();
+    /* FNXC:ExecutorLifecycle 2026-10-08-08:26: KB-049 — this executor is built on a shared store; dispose it so it never reacts to a later test's store events. */
+    executor.dispose();
   }
 }
 

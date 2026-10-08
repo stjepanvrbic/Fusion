@@ -226,9 +226,10 @@ describe("oauth credential interop", () => {
   });
 
   it("returns both supported Claude credential paths", () => {
+    // FNXC:TestInfraWindows 2026-10-08-07:11: the contract is native `join` paths; on Linux these equal "/tmp/home/.claude/.credentials.json" etc.
     expect(getClaudeCodeCredentialPaths("/tmp/home")).toEqual([
-      "/tmp/home/.claude/.credentials.json",
-      "/tmp/home/.config/claude/.credentials.json",
+      join("/tmp/home", ".claude", ".credentials.json"),
+      join("/tmp/home", ".config", "claude", ".credentials.json"),
     ]);
   });
 

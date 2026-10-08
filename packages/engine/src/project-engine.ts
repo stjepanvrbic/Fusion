@@ -4862,6 +4862,8 @@ export class ProjectEngine {
               }
             }
             let selected = false;
+            // The graph-owned merge of a running continuation reuses that run's reservation, which stays with the run.
+            let reusedReservation = false;
             const admissionSettings = await store.getSettings();
             let mergeClaimSnapshot: Promise<ProjectCapacityHolders> | undefined;
             const getMergeClaimSnapshot = () => mergeClaimSnapshot ??= (async () => {
@@ -4896,8 +4898,9 @@ export class ProjectEngine {
                 projectId: cwd,
                 lane: "review",
                 createdAt: mergeCandidate?.createdAt,
-                start: async () => {
+                start: async (handoff) => {
                   selected = true;
+                  reusedReservation = handoff.reusedReservation;
                   return true;
                 },
               }],
@@ -4928,7 +4931,7 @@ export class ProjectEngine {
             try {
               return await start();
             } finally {
-              projectAdmissionCoordinator.releaseReservation(taskId);
+              if (!reusedReservation) projectAdmissionCoordinator.releaseReservation(taskId);
             }
           };
           const deferMergeForCapacity = (): void => {

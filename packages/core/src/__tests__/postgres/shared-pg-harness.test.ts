@@ -10,7 +10,7 @@
  * Skipped when PostgreSQL is unreachable (FUSION_PG_TEST_SKIP=1).
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
 import {
   pgDescribe,
   createSharedPgTaskStoreTestHarness,
@@ -74,5 +74,49 @@ pgTest("createSharedPgTaskStoreTestHarness", () => {
     // After reset the config row is reseeded with DEFAULT_PROJECT_SETTINGS,
     // so the custom prefix is gone.
     expect(settings.taskPrefix).not.toBe("SHARED");
+  });
+});
+
+/*
+FNXC:ExecutorLifecycle 2026-10-08-08:13 (KB-049):
+A listener or executor left attached by one test must not act on the next test's tasks.
+These two cases run in order: A leaks a task:moved listener and a tracked disposable; B proves the harness disposed and detached them while the store-init activity listeners stay wired.
+*/
+pgTest("createSharedPgTaskStoreTestHarness per-test listener reset", () => {
+  const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
+    prefix: "fusion_shared_harness_listeners",
+  });
+  const leakedMoves: string[] = [];
+  const leakedDisposable = { dispose: vi.fn() };
+  let baselineMovedCount = -1;
+
+  beforeAll(h.beforeAll);
+  beforeEach(h.beforeEach);
+  afterEach(h.afterEach);
+  afterAll(h.afterAll);
+
+  it("A: leaks a task:moved listener and registers a disposable", () => {
+    const store = h.store();
+    baselineMovedCount = store.listenerCount("task:moved");
+    store.on("task:moved", ({ task }) => {
+      leakedMoves.push(task.id);
+    });
+    h.trackDisposable(leakedDisposable);
+    expect(store.listenerCount("task:moved")).toBe(baselineMovedCount + 1);
+  });
+
+  it("B: sees the previous test's listener removed and its disposable disposed", async () => {
+    const store = h.store();
+    expect(leakedDisposable.dispose).toHaveBeenCalledOnce();
+    expect(store.listenerCount("task:moved")).toBe(baselineMovedCount);
+
+    const task = await store.createTask({ description: "listener isolation" });
+    await store.moveTask(task.id, "in-progress", { moveSource: "user" });
+    expect(leakedMoves).toEqual([]);
+
+    expect(store.activityListenersWired).toBe(true);
+    for (const event of ["task:created", "task:moved", "task:updated", "task:deleted", "settings:updated"] as const) {
+      expect(store.listenerCount(event), `${event} activity listener`).toBeGreaterThan(0);
+    }
   });
 });

@@ -50,8 +50,13 @@ interface TestCtx {
   projectDirs: string[];
 }
 
+/*
+FNXC:TestInfraWindows 2026-10-08-08:20:
+CentralCore stores the canonical project path, and a Windows runner temp dir can be an 8.3 short spelling (`RUNNER~1`).
+Return the native realpath so exact path assertions compare canonical to canonical on every host; on Linux the path is unchanged.
+*/
 function makeProjectDir(ctx: TestCtx, name: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `kb-cc-pg-${name}-`));
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), `kb-cc-pg-${name}-`)));
   ctx.projectDirs.push(dir);
   return dir;
 }

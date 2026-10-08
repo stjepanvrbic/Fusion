@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, afterEach } from "vitest";
-import { execFileSync } from "node:child_process";
+import { createBaselinedPgTestDatabase } from "../../__test-utils__/pg-test-harness.js";
 import { createAsyncDataLayer, type AsyncDataLayer } from "../../postgres/data-layer.js";
 import { ChatStore } from "../chat-store.js";
 import type { ChatSession } from "../chat-types.js";
@@ -24,36 +24,28 @@ const PG_AVAILABLE =
 
 const pgDescribe = PG_AVAILABLE ? describe : describe.skip;
 
-function uniqueDbName(): string {
-  return `fusion_chat_focus_test_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
 /*
 FNXC:MemoryFocus 2026-08-21-13:35:
 RUFU-146 review (PRRT_kwDOSA-8Y86a7RZb): FUSION_PG_TEST_URL_BASE comes from the
-environment and previously reached psql through shell-string interpolation in
-execSync. execFileSync with an argument vector passes the URL and the SQL as
-separate argv entries — no shell, no quoting surface.
-*/
-function adminExec(statement: string): void {
-  execFileSync(
-    "psql",
-    [`${PG_TEST_URL_BASE}/postgres`, "-v", "ON_ERROR_STOP=1", "-c", statement],
-    { stdio: "pipe", env: process.env },
-  );
-}
+environment and must never reach a shell.
 
+FNXC:TestInfraWindows 2026-10-08-08:20:
+Admin DDL runs through the shared harness maintenance connection instead of `psql`, which is not on PATH on Windows hosts or Windows CI.
+No subprocess means no quoting surface at all.
+
+FNXC:TestInfraWindows 2026-10-08-09:05:
+Each test clones the run-shared golden template (the exact applySchemaBaseline end-state) instead of paying a full baseline DDL run per test, which exceeded the 15s test budget under full-lane load on Windows.
+The test still calls applySchemaBaseline itself, so the 0065 migration stays asserted through the baseline (a marker-check no-op on the clone).
+*/
 interface Ctx {
-  dbName: string;
+  db: Awaited<ReturnType<typeof createBaselinedPgTestDatabase>>;
   layer: AsyncDataLayer;
   store: ChatStore;
 }
 
 async function setupCtx(): Promise<Ctx> {
-  const dbName = uniqueDbName();
-  try { adminExec(`DROP DATABASE IF EXISTS "${dbName}"`); } catch { /* may not exist */ }
-  adminExec(`CREATE DATABASE "${dbName}"`);
-  const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
+  const db = await createBaselinedPgTestDatabase("fusion_chat_focus_test");
+  const testUrl = db.testUrl;
   const { createConnectionSetFromUrl } = await import("../../postgres/connection.js");
   const { applySchemaBaseline } = await import("../../postgres/schema-applier.js");
   const { resolveBackendWithOptions } = await import("../../postgres/backend-resolver.js");
@@ -61,13 +53,13 @@ async function setupCtx(): Promise<Ctx> {
   const connections = await createConnectionSetFromUrl(backend, { poolMax: 3, connectTimeoutSeconds: 5 });
   await applySchemaBaseline(connections.migration);
   const layer = createAsyncDataLayer(connections);
-  return { dbName, layer, store: new ChatStore(layer) };
+  return { db, layer, store: new ChatStore(layer) };
 }
 
 async function teardownCtx(ctx: Ctx | null): Promise<void> {
   if (!ctx) return;
   try { await ctx.layer.close(); } catch { /* best-effort */ }
-  try { adminExec(`DROP DATABASE IF EXISTS "${ctx.dbName}"`); } catch { /* best-effort */ }
+  try { await ctx.db.drop(); } catch { /* best-effort */ }
 }
 
 let sessionCounter = 0;

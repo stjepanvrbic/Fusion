@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { writeFakePgClient } from "./_fake-pg-client.js";
 import {
   BackupManager,
   createBackupManager,
@@ -282,40 +283,45 @@ async function createRestoreFixture(root: string, backupOptions: BackupOptions =
   const backupDir = join(fusionDir, "backups");
   const actionsPath = join(root, "actions.log");
   const failRollbackMarker = join(root, "fail-rollback");
-  const pgDumpPath = join(root, "pg_dump");
-  const pgRestorePath = join(root, "pg_restore");
   await mkdir(backupDir, { recursive: true });
-  await writeFile(pgDumpPath, `#!/bin/sh
-output=
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = --file ]; then shift; output="$1"; fi
-  shift
-done
-base="$(basename "$output")"
-printf 'DUMP %s\n' "$base" >> "${actionsPath}"
-if [ -f "${failRollbackMarker}" ] && echo "$base" | grep -q '^fusion-pre-restore-pg-'; then
-  printf FAIL_ROLLBACK > "$output"
-else
-  printf dump > "$output"
-fi
-`);
-  await writeFile(pgRestorePath, `#!/bin/sh
-first="$1"
-for last do :; done
-base="$(basename "$last")"
-if [ "$first" = --list ]; then
-  printf 'LIST %s\n' "$base" >> "${actionsPath}"
-  grep -q CORRUPT "$last" && { echo 'corrupt archive' >&2; exit 1; }
-  exit 0
-fi
-printf 'RESTORE %s %s\n' "$base" "$*" >> "${actionsPath}"
-if grep -q FAIL_PROJECT "$last"; then echo 'project restore exploded' >&2; exit 1; fi
-if grep -q FAIL_CENTRAL "$last"; then echo 'central restore exploded' >&2; exit 1; fi
-if grep -q FAIL_ROLLBACK "$last"; then echo 'project rollback exploded' >&2; exit 1; fi
-exit 0
-`);
-  await chmod(pgDumpPath, 0o755);
-  await chmod(pgRestorePath, 0o755);
+  /*
+  FNXC:TestInfraWindows 2026-10-08-07:11:
+  Node-script fakes (see `_fake-pg-client.ts`) replace the former `#!/bin/sh` shims, which Windows cannot launch, with identical behavior:
+  pg_dump logs `DUMP <base>` and writes "dump" (or FAIL_ROLLBACK for a pre-restore dump while the marker exists);
+  pg_restore logs `LIST`/`RESTORE` lines and fails on CORRUPT/FAIL_* archive content.
+  */
+  const actionsLog = JSON.stringify(actionsPath);
+  const fakeDump = writeFakePgClient({
+    dir: root,
+    name: "pg_dump",
+    script: [
+      'const output = argv[argv.lastIndexOf("--file") + 1];',
+      "const base = path.basename(output);",
+      `fs.appendFileSync(${actionsLog}, \`DUMP \${base}\\n\`);`,
+      `const failRollback = fs.existsSync(${JSON.stringify(failRollbackMarker)}) && base.startsWith("fusion-pre-restore-pg-");`,
+      'fs.writeFileSync(output, failRollback ? "FAIL_ROLLBACK" : "dump");',
+    ].join("\n"),
+  });
+  const pgDumpPath = fakeDump.path;
+  const pgRestorePath = writeFakePgClient({
+    dir: root,
+    name: "pg_restore",
+    script: [
+      "const last = argv[argv.length - 1];",
+      "const base = path.basename(last);",
+      'const archive = (() => { try { return fs.readFileSync(last, "utf8"); } catch { return ""; } })();',
+      "const fail = (message) => { process.stderr.write(message + \"\\n\"); process.exit(1); };",
+      'if (argv[0] === "--list") {',
+      `  fs.appendFileSync(${actionsLog}, \`LIST \${base}\\n\`);`,
+      '  if (archive.includes("CORRUPT")) fail("corrupt archive");',
+      "  process.exit(0);",
+      "}",
+      `fs.appendFileSync(${actionsLog}, \`RESTORE \${base} \${argv.join(" ")}\\n\`);`,
+      'if (archive.includes("FAIL_PROJECT")) fail("project restore exploded");',
+      'if (archive.includes("FAIL_CENTRAL")) fail("central restore exploded");',
+      'if (archive.includes("FAIL_ROLLBACK")) fail("project rollback exploded");',
+    ].join("\n"),
+  }).path;
   const projectFilename = "fusion-pg-20260831-120000.dump";
   const centralFilename = "fusion-central-pg-20260831-120000.dump";
   const migrationsFilename = "fusion-migrations-pg-20260831-120000.dump";
@@ -326,6 +332,7 @@ exit 0
     connectionString: embeddedUrl,
     pgDumpPath,
     pgRestorePath,
+    clientExec: fakeDump.clientExec,
     reconcileRestoredMigrations: async () => {},
     ...backupOptions,
   });
@@ -356,16 +363,16 @@ describe("PostgreSQL backup pair inventory", () => {
     try {
       const fusionDir = join(root, "project", ".fusion");
       await mkdir(fusionDir, { recursive: true });
-      const pgDumpPath = join(root, "pg_dump");
-      await writeFile(
-        pgDumpPath,
-        "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do if [ \"$1\" = --file ]; then shift; printf dump >\"$1\"; fi; shift; done\n",
-      );
-      await chmod(pgDumpPath, 0o755);
+      const fakeDump = writeFakePgClient({
+        dir: root,
+        name: "pg_dump",
+        script: 'const output = argv[argv.lastIndexOf("--file") + 1]; fs.writeFileSync(output, "dump");',
+      });
 
       const manager = new BackupManager(fusionDir, {
         connectionString: embeddedUrl,
-        pgDumpPath,
+        pgDumpPath: fakeDump.path,
+        clientExec: fakeDump.clientExec,
       });
       const created = await manager.createBackup();
       const pairs = await manager.listBackupPairs();
@@ -377,8 +384,8 @@ describe("PostgreSQL backup pair inventory", () => {
           ? created.centralBackup.filename
           : undefined,
       );
-      expect(pairs[0]?.project?.path).toMatch(/^\//);
-      expect(pairs[0]?.central?.path).toMatch(/^\//);
+      expect(isAbsolute(pairs[0]?.project?.path ?? "")).toBe(true);
+      expect(isAbsolute(pairs[0]?.central?.path ?? "")).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -129,6 +129,29 @@ describe("two-dimension project admission", () => {
     expect(started).toEqual(["KB-046"]);
   });
 
+  /*
+  FNXC:WorktreeCapacity 2026-10-08-10:05:
+  The same-slot discount (a candidate's own coordinator reservation) applies to the worktree dimension too: a continuation run's own
+  merge never needs a second worktree, while a new card is still refused by a frozen checkout at a full worktree cap.
+  */
+  it("applies the same-slot discount to both dimensions", async () => {
+    const coordinator = new ProjectAdmissionCoordinator();
+    const projectId = "frozen-same-slot";
+    expect(await coordinator.reserveIfAvailable({ projectId, taskId: "KB-008", maxConcurrent: 8, claimed: () => 0 })).toBe(true);
+    const holders = { runningTaskIds: ["A", "B"], checkoutOnlyHolderTaskIds: ["KB-046"] };
+    const limits = projectCapacityAdmissionLimits({ maxConcurrent: 8, maxWorktrees: 4, worktreeLimitEnabled: true }, async () => holders);
+
+    expect(await coordinator.admitNext({ projectId, ...limits, refresh: async () => [{ taskId: "KB-061", projectId, lane: "review", start: async () => true }] })).toBeUndefined();
+    const handoffs: unknown[] = [];
+    expect(await coordinator.admitNext({
+      projectId,
+      ...limits,
+      refresh: async () => [{ taskId: "KB-008", projectId, lane: "review", start: async (handoff) => { handoffs.push(handoff); return true; } }],
+    })).toBe("KB-008");
+    expect(handoffs).toEqual([{ reusedReservation: true }]);
+    coordinator.releaseReservation("KB-008");
+  });
+
   it("ignores frozen checkouts entirely when worktrees are not a capacity dimension", async () => {
     const coordinator = new ProjectAdmissionCoordinator();
     const holders = { runningTaskIds: ["A"], checkoutOnlyHolderTaskIds: ["F1", "F2", "F3"] };

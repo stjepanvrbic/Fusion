@@ -161,8 +161,10 @@ export interface AdmissionCandidate {
    * Starts the owning lane after this coordinator has atomically reserved a slot.
    * Return `false` when the lane rejects the handoff before it has accepted the
    * reservation; this makes the coordinator release capacity in one place.
+   * `reusedReservation` is true when the task already held the reservation (a same-slot
+   * handoff); the lane must then leave that reservation to its existing owner.
    */
-  start: () => Promise<boolean | void>;
+  start: (handoff: { reusedReservation: boolean }) => Promise<boolean | void>;
 }
 
 /** A lane contributes its current ready work on every project admission pass. */
@@ -256,11 +258,24 @@ export class ProjectAdmissionCoordinator {
     return this.reservations.get(projectId)?.size ?? 0;
   }
 
+  /*
+  FNXC:ConcurrencyAdmission 2026-10-08-09:31:
+  A candidate whose own task already holds a coordinator reservation is a same-slot handoff, so it is measured against the occupancy
+  without its own id; every other task still counts. Live deadlock: continuation runs kept their reservations while waiting for their
+  graph merge, the merge pump counted each run's own reservation against its merge, and with 3 claimed holders against maxConcurrent 6
+  every merge was deferred until a restart cleared the in-memory reservations.
+  A claimed holder WITHOUT a reservation is deliberately not exempt: its slot belongs to an agent already running in another lane, and
+  exempting it would let, say, planning start a second agent on a card whose review gate is live.
+
+  FNXC:WorktreeCapacity 2026-10-08-10:05:
+  The same-slot discount applies to both admission dimensions: `runningFor` is the running occupancy without the candidate's own
+  reservation, and the per-candidate worktree check starts from that same number.
+  */
   private async occupancy(params: {
     projectId: string;
     claimed: () => Promise<number> | number;
     claimedTaskIds?: () => Promise<Iterable<string>> | Iterable<string>;
-  }): Promise<{ running: number; reservations: ReadonlySet<string> }> {
+  }): Promise<{ running: number; reservations: ReadonlySet<string>; runningFor: (taskId: string) => number }> {
     /*
     FNXC:ConcurrencyAdmission 2026-08-01-07:35:
     A durable handoff can release its in-memory reservation while an asynchronous task snapshot is
@@ -272,14 +287,19 @@ export class ProjectAdmissionCoordinator {
     const reservations = new Set(this.reservations.get(params.projectId) ?? []);
     const claimed = await params.claimed();
     for (const taskId of this.reservations.get(params.projectId) ?? []) reservations.add(taskId);
-    if (!params.claimedTaskIds) return { running: claimed + reservations.size, reservations };
+    if (!params.claimedTaskIds) {
+      const running = claimed + reservations.size;
+      return { running, reservations, runningFor: (taskId) => running - (reservations.has(taskId) ? 1 : 0) };
+    }
     const claimedIds = new Set(await params.claimedTaskIds());
     for (const taskId of this.reservations.get(params.projectId) ?? []) reservations.add(taskId);
     let pendingReservations = 0;
     for (const taskId of reservations) {
       if (!claimedIds.has(taskId)) pendingReservations += 1;
     }
-    return { running: claimed + pendingReservations, reservations };
+    const running = claimed + pendingReservations;
+    // A reservation is counted exactly once, as a claimed holder or as a pending reservation, so excluding it removes one.
+    return { running, reservations, runningFor: (taskId) => running - (reservations.has(taskId) ? 1 : 0) };
   }
 
   /*
@@ -287,10 +307,11 @@ export class ProjectAdmissionCoordinator {
   The worktree dimension is judged per candidate. After admitting `taskId` the worktree population is the running occupancy plus the
   new card plus every frozen checkout not already reserved; a candidate that is itself a frozen checkout reuses its own worktree.
   So a resumed frozen card can re-enter at a full worktree cap it already counts toward, while a card needing a new worktree cannot.
+  `runningWithoutCandidate` excludes the candidate's own reservation, so a same-slot handoff never needs a second worktree either.
   */
   private static worktreeAdmits(
     capacity: { limit: number; checkoutOnly: ReadonlySet<string> } | undefined,
-    running: number,
+    runningWithoutCandidate: number,
     reservations: ReadonlySet<string>,
     taskId: string,
   ): boolean {
@@ -299,7 +320,7 @@ export class ProjectAdmissionCoordinator {
     for (const id of capacity.checkoutOnly) {
       if (id !== taskId && !reservations.has(id)) unreservedCheckouts += 1;
     }
-    return running + unreservedCheckouts < capacity.limit;
+    return runningWithoutCandidate + unreservedCheckouts < capacity.limit;
   }
 
   private static async readWorktreeCapacity(
@@ -331,10 +352,11 @@ export class ProjectAdmissionCoordinator {
         reserved = true;
         return;
       }
-      const { running, reservations } = await this.occupancy(params);
-      if (running >= params.maxConcurrent) return;
+      const { runningFor, reservations } = await this.occupancy(params);
+      const runningWithoutCandidate = runningFor(params.taskId);
+      if (runningWithoutCandidate >= params.maxConcurrent) return;
       const worktrees = await ProjectAdmissionCoordinator.readWorktreeCapacity(params.worktreeCapacity);
-      if (!ProjectAdmissionCoordinator.worktreeAdmits(worktrees, running, reservations, params.taskId)) return;
+      if (!ProjectAdmissionCoordinator.worktreeAdmits(worktrees, runningWithoutCandidate, reservations, params.taskId)) return;
       this.reserve(params.projectId, params.taskId);
       reserved = true;
     })();
@@ -386,8 +408,7 @@ export class ProjectAdmissionCoordinator {
       // Persisted task rows lag a fire-and-forget lane start, so omitting these
       // reservations lets a second coordinator pass over-admit one project.
       if (candidates.length === 0) return;
-      const { running, reservations } = await this.occupancy(params);
-      if (running >= params.maxConcurrent) return;
+      const { runningFor, reservations } = await this.occupancy(params);
       const worktrees = await ProjectAdmissionCoordinator.readWorktreeCapacity(params.worktreeCapacity);
       // Older test/runtime semaphore wrappers predate tryAcquire. They still
       // exercise project admission, while production semaphores atomically take
@@ -411,8 +432,12 @@ export class ProjectAdmissionCoordinator {
       this function exists to prevent.
       */
       for (const winner of candidates) {
+        // Same-slot handoffs are measured without their own reservation; everyone else needs a genuinely free slot.
+        const runningWithoutCandidate = runningFor(winner.taskId);
+        if (runningWithoutCandidate >= params.maxConcurrent) continue;
         // A candidate needing a new worktree cannot take a slot a frozen checkout still holds; a frozen card's own resume can.
-        if (!ProjectAdmissionCoordinator.worktreeAdmits(worktrees, running, reservations, winner.taskId)) continue;
+        if (!ProjectAdmissionCoordinator.worktreeAdmits(worktrees, runningWithoutCandidate, reservations, winner.taskId)) continue;
+        const reusedReservation = this.reservations.get(params.projectId)?.has(winner.taskId) === true;
         const acquiredHostSlot = hasReservableHostSlot
           ? params.semaphore!.tryAcquire()
           : true;
@@ -442,12 +467,13 @@ export class ProjectAdmissionCoordinator {
         */
         const releaseAttempt = () => {
           dropPreHeldExecutorSlot(winner.taskId);
-          this.releaseReservation(winner.taskId);
+          // A reused reservation belongs to the run that already held it; a declined handoff must not free it.
+          if (!reusedReservation) this.releaseReservation(winner.taskId);
           if (hasReservableHostSlot) params.semaphore?.release();
         };
         try {
           winner.reserve?.();
-          const accepted = await winner.start();
+          const accepted = await winner.start({ reusedReservation });
           if (accepted === false) {
             releaseAttempt();
             continue;

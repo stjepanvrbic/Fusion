@@ -8,9 +8,9 @@
  *  2. An end-to-end symptom test: a fixture Node process fires a background refresh
  *     against a slow fake `qmd` stub on PATH and must exit well before the stub does.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -44,7 +44,31 @@ describe("unrefQmdChildProcess (unit)", () => {
   });
 });
 
-describe("qmd background refresh does not keep a short-lived caller alive (symptom)", () => {
+/** Invocation log the stub appends its argv to, proving the stub (not a real or absent qmd) was reached. */
+function invocationLogPath(stubDir: string): string {
+  return join(stubDir, "invocations.log");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * FNXC:ProjectMemory 2026-10-08-07:11:
+ * The symptom proof is only meaningful when the bash stub is the qmd that ran.
+ * The stub logs every invocation and each test waits for its first call (`collection add`); later calls race the fixture's prompt exit by design, so they are not required.
+ * Skipped on Windows: shell-free `spawn("qmd")` only launches `qmd.exe`/`qmd.com`, never an extensionless bash stub, and a real `qmd.exe` on the host PATH shadows it.
+ * The search stub's "ignore SIGTERM" model also cannot exist there, because kill is TerminateProcess.
+ * The unit suites above keep running on every platform.
+ */
+async function expectStubInvoked(stubDir: string): Promise<void> {
+  const logPath = invocationLogPath(stubDir);
+  await vi.waitFor(() => {
+    expect(existsSync(logPath) ? readFileSync(logPath, "utf8") : "").toContain("collection add");
+  }, { timeout: 5_000, interval: 50 });
+}
+
+describe.skipIf(process.platform === "win32")("qmd background refresh does not keep a short-lived caller alive (symptom)", () => {
   const tempDirs: string[] = [];
 
   afterEach(() => {
@@ -65,6 +89,7 @@ describe("qmd background refresh does not keep a short-lived caller alive (sympt
       stubPath,
       [
         "#!/usr/bin/env bash",
+        `echo "$*" >> ${shellQuote(invocationLogPath(stubDir))}`,
         'case "$1" in',
         "  update|embed)",
         "    cd / && sleep 8",
@@ -110,6 +135,7 @@ describe("qmd background refresh does not keep a short-lived caller alive (sympt
     writeSlowQmdStub(stubDir);
 
     const exitInfo = await runFixture("project", rootDir, stubDir);
+    await expectStubInvoked(stubDir);
 
     expect(exitInfo.stdout).toContain("qmd-refresh-fixture:scheduled");
     expect(exitInfo.code).toBe(0);
@@ -127,6 +153,7 @@ describe("qmd background refresh does not keep a short-lived caller alive (sympt
     writeSlowQmdStub(stubDir);
 
     const exitInfo = await runFixture("agent", rootDir, stubDir);
+    await expectStubInvoked(stubDir);
 
     expect(exitInfo.stdout).toContain("qmd-refresh-fixture:scheduled");
     expect(exitInfo.code).toBe(0);
