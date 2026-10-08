@@ -1,4 +1,4 @@
-import { TaskStore, COLUMNS, COLUMN_LABELS, MAX_TASK_MESSAGE_LENGTH, resolveProjectColumnsForRoles, TERMINAL_ROLES, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, resolvePreMergeGateForTask, resolveEffectiveAutoMerge, CentralCore, buildAutoPauseClearPatch, buildManualRetryResetPatch, buildManualRetryResetPatchIfCurrent, extractIntentSignature, findNearDuplicates, getTaskDuplicateLineage, isValidRepoSlug, isWorkspaceTask, reconcileDeterministicDuplicate, resolveTaskGithubTracking, runDeterministicDuplicateGuard, evaluateArchiveTaskLiveness, describeArchiveLiveness, TaskIsLiveError, claimEmbeddedPostgresSignalShutdown, type Settings, type Column, type ColumnId, type StepStatus, type AgentLogType, type AgentLogEntry, type IntentSignature, type NearDuplicateCandidate, type NearDuplicateMatch, type TaskDependencyMutation } from "@fusion/core";
+import { TaskStore, COLUMNS, COLUMN_LABELS, MAX_TASK_MESSAGE_LENGTH, resolveProjectColumnsForRoles, TERMINAL_ROLES, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, workflowHasColumn, resolvePreMergeGateForTask, resolveEffectiveAutoMerge, CentralCore, buildAutoPauseClearPatch, buildManualRetryResetPatch, buildManualRetryResetPatchIfCurrent, extractIntentSignature, findNearDuplicates, getTaskDuplicateLineage, isValidRepoSlug, isWorkspaceTask, reconcileDeterministicDuplicate, resolveTaskGithubTracking, runDeterministicDuplicateGuard, evaluateArchiveTaskLiveness, describeArchiveLiveness, TaskIsLiveError, claimEmbeddedPostgresSignalShutdown, type Settings, type Column, type ColumnId, type StepStatus, type AgentLogType, type AgentLogEntry, type IntentSignature, type NearDuplicateCandidate, type NearDuplicateMatch, type TaskDependencyMutation } from "@fusion/core";
 import { isFailedNoVerdictPreMergeReviewResult, isInReviewMissingWorktreeSessionStartFailure, runAiMerge, landWorkspaceTask, withWorkspaceMergeDispatchLease, installBaselineArchiveWorktreeDisposer, clearOwnedMergeStamp, reconcileUnownedStaleMergeStamp, SelfHealingManager } from "@fusion/engine";
 import { createInterface } from "node:readline/promises";
 import type { PlanningQuestion, PlanningSummary } from "@fusion/core";
@@ -1572,9 +1572,16 @@ export async function runTaskUnpause(id: string, projectName?: string) {
 }
 
 export async function runTaskMove(id: string, column: string, projectName?: string) {
-  if (!COLUMNS.includes(column as Column)) {
+  /*
+  FNXC:CliBoardVocabulary 2026-10-08-02:00:
+  KB-018: `fn task move` validates the target against the TASK'S resolved workflow columns, matching the dashboard `POST /tasks/:id/move` route.
+  The former pre-store check against the legacy six-id `COLUMNS` rejected every custom or renamed lane, so a custom-workflow board could not move cards from the CLI.
+  Only an empty/whitespace id is rejected before the store opens; a workflow that declares no columns, or an IR that cannot be resolved, falls back to the legacy set.
+  An invalid column is reported OUTSIDE `withBoardWrite` so the store is always closed first (`process.exit` skips pending `finally` blocks).
+  */
+  if (typeof column !== "string" || !column.trim()) {
     console.error(`Invalid column: ${column}`);
-    console.error(`Valid columns: ${COLUMNS.join(", ")}`);
+    console.error("Expected a non-empty column id.");
     process.exit(1);
   }
 
@@ -1594,12 +1601,30 @@ export async function runTaskMove(id: string, column: string, projectName?: stri
   disposeTaskBeforeMove hard-cancel seam — the board showed Todo while the
   agent session kept running (Move-Task contract violation).
   */
-  await withBoardWrite(projectName, { id, action: "move task" }, async (context) => {
+  const result = await withBoardWrite(projectName, { id, action: "move task" }, async (context): Promise<{ invalid: string[] } | undefined> => {
+    const moveTargetIr = await resolveWorkflowIrForTask(context.store, id).catch(() => undefined);
+    const declaredColumns = (moveTargetIr as { columns?: unknown } | undefined)?.columns;
+    const declaresColumns = Array.isArray(declaredColumns) && declaredColumns.length > 0;
+    const columnIsValid = moveTargetIr && declaresColumns
+      ? workflowHasColumn(moveTargetIr, column)
+      : COLUMNS.includes(column as Column);
+    if (!columnIsValid) {
+      const allowed = moveTargetIr && declaresColumns
+        ? (declaredColumns as Array<{ id: string }>).map((c) => c.id)
+        : [...COLUMNS];
+      return { invalid: allowed };
+    }
     const task = await context.store.moveTask(id, column as Column, { moveSource: "user" });
     console.log();
     console.log(`  ✓ Moved ${task.id} → ${columnLabel(task.column)}`);
     console.log();
+    return undefined;
   });
+  if (result?.invalid) {
+    console.error(`Invalid column: ${column}`);
+    console.error(`Valid columns: ${result.invalid.join(", ")}`);
+    process.exit(1);
+  }
 }
 
 export async function runTaskDuplicate(id: string, projectName?: string) {

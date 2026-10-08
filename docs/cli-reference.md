@@ -723,6 +723,8 @@ fn task pause FN-001
 fn task unpause FN-001
 ```
 
+`fn task move` accepts any column declared by the task's workflow (custom or renamed lanes included); when the workflow declares no columns or cannot be resolved, the built-in legacy columns are used. An invalid column lists the columns that board actually has.
+
 ### Node routing controls
 
 ```bash

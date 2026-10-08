@@ -105,6 +105,8 @@ vi.mock("@fusion/core", async (importActual) => {
     TaskStore: TaskStoreMock,
     COLUMNS,
     COLUMN_LABELS,
+    // FNXC:CliBoardVocabulary 2026-10-08-02:00: KB-018: delegate to the real resolver by default; per-test overrides pin workflow-column scenarios.
+    resolveWorkflowIrForTask: vi.fn(actual.resolveWorkflowIrForTask),
     runDeterministicDuplicateGuard: vi.fn(),
     reconcileDeterministicDuplicate: vi.fn(),
     extractIntentSignature: vi.fn(),
@@ -1273,6 +1275,114 @@ describe("project-aware task command behavior", () => {
 
     expect(disposer).toHaveBeenCalledOnce();
     expect(disposer).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-123" }));
+  });
+
+  /*
+  FNXC:CliBoardVocabulary 2026-10-08-02:00:
+  KB-018: `fn task move` validates against the task's resolved workflow columns (matching the dashboard move route), falling back to the legacy set only for column-less or unresolvable IRs, and always closes the store before exiting on an invalid column.
+  */
+  describe("runTaskMove workflow-column validation (KB-018)", () => {
+    const customIr = {
+      version: 2,
+      columns: [{ id: "backlog" }, { id: "building" }, { id: "merging" }, { id: "shipped" }],
+    };
+
+    function installStore() {
+      const moveTask = vi.fn(async (id: string, column: string) => makeTask({ id, column: column as never }));
+      const close = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(resolveProject).mockResolvedValue({
+        projectId: "proj_test",
+        projectPath: "/test",
+        projectName: "demo-project",
+        isRegistered: true,
+        store: { moveTask, close } as unknown as TaskStore,
+      });
+      return { moveTask, close };
+    }
+
+    async function runExpectingExit(column: string) {
+      const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        throw new Error(`process.exit:${code}`);
+      }) as never);
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(runTaskMove("FN-123", column, "demo-project")).rejects.toThrow("process.exit:1");
+        return errors.mock.calls.flat().join("\n");
+      } finally {
+        exit.mockRestore();
+        errors.mockRestore();
+      }
+    }
+
+    it("accepts a column declared only by the task's workflow", async () => {
+      const { resolveWorkflowIrForTask } = await import("@fusion/core");
+      vi.mocked(resolveWorkflowIrForTask).mockResolvedValueOnce(customIr as never);
+      const { moveTask, close } = installStore();
+      const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        throw new Error(`process.exit:${code}`);
+      }) as never);
+      const logs = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        await runTaskMove("FN-123", "merging", "demo-project");
+        expect(moveTask).toHaveBeenCalledWith("FN-123", "merging", { moveSource: "user" });
+        expect(exit).not.toHaveBeenCalled();
+        expect(close).toHaveBeenCalled();
+      } finally {
+        exit.mockRestore();
+        logs.mockRestore();
+      }
+    });
+
+    it("rejects a legacy column the workflow does not declare, lists the workflow columns, and closes the store", async () => {
+      const { resolveWorkflowIrForTask } = await import("@fusion/core");
+      vi.mocked(resolveWorkflowIrForTask).mockResolvedValueOnce(customIr as never);
+      const { moveTask, close } = installStore();
+      const printed = await runExpectingExit("done");
+      expect(printed).toContain("Invalid column: done");
+      expect(printed).toContain("Valid columns: backlog, building, merging, shipped");
+      expect(moveTask).not.toHaveBeenCalled();
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to the legacy columns when the workflow cannot be resolved", async () => {
+      const { resolveWorkflowIrForTask } = await import("@fusion/core");
+      vi.mocked(resolveWorkflowIrForTask).mockRejectedValueOnce(new Error("resolver unavailable"));
+      const accepted = installStore();
+      const logs = vi.spyOn(console, "log").mockImplementation(() => {});
+      await runTaskMove("FN-123", "specified", "demo-project");
+      logs.mockRestore();
+      expect(accepted.moveTask).toHaveBeenCalledWith("FN-123", "specified", { moveSource: "user" });
+
+      vi.mocked(resolveWorkflowIrForTask).mockRejectedValueOnce(new Error("resolver unavailable"));
+      const rejected = installStore();
+      const printed = await runExpectingExit("merging");
+      expect(printed).toContain("Valid columns: triage, specified, in-progress, review, done");
+      expect(rejected.moveTask).not.toHaveBeenCalled();
+      expect(rejected.close).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to the legacy columns for a column-less (v1) workflow", async () => {
+      const { resolveWorkflowIrForTask } = await import("@fusion/core");
+      vi.mocked(resolveWorkflowIrForTask).mockResolvedValueOnce({ version: 1, nodes: [], edges: [] } as never);
+      const accepted = installStore();
+      const logs = vi.spyOn(console, "log").mockImplementation(() => {});
+      await runTaskMove("FN-123", "review", "demo-project");
+      logs.mockRestore();
+      expect(accepted.moveTask).toHaveBeenCalledWith("FN-123", "review", { moveSource: "user" });
+
+      vi.mocked(resolveWorkflowIrForTask).mockResolvedValueOnce({ version: 1, nodes: [], edges: [] } as never);
+      const rejected = installStore();
+      const printed = await runExpectingExit("shipped");
+      expect(printed).toContain("Valid columns: triage, specified, in-progress, review, done");
+      expect(rejected.moveTask).not.toHaveBeenCalled();
+    });
+
+    it("rejects an empty column id before opening the store", async () => {
+      const { moveTask } = installStore();
+      await runExpectingExit("   ");
+      expect(resolveProject).not.toHaveBeenCalled();
+      expect(moveTask).not.toHaveBeenCalled();
+    });
   });
 
   it("runTaskAttach uses resolved project store when project name is provided", async () => {

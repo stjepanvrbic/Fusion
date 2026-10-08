@@ -5,6 +5,7 @@ import { buildRuntimeResolutionContext, resolveRuntime, type SessionPurpose } fr
 import { createLogger } from "../logger.js";
 import { isRetryableModelSelectionError, type FallbackModelUsedPayload } from "../pi.js";
 import type { RunAuditor } from "../util/run-audit.js";
+import { emitBoundedRunAudit } from "../util/emit-bounded-run-audit.js";
 import { getCliProviderRouting, stripCliProviderPrefix } from "./cli-provider-routing.js";
 
 const fallbackLog = createLogger("cross-runtime-fallback");
@@ -289,24 +290,30 @@ export function armDeferredCrossRuntimeFallback(args: {
           try {
             await onFallbackModelUsed?.({ primaryModel: primaryDescription, fallbackModel: fallbackDescription, triggerPoint: "prompt-time", taskId, taskTitle, timestamp: new Date().toISOString(), failureCategory: category });
           } catch { /* observer failures must not break the swapped prompt */ }
-          try {
-            await runAuditor?.database({
-              type: auditEventType,
-              target: deferred.runtimeId,
-              metadata: {
-                sessionPurpose,
-                primaryProvider: primaryProvider ?? null,
-                primaryModelId: primaryModelId ?? null,
-                fallbackProvider: deferred.providerId,
-                fallbackModelId: deferred.modelId ?? null,
-                triggerPoint: "prompt-time",
-                failureCategory: category,
-                ...(auditEventType === "session:cross-runtime-fallback-engaged" ? { contextTransferred: Boolean(transferredContext) } : {}),
-              },
-            });
-          } catch (auditError) {
-            fallbackLog.warn(`[${sessionPurpose}] failed to record ${auditEventType} audit: ${String(auditError)}`);
-          }
+          /*
+          FNXC:RunAudit 2026-10-08-02:00:
+          KB-018: this emit runs inside the shared `swapPromise`, so a hanging injected `RunAuditor` would wedge EVERY prompt waiting on the swap (both the cross-runtime and grok-cli fallback event types reach this one site).
+          Route it through the FN-9175 bounded seam: a hanging, throwing, or rejecting sink is logged and abandoned after `RUN_AUDIT_EMIT_TIMEOUT_MS`, and the swap completes. Payload is unchanged.
+          */
+          const engagedAudit = {
+            type: auditEventType,
+            target: deferred.runtimeId,
+            metadata: {
+              sessionPurpose,
+              primaryProvider: primaryProvider ?? null,
+              primaryModelId: primaryModelId ?? null,
+              fallbackProvider: deferred.providerId,
+              fallbackModelId: deferred.modelId ?? null,
+              triggerPoint: "prompt-time",
+              failureCategory: category,
+              ...(auditEventType === "session:cross-runtime-fallback-engaged" ? { contextTransferred: Boolean(transferredContext) } : {}),
+            },
+          };
+          await emitBoundedRunAudit(
+            runAuditor ? { recordRunAuditEvent: () => runAuditor.database(engagedAudit) } : undefined,
+            { mutationType: auditEventType },
+            { log: fallbackLog },
+          );
           swap = createdSwap;
           return createdSwap;
         })();

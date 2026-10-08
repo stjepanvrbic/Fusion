@@ -192,6 +192,66 @@ describe("cross-runtime fallback", () => {
     await expect((session.promptWithFallback as (prompt: string) => Promise<unknown>)("hello")).resolves.toBe("swapped");
   });
 
+  /*
+  FNXC:RunAudit 2026-10-08-02:00:
+  KB-018: the fallback-engaged emit runs inside the shared swap promise, so a never-settling injected RunAuditor must be abandoned after RUN_AUDIT_EMIT_TIMEOUT_MS instead of wedging every waiting prompt (FN-9175).
+  */
+  describe("fallback-engaged audit is bounded (KB-018)", () => {
+    function resolveSwap() {
+      const fallbackPrompt = vi.fn(async () => "swapped");
+      resolveRuntime.mockResolvedValue({ runtimeId: "cursor", runtime: { createSession: vi.fn(async () => ({ session: {} })), promptWithFallback: fallbackPrompt } });
+      return fallbackPrompt;
+    }
+
+    for (const auditEventType of ["session:cross-runtime-fallback-engaged", "session:grok-cli-fallback-engaged"] as const) {
+      it(`${auditEventType}: concurrent prompts resolve with the swap when the sink never settles`, async () => {
+        const { RUN_AUDIT_EMIT_TIMEOUT_MS } = await import("../util/emit-bounded-run-audit.js");
+        resolveSwap();
+        const database = vi.fn(() => new Promise<void>(() => {}));
+        const session = createSession();
+        arm(session, { runAuditor: { database }, auditEventType });
+        const prompt = session.promptWithFallback as (prompt: string) => Promise<unknown>;
+        vi.useFakeTimers();
+        try {
+          const settled: unknown[] = [];
+          const first = prompt("first").then((value) => { settled.push(value); return value; });
+          const second = prompt("second").then((value) => { settled.push(value); return value; });
+          await vi.advanceTimersByTimeAsync(RUN_AUDIT_EMIT_TIMEOUT_MS + 1);
+          expect(settled).toEqual(["swapped", "swapped"]);
+          await expect(first).resolves.toBe("swapped");
+          await expect(second).resolves.toBe("swapped");
+          expect(resolveRuntime).toHaveBeenCalledTimes(1);
+          expect(database).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    }
+
+    it("delivers the exact engaged payload to a resolving sink", async () => {
+      resolveSwap();
+      const database = vi.fn(async () => undefined);
+      const session = createSession();
+      arm(session, { runAuditor: { database } });
+      await expect((session.promptWithFallback as (prompt: string) => Promise<unknown>)("hello")).resolves.toBe("swapped");
+      expect(database).toHaveBeenCalledTimes(1);
+      expect(database).toHaveBeenCalledWith({
+        type: "session:cross-runtime-fallback-engaged",
+        target: "cursor",
+        metadata: {
+          sessionPurpose: "executor",
+          primaryProvider: "openai",
+          primaryModelId: "gpt",
+          fallbackProvider: "cursor-cli",
+          fallbackModelId: "cursor-small",
+          triggerPoint: "prompt-time",
+          failureCategory: expect.any(String),
+          contextTransferred: true,
+        },
+      });
+    });
+  });
+
   it("extracts bounded text-only context across supported message shapes", () => {
     expect(captureTransferableConversationContext({ getMessages: () => [{ role: "assistant", content: [{ type: "tool", text: "ignore" }, { type: "text", text: "keep" }] }] })).toBe("assistant: keep");
     expect(captureTransferableConversationContext({ state: { messages: [] } })).toBeUndefined();

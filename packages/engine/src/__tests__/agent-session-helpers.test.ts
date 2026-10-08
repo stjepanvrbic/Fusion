@@ -942,6 +942,53 @@ describe("createResolvedAgentSession", () => {
     });
   });
 
+  /*
+  FNXC:RunAudit 2026-10-08-02:00:
+  KB-018: a hanging, throwing, or rejecting injected RunAuditor must never block session start; the emit is bounded by RUN_AUDIT_EMIT_TIMEOUT_MS (FN-9175).
+  */
+  describe("session:runtime-resolved audit is bounded (KB-018)", () => {
+    const baseOptions = {
+      sessionPurpose: "executor" as const,
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      defaultProvider: "mock",
+      defaultModelId: "mock-default",
+      settings: { testMode: true } as any,
+    };
+
+    it("returns the session when the audit sink never settles", async () => {
+      const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
+      const { RUN_AUDIT_EMIT_TIMEOUT_MS } = await import("../util/emit-bounded-run-audit.js");
+      const database = vi.fn(() => new Promise<void>(() => {}));
+      vi.useFakeTimers();
+      try {
+        let settled = false;
+        const pending = createResolvedAgentSession({ ...baseOptions, runAuditor: { database } as any })
+          .then((result) => { settled = true; return result; });
+        await vi.advanceTimersByTimeAsync(RUN_AUDIT_EMIT_TIMEOUT_MS + 1);
+        expect(settled).toBe(true);
+        const result = await pending;
+        expect(result.session).toBeDefined();
+        expect(database).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("returns the session when the audit sink throws synchronously or rejects", async () => {
+      const { createResolvedAgentSession } = await import("../agents/agent-session-helpers.js");
+      const throwing = vi.fn(() => { throw new Error("sink exploded"); });
+      const rejecting = vi.fn(() => Promise.reject(new Error("sink rejected")));
+
+      await expect(createResolvedAgentSession({ ...baseOptions, runAuditor: { database: throwing } as any }))
+        .resolves.toEqual(expect.objectContaining({ session: expect.anything() }));
+      await expect(createResolvedAgentSession({ ...baseOptions, runAuditor: { database: rejecting } as any }))
+        .resolves.toEqual(expect.objectContaining({ session: expect.anything() }));
+      expect(throwing).toHaveBeenCalledTimes(1);
+      expect(rejecting).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("records an ids-only bridge failure outcome in session:runtime-resolved", async () => {
     const auditDatabaseMock = vi.fn().mockResolvedValue(undefined);
     resolveRuntimeMock.mockResolvedValue({

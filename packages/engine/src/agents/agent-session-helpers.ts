@@ -55,6 +55,7 @@ import {
 } from "../pi.js";
 import * as piModuleForRegistration from "../pi.js";
 import type { RunAuditor } from "../util/run-audit.js";
+import { emitBoundedRunAudit } from "../util/emit-bounded-run-audit.js";
 import { createFusionAuthStorage, resolveCredentialInstanceRef, type FusionAuthStorage } from "../auth/auth-storage.js";
 import { MockAgentRuntime } from "../providers/mock-provider.js";
 import {
@@ -1081,9 +1082,13 @@ export async function createResolvedAgentSession(
     );
   }
 
-  try {
-    await runAuditor?.database({
-      type: "session:runtime-resolved",
+  /*
+  FNXC:RunAudit 2026-10-08-02:00:
+  KB-018: an injected `RunAuditor` (wrappers, forwarders, test doubles) may hang, throw, or reject even though `createRunAuditor` bounds its own writes.
+  FN-9175 forbids telemetry from becoming a session-start dependency, so this emit goes through the bounded seam: a stalled sink is logged and abandoned after `RUN_AUDIT_EMIT_TIMEOUT_MS` and the session is still returned. Payload is unchanged.
+  */
+  const runtimeResolvedAudit = {
+      type: "session:runtime-resolved" as const,
       target: resolved.runtimeId,
       metadata: {
         sessionPurpose,
@@ -1135,10 +1140,12 @@ export async function createResolvedAgentSession(
         ...(deferredCrossRuntimeFallback ? { reason: "cross-runtime-fallback-deferred" } : {}),
         ...(!autoCliRuntimeHint && !grokFallbackDeferral.dropped && !deferredGrokFallback && !crossRuntimeFallbackDeferral.dropped && !deferredCrossRuntimeFallback && "fallbackReason" in resolved && resolved.fallbackReason ? { reason: resolved.fallbackReason } : {}),
       },
-    });
-  } catch (err) {
-    sessionLog.warn(`[${sessionPurpose}] failed to record session:runtime-resolved audit: ${String(err)}`);
-  }
+    };
+  await emitBoundedRunAudit(
+    runAuditor ? { recordRunAuditEvent: () => runAuditor.database(runtimeResolvedAudit) } : undefined,
+    { mutationType: "session:runtime-resolved" },
+    { log: sessionLog },
+  );
 
   // Attach the resolved runtime's promptWithFallback as a bound method on the
   // session object when it is not already present. This is the dispatch hook
