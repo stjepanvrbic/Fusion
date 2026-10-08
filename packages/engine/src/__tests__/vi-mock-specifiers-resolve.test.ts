@@ -29,13 +29,14 @@ both aimed at `../run-audit.js` after that module folded into `util/run-audit.ts
 A dead specifier mocks NOTHING, so each silently disarmed every audit/dependency assertion in its
 file — the tests passed for the wrong reason until the modules' real behavior broke them. This list
 only ever shrinks; the counts below are the ratchet.
+
+FNXC:ViMockSpecifiers 2026-10-08-08:13:
+RATCHETED DOWN 8 -> 3. KB-046 re-pointed the five `merge-single-flight-invariant` mocks to
+`../merge/pr-monitor.js`, `../merge/pr-comment-handler.js`, `../auth/auth-storage.js`,
+`../util/notifier.js` and `../scheduling/cron-runner.js`. Before KB-035's separator normalization
+this guard was vacuous on win32 (keys were `__tests__\\...`), so it reported those still-dead entries as stale there.
 */
 const KNOWN_DEAD_SPECIFIERS = [
-  { file: "__tests__/merge-single-flight-invariant.test.ts", specifier: "../pr-monitor.js" },
-  { file: "__tests__/merge-single-flight-invariant.test.ts", specifier: "../pr-comment-handler.js" },
-  { file: "__tests__/merge-single-flight-invariant.test.ts", specifier: "../auth-storage.js" },
-  { file: "__tests__/merge-single-flight-invariant.test.ts", specifier: "../notifier.js" },
-  { file: "__tests__/merge-single-flight-invariant.test.ts", specifier: "../cron-runner.js" },
   { file: "__tests__/triage-duplicate-verdict-session-recovery.test.ts", specifier: "../reviewer.js" },
   { file: "__tests__/triage-plan-admission-throttle-audit.test.ts", specifier: "../reviewer.js" },
   { file: "__tests__/triage-planning-worktree-session-registration.test.ts", specifier: "../reviewer.js" },
@@ -261,9 +262,9 @@ describe("relative engine test specifiers", () => {
   });
 
   it("resolves relative literals and ratchets the remaining moved-module exceptions downward", () => {
-    expect(KNOWN_DEAD_SPECIFIERS).toHaveLength(8);
-    expect(new Set(KNOWN_DEAD_SPECIFIERS.map((entry) => entry.file))).toHaveLength(4);
-    expect(KNOWN_DEAD_SPECIFIERS.some((entry) => entry.file === "__tests__/self-healing-query-filter-blindness.test.ts")).toBe(false);
+    expect(KNOWN_DEAD_SPECIFIERS).toHaveLength(3);
+    expect(new Set(KNOWN_DEAD_SPECIFIERS.map((entry) => entry.file))).toHaveLength(3);
+    expect(KNOWN_DEAD_SPECIFIERS.some((entry) => (entry.file as string) === "__tests__/self-healing-query-filter-blindness.test.ts")).toBe(false);
 
     const allowed = new Set(KNOWN_DEAD_SPECIFIERS.map((entry) => `${entry.file}\0${entry.specifier}`));
     const observedDead = new Set<string>();

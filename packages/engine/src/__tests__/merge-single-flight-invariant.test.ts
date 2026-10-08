@@ -43,20 +43,24 @@ vi.mock("@fusion/core", async (importOriginal) => {
 });
 
 vi.mock("../merger.js", () => ({ aiMergeTask: vi.fn(), sweepStaleAutostashes: vi.fn(async () => undefined) }));
-vi.mock("../pr-monitor.js", () => ({ PrMonitor: vi.fn().mockImplementation(function () { return { onNewComments: vi.fn() }; }) }));
-vi.mock("../pr-comment-handler.js", () => ({ PrCommentHandler: vi.fn().mockImplementation(function () { return { handleNewComments: vi.fn() }; }) }));
-vi.mock("../auth-storage.js", () => ({
+/*
+FNXC:TestHarnessIntegrity 2026-10-08-08:13:
+KB-046 re-pointed these mocks after the cb57093d0 domain-folder move: the old `../pr-monitor.js`-style paths no longer resolved, so they mocked nothing and the real modules loaded.
+*/
+vi.mock("../merge/pr-monitor.js", () => ({ PrMonitor: vi.fn().mockImplementation(function () { return { onNewComments: vi.fn() }; }) }));
+vi.mock("../merge/pr-comment-handler.js", () => ({ PrCommentHandler: vi.fn().mockImplementation(function () { return { handleNewComments: vi.fn() }; }) }));
+vi.mock("../auth/auth-storage.js", () => ({
   createFusionAuthStorage: vi.fn(() => ({ reload: vi.fn(), getOAuthProviders: vi.fn(() => []), get: vi.fn(() => undefined) })),
   getFusionOAuthAlertStatePath: vi.fn(() => "/tmp/oauth-alert-state.json"),
 }));
-vi.mock("../notifier.js", () => ({ NtfyNotifier: vi.fn().mockImplementation(function () { return { start: vi.fn(), stop: vi.fn() }; }) }));
+vi.mock("../util/notifier.js", () => ({ NtfyNotifier: vi.fn().mockImplementation(function () { return { start: vi.fn(), stop: vi.fn() }; }) }));
 vi.mock("../notification/index.js", () => ({
   NotificationService: vi.fn().mockImplementation(function () { return { start: vi.fn(), stop: vi.fn() }; }),
   OAuthAlertStateStore: vi.fn().mockImplementation(function () { return {}; }),
   OAuthExpiryMonitor: vi.fn().mockImplementation(function () { return { start: vi.fn(), stop: vi.fn() }; }),
   OAuthValidityLogger: vi.fn().mockImplementation(function () { return { start: vi.fn(), stop: vi.fn() }; }),
 }));
-vi.mock("../cron-runner.js", () => ({
+vi.mock("../scheduling/cron-runner.js", () => ({
   CronRunner: vi.fn().mockImplementation(function () { return { start: vi.fn(), stop: vi.fn() }; }),
   createAiPromptExecutor: vi.fn(async () => vi.fn()),
 }));
