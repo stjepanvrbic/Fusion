@@ -214,45 +214,18 @@ export interface PluginStepParserContribution {
 
 import type { FusionPlugin } from "@fusion/core";
 
-// NOTE (U8): trait-contribution VALIDATION lives in @fusion/core
-// (validatePluginTraitContribution) and runs engine-side at registration.
-// It is deliberately NOT re-exported here — plugin-sdk's built artifact must
-// carry no @fusion runtime specifiers (see cli plugin-sdk-export test); only
-// type-level re-exports are allowed from @fusion/core.
+/*
+NOTE (U8), corrected by FNXC:PluginManifestValidation 2026-10-08-04:45:
+Runtime values ARE re-exported from @fusion/core (see the export blocks above). In the published SDK bundle the CLI tsup config aliases @fusion/core to plugin-sdk-core-runtime-shim.mjs, which re-exports each binding from core source, so the built artifact still carries no @fusion runtime specifiers.
+Trait-contribution validation (validatePluginTraitContribution) runs engine-side at registration and is not exported from the SDK; that is a scope choice, not a bundling constraint.
+*/
 
-const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-
-export function validatePluginManifest(manifest: unknown): { valid: boolean; errors: string[] } {
-  const errors: string[] = [];
-
-  if (manifest === null || manifest === undefined) {
-    return { valid: false, errors: ["Manifest is required"] };
-  }
-
-  if (typeof manifest !== "object" || Array.isArray(manifest)) {
-    return { valid: false, errors: ["Manifest must be an object"] };
-  }
-
-  const m = manifest as Record<string, unknown>;
-
-  if (!m.id || typeof m.id !== "string" || m.id.trim() === "") {
-    errors.push("id is required and must be a non-empty string");
-  } else if (!SLUG_PATTERN.test(m.id)) {
-    errors.push("id must be a valid slug (lowercase, alphanumeric, hyphens only, cannot start or end with hyphen)");
-  }
-
-  if (!m.name || typeof m.name !== "string" || m.name.trim() === "") {
-    errors.push("name is required and must be a non-empty string");
-  }
-
-  if (!m.version || typeof m.version !== "string" || m.version.trim() === "") {
-    errors.push("version is required and must be a non-empty string");
-  } else if (!/^\d+\.\d+\.\d+$/.test(m.version)) {
-    errors.push("version must be a valid semver string (e.g., 1.0.0)");
-  }
-
-  return { valid: errors.length === 0, errors };
-}
+/*
+FNXC:PluginManifestValidation 2026-10-08-04:45:
+The SDK validator must be the loader validator (KB-034). A hand-written copy checked only id/name/version, so authors saw "valid: true" and then "Invalid plugin manifest" at load.
+Signature unchanged: (manifest: unknown) => { valid: boolean; errors: string[] }.
+*/
+export { validatePluginManifest } from "@fusion/core";
 
 /**
  * Type-safe helper for defining a Fusion plugin.

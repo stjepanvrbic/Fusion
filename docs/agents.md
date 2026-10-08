@@ -1697,7 +1697,7 @@ The pi extension ships as part of `@runfusion/fusion` and provides tools + a `/f
 
 The extension has no skills — tool descriptions give the LLM everything it needs.
 
-Published SDK surface: `@runfusion/fusion/plugin-sdk` now ships as a public subpath export from the CLI package, exposing `definePlugin`, `validatePluginManifest`, and the plugin type surface for external plugin authors without depending on private `@fusion/*` workspace packages.
+Published SDK surface: `@runfusion/fusion/plugin-sdk` now ships as a public subpath export from the CLI package, exposing `definePlugin`, `validatePluginManifest`, and the plugin type surface for external plugin authors without depending on private `@fusion/*` workspace packages. The SDK's `validatePluginManifest` is the same function the Fusion plugin loader runs (re-exported from core's `plugin-manifest-validation.ts` and bundled through the CLI runtime shim), so it validates `id`, `name`, `version`, `dependencies`, `settingsSchema`, `runtime`, `skills`, `workflowSteps`, `traits`, `workflowExtensions`, `promptSurfaces`, `dashboardViews`, and `setup`; a manifest it accepts will not fail with "Invalid plugin manifest" at load.
 
 ### `fn_web_fetch`
 

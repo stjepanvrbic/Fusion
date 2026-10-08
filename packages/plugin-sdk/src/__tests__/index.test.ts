@@ -1,20 +1,15 @@
-import { describe, it, expect, beforeAll } from "vitest";
-import { definePlugin } from "../index.js";
+import { describe, it, expect } from "vitest";
+import { validatePluginManifest as coreBarrelValidate } from "@fusion/core";
+import { definePlugin, validatePluginManifest } from "../index.js";
 import type { FusionPlugin, PluginUiContributionSurface } from "../../../core/src/plugins/plugin-types.js";
 import type { TaskStore } from "../../../core/src/store.js";
-import { validatePluginManifest } from "../../../core/src/plugins/plugin-types.js";
+import { validatePluginManifest as coreValidate } from "../../../core/src/plugins/plugin-types.js";
 
 type AssertNever<T extends never> = T;
 type NoStaleStructuredSurface = AssertNever<Extract<
   PluginUiContributionSurface,
   "settings-integration-card" | "onboarding-recommendation-card"
 >>;
-
-let validateFn: typeof validatePluginManifest;
-
-beforeAll(async () => {
-  validateFn = validatePluginManifest;
-});
 
 describe("Plugin SDK", () => {
   // ── definePlugin ────────────────────────────────────────────────────
@@ -282,27 +277,86 @@ describe("Plugin SDK", () => {
 
   // ── validatePluginManifest ───────────────────────────────────────────
 
+  /*
+  FNXC:PluginManifestValidation 2026-10-08-04:45:
+  KB-034: these tests exercise the SDK export itself. The previous suite imported core's validator, so the SDK's id/name/version-only copy was never tested and accepted manifests the loader rejected.
+  */
   describe("validatePluginManifest", () => {
-    it("validates a valid manifest", () => {
-      const result = validateFn({
-        id: "valid-plugin",
-        name: "Valid Plugin",
-        version: "1.0.0",
-      });
+    const base = { id: "demo-plugin", name: "Demo", version: "1.0.0" };
 
-      expect(result.valid).toBe(true);
-      expect(result.errors).toEqual([]);
+    it("is the loader's validator from @fusion/core, not a copy", () => {
+      expect(validatePluginManifest).toBe(coreBarrelValidate);
+      expect(validatePluginManifest).toBe(coreValidate);
     });
 
-    it("rejects invalid manifest", () => {
-      const result = validateFn({
-        id: "",
-        name: "",
-        version: "",
-      });
+    const loaderRejected: Array<[string, Record<string, unknown>]> = [
+      ["dependencies type", { dependencies: "x" }],
+      ["dependencies entries", { dependencies: [""] }],
+      ["settingsSchema type", { settingsSchema: { k: { type: "bogus" } } }],
+      ["settingsSchema enum", { settingsSchema: { k: { type: "enum" } } }],
+      ["settingsSchema array", { settingsSchema: { k: { type: "array" } } }],
+      ["runtime", { runtime: {} }],
+      ["skills", { skills: [{ skillId: "Bad" }] }],
+      ["workflowSteps", { workflowSteps: [{ stepId: "s", name: "S", mode: "x" }] }],
+      ["traits", { traits: [{ traitId: "t", name: "T", schemaVersion: 1, hooks: { guard: {} } }] }],
+      ["workflowExtensions", { workflowExtensions: [{ extensionId: "e", name: "E", kind: "nope" }] }],
+      ["promptSurfaces", { promptSurfaces: ["nope"] }],
+      ["dashboardViews", { dashboardViews: [{ viewId: "v", label: "V" }] }],
+      ["setup", { setup: { binaryName: "b", description: "d", channel: "alpha" } }],
+    ];
 
+    it.each(loaderRejected)("rejects a manifest with malformed %s exactly as the loader does", (_label, extra) => {
+      const manifest = { ...base, ...extra };
+      const result = validatePluginManifest(manifest);
       expect(result.valid).toBe(false);
       expect(result.errors.length).toBeGreaterThan(0);
+      expect(result).toEqual(coreValidate(manifest));
+    });
+
+    it("rejects non-array dependencies with the loader's message", () => {
+      expect(validatePluginManifest({ ...base, dependencies: "not-an-array" })).toEqual({
+        valid: false,
+        errors: ["dependencies must be an array"],
+      });
+    });
+
+    it("accepts minimal and fully populated valid manifests", () => {
+      expect(validatePluginManifest(base)).toEqual({ valid: true, errors: [] });
+      expect(
+        validatePluginManifest({
+          ...base,
+          dependencies: ["other-plugin"],
+          settingsSchema: { mode: { type: "enum", enumValues: ["a"] }, tags: { type: "array", itemType: "number" } },
+          runtime: { runtimeId: "demo-runtime", name: "Demo Runtime" },
+          skills: [{ skillId: "demo-skill", name: "Demo Skill" }],
+          workflowSteps: [{ stepId: "demo-step", name: "Demo Step", mode: "script" }],
+          traits: [{ traitId: "demo-trait", name: "Demo Trait" }],
+          workflowExtensions: [{ extensionId: "demo-ext", name: "Demo Ext", kind: "work-engine" }],
+          promptSurfaces: ["reviewer"],
+          dashboardViews: [{ viewId: "demo-view", label: "Demo", componentPath: "./view.js" }],
+          setup: { binaryName: "demo", description: "Demo binary", channel: "stable" },
+        }),
+      ).toEqual({ valid: true, errors: [] });
+    });
+
+    it("rejects missing and non-object manifests with the loader's messages", () => {
+      expect(validatePluginManifest(null)).toEqual({ valid: false, errors: ["Manifest is required"] });
+      expect(validatePluginManifest(undefined)).toEqual({ valid: false, errors: ["Manifest is required"] });
+      expect(validatePluginManifest([])).toEqual({ valid: false, errors: ["Manifest must be an object"] });
+    });
+
+    it("rejects empty required fields", () => {
+      const result = validatePluginManifest({ id: "", name: "", version: "" });
+      expect(result.valid).toBe(false);
+      expect(result.errors).toEqual([
+        "id is required and must be a non-empty string",
+        "name is required and must be a non-empty string",
+        "version is required and must be a non-empty string",
+      ]);
+    });
+
+    it("accepts consecutive hyphens in the id, matching the loader slug rule", () => {
+      expect(validatePluginManifest({ ...base, id: "a--b" })).toEqual({ valid: true, errors: [] });
     });
   });
 });

@@ -65,6 +65,14 @@ import { resolveWorkflowIrForTask } from "../../core/src/workflows/workflow-ir-r
 
 export { columnsWithFlag, resolveReviewColumns, resolveWorkflowIrForTask };
 
+/*
+ * FNXC:PluginManifestValidation 2026-10-08-04:45:
+ * The plugin SDK re-exports core's validatePluginManifest so authors get the loader's exact rules (KB-034).
+ * Without this binding the plugin-sdk and bundled-plugin esbuild builds fail with "No matching export".
+ * Re-export from the pure core source module, never a copy, core dist, or the core barrel.
+ */
+export { validatePluginManifest } from "../../core/src/plugins/plugin-manifest-validation.js";
+
 export const FUSION_RESTART_EXIT_CODE = 86;
 
 export function superviseSpawn(command, args = [], options = {}) {

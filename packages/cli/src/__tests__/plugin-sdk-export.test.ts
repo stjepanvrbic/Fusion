@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { builtinModules } from "node:module";
 import ts from "typescript";
 import { definePlugin, validatePluginManifest } from "@fusion/plugin-sdk";
@@ -72,6 +73,31 @@ describe("plugin-sdk export surface", () => {
 
     expect(validatePluginManifest(plugin.manifest)).toEqual({ valid: true, errors: [] });
     expect(validatePluginManifest({ id: "Bad_ID", name: "", version: "nope" }).valid).toBe(false);
+    // KB-034: the SDK validator applies the loader rules, not only id/name/version.
+    const rejected = validatePluginManifest({ id: "demo-plugin", name: "Demo", version: "1.0.0", dependencies: "nope" });
+    expect(rejected.valid).toBe(false);
+    expect(rejected.errors).toContain("dependencies must be an array");
+  });
+
+  it("keeps no copy of validatePluginManifest in the SDK source or the runtime shim", () => {
+    const sdkRaw = readFileSync(join(workspaceRoot, "packages", "plugin-sdk", "src", "index.ts"), "utf-8");
+    const shimRaw = readFileSync(join(workspaceRoot, "packages", "cli", "src", "plugin-sdk-core-runtime-shim.mjs"), "utf-8");
+    expect(sdkRaw).not.toMatch(/function\s+validatePluginManifest\b/);
+    expect(shimRaw).not.toMatch(/function\s+validatePluginManifest\b/);
+  });
+
+  it("validates manifests with the loader rules in the built plugin-sdk artifact when present", async () => {
+    const distPath = join(workspaceRoot, "packages", "cli", "dist", "plugin-sdk", "index.js");
+    if (!existsSync(distPath)) {
+      return;
+    }
+    const built = (await import(pathToFileURL(distPath).href)) as {
+      validatePluginManifest: (manifest: unknown) => { valid: boolean; errors: string[] };
+    };
+    const rejected = built.validatePluginManifest({ id: "demo-plugin", name: "Demo", version: "1.0.0", dependencies: "nope" });
+    expect(rejected.valid).toBe(false);
+    expect(rejected.errors).toContain("dependencies must be an array");
+    expect(built.validatePluginManifest({ id: "demo-plugin", name: "Demo", version: "1.0.0" })).toEqual({ valid: true, errors: [] });
   });
 
   it("injects plugin-sdk subpath export into prepack manifest", () => {
@@ -145,6 +171,7 @@ describe("plugin-sdk export surface", () => {
     bindings to be exported and let the list grow.
     */
     expect(shimRaw).toMatch(/export\s*\{[^}]*\bAgentStore\b[^}]*\bpostgresSchema\b[^}]*\}/);
+    expect(shimRaw).toMatch(/export\s*\{[^}]*\bvalidatePluginManifest\b[^}]*\}\s*from\s*"\.\.\/\.\.\/core\/src\/plugins\/plugin-manifest-validation\.js"/);
     expect(shimRaw).toContain("export function superviseSpawn");
     expect(shimRaw).not.toContain("../../core/dist/");
   });

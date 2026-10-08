@@ -173,6 +173,16 @@ const manifest: PluginManifest = {
 | `settingsSchema` | Record<string, PluginSettingSchema> | No | Configuration schema |
 | `runtime` | PluginRuntimeManifestMetadata | No | Agent runtime metadata for discovery |
 
+### Validating a manifest
+
+`validatePluginManifest` from `@fusion/plugin-sdk` (published as `@runfusion/fusion/plugin-sdk`) is the same validator the Fusion plugin loader runs at install and load time. It checks `id`, `name`, `version`, and every optional block: `dependencies`, `settingsSchema`, `runtime`, `skills`, `workflowSteps`, `traits`, `workflowExtensions`, `promptSurfaces`, `dashboardViews`, and `setup`. A manifest it accepts will not fail later with an "Invalid plugin manifest" error, and the error messages it returns are the ones the loader reports.
+
+```typescript
+import { validatePluginManifest } from "@runfusion/fusion/plugin-sdk";
+
+const { valid, errors } = validatePluginManifest(manifest);
+```
+
 ---
 
 ## 3. Plugin Settings Schema
