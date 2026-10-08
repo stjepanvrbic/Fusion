@@ -145,7 +145,14 @@ export async function syncWorktreeToHead(input: SyncWorktreeInput): Promise<Sync
   let untrackedFiles: string[];
   try {
     dirtyFiles = await listFiles(worktreePath, ["diff", "--name-only", previousSha]);
-    untrackedFiles = await listFiles(worktreePath, ["ls-files", "--others", "--exclude-standard"]);
+    /*
+    FNXC:MergeAdvanceSync 2026-10-07-23:45:
+    Git reports a nested repository or linked worktree (for example Fusion's own `.fusion/worktrees/<task>`) as one
+    untracked entry ending in `/`. It is a separate checkout that `reset --hard` never touches, not an operator edit, and
+    copying it as a file failed the snapshot and stranded the root checkout behind the landed ref.
+    */
+    untrackedFiles = (await listFiles(worktreePath, ["ls-files", "--others", "--exclude-standard"]))
+      .filter((entry) => !entry.endsWith("/"));
   } catch (err: unknown) {
     return { kind: "failed", stage: "snapshot", error: commandError(err) };
   }
