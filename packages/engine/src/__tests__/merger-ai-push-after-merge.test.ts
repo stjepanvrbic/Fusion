@@ -156,7 +156,12 @@ function realMergeAgent(branch: string) {
 const approveReviewer = () => vi.fn(async () => "REVIEW_VERDICT: approve");
 
 describe("runAiMerge push-after-merge", () => {
-  it.each(["new-landing", "already-landed", "no-op", "missing-branch"].flatMap((surface) => [false, true].map((graphOwnedPostMergeTraversal) => ({ surface, graphOwnedPostMergeTraversal }))))("publishes $surface while required evidence blocks completion (graph=$graphOwnedPostMergeTraversal)", async ({ surface, graphOwnedPostMergeTraversal }) => {
+  /*
+  FNXC:PostMergeEvidenceOrderingTest 2026-10-08-15:24:
+  KB-079: direct (graph=false) and graph-owned requesters both resolve with a confirmed landing while the required gate is unreported.
+  The direct half used to throw "has not reported", which the merge pump parked as status failed.
+  */
+  it.each(["new-landing", "already-landed", "no-op", "missing-branch"].flatMap((surface) => [false, true].map((graphOwnedPostMergeTraversal) => ({ surface, graphOwnedPostMergeTraversal }))))("publishes $surface while unreported required evidence defers completion (graph=$graphOwnedPostMergeTraversal)", async ({ surface, graphOwnedPostMergeTraversal }) => {
     const { dir, originDir } = initRepoWithRemote();
     const { store, storeMocks, task } = makeStore();
     const branchTip = git(dir, "rev-parse fusion/fn-1");
@@ -174,8 +179,9 @@ describe("runAiMerge push-after-merge", () => {
     });
     const mergeAgent = realMergeAgent("fusion/fn-1");
     const merge = runAiMerge(store, dir, "FN-1", { manual: true, graphOwnedPostMergeTraversal }, { mergeAgent, reviewAgent: approveReviewer() });
-    if (graphOwnedPostMergeTraversal) await expect(merge).resolves.toMatchObject({ pushedToRemote: true });
-    else await expect(merge).rejects.toThrow("has not reported");
+    await expect(merge).resolves.toMatchObject({ pushedToRemote: true, mergeConfirmed: true });
+    expect(task.status).not.toBe("failed");
+    expect(task.error).toBeFalsy();
     expect(git(originDir, "rev-parse main")).toBe(git(dir, "rev-parse main"));
     expect(task.column).toBe("in-review");
     expect(storeMocks.recordRunAuditEvent.mock.calls.filter(([event]) => event.mutationType === "push:origin")).toHaveLength(1);

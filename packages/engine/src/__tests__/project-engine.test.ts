@@ -2286,6 +2286,57 @@ describe("ProjectEngine workspace merge dispatch hardening (Phase C review)", ()
     await engine.stop();
   });
 
+  /*
+  FNXC:PostMergeEvidenceOrderingTest 2026-10-08-15:24:
+  KB-079: a workspace landing deferred on an unreported required post-merge gate is a confirmed landing.
+  Both the manual door and the auto lane must take the success path instead of WorkspaceFinalizeBlockedError or a failed park.
+  */
+  const deferredWorkspaceLanding = () => ({
+    allLanded: true,
+    finalized: false,
+    deferredPostMergeEvidence: true,
+    repos: [{ repo: "repo-a", status: "landed", landedSha: "abc", integrationBranch: "main" }],
+  });
+  const expectNoFailedPark = (store: ReturnType<typeof createMockStore>["store"]) => {
+    expect(store.updateTask.mock.calls.some(([, patch]) => {
+      const typed = patch as { status?: unknown; error?: unknown };
+      return typed.status === "failed" || (typed.error !== undefined && typed.error !== null);
+    })).toBe(false);
+    expect(store.logEntry).not.toHaveBeenCalledWith("FN-WSH", expect.anything(), "WorkspaceFinalizeBlocked");
+  };
+
+  it("resolves a manual workspace merge whose post-merge gate has not reported as a confirmed landing", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mockStore.store.getTask.mockResolvedValue(workspaceTask() as any);
+    mocks.currentStore = mockStore.store;
+    mocks.landWorkspaceTask.mockResolvedValue(deferredWorkspaceLanding() as any);
+    const engine = createEngine();
+    await engine.start();
+
+    await expect(engine.onMerge("FN-WSH")).resolves.toMatchObject({ mergeConfirmed: true, merged: true, commitSha: "abc" });
+    expectNoFailedPark(mockStore.store);
+    await engine.stop();
+  });
+
+  it("keeps an auto-lane workspace merge whose post-merge gate has not reported out of the failure path", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mockStore.store.getTask.mockResolvedValue(workspaceTask() as any);
+    mocks.currentStore = mockStore.store;
+    mocks.landWorkspaceTask.mockResolvedValue(deferredWorkspaceLanding() as any);
+    const mergedLogSpy = vi.spyOn(runtimeLog, "log").mockImplementation(() => undefined);
+    const engine = createEngine();
+    await engine.start();
+    engine.enqueueMerge("FN-WSH");
+
+    await vi.waitFor(() => {
+      expect(mergedLogSpy.mock.calls.flat().join(" ")).toContain("Auto-merge merged: FN-WSH");
+    });
+    expectNoFailedPark(mockStore.store);
+
+    mergedLogSpy.mockRestore();
+    await engine.stop();
+  });
+
   it("rejects a manual workspace merge when finalization is blocked without laundering success", async () => {
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
     const task = workspaceTask({

@@ -1915,7 +1915,7 @@ export async function runAiMerge(
         target: branch,
         metadata: { taskId, kind: "no-commits-expected", noCommitsExpected: true },
       });
-      return await finalizeTask(store, taskId, noOpResult(task, branch, "no-commits-expected"), undefined, undefined, projectRootDir, fence, options.graphOwnedPostMergeTraversal === true);
+      return await finalizeTask(store, taskId, noOpResult(task, branch, "no-commits-expected"), undefined, undefined, projectRootDir, fence);
     }
     if (wasExecuted && !alreadyMerged) {
       await audit.git({
@@ -1938,7 +1938,7 @@ export async function runAiMerge(
     const hasRecordedLandingProof = alreadyMerged && typeof recordedCommitSha === "string"
       && /^[a-f0-9]{40,64}$/i.test(recordedCommitSha)
       && await gitOk(["merge-base", "--is-ancestor", recordedCommitSha, `refs/heads/${integrationBranch}`], projectRootDir);
-    return await finalizeTask(store, taskId, noOpResult(task, branch, alreadyMerged ? "already-merged" : "no-branch"), undefined, undefined, projectRootDir, fence, options.graphOwnedPostMergeTraversal === true, hasRecordedLandingProof ? publishLanding : undefined);
+    return await finalizeTask(store, taskId, noOpResult(task, branch, alreadyMerged ? "already-merged" : "no-branch"), undefined, undefined, projectRootDir, fence, hasRecordedLandingProof ? publishLanding : undefined);
   }
 
   /*
@@ -2006,7 +2006,7 @@ export async function runAiMerge(
       const finalized = await finalizeMerged(store, projectRootDir, taskId, task, branch, integrationBranch, alreadyLanded.landedSha, audit, log, {
         empty: false,
         expectedBranchTipSha: alreadyLanded.landedBranchTipSha,
-      }, mergeTarget, groupRouting, options.syncGroupPr, fence, options.graphOwnedPostMergeTraversal === true, publishLanding);
+      }, mergeTarget, groupRouting, options.syncGroupPr, fence, publishLanding);
       await audit.git({
         type: "merge:ai-landed",
         target: integrationBranch,
@@ -2239,13 +2239,13 @@ export async function runAiMerge(
     }
 
     await log(`AI merge: ${branch} had no net changes vs ${integrationBranch} — finalizing as no-op`);
-    const noOpFinalized = await finalizeMerged(store, projectRootDir, taskId, task, branch, integrationBranch, landResult.tipSha, audit, log, { empty: true }, mergeTarget, groupRouting, options.syncGroupPr, fence, options.graphOwnedPostMergeTraversal === true, publishLanding);
+    const noOpFinalized = await finalizeMerged(store, projectRootDir, taskId, task, branch, integrationBranch, landResult.tipSha, audit, log, { empty: true }, mergeTarget, groupRouting, options.syncGroupPr, fence, publishLanding);
     return noOpFinalized;
   }
 
   let finalized: MergeResult;
   try {
-    finalized = await finalizeMerged(store, projectRootDir, taskId, task, branch, integrationBranch, landResult.squashSha, audit, log, { empty: false, expectedBranchTipSha: landResult.sourceSha }, mergeTarget, groupRouting, options.syncGroupPr, fence, options.graphOwnedPostMergeTraversal === true, publishLanding);
+    finalized = await finalizeMerged(store, projectRootDir, taskId, task, branch, integrationBranch, landResult.squashSha, audit, log, { empty: false, expectedBranchTipSha: landResult.sourceSha }, mergeTarget, groupRouting, options.syncGroupPr, fence, publishLanding);
   } catch (error: unknown) {
     const failure = getErrorMessage(error);
     const landingMessage = error instanceof RecordedMergeBranchTipChangedError
@@ -2436,6 +2436,19 @@ export interface WorkspaceMergeResult {
    */
   finalized: boolean;
   finalizeBlockedReason?: string;
+  /**
+   * FNXC:PostMergeEvidenceOrdering 2026-10-08-15:24:
+   * KB-079: every repo landed and merge proof is persisted, but a required post-merge gate has not reported yet.
+   * `finalized` stays false (the task did not reach done); merge doors must treat this as a confirmed landing, not a blocked finalization, and must not park the task failed.
+   * The gate is seeded or resumed by the shared finalizer's post-merge reseed seam.
+   */
+  deferredPostMergeEvidence?: boolean;
+}
+
+/** Outcome of {@link finalizeWorkspaceTask}: `finalized` means the task reached done. */
+interface WorkspaceFinalizeOutcome {
+  finalized: boolean;
+  deferredPostMergeEvidence?: true;
 }
 
 /*
@@ -3369,12 +3382,12 @@ export async function landWorkspaceTask(
     const withValidDispatchLease = (store as Partial<TaskStore>).withValidWorkspaceLease;
     if (options.workspaceDispatchFence && typeof withValidDispatchLease === "function") {
       try {
-        const finalized = await (withValidDispatchLease.call(
+        const outcome = await (withValidDispatchLease.call(
           store,
           options.workspaceDispatchFence,
           async () => finalize(),
-        ) as Promise<boolean>);
-        return { taskId, repos, allLanded, finalized };
+        ) as Promise<WorkspaceFinalizeOutcome>);
+        return { taskId, repos, allLanded, ...outcome };
       } catch (error) {
         if (error instanceof Error && error.message === "Workspace lease is no longer valid") {
           await audit.database({
@@ -3388,8 +3401,8 @@ export async function landWorkspaceTask(
         throw error;
       }
     }
-    const finalized = await finalize();
-    return { taskId, repos, allLanded, finalized };
+    const outcome = await finalize();
+    return { taskId, repos, allLanded, ...outcome };
   }
   return { taskId, repos, allLanded, finalized: false };
 }
@@ -3491,7 +3504,7 @@ async function finalizeWorkspaceTask(
   workspaceRootDir: string,
   fence?: MergeWriteFence,
   audit?: RunAuditor,
-): Promise<boolean> {
+): Promise<WorkspaceFinalizeOutcome> {
   const landed = repos.filter((r) => r.status === "landed" && r.landedSha);
   const workspaceLandedShas: Record<string, string> = {};
   for (const r of landed) workspaceLandedShas[r.repo] = r.landedSha!;
@@ -3581,8 +3594,17 @@ async function finalizeWorkspaceTask(
     await store.logEntry(taskId, formatWorkspaceLandingSummary(repos), "AiMerge").catch(() => undefined);
   }
   fence?.assertOwned("finalization");
-  await finalizeTask(store, taskId, result, undefined, undefined, undefined, fence);
-  return true;
+  const finalized = await finalizeTask(store, taskId, result, undefined, undefined, undefined, fence);
+  if (finalized.deferredPostMergeEvidence) {
+    /*
+    FNXC:PostMergeEvidenceOrdering 2026-10-08-15:24:
+    KB-079: a workspace landing waiting on an unreported required post-merge gate is a confirmed landing, not a failure.
+    Report the deferral so the merge door returns the landing instead of raising WorkspaceFinalizeBlockedError.
+    The shared finalizer already logged its deduped deferral line, so no extra durable write happens here.
+    */
+    return { finalized: false, deferredPostMergeEvidence: true };
+  }
+  return { finalized: true };
 }
 
 async function mergeAndReview(input: {
@@ -4035,7 +4057,6 @@ async function finalizeMerged(
   groupRouting?: BranchGroupMergeRouting | null,
   syncGroupPr?: SyncGroupPrFn,
   fence?: MergeWriteFence,
-  graphOwnedPostMergeTraversal = false,
   publishLanding?: (result: MergeResult) => Promise<void>,
 ): Promise<MergeResult> {
   /*
@@ -4231,7 +4252,7 @@ async function finalizeMerged(
   }
 
   fence?.assertOwned("finalization");
-  const finalized = await finalizeTask(store, taskId, result, audit, log, projectRootDir, fence, graphOwnedPostMergeTraversal, publishLanding);
+  const finalized = await finalizeTask(store, taskId, result, audit, log, projectRootDir, fence, publishLanding);
   if (finalized.deferredPostMergeEvidence) {
     await log(`AI merge: ${taskId} landed; awaiting required post-merge verification before task finalization`);
   } else {
@@ -4252,7 +4273,6 @@ async function finalizeTask(
   log?: (message: string) => Promise<void>,
   rootDir?: string,
   fence?: MergeWriteFence,
-  graphOwnedPostMergeTraversal = false,
   publishLanding?: (result: MergeResult) => Promise<void>,
 ): Promise<FinalizeTaskResult> {
   const finalization = await finalizeProvenAutoMergeTask({
@@ -4281,14 +4301,13 @@ async function finalizeTask(
   }
   if (finalization.deferredPostMergeEvidence) {
     /*
-    FNXC:PostMergeEvidenceOrdering 2026-09-25-20:07:
-    Proven no-op merge proof cannot substitute for required post-merge evidence. Only the graph
-    requester guarantees immediate traversal of its authored gate, so direct/manual callers fail
-    visibly rather than reporting a successful merge that leaves the required gate stranded.
+    FNXC:PostMergeEvidenceOrdering 2026-10-08-15:24:
+    KB-079: every direct, manual, workspace and graph caller receives the same "merge confirmed, gate pending" deferral as the shared finalizer.
+    finalizeProvenAutoMergeTask itself resumes a missing gate, and the merge-confirmed fast path plus self-healing re-enter the reseed seam, so a non-graph deferral can no longer strand the gate.
+    Only an absent gate result defers; reported non-approval and other refusals still throw above so the merge pump parks them visibly.
+    The deferral writes no status, error, retry count or column and emits no task:merged.
+    Incidents: KB-008, KB-034 and KB-037 (2026-10-08) were parked failed with "has not reported" while their gate then ran normally.
     */
-    if (!graphOwnedPostMergeTraversal) {
-      throw new Error(`AI merge finalization blocked for ${taskId}: ${finalization.reason ?? "required post-merge evidence has not reported"}`);
-    }
     return {
       ...result,
       task: finalization.task ?? result.task,

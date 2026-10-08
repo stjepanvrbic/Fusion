@@ -77,7 +77,11 @@ export interface AutoMergeFinalizationResult {
   task: Task | null;
   previousColumn: string | null;
   reason?: string;
-  /** True only for the graph-owned post-merge gate that must run before retrying finalization. */
+  /**
+   * FNXC:PostMergeEvidenceOrdering 2026-10-08-15:24:
+   * Marks the resumable (zero-result) required post-merge gate deferral for any finalizer caller (KB-079).
+   * The landing is confirmed and the gate must run before finalization is retried; callers must not park it failed.
+   */
   deferredPostMergeEvidence?: boolean;
   /** Required post-merge evidence blocks completion independently of its retry/traversal state. */
   postMergeEvidenceBlocked?: boolean;

@@ -902,12 +902,12 @@ describe("runAiMerge", () => {
   });
 
   /*
-  FNXC:PostMergeEvidenceOrderingTest 2026-10-01-03:31:
-  A direct merge request retains its transient merging status after required evidence blocks
-  completion. The graph-owned requester is a separate production dispatch, so this regression
-  must use a fresh lifecycle rather than treating that retained status as a retryable request.
+  FNXC:PostMergeEvidenceOrderingTest 2026-10-08-15:24:
+  KB-079: direct and graph requesters receive the identical "merge confirmed, gate pending" deferral when the required post-merge gate has no result.
+  The direct half used to throw "has not reported", which the merge pump parked as status failed (KB-008/KB-034/KB-037).
+  Each requester uses a fresh lifecycle so neither observes the other's retained state.
   */
-  it("defers no-op completion only to a graph requester that will traverse post-merge evidence", async () => {
+  it("defers no-op completion identically for direct and graph requesters while post-merge evidence is unreported", async () => {
     const selection = { workflowId: "builtin:coding", stepIds: ["post-merge-verification"] };
     const deps = {
       mergeAgent: vi.fn(async () => undefined),
@@ -923,8 +923,11 @@ describe("runAiMerge", () => {
     directStore.getTaskWorkflowSelection = vi.fn(() => selection);
     directStore.getTaskWorkflowSelectionAsync = vi.fn(async () => selection);
 
-    await expect(runAiMerge(directStore, directRepository.dir, "FN-1", { manual: true }, deps))
-      .rejects.toThrow("has not reported");
+    const directResult = await runAiMerge(directStore, directRepository.dir, "FN-1", { manual: true }, deps);
+    expect(directResult).toMatchObject({ noOp: true, mergeConfirmed: true });
+    expect(directTask.status).not.toBe("failed");
+    expect(directTask.error).toBeFalsy();
+    expect(directTask.mergeDetails).toMatchObject({ mergeConfirmed: true });
     expect(directTask.column).toBe("in-review");
     expect(directStore.moveTask).not.toHaveBeenCalledWith("FN-1", "done", expect.anything());
     expect(directStore.emit).not.toHaveBeenCalledWith("task:merged", expect.anything());
@@ -947,6 +950,68 @@ describe("runAiMerge", () => {
     expect(graphTask.column).toBe("in-review");
     expect(graphStore.moveTask).not.toHaveBeenCalledWith("FN-1", "done", expect.anything());
     expect(graphStore.emit).not.toHaveBeenCalledWith("task:merged", expect.anything());
+  });
+
+  /*
+  FNXC:PostMergeEvidenceOrderingTest 2026-10-08-15:24:
+  KB-079 symptom regression: a direct (non-graph) squash landing whose required post-merge gate has not reported resolves as a confirmed landing.
+  It must not throw, so the merge pump never writes status failed or the "finalization blocked" error text.
+  */
+  it("returns a confirmed-landing deferral for a direct new landing while the post-merge gate is unreported", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+    const { store, task, logs } = makeStore(dir, {
+      enabledWorkflowSteps: ["post-merge-verification"],
+      workflowStepResults: [],
+    });
+    const selection = { workflowId: "builtin:coding", stepIds: ["post-merge-verification"] };
+    store.getTaskWorkflowSelection = vi.fn(() => selection);
+    store.getTaskWorkflowSelectionAsync = vi.fn(async () => selection);
+    const mainBefore = git(dir, "rev-parse main");
+
+    const result = await runAiMerge(store, dir, "FN-1", { manual: true }, {
+      mergeAgent: realMergeAgent("fusion/fn-1"),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    });
+
+    expect(result).toMatchObject({ merged: true, mergeConfirmed: true });
+    expect(git(dir, "rev-parse main")).not.toBe(mainBefore);
+    expect(task.status).not.toBe("failed");
+    expect(task.error).toBeFalsy();
+    expect(String(task.error ?? "")).not.toContain("finalization blocked");
+    expect(task.mergeDetails).toMatchObject({ mergeConfirmed: true });
+    expect(task.column).toBe("in-review");
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-1", "done", expect.anything());
+    expect(store.emit).not.toHaveBeenCalledWith("task:merged", expect.anything());
+    expect(logs.some((line) => line.includes("awaiting required post-merge verification"))).toBe(true);
+  });
+
+  /*
+  FNXC:PostMergeEvidenceOrderingTest 2026-10-08-15:24:
+  KB-079 companion: only an absent gate result defers. A reported non-approved gate is durable evidence and must keep failing visibly.
+  */
+  it("still rejects a direct landing whose post-merge gate reported a non-approval", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+    const { store, task } = makeStore(dir, {
+      enabledWorkflowSteps: ["post-merge-verification"],
+      workflowStepResults: [{
+        workflowStepId: "post-merge-verification",
+        workflowStepName: "Post-Merge Verification",
+        phase: "post-merge",
+        status: "failed",
+        output: "verification failed",
+      }],
+    });
+    const selection = { workflowId: "builtin:coding", stepIds: ["post-merge-verification"] };
+    store.getTaskWorkflowSelection = vi.fn(() => selection);
+    store.getTaskWorkflowSelectionAsync = vi.fn(async () => selection);
+
+    await expect(runAiMerge(store, dir, "FN-1", { manual: true }, {
+      mergeAgent: realMergeAgent("fusion/fn-1"),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    })).rejects.toThrow("is not approved");
+    expect(task.column).toBe("in-review");
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-1", "done", expect.anything());
+    expect(store.emit).not.toHaveBeenCalledWith("task:merged", expect.anything());
   });
 
   /*

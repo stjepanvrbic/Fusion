@@ -444,6 +444,23 @@ describe("missing post-merge continuation recovery", () => {
     expect(store.logEntry).not.toHaveBeenCalled();
   });
 
+  /*
+  FNXC:PostMergeEvidenceOrderingTest 2026-10-08-15:24:
+  KB-079: merger-ai finalizeTask now returns this deferral to every direct/manual caller instead of throwing.
+  That is only safe because the shared finalizer it invokes (source "direct-ai-merge") seeds the missing gate itself, so prove the direct-merge source alone resumes it.
+  */
+  it("seeds the missing gate from a direct AI merge finalization without writing a failed park", async () => {
+    const { task, store, items } = recoveryFixture();
+    const result = await finalizeProvenAutoMergeTask({ store, taskId: task.id, source: "direct-ai-merge" });
+    expect(result).toMatchObject({ outcome: "blocked", deferredPostMergeEvidence: true, resumedPostMergeEvidence: true });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ nodeId: "post-merge-verification", state: "runnable", kind: "task" });
+    expect(task.status).not.toBe("failed");
+    expect(task.error).toBeFalsy();
+    expect(task.column).toBe("in-review");
+    expect(store.moveTask).not.toHaveBeenCalled();
+  });
+
   it("resumes the missing gate exactly once across repeated finalization polls, without merging or completing", async () => {
     const { task, store, items } = recoveryFixture();
     const results = [];

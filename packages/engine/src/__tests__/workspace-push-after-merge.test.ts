@@ -268,9 +268,12 @@ describeIfGit("landWorkspaceTask push-after-merge", () => {
     const selection = { workflowId: "builtin:coding", stepIds: ["post-merge-verification"] };
     Object.assign(mocks, { getTaskWorkflowSelection: () => selection, getTaskWorkflowSelectionAsync: async () => selection });
     enableRemotePublication(mocks);
+    // FNXC:PostMergeEvidenceOrderingTest 2026-10-08-15:24: KB-079 — an unreported gate defers the landing instead of throwing a failed park.
     await expect(landWorkspaceTask(store, task, fixture.rootDir, {}, {
       mergeAgent: squashMergeAgent(BRANCH), reviewAgent: async () => "REVIEW_VERDICT: approve",
-    })).rejects.toThrow("has not reported");
+    })).resolves.toMatchObject({ allLanded: true, finalized: false, deferredPostMergeEvidence: true });
+    expect(task.status).not.toBe("failed");
+    expect(task.error).toBeFalsy();
     for (const repository of fixture.repos) {
       expect(remoteMain(fixture, repository)).toBe(fixture.git(repository, "git rev-parse refs/heads/main"));
     }

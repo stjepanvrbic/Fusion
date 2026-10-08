@@ -5198,15 +5198,21 @@ export class ProjectEngine {
                 reach the success path that resets retries, resolves manual waiters, or promotes
                 a branch group.
                 */
-                if (!workspaceResult.finalized) {
+                /*
+                FNXC:PostMergeEvidenceOrdering 2026-10-08-15:24:
+                KB-079: a workspace landing whose required post-merge gate has not reported is a confirmed landing waiting on that gate, not a blocked finalize.
+                It falls through to the confirmed-landing return below, exactly like single-repo and graph-owned deferrals, so the pump never parks it failed.
+                Every other unfinalized outcome keeps throwing WorkspaceFinalizeBlockedError.
+                */
+                if (!workspaceResult.finalized && !workspaceResult.deferredPostMergeEvidence) {
                   throw new WorkspaceFinalizeBlockedError(
                     taskId,
                     workspaceResult.finalizeBlockedReason
                       ?? "workspace finalize was blocked after all sub-repos landed; task progress was preserved",
                   );
                 }
-                // Finalized to done by landWorkspaceTask; report the merge as merged so
-                // the success path (retry reset + branch-group promotion) runs normally.
+                // Finalized to done (or deferred on an unreported post-merge gate) by landWorkspaceTask;
+                // report the merge as merged so the success path (retry reset + branch-group promotion) runs normally.
                 const latest = await store.getTask(taskId).catch(() => mergeTask!);
                 const anyLanded = workspaceResult.repos.some((r) => r.status === "landed");
                 return {
