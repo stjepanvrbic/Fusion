@@ -141,6 +141,12 @@ import { evaluateAutoMergeFactProviders } from "./merge/auto-merge-fact-provider
 import { resolveMergePolicy } from "./merge/merge-trait.js";
 import { describeModel, promptWithFallback } from "./pi.js";
 import { accumulateSessionTokenUsage } from "./execution/session-token-usage.js";
+/*
+FNXC:AiMerge 2026-10-08-01:43:
+Every merge-path agent session (autostash conflict, autostash hard-fail, complex rebase, commit, verification fix, PR response) must await bounded disposal before its factory returns.
+Otherwise checkout/worktree cleanup races the agent's still-open file handles and Windows reports "Directory not empty" on a partial removal.
+*/
+import { disposeAgentSessionBounded } from "./agents/dispose-agent-session.js";
 import { createResolvedAgentSession, extractRuntimeHint, resolveMergerSessionModel, resolveMergerThinkingLevel, resolveMergerFallbackThinkingLevel } from "./agents/agent-session-helpers.js";
 import { createFallbackModelObserver } from "./auth/fallback-model-observer.js";
 
@@ -1456,7 +1462,7 @@ ${failureContext.output.slice(0, VERIFICATION_LOG_MAX_CHARS)}
     } finally {
       // Flush buffered output before disposal so fix-attempt activity is visible.
       await logger.flush();
-      await session.dispose();
+      await disposeAgentSessionBounded(session);
     }
   } catch (err: unknown) {
     rethrowIfMergeAborted(err);
@@ -2145,6 +2151,10 @@ export const __test__ = {
   getAutostashDiff,
   notifyAutostashOrphans,
   runMergeAdvanceAutoSync,
+  runAiAgentForAutostashConflict,
+  runAiAgentForAutostashHardFail,
+  resolveComplexRebaseConflictsWithAi,
+  runAiAgentForCommit,
 };
 
 export async function stashUnrelatedRootDirChanges(
@@ -2624,11 +2634,7 @@ ${fileList}
     } catch {
       // ignore
     }
-    try {
-      session.dispose();
-    } catch {
-      // ignore
-    }
+    await disposeAgentSessionBounded(session);
   }
 }
 
@@ -3072,11 +3078,7 @@ ${fileList}
     } catch {
       // ignore
     }
-    try {
-      session.dispose();
-    } catch {
-      // ignore
-    }
+    await disposeAgentSessionBounded(session);
   }
 }
 
@@ -6189,11 +6191,7 @@ You are assisting with a paused \`git pull --rebase\`.
     } catch {
       // ignore
     }
-    try {
-      session.dispose();
-    } catch {
-      // ignore
-    }
+    await disposeAgentSessionBounded(session);
   }
 }
 
@@ -11409,7 +11407,7 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
   } finally {
     await accumulateSessionTokenUsage(store, taskId, session);
     await agentLogger.flush();
-    session.dispose();
+    await disposeAgentSessionBounded(session);
   }
 }
 

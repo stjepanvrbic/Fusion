@@ -4,6 +4,10 @@ The AI-merge clean room is removed in runAiMerge's finally. The merge agent's se
 disposed without awaiting, so cleanup raced the agent's still-exiting child processes (Windows:
 "Directory not empty" on every AI merge). The merge must wait for disposal before cleanup, stay
 bounded when disposal hangs, and keep its landed outcome independent of cleanup failures.
+
+FNXC:AiMerge 2026-10-08-01:43:
+KB-010 extends the invariant to every merge-path helper session factory: autostash conflict, autostash hard-fail, complex rebase, commit, and PR-response runner.
+Each factory's promise must not settle before its session's dispose settles (or the bound expires), so worktree cleanup never races the agent's file handles.
 */
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -24,6 +28,10 @@ vi.mock("../pi.js", async (importOriginal) => ({
     await session.prompt(prompt);
   }),
 }));
+vi.mock("../mcp/mcp-resolution.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../mcp/mcp-resolution.js")>(),
+  resolveMcpServersForStore: vi.fn(async () => ({ servers: [] })),
+}));
 vi.mock("../merge/merger-ai-worktree.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../merge/merger-ai-worktree.js")>();
   return {
@@ -37,6 +45,8 @@ vi.mock("../merge/merger-ai-worktree.js", async (importOriginal) => {
 });
 
 import { __test__, runAiMerge } from "../merge/merger-ai.js";
+import { __test__ as mergerTest } from "../merger.js";
+import { makePrResponseAgentRunner } from "../merge/pr-response-run-ops.js";
 import { AGENT_SESSION_DISPOSE_TIMEOUT_MS } from "../agents/dispose-agent-session.js";
 import { withBranchWriteProvenance } from "./branch-write-provenance-store-stub.js";
 
@@ -101,6 +111,17 @@ function makeStore() {
   return store;
 }
 
+function deferredDispose() {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const dispose = vi.fn(() => gate.then(() => { order.events.push("disposed"); }));
+  return { dispose, release };
+}
+
+async function flushTurns(): Promise<void> {
+  for (let i = 0; i < 5; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 function mergeSession(dispose: () => unknown) {
   return {
     async prompt() {
@@ -116,17 +137,6 @@ function mergeSession(dispose: () => unknown) {
 
 describe("AI merge agent sessions are disposed before the agent call returns", () => {
   const audit = { git: vi.fn(async () => undefined), database: vi.fn(async () => undefined), filesystem: vi.fn(async () => undefined), sandbox: vi.fn(async () => undefined) } as never;
-
-  function deferredDispose() {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const dispose = vi.fn(() => gate.then(() => { order.events.push("disposed"); }));
-    return { dispose, release };
-  }
-
-  async function flushTurns(): Promise<void> {
-    for (let i = 0; i < 5; i++) await new Promise<void>((resolve) => setImmediate(resolve));
-  }
 
   it.each(["merge", "review"] as const)("the %s agent waits for an asynchronous dispose", async (kind) => {
     order.events = [];
@@ -188,5 +198,92 @@ describe("AI merge clean-room cleanup cannot change a landed outcome", () => {
     expect(result).toMatchObject({ merged: true });
     expect(order.events).toContain("cleanup");
     expect(git(dir, ["show", "main:feature.txt"])).toBe("feature");
+  });
+});
+
+describe("merge-path helper agent sessions are disposed before their factory settles", () => {
+  const settings = { merger: { mode: "ai" } } as never;
+
+  function helperSession(dispose: () => unknown, prompt: () => Promise<void> = async () => undefined) {
+    return {
+      async prompt() { await prompt(); order.events.push("prompted"); },
+      dispose,
+      getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 1 } })),
+    };
+  }
+
+  type FactoryCase = { name: string; failPrompt?: boolean; run: (store: any) => Promise<unknown> };
+  const factories: FactoryCase[] = [
+    {
+      name: "autostash conflict agent",
+      run: (store) => mergerTest.runAiAgentForAutostashConflict({
+        store, rootDir: process.cwd(), taskId: "FN-1", conflictedFiles: ["a.txt"], options: {}, settings,
+      }),
+    },
+    {
+      name: "autostash hard-fail agent",
+      run: (store) => mergerTest.runAiAgentForAutostashHardFail({
+        store, rootDir: process.cwd(), taskId: "FN-1", stashSha: "abc123", stashFiles: ["a.txt"],
+        applyErrorMsg: "apply failed", applyStderr: "error: could not apply", options: {}, settings,
+      }),
+    },
+    {
+      name: "complex rebase conflict agent",
+      run: (store) => mergerTest.resolveComplexRebaseConflictsWithAi(store, process.cwd(), "FN-1", settings, ["a.txt"]),
+    },
+    {
+      // A plain non-context prompt failure skips the shell-based staged-diff check.
+      name: "commit agent",
+      failPrompt: true,
+      run: (store) => mergerTest.runAiAgentForCommit({
+        store, rootDir: process.cwd(), taskId: "FN-1", branch: "fusion/fn-1", commitLog: "", diffStat: "",
+        includeTaskId: true, hasConflicts: false, simplifiedContext: false, options: {},
+      }),
+    },
+    {
+      name: "PR-response runner",
+      run: (store) => makePrResponseAgentRunner(settings, "FN-1", process.cwd(), store)({
+        prompt: "respond", systemPrompt: "system", threads: [{ id: "t1" }],
+      }),
+    },
+  ];
+
+  it.each(factories)("the $name waits for an asynchronous dispose", async ({ failPrompt, run }) => {
+    order.events = [];
+    const { dispose, release } = deferredDispose();
+    const prompt = failPrompt ? async () => { throw new Error("boom"); } : undefined;
+    createResolvedAgentSessionMock.mockImplementation(async () => ({ session: helperSession(dispose, prompt) }));
+    const call = run(makeStore()).then(
+      () => { order.events.push("returned"); },
+      () => { order.events.push("returned"); },
+    );
+
+    await flushTurns();
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(order.events).not.toContain("returned");
+    release();
+    await call;
+    expect(order.events.slice(-2)).toEqual(["disposed", "returned"]);
+  });
+
+  it("the autostash conflict agent returns after the bound when dispose never settles", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      createResolvedAgentSessionMock.mockImplementation(async () => ({
+        session: helperSession(() => new Promise<void>(() => undefined)),
+      }));
+      let returned = false;
+      const call = mergerTest.runAiAgentForAutostashConflict({
+        store: makeStore(), rootDir: process.cwd(), taskId: "FN-1", conflictedFiles: ["a.txt"], options: {}, settings,
+      }).then((result) => { returned = true; return result; });
+      await flushTurns();
+      await vi.advanceTimersByTimeAsync(AGENT_SESSION_DISPOSE_TIMEOUT_MS - 1);
+      expect(returned).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(call).resolves.toEqual({ success: true });
+      expect(returned).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

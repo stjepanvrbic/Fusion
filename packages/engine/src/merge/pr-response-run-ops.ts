@@ -14,6 +14,7 @@ import { resolveAgentPrompt, resolveMergerFallbackModel } from "@fusion/core";
 import { createResolvedAgentSession, resolveMergerSessionModel, resolveMergerThinkingLevel, resolveMergerFallbackThinkingLevel } from "../agents/agent-session-helpers.js";
 import { resolveMcpServersForStore } from "../mcp/mcp-resolution.js";
 import { promptWithFallback } from "../pi.js";
+import { disposeAgentSessionBounded } from "../agents/dispose-agent-session.js";
 import { withRateLimitRetry } from "../errors/rate-limit-retry.js";
 import { checkSessionError } from "../errors/usage-limit-detector.js";
 import {
@@ -147,7 +148,8 @@ export function makePrResponseAgentRunner(
         checkSessionError(session);
       }, { signal });
     } finally {
-      session.dispose();
+      /* FNXC:AiMerge 2026-10-08-01:43: Await bounded disposal so the runner resolves only after the agent winds down; worktree cleanup must not race its file handles (Windows "Directory not empty"). */
+      await disposeAgentSessionBounded(session);
     }
     return { verdicts: parseAgentVerdicts(captured, threads.map((t) => t.id)) };
   };

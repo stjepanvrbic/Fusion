@@ -5,6 +5,10 @@ clean-room removal in runAiMerge's finally raced the agent's still-exiting child
 Windows, every AI merge logged "Directory not empty". Callers now await disposal before releasing the
 checkout. Disposal is bounded: a hung or throwing dispose must never wedge or fail the merge, because
 the merge outcome is already decided when the agent call returns.
+
+FNXC:AiMerge 2026-10-08-01:43:
+KB-010 extends the contract to every merge-path agent session factory. Consumers: merge/merger-ai.ts (makeMutatingAgent, makeReviewAgent); merger.ts (runAiAgentForAutostashConflict, runAiAgentForAutostashHardFail, resolveComplexRebaseConflictsWithAi, runAiAgentForCommit, attemptInMergeVerificationFix); merge/pr-response-run-ops.ts (makePrResponseAgentRunner).
+Each awaits this helper in its finally so the factory settles only after disposal or the bound.
 */
 
 /** Upper bound on waiting for an agent session (and its child processes) to wind down. */
