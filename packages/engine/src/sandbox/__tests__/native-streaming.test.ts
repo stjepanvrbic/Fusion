@@ -140,11 +140,12 @@ describe("NativeSandboxBackend.runStreaming", () => {
   it("uses the win32 tree kill without a process group", async () => {
     platformSpy.mockReturnValue("win32");
     const child = new FakeChild(8877);
-    const taskkillCalls: Array<{ command: string; args: string[] }> = [];
+    const taskkillCalls: Array<{ command: string; args: string[]; killer: EventEmitter }> = [];
     spawnMock.mockImplementation((command: string, args: string[]) => {
       if (/taskkill(\.exe)?$/i.test(command)) {
-        taskkillCalls.push({ command, args });
-        return Object.assign(new EventEmitter(), { unref: () => undefined });
+        const killer = Object.assign(new EventEmitter(), { unref: () => undefined });
+        taskkillCalls.push({ command, args, killer });
+        return killer;
       }
       return child;
     });
@@ -157,6 +158,8 @@ describe("NativeSandboxBackend.runStreaming", () => {
     expect(processKillSpy).not.toHaveBeenCalledWith(-8877, "SIGTERM");
     child.emit("exit", 1, null);
     child.emit("close", 1, null);
+    // FNXC:ProcessLifecycle 2026-10-08-02:12: the supervised exit settles after its taskkill finished (KB-008), so the fake helper reports its exit like the real one.
+    for (const call of taskkillCalls) call.killer.emit("exit", 0);
 
     await expect(promise).resolves.toMatchObject({ outcome: "timeout", timeoutMs: 100 });
     expect(spawnMock).toHaveBeenCalledWith("sleep", [], expect.objectContaining({ detached: false }));

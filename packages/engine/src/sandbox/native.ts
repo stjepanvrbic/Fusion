@@ -113,11 +113,23 @@ export class NativeSandboxBackend implements SandboxBackend {
           scheduleForceKill(NORMAL_CLEANUP_FORCE_KILL_DELAY_MS);
         }
 
+        /*
+        FNXC:ProcessLifecycle 2026-10-08-00:36:
+        Exceeding maxBuffer is a backend-terminated command failure, so it reports no exit code on every platform, matching execFile's maxBuffer contract.
+        The tree kill races a short command's own exit; on Windows the command usually exits 0 before `taskkill` lands, which leaked a success-shaped `exitCode: 0` beside truncated output (KB-008).
+
+        FNXC:ProcessLifecycle 2026-10-08-01:45:
+        A timeout is the same kind of backend-terminated failure and follows the same rule, matching execFile's timeout contract (code null, signal SIGTERM). On a loaded Windows host the timed-out command was observed reporting `exitCode: 0` (KB-008).
+
+        FNXC:ProcessLifecycle 2026-10-08-02:12:
+        A backend-terminated result always names the termination signal. When the async `taskkill` lands after the command already exited on its own (a loaded Windows host), the platform reports no signal, so the backend reports the SIGTERM it sent (KB-008).
+        */
+        const backendTerminated = bufferExceeded || timedOut;
         resolve({
           stdout,
           stderr,
-          exitCode,
-          signal,
+          exitCode: backendTerminated ? null : exitCode,
+          signal: backendTerminated ? (signal ?? "SIGTERM") : signal,
           timedOut,
           bufferExceeded,
           ...(spawnError ? { spawnError } : {}),

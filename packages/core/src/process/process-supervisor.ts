@@ -24,6 +24,12 @@ const DEFAULT_KILL_GRACE_MS = 2_000;
 const DEFAULT_MAX_LIFETIME_MS = 600_000;
 const MAX_KILL_WAIT_MS = 1_000;
 const DEFAULT_STDIO_RELEASE_GRACE_MS = 1_000;
+/*
+FNXC:ProcessLifecycle 2026-10-08-02:12:
+A supervised exit is reported only after every async win32 `taskkill` the supervisor issued for it has finished, so no kill helper outlives the supervised run (KB-008: a short command exited before its `taskkill` landed, and the helper was still running when the caller's run settled).
+The wait is bounded so a hung `taskkill` can never wedge `waitExit()`.
+*/
+const MAX_TREE_KILL_SETTLE_WAIT_MS = 5_000;
 type ShutdownReason =
   | { kind: "signal"; signal: NodeJS.Signals }
   | { kind: "fatal"; source: "uncaughtException" | "unhandledRejection"; error: unknown }
@@ -85,6 +91,8 @@ interface RegistryEntry {
   treeKillSignal: NodeJS.Signals | null;
   stdioReleaseGraceMs: number;
   stdioReleaseTimer: NodeJS.Timeout | null;
+  /** Async win32 tree kills issued for this entry that have not finished yet. */
+  pendingTreeKills: Set<Promise<void>>;
 }
 
 const registry = new Map<number, RegistryEntry>();
@@ -199,8 +207,15 @@ function killEntry(entry: RegistryEntry, signal: NodeJS.Signals = "SIGTERM", opt
     if (!entry.exited) {
       const pid = entry.pid;
       entry.treeKillSignal ??= signal;
+      let settleTreeKill: () => void = () => undefined;
+      const treeKill = new Promise<void>((resolve) => {
+        settleTreeKill = resolve;
+      });
+      entry.pendingTreeKills.add(treeKill);
+      void treeKill.then(() => entry.pendingTreeKills.delete(treeKill));
       killWindowsProcessTrees([pid], {
         sync: options.sync,
+        onSettled: () => settleTreeKill(),
         onTreeKillFailed: () => {
           log.warn(`taskkill could not terminate the tree of pid=${pid}; falling back to direct kill`);
           try {
@@ -386,6 +401,7 @@ export function superviseSpawn(
     treeKillSignal: null,
     stdioReleaseGraceMs,
     stdioReleaseTimer: null,
+    pendingTreeKills: new Set(),
   };
 
   child.once("exit", () => {
@@ -396,7 +412,19 @@ export function superviseSpawn(
   child.once("close", (code, signal) => {
     const result = normalizeTreeKilledExit(entry, { code, signal });
     deregister(entry, result);
-    resolveExit?.(result);
+    if (entry.pendingTreeKills.size === 0) {
+      resolveExit?.(result);
+      return;
+    }
+    let boundTimer: NodeJS.Timeout | null = null;
+    const bound = new Promise<void>((resolve) => {
+      boundTimer = setTimeout(resolve, MAX_TREE_KILL_SETTLE_WAIT_MS);
+      boundTimer.unref();
+    });
+    void Promise.race([Promise.all([...entry.pendingTreeKills]), bound]).then(() => {
+      if (boundTimer) clearTimeout(boundTimer);
+      resolveExit?.(result);
+    });
   });
 
   if (typeof child.pid === "number") {

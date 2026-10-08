@@ -64,11 +64,12 @@ describe("searchWithQmd routes through the hardened default executor (unit)", ()
     const backend = new QmdMemoryBackend();
     const results = await backend.search(rootDir, { query: "unit-test-query", limit: 5 });
     /*
-    FNXC:ProjectMemory 2026-10-07-23:34:
-    The search also schedules a fire-and-forget index refresh whose children run with the project root as their working directory.
-    Joining that in-flight refresh before cleanup keeps Windows from refusing to delete a directory a live child still uses.
+    FNXC:ProjectMemory 2026-10-08-01:30:
+    search() also schedules the fire-and-forget background refresh, whose children run with cwd rootDir.
+    Windows refuses to delete a directory that is a live process's cwd, so afterEach failed with EPERM on the Windows CI lane whenever a slow runner left a refresh child alive (KB-008).
+    Join the in-flight refresh (a non-forced call returns it) so every child this test caused has exited before cleanup.
     */
-    await refreshQmdProjectMemoryIndex(rootDir);
+    await refreshQmdProjectMemoryIndex(rootDir).catch(() => {});
 
     expect(Array.isArray(results)).toBe(true);
     // Both the collection-add and the qmd search calls must go through the mocked

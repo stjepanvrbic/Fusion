@@ -32,6 +32,62 @@ describe("activeSessionRegistry", () => {
     expect(activeSessionRegistry.lookupByPath("/tmp/missing")).toBeNull();
   });
 
+  /*
+  FNXC:PathIdentity 2026-10-08-01:30:
+  KB-008: Windows CI registers sessions under 8.3 short temp paths while sweeps probe the long real path.
+  One directory must be one registry entry under every spelling, on every platform; a directory alias (junction on Windows, symlink on POSIX) is the portable second spelling.
+  */
+  describe("one directory under two spellings", () => {
+    let root: string;
+    let real: string;
+    let alias: string;
+    let other: string;
+
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "fusion-session-identity-"));
+      real = join(root, "real-checkout");
+      other = join(root, "other-checkout");
+      alias = join(root, "alias-checkout");
+      mkdirSync(real);
+      mkdirSync(other);
+      symlinkSync(real, alias, "junction");
+    });
+
+    afterEach(() => {
+      rmSync(root, { recursive: true, force: true });
+    });
+
+    it("reports a session registered under one spelling as live under the other", () => {
+      activeSessionRegistry.registerPath(alias, { taskId: "FN-1", kind: "executor", ownerKey: "FN-1" });
+
+      expect(activeSessionRegistry.isPathActive(real)).toBe(true);
+      expect(activeSessionRegistry.lookupByPath(real)?.taskId).toBe("FN-1");
+      expect(activeSessionRegistry.isPathActive(other)).toBe(false);
+      expect(activeSessionRegistry.pathsForTask("FN-1")).toEqual([alias]);
+    });
+
+    it("refuses a foreign task registering the same directory under another spelling", () => {
+      activeSessionRegistry.registerPath(real, { taskId: "FN-1", kind: "executor", ownerKey: "FN-1" });
+
+      expect(() =>
+        activeSessionRegistry.registerPath(alias, { taskId: "FN-2", kind: "executor", ownerKey: "FN-2" }),
+      ).toThrow(ActiveSessionPathHeldByForeignTaskError);
+      expect(activeSessionRegistry.lookupByPath(alias)?.taskId).toBe("FN-1");
+    });
+
+    it("keeps one entry for a same-task re-registration and releases it by either spelling", () => {
+      activeSessionRegistry.registerPath(real, { taskId: "FN-1", kind: "executor", ownerKey: "FN-1" });
+      activeSessionRegistry.registerPath(alias, { taskId: "FN-1", kind: "step-session", ownerKey: "FN-1#step" });
+
+      expect(activeSessionRegistry.pathsForTask("FN-1")).toEqual([real]);
+      expect(activeSessionRegistry.lookupByPath(real)?.kind).toBe("step-session");
+
+      activeSessionRegistry.unregisterPath(alias);
+      expect(activeSessionRegistry.isPathActive(real)).toBe(false);
+      expect(activeSessionRegistry.pathsForTask("FN-1")).toEqual([]);
+    });
+  });
+
   // FNXC:Workspace 2026-06-22-04:10 (Phase C review A2 — taskId-aware lease across kinds):
   // registerPath must NOT silently clobber an entry held by a DIFFERENT task (that was the
   // cross-phase clobber bug: a merging task's land lease overwriting an executing task's

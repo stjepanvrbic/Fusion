@@ -129,12 +129,14 @@ export class ActiveSessionRegistry {
   */
   registerPath(worktreePath: string, registration: ActiveSessionRegistration): void {
     const key = this.keyFor(worktreePath);
-    const existing = this.records.get(key)?.record;
+    const existingEntry = this.records.get(key);
+    const existing = existingEntry?.record;
     if (existing && existing.taskId !== registration.taskId) {
       throw new ActiveSessionPathHeldByForeignTaskError(worktreePath, existing.taskId, registration.taskId);
     }
+    // FNXC:PathIdentity 2026-10-08-01:30: a same-task re-registration under another spelling refreshes the existing entry and keeps its original spelling (KB-008).
     this.records.set(key, {
-      path: worktreePath,
+      path: existingEntry?.path ?? worktreePath,
       record: { ...registration, registeredAt: Date.now() },
     });
   }

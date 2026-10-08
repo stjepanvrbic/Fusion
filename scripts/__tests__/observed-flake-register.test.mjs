@@ -202,6 +202,10 @@ Entry 34 was sighted a second time on the fork's Full Suite (the same case and a
 deletion ratchet moves it to the archive. The archived record must keep both run identifiers and the unchanged
 assertion message so a rescue starts from when AgentDetailView subscribes rather than from a timeout.
 */
+/*
+FNXC:TestFlakeRegister 2026-10-08-01:13:
+KB-008 reproduced entry 13 in four Windows CI merge-gate runs. It stays active, and its status records an escalation awaiting the owner's gate-eviction decision instead of a first sighting.
+*/
 test("observed-flake register active count, escalation state, and owners stay synchronized", () => {
   const register = readFileSync(registerPath, "utf8");
   const statedCount = register.match(/\*\*(\d+) active observation records\*\*/);
@@ -221,7 +225,7 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "13. Handoff-to-review atomicity PostgreSQL setup hook",
-      status: "Active first sighting — recorded 2026-08-23, unattributed.",
+      status: "Active escalation — reproduced 2026-10-07 in four Windows CI merge-gate runs; gate-eviction owner decision pending.",
     },
     {
       heading: "20. ProjectEngine research recall composition ordering",

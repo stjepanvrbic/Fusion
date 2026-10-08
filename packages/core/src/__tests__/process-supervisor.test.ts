@@ -332,8 +332,53 @@ describe("process-supervisor win32 tree kill", () => {
     fake.exitCode = 1;
     fake.emit("exit", 1, null);
     fake.emit("close", 1, null);
+    killers[0].emit("exit", 0);
 
     await expect(supervised.waitExit()).resolves.toEqual({ code: null, signal: "SIGTERM" });
+  });
+
+  /*
+  FNXC:ProcessLifecycle 2026-10-08-02:12:
+  A supervised exit settles only after the supervisor's own async taskkill finished, so no kill helper outlives the run; a hung taskkill is bounded (KB-008).
+  */
+  it("settles waitExit only after its in-flight taskkill finished, even when the root exited first", async () => {
+    const fake = installWin32();
+    const supervised = spawnFake(fake);
+    let settled = false;
+    void supervised.waitExit().then(() => {
+      settled = true;
+    });
+
+    supervised.kill("SIGTERM");
+    fake.exitCode = 0;
+    fake.emit("exit", 0, null);
+    fake.emit("close", 0, null);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    killers[0].emit("exit", 128);
+    await expect(supervised.waitExit()).resolves.toEqual({ code: 0, signal: null });
+  });
+
+  it("bounds the wait for a taskkill that never finishes", async () => {
+    vi.useFakeTimers();
+    const fake = installWin32();
+    const supervised = spawnFake(fake);
+    let settled = false;
+    void supervised.waitExit().then(() => {
+      settled = true;
+    });
+
+    supervised.kill("SIGTERM");
+    fake.exitCode = 1;
+    fake.emit("exit", 1, null);
+    fake.emit("close", 1, null);
+    await vi.advanceTimersByTimeAsync(4_900);
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(200);
+    expect(settled).toBe(true);
   });
 
   it("does not tree-kill a pid whose root already exited, because the pid may be reused", () => {
@@ -384,6 +429,8 @@ describe("process-supervisor win32 tree kill", () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(fake.stdout.destroyed).toBe(true);
     expect(fake.stderr.destroyed).toBe(true);
+    killers[0].emit("exit", 0);
+    await vi.advanceTimersByTimeAsync(0);
     expect(settled).toBe(true);
   });
 

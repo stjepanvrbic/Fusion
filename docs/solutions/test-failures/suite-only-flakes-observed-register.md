@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, 35, and 36), all **active first sightings**. Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **19 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **12 active observation records** (entries 2, 13, 20, 21, 25, 27, 30, 31, 32, 33, 35, and 36): eleven **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, and 18 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **19 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -217,7 +217,7 @@ The 12-worker snapshots show 21 backends and concurrent template `CREATE DATABAS
 
 ### 13. Handoff-to-review atomicity PostgreSQL setup hook
 
-- **Status:** Active first sighting — recorded 2026-08-23, unattributed.
+- **Status:** Active escalation — reproduced 2026-10-07 in four Windows CI merge-gate runs; gate-eviction owner decision pending.
 
 - **File:** `packages/core/src/__tests__/postgres/handoff-to-review-atomicity.pg.test.ts`
 - **Exact test:** `handoff-to-review transactional invariant (PostgreSQL)` suite `beforeAll(h.beforeAll)` setup hook (line 35).
@@ -236,6 +236,27 @@ The 12-worker snapshots show 21 backends and concurrent template `CREATE DATABAS
 This is the same mode already characterized by entry 6 and by entry 7's A02 lane: a 15s `beforeAll` abort on the DDL-heavy per-file schema-template setup that the one shared Postgres serializes. Two properties make this sighting narrower than the shapes those entries measured. It occurred under the CAPPED gate lane — `PG_MAX_WORKERS = 4` and only two selected files — which `FNXC:PgTestWorkerCap 2026-07-18-18:00` established as the DB-safe ceiling (measured: 6 forks all time out, 4 forks pass in ~42s). And it occurred on the first gate invocation after the cluster had been idle, with every later run in the same shell green, which points at cold-cluster startup cost landing inside the first file's setup budget rather than at fork oversubscription. That correlation is a HYPOTHESIS, not a measurement: reproducing it means stopping the embedded cluster, which was not done because this host also runs a live Fusion instance.
 
 Quarantine was not available as an alternative. Core PostgreSQL files cannot be quarantined inline — the gate-policy assertion requires `quarantinedCoreTests` to remain empty — and a merge-gate eviction of a transactional-invariant file is the owner-escalated decision described in the policy section below. The file carries only 4 tests, which is thin against the usual first-sighting coverage argument, but they are the atomicity invariant for handoff-to-review and one of just two files in the blocking PG lane; recording preserves that rather than trading it away over a single unreproduced cold-start abort. A **second sighting** follows normal escalation.
+
+<!--
+FNXC:TestFlakeRegister 2026-10-08-01:13:
+KB-008 classified the Windows "Merge gate suite" failure of Full Suite run 37693147198. It is this record's mode, reproduced, not a regression from #26 (9d216bec), because the same abort predates that commit. Eviction of a transactional-invariant canary is owner-escalated by the policy below, and evicting both canaries would delete the blocking PostgreSQL lane, so the record escalates instead of being edited inline.
+-->
+
+**Reproduced 2026-10-07 on Windows CI (KB-008):** the Windows job of the non-blocking Full Suite runs `pnpm test:gate` against a PostgreSQL service started a few minutes earlier in the same job. In that job the `pg-gate` lane aborted both of its canaries at the inherited 15s `beforeAll` budget (this file at `:35:3`, and `task-lifecycle-e2e.pg.test.ts > VAL-CROSS-001: End-to-end task lifecycle (PostgreSQL)` at `:25:3`) in 4 of 20 consecutive completed runs. The other two gate lanes passed in every listed run.
+
+| run | SHA | Windows merge gate |
+|---|---|---|
+| [37681502535](https://github.com/stjepanvrbic/Fusion/actions/runs/37681502535) | `c1b4d5c3` | **both canaries: `beforeAll` 15s timeout** |
+| [37688377857](https://github.com/stjepanvrbic/Fusion/actions/runs/37688377857) | `9776eca9` | **both canaries: `beforeAll` 15s timeout** |
+| [37693147198](https://github.com/stjepanvrbic/Fusion/actions/runs/37693147198) | `9d216bec` | **both canaries: `beforeAll` 15s timeout** |
+| [37702452940](https://github.com/stjepanvrbic/Fusion/actions/runs/37702452940) | `41950446` | **both canaries: `beforeAll` 15s timeout** |
+| 16 other completed runs, `e66474d9`..`ab571780` | — | green |
+| local Windows host, `test:pg-gate` alone | `c53017ac` | 2 files / 10 tests passed (19.3s) |
+| local Windows host, all three gate lanes concurrently, process affinity pinned to 4 CPUs, `VITEST_MAX_WORKERS=2` | `c53017ac` | all lanes green; `pg-gate` finished in 22s |
+
+The failures predate the #26 harness rework (`9d216bec`), which rules it out as the cause. The two canaries always failed together, which fits the shared run-wide golden-template build both files wait on, rather than either file's own body. Every sighting was on a freshly started CI cluster, but so were the green runs, so the cold-cluster hypothesis above is still unmeasured. The local reproductions used a long-lived, warm cluster and did not fail. The Linux blocking gate shows no matching sighting.
+
+The disposition is an owner decision, so it is not made inline here. Both canaries in the blocking PostgreSQL lane fail together. Evicting them under the AGENTS.md gate rule would therefore delete the `pg-gate` lane and its pinned gate composition, not trim it. The policy section below also escalates a merge-gate eviction of a transactional-invariant file to its owner. Raising `hookTimeout` stays forbidden.
 
 
 ### 15. Workflow-results preserved-column selector mock ordering
@@ -1115,3 +1136,27 @@ The second-sighting timing artifact [`11358593242`](https://github.com/Runfusion
 The assertion counts `createFnAgent` calls after a resume and observed zero only in broad shard/multi-file execution. FN-9510 traced the production `task:updated` listener through its synchronous single-flight claim, pause/dependency admission, active session/graph re-check, resume log, and graph-owned execution handoff; no reachable resume invariant violation was found. No timeout was widened, no retry added, and no assertion relaxed. This is therefore a file-level quarantine rather than a product repair, with healthy coverage intentionally excluded until the 14-day deletion deadline.
 
 **Resolution (KB-048, 2026-10-08).** The test fired the resume with a fire-and-forget `_trigger` and then slept a fixed 50 ms before counting agents. Delaying the resume chain's pause-label settings read past that window reproduces the exact hosted failure (`expected 0 to be greater than or equal to 2`, with no resume log written), and the test fails the same way when run alone on a cold worker. Full-file runs often passed vacuously: executors from earlier tests kept running (fire-and-forget `execute`, plus the in-place retry timers added by PR #32) and created agents inside later tests, while `settleLeakedBackgroundRuns` only polled `processWideGraphRouting` for 3 s and returned before a just-triggered listener had claimed an owner. The harness now tracks every store listener invocation, `dispatchUnpauseResume`, and `execute` of its executors. Tests await `_triggerAsync` plus the tracked work instead of sleeping, a file-wide `afterEach` drains it and cancels pending in-place retry timers, and the pause teardown asserts no process-wide owner leaked. Two regression scenarios (a slow resume-chain collaborator, and a fire-and-forget resume that must be fully drained) fail with the pre-fix sleep or poll. While excluded, the file had also drifted behind PR #32 (pause teardown now retries in place instead of moving to todo), so those fixtures were refreshed to state that contract. Verification: 117/117 five consecutive runs; the six-file arrangement passed three times under CPU oversubscription (24 busy loops, 16 workers).
+
+---
+
+## Entry: Windows Full Suite lane single sightings under runner load (KB-008, first sightings)
+
+<!--
+FNXC:TestFlakeRegister 2026-10-08-01:30:
+KB-008 classified every unexpected Windows-lane failure across five consecutive Full Suite runs (9d216bec through 03cc07bb4). Deterministic failures were fixed at their root cause. The files below failed once each with load-shaped timeouts, retain substantial coverage, and pass in isolation on a Windows host, so they are recorded as first sightings rather than quarantined. Core PostgreSQL files cannot be quarantined inline under the gate-policy assertion.
+-->
+
+- **Status:** First sightings recorded 2026-10-08 by KB-008. A second sighting of any listed test follows normal escalation: an on-sight file-level quarantine, or an owner decision for a core PostgreSQL file.
+- **Lane:** the Windows job of `full-suite.yml` (`windows-latest`, local PostgreSQL service), compared by `scripts/check-windows-known-failing.mjs`.
+
+| file | exact test | sighting | failure |
+|---|---|---|---|
+| `packages/engine/src/__tests__/auth-storage-durability.test.ts` | `instance-scoped OAuth refresh > bounds a hanging refresh request instead of waiting on it indefinitely` | [run 37693147198](https://github.com/stjepanvrbic/Fusion/actions/runs/37693147198) at `9d216bec` | fetch mock still uncalled after its bounded 200-iteration poll |
+| `packages/engine/src/__tests__/triage.test.ts` | `pause-abort status clearing (bug fix) > clears planning status to null on global pause (not a no-op)` | [run 37698750646](https://github.com/stjepanvrbic/Fusion/actions/runs/37698750646) at `0480b153` | 30s test timeout |
+| `packages/engine/src/__tests__/hybrid-executor-multi-node-routing.test.ts` | `HybridExecutor multi-node routing > enables multi-node and initializes with node visibility` | [run 37702452940](https://github.com/stjepanvrbic/Fusion/actions/runs/37702452940) at `41950446` | 30s test timeout |
+| `packages/core/src/__tests__/postgres/pg-harness-ddl-concurrency.pg.test.ts` | `harness DDL lifecycle (PostgreSQL) > creates distinct empty databases and removes every one` | [run 37702452940](https://github.com/stjepanvrbic/Fusion/actions/runs/37702452940) at `41950446` | 15s test timeout |
+| `packages/core/src/__tests__/task-updated-lanes-emit-surfaces.test.ts` | `task:updated producer integration > delivers warm then cold metadata through TaskStore's direct emit producer` | [run 37702452940](https://github.com/stjepanvrbic/Fusion/actions/runs/37702452940) at `41950446` | 15s test timeout |
+
+Each file passed in every other run of the five, and the engine files passed in a targeted run on a local Windows host at `c53017ac`.
+
+**Already a second sighting, escalated rather than recorded:** `packages/core/src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts > durable agent Activity analytics > turns a production durable no-task heartbeat into Activity sessions and tool usage` failed with `expected 0 to be greater than 0` on `activity.sessions` in runs 37693147198 and 37702452940, and passed in the other three. Core PostgreSQL quarantine is policy-forbidden, so this goes to its owner for a decision. The zero-session read fits usage events landing after the aggregation, but that mechanism is unconfirmed.

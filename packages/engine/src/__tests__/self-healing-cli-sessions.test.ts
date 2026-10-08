@@ -179,6 +179,36 @@ describe("self-healing idle-worktree sweeps skip resume-eligible CLI session wor
     }
   });
 
+  /*
+  FNXC:PathIdentity 2026-10-08-01:30:
+  KB-008: on Windows CI the candidate kept an 8.3 short spelling while the scan root was the long real path, and a raw string match hid this live checkout.
+  The second spelling here is a case variant on Windows (case-insensitive volumes; the JS realpath keeps the caller's case) and a symlinked parent on POSIX.
+  */
+  it("matches a metadata-free checkout to its task when the candidate is another spelling of the same directory", async () => {
+    makeLinkedWorktree("fn-9381");
+    const aliasParent = mkdtempSync(join(tmpdir(), "kb-selfheal-alias-"));
+    try {
+      let candidate: string;
+      if (process.platform === "win32") {
+        candidate = join(worktreesDir, "fn-9381").toUpperCase();
+      } else {
+        symlinkSync(worktreesDir, join(aliasParent, "worktrees"));
+        candidate = join(aliasParent, "worktrees", "fn-9381");
+      }
+      const store = createStore({ recycleWorktrees: false });
+      (store as any).listTasks.mockResolvedValue([{ id: "FN-9381", column: "todo", worktree: undefined, branch: undefined }]);
+      (store as any).listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([{
+        state: "running", leaseOwner: "executor:FN-9381", leaseExpiresAt: null,
+      }]);
+
+      const manager = new SelfHealingManager(store, { rootDir });
+      await expect((manager as any).isCandidateWorktreeLive(candidate, { recycleWorktrees: false })).resolves.toBe(true);
+      await expect((manager as any).isCandidateWorktreeLive(freePath, { recycleWorktrees: false })).resolves.toBe(false);
+    } finally {
+      rmSync(aliasParent, { recursive: true, force: true });
+    }
+  });
+
   it("enforceWorktreeCap skips a worktree backing a live (active-session) executor session", async () => {
     makeLinkedWorktree("wt-extra");
     const store = createStore({ maxWorktrees: 1, recycleWorktrees: false });
