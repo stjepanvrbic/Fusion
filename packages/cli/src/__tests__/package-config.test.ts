@@ -145,6 +145,20 @@ describe("CLI package.json publishing config", () => {
     expect(pkg.files).toContain("README.md");
   });
 
+  /*
+   * FNXC:CliPackaging 2026-10-08-00:26:
+   * Root launchers are committed .mjs files outside dist, so every sibling module they import must be listed in "files" or the published `fn` fails at its first import.
+   */
+  it("ships every local module imported by the committed root launchers", () => {
+    const cliDir = join(workspaceRoot, "packages", "cli");
+    for (const launcher of ["bin.mjs", "agent-browser.mjs"]) {
+      const source = readFileSync(join(cliDir, launcher), "utf-8");
+      const localImports = [...source.matchAll(/\bfrom\s+["']\.\/([^"']+)["']/g)].map((match) => match[1]);
+      for (const localImport of localImports) expect(pkg.files).toContain(localImport);
+    }
+    expect(pkg.files).toContain("skills-get-route.mjs");
+  });
+
   it("does not include bare 'dist' entry or globs that would match Bun binaries", () => {
     const bunBinaryNames = [
       "fn",
