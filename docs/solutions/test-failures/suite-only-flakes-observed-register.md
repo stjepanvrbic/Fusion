@@ -1320,3 +1320,20 @@ KB-066 removed merger-ai.test.ts from the shrink-only Windows ledger on one pass
 - **Mechanism:** both jobs ran the engine lane as one job with default worker fan-out (engine import time above 3200 s cumulative, 19 and 50 failing engine files). Each real-git case spawned 64 to 98 git processes locally, including 5 to 8 detached `git maintenance run --auto` children and about 7 repository-setup spawns, so per-spawn cost under that contention pushed the two-cycle cases past 30 s. No clean-room filesystem retry evidence appeared in either log.
 - **Resolution (KB-089):** the file disables `maintenance.auto` and `gc.auto` for every git child (product calls included) through appended `GIT_CONFIG_*` entries, builds each repository shape once and copies it per test, and drops a redundant clean-path `git add -A`. The two named cases now spawn 51 and 81 processes (from 64 and 98), with zero maintenance children and zero test-side setup spawns. The whole file still passes all cases with unchanged assertions and timeouts, and its summed case time on a local Windows host dropped from 215.5 s to 164 to 186 s.
 - **Escalation rule:** a further Windows timeout of this file is an immediate file-level quarantine in `scripts/lib/test-quarantine.json` with its matching vitest exclude, never a Windows ledger re-add and never a widened timeout.
+
+### Record 2026-10-10: merger-ai files under local Windows load
+
+<!--
+FNXC:TestFlakeRegister 2026-10-10-19:33:
+Two merger-ai files each failed once when all eleven merger-ai test files ran in one vitest invocation on a local Windows host that was also running other verification. They are first sightings, recorded instead of quarantined because both files carry substantial real-git merge coverage. A second sighting of any listed case is an on-sight file-level quarantine.
+-->
+
+- **Lane:** local Windows host, `pnpm --filter @fusion/engine exec vitest run src/__tests__/merger-ai` (11 files in one run), with other test and build work running on the same machine.
+
+| file | exact test | sighting | failure |
+|---|---|---|---|
+| `packages/engine/src/__tests__/merger-ai-squash-gates.test.ts` | `runAiMerge pre-review file-scope check > refuses custom rules that miss the branch before any agent runs, and lands when they cover it` | one of one combined run on a branch based on `d5b7f7826` | assertion text not captured |
+| `packages/engine/src/__tests__/merger-ai-dependency-install.slow.test.ts` | `runAiMerge dependency install > infers lockfile install commands in the AI-merge clean room` | one of one combined run at `d5b7f7826` | assertion text not captured |
+| `packages/engine/src/__tests__/merger-ai-dependency-install.slow.test.ts` | `runAiMerge dependency install > skips inferred installs on a matching marker but never skips configured init commands` | same run at `d5b7f7826` | assertion text not captured |
+
+`merger-ai-squash-gates.test.ts` then passed alone in 3 of 3 runs on the branch and 1 of 1 at `d5b7f7826` (28 cases each). The dependency-install file was not rerun alone.
