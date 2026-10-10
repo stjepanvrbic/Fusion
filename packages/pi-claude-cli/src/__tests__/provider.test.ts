@@ -1,4 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vitest";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
@@ -208,7 +210,38 @@ describe("provider registration (default export)", () => {
   });
 });
 
+/** Give the CLI a transcript for this session id, as a prior turn would have. */
+async function seedCliSession(sessionId: string): Promise<void> {
+  const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
+  const projectDir = join(homedir(), ".claude", "projects", "fusion-provider-test");
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.writeFileSync(join(projectDir, `${sessionId}.jsonl`), "");
+}
+
+const CONVERSATION = () => ({
+  messages: [
+    { role: "user", content: "first message" },
+    { role: "assistant", content: "response" },
+    { role: "user", content: "follow-up" },
+  ],
+  systemPrompt: "Be helpful",
+});
+
+function spawnArgs(index: number): string[] {
+  return (spawn as any).mock.calls[index][1] as string[];
+}
+
+function writtenPrompt(index: number): unknown {
+  const proc = (spawn as any).mock.results[index].value;
+  return JSON.parse((proc.stdin.write.mock.calls[0][0] as string).trim()).message.content;
+}
+
 describe("streamViaCli", { timeout: 90_000 }, () => {
+  // Sessions the CLI already holds; every other id in this suite is one it has never seen.
+  beforeAll(async () => {
+    for (const id of ["session-follow-up", "sess-abc-123", "sess-resume", "sess-on-disk"]) await seedCliSession(id);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     // Launch resolution and tree kill are platform-specific; these cases assert the POSIX shape on fake processes.
@@ -2238,6 +2271,114 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       expect(fsMocks.mkdtempSync).toHaveBeenCalledTimes(1);
       expect(fsMocks.rmSync).toHaveBeenCalledTimes(1);
       expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
+    });
+  });
+
+  /*
+  FNXC:ClaudeCliSession 2026-10-10-20:07:
+  The session mode follows what the CLI holds, not the shape of the context, and a mode the CLI rejects is corrected once instead of failing the turn.
+  */
+  describe("session mode", () => {
+    const completeTurn = async (index: number) => {
+      const proc = (spawn as any).mock.results[index].value;
+      proc.stdout.write(JSON.stringify({ type: "result", subtype: "success", result: "ok" }) + "\n");
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    };
+
+    it("starts a new session with the full prompt when a multi-message context names a session the CLI has never seen", async () => {
+      streamViaCli(mockModels[0] as any, CONVERSATION() as any, { sessionId: "sess-never-seen" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(spawnArgs(0)).not.toContain("--resume");
+      expect(spawnArgs(0)[spawnArgs(0).indexOf("--session-id") + 1]).toBe("sess-never-seen");
+      expect(spawnArgs(0)).toContain("--append-system-prompt-file");
+      expect(writtenPrompt(0)).toContain("first message");
+      expect(writtenPrompt(0)).toContain("follow-up");
+
+      await completeTurn(0);
+      expect(terminalEvents(MockAssistantMessageEventStream.mock.instances[0]).map((e: any) => e.type)).toEqual(["done"]);
+    });
+
+    it("resumes a session the CLI already holds even on a single-message context", async () => {
+      streamViaCli(mockModels[0] as any, { messages: [{ role: "user", content: "Hello" }] } as any, { sessionId: "sess-on-disk" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(spawnArgs(0)[spawnArgs(0).indexOf("--resume") + 1]).toBe("sess-on-disk");
+      expect(spawnArgs(0)).not.toContain("--session-id");
+      await completeTurn(0);
+    });
+
+    it("restarts as a new session when the CLI reports no conversation for a resumed id", async () => {
+      streamViaCli(mockModels[0] as any, CONVERSATION() as any, { sessionId: "sess-on-disk" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(spawnArgs(0)).toContain("--resume");
+
+      const rejected = (spawn as any).mock.results[0].value;
+      rejected.stdout.write("No conversation found with session ID: sess-on-disk\n");
+      rejected.stdout.write(JSON.stringify({
+        type: "result",
+        subtype: "error_during_execution",
+        is_error: true,
+        errors: ["No conversation found with session ID: sess-on-disk"],
+      }) + "\n");
+      rejected.stdout.end();
+      await vi.advanceTimersByTimeAsync(0);
+      rejected.emit("close", 1, null);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(spawn).toHaveBeenCalledTimes(2);
+      expect(spawnArgs(1)).not.toContain("--resume");
+      expect(spawnArgs(1)[spawnArgs(1).indexOf("--session-id") + 1]).toBe("sess-on-disk");
+      expect(spawnArgs(1)).toContain("--append-system-prompt-file");
+      expect(writtenPrompt(1)).toContain("first message");
+
+      await completeTurn(1);
+      expect(terminalEvents(MockAssistantMessageEventStream.mock.instances[0]).map((e: any) => e.type)).toEqual(["done"]);
+    });
+
+    it("resumes when the CLI reports the new session id is already in use", async () => {
+      streamViaCli(mockModels[0] as any, CONVERSATION() as any, { sessionId: "sess-taken" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(spawnArgs(0)).toContain("--session-id");
+
+      const rejected = (spawn as any).mock.results[0].value;
+      rejected.stderr.emit("data", Buffer.from("Error: Session ID sess-taken is already in use.\n"));
+      rejected.emit("close", 1, null);
+      rejected.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(spawn).toHaveBeenCalledTimes(2);
+      expect(spawnArgs(1)[spawnArgs(1).indexOf("--resume") + 1]).toBe("sess-taken");
+      expect(spawnArgs(1)).not.toContain("--append-system-prompt-file");
+      expect(writtenPrompt(1)).toBe("follow-up");
+
+      await completeTurn(1);
+      expect(terminalEvents(MockAssistantMessageEventStream.mock.instances[0]).map((e: any) => e.type)).toEqual(["done"]);
+    });
+
+    it("fails the turn when the CLI rejects the corrected mode as well", async () => {
+      streamViaCli(mockModels[0] as any, CONVERSATION() as any, { sessionId: "sess-taken" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+      const first = (spawn as any).mock.results[0].value;
+      first.stderr.emit("data", Buffer.from("Error: Session ID sess-taken is already in use.\n"));
+      first.emit("close", 1, null);
+      first.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const second = (spawn as any).mock.results[1].value;
+      second.stdout.write(JSON.stringify({
+        type: "result",
+        subtype: "error_during_execution",
+        is_error: true,
+        errors: ["No conversation found with session ID: sess-taken"],
+      }) + "\n");
+      second.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(spawn).toHaveBeenCalledTimes(2);
+      const failure = expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
+      expect(failure.error.errorMessage).toContain("No conversation found");
     });
   });
 });
