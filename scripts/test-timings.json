@@ -11,7 +11,7 @@
         "plugins/fusion-plugin-acp-runtime/src/__tests__/fs-capabilities.test.ts": 400,
         "plugins/fusion-plugin-acp-runtime/src/__tests__/index.test.ts": 200,
         "plugins/fusion-plugin-acp-runtime/src/__tests__/ktd10-fail-closed.test.ts": 100,
-        "plugins/fusion-plugin-acp-runtime/src/__tests__/path-jail.test.ts": 200,
+        "plugins/fusion-plugin-acp-runtime/src/__tests__/path-deny-list.test.ts": 200,
         "plugins/fusion-plugin-acp-runtime/src/__tests__/probe.test.ts": 2100,
         "plugins/fusion-plugin-acp-runtime/src/__tests__/process-manager.test.ts": 900,
         "plugins/fusion-plugin-acp-runtime/src/__tests__/prompt-builder.test.ts": 100,

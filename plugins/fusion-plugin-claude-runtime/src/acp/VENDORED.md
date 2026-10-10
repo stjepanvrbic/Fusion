@@ -19,7 +19,7 @@ Client-side ACP only:
 | `process-manager.ts` | spawn env allow-list + SIGKILL registry |
 | `event-bridge.ts` | `session/update` → Fusion callbacks |
 | `control-handler.ts` | permission floor |
-| `fs-capabilities.ts` / `path-jail.ts` | optional client fs |
+| `fs-capabilities.ts` / `path-deny-list.ts` | optional client fs |
 | `cli-spawn.ts` | settings resolution |
 | `prompt-builder.ts`, `sanitize.ts`, `tool-mapping.ts`, `types.ts` | support |
 
