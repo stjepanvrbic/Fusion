@@ -30,7 +30,7 @@ Port 4040 is reserved for the production dashboard. Sandbox policy rejects `allo
 
 ### Fusion task sessions
 
-Task sessions resolve the backend with prompt override, project setting, then the native default. When an isolating backend is selected, the declared task boundary is its writable root; workspace tasks use their one task directory, and linked repository worktrees additionally receive the Git administration paths required for commits. The agent `bash` tool and streaming verification both run through that backend. The JavaScript boundary remains active underneath as portable defense in depth when the backend is native or falls back to native.
+Task sessions resolve the backend with prompt override, project setting, then the native default. When an isolating backend is selected, the declared task boundary is its writable root; workspace tasks use their one task directory, and linked repository worktrees additionally receive the Git administration paths required for commits. The agent `bash` tool and streaming verification both run through that backend. With the native backend, or after a fallback to native, no tool restricts paths: agents are instructed to keep their changes in the task worktree.
 
 Defaults remain unchanged: sandboxing is experimental, `backend` defaults to `native`, and `failureMode` defaults to `fail-hard` because host namespace capability is not universal.
 

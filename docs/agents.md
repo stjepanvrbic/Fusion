@@ -967,9 +967,9 @@ Task-detail Chat is included because it is a `task-planner:<taskId>` ChatManager
 
 Planning and re-planning sessions may receive `fn_install_worktree_dependencies` when a task worktree has unresolved or unrecognised dependency evidence. Its `install` action asks Fusion to execute the supplied command in the selected task worktree; only an engine-observed exit code `0` is recorded as installed. Its `none` action requires a reason and records that a detected unknown evidence file has no install step. The tool is planning-session-only: it is command-execution governed, absent from readonly sessions, and never registered for executor, reviewer, or merger sessions. Plan Review verifies the durable record rather than trusting planner prose or a shell invocation outside the tool.
 
-### Worktree session file boundary
+### Worktree session paths
 
-Pi sessions started in an isolated task worktree reject filesystem paths outside that worktree. The established project-memory and task-attachment exceptions remain unchanged. The standard user Agent Skills root at `~/.agents/skills` is readable from worktree sessions. Separately, when Fusion advertises skill bodies through `AgentOptions.additionalSkillPaths` (including enabled plugin skill roots), it allows only `read`, `glob`, and `grep` to access those exact normalized roots. `write`, `edit`, and Bash working directories remain worktree-bound for skill roots; these are not general `~/.agents` or `~/.fusion/plugins` exceptions.
+Agents in an isolated task worktree are instructed, not path-restricted. The system prompt tells them to make every change inside the worktree unless the task directs them to another repository or directory, and reviewers treat stray edits as a blocking REVISE. No file or shell tool refuses a path outside the worktree: a project may span several repositories and directories, and agents read installed tools, logs and other repositories as part of ordinary work. A `read-only-root` session still refuses every `write`, `edit` and Bash call. When an isolating sandbox backend is configured, it remains the hard write control (see `docs/sandbox.md`).
 
 ```bash
 fn message inbox
@@ -1002,7 +1002,7 @@ Heartbeat runs are composed from multiple prompt layers so each wake has full id
    - Task-scoped runs use the task heartbeat system prompt.
    - No-task runs use the ambient/no-task heartbeat system prompt (tool-aligned: no task-scoped tools).
 2. **Workspace tool mode**
-   - Heartbeat sessions are created with coding-capable workspace tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) inside worktree boundary guards.
+   - Heartbeat sessions are created with coding-capable workspace tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) and are instructed to keep their changes inside the worktree.
    - Heartbeat behavior still stays lightweight: one concrete action per run, then `fn_heartbeat_done`.
    - Engine-owned heartbeat tools are layered on top for both task-scoped and no-task runs. Permanent/custom agents get the safe coordination/work-discovery surface (task creation/delegation, agent config/provisioning, artifacts, memory, messaging, goals/evaluations/identity/reflection, workflow discovery, bounded research, and `fn_ask_question`), while task-only tools such as `fn_task_log`, `fn_task_logs_read`, and task documents stay limited to task-scoped runs.
 2. **Agent identity and instructions bundle**
