@@ -17,7 +17,8 @@ vi.mock("../process-manager.js", () => ({
 // Belt-and-suspenders: no real CLI spawn even if a probe slips through.
 vi.mock("node:child_process", () => ({ spawn: vi.fn(() => ({ on: vi.fn(), stdout: { on: vi.fn() }, stderr: { on: vi.fn() }, stdin: { write: vi.fn(), end: vi.fn() }, kill: vi.fn() })), execSync: vi.fn(() => Buffer.from("")) }));
 
-vi.mock("@earendil-works/pi-ai", () => ({
+vi.mock("@earendil-works/pi-ai", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@earendil-works/pi-ai")>()),
   getModels: vi.fn(() => []),
   AssistantMessageEventStream: vi.fn(),
   calculateCost: vi.fn(),

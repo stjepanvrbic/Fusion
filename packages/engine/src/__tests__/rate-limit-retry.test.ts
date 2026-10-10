@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { withRateLimitRetry } from "../errors/rate-limit-retry.js";
+import {
+  CLAUDE_CLI_FAILURE_MARKER,
+  CLAUDE_CLI_RATE_LIMIT_RETRY_DELAYS_MS,
+  isClaudeCliRateLimitError,
+  withRateLimitRetry,
+} from "../errors/rate-limit-retry.js";
+import { pushTurnFailure } from "../../../pi-claude-cli/src/turn-failure.js";
 
 describe("withRateLimitRetry", () => {
   beforeEach(() => {
@@ -344,6 +350,65 @@ describe("withRateLimitRetry", () => {
 
     await expect(promise).rejects.toThrow("Task paused");
     // Only the initial call — the auth retry never fires.
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+
+/*
+FNXC:ClaudeCliRateLimit 2026-10-10-17:54:
+A Claude CLI 429 is retried in place on a fixed ladder so account rotation can clear it; once the ladder is spent the original error reaches the caller's freeze path unchanged.
+*/
+describe("withRateLimitRetry Claude CLI ladder", () => {
+  const CLI_429 = `${CLAUDE_CLI_FAILURE_MARKER}Claude CLI result success (is_error) (HTTP 429): You've hit your limit · resets 3pm`;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("recognises the failure text the vendored provider produces", () => {
+    const stream = { push: vi.fn(), end: vi.fn() };
+    pushTurnFailure(stream as never, { role: "assistant", content: [] } as never, "error",
+      "Claude CLI result success (is_error) (HTTP 429): You've hit your limit · resets 3pm");
+    const errorMessage = stream.push.mock.calls[0][0].error.errorMessage as string;
+    expect(isClaudeCliRateLimitError(errorMessage)).toBe(true);
+    expect(isClaudeCliRateLimitError("429 too many requests")).toBe(false);
+  });
+
+  it("retries a CLI 429 in place after the first ladder delay", async () => {
+    const fn = vi.fn().mockRejectedValueOnce(new Error(CLI_429)).mockResolvedValueOnce("recovered");
+    const onRetry = vi.fn();
+    const promise = withRateLimitRetry(fn, { onRetry });
+
+    await vi.advanceTimersByTimeAsync(CLAUDE_CLI_RATE_LIMIT_RETRY_DELAYS_MS[0] - 1);
+    expect(fn).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(promise).resolves.toBe("recovered");
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(onRetry).toHaveBeenCalledWith(1, CLAUDE_CLI_RATE_LIMIT_RETRY_DELAYS_MS[0], expect.any(Error));
+  });
+
+  it("walks the whole ladder, independent of maxRetries, then rethrows the original error", async () => {
+    const fn = vi.fn().mockRejectedValue(new Error(CLI_429));
+    const onRetry = vi.fn();
+    const promise = withRateLimitRetry(fn, { maxRetries: 0, onRetry });
+    const assertion = expect(promise).rejects.toThrow(CLI_429);
+
+    for (const delay of CLAUDE_CLI_RATE_LIMIT_RETRY_DELAYS_MS) await vi.advanceTimersByTimeAsync(delay);
+
+    await assertion;
+    expect(fn).toHaveBeenCalledTimes(CLAUDE_CLI_RATE_LIMIT_RETRY_DELAYS_MS.length + 1);
+    expect(onRetry.mock.calls.map(([, delay]) => delay)).toEqual([...CLAUDE_CLI_RATE_LIMIT_RETRY_DELAYS_MS]);
+  });
+
+  it("rethrows every other error at once when limited to Claude CLI failures", async () => {
+    const fn = vi.fn().mockRejectedValue(new Error("429 too many requests"));
+    await expect(withRateLimitRetry(fn, { claudeCliOnly: true })).rejects.toThrow("429 too many requests");
     expect(fn).toHaveBeenCalledTimes(1);
   });
 });

@@ -346,7 +346,7 @@ export function buildCreateAuthoritativeWorkflowSeamsDeps(host: any): any {
     ...facadeFields(host, [
       "activeWorkflowPrincipals", "graphSeamGoverningNodeId", "graphSeamThinkingLevel",
       "graphStepActiveContext", "graphRethinkNarrations", "pausedAborted",
-      "mergeRequester",
+      "mergeRequester", "activeWorkflowGraphAbortControllers",
     ]),
     ...facadeMethods(host, [
       "getRunContextFor",
@@ -380,6 +380,7 @@ export function buildExecuteWorkflowStepDeps(host: any): any {
     options: host.options,
     activePlanningWorkflowSessions: host.activePlanningWorkflowSessions,
     activeWorkflowStepSessions: host.activeWorkflowStepSessions,
+    activeWorkflowGraphAbortControllers: host.activeWorkflowGraphAbortControllers,
     ...facadeMethods(host, [
       "getRunContextFor",
       "captureModifiedFiles", "createSpawnAgentTool",

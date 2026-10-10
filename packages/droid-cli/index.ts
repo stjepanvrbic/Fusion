@@ -1,5 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
+/*
+ * FNXC:ExtensionLoading 2026-10-10-17:40:
+ * Pi's extension loader aliases bare `@earendil-works/pi-ai` to `dist/compat.js` by prefix, so unaliased subpaths such as `/utils/transcript` fail to resolve.
+ * Import from the package root, which exports the transcript helpers under both Pi's loader and Node.
+ */
+import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import {
   streamViaCli,
   discoverDroidModels,

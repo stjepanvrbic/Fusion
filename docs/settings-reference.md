@@ -972,6 +972,17 @@ Anthropic has three independent authentication/routing paths:
 
 Anthropic can be connected with a raw API key from both Model Onboarding and **Settings → Authentication**. Anthropic API-key auth appears as a separate **Anthropic API Key** card, while Claude subscription OAuth appears as **Anthropic Subscription** with Login/Logout controls. On Fusion desktop, Anthropic Subscription OAuth login URLs are delegated to the operating system browser instead of an Electron child window so the existing polling/callback flow can complete. `/api/auth/status` returns only masked key hints for the API-key card.
 
+#### Claude CLI rate-limit retries
+
+A rate limit from the `pi-claude-cli` provider is retried in place before Fusion's normal rate-limit handling runs. This is for account switchers such as `cswap auto`, which move the local `claude` login to another subscription account shortly after one hits its limit. Fusion starts a new `claude` process for every attempt, so a retry uses whichever account is logged in at that moment.
+
+- **Schedule:** 20 s, then 45 s, then 90 s (each ±10 %), about 2.5 minutes in total. With `cswap` checking usage every 15 s (`autoswitch.intervalSeconds`), the first retry falls after one check and the second after about four.
+- **Lanes:** planning, the executor, workflow review steps (Plan Review, Code Review, Browser Verification, Post-merge Verification), per-step reviews, AI merge and agent heartbeats. The task log records each wait as a `rate limited … retry N in Ns` entry.
+- **After the ladder:** the original error goes to the lane's existing handling unchanged. A rate limit enters the external-block freeze (automatic resumes at 5, 15, 30, 60, 120 and 120 minutes), and a quota or billing error waits for an operator.
+- **Scope:** the ladder applies only to failures reported by the Claude CLI provider. Rate limits from other providers keep their previous behaviour: 30 s, 60 s and 120 s backoff in planning, the executor and merge, and an immediate freeze for workflow review steps.
+
+Fusion recognises a CLI rate limit from the HTTP status the CLI reports with a failed turn (`api_error_status`, 429), because the CLI's own limit notice carries no status code.
+
 ### CLI local OpenAI-compatible registry
 
 `fn onboard` can add a local/custom endpoint to pi's model registry without
