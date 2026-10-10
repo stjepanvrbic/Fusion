@@ -1,4 +1,5 @@
 import { commitIdentityArgs, resolveCommitIdentity } from "../git-identity.js";
+import { mergeEffectiveSettings } from "../project/effective-settings.js";
 /**
  * Standalone AI merge path (FN-5633).
  *
@@ -1817,7 +1818,11 @@ export async function runAiMerge(
   The helper's own comment records this exact defect being fixed in `moves.ts`; these two merge
   entry points were missed. Resolve the task's own review lanes and pass them.
   */
-  const settings = await store.getSettings();
+  /*
+  FNXC:WorkflowSettings 2026-10-10-23:03:
+  The merge reviewer runs on the validator lane, a workflow setting. Read the task's effective workflow settings so a lane the operator stored for the workflow reaches the reviewer instead of the project default.
+  */
+  const settings = await mergeEffectiveSettings(store, task, await store.getSettings());
   let mergeGate;
   try {
     mergeGate = await resolvePreMergeGateForTask(store, taskId, task.enabledWorkflowSteps, task);
@@ -2743,7 +2748,8 @@ export async function landWorkspaceTask(
 ): Promise<WorkspaceMergeResult> {
   const taskId = task.id;
   assertMergeGenerationOwned(options.signal, taskId);
-  const settings = await store.getSettings();
+  // FNXC:WorkflowSettings 2026-10-10-23:03: the per-repository merge reviewers read the same effective validator lane as runAiMerge.
+  const settings = await mergeEffectiveSettings(store, task, await store.getSettings());
   const publishToRemote = isPushAfterMergeEnabled(settings, { lane: "workspace" });
   const audit = createRunAuditor(store, {
     runId: generateSyntheticRunId("ai-merge", taskId),

@@ -132,4 +132,31 @@ describe("TaskExecutor post-task reflection capture (FN-7528)", () => {
 
     expect(onComplete).toHaveBeenCalledWith(task);
   });
+
+  /*
+  FNXC:WorkflowSettings 2026-10-10-23:03:
+  `reflectionEnabled` is a workflow setting. A value the operator stored for the task's workflow decides the capture; project settings no longer carry the key.
+  */
+  it.for([
+    { stored: true, captures: 1 },
+    { stored: false, captures: 0 },
+  ])("follows the reflectionEnabled value stored for the task's workflow ($stored)", async ({ stored, captures }) => {
+    const store = createMockStore();
+    store.getSettings.mockResolvedValue({ maxConcurrent: 2 });
+    Object.assign(store, {
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: "builtin:coding", stepIds: [] })),
+      getWorkflowSettingValues: vi.fn(() => ({ reflectionEnabled: stored })),
+      getWorkflowSettingsProjectId: vi.fn(() => "proj-1"),
+    });
+    const captureTaskPerformance = vi.fn().mockResolvedValue(null);
+    const executor = new TaskExecutor(store as any, "/tmp/test", {
+      reflectionService: { captureTaskPerformance } as any,
+    });
+
+    (executor as any).signalTaskComplete(makeTask());
+    await vi.waitFor(() => expect(store.getSettings).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(captureTaskPerformance).toHaveBeenCalledTimes(captures);
+  });
 });

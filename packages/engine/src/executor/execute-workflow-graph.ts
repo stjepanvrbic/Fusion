@@ -74,6 +74,7 @@ import {
   type ActiveWorkflowAuthority,
 } from "./workflow-principal-before-node.js";
 import { resolvePendingOverlapWaits } from "../workflows/overlap-plan-revalidation.js";
+import { mergeEffectiveSettings } from "../project/effective-settings.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mirror TaskExecutor method/map surface
 type AnyFn = (...args: any[]) => any;
@@ -643,7 +644,14 @@ export async function executeWorkflowGraph(
     try {
       let settings: Settings;
       try {
-        settings = await deps.store.getSettings();
+        /*
+        FNXC:WorkflowSettings 2026-10-10-23:00:
+        Every node of this run reads one settings snapshot: the project settings overlaid with the task's effective workflow settings.
+        Moved workflow settings (step timeout, model lanes, reviewer policy) no longer live in project settings, so a raw snapshot made each graph reader fall back to its built-in default and silently ignore the operator's stored workflow value.
+        KB-080's Code Review timed out at the 15-minute default four times with its workflow "Step timeout" stored at 45 minutes.
+        Merging once here, as the implementation session already does, gives every node the same values for the whole run instead of each reader re-resolving them.
+        */
+        settings = await mergeEffectiveSettings(deps.store, task, await deps.store.getSettings());
       } catch (err) {
         await deps.handleGraphFailure(task, {
           disposition: "failed",

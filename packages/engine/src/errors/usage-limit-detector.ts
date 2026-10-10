@@ -10,6 +10,7 @@
  * retry.
  */
 
+import { mergeEffectiveSettings } from "../project/effective-settings.js";
 import type { Task, TaskStore } from "@fusion/core";
 import type { CredentialInstanceRotator } from "../credential-instance-rotation.js";
 // FNXC:WorkflowLifecycleColumns 2026-07-30-11:00: `agentType` is an AGENT ROLE, not a column.
@@ -279,6 +280,12 @@ export class UsageLimitPauser {
     */
     const activeLanesByTask = new Map<string, { wip?: string; review?: string } | undefined>();
     /*
+    FNXC:WorkflowSettings 2026-10-10-23:03:
+    Model lanes are workflow settings, so which provider a card runs on is read from that card's effective workflow settings, resolved over the same per-workflow IR cache.
+    Matching against raw project settings missed every card whose lane the operator stored on its workflow, and that card kept hammering the limited provider.
+    */
+    const settingsByTask = new Map<string, Awaited<ReturnType<TaskStore["getSettings"]>>>();
+    /*
     FNXC:WorkflowLifecycleColumns 2026-07-31-23:20 (PR #2672 review, greptile P2):
     RESOLVE ONLY THE CANDIDATES. The first version resolved every task on the board before filtering, so a
     rate limit on a 400-card board paid 400 resolutions to pause a handful — and terminal or paused cards,
@@ -303,6 +310,7 @@ export class UsageLimitPauser {
     await Promise.all(laneCandidates.map(async (task) => {
       const columns = await resolveTaskLifecycleColumns(this.store, task.id, irCache).catch(() => undefined);
       activeLanesByTask.set(task.id, columns ? { wip: columns.wip, review: columns.review } : undefined);
+      settingsByTask.set(task.id, await mergeEffectiveSettings(this.store, task, settings, irCache));
     }));
     if (agentType === PLANNER_AGENT_ROLE) {
       await Promise.all(tasks.map(async (task) => {
@@ -347,7 +355,7 @@ export class UsageLimitPauser {
       && this.taskUsesProvider(
         task,
         providerId,
-        settings,
+        settingsByTask.get(task.id) ?? settings,
         agentType,
         preImplementationByTask.get(task.id),
         activeLanesByTask.get(task.id),

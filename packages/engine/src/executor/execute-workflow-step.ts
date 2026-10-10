@@ -566,11 +566,9 @@ CRITICAL SCOPING RULES — read before doing anything else:
      * classification honest; when severity had no stated consequence, reviewers marked everything
      * blocking and every nit forced a remediation round.
      *
-     * `settings` here is the RAW project map: the graph run loads it via `store.getSettings()` and never
-     * merges per-workflow values (see execute-workflow-graph.ts). Reading the threshold off it directly
-     * would silently ignore an operator's Workflow Editor override and always use the built-in default.
-     * Merge the per-task effective workflow settings first, exactly as the remediation path does — the
-     * merge is scoped to review-kind nodes so non-review steps pay nothing.
+     * The severity gate also needs to know which workflow values the operator stored, not only their values,
+     * so resolve the provenance-carrying overlay here, exactly as the remediation path does. The merge is
+     * scoped to review-kind nodes so non-review steps pay nothing.
      */
     const resolvedReviewSettings = reviewFindingsContract
       ? await mergeEffectiveSettingsWithProvenance(deps.store, task, settings)

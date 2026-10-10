@@ -28,6 +28,7 @@ import {
   type EffectiveSettingsResult,
   type Settings,
   type TaskStore,
+  type WorkflowIr,
 } from "@fusion/core";
 
 /** The minimal task shape the resolver needs. Task carries no projectId field —
@@ -59,11 +60,13 @@ export async function mergeEffectiveSettingsWithProvenance<T extends Partial<Set
   >,
   task: EffectiveSettingsTask,
   base: T,
+  irCache?: Map<string, WorkflowIr>,
 ): Promise<EffectiveSettingsWithProvenance<T>> {
   try {
     const detailed: EffectiveSettingsResult = await resolveEffectiveSettingsDetailed(
       store as Parameters<typeof resolveEffectiveSettingsDetailed>[0],
       task,
+      irCache,
     );
     return { settings: applyWorkflowSettingsOverlay(base, detailed), storedKeys: detailed.storedKeys };
   } catch {
@@ -71,7 +74,10 @@ export async function mergeEffectiveSettingsWithProvenance<T extends Partial<Set
   }
 }
 
-/** Merge settings while preserving the legacy flattened-only API for existing callers. */
+/**
+ * Merge settings while preserving the legacy flattened-only API for existing callers.
+ * A caller resolving many tasks passes one `irCache` so each workflow's IR is read once.
+ */
 export async function mergeEffectiveSettings<T extends Partial<Settings>>(
   store: Pick<
     TaskStore,
@@ -84,8 +90,9 @@ export async function mergeEffectiveSettings<T extends Partial<Settings>>(
   >,
   task: EffectiveSettingsTask,
   base: T,
+  irCache?: Map<string, WorkflowIr>,
 ): Promise<T> {
-  return (await mergeEffectiveSettingsWithProvenance(store, task, base)).settings;
+  return (await mergeEffectiveSettingsWithProvenance(store, task, base, irCache)).settings;
 }
 
 /** Merge the Project Models workflow-lane baseline when no task-selected
