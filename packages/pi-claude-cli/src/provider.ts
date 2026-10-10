@@ -43,6 +43,7 @@ import {
   type SystemPromptFile,
 } from "./process-manager.js";
 import { parseLine } from "./stream-parser.js";
+import { resolveCliSessionMode, sessionModeAfterRejection, type CliSessionMode } from "./session-store.js";
 import { createEventBridge } from "./event-bridge.js";
 import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
@@ -140,27 +141,42 @@ export function streamViaCli(
     pushTurnFailure(stream, bridge.getOutput(), reason, errMsg);
   }
 
-  (async () => {
+  /**
+   * Run the turn once in the given session mode.
+   * Resolves to the other mode when the CLI rejected this one before producing output and `allowSessionFallback` is set; otherwise the stream is settled and it resolves to undefined.
+   */
+  const attemptTurn = async (
+    sessionMode: CliSessionMode,
+    allowSessionFallback: boolean,
+  ): Promise<CliSessionMode | undefined> => {
     let proc: ReturnType<typeof spawnClaude> | undefined;
     let promptFile: SystemPromptFile | undefined;
     let abortHandler: (() => void) | undefined;
     let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+    let sessionFallback: CliSessionMode | undefined;
+    // Events from a rejected attempt's process may arrive after the next attempt has started.
+    let attemptOver = false;
+    let forwardedOutput = false;
+
+    /** Fail the turn, unless the failure is the CLI rejecting the session mode and the other mode is still untried. */
+    function failTurn(errMsg: string) {
+      if (attemptOver) return;
+      if (allowSessionFallback && !forwardedOutput) {
+        sessionFallback ??= sessionModeAfterRejection(sessionMode, errMsg);
+        if (sessionFallback) return;
+      }
+      endStreamWithFailure("error", errMsg);
+    }
 
     try {
       if (options?.signal?.aborted) {
         endStreamWithFailure("aborted", ABORTED_MESSAGE);
-        return;
+        return undefined;
       }
 
       const cwd = options?.cwd ?? process.cwd();
 
-      // Resume if pi provides a session ID AND this isn't the first turn.
-      // Pi passes sessionId on every call (including first), but we can only
-      // --resume a CLI session that already exists on disk from a prior turn.
-      const resumeSessionId =
-        options?.sessionId && context.messages.length > 1
-          ? options.sessionId
-          : undefined;
+      const resumeSessionId = sessionMode === "resume" ? options?.sessionId : undefined;
 
       // Build prompt: if resuming, only send the latest user turn;
       // otherwise build the full flattened conversation history
@@ -255,7 +271,7 @@ export function streamViaCli(
 
       // Handle process error (e.g. spawn ENOENT)
       spawned.on("error", (err: Error) => {
-        if (broken) return; // Break-early killed the process intentionally
+        if (broken || attemptOver) return; // Break-early killed the process intentionally
         clearTimeout(inactivityTimer);
         const stderr = getStderr().trim();
         endStreamWithFailure("error", stderr || err.message);
@@ -281,7 +297,7 @@ export function streamViaCli(
           const message = stderr
             ? `Claude CLI exited with code ${code}: ${stderr}`
             : `Claude CLI exited unexpectedly with code ${code}`;
-          endStreamWithFailure("error", message);
+          failTurn(message);
         }
       });
 
@@ -306,6 +322,7 @@ export function streamViaCli(
           // Sub-agent events (parent_tool_use_id !== null) are internal to the CLI.
           const isTopLevel = !msg.parent_tool_use_id;
           if (isTopLevel) {
+            forwardedOutput = true;
             bridge.handleEvent(msg.event);
           }
 
@@ -351,7 +368,7 @@ export function streamViaCli(
         } else if (msg.type === "result") {
           resultReceived = true;
           const failure = describeResultFailure(msg);
-          if (failure) endStreamWithFailure("error", failure);
+          if (failure) failTurn(failure);
           clearTimeout(inactivityTimer);
           cleanupProcess(spawned);
           rl.close();
@@ -368,7 +385,8 @@ export function streamViaCli(
       // Wait for readline to close (result received, process ended, or turn settled)
       await outputClosed;
 
-      if (streamEnded) return;
+      if (streamEnded) return undefined;
+      if (sessionFallback) return sessionFallback;
 
       if (!broken && !resultReceived) {
         // Output ended without a result: the turn did not complete. Wait briefly for the exit code and stderr so the failure says why.
@@ -382,11 +400,8 @@ export function streamViaCli(
           : exitInfo
             ? `exited with code ${exitInfo.code}`
             : "output ended";
-        endStreamWithFailure(
-          "error",
-          `Claude CLI ${exitDetail} without a result${stderr ? `: ${stderr}` : ""}`,
-        );
-        return;
+        failTurn(`Claude CLI ${exitDetail} without a result${stderr ? `: ${stderr}` : ""}`);
+        return sessionFallback;
       }
 
       // Push done event after readline closes (async). Pushing synchronously
@@ -423,17 +438,40 @@ export function streamViaCli(
         message: { ...output, stopReason: effectiveReason },
       });
       stream.end();
+      return undefined;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (proc) forceKillProcess(proc);
       endStreamWithFailure(options?.signal?.aborted ? "aborted" : "error", errMsg);
+      return undefined;
     } finally {
+      attemptOver = true;
       clearTimeout(inactivityTimer);
       if (options?.signal && abortHandler) {
         options.signal.removeEventListener("abort", abortHandler);
       }
       // A prompt file whose process never started has no close event to remove it.
       if (!proc) promptFile?.cleanup();
+      // A rejected attempt's process has no further use; a settled turn's process is already cleaned up or killed.
+      else if (sessionFallback) forceKillProcess(proc);
+    }
+  };
+
+  /*
+  FNXC:ClaudeCliSession 2026-10-10-20:07:
+  The first attempt uses the mode the CLI's transcript store indicates.
+  If the CLI rejects it (the transcript aged out, or another process created the session in between), the turn is retried once in the other mode: a rejected resume restarts as a new session with the full flattened prompt and system prompt, and a rejected new session resumes.
+  */
+  (async () => {
+    try {
+      const firstMode = resolveCliSessionMode(options?.sessionId);
+      const fallbackMode = await attemptTurn(firstMode, true);
+      if (fallbackMode) {
+        debugLog(`CLI rejected session mode ${firstMode} for ${options?.sessionId}; retrying as ${fallbackMode}`);
+        await attemptTurn(fallbackMode, false);
+      }
+    } catch (err) {
+      endStreamWithFailure("error", err instanceof Error ? err.message : String(err));
     }
   })();
 
