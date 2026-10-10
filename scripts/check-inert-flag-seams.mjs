@@ -196,7 +196,7 @@ for (const file of SCAN_ROOTS.flatMap((root) => [...walkAll(root)])) {
       const exported = node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) === true;
       const last = node.parameters[node.parameters.length - 1];
       if (!fileIsTest && exported && last.questionToken && ts.isIdentifier(last.name) && TRAILING_FLAG_PARAM.test(last.name.text)) {
-        declared.set(node.name.text, { file: relative(REPO, file), arity: node.parameters.length });
+        declared.set(node.name.text, { file: relative(REPO, file).split("\\").join("/"), arity: node.parameters.length });
       }
     }
     if (ts.isCallExpression(node)) {
@@ -213,7 +213,7 @@ for (const file of SCAN_ROOTS.flatMap((root) => [...walkAll(root)])) {
         const target = localAlias.get(callee) ?? callee;
         if (!callSites.has(target)) callSites.set(target, []);
         callSites.get(target).push({
-          file: relative(REPO, file),
+          file: relative(REPO, file).split("\\").join("/"),
           args: effectiveArgCount(node.arguments),
           shadowed: locallyDeclared.has(callee),
           from: importedFrom.get(callee),

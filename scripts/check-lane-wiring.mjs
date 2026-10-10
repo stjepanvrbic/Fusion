@@ -90,7 +90,7 @@ const unwired = findUnwiredCallSites(files, accepting);
 
 const counts = {};
 for (const hit of unwired) {
-  const key = relative(ROOT, hit.file);
+  const key = relative(ROOT, hit.file).split("\\").join("/");
   counts[key] = (counts[key] ?? 0) + 1;
 }
 
