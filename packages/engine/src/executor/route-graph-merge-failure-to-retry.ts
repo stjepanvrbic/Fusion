@@ -23,6 +23,8 @@ import type { MergeBoundaryRecoveryEvidence, MergeBoundaryUnprovenReasonCode } f
 import { AUTO_MERGE_RETRY_REJECTED_PREFIX } from "../merge/stale-content-park.js";
 import { isEngineShutdownError } from "../merge/engine-shutdown-error.js";
 import { deferMergeOnProviderRateLimit, isProviderRateLimitError } from "../external-block/provider-rate-limit-deferral.js";
+import { classifyTransientMergeError, MAX_AUTO_MERGE_TRANSIENT_RETRIES } from "../errors/transient-merge-error-classifier.js";
+import { isMergeAbortedError } from "../merge/merge-write-fence.js";
 
 export type RouteGraphMergeFailureToRetryDeps = {
   store: TaskStore;
@@ -125,6 +127,53 @@ async function persistTokenUsageBestEffort(
       `${taskId}: failed to persist token usage: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+/*
+FNXC:MergeRetryReliability 2026-10-10-22:57:
+A merge request rejected because the merge was interrupted says nothing about the branch: the engine aborted its own merge (run bound, wedge reclaim, a revoked gate) or the provider dropped the turn.
+Such a rejection is re-requested on the durable transient merge budget (`mergeTransientRetryCount`, the budget the automatic merge lane already spends on the same error class) with the same backoff, instead of parking on a bare abort message.
+The claim is fenced like the terminal park, and it is refused under any operator hold: a paused or deleted card, a card that left its lane, and a globally paused or stopped engine keep their existing handling.
+KB-097 was parked `AUTO_MERGE_RETRY_REJECTED: This operation was aborted` after its first interrupted request.
+*/
+function isInterruptedMergeRejection(rejection: unknown, reason: string): boolean {
+  if (isEngineShutdownError(rejection) || isProviderRateLimitError(reason) || reason.endsWith(PRE_MERGE_STEPS_NOT_RUN_BLOCKER)) return false;
+  return isMergeAbortedError(rejection)
+    || (rejection instanceof Error && rejection.name === "AbortError")
+    || classifyTransientMergeError(reason) !== null;
+}
+
+type InterruptedMergeRetryClaim = { claimed: true; attempt: number } | { claimed: false; budgetSpent: boolean };
+
+async function claimInterruptedMergeRetry(
+  deps: RouteGraphMergeFailureToRetryDeps,
+  live: TaskDetail,
+): Promise<InterruptedMergeRetryClaim> {
+  const settings = typeof deps.store.getSettings === "function"
+    ? await deps.store.getSettings().catch(() => undefined)
+    : undefined;
+  if (settings?.globalPause || settings?.enginePaused) return { claimed: false, budgetSpent: false };
+  let claim: InterruptedMergeRetryClaim = { claimed: false, budgetSpent: false };
+  await deps.store.updateTaskAtomic(live.id, (current) => {
+    if (
+      !current
+      || current.deletedAt
+      || current.status != null
+      || current.paused
+      || current.userPaused
+      || (typeof live.columnMovedAt === "string"
+        && typeof current.columnMovedAt === "string"
+        && current.columnMovedAt !== live.columnMovedAt)
+    ) return null;
+    const used = current.mergeTransientRetryCount ?? 0;
+    if (used >= MAX_AUTO_MERGE_TRANSIENT_RETRIES) {
+      claim = { claimed: false, budgetSpent: true };
+      return null;
+    }
+    claim = { claimed: true, attempt: used + 1 };
+    return { mergeTransientRetryCount: used + 1 };
+  }, deps.getRunContextFor(live.id));
+  return claim;
 }
 
 export async function routeGraphMergeFailureToRetry(
@@ -317,34 +366,59 @@ export async function routeGraphMergeFailureToRetry(
     */
     let mergeRequestRejected = false;
     let mergeRequestRejection: unknown;
-    try {
-      const mergeResult = await deps.mergeRequester(mergeBoundary.task.id);
-      /*
-      FNXC:MergeRetryAdmission 2026-09-20-02:17:
-      A fulfilled callback is not evidence that ProjectEngine accepted work into its
-      serialized merge lifecycle. The retry seam must require the canonical merge
-      result: either a confirmed merge or the explicit no-op/manual-review hold.
-      Undefined and partial callback results previously made the graph report a
-      retry while no queue owner, status, or retry counter existed.
-      */
-      if (
-        !mergeResult
-        || typeof mergeResult !== "object"
-        || (!(mergeResult as { merged?: unknown }).merged
-          && (mergeResult as { noOp?: unknown }).noOp !== true)
-      ) {
-        const reason = typeof mergeResult === "object" && mergeResult !== null
-          && typeof (mergeResult as { error?: unknown; reason?: unknown }).error === "string"
-          ? (mergeResult as { error: string }).error
-          : typeof mergeResult === "object" && mergeResult !== null
-            && typeof (mergeResult as { reason?: unknown }).reason === "string"
-            ? (mergeResult as { reason: string }).reason
-            : "merge requester resolved without an admitted merge result";
-        throw new Error(reason);
+    let interruptedRetryBudgetSpent = false;
+    for (;;) {
+      try {
+        const mergeResult = await deps.mergeRequester(mergeBoundary.task.id);
+        /*
+        FNXC:MergeRetryAdmission 2026-09-20-02:17:
+        A fulfilled callback is not evidence that ProjectEngine accepted work into its
+        serialized merge lifecycle. The retry seam must require the canonical merge
+        result: either a confirmed merge or the explicit no-op/manual-review hold.
+        Undefined and partial callback results previously made the graph report a
+        retry while no queue owner, status, or retry counter existed.
+        */
+        if (
+          !mergeResult
+          || typeof mergeResult !== "object"
+          || (!(mergeResult as { merged?: unknown }).merged
+            && (mergeResult as { noOp?: unknown }).noOp !== true)
+        ) {
+          const reason = typeof mergeResult === "object" && mergeResult !== null
+            && typeof (mergeResult as { error?: unknown; reason?: unknown }).error === "string"
+            ? (mergeResult as { error: string }).error
+            : typeof mergeResult === "object" && mergeResult !== null
+              && typeof (mergeResult as { reason?: unknown }).reason === "string"
+              ? (mergeResult as { reason: string }).reason
+              : "merge requester resolved without an admitted merge result";
+          throw new Error(reason);
+        }
+      } catch (error) {
+        mergeRequestRejected = true;
+        mergeRequestRejection = error;
       }
-    } catch (error) {
-      mergeRequestRejected = true;
-      mergeRequestRejection = error;
+      if (!mergeRequestRejected) break;
+      const rejectionReason = mergeRequestRejection instanceof Error ? mergeRequestRejection.message : String(mergeRequestRejection);
+      if (!isInterruptedMergeRejection(mergeRequestRejection, rejectionReason)) break;
+      const claim = await claimInterruptedMergeRetry(deps, live).catch((): InterruptedMergeRetryClaim => ({ claimed: false, budgetSpent: false }));
+      if (!claim.claimed) {
+        interruptedRetryBudgetSpent = claim.budgetSpent;
+        break;
+      }
+      const delayMs = 5000 * Math.pow(2, claim.attempt - 1);
+      try {
+        await deps.store.logEntry(
+          live.id,
+          `Bounded auto-merge retry was interrupted, not refused — re-requesting the merge in ${delayMs / 1000}s (transient retry ${claim.attempt}/${MAX_AUTO_MERGE_TRANSIENT_RETRIES}): ${rejectionReason}`,
+          undefined,
+          deps.getRunContextFor(live.id),
+        );
+      } catch {
+        // best-effort telemetry; the re-request below is what matters
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      mergeRequestRejected = false;
+      mergeRequestRejection = undefined;
     }
     if (!mergeRequestRejected) {
       await persistTokenUsageBestEffort(deps.persistTokenUsage, live.id);
@@ -369,7 +443,10 @@ export async function routeGraphMergeFailureToRetry(
     skipped because telemetry failed. Log write is best-effort; the status write runs
     unconditionally with its own bounded retry.
     */
-    const reason = mergeRequestRejection instanceof Error ? mergeRequestRejection.message : String(mergeRequestRejection);
+    const rejectionReason = mergeRequestRejection instanceof Error ? mergeRequestRejection.message : String(mergeRequestRejection);
+    const reason = interruptedRetryBudgetSpent
+      ? `merge was interrupted and the transient retry budget (${MAX_AUTO_MERGE_TRANSIENT_RETRIES}) is spent: ${rejectionReason}`
+      : rejectionReason;
     /*
     FNXC:MergeRestartDeferral 2026-10-08-06:10:
     A restart is never a merge failure. ProjectEngine rejects with a name-tagged EngineShutdownError when stop() abandons a pending request or a stopping/unstarted engine refuses the enqueue.

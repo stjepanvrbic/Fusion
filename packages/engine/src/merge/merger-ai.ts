@@ -1062,6 +1062,8 @@ export interface LandRepoContext {
   trailers: string[];
   taskTitle?: string;
   signal?: AbortSignal;
+  /** Reports each clean-room attempt to the merge pump; see `MergerOptions.onMergeAttemptStarted`. */
+  onAttemptStarted?: () => void;
   allowDirtyLocalCheckoutSync?: boolean;
   /*
   FNXC:Workspace 2026-06-24-23:50 (resilient workspace land):
@@ -1241,6 +1243,7 @@ export async function landOneRepo(
   let outstandingReviewReasons: string[] = [];
   while (true) {
     throwIfAborted(signal, taskId);
+    ctx.onAttemptStarted?.();
     const tipSha = await git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], repoRootDir);
 
     // Short-circuit a branch with zero commits ahead of the integration tip
@@ -2130,6 +2133,7 @@ export async function runAiMerge(
     taskId, settings, audit, log, setStatus, maxPasses,
     mergeAgent, reviewAgent, stashResolveAgent,
     includeTaskId, trailers, taskTitle, signal: options.signal,
+    onAttemptStarted: options.onMergeAttemptStarted,
     allowDirtyLocalCheckoutSync,
     // FNXC:MergeNoCommits 2026-07-17-12:00: no-commits tasks skip dependency sync in the clean room
     noCommitsExpected: task.noCommitsExpected === true,
@@ -3239,6 +3243,7 @@ export async function landWorkspaceTask(
         taskId, settings, audit, log, setStatus, maxPasses,
         mergeAgent, reviewAgent, stashResolveAgent,
         includeTaskId, trailers, taskTitle, signal: landSignal,
+        onAttemptStarted: options.onMergeAttemptStarted,
         allowDirtyLocalCheckoutSync,
         // FNXC:Workspace 2026-06-24-23:50: one sub-repo's dependency-sync failure must not block
         // landing the others — degrade verification for that repo, still land the git squash.

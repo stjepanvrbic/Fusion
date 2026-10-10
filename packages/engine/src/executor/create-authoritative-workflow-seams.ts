@@ -44,6 +44,7 @@ import type { EngineRunContext } from "../util/run-audit.js";
 import { executorLog, reviewerLog } from "../logger.js";
 import { normalizeWorkspaceTaskRouting } from "./workspace-config-resolver.js";
 import { isApprovalFamilyVerdict } from "./workspace-review-per-repo.js";
+import { createMergeRunTimeout, GRAPH_MERGE_RUN_TIMEOUT_MS } from "./merge-run-timeout.js";
 
 const WORKFLOW_THINKING_LEVEL_SET: ReadonlySet<string> = new Set(THINKING_LEVELS);
 
@@ -297,16 +298,11 @@ export function createAuthoritativeWorkflowSeams(
           );
           return { outcome: "failure", value: "implementation-incomplete" };
         }
-        // Bound the wait: a wedged merge queue must not strand the graph walk
-        // holding the routing claim. On timeout the run fails cleanly and the
-        // task is parked for human review; the queue can still finish later.
-        // FNXC:WorkflowCancellation 2026-07-15-10:42: the timeout is the wedged-queue bound, `signal` is the cancellation path — both must stay live. See the `requestMerge` primitive for the stall this prevents.
-        const GRAPH_MERGE_TIMEOUT_MS = 30 * 60 * 1000;
-        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-        const timeout = new Promise<"timeout">((resolve) => {
-          timeoutHandle = setTimeout(() => resolve("timeout"), GRAPH_MERGE_TIMEOUT_MS);
-          timeoutHandle.unref?.();
-        });
+        // Bound a hung merge: it must not strand the graph walk holding the
+        // routing claim. On timeout the run fails cleanly and the task is parked
+        // for human review; the queue can still finish later.
+        // FNXC:WorkflowCancellation 2026-07-15-10:42: the timeout is the hung-merge bound, `signal` is the cancellation path — both must stay live. See the `requestMerge` primitive for the stall this prevents.
+        const runTimeout = createMergeRunTimeout();
         let onGraphAbort: (() => void) | undefined;
         const cancelled = new Promise<"cancelled">((resolve) => {
           if (!signal) return;
@@ -316,7 +312,7 @@ export function createAuthoritativeWorkflowSeams(
         try {
           let result: Awaited<ReturnType<NonNullable<typeof deps.mergeRequester>>> | "timeout" | "cancelled";
           try {
-            result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal, graphOwnedPostMergeTraversal: true }), timeout, cancelled]);
+            result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal, graphOwnedPostMergeTraversal: true, onMergeRunStarted: runTimeout.restart }), runTimeout.expired, cancelled]);
           } catch (error) {
             // The legacy seam has no node context; it always runs as the `merge` seam node.
             const terminalRefusal = classifyMergeRequesterRejection(error, "merge");
@@ -328,7 +324,7 @@ export function createAuthoritativeWorkflowSeams(
             return { outcome: "failure", value: "merge-cancelled" };
           }
           if (result === "timeout") {
-            executorLog.warn(`${mergeTask.id}: graph merge seam timed out after ${GRAPH_MERGE_TIMEOUT_MS}ms`);
+            executorLog.warn(`${mergeTask.id}: graph merge seam timed out after running ${GRAPH_MERGE_RUN_TIMEOUT_MS}ms`);
             return { outcome: "failure", value: "merge-timeout" };
           }
           if (result.merged || result.noOp) {
@@ -336,7 +332,7 @@ export function createAuthoritativeWorkflowSeams(
           }
           return { outcome: "failure", value: result.reason ?? result.error ?? "merge-failed" };
         } finally {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
+          runTimeout.clear();
           if (onGraphAbort) signal?.removeEventListener("abort", onGraphAbort);
         }
       },

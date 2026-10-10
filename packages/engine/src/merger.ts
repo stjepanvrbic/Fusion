@@ -5080,6 +5080,12 @@ export interface MergerOptions {
   /** Abort signal used to stop an in-flight merge when the engine is shutting down. */
   signal?: AbortSignal;
   /**
+   * FNXC:MergeRunTimeout 2026-10-10-22:49:
+   * Called each time the merge starts an attempt from an integration tip, including a rebuild after that tip moved.
+   * The merge pump restarts its hung-merge bounds here, so a rebuild is not charged against the attempt it replaced.
+   */
+  onMergeAttemptStarted?: () => void;
+  /**
    * True only when the workflow graph caller will immediately traverse its authored post-merge
    * nodes after this merge resolves. Direct/manual callers must not defer required evidence.
    */

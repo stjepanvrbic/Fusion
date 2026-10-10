@@ -26,6 +26,7 @@ import type { PausedAbortProvenance } from "./paused-abort-provenance.js";
 import type { ActiveExecutorSessionState, TaskExecutorOptions } from "./task-executor-options.js";
 import type { WorkflowAgentCapacity } from "../agents/workflow-agent-capacity.js";
 import { invalidateWorkspaceConfigCache } from "./workspace-config-resolver.js";
+import type { MergeRequestOptions } from "../merge/merge-request-options.js";
 
 export abstract class TaskExecutorState {
   /**
@@ -145,7 +146,7 @@ export abstract class TaskExecutorState {
   protected graphSeamGoverningNodeId = new Map<string, string>();
   protected graphSeamThinkingLevel = new Map<string, ThinkingLevel>();
   protected graphSeamSkillName = new Map<string, string>();
-  protected mergeRequester?: (taskId: string, options?: { signal?: AbortSignal; graphOwnedPostMergeTraversal?: boolean }) => Promise<MergeResult>;
+  protected mergeRequester?: (taskId: string, options?: MergeRequestOptions) => Promise<MergeResult>;
   /** ProjectEngine-owned fence for automatic failed no-verdict review recovery. */
   protected rerouteFailedNoVerdictPreMergeReview?: (task: Task) => Promise<"rerouted" | "pending" | "changed" | "unavailable" | "not-applicable">;
   protected sessionContentionHoldAttempts = new Map<string, number>();

@@ -33,6 +33,7 @@ import { finalizeProvenAutoMergeTask } from "../merge/auto-merge-finalization.js
 import { createRunAuditor, type EngineRunContext } from "../util/run-audit.js";
 import { executorLog } from "../logger.js";
 import { resolveExternalExecutionCheckoutRoute } from "../execution/external-execution-checkout.js";
+import { createMergeRunTimeout, GRAPH_MERGE_RUN_TIMEOUT_MS } from "./merge-run-timeout.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mirror TaskExecutor method surface without re-typing the class
 type AnyFn = (...args: any[]) => any;
@@ -433,19 +434,11 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
         }
         /*
         FNXC:WorkflowCancellation 2026-07-15-10:42:
-        The timeout bounds a wedged merge queue; it is NOT the cancellation path. `ctx.signal` (graph abort) is linked in via `AbortSignal.any` so a hard-cancel collapses the merge node immediately instead of after the full timeout, and is raced separately so the walk returns rather than waiting on a requester that may not settle on abort. Keep both signals live: dropping the timeout re-strands the walk behind a wedged queue, dropping the cancel link restores the 30-minute stall.
+        The timeout bounds a hung merge; it is NOT the cancellation path. `ctx.signal` (graph abort) is linked in via `AbortSignal.any` so a hard-cancel collapses the merge node immediately instead of after the full timeout, and is raced separately so the walk returns rather than waiting on a requester that may not settle on abort. Keep both signals live: dropping the timeout re-strands the walk behind a hung merge, dropping the cancel link restores the 30-minute stall.
         */
-        const GRAPH_MERGE_TIMEOUT_MS = 30 * 60 * 1000;
         const controller = new AbortController();
         const mergeSignal = ctx.signal ? AbortSignal.any([ctx.signal, controller.signal]) : controller.signal;
-        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-        const timeout = new Promise<"timeout">((resolve) => {
-          timeoutHandle = setTimeout(() => {
-            controller.abort();
-            resolve("timeout");
-          }, GRAPH_MERGE_TIMEOUT_MS);
-          timeoutHandle.unref?.();
-        });
+        const runTimeout = createMergeRunTimeout(() => controller.abort());
         let onGraphAbort: (() => void) | undefined;
         const cancelled = new Promise<"cancelled">((resolve) => {
           if (!ctx.signal) return;
@@ -455,7 +448,7 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
         try {
           let result: Awaited<ReturnType<NonNullable<typeof deps.mergeRequester>>> | "timeout" | "cancelled";
           try {
-            result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal: mergeSignal, graphOwnedPostMergeTraversal: true }), timeout, cancelled]);
+            result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal: mergeSignal, graphOwnedPostMergeTraversal: true, onMergeRunStarted: runTimeout.restart }), runTimeout.expired, cancelled]);
           } catch (error) {
             const terminalRefusal = classifyMergeRequesterRejection(error, ctx.node.node.id);
             if (terminalRefusal) return terminalRefusal;
@@ -466,7 +459,7 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
             return { outcome: "failure", value: "merge-cancelled" };
           }
           if (result === "timeout") {
-            executorLog.warn(`${mergeTask.id}: workflow merge primitive timed out after ${GRAPH_MERGE_TIMEOUT_MS}ms`);
+            executorLog.warn(`${mergeTask.id}: workflow merge primitive timed out after running ${GRAPH_MERGE_RUN_TIMEOUT_MS}ms`);
             return { outcome: "failure", value: "merge-timeout", data: { status: "timeout" } };
           }
           if (result.merged || result.noOp) {
@@ -523,7 +516,7 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
             data: { status: "failed", reason: result.reason ?? result.error ?? "merge-failed" },
           };
         } finally {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
+          runTimeout.clear();
           // FNXC:WorkflowCancellation 2026-07-15-10:42: the graph signal outlives this node; leaving the listener attached leaks one per merge attempt across a retry loop.
           if (onGraphAbort) ctx.signal?.removeEventListener("abort", onGraphAbort);
           await logAudit(mergeTask.id, {

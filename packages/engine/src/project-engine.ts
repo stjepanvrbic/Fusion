@@ -74,6 +74,7 @@ import {
 import { assemblePlannerOverseerRuntimeSnapshot } from "./overseer/planner-overseer-runtime-snapshot.js";
 import { activeSessionRegistry, executingTaskLock } from "./agents/active-session-registry.js";
 import { createEngineShutdownError } from "./merge/engine-shutdown-error.js";
+import type { MergeRequestOptions } from "./merge/merge-request-options.js";
 import { isTaskExecutionLive } from "./merge/merge-execution-exclusion.js";
 import { isMergeActiveStatus } from "./merge/merge-active-status.js";
 import { isPostMergeGateRecoveryDue, resumeMissingPostMergeGate } from "./merge/post-merge-gate-reseed.js";
@@ -501,6 +502,7 @@ type MergeResolver = {
   resolve: (result: MergeResult) => void;
   reject: (err: Error) => void;
   graphOwnedPostMergeTraversal?: boolean;
+  onMergeRunStarted?: () => void;
 };
 
 const EXTERNAL_MERGE_REGION_KINDS = new Set([
@@ -705,6 +707,13 @@ export class ProjectEngine {
   */
   private mergeBodyInFlight: Promise<unknown> | null = null;
   private mergeAbortController: AbortController | null = null;
+  /*
+  FNXC:MergeRetryReliability 2026-10-10-22:49:
+  Claim signals of merges whose own requester aborted them (the graph merge node's run bound, or a cancelled walk).
+  That abort ends one request, not the task's need to merge: a request that joins while the aborted merge unwinds gets a fresh merge instead of the abandoned one's rejection.
+  Pause, stop, soft-delete and self-healing aborts are not recorded here and keep rejecting their waiters.
+  */
+  private requesterAbandonedMergeSignals = new WeakSet<AbortSignal>();
   private mergeRetryTimer: ReturnType<typeof setTimeout> | null = null;
   /** One durable PR-retry wake per task; admission can safely re-request it after restart/races. */
   private readonly prMergeRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -1212,7 +1221,28 @@ export class ProjectEngine {
     this.activeMergeTaskId = taskId;
     this.activeMergeStartedAtMs = Date.now();
     this.mergeAbortController = new AbortController();
+    this.noteMergeRunStarted(taskId);
     return this.mergeAbortController.signal;
+  }
+
+  /*
+  FNXC:MergeRunTimeout 2026-10-10-22:49:
+  A merge attempt starts when the pump claims it and again each time the merger rebuilds on a new integration tip.
+  Both hung-merge bounds restart there: the pump watchdog (`mergeRunningSince`) and the bound of every requester waiting on this merge.
+  Time queued behind other merges or deferred for capacity is therefore never read as a hang, and a rebuild caused by the integration branch moving gets a full bound.
+  */
+  private noteMergeRunStarted(taskId: string): void {
+    this.mergeRunningSince = Date.now();
+    for (const resolver of this.manualMergeResolvers.get(taskId) ?? []) resolver.onMergeRunStarted?.();
+  }
+
+  /*
+  FNXC:MergeQueue 2026-10-10-22:49:
+  The abort handle belongs to the pump pass that claimed it. A pass for another task (reachable when the watchdog opens the guard beside a merge that really outlived it) must not drop it:
+  KB-097's handle was dropped that way, so its requester's abort only disposed the session and the merge failed with the provider's bare "This operation was aborted".
+  */
+  private releaseMergeAbortController(claimedSignal: AbortSignal | undefined): void {
+    if (claimedSignal && this.mergeAbortController?.signal === claimedSignal) this.mergeAbortController = null;
   }
 
   private clearActiveMergeClaim(taskId: string): void {
@@ -2998,7 +3028,7 @@ export class ProjectEngine {
    * Returns the full MergeResult so it can be used as the `onMerge` callback
    * in createServer().
    */
-  async onMerge(taskId: string, options: { signal?: AbortSignal; graphOwnedPostMergeTraversal?: boolean } = {}): Promise<MergeResult> {
+  async onMerge(taskId: string, options: MergeRequestOptions = {}): Promise<MergeResult> {
     const signal = options.signal;
     if (signal?.aborted) {
       throw new Error(`Merge request for ${taskId} aborted`);
@@ -3032,6 +3062,7 @@ export class ProjectEngine {
       };
       const resolver: MergeResolver = {
         graphOwnedPostMergeTraversal: options.graphOwnedPostMergeTraversal === true,
+        onMergeRunStarted: options.onMergeRunStarted,
         resolve: (result) => {
           if (settled) return;
           settled = true;
@@ -3057,6 +3088,7 @@ export class ProjectEngine {
           }
         }
         if (this.activeMergeTaskId === taskId) {
+          if (this.mergeAbortController) this.requesterAbandonedMergeSignals.add(this.mergeAbortController.signal);
           this.mergeAbortController?.abort();
           this.mergeAbortController = null;
           this.activeMergeSession?.dispose();
@@ -3070,6 +3102,7 @@ export class ProjectEngine {
 
       signal?.addEventListener("abort", abort, { once: true });
       this.addMergeResolver(taskId, resolver);
+      if (this.activeMergeTaskId === taskId) resolver.onMergeRunStarted?.();
 
       // If this task is already queued or actively merging, wait for the
       // existing merge to finish rather than starting a second one.
@@ -3101,7 +3134,7 @@ export class ProjectEngine {
    * it as "manual merge required" and parks the task in review — preserving the
    * contract that autoMerge-off leaves in-review terminal until a human merges.
    */
-  async requestInterpreterMerge(taskId: string, options: { signal?: AbortSignal; graphOwnedPostMergeTraversal?: boolean } = {}): Promise<MergeResult> {
+  async requestInterpreterMerge(taskId: string, options: MergeRequestOptions = {}): Promise<MergeResult> {
     let task: Task | null = null;
     let settings: Settings | undefined;
     const store = this.runtime.getTaskStore();
@@ -4294,6 +4327,7 @@ export class ProjectEngine {
   private async drainMergeQueue(): Promise<void> {
     if (this.mergeRunning) {
       /* FNXC:PumpWatchdog 2026-08-01-02:00: one hung pass leaves the guard closed forever and every later tick/wake drops SILENTLY (the triage-poll death, 00769fad7c/e51ebff381). Past the threshold, warn with the stuck duration and force the guard open; the hung pass's own finally re-clearing it later is harmless. A legitimate merge runs many minutes (rebase, verification, land), so the threshold is 30min — past it the merge is wedged (stale-merge sweeps own the TASK, this owns the PUMP flag). */
+      /* FNXC:PumpWatchdog 2026-10-10-22:49: the clock is the pass's last progress — the queue entry it took or the merge attempt it started — never the start of the pass. Timed from the pass start, 30 minutes of healthy back-to-back merges opened a second pass beside a running merge: KB-097 merged concurrently with KB-057, whose landing moved the integration branch under it and forced a full rebuild. */
       const stuckMs = this.mergeRunningSince > 0 ? Date.now() - this.mergeRunningSince : 0;
       if (stuckMs < 1_800_000) return;
       runtimeLog.warn(`merge-queue watchdog: previous drain still marked in-flight after ${Math.round(stuckMs / 1000)}s — forcing the guard open so merging resumes`);
@@ -4320,6 +4354,7 @@ export class ProjectEngine {
       while (this.mergeQueue.length > 0 && !this.shuttingDown) {
         // KB-065: a dequeued id only counts as merge demand for the pump pass that took it.
         this.mergeLaneDequeuedTaskId = null;
+        this.mergeRunningSince = Date.now();
         const shadowCandidateTaskId = await this.getShadowMergeRequestCandidateId();
         const taskId = await this.pickNextMergeTaskId(store);
         if (!taskId) break;
@@ -4355,6 +4390,8 @@ export class ProjectEngine {
         const hasManualResolver = this.hasMergeResolvers(taskId);
         const graphOwnedPostMergeTraversal = this.manualMergeResolvers.get(taskId)
           ?.some((resolver) => resolver.graphOwnedPostMergeTraversal === true) === true;
+        let claimedMergeSignal: AbortSignal | undefined;
+        let requestsAfterRequesterAbort: MergeResolver[] = [];
         /*
         FNXC:MergeQueue 2026-08-28-09:29:
         Waiting-caller dispatches deliberately skip the merge-confirmed fast path in the automatic
@@ -5051,7 +5088,7 @@ export class ProjectEngine {
             PR merge dispatch shares the single-flight pump. Race the PR body with abort so pause/reclaim unblocks drainMergeQueue even when processPullRequestMerge ignores cooperative abort.
             */
             const result = await runWithMergeAdmission(async () => {
-              const abortSignal = this.claimActiveMerge(taskId);
+              const abortSignal = claimedMergeSignal = this.claimActiveMerge(taskId);
               await this.reconcileClaimedMergeStamp(taskId);
               runtimeLog.log(`${hasManualResolver ? "Manual" : "Auto"}-merge processing PR flow for ${taskId}...`);
               return await this.runAbortableMergeBody(
@@ -5131,7 +5168,7 @@ export class ProjectEngine {
             const credentialRotator = (this.runtime as any).credentialRotator;
 
             const rawMerge = async () => {
-              const abortSignal = this.claimActiveMerge(taskId);
+              const abortSignal = claimedMergeSignal = this.claimActiveMerge(taskId);
               await this.reconcileClaimedMergeStamp(taskId);
               /*
               FNXC:GrokCliRouting 2026-07-15-09:45:
@@ -5144,6 +5181,7 @@ export class ProjectEngine {
                 agentStore,
                 pluginRunner: this.getPluginRunner(),
                 signal: abortSignal,
+                onMergeAttemptStarted: () => this.noteMergeRunStarted(taskId),
                 graphOwnedPostMergeTraversal,
                 syncGroupPr: this.options.syncGroupPr,
                 onSession: (session: { dispose: () => void }) => {
@@ -5306,9 +5344,22 @@ export class ProjectEngine {
           const errorMsg = err instanceof Error ? err.message : String(err);
           const mergeWasAborted = err instanceof Error && err.name === "MergeAbortedError";
 
+          if (claimedMergeSignal && this.requesterAbandonedMergeSignals.has(claimedMergeSignal)) {
+            /*
+            FNXC:MergeRetryReliability 2026-10-10-22:49:
+            The requester that owned this merge aborted it and already has its own rejection. Whatever the unwinding body throws belongs to that abandoned request.
+            A request that joined meanwhile (the graph's bounded auto-merge retry after `merge-timeout`) is re-queued for a fresh merge after this pass releases the lane, with no status write and no retry spent.
+            Handing it this failure parked KB-097 as `AUTO_MERGE_RETRY_REJECTED: This operation was aborted`.
+            */
+            runtimeLog.log(`${hasManualResolver ? "Manual" : "Auto"}-merge for ${taskId} ended after its requester aborted it: ${errorMsg}`);
+            await this.clearAbortedMergeStamp(taskId);
+            requestsAfterRequesterAbort = this.takeMergeResolvers(taskId);
+            continue;
+          }
+
           if (mergeWasAborted) {
             runtimeLog.log(`${hasManualResolver ? "Manual" : "Auto"}-merge aborted for ${taskId}: ${errorMsg}`);
-            this.mergeAbortController = null;
+            this.releaseMergeAbortController(claimedMergeSignal);
             await this.clearAbortedMergeStamp(taskId);
             if (hasManualResolver) {
               this.rejectMergeResolvers(taskId, err instanceof Error ? err : new Error(errorMsg));
@@ -5324,7 +5375,7 @@ export class ProjectEngine {
             fresh graph review is the only exit that can reopen this fence.
             */
             runtimeLog.log(`${hasManualResolver ? "Manual" : "Auto"}-merge gate revoked for ${taskId}: ${errorMsg}`);
-            this.mergeAbortController = null;
+            this.releaseMergeAbortController(claimedMergeSignal);
             await this.clearAbortedMergeStamp(taskId);
             if (hasManualResolver) this.rejectMergeResolvers(taskId, err);
             continue;
@@ -6300,7 +6351,7 @@ export class ProjectEngine {
             projectAdmissionCoordinator.releaseReservation(taskId);
           }
           this.clearActiveMergeClaim(taskId);
-          this.mergeAbortController = null;
+          this.releaseMergeAbortController(claimedMergeSignal);
           this.clearMergeActive(taskId);
           // If a manual merge was requested while this task was already in-flight,
           // the waiter(s) were set but not consumed above. Resolve them now.
@@ -6325,6 +6376,15 @@ export class ProjectEngine {
               worktreeRemoved: false,
               branchDeleted: false,
             } as MergeResult);
+          }
+          if (requestsAfterRequesterAbort.length > 0) {
+            for (const resolver of requestsAfterRequesterAbort) this.addMergeResolver(taskId, resolver);
+            if (!this.internalEnqueueMerge(taskId)) {
+              const refusal = this.shuttingDown || !this.started
+                ? createEngineShutdownError(`Engine shutting down — merge for ${taskId} aborted`)
+                : new Error(`Merge enqueue rejected for ${taskId}`);
+              this.rejectMergeResolvers(taskId, refusal);
+            }
           }
         }
       }

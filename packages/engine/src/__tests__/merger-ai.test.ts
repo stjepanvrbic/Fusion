@@ -423,7 +423,8 @@ describe("runAiMerge", () => {
       return "REVIEW_VERDICT: approve";
     });
 
-    const result = await runAiMerge(store, dir, "FN-1", { manual: true }, {
+    const onMergeAttemptStarted = vi.fn();
+    const result = await runAiMerge(store, dir, "FN-1", { manual: true, onMergeAttemptStarted }, {
       mergeAgent: realMergeAgent("fusion/fn-1"),
       reviewAgent,
     });
@@ -431,6 +432,8 @@ describe("runAiMerge", () => {
     expect(result.merged).toBe(true);
     expect(reviewAgent).toHaveBeenCalledTimes(3);
     expect(git(dir, "show main:after-review.txt")).toContain("new source identity");
+    // FNXC:MergeRunTimeout 2026-10-10-22:49: the rebuild is reported as a second attempt so the pump restarts its hung-merge bounds.
+    expect(onMergeAttemptStarted).toHaveBeenCalledTimes(2);
   });
 
   it("passes explicit still-present findings to a corrective merger", async () => {
