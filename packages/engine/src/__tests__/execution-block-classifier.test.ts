@@ -7,6 +7,7 @@ import {
   isDurableBlockedTask,
   partitionBlockedByRefs,
 } from "../execution-block-classifier.js";
+import { ANTHROPIC_RATE_LIMIT_429 } from "./fixtures/rate-limit-deferral-store.js";
 
 /*
 FNXC:HonestBlockedExit 2026-08-02-23:59 (operator decision — FN-8728 vs PR #2398):
@@ -28,6 +29,7 @@ describe("classifyExternalObstacle", () => {
   */
   it("splits transient rate limits from billing and quota exhaustion", () => {
     for (const message of [
+      ANTHROPIC_RATE_LIMIT_429,
       'Usage limit detected (executor/unknown): 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit"}}',
       "Too Many Requests",
       "overloaded_error: Overloaded",

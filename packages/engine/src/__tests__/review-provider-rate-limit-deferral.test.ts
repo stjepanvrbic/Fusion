@@ -5,7 +5,7 @@ structured `providerFailure` marker on its step result, then freezes in place an
 instead of exhausting its no-verdict repair within a minute. Genuine reviewer failures keep today's re-seed contract.
 */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Task, TaskDetail, WorkflowIr, WorkflowStepResult } from "@fusion/core";
+import { postMergeVerificationOptionalGroupNode, type Task, type TaskDetail, type WorkflowIr, type WorkflowIrNode, type WorkflowStepResult } from "@fusion/core";
 
 import { PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE, WorkflowGraphExecutor, type WorkflowNodeHandler } from "../workflows/workflow-graph-executor.js";
 import type { WorkflowGraphTaskRunResult } from "../workflows/workflow-graph-task-runner.js";
@@ -18,7 +18,7 @@ import { resumeDueExternalBlocks } from "../external-block/external-block-lifecy
 import { projectAdmissionCoordinator } from "../concurrency/concurrency.js";
 import { buildStepFailureContextPatch } from "../executor/run-graph-custom-node.js";
 import { deferReviewStepOnProviderRateLimit } from "../external-block/provider-rate-limit-deferral.js";
-import { MINUTE, RAW_429, T0, createRateLimitStore, rateLimitedResult, reviewCard } from "./fixtures/rate-limit-deferral-store.js";
+import { ANTHROPIC_RATE_LIMIT_429, MINUTE, RAW_429, T0, createRateLimitStore, graphFailureDeps, rateLimitedResult, reviewCard } from "./fixtures/rate-limit-deferral-store.js";
 
 const settingsOn = () => ({ experimentalFeatures: { workflowGraphExecutor: true } });
 
@@ -277,44 +277,6 @@ describe("KB-077 deferReviewStepOnProviderRateLimit (shared freeze helper)", () 
   });
 });
 
-/** Minimal `handleGraphFailure` deps: real store and lanes, inert recovery seams, and a spy for the production no-verdict rerouter. */
-function graphFailureDeps(env: ReturnType<typeof createRateLimitStore>, overrides: Record<string, unknown> = {}) {
-  const base: Record<string, unknown> = {
-    store: env.store,
-    rootDir: env.store.getRootDir(),
-    options: {},
-    activeWorktrees: new Map(),
-    pausedAborted: new Set(),
-    pausedAbortProvenance: new Map(),
-    userCanceledTaskIds: new Set(),
-    executing: new Set(),
-    resumingUnpaused: new Set(),
-    activeSessions: new Map(),
-    activeStepExecutors: new Map(),
-    activeWorkflowStepSessions: new Map(),
-    activeCliTaskSessions: new Map(),
-    activeWorkflowGraphAbortControllers: new Map(),
-    processWideGraphRouting: new Set(),
-    deferredTerminalParksInFlight: new Set(),
-    getRunContextFor: () => undefined,
-    resolveResumeLanes: vi.fn(async () => ({ hold: "planning", wip: "building", review: "review", wipDeclared: true })),
-    persistTokenUsage: vi.fn(async () => undefined),
-    rerouteFailedNoVerdictPreMergeReview: vi.fn(async () => "rerouted"),
-    requestPreMergeOptionalStepFix: vi.fn(async () => false),
-    hasLiveTaskSessionSurface: vi.fn(() => false),
-    ...overrides,
-  };
-  return new Proxy(base, {
-    get(target, property) {
-      if (property in target) return target[property as string];
-      if (typeof property !== "string" || property === "then") return undefined;
-      // Unlisted id registries are empty sets; every other unlisted seam is an inert async decline.
-      target[property] = /Ids$/.test(property) ? new Set() : vi.fn(async () => false);
-      return target[property];
-    },
-  }) as never;
-}
-
 function failedRun(nodeId: string, value = "failed"): WorkflowGraphTaskRunResult {
   return { disposition: "failed", outcome: "failure", visitedNodeIds: ["start", nodeId], context: { [`node:${nodeId}:outcome`]: "failure", [`node:${nodeId}:value`]: value } } as WorkflowGraphTaskRunResult;
 }
@@ -450,6 +412,74 @@ describe("KB-077 automatic review recovery freezes a rate-limited review instead
     const env = createRateLimitStore([reviewCard("KB-066", { workflowStepResults: [rateLimitedResult("code-review")] })]);
     const outcome = await recoverFailedPreMergeWorkflowStepDetailed({ store: env.store } as never, env.rows.get("KB-066")!);
     expect(outcome).toEqual({ kind: "skipped" });
+  });
+});
+
+function reviewGroupNode(id: string, name: string): WorkflowIrNode {
+  return {
+    id,
+    kind: "optional-group",
+    column: "review",
+    config: { name, defaultOn: true, template: { nodes: [{ id: `${id}-step`, kind: "prompt", config: { prompt: name, gateMode: "gate" } }], edges: [] } },
+  };
+}
+
+function singleGateIr(gate: WorkflowIrNode): WorkflowIr {
+  return {
+    version: "v2",
+    name: `single-${gate.id}`,
+    columns: [{ id: "planning", name: "Planning", traits: [{ trait: "hold" }] }, { id: "review", name: "Review", traits: [] }],
+    nodes: [{ id: "start", kind: "start" }, gate, { id: "end", kind: "end" }],
+    edges: [{ from: "start", to: gate.id }, { from: gate.id, to: "end", condition: "success" }],
+  } as WorkflowIr;
+}
+
+/*
+FNXC:ProviderRateLimitDeferral 2026-10-10-17:24:
+From 2026-10-08 to 2026-10-10 eleven landed cards failed Post-merge Verification every hour within about 16 seconds with the bare detail
+"Post-merge verification failed before producing a verdict: failed" while the Anthropic account answered 429.
+Every review gate that dies on that exact payload must keep the provider text on its step result and freeze in place on the
+external-block schedule, so the operator sees the rate limit and the hourly recheck stops spending reviewer sessions.
+*/
+describe("an Anthropic 429 at any review gate keeps the provider error and freezes in place", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    projectAdmissionCoordinator.clearReservationsForTests();
+  });
+  afterEach(() => {
+    projectAdmissionCoordinator.clearReservationsForTests();
+    vi.useRealTimers();
+  });
+
+  it.each([
+    { label: "Plan Review", gate: { id: "plan-review", kind: "prompt", column: "planning", config: { name: "Plan Review", prompt: "plan", reviewKind: "plan" } } as WorkflowIrNode, card: { column: "planning" } },
+    { label: "Code Review", gate: reviewGroupNode("code-review", "Code Review"), card: {} },
+    { label: "Browser Verification", gate: reviewGroupNode("browser-verification", "Browser Verification"), card: {} },
+    { label: "Post-merge verification", gate: postMergeVerificationOptionalGroupNode("review"), card: { mergeDetails: { mergeConfirmed: true, commitSha: "8ae7ec0a2099b707f6bb5d689b748f8c14987548" } } },
+  ])("$label", async ({ gate, card }) => {
+    const env = createRateLimitStore([reviewCard("KB-083", { ...card, enabledWorkflowSteps: [gate.id] } as Partial<Task>)], { ir: singleGateIr(gate) });
+    const graph = new WorkflowGraphExecutor({
+      handlers: { prompt: failingStep({ success: false, error: ANTHROPIC_RATE_LIMIT_429 }) },
+      recordWorkflowStepResult: async (_taskId, result) => {
+        const row = env.rows.get("KB-083")!;
+        row.workflowStepResults = [...(row.workflowStepResults ?? []).filter((entry) => entry.workflowStepId !== result.workflowStepId), structuredClone(result)];
+      },
+    });
+    const run = await graph.run({ ...env.rows.get("KB-083")! } as TaskDetail, settingsOn(), singleGateIr(gate));
+    expect(run.outcome).toBe("failure");
+
+    await handleGraphFailure(graphFailureDeps(env), env.rows.get("KB-083")!, { disposition: "failed", outcome: run.outcome, visitedNodeIds: run.visitedNodeIds, context: run.context } as WorkflowGraphTaskRunResult);
+
+    const row = env.rows.get("KB-083")!;
+    const result = row.workflowStepResults?.find((entry) => entry.workflowStepId === gate.id);
+    expect(result?.output).toContain(ANTHROPIC_RATE_LIMIT_429);
+    expect(result?.output).not.toMatch(/failed before producing a verdict: failed$/);
+    expect(result?.providerFailure).toEqual({ origin: "model-provider", code: "RATE_LIMIT" });
+    expect(row.status).toBe("blocked");
+    expect(row.error ?? "").not.toMatch(/^Review recovery stopped/);
+    expect(row.externalBlock).toMatchObject({ origin: "model-provider", code: "RATE_LIMIT", resume: { nodeId: gate.id } });
+    expect(row.externalBlock?.autoResume?.resumeAt).toBe(new Date(T0 + 5 * MINUTE).toISOString());
   });
 });
 
