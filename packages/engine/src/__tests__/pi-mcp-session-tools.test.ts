@@ -10,7 +10,7 @@ describe("pi MCP session tool integration", () => {
     expect(source).toContain("connectMcpSessionTools(mcpServersToConnect");
     expect(source).toContain("...(mcpToolset?.tools ?? [])");
     expect(source).toContain("wrapToolsWithActionGate(");
-    expect(source).toContain("wrapToolsWithBoundary(");
+    expect(source).toContain("wrapToolsWithReadOnlyBoundary(");
     expect(source).not.toContain("mcpServers: forwardedMcpServers");
   });
 

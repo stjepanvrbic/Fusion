@@ -31,7 +31,7 @@ function isNoTaskDoneFailure(task: Task): boolean {
 }
 
 /**
- * Keep this list in sync with the assertValidWorktreeSession() and resolveSessionBoundaryRoot() error strings in pi.ts:
+ * Keep this list in sync with the assertValidWorktreeSession() and assertSessionBoundaryRoot() error strings in pi.ts:
  * - Refusing to start coding agent in missing worktree:
  * - Refusing to start coding agent in incomplete worktree:
  * - Refusing to start coding agent in unregistered git worktree:

@@ -747,7 +747,7 @@ The runtime continuation drain is a single-flight pump. Once it claims its re-en
 - `AgentActionGate` (`agent-action-gate.ts`) — permanent-agent runtime action classification + policy disposition decisions (shared classification source: `packages/engine/src/gating-classifications.ts`)
 
 Runtime action-gate flow (v1):
-- Tool execution wrappers in `pi.ts` compose `wrapToolsWithBoundary()` and `wrapToolsWithActionGate()`.
+- Tool execution wrappers in `pi.ts` compose `wrapToolsWithActionGate()` and `wrapToolsWithReadOnlyBoundary()`; no wrapper refuses a path outside the task worktree.
 - Non-ephemeral agents receive `AgentActionGateContext` from executor/heartbeat session creation.
 - `block` and `require-approval` dispositions intercept before tool side effects.
 - `require-approval` persists durable requests via `ApprovalRequestStore`, reusing pending requests by dedupe key in `targetAction.context.approvalDedupeKey`.

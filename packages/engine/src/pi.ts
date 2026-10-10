@@ -11,7 +11,6 @@ import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { basename, dirname, join, relative, isAbsolute, resolve } from "node:path";
 
 const execAsync = promisify(exec);
@@ -1667,28 +1666,12 @@ function normalizeExistingPathForGitComparison(path: string): string {
   }
 }
 
-function normalizePathThroughExistingAncestor(path: string): string {
-  const resolvedPath = resolve(path);
-  let existingAncestor = resolvedPath;
-
-  while (true) {
-    try {
-      const canonicalAncestor = realpathSync.native(existingAncestor);
-      return resolve(canonicalAncestor, relative(existingAncestor, resolvedPath));
-    } catch {
-      const parent = dirname(existingAncestor);
-      if (parent === existingAncestor) return resolvedPath;
-      existingAncestor = parent;
-    }
-  }
-}
-
 /**
- * FNXC:SkillReadBoundary 2026-07-21-12:00:
+ * FNXC:SkillReadBoundary 2026-10-10-17:34:
  * GitHub #2384 / FN-8466 requires the exact host-advertised additional skill
- * roots to drive both pi discovery and the worktree Read boundary. Resolve and
- * deduplicate once so the manifest cannot advertise a skill body the boundary
- * rejects through a divergent raw-path list.
+ * roots to drive pi discovery. Resolve and deduplicate once so the manifest
+ * lists each skill root a single time. No tool restricts reads to these roots;
+ * agents may read anywhere.
  */
 export function normalizeAdditionalSkillPaths(paths?: readonly string[]): string[] {
   const seen = new Set<string>();
@@ -1746,14 +1729,14 @@ export async function assertValidWorktreeSession(cwd: string, projectRoot: strin
  * worktree paths cannot safely be inferred. A workspace task directory is not a
  * Git checkout: each child is validated against its own repository root instead.
  */
-export async function resolveSessionBoundaryRoot(
+export async function assertSessionBoundaryRoot(
   cwd: string,
   descriptor?: SessionBoundaryDescriptor,
-): Promise<{ worktreePath: string | null; worktreeProjectRoot: string | null }> {
+): Promise<void> {
   if (!descriptor) {
     const worktreeProjectRoot = getProjectRootFromWorktree(cwd);
     if (worktreeProjectRoot) await assertValidWorktreeSession(cwd, worktreeProjectRoot);
-    return { worktreePath: cwd, worktreeProjectRoot };
+    return;
   }
 
   const root = descriptor.writableRoot ?? cwd;
@@ -1777,11 +1760,11 @@ export async function resolveSessionBoundaryRoot(
     if (descriptor.writableRoot !== null) {
       throw new Error("Refusing read-only-root session with a writable root");
     }
-    return { worktreePath: root, worktreeProjectRoot: descriptor.projectRoot };
+    return;
   }
   if (descriptor.kind === "task-worktree") {
     await assertValidWorktreeSession(root, descriptor.projectRoot);
-    return { worktreePath: root, worktreeProjectRoot: descriptor.projectRoot };
+    return;
   }
 
   const repoRoots = descriptor.repoRoots ?? [];
@@ -1798,112 +1781,8 @@ export async function resolveSessionBoundaryRoot(
   if (validatedChildren === 0) {
     throw new Error("Refusing workspace-task-dir session without a valid repository worktree child");
   }
-  return { worktreePath: root, worktreeProjectRoot: descriptor.projectRoot };
 }
 
-/**
- * Check if a path is allowed to be accessed from a worktree session.
- * Rules:
- * - Paths inside the worktree are always allowed
- * - Project root .fusion/memory/ files are allowed (for durable project learnings)
- * - Task attachments under .fusion/tasks/N/attachments/ are allowed (for reading context files)
- * - Sibling task specs (.fusion/tasks/N/PROMPT.md and task.json) are allowed for
- *   read-only tools (read/glob/grep) so agents can consult dependency specs.
- * - User skills under ~/.agents/skills are allowed for read-only tools only.
- * - Host-advertised additional skill roots are allowed for read-only tools only.
- * - All other paths outside the worktree are rejected
- *
- * @param worktreePath - Absolute path to the worktree directory
- * @param projectRoot - Absolute path to the project root (derived from worktree)
- * @param requestedPath - The path being accessed
- * @param toolName - Tool making the request (controls read-only exceptions)
- * @param readOnlyExtraRoots - Host-advertised roots readable by read-only tools
- * @returns true if allowed, false if rejected
- */
-function isWorktreeAllowedPath(
-  worktreePath: string,
-  projectRoot: string,
-  requestedPath: string,
-  toolName?: string,
-  readOnlyExtraRoots: readonly string[] = [],
-): boolean {
-  // Normalize paths
-  const worktreeResolved = resolve(worktreePath);
-  const projectRootResolved = resolve(projectRoot);
-  const requestedResolved = isAbsolute(requestedPath) ? resolve(requestedPath) : resolve(worktreeResolved, requestedPath);
-  const worktreeCanonical = normalizeExistingPathForGitComparison(worktreeResolved);
-  const projectRootCanonical = normalizeExistingPathForGitComparison(projectRootResolved);
-  const requestedCanonical = normalizePathThroughExistingAncestor(requestedResolved);
-
-  /*
-  FNXC:WorktreeBoundary 2026-08-22-02:52:
-  Every worktree and project exception must use canonical containment only. A lexical path beneath an allowed root can cross a symlink to host files, including when the final glob/write target does not exist yet; normalize through the deepest existing ancestor before deciding.
-  */
-  // Check if path is inside the worktree
-  if (isSameOrInsidePath(worktreeCanonical, requestedCanonical)) {
-    return true; // Path is inside the worktree
-  }
-
-  // Exception: project root `.fusion/memory/` files for durable project learnings
-  const relToCanonicalProjectRoot = relative(projectRootCanonical, requestedCanonical).replace(/\\/g, "/");
-  if (
-    relToCanonicalProjectRoot === ".fusion/memory" ||
-    relToCanonicalProjectRoot === ".fusion/memory/" ||
-    relToCanonicalProjectRoot.startsWith(".fusion/memory/")
-  ) {
-    return true;
-  }
-
-  // Exception: task attachments under `.fusion/tasks/*/attachments/*`
-  if (relToCanonicalProjectRoot.match(/^\.fusion\/tasks\/[^/]+\/attachments\//)) {
-    return true;
-  }
-
-  // Exception (read-only): sibling task specs so the agent can consult the
-  // PROMPT.md / task.json of dependency tasks without needing them copied
-  // into the worktree. `glob`/`grep` are narrow enough to allow as well so
-  // the agent can discover them; writes and bash remain restricted.
-  const readOnlyTools = new Set(["read", "glob", "grep", "find", "ls"]);
-  if (toolName && readOnlyTools.has(toolName)) {
-    if (/^\.fusion\/tasks\/[^/]+\/(PROMPT\.md|task\.json)$/.test(relToCanonicalProjectRoot)) {
-      return true;
-    }
-
-    /*
-    FNXC:SkillReadBoundary 2026-07-21-12:00:
-    GitHub #2384 / FN-8466 lets agents Read only the specific additional skill
-    roots advertised by this session. Do not extend this exception to write,
-    edit, or bash: plugin skill bodies remain host-owned read-only context.
-
-    FNXC:SkillReadBoundary 2026-08-22-09:37:
-    Skill-root containment must compare canonical paths only. A lexical path
-    beneath an allowed root can traverse a symlink whose real target is outside
-    that root; canonicalizing the deepest existing ancestor also closes this
-    escape for glob paths and nonexistent descendants.
-    */
-    if (readOnlyExtraRoots.some((root) => {
-      const rootResolved = resolve(root);
-      const rootCanonical = normalizePathThroughExistingAncestor(rootResolved);
-      return isSameOrInsidePath(rootCanonical, requestedCanonical);
-    })) {
-      return true;
-    }
-  }
-
-  // All other paths outside the worktree are rejected
-  return false;
-}
-
-/**
- * Wrap tools with worktree boundary validation.
- * When cwd is a worktree path, file operations are validated against worktree boundaries.
- *
- * @param tools - Array of tool definitions to wrap
- * @param worktreePath - Absolute path to the worktree directory (if applicable)
- * @param projectRoot - Absolute path to the project root (if applicable)
- * @param readOnlyExtraRoots - Host-advertised roots readable by read/glob/grep only
- * @returns Wrapped tools with boundary validation
- */
 /**
  * Build a tool result payload in the shape pi-coding-agent / pi-ai expect
  * (content as an array of typed blocks, isError=true) rather than a bare
@@ -1911,60 +1790,6 @@ function isWorktreeAllowedPath(
  * message with `content: undefined`, which pi's downstream handling later
  * crashes on with "Cannot read properties of undefined (reading 'filter')".
  */
-/*
-FNXC:WorkspaceBoundary 2026-08-22-23:17:
-FN-158 keeps this deliberately limited shell-text inspection as portable defence
-in depth. Shell parsing is not sound; the kernel sandbox is the hard control.
-This catches the known `cd ../../repo && touch` bypass and makes it visible with
-exactly the same boundary rejection as file tools.
-
-FNXC:WorkspaceBoundary 2026-10-07-15:46:
-Drive-qualified targets (`cd C:\Users\...`, `C:/...`) are absolute paths on Windows and must be inspected too; matching only `/`-rooted text let any Windows absolute path bypass this check.
-On POSIX such text is relative and resolves inside cwd, so the extra alternative cannot reject anything there.
-
-FNXC:WorkspaceBoundary 2026-10-07-17:57:
-Boundary decisions must be the same for every spelling of the same path, and win32 has no kernel sandbox backend, so this text check is the only bash boundary there.
-Operands are tokenized quote-aware (`"C:/x"`, `'../..'`, `C:/"Program Files"/x`, spaces inside quotes) after whitespace or a redirection, then checked when they spell an absolute, UNC, home or parent-relative path (`..`, `../`, `..\`).
-Device sinks (`/dev/null` and the std streams) are not workspace paths and stay allowed; MSYS `/c/...` maps to `C:\...` on win32 instead of resolving to `C:\c\...`.
-*/
-const BASH_OPERAND_PATTERN = /(?<=^|[\s<>(])(?:"[^"]*"|'[^']*'|[^\s;&|<>()"'])+/g;
-const BASH_PATH_CANDIDATE_PATTERN = /^(?:\/|\\\\|\.\.(?:[\\/]|$)|[A-Za-z]:[\\/]|~(?:[\\/]|$))/;
-const BASH_DEVICE_SINKS = new Set(["/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/tty"]);
-
-/** FNXC:WorkspaceBoundary 2026-10-07-17:57: Git Bash spells `C:\x` as `/c/x`; translate it on win32 so in-worktree targets are not rejected and outside ones resolve to the real drive. */
-export function translateMsysDrivePath(target: string, platform: NodeJS.Platform = process.platform): string {
-  if (platform !== "win32") return target;
-  const match = /^\/([A-Za-z])(?:\/(.*))?$/.exec(target);
-  if (!match) return target;
-  return `${match[1].toUpperCase()}:\\${(match[2] ?? "").replace(/\//g, "\\")}`;
-}
-
-function resolveBashPathOperand(operand: string, cwd: string): string {
-  let target = operand;
-  // Backslash separators are fail-closed on POSIX too: `..\..\x` or `\\server\share` is treated as the path it spells on Windows.
-  if (process.platform !== "win32") target = target.replace(/\\/g, "/");
-  target = translateMsysDrivePath(target);
-  if (target === "~" || /^~[\\/]/.test(target)) target = join(homedir(), target.slice(1));
-  return isAbsolute(target) ? target : resolve(cwd, target);
-}
-
-function bashCommandTargetsOutsideBoundary(
-  command: string,
-  cwd: string,
-  worktreePath: string,
-  projectRoot: string,
-  readOnlyExtraRoots: readonly string[],
-): boolean {
-  for (const match of command.matchAll(BASH_OPERAND_PATTERN)) {
-    const operand = match[0].replace(/["']/g, "");
-    if (!BASH_PATH_CANDIDATE_PATTERN.test(operand)) continue;
-    if (BASH_DEVICE_SINKS.has(operand.toLowerCase())) continue;
-    const resolvedTarget = resolveBashPathOperand(operand, cwd);
-    if (!isWorktreeAllowedPath(worktreePath, projectRoot, resolvedTarget, "bash", readOnlyExtraRoots)) return true;
-  }
-  return false;
-}
-
 function boundaryRejection(message: string, details?: Record<string, unknown>) {
   return {
     content: [{ type: "text", text: message }],
@@ -2004,83 +1829,24 @@ const GATE_BYPASS_TOOL_NAMES = new Set([
   "fn_post_room_message",
 ]);
 
-export function wrapToolsWithBoundary(
-  tools: ToolDefinition[],
-  worktreePath: string | null,
-  projectRoot: string | null,
-  readOnlyExtraRoots: readonly string[] = [],
-  readOnlyBoundary = false,
-): ToolDefinition[] {
-  if (!worktreePath || !projectRoot) {
-    return tools; // Not a worktree session, no wrapping needed
-  }
-
-  /*
-  FNXC:SkillReadBoundary 2026-08-22-09:20:
-  Agent Skills installs reusable user skills under ~/.agents/skills. Worktree
-  sessions must be able to read those skill bodies and references, but the
-  exception must not expose sibling ~/.agents configuration or permit writes,
-  edits, or Bash outside the worktree.
-  */
-  const normalizedReadOnlyExtraRoots = normalizeAdditionalSkillPaths([
-    join(homedir(), ".agents", "skills"),
-    ...readOnlyExtraRoots,
-  ]);
-
+/*
+FNXC:WorkspaceBoundary 2026-10-10-17:34:
+Agents are instructed to stay in their task worktree, not path-restricted.
+An operator's project may span several repositories and directories, and refusing every path outside the worktree turned ordinary commands (`cd packages/x && ... > ../../out.txt`, reading an installed browser, writing a scratch file to the temp directory) into failed tool calls that stalled executor and reviewer sessions.
+The system prompt carries the instruction; the kernel sandbox, where a backend exists, remains the hard write control.
+The read-only-root session kind is a capability restriction, not a path boundary, and still refuses every write, edit and shell call.
+*/
+export function wrapToolsWithReadOnlyBoundary(tools: ToolDefinition[], readOnly: boolean): ToolDefinition[] {
+  if (!readOnly) return tools;
   return tools.map((tool) => {
-    // Only wrap tools that access the filesystem
-    const fileToolNames = new Set(["read", "write", "edit", "glob", "grep", "find", "ls", "bash", "fn_run_verification"]);
-    if (!fileToolNames.has(tool.name)) {
-      return tool;
-    }
-
-    // Store the original execute function
-    const originalExecute = tool.execute as any;
-
-     
+    if (!["write", "edit", "bash"].includes(tool.name)) return tool;
     return {
       ...tool,
-       
-      execute: async (...args: any[]) => {
-        const _toolCallId = args[0] as string;
-        const params = args[1] as Record<string, unknown>;
-        const _signal = args[2] as AbortSignal | undefined;
-
-        if (readOnlyBoundary && new Set(["write", "edit", "bash"]).has(tool.name)) {
-          return boundaryRejection("This session has a read-only workspace boundary and cannot modify files or run shell commands.");
-        }
-
-        // Check path argument for file operations
-        const pathArg = params.path as string | undefined;
-        if (pathArg && !isWorktreeAllowedPath(worktreePath, projectRoot, pathArg, tool.name, normalizedReadOnlyExtraRoots)) {
-          const relToProject = relative(projectRoot, pathArg);
-          return boundaryRejection(
-            `Path "${relToProject}" is outside the worktree boundary. ` +
-              `Coding agents can only access files inside the current worktree. ` +
-              `Existing exceptions include .fusion/memory/ and task attachments; ` +
-              `read-only tools may also access sibling task specs, ~/.agents/skills, and host-advertised skill roots.`,
-          );
-        }
-
-        // Bash and bounded verification commands must share the same cwd fence.
-        const cwdArg = params.cwd as string | undefined;
-        if ((tool.name === "bash" || tool.name === "fn_run_verification") && cwdArg
-          && !isWorktreeAllowedPath(worktreePath, projectRoot, cwdArg, tool.name, normalizedReadOnlyExtraRoots)) {
-          return boundaryRejection("Working directory is outside the worktree boundary. Commands must run inside the worktree.");
-        }
-        if (tool.name === "bash" && typeof params.command === "string"
-          && bashCommandTargetsOutsideBoundary(params.command, cwdArg ?? worktreePath, worktreePath, projectRoot, normalizedReadOnlyExtraRoots)) {
-          return boundaryRejection("Command targets a path outside the worktree boundary. Commands must run inside the worktree.");
-        }
-
-        // Call the original tool implementation with all arguments passed through
-        return originalExecute(...args);
-      },
+      execute: (async () => boundaryRejection("This session has a read-only workspace boundary and cannot modify files or run shell commands.")) as ToolDefinition["execute"],
     };
   });
 }
 
-/*
 /*
 FNXC:BashContainment 2026-07-26-13:20:
 Unconditional privilege-escalation floor for engine-spawned sessions (see
@@ -2737,7 +2503,7 @@ export async function createPiAgentSessionRaw(options: AgentOptions): Promise<Ag
 
   // Declared task boundaries fail closed; only ordinary undeclared sessions retain
   // legacy inference so durable-agent heartbeats at the project root stay unchanged.
-  const boundaryContext = await resolveSessionBoundaryRoot(options.cwd, options.sessionBoundary);
+  await assertSessionBoundaryRoot(options.cwd, options.sessionBoundary);
 
   // resolvedProjectRoot was computed above (before registerExtensionProviders)
   // and is reused here for resource loader and skill discovery.
@@ -3015,11 +2781,8 @@ export async function createPiAgentSessionRaw(options: AgentOptions): Promise<Ag
       toolsWithPermanentGating,
       options.actionGateContext,
     );
-    const boundaryWrappedTools = wrapToolsWithBoundary(
+    const boundaryWrappedTools = wrapToolsWithReadOnlyBoundary(
       toolsWithActionGate,
-      boundaryContext.worktreePath,
-      boundaryContext.worktreeProjectRoot,
-      normalizedAdditionalSkillPaths,
       options.sessionBoundary?.kind === "read-only-root",
     );
     // FNXC:ToolOutputBudget 2026-08-03-16:00:

@@ -97,7 +97,7 @@ import {
   reconcileMissionState,
 } from "@fusion/engine";
 import * as dashboard from "@fusion/dashboard";
-import { resolve, relative, isAbsolute, sep, basename, extname, join } from "node:path";
+import { resolve, basename, extname, join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -2418,6 +2418,11 @@ export default function kbExtension(pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      /*
+       * FNXC:CliTaskAttach 2026-10-10-17:34:
+       * Agents are instructed to stay in their task worktree, not path-restricted, so fn_task_attach reads any path the caller names.
+       * A project may span several repositories and directories; confining attachments to ctx.cwd only refused legitimate files while shell tools could copy the same file into the worktree first.
+       */
       const filePath = resolve(ctx.cwd, params.path.replace(/^@/, ""));
       const filename = basename(filePath);
       const ext = extname(filename).toLowerCase();
@@ -2426,27 +2431,6 @@ export default function kbExtension(pi: ExtensionAPI) {
       if (!mimeType) {
         throw new Error(
           `Unsupported file type: ${ext}. Supported: ${Object.keys(MIME_TYPES).join(", ")}`,
-        );
-      }
-
-      /*
-       * FNXC:CliTaskAttach 2026-07-05-00:00:
-       * fn_task_attach must confine reads to the task worktree boundary (ctx.cwd) to
-       * prevent a path-traversal / absolute-path read-boundary bypass — an agent could
-       * previously pass "../../../etc/hosts" or an absolute path (with an allowed
-       * extension) and exfiltrate arbitrary files into a task's attachments. The guard
-       * must run BEFORE readFile so an out-of-boundary path is never opened, even to
-       * fail. The boundary is intentionally ctx.cwd (the worktree) — not a broader
-       * project root — to avoid re-exposing sibling worktrees. (FN-7619, flagged
-       * out-of-scope during FN-7608.)
-       */
-      const boundaryRoot = resolve(ctx.cwd);
-      const rel = relative(boundaryRoot, filePath);
-      const escapesBoundary =
-        rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
-      if (escapesBoundary) {
-        throw new Error(
-          `Refusing to attach file outside the task worktree boundary: ${params.path}`,
         );
       }
 

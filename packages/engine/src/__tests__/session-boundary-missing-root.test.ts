@@ -6,7 +6,7 @@ import {
   extractMissingWorktreePathFromSessionStartFailure,
   isMissingWorktreeSessionStartFailure,
 } from "../healing/restart-recovery-coordinator.js";
-import { resolveSessionBoundaryRoot } from "../pi.js";
+import { assertSessionBoundaryRoot } from "../pi.js";
 
 /*
 FNXC:WorktreeSessionRecovery 2026-10-10-17:21:
@@ -23,7 +23,7 @@ const missingRoot = join(tmpdir(), "fusion-session-boundary-missing-root-never-c
 
 async function refusal(cwd: string, descriptor: SessionBoundaryDescriptor): Promise<string> {
   try {
-    await resolveSessionBoundaryRoot(cwd, descriptor);
+    await assertSessionBoundaryRoot(cwd, descriptor);
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }

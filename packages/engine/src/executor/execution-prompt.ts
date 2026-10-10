@@ -251,11 +251,11 @@ ${pluginTaskContributions}
 
 You are running in an **isolated git worktree**. This means:
 
-- **All code changes must be made inside the current worktree directory.** Do not modify files outside the worktree.
+- **All code changes must be made inside the current worktree directory.** Do not create, edit, move or delete files outside it unless the task explicitly directs you to another repository or directory. Your branch lives in this worktree; edits made elsewhere bypass review and merge and can overwrite another session's work.
 - **Exception — Project memory:** You MAY read and write to files under \`.fusion/memory/\` at the project root to save durable project learnings.
 - **Exception — Task attachments:** You MAY read files under \`.fusion/tasks/{taskId}/attachments/\` at the project root for context.
 - **Exception — Sibling task specs:** You MAY read \`.fusion/tasks/{taskId}/PROMPT.md\` and \`.fusion/tasks/{taskId}/task.json\` at the project root (read-only) to consult dependency tasks' specifications. If those files do not exist, the dependency has been archived — call \`fn_task_show\` with its ID to load the spec from the archive.
-- **Shell commands** run inside the worktree by default. Avoid using \`cd\` to navigate outside the worktree.
+- **Shell commands** run inside the worktree by default. Reading outside it (other repositories, installed tools, logs) is fine; writes belong in the worktree, apart from scratch files in the system temp directory.
 
 ## Begin
 

@@ -348,652 +348,36 @@ describe("RTK bash rewrite wrapper", () => {
   });
 });
 
-describe("worktree path boundary helpers", () => {
-  // Test helper functions directly by importing them
-  // Note: These tests verify the boundary logic without needing a full agent session
-  beforeEach(() => {
-    spawnSyncMock.mockReturnValue({ status: 1, stdout: "" });
-    realpathSyncNativeMock.mockImplementation((path: PathLike) => String(path));
+describe("worktree session tools", () => {
+  it("refuses write, edit and bash only in read-only-root sessions", async () => {
+    const makeTool = (name: string) => ({ name, label: name, description: name, parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) });
+    const { wrapToolsWithReadOnlyBoundary } = await import("../pi.js");
+
+    const readOnly = wrapToolsWithReadOnlyBoundary(["read", "grep", "write", "edit", "bash"].map(makeTool) as any, true);
+    for (const tool of readOnly) {
+      const result = await (tool as any).execute("call", { path: "src/file.ts", command: "ls" });
+      if (["write", "edit", "bash"].includes(tool.name)) {
+        expect({ tool: tool.name, result }).toMatchObject({ tool: tool.name, result: { ok: false, error: expect.stringContaining("read-only workspace boundary") } });
+      } else {
+        expect({ tool: tool.name, result }).toEqual({ tool: tool.name, result: { ok: true } });
+      }
+    }
+
+    const tools = ["write", "bash"].map(makeTool);
+    expect(wrapToolsWithReadOnlyBoundary(tools as any, false)).toBe(tools);
   });
 
-  describe("path boundary logic for worktree sessions", () => {
-    it("wraps file tools with boundary validation when cwd is a worktree", async () => {
-      const mockReadTool = {
-        name: "read",
-        label: "Read",
-        description: "Read a file",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [{ type: "text", text: "file content" }] }),
-      };
-
-      // Import the wrapping function
-       
-      const tools = [mockReadTool as any];
-
-      // Simulate wrapping (normally done inside createFnAgent)
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const wrapped = wrapToolsWithBoundary(
-        tools,
-        "/project/.worktrees/fn-001", // worktree path
-        "/project", // project root
-      );
-
-      // Read inside worktree should work
-      const insideResult = await (wrapped[0] as any).execute("call-1", { path: "/project/.worktrees/fn-001/src/file.ts" });
-      expect(insideResult).toEqual({ ok: true, content: [{ type: "text", text: "file content" }] });
-      expect(mockReadTool.execute).toHaveBeenCalled();
-
-      // Reset mock
-      mockReadTool.execute.mockClear();
-
-      // Read outside worktree should be rejected
-      const outsideResult = await (wrapped[0] as any).execute("call-2", { path: "/other/project/file.ts" });
-      expect(outsideResult).toMatchObject({
-        ok: false,
-        error: expect.stringContaining("outside the worktree boundary"),
-      });
-      expect(mockReadTool.execute).not.toHaveBeenCalled();
-    }, 15_000);
-
-    it("allows macOS-canonicalized paths inside the worktree boundary", async () => {
-      const mockBashTool = {
-        name: "bash",
-        label: "Bash",
-        description: "Run a command",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
-      };
-      const worktreePath = "/var/folders/zp/fjh8794n7bl61c_pn1gmdt200000gn/T/fusion-ai-merge-fn-6085-2nTWPZ";
-      const canonicalWorktreePath = "/private/var/folders/zp/fjh8794n7bl61c_pn1gmdt200000gn/T/fusion-ai-merge-fn-6085-2nTWPZ";
-      realpathSyncNativeMock.mockImplementation((path: PathLike) => {
-        const text = String(path);
-        return text.startsWith("/var/folders/") ? `/private${text}` : text;
-      });
-
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const wrapped = wrapToolsWithBoundary(
-        [mockBashTool as any],
-        worktreePath,
-        "/var/folders/zp/fjh8794n7bl61c_pn1gmdt200000gn/T/project",
-      );
-
-      const result = await (wrapped[0] as any).execute("call-1", {
-        command: "pwd",
-        cwd: canonicalWorktreePath,
-      });
-
-      expect(result).toEqual({ ok: true, content: [] });
-      expect(mockBashTool.execute).toHaveBeenCalled();
-    });
-
-    it("rejects symlink escapes through every allowed root across all path-taking tools", async () => {
-      const makeTool = (name: string) => ({
-        name,
-        label: name,
-        description: `${name} a boundary path`,
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
-      });
-      /*
-      FNXC:WorktreeBoundary 2026-08-23-03:44:
-      Symlink-escape coverage must include every filesystem wrapper plus both Bash path surfaces. Read-only aliases and verification cwd checks are part of the same boundary invariant, not optional follow-up cases.
-      */
-      const toolNames = ["read", "glob", "grep", "find", "ls", "write", "edit", "bash", "fn_run_verification"];
-      const tools = toolNames.map(makeTool);
-      const worktreeRoot = "/project/.worktrees/fn-001";
-      const projectRoot = "/project";
-      const hostSkillRoot = "/host/skills";
-      const userSkillRoot = join(homedir(), ".agents", "skills");
-      const externalRoot = "/host/private";
-      const escapeCases = [
-        { symlink: `${worktreeRoot}/escape`, path: `${worktreeRoot}/escape/secret.txt` },
-        { symlink: `${projectRoot}/.fusion/memory/escape`, path: `${projectRoot}/.fusion/memory/escape/secret.txt` },
-        { symlink: `${projectRoot}/.fusion/tasks/FN-001/attachments/escape`, path: `${projectRoot}/.fusion/tasks/FN-001/attachments/escape/secret.txt` },
-        { symlink: `${projectRoot}/.fusion/tasks/FN-002`, path: `${projectRoot}/.fusion/tasks/FN-002/PROMPT.md` },
-        { symlink: `${userSkillRoot}/escape`, path: `${userSkillRoot}/escape/secret.txt` },
-        { symlink: `${hostSkillRoot}/escape`, path: `${hostSkillRoot}/escape/secret.txt` },
-      ];
-      const escapedPaths = new Set(escapeCases.map(({ path }) => posixFixturePath(path)));
-      const symlinkTargets = new Map(escapeCases.map(({ symlink }) => [posixFixturePath(symlink), externalRoot]));
-      realpathSyncNativeMock.mockImplementation((path: PathLike) => {
-        const text = String(path);
-        if (escapedPaths.has(text)) throw new Error("ENOENT");
-        return symlinkTargets.get(text) ?? text;
-      });
-
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const wrapped = wrapToolsWithBoundary(tools as any, worktreeRoot, projectRoot, [hostSkillRoot]);
-
-      for (const { symlink, path } of escapeCases) {
-        for (const tool of wrapped as any[]) {
-          const params = tool.name === "bash"
-            ? { command: "pwd", cwd: symlink }
-            : tool.name === "fn_run_verification"
-              ? { command: "pnpm test", cwd: symlink }
-              : { path };
-          const result = await tool.execute(`call-${tool.name}-${symlink}`, params);
-          expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-        }
-
-        const wrappedBash = (wrapped as any[]).find((tool) => tool.name === "bash");
-        const commandTargetResult = await wrappedBash.execute(`call-bash-command-${symlink}`, {
-          command: `cd ${symlink} && pwd`,
-          cwd: worktreeRoot,
-        });
-        expect(commandTargetResult).toMatchObject({
-          ok: false,
-          error: expect.stringContaining("outside the worktree boundary"),
-        });
-      }
-      for (const tool of tools) {
-        expect(tool.execute).not.toHaveBeenCalled();
-      }
-    });
-
-    it("allows project root .fusion/memory/ files from worktree session", async () => {
-      const mockReadTool = {
-        name: "read",
-        label: "Read",
-        description: "Read a file",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [{ type: "text", text: "memory content" }] }),
-      };
-
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-
-      const wrapped = wrapToolsWithBoundary(
-        [mockReadTool as any],
-        "/project/.worktrees/fn-001",
-        "/project",
-      );
-
-      // Reading project root .fusion/memory/ files should be allowed
-      const result = await (wrapped[0] as any).execute("call-1", { path: "/project/.fusion/memory/MEMORY.md" });
-      expect(mockReadTool.execute).toHaveBeenCalled();
-      expect(result).toEqual({ ok: true, content: [{ type: "text", text: "memory content" }] });
-
-      // Reading project root .fusion/memory/MEMORY.md should also be allowed
-      mockReadTool.execute.mockClear();
-      const memoryResult = await (wrapped[0] as any).execute("call-2", { path: "/project/.fusion/memory/MEMORY.md" });
-      expect(mockReadTool.execute).toHaveBeenCalled();
-      expect(memoryResult).toEqual({ ok: true, content: [{ type: "text", text: "memory content" }] });
-
-      // Reading project root .fusion/memory/2026-04-18.md should also be allowed
-      mockReadTool.execute.mockClear();
-      const dailyResult = await (wrapped[0] as any).execute("call-3", { path: "/project/.fusion/memory/2026-04-18.md" });
-      expect(mockReadTool.execute).toHaveBeenCalled();
-      expect(dailyResult).toEqual({ ok: true, content: [{ type: "text", text: "memory content" }] });
-
-      // Reading project root .fusion/memory/DREAMS.md should also be allowed
-      mockReadTool.execute.mockClear();
-      const dreamsResult = await (wrapped[0] as any).execute("call-4", { path: "/project/.fusion/memory/DREAMS.md" });
-      expect(mockReadTool.execute).toHaveBeenCalled();
-      expect(dreamsResult).toEqual({ ok: true, content: [{ type: "text", text: "memory content" }] });
-    });
-
-    it("allows daily memory files under .fusion/memory from worktree session", async () => {
-      const mockReadTool = {
-        name: "read",
-        label: "Read",
-        description: "Read a file",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [{ type: "text", text: "daily memory" }] }),
-      };
-
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-
-      const wrapped = wrapToolsWithBoundary(
-        [mockReadTool as any],
-        "/project/.worktrees/fn-001",
-        "/project",
-      );
-
-      const result = await (wrapped[0] as any).execute("call-1", { path: "/project/.fusion/memory/2026-04-19.md" });
-      expect(mockReadTool.execute).toHaveBeenCalled();
-      expect(result).toEqual({ ok: true, content: [{ type: "text", text: "daily memory" }] });
-    });
-
-    it("rejects bash command targets and verification cwd outside the same boundary", async () => {
-      const makeTool = (name: string) => ({ name, label: name, description: name, parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) });
-      const bash = makeTool("bash");
-      const verification = makeTool("fn_run_verification");
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const wrapped = wrapToolsWithBoundary([bash, verification] as any, "/project/.worktrees/fn-158", "/project");
-
-      const bashResult = await (wrapped[0] as any).execute("bash", { command: "cd ../../other-repo && touch x" });
-      const verificationResult = await (wrapped[1] as any).execute("verify", { cwd: "/project/other-repo", command: "pnpm test" });
-
-      expect(bashResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      expect(verificationResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      expect(bash.execute).not.toHaveBeenCalled();
-      expect(verification.execute).not.toHaveBeenCalled();
-    });
-
-    it("rejects bash command text naming this platform's native absolute path outside the boundary", async () => {
-      // On Windows this is a drive-qualified path (C:\host\private), which the text inspection once ignored.
-      const bash = { name: "bash", label: "bash", description: "bash", parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) };
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const wrapped = wrapToolsWithBoundary([bash] as any, "/project/.worktrees/fn-158", "/project");
-      const outside = nativeFixturePath("/host/private");
-
-      for (const command of [`cd ${outside} && touch x`, `touch ${outside.replace(/\\/g, "/")}/x`]) {
-        const result = await (wrapped[0] as any).execute("bash", { command });
-        expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      }
-      expect(bash.execute).not.toHaveBeenCalled();
-    });
-
-    /*
-    FNXC:WorkspaceBoundary 2026-10-07-17:57:
-    Boundary decisions must be the same for every spelling of the same path: quoted or unquoted, either separator, paths with spaces, parent traversal with `..`, `../` or `..\`, UNC, `~`, and `cd`/`pushd`/`git -C` operands.
-    Win32 has no kernel sandbox backend, so this text check is the only bash boundary there.
-    */
-    it("rejects every quoted, backslash-relative, UNC and home spelling of an outside target", async () => {
-      const bash = { name: "bash", label: "bash", description: "bash", parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) };
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const wrapped = wrapToolsWithBoundary([bash] as any, "/project/.worktrees/fn-158", "/project");
-      const outside = nativeFixturePath("/host/private");
-      const outsideForward = outside.replace(/\\/g, "/");
-      const outsideWithSpace = nativeFixturePath("/host/with space");
-
-      const commands = [
-        `cd "${outside}" && touch x`,
-        `cd '${outsideForward}' && touch x`,
-        `pushd "${outside}"`,
-        `git -C "${outsideForward}" commit -am x`,
-        `git -C '${outside}' status`,
-        `cd "${outsideWithSpace}" && touch x`,
-        `touch "${outsideForward}/new file.txt"`,
-        `echo x >"${outsideForward}/out.txt"`,
-        `cd "../.." && touch x`,
-        `cd '..' && touch x`,
-        `cd .. && touch x`,
-        "cd ..\\..\\other && touch x",
-        "cd \"..\\..\\other\" && touch x",
-        "type \\\\server\\share\\secret.txt",
-        "cd ~ && touch x",
-        "cat ~/notes.txt",
-      ];
-      for (const command of commands) {
-        const result = await (wrapped[0] as any).execute("bash", { command });
-        expect({ command, result }).toMatchObject({ command, result: { ok: false, error: expect.stringContaining("outside the worktree boundary") } });
-      }
-      expect(bash.execute).not.toHaveBeenCalled();
-    });
-
-    it("allows device sinks and quoted in-worktree targets in bash commands", async () => {
-      const bash = { name: "bash", label: "bash", description: "bash", parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) };
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const worktree = nativeFixturePath("/project/.worktrees/fn-158");
-      const wrapped = wrapToolsWithBoundary([bash] as any, "/project/.worktrees/fn-158", "/project");
-
-      const commands = [
-        "pnpm build > /dev/null 2>&1",
-        "git status 2>/dev/null",
-        "pnpm lint >/dev/null",
-        "echo ok > NUL",
-        `cd "${worktree}/packages" && ls`,
-        `cd '${worktree.replace(/\\/g, "/")}/src' && ls`,
-        `git -C "${worktree}" status`,
-        "git log HEAD..main",
-        "curl https://registry.npmjs.org/react",
-      ];
-      for (const command of commands) {
-        bash.execute.mockClear();
-        const result = await (wrapped[0] as any).execute("bash", { command });
-        expect({ command, result }).toEqual({ command, result: { ok: true } });
-        expect(bash.execute).toHaveBeenCalledTimes(1);
-      }
-    });
-
-    it("resolves Git Bash /c/... spellings of the worktree as inside on win32", async () => {
-      const bash = { name: "bash", label: "bash", description: "bash", parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) };
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const worktree = nativeFixturePath("/project/.worktrees/fn-158");
-      const wrapped = wrapToolsWithBoundary([bash] as any, "/project/.worktrees/fn-158", "/project");
-      // On win32 C:\project\... is spelled /c/project/... by Git Bash; on POSIX the native spelling is already /project/...
-      const gitBashSpelling = worktree.replace(/^([A-Za-z]):[\\/]/, (_m, drive: string) => `/${drive.toLowerCase()}/`).replace(/\\/g, "/");
-
-      const result = await (wrapped[0] as any).execute("bash", { command: `cd ${gitBashSpelling}/src && touch x` });
-      expect(result).toEqual({ ok: true });
-    });
-
-    it("translates MSYS drive paths only on win32", async () => {
-      const { translateMsysDrivePath } = await import("../pi.js");
-      expect(translateMsysDrivePath("/c/Users/x/repo", "win32")).toBe("C:\\Users\\x\\repo");
-      expect(translateMsysDrivePath("/d", "win32")).toBe("D:\\");
-      expect(translateMsysDrivePath("/cache/x", "win32")).toBe("/cache/x");
-      expect(translateMsysDrivePath("/c/Users/x/repo", "linux")).toBe("/c/Users/x/repo");
-    });
-
-    it("allows task attachments from worktree session", async () => {
-      const mockReadTool = {
-        name: "read",
-        label: "Read",
-        description: "Read a file",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [{ type: "text", text: "attachment content" }] }),
-      };
-
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-       
-      const wrapped = wrapToolsWithBoundary(
-        [mockReadTool as any],
-        "/project/.worktrees/fn-001",
-        "/project",
-      );
-
-      // Reading task attachment should be allowed
-      const result = await (wrapped[0] as any).execute("call-1", { path: "/project/.fusion/tasks/FN-001/attachments/screenshot.png" });
-      expect(mockReadTool.execute).toHaveBeenCalled();
-      expect(result).toEqual({ ok: true, content: [{ type: "text", text: "attachment content" }] });
-    });
-
-    it("allows only read/glob/grep under host-advertised skill roots", async () => {
-      const makeTool = (name: string) => ({
-        name,
-        label: name,
-        description: `${name} a skill file`,
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
-      });
-      const skillRoot = "/Users/agent/.fusion/plugins/de-sloppify/skills";
-      const skillPath = `${skillRoot}/de-sloppify/references/style.md`;
-      const [readTool, globTool, grepTool, writeTool, editTool, bashTool] = [
-        makeTool("read"),
-        makeTool("glob"),
-        makeTool("grep"),
-        makeTool("write"),
-        makeTool("edit"),
-        makeTool("bash"),
-      ];
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const wrapped = wrapToolsWithBoundary(
-        [readTool, globTool, grepTool, writeTool, editTool, bashTool] as any,
-        "/project/.worktrees/fn-8466",
-        "/project",
-        [skillRoot],
-      );
-
-      for (const tool of wrapped.slice(0, 3) as any[]) {
-        await tool.execute(`call-${tool.name}`, { path: skillPath });
-      }
-      expect(readTool.execute).toHaveBeenCalledOnce();
-      expect(globTool.execute).toHaveBeenCalledOnce();
-      expect(grepTool.execute).toHaveBeenCalledOnce();
-
-      for (const tool of wrapped.slice(3, 5) as any[]) {
-        const result = await tool.execute(`call-${tool.name}`, { path: skillPath });
-        expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      }
-      expect(writeTool.execute).not.toHaveBeenCalled();
-      expect(editTool.execute).not.toHaveBeenCalled();
-
-      const bashResult = await (wrapped[5] as any).execute("call-bash", { command: "pwd", cwd: skillRoot });
-      expect(bashResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      expect(bashTool.execute).not.toHaveBeenCalled();
-
-      const outsideResult = await (wrapped[0] as any).execute("call-outside", { path: "/other/project/secret" });
-      expect(outsideResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      expect(readTool.execute).toHaveBeenCalledOnce();
-    });
-
-    it("allows read/glob/grep/find/ls under the standard user agent skill root without symlink escapes", async () => {
-      const makeTool = (name: string) => ({
-        name,
-        label: name,
-        description: `${name} a user skill file`,
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
-      });
-      const userAgentRoot = join(homedir(), ".agents");
-      const userSkillRoot = join(userAgentRoot, "skills");
-      const skillPath = join(userSkillRoot, "code-review", "SKILL.md");
-      /*
-      FNXC:SkillReadBoundary 2026-08-23-03:54:
-      Every read-only filesystem alias must share the user-skill allowance and symlink-escape denial. Cover `find` and `ls` alongside `read`, `glob`, and `grep` so aliases cannot drift into a broader or narrower host boundary.
-      */
-      const [readTool, globTool, grepTool, findTool, lsTool, writeTool, editTool, bashTool] = [
-        makeTool("read"),
-        makeTool("glob"),
-        makeTool("grep"),
-        makeTool("find"),
-        makeTool("ls"),
-        makeTool("write"),
-        makeTool("edit"),
-        makeTool("bash"),
-      ];
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const wrapped = wrapToolsWithBoundary(
-        [readTool, globTool, grepTool, findTool, lsTool, writeTool, editTool, bashTool] as any,
-        "/project/.worktrees/fn-user-skills",
-        "/project",
-      );
-
-      for (const tool of wrapped.slice(0, 5) as any[]) {
-        await tool.execute(`call-${tool.name}`, { path: skillPath });
-      }
-      expect(readTool.execute).toHaveBeenCalledOnce();
-      expect(globTool.execute).toHaveBeenCalledOnce();
-      expect(grepTool.execute).toHaveBeenCalledOnce();
-      expect(findTool.execute).toHaveBeenCalledOnce();
-      expect(lsTool.execute).toHaveBeenCalledOnce();
-
-      for (const tool of wrapped.slice(5, 7) as any[]) {
-        const result = await tool.execute(`call-${tool.name}`, { path: skillPath });
-        expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      }
-      expect(writeTool.execute).not.toHaveBeenCalled();
-      expect(editTool.execute).not.toHaveBeenCalled();
-
-      const bashResult = await (wrapped[7] as any).execute("call-bash", { command: "pwd", cwd: userSkillRoot });
-      expect(bashResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      expect(bashTool.execute).not.toHaveBeenCalled();
-
-      const siblingConfigResult = await (wrapped[0] as any).execute("call-config", {
-        path: join(userAgentRoot, "config.json"),
-      });
-      expect(siblingConfigResult).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      expect(readTool.execute).toHaveBeenCalledOnce();
-
-      const symlinkDir = join(userSkillRoot, "linked-config");
-      const symlinkEscapePath = join(symlinkDir, "config.json");
-      realpathSyncNativeMock.mockImplementation((path: PathLike) => {
-        const text = String(path);
-        if (text === posixFixturePath(symlinkEscapePath)) throw new Error("ENOENT");
-        return text === posixFixturePath(symlinkDir) ? userAgentRoot : text;
-      });
-      for (const tool of wrapped.slice(0, 5) as any[]) {
-        const result = await tool.execute(`call-${tool.name}-symlink`, { path: symlinkEscapePath });
-        expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      }
-      expect(readTool.execute).toHaveBeenCalledOnce();
-      expect(globTool.execute).toHaveBeenCalledOnce();
-      expect(grepTool.execute).toHaveBeenCalledOnce();
-      expect(findTool.execute).toHaveBeenCalledOnce();
-      expect(lsTool.execute).toHaveBeenCalledOnce();
-    });
-
-    it("rejects host skill paths when no read-only extra roots are provided", async () => {
-      const mockReadTool = {
-        name: "read",
-        label: "Read",
-        description: "Read a file",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
-      };
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const wrapped = wrapToolsWithBoundary([mockReadTool as any], "/project/.worktrees/fn-8466", "/project");
-
-      const result = await (wrapped[0] as any).execute("call-1", {
-        path: "/Users/agent/.fusion/plugins/de-sloppify/skills/de-sloppify/SKILL.md",
-      });
-      expect(result).toMatchObject({ ok: false, error: expect.stringContaining("outside the worktree boundary") });
-      expect(mockReadTool.execute).not.toHaveBeenCalled();
-    });
-
-    it("canonicalizes macOS-style skill roots before allowing reads", async () => {
-      const skillRoot = "/var/folders/fn-8466/plugin/skills";
-      const canonicalSkillPath = "/private/var/folders/fn-8466/plugin/skills/de-sloppify/SKILL.md";
-      const mockReadTool = {
-        name: "read",
-        label: "Read",
-        description: "Read a file",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
-      };
-      realpathSyncNativeMock.mockImplementation((path: PathLike) => {
-        const text = String(path);
-        return text.startsWith("/var/") ? `/private${text}` : text;
-      });
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-      const wrapped = wrapToolsWithBoundary(
-        [mockReadTool as any],
-        "/project/.worktrees/fn-8466",
-        "/project",
-        [skillRoot],
-      );
-
-      const result = await (wrapped[0] as any).execute("call-1", { path: canonicalSkillPath });
-      expect(result).toEqual({ ok: true, content: [] });
-      expect(mockReadTool.execute).toHaveBeenCalledOnce();
-    });
-
-    it("normalizes one stable skill-root list for resource loading and boundary wiring", async () => {
-      const { normalizeAdditionalSkillPaths } = await import("../pi.js");
-      expect(normalizeAdditionalSkillPaths(["/skills/plugin", "", "/skills/plugin/", "/skills/ce"])).toEqual([
-        nativeFixturePath("/skills/plugin"),
-        nativeFixturePath("/skills/ce"),
-      ]);
-
-      const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
-      const source = fs.readFileSync(`${process.cwd()}/src/pi.ts`, "utf8");
-      expect(source).toContain("const normalizedAdditionalSkillPaths = normalizeAdditionalSkillPaths(options.additionalSkillPaths);");
-      expect(source).toContain("additionalSkillPaths: normalizedAdditionalSkillPaths");
-      expect(source).toMatch(/wrapToolsWithBoundary\(\s*toolsWithActionGate,\s*boundaryContext\.worktreePath,\s*boundaryContext\.worktreeProjectRoot,\s*normalizedAdditionalSkillPaths,/);
-    });
-
-    it("does not wrap tools when cwd is not a worktree", async () => {
-      const mockTool = {
-        name: "read",
-        label: "Read",
-        description: "Read a file",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
-      };
-
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-       
-      const wrapped = wrapToolsWithBoundary([mockTool as any], null, null);
-
-      // Should be the same tool, not wrapped
-      expect(wrapped[0]).toBe(mockTool);
-
-      // Any path should work
-      await (wrapped[0] as any).execute("call-1", { path: "/any/path/file.ts" });
-      expect(mockTool.execute).toHaveBeenCalled();
-    });
-
-    it("wraps only file tools, not other tools", async () => {
-      const mockTaskTool = {
-        name: "fn_task_create",
-        label: "Create Task",
-        description: "Create a task",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
-      };
-
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-       
-      const wrapped = wrapToolsWithBoundary(
-        [mockTaskTool as any],
-        "/project/.worktrees/fn-001",
-        "/project",
-      );
-
-      // fn_task_create should be unchanged (not wrapped)
-      expect(wrapped[0]).toBe(mockTaskTool);
-    });
-
-    it("rejects write to paths outside worktree", async () => {
-      const mockWriteTool = {
-        name: "write",
-        label: "Write",
-        description: "Write a file",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
-      };
-
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-       
-      const wrapped = wrapToolsWithBoundary(
-        [mockWriteTool as any],
-        "/project/.worktrees/fn-001",
-        "/project",
-      );
-
-      // Writing outside worktree should be rejected
-      const result = await (wrapped[0] as any).execute("call-1", { path: "/another/project/file.ts" });
-      expect(result).toMatchObject({
-        ok: false,
-        error: expect.stringContaining("outside the worktree boundary"),
-      });
-      expect(mockWriteTool.execute).not.toHaveBeenCalled();
-    });
-
-    it("rejects bash commands with cwd outside worktree", async () => {
-      const mockBashTool = {
-        name: "bash",
-        label: "Bash",
-        description: "Run a command",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [] }),
-      };
-
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-       
-      const wrapped = wrapToolsWithBoundary(
-        [mockBashTool as any],
-        "/project/.worktrees/fn-001",
-        "/project",
-      );
-
-      // Bash with cwd outside worktree should be rejected
-      const result = await (wrapped[0] as any).execute("call-1", { command: "ls -la", cwd: "/another/project" });
-      expect(result).toMatchObject({
-        ok: false,
-        error: expect.stringContaining("outside the worktree boundary"),
-      });
-      expect(mockBashTool.execute).not.toHaveBeenCalled();
-    });
-
-    it("allows bash commands without cwd or with cwd inside worktree", async () => {
-      const mockBashTool = {
-        name: "bash",
-        label: "Bash",
-        description: "Run a command",
-        parameters: {},
-        execute: vi.fn().mockResolvedValue({ ok: true, content: [{ type: "text", text: "ls result" }] }),
-      };
-
-      const { wrapToolsWithBoundary } = await import("../pi.js");
-       
-      const wrapped = wrapToolsWithBoundary(
-        [mockBashTool as any],
-        "/project/.worktrees/fn-001",
-        "/project",
-      );
-
-      // Bash without cwd should work
-      let result = await (wrapped[0] as any).execute("call-1", { command: "ls -la" });
-      expect(mockBashTool.execute).toHaveBeenCalled();
-
-      mockBashTool.execute.mockClear();
-
-      // Bash with cwd inside worktree should work
-      result = await (wrapped[0] as any).execute("call-2", { command: "ls -la", cwd: "/project/.worktrees/fn-001" });
-      expect(mockBashTool.execute).toHaveBeenCalled();
-    });
+  it("normalizes one stable skill-root list for resource loading", async () => {
+    const { normalizeAdditionalSkillPaths } = await import("../pi.js");
+    expect(normalizeAdditionalSkillPaths(["/skills/plugin", "", "/skills/plugin/", "/skills/ce"])).toEqual([
+      nativeFixturePath("/skills/plugin"),
+      nativeFixturePath("/skills/ce"),
+    ]);
+
+    const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
+    const source = fs.readFileSync(`${process.cwd()}/src/pi.ts`, "utf8");
+    expect(source).toContain("const normalizedAdditionalSkillPaths = normalizeAdditionalSkillPaths(options.additionalSkillPaths);");
+    expect(source).toContain("additionalSkillPaths: normalizedAdditionalSkillPaths");
   });
 });
 
@@ -1211,24 +595,6 @@ describe("wrapToolsWithPermanentAgentGating", () => {
 
     await (wrapped[0] as any).execute("t1", { path: "a.ts" });
     expect(createApprovalRequest).not.toHaveBeenCalled();
-    expect(tool.execute).not.toHaveBeenCalled();
-  });
-
-  it("lets boundary rejections fire before permanent-agent gating", async () => {
-    const tool = { name: "write", label: "Write", description: "", parameters: {}, execute: vi.fn() };
-    const { wrapToolsWithPermanentAgentGating, wrapToolsWithBoundary } = await import("../pi.js");
-    const gated = wrapToolsWithPermanentAgentGating([tool as any], {
-      permissionPolicy: {
-        presetId: "locked-down",
-        rules: { file_write_delete: "block" },
-      },
-    });
-    const wrapped = wrapToolsWithBoundary(gated as any, "/project/.worktrees/fn-001", "/project");
-
-    const result = await (wrapped[0] as any).execute("t1", { path: "/project/README.md" });
-    expect((result as any).isError).toBe(true);
-    expect((result as any).error).toContain("outside the worktree boundary");
-    expect((result as any).details).toBeUndefined();
     expect(tool.execute).not.toHaveBeenCalled();
   });
 
@@ -2055,6 +1421,54 @@ describe("createFnAgent", () => {
     });
 
     expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+  });
+
+  /*
+  FNXC:WorkspaceBoundary 2026-10-10-17:34:
+  Agents are instructed to stay in their task worktree, not path-restricted.
+  A project may span several repositories and directories, so a worktree session's file and shell tools must reach paths outside the worktree.
+  */
+  it("lets worktree session tools reach paths outside the worktree", async () => {
+    existsSyncMock.mockImplementation((path) => {
+      const value = String(path);
+      return value === "/project/.worktrees/fn-001" ||
+        value === "/project/.worktrees/fn-001/.git";
+    });
+    execSyncMock.mockImplementation((cmd) => {
+      if (cmd === "git rev-parse --show-toplevel") {
+        return "/project/.worktrees/fn-001\n";
+      }
+      return "worktree /project\nHEAD abc123\nbranch refs/heads/main\n\n" +
+        "worktree /project/.worktrees/fn-001\nHEAD def456\nbranch refs/heads/fusion/fn-001\n";
+    });
+    const makeTool = (name: string) => ({ name, label: name, description: name, parameters: {}, execute: vi.fn().mockResolvedValue({ ok: true }) });
+    const callerTools = ["read", "write", "bash", "fn_run_verification"].map(makeTool);
+
+    const { createPiAgentSessionRaw: createFnAgent } = await import("../pi.js");
+    await createFnAgent({
+      cwd: "/project/.worktrees/fn-001",
+      systemPrompt: "test",
+      tools: "coding",
+      customTools: callerTools as any,
+      defaultProvider: "openai-codex",
+      defaultModelId: "gpt-5.4",
+    });
+
+    const { customTools } = createAgentSessionMock.mock.calls[0][0] as { customTools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> };
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["read", { path: "/project/other-repo/README.md" }],
+      ["write", { path: "/project/other-repo/notes.md", content: "x" }],
+      ["bash", { command: "cd ../../other-repo && touch x > ../../../out.txt" }],
+      ["bash", { command: "ls", cwd: "/project/other-repo" }],
+      ["fn_run_verification", { command: "pnpm test", cwd: "/project/other-repo" }],
+    ];
+    for (const [name, params] of calls) {
+      // The mocked built-in tools carry no execute, so pick the caller-supplied tool of the same name.
+      const tool = customTools.findLast((candidate) => candidate.name === name)!;
+      const result = await tool.execute("call", params);
+      expect({ name, params, result }).toEqual({ name, params, result: { ok: true } });
+    }
+    for (const tool of callerTools) expect(tool.execute).toHaveBeenCalled();
   });
 
   it("resolves project root from worktree cwd for convenience skills parameter", async () => {
