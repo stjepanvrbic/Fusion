@@ -89,7 +89,13 @@ function describeResultFailure(msg: ClaudeResultMessage): string | undefined {
     msg.result ||
     msg.error ||
     "no error detail";
-  return `Claude CLI result ${msg.subtype}${msg.is_error ? " (is_error)" : ""}: ${detail}`;
+  /*
+   * FNXC:ClaudeCliRateLimit 2026-10-10-17:50:
+   * A subscription usage limit reports the CLI's own limit notice as the result text, with no status code, so Fusion's usage-limit classifier could not recognise it and the turn read as a generic failure.
+   * The documented `api_error_status` field carries the HTTP status (429 for a rate limit); including it lets the engine's retry ladder and rate-limit freeze recognise CLI limits.
+   */
+  const status = typeof msg.api_error_status === "number" ? ` (HTTP ${msg.api_error_status})` : "";
+  return `Claude CLI result ${msg.subtype}${msg.is_error ? " (is_error)" : ""}${status}: ${detail}`;
 }
 
 /** Extended stream options: pi's SimpleStreamOptions plus optional cwd and mcpConfigPath */

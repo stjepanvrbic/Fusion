@@ -23,6 +23,7 @@ import { WorkflowReviewService } from "../workflows/workflow-review-service.js";
 import { classifyMergeRequesterRejection, MERGE_BOUNDARY_UNPROVEN_VALUE } from "../workflows/workflow-merge-nodes.js";
 import { SESSION_CONTENTION_HOLD_VALUE } from "../workflows/workflow-graph-executor.js";
 import { isSessionContentionError } from "../errors/transient-error-patterns.js";
+import { withRateLimitRetry } from "../errors/rate-limit-retry.js";
 import { mergeEffectiveSettings } from "../project/effective-settings.js";
 import { resolveReviewCheckoutCwd } from "../execution/review-checkout.js";
 import { logReviewCheckoutRouting } from "./review-checkout-routing.js";
@@ -129,6 +130,7 @@ export type CreateAuthoritativeWorkflowSeamsDeps = {
   graphStepActiveContext: Map<string, unknown>;
   graphRethinkNarrations: Map<string, unknown>;
   pausedAborted: Set<string>;
+  activeWorkflowGraphAbortControllers: Map<string, AbortController>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   mergeRequester?: ((taskId: string, opts?: any) => Promise<any>) | null;
   getRunContextFor: (taskId: string) => EngineRunContext | undefined;
@@ -530,9 +532,20 @@ export function createAuthoritativeWorkflowSeams(
               onSessionEnded: (s) => deps.unregisterSubagentSession(seamTask.id, s),
             },
           });
+        /*
+        FNXC:ClaudeCliRateLimit 2026-10-10-17:54:
+        A Claude CLI rate limit is often cleared within a minute by account rotation, so step reviews wait on the shared in-place ladder before reporting the reviewer unavailable.
+        The wait runs outside the semaphore so a waiting review holds no agent slot.
+        */
         const runForCwd = (cwd: string): Promise<ReviewResult> => {
           const invoke = () => invokeReviewerForCwd(cwd);
-          return sem ? sem.runNested(invoke) : invoke();
+          return withRateLimitRetry(() => (sem ? sem.runNested(invoke) : invoke()), {
+            claudeCliOnly: true,
+            signal: deps.activeWorkflowGraphAbortControllers.get(seamTask.id)?.signal,
+            onRetry: (attempt, delayMs) => {
+              reviewerLog.warn(`${seamTask.id}: step review rate limited by the Claude CLI — retry ${attempt} in ${Math.round(delayMs / 1000)}s`);
+            },
+          });
         };
         /*
         FNXC:RepositoryScope 2026-08-20-23:40:

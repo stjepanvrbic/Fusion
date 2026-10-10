@@ -438,7 +438,8 @@ vi.mock("../execution/step-session-executor.js", () => ({
   ].join("\n"),
 }));
 
-vi.mock("../errors/rate-limit-retry.js", () => ({
+vi.mock("../errors/rate-limit-retry.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../errors/rate-limit-retry.js")>()),
   withRateLimitRetry: vi.fn((fn: () => Promise<unknown>) => fn()),
 }));
 vi.mock("../worktree/worktree-db-hydrate.js", () => ({

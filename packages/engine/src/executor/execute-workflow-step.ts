@@ -63,6 +63,7 @@ import {
   type EnvironmentCapabilityProbe,
 } from "../environment/environment-capabilities.js";
 import { checkSessionError } from "../errors/usage-limit-detector.js";
+import { isClaudeCliRateLimitError, withRateLimitRetry } from "../errors/rate-limit-retry.js";
 import {
   requiredArtifactMissingValue,
   requiredArtifactReadFailedValue,
@@ -196,6 +197,7 @@ export type ExecuteWorkflowStepDeps = {
   };
   activePlanningWorkflowSessions: Set<string>;
   activeWorkflowStepSessions: Map<string, AgentSession>;
+  activeWorkflowGraphAbortControllers: Map<string, AbortController>;
   getRunContextFor: (taskId: string) => EngineRunContext | undefined;
   captureModifiedFiles: AnyFn;
   createSpawnAgentTool: AnyFn;
@@ -209,6 +211,13 @@ export type ExecuteWorkflowStepDeps = {
   resolveMcpServers: AnyFn;
   setActiveWorkflowStepSession: AnyFn;
 };
+
+/** Carries a rate-limited step outcome through `withRateLimitRetry`, which retries on thrown errors. */
+class RateLimitedWorkflowStepOutcome extends Error {
+  constructor(readonly outcome: WorkflowStepOutcome) {
+    super(outcome.error);
+  }
+}
 
 export async function executeWorkflowStep(
   deps: ExecuteWorkflowStepDeps,
@@ -894,7 +903,7 @@ CRITICAL SCOPING RULES — read before doing anything else:
     */
     let lastEmittedModelMarker: string | undefined;
 
-    const runOnce = async (
+    const runSessionOnce = async (
       provider: string | undefined,
       modelId: string | undefined,
       attemptLabel: string,
@@ -1516,6 +1525,46 @@ CRITICAL SCOPING RULES — read before doing anything else:
         }
         // Suppress unused-variable warning; `timedOut` documents intent.
         void timedOut;
+      }
+    };
+
+    /*
+    FNXC:ClaudeCliRateLimit 2026-10-10-17:54:
+    Review steps record a failed outcome instead of throwing, and a rate-limited outcome enters the external-block freeze (5 min first resume).
+    A Claude CLI rate limit is often cleared within a minute by account rotation, so it first gets the shared in-place ladder from `withRateLimitRetry`; each retry opens a new session, which spawns a fresh `claude` process.
+    Other failures, including rate limits from other providers, keep their existing routing.
+    */
+    const runOnce = async (
+      provider: string | undefined,
+      modelId: string | undefined,
+      attemptLabel: string,
+    ): Promise<WorkflowStepOutcome> => {
+      const signal = deps.activeWorkflowGraphAbortControllers.get(task.id)?.signal;
+      let rateLimitedOutcome: WorkflowStepOutcome | undefined;
+      try {
+        return await withRateLimitRetry(async () => {
+          const outcome = await runSessionOnce(provider, modelId, attemptLabel);
+          if (!outcome.success && typeof outcome.error === "string" && isClaudeCliRateLimitError(outcome.error)) {
+            rateLimitedOutcome = outcome;
+            throw new RateLimitedWorkflowStepOutcome(outcome);
+          }
+          return outcome;
+        }, {
+          claudeCliOnly: true,
+          signal,
+          onRetry: (attempt, delayMs) => {
+            const message = `Workflow step '${workflowStep.name}' rate limited by the Claude CLI — retry ${attempt} in ${Math.round(delayMs / 1000)}s`;
+            executorLog.warn(`${task.id}: ${message}`);
+            deps.store.logEntry(task.id, message, undefined, deps.getRunContextFor(task.id)).catch((err: unknown) => {
+              executorLog.warn(`${task.id}: failed to log workflow step rate-limit retry: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          },
+        });
+      } catch (err) {
+        if (err instanceof RateLimitedWorkflowStepOutcome) return err.outcome;
+        // A cancelled wait reports the rate-limited outcome it was waiting on, so the step records the provider failure.
+        if (signal?.aborted && rateLimitedOutcome) return rateLimitedOutcome;
+        throw err;
       }
     };
 

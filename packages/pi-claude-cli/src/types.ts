@@ -18,6 +18,8 @@ export interface ClaudeResultMessage {
   type: "result";
   subtype: "success" | "error_max_turns" | "error_during_execution" | (string & {});
   is_error?: boolean;
+  /** HTTP status of the API error that ended the turn; absent or null when the turn ended without one. */
+  api_error_status?: number | null;
   result?: string;
   /** Diagnostics on `error_*` results. */
   errors?: string[];

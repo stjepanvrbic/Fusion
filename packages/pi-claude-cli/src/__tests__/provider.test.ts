@@ -90,6 +90,7 @@ vi.mock("@earendil-works/pi-ai/providers/all", () => ({
 import { spawn } from "node:child_process";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { streamViaCli } from "../provider";
+import { CLAUDE_CLI_FAILURE_MARKER } from "../turn-failure";
 
 /** The terminal events (`done` or `error`) a turn pushed. */
 function terminalEvents(mockStream: any): any[] {
@@ -2030,11 +2031,12 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       { subtype: "error_max_turns" },
       { subtype: "error_during_execution", errors: ["tool crashed"] },
       { subtype: "success", is_error: true, result: "Credit balance is too low" },
+      { subtype: "success", is_error: true, api_error_status: 429, result: "You've hit your limit · resets 3pm" },
     ];
 
     for (const session of sessions) {
       for (const result of failureResults) {
-        it(`fails the turn on a ${result.subtype}${result.is_error ? "+is_error" : ""} result (${session.name})`, async () => {
+        it(`fails the turn on a ${result.subtype}${result.is_error ? "+is_error" : ""}${result.api_error_status ? `+HTTP ${result.api_error_status}` : ""} result (${session.name})`, async () => {
           streamViaCli(mockModels[0] as any, session.context(), session.options as any);
           await vi.advanceTimersByTimeAsync(0);
           const proc = (spawn as any).mock.results[0].value;
@@ -2045,7 +2047,9 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
           const failure = expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
           expect(failure.error.errorMessage).toContain(result.subtype);
           if (result.errors) expect(failure.error.errorMessage).toContain("tool crashed");
-          if (result.result) expect(failure.error.errorMessage).toContain("Credit balance is too low");
+          if (result.result) expect(failure.error.errorMessage).toContain(result.result);
+          if (result.api_error_status) expect(failure.error.errorMessage).toContain("(HTTP 429)");
+          expect(failure.error.errorMessage.startsWith(CLAUDE_CLI_FAILURE_MARKER)).toBe(true);
         });
       }
 

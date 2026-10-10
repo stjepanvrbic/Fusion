@@ -48,6 +48,30 @@ const AUTH_MAX_RETRIES = 2;
  */
 const AUTH_RETRY_DELAY_MS = 5_000;
 
+/*
+FNXC:ClaudeCliRateLimit 2026-10-10-17:52:
+Operators run Claude Code with an account switcher (cswap) that moves the local `claude` login to another subscription account when one nears its usage limit.
+Its auto mode polls usage on an interval (15 s in the operator's setup), so a 429 from the `pi-claude-cli` provider is often cleared within a minute.
+Every retry starts a new session turn, and the provider spawns a fresh `claude` process per turn, which reads the switched credentials.
+The ladder waits 20 s (one poll interval plus margin), then 45 s (about 65 s since the first failure), then 90 s (about 2.5 min in total) before the caller's existing rate-limit handling, such as the external-block freeze, takes over.
+It has its own budget, independent of `maxRetries`, because its purpose is waiting for account rotation rather than for the provider's own limit window.
+*/
+/** Marker the vendored `pi-claude-cli` provider puts in front of every failed turn's error message (`CLAUDE_CLI_FAILURE_MARKER` in its `turn-failure.ts`). */
+export const CLAUDE_CLI_FAILURE_MARKER = "pi-claude-cli: ";
+
+/** Delays before each in-place retry of a Claude CLI usage-limit failure. */
+export const CLAUDE_CLI_RATE_LIMIT_RETRY_DELAYS_MS: readonly number[] = [20_000, 45_000, 90_000];
+
+/** True when a usage-limit failure came from the Claude CLI provider. */
+export function isClaudeCliRateLimitError(message: string): boolean {
+  return message.includes(CLAUDE_CLI_FAILURE_MARKER) && isUsageLimitError(message);
+}
+
+function withJitter(delayMs: number): number {
+  const jitter = delayMs * 0.1 * (2 * Math.random() - 1); // ±10 %
+  return Math.max(0, Math.round(delayMs + jitter));
+}
+
 export interface RateLimitRetryOptions {
   /** Maximum number of retry attempts before re-throwing (default: 3). */
   maxRetries?: number;
@@ -65,6 +89,11 @@ export interface RateLimitRetryOptions {
    * re-throws the last error immediately. Essential for paused / cancelled tasks.
    */
   signal?: AbortSignal;
+  /**
+   * Retry only Claude CLI usage-limit failures and rethrow every other error at once.
+   * For lanes whose other provider failures are owned by a different recovery path.
+   */
+  claudeCliOnly?: boolean;
   /**
    * Optional credential-instance reroute. The finite RotationEvent behind
    * nextInstance owns boundedness; candidateCount is diagnostics only.
@@ -112,16 +141,20 @@ export async function withRateLimitRetry<T>(
     onRetry,
     signal,
     rotation,
+    claudeCliOnly = false,
   } = options;
 
   let lastError: Error | undefined;
   let authRetries = 0;
+  let claudeCliRetries = 0;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (err: unknown) {
       const error = err instanceof Error ? err : new Error(String(err));
+      const claudeCliRateLimit = isClaudeCliRateLimitError(error.message);
+      if (claudeCliOnly && !claudeCliRateLimit) throw error;
       const authError = isTransientAuthError(error.message);
 
       // Non-retryable errors: re-throw immediately — no retry
@@ -143,8 +176,7 @@ export async function withRateLimitRetry<T>(
         // Don't consume a rate-limit attempt for an auth retry
         attempt--;
 
-        const jitter = AUTH_RETRY_DELAY_MS * 0.1 * (2 * Math.random() - 1); // ±10 %
-        const delay = Math.max(0, Math.round(AUTH_RETRY_DELAY_MS + jitter));
+        const delay = withJitter(AUTH_RETRY_DELAY_MS);
 
         onRetry?.(authRetries, delay, error);
 
@@ -167,6 +199,16 @@ export async function withRateLimitRetry<T>(
         continue;
       }
 
+      if (claudeCliRateLimit) {
+        if (claudeCliRetries >= CLAUDE_CLI_RATE_LIMIT_RETRY_DELAYS_MS.length) throw lastError;
+        const delay = withJitter(CLAUDE_CLI_RATE_LIMIT_RETRY_DELAYS_MS[claudeCliRetries]);
+        claudeCliRetries++;
+        attempt--;
+        onRetry?.(claudeCliRetries, delay, error);
+        await sleep(delay, signal);
+        continue;
+      }
+
       // FNXC:ProviderRateLimitIsolation 2026-07-21-18:00: exhaustion parks only
       // the affected provider-routed task instead of stopping the project.
       if (attempt >= maxRetries) {
@@ -175,8 +217,7 @@ export async function withRateLimitRetry<T>(
 
       // Exponential backoff with ±10 % jitter
       const rawDelay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
-      const jitter = rawDelay * 0.1 * (2 * Math.random() - 1); // ±10 %
-      const delay = Math.max(0, Math.round(rawDelay + jitter));
+      const delay = withJitter(rawDelay);
 
       onRetry?.(attempt + 1, delay, error);
 
