@@ -15,7 +15,13 @@
  * version and the ExtensionAPI stream types stay compatible.
  */
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
-import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
+/*
+ * FNXC:ExtensionLoading 2026-10-10-17:40:
+ * Pi loads extensions through jiti with an alias table that maps the bare `@earendil-works/pi-ai` specifier to the `dist/compat.js` file and aliases only `/compat`, `/oauth` and `/providers/all` as subpaths.
+ * jiti aliases match by prefix, so any other subpath (for example `/utils/transcript`) resolves under `compat.js/` and the whole extension fails to load.
+ * Import transcript helpers from the package root, which both the compat entrypoint (under Pi's loader) and the core entrypoint (under Node) export.
+ */
+import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { streamViaCli } from "./src/provider.js";
 import { streamViaAcp } from "./src/acp-driver.js";
