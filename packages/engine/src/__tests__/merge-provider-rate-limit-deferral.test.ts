@@ -55,7 +55,9 @@ import { routeGraphMergeFailureToRetry } from "../executor/route-graph-merge-fai
 import { deferMergeOnProviderRateLimit } from "../external-block/provider-rate-limit-deferral.js";
 import { resumeDueExternalBlocks } from "../external-block/external-block-lifecycle.js";
 import { AUTO_MERGE_RETRY_REJECTED_PREFIX } from "../merge/stale-content-park.js";
-import { MINUTE, T0, createRateLimitStore, reviewCard } from "./fixtures/rate-limit-deferral-store.js";
+import { handleGraphFailure } from "../executor/handle-graph-failure.js";
+import type { WorkflowGraphTaskRunResult } from "../workflows/workflow-graph-task-runner.js";
+import { ANTHROPIC_RATE_LIMIT_429, MINUTE, T0, createRateLimitStore, graphFailureDeps, reviewCard } from "./fixtures/rate-limit-deferral-store.js";
 
 const RAW_MERGE_429 = "429 Too Many Requests: rate limit exceeded";
 
@@ -273,5 +275,68 @@ describe("KB-077 graph-owned merge: a rate-limited merge request freezes instead
     const row = env.rows.get("KB-065")!;
     expect(row.status).toBe("failed");
     expect(row.error).toContain(AUTO_MERGE_RETRY_REJECTED_PREFIX);
+  });
+});
+
+/*
+FNXC:ProviderRateLimitDeferral 2026-10-10-17:24:
+On 2026-10-08 an Anthropic 429 parked AI merges failed with AUTO_MERGE_RETRY_REJECTED after three merge attempts: the graph merge node
+retried in place, the graph failure routed to the bounded merge retry, and that retry's rejection parked the card.
+Every merge entry must freeze on the exact provider payload instead, before any further merge attempt or failed park.
+*/
+describe("an Anthropic 429 on any AI merge path freezes the card instead of parking it failed", () => {
+  function expectFrozenAtMergeGate(env: ReturnType<typeof mergeEnv>) {
+    const row = env.rows.get("KB-065")!;
+    expect(failedWrites(env)).toEqual([]);
+    expect(row.status).toBe("blocked");
+    expect(row.error ?? "").not.toContain(AUTO_MERGE_RETRY_REJECTED_PREFIX);
+    expect(row.column).toBe("in-review");
+    expect(row.externalBlock).toMatchObject({ origin: "model-provider", code: "RATE_LIMIT", message: ANTHROPIC_RATE_LIMIT_429, resume: { nodeId: "merge-gate" } });
+    expect(row.externalBlock?.autoResume?.resumeAt).toBe(new Date(T0 + 5 * MINUTE).toISOString());
+    expect(row.mergeRetries).toBe(0);
+  }
+
+  it("merge pump: a rejected AI merge session", async () => {
+    const env = mergeEnv(mergeCard());
+    testState.runAiMerge.mockRejectedValueOnce(new Error(ANTHROPIC_RATE_LIMIT_429));
+
+    await runMergeCycle(createEngine(env.store));
+
+    expectFrozenAtMergeGate(env);
+  });
+
+  it("graph-owned merge: the merge node's exception freezes before the bounded merge retry is requested", async () => {
+    const env = mergeEnv(mergeCard());
+    const routeGraphMergeFailureToRetry = vi.fn(async () => true);
+    const run = {
+      disposition: "failed",
+      outcome: "failure",
+      visitedNodeIds: ["start", "review", "merge"],
+      context: { "node:merge:outcome": "failure", "node:merge:value": "exception", "node:merge:error": ANTHROPIC_RATE_LIMIT_429 },
+    } as WorkflowGraphTaskRunResult;
+
+    await handleGraphFailure(graphFailureDeps(env, { routeGraphMergeFailureToRetry }), env.rows.get("KB-065")! as never, run);
+
+    expect(routeGraphMergeFailureToRetry).not.toHaveBeenCalled();
+    expectFrozenAtMergeGate(env);
+  });
+
+  it("bounded merge retry: a merge request rejected by the provider", async () => {
+    const env = mergeEnv(mergeCard());
+    const handled = await routeGraphMergeFailureToRetry({
+      store: env.store as never,
+      getRunContextFor: () => undefined,
+      mergeRequester: vi.fn(async () => { throw new Error(ANTHROPIC_RATE_LIMIT_429); }),
+      ensureWorkflowMergeBoundaryTask: vi.fn(async (task) => ({ task })) as never,
+      persistTokenUsage: vi.fn(async () => undefined),
+    }, env.rows.get("KB-065")! as never, {
+      disposition: "failed",
+      outcome: "failure",
+      visitedNodeIds: ["start", "merge"],
+      context: { "node:merge:value": "exception", "node:merge:error": ANTHROPIC_RATE_LIMIT_429 },
+    }, undefined);
+
+    expect(handled).toBe(true);
+    expectFrozenAtMergeGate(env);
   });
 });

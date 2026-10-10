@@ -48,6 +48,8 @@ export const RATE_LIMIT_IR = {
 export const MINUTE = 60_000;
 export const T0 = Date.parse("2026-10-08T10:45:41.000Z");
 export const RAW_429 = "429 Too Many Requests: rate limited";
+/** The exact error text Anthropic returned to AI merge and Post-merge Verification sessions during the 2026-10-08 to 2026-10-10 rate-limit window. */
+export const ANTHROPIC_RATE_LIMIT_429 = `429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."},"request_id":"req_011CfqPMxSfenxinoP3ZC3JA"}`;
 
 export function rateLimitedResult(workflowStepId: string, overrides: Partial<WorkflowStepResult> = {}): WorkflowStepResult {
   const names: Record<string, string> = {
@@ -140,4 +142,42 @@ export function createRateLimitStore(initial: Task[], options: { settings?: Reco
     recordRunAuditEvent: vi.fn(async (event: { mutationType: string; agentId?: string; metadata: Record<string, unknown> }) => { audits.push(event); }),
   };
   return { store, rows, items, audits, logs };
+}
+
+/** Minimal `handleGraphFailure` deps: real store and lanes, inert recovery seams, and a spy for the production no-verdict rerouter. */
+export function graphFailureDeps(env: ReturnType<typeof createRateLimitStore>, overrides: Record<string, unknown> = {}) {
+  const base: Record<string, unknown> = {
+    store: env.store,
+    rootDir: env.store.getRootDir(),
+    options: {},
+    activeWorktrees: new Map(),
+    pausedAborted: new Set(),
+    pausedAbortProvenance: new Map(),
+    userCanceledTaskIds: new Set(),
+    executing: new Set(),
+    resumingUnpaused: new Set(),
+    activeSessions: new Map(),
+    activeStepExecutors: new Map(),
+    activeWorkflowStepSessions: new Map(),
+    activeCliTaskSessions: new Map(),
+    activeWorkflowGraphAbortControllers: new Map(),
+    processWideGraphRouting: new Set(),
+    deferredTerminalParksInFlight: new Set(),
+    getRunContextFor: () => undefined,
+    resolveResumeLanes: vi.fn(async () => ({ hold: "planning", wip: "building", review: "review", wipDeclared: true })),
+    persistTokenUsage: vi.fn(async () => undefined),
+    rerouteFailedNoVerdictPreMergeReview: vi.fn(async () => "rerouted"),
+    requestPreMergeOptionalStepFix: vi.fn(async () => false),
+    hasLiveTaskSessionSurface: vi.fn(() => false),
+    ...overrides,
+  };
+  return new Proxy(base, {
+    get(target, property) {
+      if (property in target) return target[property as string];
+      if (typeof property !== "string" || property === "then") return undefined;
+      // Unlisted id registries are empty sets; every other unlisted seam is an inert async decline.
+      target[property] = /Ids$/.test(property) ? new Set() : vi.fn(async () => false);
+      return target[property];
+    },
+  }) as never;
 }
