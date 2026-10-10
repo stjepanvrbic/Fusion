@@ -81,6 +81,7 @@ function listTouchGeometryProjectsWithDeepEnv(): string[] {
     "--project",
     "dashboard-api",
     // FNXC:WindowsTestPortability 2026-10-08-17:49: KB-087: project membership is a file-level question; --filesOnly answers it without importing the spec, whose describe.runIf(Chromium) would otherwise list zero tests (or throw under CI) on hosts without a discovered browser such as Windows.
+    // FNXC:WindowsTestPortability 2026-10-08-19:36: KB-096: module load no longer throws (see listTouchGeometrySpecRowsUnderCi); --filesOnly stays because deep-env membership is still a file-level question.
     "--filesOnly",
     "--json",
   ]);
@@ -103,6 +104,25 @@ function listTouchGeometryProjectsWithDeepEnv(): string[] {
         .map((row) => row.projectName),
     ),
   ];
+}
+
+/**
+ * FNXC:WindowsTestPortability 2026-10-08-19:36:
+ * KB-096: collecting the touch-geometry spec (importing it, no --filesOnly) under CI must succeed on every host.
+ * With a browser the regression tests are listed; without one the explicit discovery-failure test is listed, so a
+ * browserless CI run still fails at run time (FN-8806) but never at module load.
+ */
+function listTouchGeometrySpecRowsUnderCi(): { file: string; name: string }[] {
+  const launch = resolveShellFreeLaunch("pnpm", ["exec", "vitest", "list", touchGeometrySpec, "--project", "dashboard-browser-touch", "--json"]);
+  const result = spawnSync(launch.command, launch.args, {
+    cwd: dashboardRoot,
+    encoding: "utf8",
+    env: { ...process.env, CI: "1" },
+  });
+  expect(result.status, result.stderr).toBe(0);
+  const rows = JSON.parse(result.stdout) as { file: string; name: string }[];
+  const expectedFile = toForwardSlashes(resolve(touchGeometrySpecPath));
+  return rows.filter((row) => toForwardSlashes(resolve(row.file)) === expectedFile);
 }
 
 describe("dashboard test config guard", () => {
@@ -261,6 +281,9 @@ describe("dashboard test config guard", () => {
 
     // Deep-env contract: the deep API escape hatch must still leave one collection owner.
     expect(listTouchGeometryProjectsWithDeepEnv()).toEqual(["dashboard-browser-touch"]);
+
+    // Collection contract: importing the spec under CI never throws, with or without a discovered browser.
+    expect(listTouchGeometrySpecRowsUnderCi().length).toBeGreaterThan(0);
 
     // Port contract: the browser fixture requests an OS-selected port and never names the production port.
     expect(specSource).toContain("port: 0");

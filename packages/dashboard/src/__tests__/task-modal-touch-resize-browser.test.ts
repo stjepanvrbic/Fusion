@@ -4,9 +4,11 @@ import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import { userInfo } from "node:os";
+import { chromiumLaunchEnv, planChromiumDiscovery, resolveChromiumExecutable } from "./chromium-executable";
 
 const requireFromEngine = createRequire(new URL("../../../engine/package.json", import.meta.url));
-const { chromium } = requireFromEngine("playwright-core") as { chromium: { launch(options: { executablePath: string; headless: boolean; args?: string[] }): Promise<Browser> } };
+const { chromium } = requireFromEngine("playwright-core") as { chromium: { launch(options: { executablePath: string; headless: boolean; args?: string[]; env?: NodeJS.ProcessEnv }): Promise<Browser> } };
 type Browser = { newPage(options: { viewport: { width: number; height: number } }): Promise<Page>; close(): Promise<void> };
 type Page = { goto(url: string): Promise<unknown>; evaluate<T, Arg = undefined>(fn: (arg: Arg) => T, arg?: Arg): Promise<T>; locator(selector: string): Locator; mouse: { move(x: number, y: number): Promise<void>; down(): Promise<void>; up(): Promise<void> }; waitForTimeout(ms: number): Promise<void>; screenshot(options: { path: string }): Promise<void>; close(): Promise<void>; context(): { newCDPSession(page: Page): Promise<Cdp> }; on(event: "console" | "pageerror", listener: (message: { text?(): string; message?: string }) => void): void };
 type Locator = { boundingBox(): Promise<{ x: number; y: number; width: number; height: number } | null> };
@@ -14,10 +16,8 @@ type Cdp = { send(method: string, params: Record<string, unknown>): Promise<unkn
 type Point = { x: number; y: number };
 type Rect = { x: number; y: number; width: number; height: number };
 
-const browserCandidates = process.platform === "darwin"
-  ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium"]
-  : ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
-const executablePath = [process.env.FUSION_BROWSER_SMOKE_BROWSER, process.env.CHROME_BIN, ...browserCandidates].find((candidate): candidate is string => Boolean(candidate) && existsSync(candidate));
+const executablePath = resolveChromiumExecutable({ platform: process.platform, env: process.env, exists: existsSync });
+const discovery = planChromiumDiscovery({ executablePath, env: process.env, platform: process.platform });
 /*
 FNXC:TaskDetailTitle 2026-08-05-19:18:
 FN-8806's acceptance evidence is real Chromium geometry across production hosts. A skipped browser
@@ -30,13 +30,17 @@ CI, or an explicit FUSION_BROWSER_SMOKE_REQUIRE=1 opt-in (the same flag scripts/
 uses for its --require-browser mode). A bare local run on a Chromium-less machine follows the sibling
 planning-browser-e2e.test.ts convention and self-gates via describe.runIf(executablePath) instead of
 failing discovery — the module-load throw was breaking unrelated local runs that merely collected this file.
+
+FNXC:WindowsTestPortability 2026-10-08-19:36:
+KB-096: discovery now lives in ./chromium-executable and probes win32 Chrome/Edge (Program Files, Program Files (x86), LocalAppData).
+The required-but-missing case is an in-suite failing test instead of a module-load throw, so collection (vitest list) never throws on any host.
+FN-8806's contract still holds: a CI or FUSION_BROWSER_SMOKE_REQUIRE=1 run without a browser fails and is never green.
 */
-const browserRequired = Boolean(process.env.CI) || process.env.FUSION_BROWSER_SMOKE_REQUIRE === "1";
-if (!executablePath && browserRequired) {
-  throw new Error(
-    "[task-modal-touch-resize] Chromium is required for task-title stability coverage; set FUSION_BROWSER_SMOKE_BROWSER or CHROME_BIN.",
-  );
-}
+describe.runIf(discovery.kind === "fail")("Task modal tablet touch resize browser discovery", () => {
+  it("finds a Chromium executable for the required browser lane", () => {
+    expect.fail(discovery.kind === "fail" ? discovery.message : "unreachable");
+  });
+});
 const screenshots = path.resolve(process.cwd(), "e2e/__screenshots__/fn-8602");
 const floatingWindowScreenshots = path.resolve(process.cwd(), "e2e/__screenshots__/fn-8605");
 const fn8607Screenshots = path.resolve(process.cwd(), "e2e/__screenshots__/fn-8607");
@@ -186,12 +190,13 @@ Browser CDP gestures are required because jsdom cannot resolve CSS hit targets. 
 both production resize paths and sends CSS-pixel touch input through Chromium so elementFromPoint,
 pointer capture, persistence, and header-drag isolation use the same browser input path.
 */
-describe.runIf(executablePath)("Task modal tablet touch resize browser regression", () => {
+describe.runIf(discovery.kind === "run")("Task modal tablet touch resize browser regression", () => {
   let server: ViteDevServer; let browser: Browser; let baseUrl = "";
   beforeAll(async () => {
     server = await createServer({ root: process.cwd(), server: { host: "127.0.0.1", port: 0, watch: null }, logLevel: "error" });
     await server.listen(); baseUrl = server.resolvedUrls?.local[0] ?? "";
-    browser = await chromium.launch({ executablePath: executablePath as string, headless: true, ...(process.env.CI ? { args: ["--no-sandbox", "--disable-dev-shm-usage"] } : {}) });
+    const launchEnv = chromiumLaunchEnv(process.platform, process.env, () => userInfo().homedir);
+    browser = await chromium.launch({ executablePath: executablePath as string, headless: true, ...(launchEnv ? { env: launchEnv } : {}), ...(process.env.CI ? { args: ["--no-sandbox", "--disable-dev-shm-usage"] } : {}) });
   }, 30_000);
   afterAll(async () => {
     await browser?.close();
