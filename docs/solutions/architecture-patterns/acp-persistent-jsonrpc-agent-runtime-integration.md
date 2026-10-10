@@ -16,7 +16,7 @@ tags:
   - json-rpc
   - untrusted-subprocess
   - security-floor
-  - path-jail
+  - path-deny-list
 related_components:
   - development_workflow
   - testing_framework
@@ -41,7 +41,7 @@ related_components:
 **3. Security floor for an untrusted callback-capable subprocess:**
 - **Per-category permission gating, never per-preset.** The shipped default policy preset is `unrestricted` (every category → allow). A preset-level shortcut auto-approves everything the moment the runtime is selected. Classify each call's kind into a category and read `permissionPolicy.rules[category]`; add an explicit acknowledgement setting before honoring blanket allows on sensitive categories.
 - Select `allow_once` only — never `allow_always`/`reject_always` (a persisted grant inside untrusted code loses per-call interception). Unmappable/missing kinds, missing gate/policy, and HITL-without-a-readable-decision all default-deny. Require **both** `pauseForApproval` AND `findApprovalByDedupeKey` before creating an approval request — otherwise a human approval is silently discarded and a pending record is orphaned.
-- **Filesystem jail = realpath, not string checks.** `project-root-guard.ts` is a suffix check, not a jail. Use realpath-within-realpath(cwd), `lstat` the final component for new files, `O_NOFOLLOW` open, and **truncate only after post-open re-validation** (passing `O_TRUNC` into open() truncates an escaped target before validation — write-path TOCTOU). Deny-list secrets and `.git/**` by basename regardless of cwd membership. Stat-gate reads (a full `readFile` before a byte ceiling is an OOM vector).
+- **Filesystem deny-list on the real path, not string checks.** Agents are instructed to stay in their worktree but are not confined to the session `cwd`: a project can span several repositories and directories. What is refused, anywhere, is secrets (`.env*`, private keys, credential stores, by basename) and `.git/**`. Check the deny-list against the realpath (so a symlink to a secret is caught), reject a dangling-symlink final component for new files, open with `O_NOFOLLOW`, and **truncate only after the post-open re-check** (passing `O_TRUNC` into open() truncates a denied target before the re-check — write-path TOCTOU). Stat-gate reads (a full `readFile` before a byte ceiling is an OOM vector).
 - **Bound everything the agent emits**, including the channels that don't look like output: per-turn + per-chunk caps on text/thinking, ANSI/control stripping, bounded identifier lengths and correlation maps, and **plan/structured events** (entry size was bounded but entry *count* wasn't — 1,000 × 64KB entries bypassed the per-turn budget). Redact stderr across chunk boundaries, not per-chunk (secrets split across `data` events evade per-chunk regexes). Build the subprocess env from an allow-list, never inherited `process.env` — but make the list **complete**: a thin `{HOME,PATH}` starves agent CLIs of the vars they use to find auth (`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`USER`/`SHELL`/`LANG`), and even a correct env can't beat macOS login-Keychain session isolation for detached daemons. See `integration-issues/acp-bridge-not-logged-in-thin-env-keychain-isolation.md`.
 
 **4. Per-turn bridge state must actually reset per turn.** Anything accumulated per "turn" (output budgets, cap-flag latches, tool-call correlation maps) needs an explicit `reset()` invoked at the top of each prompt — a latch that never resets silently suppresses all output for the rest of the session after one flood. Write a two-turns-through-the-same-handler test; single-turn tests cannot catch it.
@@ -63,14 +63,14 @@ The one-shot integrations never needed any of this: they hold no server→client
 
 ## Examples
 
-Truncate-after-validate (write-path TOCTOU, `path-jail.ts` / `fs-capabilities.ts`):
+Truncate-after-validate (write-path TOCTOU, `path-deny-list.ts` / `fs-capabilities.ts`):
 
 ```ts
-// WRONG: O_TRUNC truncates an escaped target BEFORE re-validation
+// WRONG: O_TRUNC truncates a denied target BEFORE re-validation
 const h = await open(p, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW);
 
-// RIGHT: open without truncate, re-validate realpath, then truncate via the fd
-const h = await openWithinCwd(p, cwd, O_WRONLY | O_CREAT); // re-validates inside
+// RIGHT: open without truncate, re-check the realpath, then truncate via the fd
+const h = await openAllowedPath(p, O_WRONLY | O_CREAT); // re-checks the deny-list
 await h.truncate(0);
 ```
 

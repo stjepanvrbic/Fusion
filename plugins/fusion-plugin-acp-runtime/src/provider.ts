@@ -33,7 +33,7 @@ import type { AcpCallbacks, AcpMcpServer, PermissionGate } from "./types.js";
 
 /** Options enabling the U7 fs client capabilities on the bridging handler. */
 export interface FsHandlerBuildOptions {
-  /** Confinement root — the session cwd / task worktree. */
+  /** Base for relative paths — the session cwd / task worktree. */
   cwd: string;
   /** Register `readTextFile` (advertised iff true). */
   allowRead: boolean;

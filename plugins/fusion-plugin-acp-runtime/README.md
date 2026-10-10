@@ -23,10 +23,12 @@ permissions and filesystem access. This plugin enforces a defense-in-depth floor
   *sensitive* category is escalated to approval unless the user explicitly sets
   `acpAllowUnrestricted: true`. Prefer running the ACP runtime under an
   `approval-required` policy.
-- **Filesystem jail.** `fs/read_text_file` / `fs/write_text_file` are opt-in
-  (`acpFsRead` / `acpFsWrite`, writes default OFF), confined to the session
-  `cwd` by a real symlink-resolving jail (realpath + `O_NOFOLLOW`), with a
-  deny-list for secrets (`.env`, `*.pem`, …) and git internals (`.git/**`).
+- **Filesystem deny-list.** `fs/read_text_file` / `fs/write_text_file` are
+  opt-in (`acpFsRead` / `acpFsWrite`, writes default OFF). Paths are not
+  confined to the session `cwd`: a project can span several repositories and
+  directories, and the agent is instructed to stay in its worktree. Secrets
+  (`.env`, `*.pem`, …) and git internals (`.git/**`) are refused wherever they
+  live, checked against the symlink-resolved path before and after open.
   Writes are gated through the `file_write_delete` permission category.
 - **Untrusted-input bounds.** Streamed output is sanitized (ANSI/control strip)
   and bounded (per-turn + per-chunk caps; bounded tool-call correlation map).

@@ -1,15 +1,15 @@
 /* Vendored ACP client from fusion-plugin-acp-runtime — see ./VENDORED.md (FNXC:GrokAcp 2026-07-11-16:00). */
-// U7 — client filesystem capabilities behind the path jail (KTD6 / Risk S3/S4/S5).
+// U7 — client filesystem capabilities behind the path deny-list (KTD6 / Risk S3/S4/S5).
 //
 // These handlers back the ACP `fs/read_text_file` / `fs/write_text_file` client
 // methods. They exist ONLY when the resolved settings opt in (KTD6): reads are
 // opt-in, writes default OFF and are additionally routed through the action gate
 // as a `file_write_delete` category (reusing the U5 floor — never a free
-// capability). Every path crosses `assertPathWithinCwd` (the symlink-resolving
-// jail) before any byte is read or written, and the secret/git deny-lists apply
-// regardless of cwd membership.
+// capability). Paths are not confined to the session cwd; every path crosses
+// `resolveAllowedPath` (symlink-resolving secret/git deny-list) before any byte
+// is read or written.
 //
-// On ANY rejection (jail / deny-list / policy / oversize) these THROW — the SDK
+// On ANY rejection (deny-list / policy / oversize) these THROW — the SDK
 // surfaces the throw as a JSON-RPC error. They MUST NEVER silently succeed.
 
 import { constants as fsConstants } from "node:fs";
@@ -19,13 +19,7 @@ import type {
   WriteTextFileRequest,
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
-import {
-  assertPathWithinCwd,
-  isGitInternal,
-  isSecretPath,
-  openWithinCwd,
-  PathJailError,
-} from "./path-jail.js";
+import { openAllowedPath, resolveAllowedPath } from "./path-deny-list.js";
 import { effectiveDisposition, runApprovalForCategory } from "./control-handler.js";
 import type { PermissionGate } from "./types.js";
 
@@ -54,7 +48,7 @@ export class FsWriteDeniedError extends Error {
 }
 
 export interface FsHandlerOptions {
-  /** Confinement root — the task worktree (session cwd). */
+  /** Base for relative paths — the task worktree (session cwd). */
   cwd: string;
   /** Per-run permission gate (U5). Required for write gating. */
   gate?: PermissionGate;
@@ -126,24 +120,8 @@ export function createFsHandlers(opts: FsHandlerOptions): FsHandlers {
     handlers.readTextFile = async (
       params: ReadTextFileRequest,
     ): Promise<ReadTextFileResponse> => {
-      const resolved = await assertPathWithinCwd(params.path, opts.cwd);
-      // Secrets that legitimately live inside the worktree are still denied.
-      if (isSecretPath(resolved)) {
-        throw new PathJailError(
-          "denied_secret",
-          `read of secret-pattern file denied: ${resolved}`,
-        );
-      }
-      // Reading git internals is also denied (config/token surface).
-      if (isGitInternal(resolved)) {
-        throw new PathJailError(
-          "denied_git",
-          `read of git-internal file denied: ${resolved}`,
-        );
-      }
-
-      // Atomic, symlink-safe open (TOCTOU defense), then read.
-      const handle = await openWithinCwd(resolved, opts.cwd, fsConstants.O_RDONLY);
+      const resolved = await resolveAllowedPath(params.path, opts.cwd);
+      const handle = await openAllowedPath(resolved, fsConstants.O_RDONLY);
       try {
         const hasLimit =
           typeof params.limit === "number" &&
@@ -183,22 +161,7 @@ export function createFsHandlers(opts: FsHandlerOptions): FsHandlers {
         throw new FsContentTooLargeError(writeMaxBytes);
       }
 
-      const resolved = await assertPathWithinCwd(params.path, opts.cwd);
-
-      // HARD-reject writes to git internals (.git/**) — RCE/token surface (S3).
-      if (isGitInternal(resolved)) {
-        throw new PathJailError(
-          "denied_git",
-          `write to git-internal path hard-rejected: ${resolved}`,
-        );
-      }
-      // Never let an agent overwrite a secret either.
-      if (isSecretPath(resolved)) {
-        throw new PathJailError(
-          "denied_secret",
-          `write to secret-pattern file denied: ${resolved}`,
-        );
-      }
+      const resolved = await resolveAllowedPath(params.path, opts.cwd);
 
       // Route the write through the action gate as `file_write_delete` (U5):
       // allow → proceed, block → reject, require-approval → HITL (or
@@ -233,23 +196,18 @@ export function createFsHandlers(opts: FsHandlerOptions): FsHandlers {
       }
       // disposition === "allow" → proceed.
 
-      // Atomic, symlink-safe create within cwd. O_NOFOLLOW (in openWithinCwd)
-      // guards ONLY the FINAL component; an intermediate dir swapped to a symlink
-      // is still followed. We therefore must NOT pass O_TRUNC into open(): doing
-      // so would TRUNCATE an escaped target BEFORE openWithinCwd's post-open
-      // realpath re-validation gets to reject it (write-path TOCTOU, FIX 3).
-      // Instead open create+write WITHOUT truncate, let openWithinCwd run its
-      // re-validation, and ONLY truncate (via the fd) AFTER it has proven the
-      // opened inode is still inside the jail.
-      const handle = await openWithinCwd(
+      // O_NOFOLLOW (in openAllowedPath) guards ONLY the FINAL component; an
+      // intermediate dir swapped to a symlink is still followed. We therefore
+      // must NOT pass O_TRUNC into open(): doing so would TRUNCATE a denied
+      // target BEFORE openAllowedPath's post-open deny-list re-check rejects it
+      // (write-path TOCTOU, FIX 3). Open create+write WITHOUT truncate, and only
+      // truncate (via the fd) after the re-check has passed.
+      const handle = await openAllowedPath(
         resolved,
-        opts.cwd,
         fsConstants.O_WRONLY | fsConstants.O_CREAT,
         0o644,
       );
       try {
-        // Truncate-AFTER-validate: openWithinCwd returned only because the
-        // re-validation passed, so it is now safe to empty the file and write.
         await handle.truncate(0);
         await handle.writeFile(content, { encoding: "utf8" });
       } finally {

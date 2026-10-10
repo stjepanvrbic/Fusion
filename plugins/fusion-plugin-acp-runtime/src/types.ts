@@ -65,7 +65,7 @@ export type GateDisposition = "allow" | "block" | "require-approval";
  * only ever produces `file_write_delete` / `command_execution` / `network_api`
  * (+ exempt). `git_write` and `task_agent_mutation` remain part of the category
  * type because the policy rules are keyed by all categories — git writes in
- * particular route through `file_write_delete` gating PLUS the path-jail's hard
+ * particular route through `file_write_delete` gating PLUS the path deny-list's hard
  * `.git/**` reject (KTD6a), not a dedicated `git_write` classification.
  */
 export type FusionCategory =

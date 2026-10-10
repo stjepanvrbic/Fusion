@@ -104,19 +104,24 @@ describe("readTextFile", () => {
     expect(res.content).toBe("a".repeat(ceiling));
   });
 
-  it("rejects a lexical ../ escape", async () => {
-    await expect(
-      reader()({ sessionId: "s", path: "../../etc/passwd" } as never),
-    ).rejects.toMatchObject({ code: "path_outside_cwd" });
+  it("reads a file outside the session directory by absolute path, `../`, and symlink", async () => {
+    const target = path.join(outside, "notes.txt");
+    await writeFile(target, "outside content", "utf8");
+    await symlink(target, path.join(cwd, "notes-link"));
+    for (const requested of [target, path.relative(cwd, target), "notes-link"]) {
+      const res = await reader()({ sessionId: "s", path: requested } as never);
+      expect(res.content).toBe("outside content");
+    }
   });
 
-  it("rejects a symlink inside cwd pointing outside", async () => {
-    const secret = path.join(outside, "passwd");
-    await writeFile(secret, "root", "utf8");
-    await symlink(secret, path.join(cwd, "evil-link"));
-    await expect(
-      reader()({ sessionId: "s", path: "evil-link" } as never),
-    ).rejects.toMatchObject({ code: "path_outside_cwd" });
+  it("denies reading a .env or private key outside the session directory", async () => {
+    await writeFile(path.join(outside, ".env"), "API_KEY=sk-123", "utf8");
+    await writeFile(path.join(outside, "id_ed25519"), "-----BEGIN", "utf8");
+    for (const secret of [".env", "id_ed25519"]) {
+      await expect(
+        reader()({ sessionId: "s", path: path.join(outside, secret) } as never),
+      ).rejects.toMatchObject({ code: "denied_secret" });
+    }
   });
 
   it("denies reading a .env secret that lives inside cwd", async () => {
@@ -202,10 +207,27 @@ describe("writeTextFile", () => {
     ).rejects.toMatchObject({ code: "denied_secret" });
   });
 
-  it("rejects a write that escapes cwd via ../", async () => {
-    await expect(
-      writer(allowGate)({ sessionId: "s", path: "../escape.txt", content: "x" } as never),
-    ).rejects.toMatchObject({ code: "path_outside_cwd" });
+  it("writes a file outside the session directory", async () => {
+    const target = path.join(outside, "sibling-repo.txt");
+    await writer(allowGate, { allowUnrestricted: true })({
+      sessionId: "s",
+      path: path.relative(cwd, target),
+      content: "written outside",
+    } as never);
+    expect(await readFile(target, "utf8")).toBe("written outside");
+  });
+
+  it("refuses to write a .env or private key outside the session directory", async () => {
+    for (const secret of [".env", "deploy.pem"]) {
+      await expect(
+        writer(allowGate, { allowUnrestricted: true })({
+          sessionId: "s",
+          path: path.join(outside, secret),
+          content: "X=1",
+        } as never),
+      ).rejects.toMatchObject({ code: "denied_secret" });
+      await expect(readFile(path.join(outside, secret), "utf8")).rejects.toBeTruthy();
+    }
   });
 
   it("BLOCKS the write under a block policy (not free)", async () => {
