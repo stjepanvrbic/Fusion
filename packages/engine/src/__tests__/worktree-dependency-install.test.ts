@@ -140,6 +140,31 @@ describe("worktree dependency installation", () => {
     ]);
   });
 
+  /*
+  FNXC:WorktreeDependencies 2026-10-10-17:21:
+  A failed install logged only "Command exited with code 4294963238", which left the cause undiagnosable.
+  The failure entry carries the tail of the command's own output, and the install outcome stays readiness, not a throw.
+  */
+  it("logs the tail of the failed install's output with the exit code", async () => {
+    const root = fixture({ "pnpm-lock.yaml": "lock", "package.json": "{}" });
+    const runner = vi.fn().mockResolvedValue({
+      ...failure(`${"progress ".repeat(400)}ENOENT: no such file or directory, open 'node_modules/.pnpm/lock.yaml'`),
+      exitCode: 4294963238,
+      stdout: `${"Progress: resolved 1, reused 0\n".repeat(200)} ERR_PNPM_ENOENT  pnpm stopped`,
+    });
+    const opts = options(root, availableEnv("pnpm"), runner);
+
+    const readiness = await ensureWorktreeDependencies(opts);
+
+    expect(readiness.readiness).toBe("unresolved");
+    const [, action, outcome] = opts.store.logEntry.mock.calls[0]!;
+    expect(action).toMatch(/^Worktree dependency install \[node\] failed in \d+ms$/);
+    expect(outcome).toContain("Command exited with code 4294963238");
+    expect(outcome).toContain("ENOENT: no such file or directory, open 'node_modules/.pnpm/lock.yaml'");
+    expect(outcome).toContain("ERR_PNPM_ENOENT  pnpm stopped");
+    expect(outcome.length).toBeLessThan(2_200);
+  });
+
   it("records a missing binary as unresolved without spawning", async () => {
     const root = fixture({ "go.mod": "module example" });
     const runner = vi.fn();

@@ -237,6 +237,7 @@ import { isOperatorActionableAgentError, isTransientError, isSilentTransientErro
 import { withRateLimitRetry } from "./errors/rate-limit-retry.js";
 import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES, type RecoveryEscalationDecision } from "./healing/recovery-policy.js";
 import { formatRecoveryExhaustedError, recordRecoveryEscalation, type RecoveryOwner } from "./healing/recovery-exhaustion.js";
+import { isMissingWorktreeSessionStartFailure } from "./healing/restart-recovery-coordinator.js";
 import type { StuckTaskDetector } from "./healing/stuck-task-detector.js";
 /*
 */
@@ -4082,7 +4083,31 @@ export class TriageProcessor {
         }
       };
 
-      const retryableWork = () => withRateLimitRetry(agentWork, {
+      /*
+      FNXC:WorktreeSessionRecovery 2026-10-10-17:21:
+      A planning worktree can be removed or left half-deleted between acquisition and session start.
+      The refusal is not a planning fault, so it must not spend the planning recovery budget: release this run's
+      registration (it would veto removal of the residue) and run the attempt once more, which re-acquires the worktree.
+      A second refusal in the same run is a persistent fault and goes to the ordinary bounded budget.
+      */
+      const agentWorkReacquiringLostWorktree = async () => {
+        try {
+          return await agentWork();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!isMissingWorktreeSessionStartFailure(message) || this.pauseAborted.has(task.id) || this.stuckAborted.has(task.id)) {
+            throw error;
+          }
+          if (registeredPlanningPath && activeSessionRegistry.lookupByPath(registeredPlanningPath)?.ownerKey === `planning:${task.id}`) {
+            activeSessionRegistry.unregisterPath(registeredPlanningPath);
+          }
+          registeredPlanningPath = null;
+          await this.store.logEntry(task.id, `Planning worktree was unusable at session start; re-acquiring it and starting planning again: ${message}`).catch(() => undefined);
+          return await agentWork();
+        }
+      };
+
+      const retryableWork = () => withRateLimitRetry(agentWorkReacquiringLostWorktree, {
         onRetry: (attempt, delayMs, error) => {
           const delaySec = Math.round(delayMs / 1000);
           planLog.warn(`⏳ ${task.id} rate limited — retry ${attempt} in ${delaySec}s: ${error.message}`);

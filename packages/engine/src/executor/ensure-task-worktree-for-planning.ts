@@ -9,11 +9,11 @@
  * This is at least as strong as the retired shared-root read-only boundary: concurrent planners
  * cannot edit each other's tree and no planner ever falls back to the operator checkout.
  */
-import { existsSync } from "node:fs";
 import type { Settings, TaskDetail, TaskStore, WorkspaceConfig } from "@fusion/core";
 import { resolveWorkspaceTaskWorktreeDir } from "@fusion/core";
 import { executorLog, formatError } from "../logger.js";
 import { resolveWorkspaceConfigOnce } from "./workspace-config-resolver.js";
+import { isUsableTaskWorktree } from "../worktree/worktree-pool.js";
 
 export type EnsureTaskWorktreeForPlanningDeps = {
   store: TaskStore;
@@ -40,7 +40,12 @@ export async function ensureTaskWorktreeForPlanning(
     workspaceMode = Boolean(workspaceConfig && (workspaceConfig.repos.length ?? 0) > 0);
 
     const live = await deps.store.getTask(taskId);
-    if (!workspaceMode && live.worktree && existsSync(live.worktree)) return live.worktree;
+    /*
+    FNXC:WorktreeSessionRecovery 2026-10-10-17:21:
+    A directory alone is not a checkout: a Windows removal can unregister the worktree and leave residue behind.
+    Reusing it handed the planning session a path it refuses to start in, so only a usable checkout is reused.
+    */
+    if (!workspaceMode && live.worktree && await isUsableTaskWorktree(deps.rootDir, live.worktree)) return live.worktree;
 
     const settings = await deps.store.getSettings();
     const acquisitionTask = live.worktree

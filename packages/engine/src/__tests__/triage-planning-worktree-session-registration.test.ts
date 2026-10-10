@@ -282,4 +282,57 @@ describe("planning session worktree registration (FN-8600)", () => {
     expect(rootActiveDuringSession).toBe(false);
     expect(activeSessionRegistry.isPathActive(ROOT_DIR)).toBe(false);
   });
+
+  /*
+  FNXC:WorktreeSessionRecovery 2026-10-10-17:21:
+  Symptom: the planning worktree was removed after acquisition, the session start was refused for a missing worktree,
+  and triage booked the refusal as an ordinary planning failure. Each later attempt could lose the race again, so the
+  card spent its recovery budget and was parked "Automatic recovery exhausted after 7 attempts".
+  Invariant: a missing, incomplete or unregistered planning worktree at session start re-acquires the worktree and
+  starts the session again in place, without spending the planning recovery budget; a second refusal in the same run
+  is an ordinary failure, so a persistent fault still reaches the bounded budget.
+  */
+  describe("planning worktree lost before the session starts", () => {
+    const refusals = [
+      `Refusing to start coding agent in missing worktree: ${PLANNING_WORKTREE}`,
+      `Refusing to start coding agent in incomplete worktree: ${PLANNING_WORKTREE}`,
+      `Refusing to start coding agent in unregistered git worktree: ${PLANNING_WORKTREE}`,
+    ];
+
+    it.each(refusals)("re-acquires the worktree and plans in place after: %s", async (refusal) => {
+      const task = createTask({ id: "FN-9701" });
+      const store = createStore(task);
+      const acquirePlanningWorktree = vi.fn(async () => PLANNING_WORKTREE);
+      let registeredDuringSession: boolean | undefined;
+      mockCreateFnAgent.mockRejectedValueOnce(new Error(refusal));
+      stubAgentSession(() => {
+        registeredDuringSession = activeSessionRegistry.isPathActive(PLANNING_WORKTREE);
+      });
+
+      await new TriageProcessor(store, ROOT_DIR, { acquirePlanningWorktree }).specifyTask(task);
+
+      expect(acquirePlanningWorktree).toHaveBeenCalledTimes(2);
+      expect(mockPromptWithFallback).toHaveBeenCalledTimes(1);
+      expect(registeredDuringSession).toBe(true);
+      expect(store.logEntry).not.toHaveBeenCalledWith("FN-9701", expect.stringContaining("Specification failed"));
+      expect(store.logEntry).not.toHaveBeenCalledWith("FN-9701", expect.stringContaining("Specification failed"), expect.anything());
+      expect(activeSessionRegistry.isPathActive(PLANNING_WORKTREE)).toBe(false);
+    });
+
+    it("books a second refusal in the same run against the planning recovery budget", async () => {
+      const task = createTask({ id: "FN-9701-PERSISTENT" });
+      const store = createStore(task);
+      const acquirePlanningWorktree = vi.fn(async () => PLANNING_WORKTREE);
+      mockCreateFnAgent
+        .mockRejectedValueOnce(new Error(refusals[0]))
+        .mockRejectedValueOnce(new Error(refusals[0]));
+
+      await new TriageProcessor(store, ROOT_DIR, { acquirePlanningWorktree }).specifyTask(task);
+
+      expect(acquirePlanningWorktree).toHaveBeenCalledTimes(2);
+      expect(mockPromptWithFallback).not.toHaveBeenCalled();
+      expect(store.logEntry).toHaveBeenCalledWith("FN-9701-PERSISTENT", expect.stringContaining("Specification failed (retry 1/"));
+      expect(store.updateTask).toHaveBeenCalledWith("FN-9701-PERSISTENT", expect.objectContaining({ recoveryRetryCount: 1 }));
+    });
+  });
 });

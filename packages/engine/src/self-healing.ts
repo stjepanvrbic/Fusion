@@ -1829,6 +1829,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
   private getFalsePositiveRequeueSignal(task: Task, options: {
     executingIds?: Set<string>;
     activeHeartbeatTaskIds?: Set<string>;
+    planningTaskIds?: Set<string>;
     graceMs: number;
     includeLiveWorktreeBoundBranch?: boolean;
     includeCheckedOutLease?: boolean;
@@ -1858,6 +1859,15 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     }
     if (options.activeHeartbeatTaskIds?.has(normalizedId)) {
       return { reason: "active-heartbeat-run", metadata };
+    }
+    /*
+    FNXC:WorktreeSessionRecovery 2026-10-10-17:21:
+    The planner owns the card from admission, but registers its checkout as a live session path only after acquisition and
+    dependency install finish. A fresh branch with no commits reads as already merged, so without this signal the reclaim
+    sweep removed the checkout in that window and the planning session refused to start in a missing worktree.
+    */
+    if (options.planningTaskIds?.has(task.id)) {
+      return { reason: "planning-active", metadata };
     }
     if ((options.includeCheckedOutLease ?? false) && task.checkedOutBy) {
       return { reason: "checked-out-lease-active", metadata };
@@ -4780,6 +4790,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
         const liveExecutionSignal = this.getFalsePositiveRequeueSignal(task, {
           executingIds,
           activeHeartbeatTaskIds: activeTaskIds,
+          planningTaskIds: this.options.getPlanningTaskIds?.(),
           graceMs: STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS,
           includeLiveWorktreeBoundBranch: false,
           includeCheckedOutLease: true,
