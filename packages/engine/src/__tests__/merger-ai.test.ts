@@ -1552,6 +1552,100 @@ describe("runAiMerge", () => {
     expect(git(dir, "rev-parse main")).toBe(mainBefore);
   });
 
+  /*
+   * Superseded-branch shape: a dependent landed a rebased superset of the branch's work first, so the branch tip is
+   * not an ancestor of main, no main commit carries its trailer, and its patch no longer matches. The
+   * merge agent makes no commit and says main already has the work; the reviewer checks that claim.
+   */
+  function landSupersetOfBranchOnMain(dir: string): void {
+    writeFileSync(join(dir, "feature.txt"), "feature work\nfollow-up work from the dependent\n");
+    git(dir, "add -A");
+    git(dir, "commit -q -m 'dependent: land a superset of the branch work'");
+  }
+  const SUPERSEDED_CLAIM = "I didn't make a commit, because main already contains everything on fusion/fn-1: the dependent landed a superset of feature.txt.";
+
+  it("finalizes a superseded branch as landed with no squash when two review passes confirm the merge agent's claim", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+    landSupersetOfBranchOnMain(dir);
+    const { store, task } = makeStore(dir);
+    const mainBefore = git(dir, "rev-parse main");
+    const branchTip = git(dir, "rev-parse fusion/fn-1");
+    const reviewAgent = vi.fn(async () => "main's feature.txt carries the branch line plus the dependent's follow-up.\nREVIEW_VERDICT: approve");
+
+    const result = await runAiMerge(store, dir, "FN-1", {}, {
+      mergeAgent: vi.fn(async () => SUPERSEDED_CLAIM),
+      reviewAgent,
+    });
+
+    expect(reviewAgent).toHaveBeenCalledTimes(2);
+    expect(reviewAgent).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("Verify a no-commit claim"));
+    expect(result).toMatchObject({ noOp: true, merged: false, ok: true });
+    expect(task.column).toBe("done");
+    expect(task.error ?? null).toBeNull();
+    expect(git(dir, "rev-parse main")).toBe(mainBefore);
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "FN-1",
+      expect.stringMatching(/confirmed by two review passes.*Merge agent: I didn't make a commit.*Reviewer: main's feature\.txt carries the branch line/),
+      expect.stringContaining(branchTip),
+    );
+    expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+      mutationType: "task:empty-merge-landed-claim-confirmed",
+      metadata: { taskId: "FN-1", branchTipSha: branchTip, integrationTipSha: mainBefore, reviewPasses: 2 },
+    }));
+    expect(store.recordRunAuditEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ mutationType: "task:empty-merge-finalize-blocked-no-landed-proof" }),
+    );
+  });
+
+  it("keeps the park with both agents' statements when the reviewer disputes the claim on the second pass", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+    landSupersetOfBranchOnMain(dir);
+    const { store, task } = makeStore(dir);
+    const reviewAgent = vi.fn()
+      .mockResolvedValueOnce("REVIEW_VERDICT: approve")
+      .mockResolvedValueOnce("- feature.txt on main lacks the branch's error handling hunk\nSEVERITY: blocking\nREVIEW_VERDICT: reject");
+
+    await runAiMerge(store, dir, "FN-1", {}, { mergeAgent: vi.fn(async () => SUPERSEDED_CLAIM), reviewAgent });
+
+    expect(reviewAgent).toHaveBeenCalledTimes(2);
+    expect(task).toMatchObject({ column: "in-review", status: "failed" });
+    expect(task.error).toContain("merge agent: I didn't make a commit");
+    expect(task.error).toContain("reviewer disputes that the work is on main: feature.txt on main lacks the branch's error handling hunk");
+    expect(store.recordRunAuditEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ mutationType: "task:empty-merge-finalize-blocked-no-landed-proof" }),
+    );
+  });
+
+  it("never claim-reviews a branch whose own net diff is empty, even with a confident merge agent and an approving reviewer", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+    revertBranchToNetZero(dir, "fusion/fn-1");
+    const { store, task } = makeStore(dir);
+    const reviewAgent = vi.fn(async () => "REVIEW_VERDICT: approve");
+
+    await runAiMerge(store, dir, "FN-1", {}, { mergeAgent: vi.fn(async () => SUPERSEDED_CLAIM), reviewAgent });
+
+    expect(reviewAgent).not.toHaveBeenCalled();
+    expect(task).toMatchObject({ column: "in-review", status: "failed" });
+  });
+
+  it("records the merge agent's bounded closing explanation and the operator way out on a no-landed-proof park", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+    revertBranchToNetZero(dir, "fusion/fn-1");
+    const { store, task } = makeStore(dir);
+    const explanation = `I didn't make a commit, because main already contains everything on fusion/fn-1. ${"detail ".repeat(200)}`;
+
+    const result = await runAiMerge(store, dir, "FN-1", { manual: true }, {
+      mergeAgent: vi.fn(async () => explanation),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    });
+
+    expect(task.error).toContain("merge agent: I didn't make a commit, because main already contains everything on fusion/fn-1.");
+    expect(task.error).toContain("fn task close-landed FN-1 --reason");
+    expect(task.error!.length).toBeLessThan(900);
+    expect(result.error).toBe(task.error);
+    expect(store.logEntry).toHaveBeenCalledWith("FN-1", expect.stringContaining("merge agent: I didn't make a commit"), expect.anything());
+  });
+
   it("still finalizes an empty branch as no-op when a prior AI no-op finalization proof exists", async () => {
     const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
     revertBranchToNetZero(dir, "fusion/fn-1"); // no ancestor/classifier proof — only the log proof qualifies

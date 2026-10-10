@@ -77,6 +77,7 @@ import {
   type WorkspaceLeaseHandle,
   resolveReviewColumns,
   canonicalizePath,
+  buildEmptyMergeNoLandedProofReason,
 } from "@fusion/core";
 import { selectUserCommentsForAgentContext } from "../agents/agent-user-comments.js";
 import { resolveTaskWorkingBranch } from "../worktree/worktree-names.js";
@@ -158,6 +159,7 @@ import {
 import {
   buildMergePrompt,
   buildMergeSystemPrompt,
+  buildNoCommitClaimReviewPrompt,
   buildReviewPrompt,
   buildReviewSystemPrompt,
   buildStashResolvePrompt,
@@ -358,7 +360,7 @@ async function landApprovedCandidate(
   ctx.workspaceLand?.assertLive();
   return await landSquash({
     projectRootDir: repoRootDir, mergeRoot, integrationBranch, tipSha, squashSha, taskId: ctx.taskId, audit: ctx.audit,
-    resolveConflicts: ctx.stashResolveAgent,
+    resolveConflicts: async (cwd, prompt) => { await ctx.stashResolveAgent(cwd, prompt); },
     allowDirtyLocalCheckoutSync: ctx.allowDirtyLocalCheckoutSync === true,
     signal: ctx.signal,
     workspaceFence,
@@ -586,17 +588,17 @@ class AiMergeReviewReconciliationInvalidatedError extends Error {
 // ---------------------------------------------------------------------------
 
 interface AgentDeps {
-  /** Run the mutating merge agent in `cwd`. */
-  mergeAgent?: (cwd: string, prompt: string) => Promise<void>;
+  /** Run the mutating merge agent in `cwd`; resolves to its closing message when it produced one. */
+  mergeAgent?: (cwd: string, prompt: string) => Promise<string | void>;
   /** Run the read-only reviewer agent in `cwd`; returns its raw text. */
   reviewAgent?: (cwd: string, prompt: string) => Promise<string>;
   /** Run the mutating stash-conflict resolver in `cwd` (local checkout sync). */
-  stashResolveAgent?: (cwd: string, prompt: string) => Promise<void>;
+  stashResolveAgent?: (cwd: string, prompt: string) => Promise<string | void>;
 }
 
 /** Factory for a mutating AI agent bound to a fixed system prompt. */
 function makeMutatingAgent(store: TaskStore, settings: Settings, taskId: string, options: MergerOptions, audit: RunAuditor, systemPrompt: string) {
-  return async (cwd: string, prompt: string): Promise<void> => {
+  return async (cwd: string, prompt: string): Promise<string> => {
     const task = await store.getTask(taskId).catch(() => undefined);
     const model = resolveMergerSessionModel(settings, undefined, task);
     // FNXC:Settings-MergerModel 2026-07-16-00:00: mutating merger retries resolve the project merger fallback lane before the shared global fallback.
@@ -615,6 +617,12 @@ function makeMutatingAgent(store: TaskStore, settings: Settings, taskId: string,
         : undefined,
     });
     { attachAgentUsageTelemetry(logger, { store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger" }); }
+    /*
+    FNXC:AIMergeEmptyExplanation 2026-10-10-17:20:
+    When the merge agent leaves HEAD at the tip, its closing message is the only record of why (for example "main already contains this branch's work").
+    Text after the last tool call is that closing message, so the empty-merge park can show it to the operator.
+    */
+    let closingMessage = "";
 
     const { session } = await createResolvedAgentSession({
       sessionPurpose: "merger",
@@ -622,9 +630,15 @@ function makeMutatingAgent(store: TaskStore, settings: Settings, taskId: string,
       cwd,
       systemPrompt,
       tools: "coding",
-      onText: logger.onText,
+      onText: (delta: string) => {
+        closingMessage += delta;
+        logger.onText(delta);
+      },
       onThinking: logger.onThinking,
-      onToolStart: logger.onToolStart,
+      onToolStart: (...args: Parameters<typeof logger.onToolStart>) => {
+        closingMessage = "";
+        return logger.onToolStart(...args);
+      },
       onToolEnd: logger.onToolEnd,
       defaultProvider: model.provider,
       defaultModelId: model.modelId,
@@ -652,6 +666,7 @@ function makeMutatingAgent(store: TaskStore, settings: Settings, taskId: string,
       /* FNXC:AiMerge 2026-10-07-15:11: await (bounded) disposal so clean-room cleanup never races the agent's exiting child processes. */
       await disposeAgentSessionBounded(session);
     }
+    return closingMessage;
   };
 }
 
@@ -1040,9 +1055,9 @@ export interface LandRepoContext {
   log: (message: string) => Promise<void>;
   setStatus: (status: string | null) => Promise<unknown>;
   maxPasses: number;
-  mergeAgent: (cwd: string, prompt: string) => Promise<void>;
+  mergeAgent: (cwd: string, prompt: string) => Promise<string | void>;
   reviewAgent: (cwd: string, prompt: string) => Promise<string>;
-  stashResolveAgent: (cwd: string, prompt: string) => Promise<void>;
+  stashResolveAgent: (cwd: string, prompt: string) => Promise<string | void>;
   includeTaskId: boolean;
   trailers: string[];
   taskTitle?: string;
@@ -1153,6 +1168,10 @@ export type LandOneRepoResult =
       /** The branch had no net changes vs the integration tip — nothing landed. */
       outcome: "empty";
       tipSha: string;
+      /** The merge agent's closing message explaining why it made no commit, bounded for display. */
+      mergeAgentExplanation?: string;
+      /** The reviewer's verdict on the merge agent's no-commit claim, when one was checked. */
+      noCommitClaim?: NoCommitClaimReview;
       integrationBranch: string;
       dependencySyncDecision: string;
     }
@@ -1432,7 +1451,7 @@ export async function landOneRepo(
         // Branch had no net changes vs the tip — nothing to land. The caller
         // decides how to finalize the (possibly multi-repo) task.
         await audit.git({ type: "merge:ai-empty", target: integrationBranch, metadata: { taskId, tipSha } });
-        return { outcome: "empty", tipSha, integrationBranch, dependencySyncDecision };
+        return { outcome: "empty", tipSha, integrationBranch, dependencySyncDecision, mergeAgentExplanation: reviewResult.mergeAgentExplanation, noCommitClaim: reviewResult.noCommitClaim };
       }
 
       /*
@@ -1640,6 +1659,85 @@ async function proveRecordedMergeAlreadyLanded(
   ]);
   if (!commitExists || !commitReachedTarget || liveBranchTip !== landedBranchTipSha) return null;
   return { landedSha, landedBranchTipSha };
+}
+
+/*
+FNXC:AIMergeEmptyExplanation 2026-10-10-17:20:
+The merge agent's closing message is the operator's main evidence for an unproven empty merge (for example "main already contains everything on this branch"), so the park keeps a bounded, whitespace-collapsed copy.
+*/
+const AGENT_STATEMENT_MAX_CHARS = 600;
+
+/** The merge agent opens with its conclusion, the reviewer closes with it, so each keeps the end that carries it. */
+function boundAgentStatement(message: string | void, keep: "start" | "end"): string | undefined {
+  const text = (message ?? "").split(/\r?\n/).filter((line) => !isAiMergeProtocolLine(line)).join(" ").replace(/\s+/g, " ").trim();
+  if (!text) return undefined;
+  if (text.length <= AGENT_STATEMENT_MAX_CHARS) return text;
+  return keep === "start" ? `${text.slice(0, AGENT_STATEMENT_MAX_CHARS - 1)}…` : `…${text.slice(text.length - AGENT_STATEMENT_MAX_CHARS + 1)}`;
+}
+
+export interface NoCommitClaimReview {
+  outcome: "confirmed" | "disputed";
+  /** The reviewer's bounded statement: its confirming evidence, or the branch changes it found missing. */
+  reviewerStatement: string;
+  branchTipSha: string;
+}
+
+/** Records both agents' statements in the task log and the ids-only run-audit row before the no-op finalize. */
+async function recordConfirmedNoCommitClaim(input: {
+  store: TaskStore; fence: MergeWriteFence; taskId: string; branch: string; integrationBranch: string; integrationTipSha: string;
+  mergeAgentExplanation?: string; claim: NoCommitClaimReview;
+}): Promise<void> {
+  const { store, fence, taskId, branch, integrationBranch, integrationTipSha, claim } = input;
+  await fence.write("log", () => store.logEntry(
+    taskId,
+    `AI merge: ${branch} already on ${integrationBranch} per the merge agent, confirmed by two review passes — finalizing as landed with no squash. Merge agent: ${input.mergeAgentExplanation ?? ""} Reviewer: ${claim.reviewerStatement}`,
+    JSON.stringify({ branch, branchTipSha: claim.branchTipSha, integrationBranch, integrationTipSha }, null, 2),
+  ));
+  await emitBoundedRunAudit(store, {
+    taskId, agentId: "merger", runId: generateSyntheticRunId("ai-merge-no-commit-claim", taskId), domain: "database",
+    mutationType: "task:empty-merge-landed-claim-confirmed", target: taskId,
+    metadata: { taskId, branchTipSha: claim.branchTipSha, integrationTipSha, reviewPasses: 2 },
+  }, { log: aiMergeLog });
+}
+
+/*
+FNXC:AIMergeSupersededClaim 2026-10-10-17:20:
+A branch superseded by other landed work (for example a dependent task that landed a rebased superset of its commits first) merges to nothing, and no mechanical proof shows its work landed: its tip is not an ancestor of the target, no target commit carries its trailer, and its patches stop matching once the rebase changes their context.
+The merge agent can see that, and says so when it makes no commit; parking on that statement left a card only an operator could close, with Retry repeating the same merge.
+The claim is accepted only through the same gate a squash needs: two consecutive reviewer approvals of the same branch tip and integration tip, re-checked after the second pass.
+A branch whose own net diff is empty is never claim-reviewed: an executor that committed work and then reverted it produces that shape, and "already on the target" would launder lost work.
+*/
+async function reviewNoCommitClaim(input: {
+  mergeRoot: string; branch: string; integrationBranch: string; tipSha: string; sourceSha: string; taskId: string;
+  mergeAgentClaim?: string;
+  reviewAgent: (cwd: string, prompt: string) => Promise<string>;
+  log: (message: string) => Promise<void>; setStatus: (status: string | null) => Promise<unknown>;
+}): Promise<NoCommitClaimReview | undefined> {
+  const { mergeRoot, branch, integrationBranch, tipSha, sourceSha, taskId } = input;
+  if (!input.mergeAgentClaim) return undefined;
+  if (await git(["status", "--porcelain"], mergeRoot)) return undefined;
+  const mergeBaseSha = await git(["merge-base", tipSha, sourceSha], mergeRoot);
+  const branchDiffStat = await git(["diff", "--stat", `${mergeBaseSha}..${sourceSha}`], mergeRoot);
+  if (!branchDiffStat) return undefined;
+  await input.setStatus("reviewing");
+  const prompt = buildNoCommitClaimReviewPrompt({ taskId, branch, integrationBranch, tipSha, branchTipSha: sourceSha, mergeBaseSha, branchDiffStat, mergeAgentClaim: input.mergeAgentClaim });
+  let reviewerStatement = "";
+  for (let pass = 1; pass <= 2; pass++) {
+    const text = await input.reviewAgent(mergeRoot, prompt);
+    const verdict = parseReviewVerdict(text);
+    if (verdict.verdict !== "approve") {
+      await input.log(`AI merge review (no-commit claim, pass ${pass}/2): disputed`);
+      return { outcome: "disputed", reviewerStatement: boundAgentStatement(verdict.reasons.join("; ") || text, "end") ?? "reviewer gave no reason", branchTipSha: sourceSha };
+    }
+    reviewerStatement = boundAgentStatement(text, "end") ?? "reviewer gave no statement";
+    await input.log(`AI merge review (no-commit claim, pass ${pass}/2): confirmed`);
+  }
+  const [liveSourceSha, liveTipSha] = await Promise.all([
+    git(["rev-parse", "--verify", branch], mergeRoot),
+    git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], mergeRoot),
+  ]);
+  if (liveSourceSha !== sourceSha || liveTipSha !== tipSha) throw new AiMergeReviewReconciliationInvalidatedError();
+  return { outcome: "confirmed", reviewerStatement, branchTipSha: sourceSha };
 }
 
 async function proveEmptyMergeAlreadyLanded(
@@ -2117,10 +2215,18 @@ export async function runAiMerge(
      * They use INDEPENDENT evidence, so any one alone stops the FN-8141 laundering shape.
      */
     if (task.noCommitsExpected !== true) {
-      const landedProof = await proveEmptyMergeAlreadyLanded(task, branch, integrationBranch, projectRootDir);
+      const claim = landResult.noCommitClaim;
+      const landedProof = await proveEmptyMergeAlreadyLanded(task, branch, integrationBranch, projectRootDir)
+        ?? (claim?.outcome === "confirmed" ? { strategy: "review-confirmed-no-commit-claim", sha: claim.branchTipSha } : null);
+      if (landedProof?.strategy === "review-confirmed-no-commit-claim" && claim) {
+        await recordConfirmedNoCommitClaim({ store, fence, taskId, branch, integrationBranch, integrationTipSha: landResult.tipSha, mergeAgentExplanation: landResult.mergeAgentExplanation, claim });
+      }
       if (!landedProof) {
-        const reason =
-          "branch had no net changes vs main — work may have been reverted or lost; operator review required";
+        const reason = buildEmptyMergeNoLandedProofReason(taskId, {
+          mergeAgentExplanations: landResult.mergeAgentExplanation ? [landResult.mergeAgentExplanation] : [],
+          reviewerDispute: claim?.outcome === "disputed" ? claim.reviewerStatement : undefined,
+          closeAsLandedAvailable: true,
+        });
         await fence.write("lifecycle", () => store.updateTask(taskId, { error: reason, status: "failed" }));
         if (fence.isOrphaned()) return {
           task, branch, merged: false, noOp: false, ok: true, reason, error: reason,
@@ -2411,6 +2517,10 @@ export interface WorkspaceRepoLandResult {
   dependencySyncDecision?: string;
   /** Failure message when `status === "failed"`. */
   error?: string;
+  /** The merge agent's bounded closing message when `status === "empty"`. */
+  mergeAgentExplanation?: string;
+  /** The reviewer's verdict on the merge agent's no-commit claim when `status === "empty"`. */
+  noCommitClaim?: NoCommitClaimReview;
   /**
    * FNXC:Workspace 2026-06-22-00:30 (Phase C U2, KTD3):
    * True when this repo was SKIPPED by the landed predicate on a retry (its recorded
@@ -3211,7 +3321,7 @@ export async function landWorkspaceTask(
       } else {
         repos.push({
           repo: repoRel, repoRootDir, integrationBranch, branch: entry.branch, status: "empty",
-          dependencySyncDecision: landResult.dependencySyncDecision,
+          dependencySyncDecision: landResult.dependencySyncDecision, mergeAgentExplanation: landResult.mergeAgentExplanation, noCommitClaim: landResult.noCommitClaim,
         });
       }
     } catch (err: unknown) {
@@ -3343,6 +3453,7 @@ export async function landWorkspaceTask(
         const tip = await git(["rev-parse", "--verify", `refs/heads/${r.branch}`], r.repoRootDir).catch(() => "");
         // Branch gone with nothing landed → treat as lost. Ahead-but-empty (tip not an ancestor of the
         // integration branch) → reverted/lost shape. Zero-ahead / already-integrated → safe no-op.
+        if (r.noCommitClaim?.outcome === "confirmed" && tip === r.noCommitClaim.branchTipSha) continue;
         if (!tip || !(await gitOk(["merge-base", "--is-ancestor", tip, r.integrationBranch], r.repoRootDir))) {
           hasRevertedEmptyRepo = true;
           break;
@@ -3350,8 +3461,12 @@ export async function landWorkspaceTask(
       }
     }
     if (hasRevertedEmptyRepo) {
-      const reason =
-        "branch had no net changes vs main — work may have been reverted or lost; operator review required";
+      /* FNXC:AIMergeEmptyExplanation 2026-10-10-17:20: close-as-landed refuses workspace tasks (per-repository landing has no single branch to close), so this park names no way out beyond operator review. */
+      const reason = buildEmptyMergeNoLandedProofReason(taskId, {
+        mergeAgentExplanations: repos.flatMap((r) => (r.mergeAgentExplanation ? [`${r.repo}: ${r.mergeAgentExplanation}`] : [])),
+        reviewerDispute: repos.flatMap((r) => (r.noCommitClaim?.outcome === "disputed" ? [`${r.repo}: ${r.noCommitClaim.reviewerStatement}`] : [])).join(" | ") || undefined,
+        closeAsLandedAvailable: false,
+      });
       await fence.write("lifecycle", () => store.updateTask(taskId, { error: reason }));
       if (fence.isOrphaned()) return { taskId, repos, allLanded, finalized: false, finalizeBlockedReason: reason };
       const reboundColumn = await resolveFinalizeReboundColumn(store, taskId);
@@ -3608,10 +3723,10 @@ async function finalizeWorkspaceTask(
 async function mergeAndReview(input: {
   mergeRoot: string; branch: string; integrationBranch: string; tipSha: string; taskTitle?: string;
   includeTaskId: boolean; trailers: string[]; taskId: string; maxPasses: number;
-  mergeAgent: (cwd: string, prompt: string) => Promise<void>; reviewAgent: (cwd: string, prompt: string) => Promise<string>;
+  mergeAgent: (cwd: string, prompt: string) => Promise<string | void>; reviewAgent: (cwd: string, prompt: string) => Promise<string>;
   audit: RunAuditor; log: (message: string) => Promise<void>; setStatus: (status: string | null) => Promise<unknown>; store: TaskStore;
   signal?: AbortSignal; initialPriorReasons?: string[];
-}): Promise<{ squashSha: string | null; sourceSha: string; priorReasons: string[] }> {
+}): Promise<{ squashSha: string | null; sourceSha: string; priorReasons: string[]; mergeAgentExplanation?: string; noCommitClaim?: NoCommitClaimReview }> {
   const { mergeRoot, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, taskId, maxPasses, mergeAgent, reviewAgent, audit, log, setStatus, store, signal } = input;
   const current = await store.getTask(taskId);
   const sourceSha = await git(["rev-parse", "--verify", branch], mergeRoot);
@@ -3663,9 +3778,13 @@ async function mergeAndReview(input: {
         await log(`AI merge: corrective re-merge (pass ${state.correctivePasses}/${maxPasses}) addressing findings: ${actionable.map((finding) => finding.text).join("; ")}`);
       }
       const task = await store.getTask(taskId);
-      await mergeAgent(mergeRoot, buildMergePrompt({ taskId, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, correctiveReasons: actionable.map((finding) => `[${finding.id}] ${finding.text}`), userComments: selectUserCommentsForAgentContext(task) }));
+      const closingMessage = await mergeAgent(mergeRoot, buildMergePrompt({ taskId, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, correctiveReasons: actionable.map((finding) => `[${finding.id}] ${finding.text}`), userComments: selectUserCommentsForAgentContext(task) }));
       let candidateSha = await git(["rev-parse", "HEAD"], mergeRoot);
-      if (candidateSha === tipSha && state.findings.length === 0) return { squashSha: null, sourceSha: state.sourceSha, priorReasons: [] };
+      if (candidateSha === tipSha && state.findings.length === 0) {
+        const mergeAgentExplanation = boundAgentStatement(closingMessage, "start");
+        const noCommitClaim = await reviewNoCommitClaim({ mergeRoot, branch, integrationBranch, tipSha, sourceSha: state.sourceSha, taskId, mergeAgentClaim: mergeAgentExplanation, reviewAgent, log, setStatus });
+        return { squashSha: null, sourceSha: state.sourceSha, priorReasons: [], mergeAgentExplanation, noCommitClaim };
+      }
       if (candidateSha !== tipSha) { await ensureCommitTaskMetadata(mergeRoot, taskId, includeTaskId, trailers); candidateSha = await git(["rev-parse", "HEAD"], mergeRoot); }
       state = { ...state, candidateSha, candidateTreeSha: await git(["rev-parse", `${candidateSha}^{tree}`], mergeRoot), consecutiveCleanApprovals: 0 };
       await persistState(persistedState, state);

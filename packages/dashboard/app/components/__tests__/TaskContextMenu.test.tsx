@@ -1,7 +1,7 @@
 import React from "react";
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import type { Task } from "@fusion/core";
+import { EMPTY_MERGE_NO_LANDED_PROOF_REASON, type Task } from "@fusion/core";
 import { TaskContextMenu, buildTaskActionMenuModel } from "../TaskContextMenu";
 
 const t = ((key: string, fallback: string, vars?: Record<string, string>) => {
@@ -99,6 +99,28 @@ describe("TaskContextMenu shared task action model", () => {
     expect(offered.actions.map((action) => action.id).filter((id) => id !== "bypass-review"))
       .toEqual(withheld.actions.map((action) => action.id));
     expect(withheld.actions.some((action) => action.id === "bypass-review")).toBe(false);
+  });
+
+  it("offers Close as landed only for the empty-merge park, and only where the host wires it", () => {
+    const onCloseAsLanded = vi.fn();
+    const parked = makeTask({
+      column: "in-review",
+      status: "failed",
+      error: `${EMPTY_MERGE_NO_LANDED_PROOF_REASON}; merge agent: main already has it.`,
+    });
+
+    const model = buildTaskActionMenuModel({ task: parked, t, onCloseAsLanded });
+    const close = model.actions.find((action) => action.id === "close-as-landed");
+    expect(close).toMatchObject({ label: "Close as landed" });
+    expect(close?.tone).not.toBe("note");
+    close?.onSelect?.();
+    expect(onCloseAsLanded).toHaveBeenCalledTimes(1);
+
+    expect(actionIds(parked)).not.toContain("close-as-landed");
+    expect(actionIds(makeTask({ column: "in-review", status: "failed", error: "AI merge blocked: reviewer rejected" }), { onCloseAsLanded }))
+      .not.toContain("close-as-landed");
+    expect(actionIds(makeTask({ column: "in-review", status: undefined as any, error: EMPTY_MERGE_NO_LANDED_PROOF_REASON }), { onCloseAsLanded }))
+      .not.toContain("close-as-landed");
   });
 
   it("offers exactly the supported recovery actions", () => {

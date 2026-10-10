@@ -118,7 +118,7 @@ async function loadCommandHandlers() {
   const { runServe } = await import("./commands/serve.js");
   const { runDaemon } = await import("./commands/daemon.js");
   const { runDesktop } = await import("./commands/desktop.js");
-  const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskReconcile, runTaskUpdate, runTaskDeps, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskImportFromGitLab, runTaskDuplicate, runTaskArchive, runTaskUnarchive, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode } = await import("./commands/task.js");
+  const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskReconcile, runTaskCloseLanded, runTaskUpdate, runTaskDeps, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskImportFromGitLab, runTaskDuplicate, runTaskArchive, runTaskUnarchive, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode } = await import("./commands/task.js");
   const { runPrCreate, runPrShow, runPrList, runPrRespond, runPrApprove, runPrRetry, runPrMerge, runPrClose, runPrAutomerge, runPrAutomergeCleanup } = await import("./commands/pr.js");
   const { runSettingsShow, runSettingsSet } = await import("./commands/settings.js");
   const { runSettingsExport } = await import("./commands/settings-export.js");
@@ -171,6 +171,7 @@ async function loadCommandHandlers() {
     runTaskMove,
     runTaskMerge,
     runTaskReconcile,
+    runTaskCloseLanded,
     runTaskUpdate,
     runTaskDeps,
     runTaskLog,
@@ -342,6 +343,8 @@ Usage:
   fn task log <id> <message>          Add a log entry
   fn task merge <id>                  Merge an in-review task and close it
   fn task reconcile <id>              Reconcile a proven already-landed review task
+  fn task close-landed <id> --reason <why>
+                                      Close a card parked as "no net changes vs main" whose work is already on main
   fn task duplicate <id>              Duplicate a task (creates copy in triage)
   fn task refine <id> [opts]          Create a refinement task from done/in-review
   fn task archive <id> [--force]      Archive a task; --force permits live-worktree removal
@@ -717,6 +720,7 @@ async function main() {
     runTaskMove,
     runTaskMerge,
     runTaskReconcile,
+    runTaskCloseLanded,
     runTaskUpdate,
     runTaskDeps,
     runTaskLog,
@@ -1409,6 +1413,13 @@ async function main() {
             const id = args[2];
             if (!id) { console.error("Usage: fn task reconcile <id>"); process.exit(1); }
             await runTaskReconcile(id, projectName);
+            break;
+          }
+          case "close-landed": {
+            const id = args[2];
+            const reason = getFlagValue(args, "--reason");
+            if (!id || !reason?.trim()) { console.error('Usage: fn task close-landed <id> --reason "<why the work is already on main>"'); process.exit(1); }
+            await runTaskCloseLanded(id, reason, projectName);
             break;
           }
           case "duplicate": {

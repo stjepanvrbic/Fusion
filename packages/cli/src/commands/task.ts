@@ -1316,6 +1316,36 @@ export async function runTaskReconcile(id: string, projectName?: string) {
 }
 
 /**
+ * Close a card parked by the empty-merge no-landed-proof guard after the operator confirms its work is already on main.
+ *
+ * FNXC:CloseAsLanded 2026-10-10-17:20:
+ * A branch superseded by other landed work parks with "no net changes vs main" and Retry reruns the same merge forever.
+ * This operator-only command (never an agent tool) requires a reason and delegates every fence and the write to `SelfHealingManager.closeEmptyMergeParkAsLanded`, the seam the dashboard action also calls.
+ */
+export async function runTaskCloseLanded(id: string, reason: string, projectName?: string) {
+  const context = await resolveBoardContext(projectName, id, "resolve project");
+  try {
+    const manager = new SelfHealingManager(context.store, { rootDir: context.projectPath });
+    const result = await manager.closeEmptyMergeParkAsLanded(id, { reason, actor: "cli-operator", source: "cli" });
+    if (result.outcome === "closed") {
+      console.log(`Closed ${id} as already landed on ${result.baseBranch}${result.branchTipSha ? ` (branch tip ${result.branchTipSha.slice(0, 8)} recorded in the task log)` : ""}; card moved to complete.`);
+      return;
+    }
+    if (result.outcome === "raced") {
+      console.error(`Cannot close ${id}: the card changed while closing (${result.reason}); retry.`);
+    } else if (result.reason === "not-empty-merge-park") {
+      console.error(`Cannot close ${id}: only a card parked with "branch had no net changes vs main" can be closed as landed.`);
+    } else {
+      const live = result.reason === "live-session" || result.reason === "executing" || result.reason === "checkout-leased";
+      console.error(`Cannot close ${id}: ${result.reason}${live ? "; something is still working on this task" : ""}.`);
+    }
+    await closeBoardContextAndExit(context, 1);
+  } finally {
+    await closeProjectStore(context).catch(() => undefined);
+  }
+}
+
+/**
  * FNXC:PostgresShutdownOrder 2026-10-07-21:17:
  * Upper bound a signalled `fn task merge` waits for its aborted merge body to settle, so the body's finally can remove its temp merge worktree before the store closes and the process exits.
  * A body that never settles must not keep an interrupted foreground command alive indefinitely.

@@ -30,7 +30,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, rmSync, st
 import { readFile } from "node:fs/promises";
 import { tmpdir, hostname } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { PRE_MERGE_STEPS_NOT_RUN_BLOCKER, isPathInside, isSamePath, pathIdentityKey, loadWorkspaceConfig, type TaskMoveLanes, resolveColumnFlags, IN_REVIEW_STALL_DEADLOCK_LOG_PREFIX, IN_REVIEW_STALL_LOG_PREFIX, IN_REVIEW_STALL_TERMINAL_LOG_PREFIX, allowsAutoMergeProcessing, hasSharedBranchMemberAutoMergeHold, hasUserAutoMergeHold, resolveEffectiveAutoMerge, countRecentIdenticalStallEntries, detectDependencyCycle, detectSelfDefeatingDependency, evaluateNoCommitsNoOpFinalize, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, getInReviewStalledSignal, getInReviewStallReason, getPrimaryPrInfo, getStalePausedReviewSignal, getStalePausedTodoSignal, getTaskHardMergeBlocker, getMergeConfirmedFinalizationBlocker, getPostMergeFinalizeBlocker, getRequiredPostMergeEvidenceBlocker, getRequiredPostMergeEvidenceDecision, planConfirmedMergeChecklistReconciliation, getTaskMergeBlocker, isStaleContentApprovalBlocker, resolvePreMergeGateForTask, isEphemeralAgent, isMergeRequestContractShadowEnabled, isWorkspaceTask, isSharedBranchGroupMemberIntegration, isLiveSharedBranchGroupMemberIntegration, isNearDuplicateCanonicalInactive, resolveExplicitDuplicateMarker, flagTriageDuplicate, isTriageDuplicateKeepAcknowledged, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, getBuiltinWorkflow, isBuiltinWorkflowId, resolveWorkflowIrForTask, resolveWorkflowIrForTaskWithProvenance, resolveRequiredPreMergeStepIds, resolveReboundTarget, columnsWithFlag, resolveLifecycleColumns, resolveTaskLifecycleColumns, isWipColumnRole, isReviewColumnRole, isTerminalColumnRole, workflowHasColumn, planLegacyAdoption, resolveOrphanedPendingStepResults, resolveUnprovenReviewApproval, classifyReviewLease, PLAN_REVIEW_LEASE_STALENESS_MS, DEFAULT_MAX_POST_REVIEW_FIXES, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AWAITING_APPROVAL_PAUSE_REASON, type Agent, type AgentStore, type ChatStore, type MessageStore, type TaskStore, type Settings, type Task, type MergeDetails, type TaskPriority, type MergeResult, type WorkflowStepResult, type WorkflowIr, type WorkflowIrV2,
+import { PRE_MERGE_STEPS_NOT_RUN_BLOCKER, isPathInside, isSamePath, pathIdentityKey, loadWorkspaceConfig, type TaskMoveLanes, resolveColumnFlags, IN_REVIEW_STALL_DEADLOCK_LOG_PREFIX, IN_REVIEW_STALL_LOG_PREFIX, IN_REVIEW_STALL_TERMINAL_LOG_PREFIX, allowsAutoMergeProcessing, hasSharedBranchMemberAutoMergeHold, hasUserAutoMergeHold, resolveEffectiveAutoMerge, countRecentIdenticalStallEntries, detectDependencyCycle, detectSelfDefeatingDependency, evaluateNoCommitsNoOpFinalize, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, getInReviewStalledSignal, getInReviewStallReason, getPrimaryPrInfo, getStalePausedReviewSignal, getStalePausedTodoSignal, getTaskHardMergeBlocker, isEmptyMergeNoLandedProofPark, getMergeConfirmedFinalizationBlocker, getPostMergeFinalizeBlocker, getRequiredPostMergeEvidenceBlocker, getRequiredPostMergeEvidenceDecision, planConfirmedMergeChecklistReconciliation, getTaskMergeBlocker, isStaleContentApprovalBlocker, resolvePreMergeGateForTask, isEphemeralAgent, isMergeRequestContractShadowEnabled, isWorkspaceTask, isSharedBranchGroupMemberIntegration, isLiveSharedBranchGroupMemberIntegration, isNearDuplicateCanonicalInactive, resolveExplicitDuplicateMarker, flagTriageDuplicate, isTriageDuplicateKeepAcknowledged, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, getBuiltinWorkflow, isBuiltinWorkflowId, resolveWorkflowIrForTask, resolveWorkflowIrForTaskWithProvenance, resolveRequiredPreMergeStepIds, resolveReboundTarget, columnsWithFlag, resolveLifecycleColumns, resolveTaskLifecycleColumns, isWipColumnRole, isReviewColumnRole, isTerminalColumnRole, workflowHasColumn, planLegacyAdoption, resolveOrphanedPendingStepResults, resolveUnprovenReviewApproval, classifyReviewLease, PLAN_REVIEW_LEASE_STALENESS_MS, DEFAULT_MAX_POST_REVIEW_FIXES, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AWAITING_APPROVAL_PAUSE_REASON, type Agent, type AgentStore, type ChatStore, type MessageStore, type TaskStore, type Settings, type Task, type MergeDetails, type TaskPriority, type MergeResult, type WorkflowStepResult, type WorkflowIr, type WorkflowIrV2,
 
   resolveNearDuplicateCanonicalFlags,
   LEGACY_COLUMN_IDS_BY_ROLE,
@@ -916,6 +916,25 @@ export type LandedReviewReconcileResult =
   | { outcome: "not-landed"; baseBranch: string }
   | { outcome: "raced"; reason: string }
   | { outcome: "ineligible"; reason: "workspace" | "not-in-review" | "paused" | "user-paused" | "executing" | "live-session" | "checkout-leased" | "auto-merge-off" | "no-branch-recorded" | "branch-present" | "branch-has-unlanded-content" | "foreign-ownership" | "workflow-approval-blocked" | "engine-paused" | "post-merge-evidence-pending" | "awaiting-finalization" };
+
+/*
+FNXC:CloseAsLanded 2026-10-10-17:20:
+Result of `closeEmptyMergeParkAsLanded`. Only `closed` is success; `raced` and `ineligible` are refusals whose reason names the fence that blocked the close.
+*/
+export type CloseAsLandedResult =
+  | { outcome: "closed"; baseBranch: string; branchTipSha?: string }
+  | { outcome: "raced"; reason: string }
+  | { outcome: "ineligible"; reason: "reason-required" | "engine-paused" | "workspace" | "not-in-review" | "not-empty-merge-park" | "workflow-approval-blocked" | ReviewCardOwnerRefusal };
+
+type ReviewCardOwnerRefusal = "paused" | "user-paused" | "live-session" | "executing" | "checkout-leased";
+
+/*
+FNXC:WorkflowRecovery 2026-09-17-06:00 (FN-9304):
+Compare-and-set fence: the fields the review-card eligibility checks examine. A concurrent write (operator unpause, another reconcile attempt, engine picking the card back up) changes the fingerprint, so the guarded mutation reports `raced` instead of overwriting it.
+*/
+function reviewCardFingerprint(task: Task): string {
+  return JSON.stringify({ column: task.column, status: task.status ?? null, paused: !!task.paused, userPaused: !!task.userPaused, branch: task.branch ?? null, mergeConfirmed: !!task.mergeDetails?.mergeConfirmed, checkoutRunId: task.checkoutRunId ?? null, checkoutLeaseRenewedAt: task.checkoutLeaseRenewedAt ?? null, enabledWorkflowSteps: task.enabledWorkflowSteps ?? [], steps: task.steps ?? [], workflowStepResults: task.workflowStepResults ?? [] });
+}
 
 export class SelfHealingManager extends SelfHealingGitEvidence {
   // ── Auto-unpause state ──────────────────────────────────────────────
@@ -14365,17 +14384,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       });
       if (approvalBlocker) return { outcome: "ineligible", reason: "workflow-approval-blocked" };
     }
-    if (task.paused) return { outcome: "ineligible", reason: "paused" };
-    if (task.userPaused) return { outcome: "ineligible", reason: "user-paused" };
-    const livePaths = activeSessionRegistry.pathsForTask(task.id).filter((path) => activeSessionRegistry.isPathActive(path));
-    if (livePaths.length > 0) return { outcome: "ineligible", reason: "live-session" };
-    if (executingTaskLock.has(task.id) || this.options.isTaskActive?.(task.id) === true) return { outcome: "ineligible", reason: "executing" };
-    // FNXC:WorkflowRecovery 2026-09-17-06:00 (FN-9304): every canonical merge-active status
-    // (reviewing/landing/etc.) proves a merger may still own this card, not only "executing".
-    if (task.status === "executing" || task.status === "in-progress" || isMergeActiveStatus(task.status)) return { outcome: "ineligible", reason: "executing" };
-    const graceMs = (settings.taskStuckTimeoutMs ?? STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS) * PHANTOM_EXECUTOR_BINDING_AGE_MULTIPLIER;
-    const leaseAge = task.checkoutLeaseRenewedAt ? Date.now() - Date.parse(task.checkoutLeaseRenewedAt) : Number.POSITIVE_INFINITY;
-    if (task.checkoutRunId && Number.isFinite(leaseAge) && leaseAge >= 0 && leaseAge < graceMs) return { outcome: "ineligible", reason: "checkout-leased" };
+    const liveRefusal = this.findReviewCardOwnerRefusal(task, settings);
+    if (liveRefusal) return { outcome: "ineligible", reason: liveRefusal };
     if ((options.requireAutoMergeEligible && !allowsAutoMergeProcessing(task, settings)) || task.autoMerge === false) return { outcome: "ineligible", reason: "auto-merge-off" };
     if (task.mergeDetails?.mergeConfirmed) {
       /*
@@ -14421,12 +14431,11 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     (operator unpause, another reconcile attempt, engine picking the card back up) fails the CAS
     and reports `raced` rather than silently overwriting whatever changed.
     */
-    const fingerprint = JSON.stringify({ column: task.column, status: task.status ?? null, paused: !!task.paused, userPaused: !!task.userPaused, branch, mergeConfirmed: !!task.mergeDetails?.mergeConfirmed, checkoutRunId: task.checkoutRunId ?? null, checkoutLeaseRenewedAt: task.checkoutLeaseRenewedAt ?? null, enabledWorkflowSteps: task.enabledWorkflowSteps ?? [], steps: task.steps ?? [], workflowStepResults: task.workflowStepResults ?? [] });
+    const fingerprint = reviewCardFingerprint(task);
     const mergeDetails: MergeDetails = { commitSha: check.landed.sha, mergedAt: new Date().toISOString(), mergeConfirmed: true, prNumber: getPrimaryPrInfo(task)?.number, mergeTargetBranch: mergeTarget.branch, mergeTargetSource: mergeTarget.source };
     let committed = false;
     const commitIfCurrent = (current: Task) => {
-      const currentFingerprint = JSON.stringify({ column: current.column, status: current.status ?? null, paused: !!current.paused, userPaused: !!current.userPaused, branch: current.branch ?? null, mergeConfirmed: !!current.mergeDetails?.mergeConfirmed, checkoutRunId: current.checkoutRunId ?? null, checkoutLeaseRenewedAt: current.checkoutLeaseRenewedAt ?? null, enabledWorkflowSteps: current.enabledWorkflowSteps ?? [], steps: current.steps ?? [], workflowStepResults: current.workflowStepResults ?? [] });
-      if (currentFingerprint !== fingerprint) return null;
+      if (reviewCardFingerprint(current) !== fingerprint) return null;
       if (getTaskHardMergeBlocker(current, { reviewColumns, requiredPreMergeStepIds })) return null;
       committed = true;
       return { mergeDetails, branch: null, branchWriteOrigin: "engine" as const, status: null, error: null, paused: false };
@@ -14453,6 +14462,99 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     */
     await emitBoundedRunAudit(this.store, { taskId: task.id, agentId: "self-healing", runId: generateSyntheticRunId("reconcile-absent-branch", task.id), domain: "database", mutationType: "task:reconcile-absent-branch-landed", target: task.id, metadata: { taskId: task.id, source: options.source, branch, baseBranch: mergeTarget.branch, mergeSha: check.landed.sha, mergeStrategy: check.landed.strategy, ownershipProof: "trailer" } }, { log });
     return { outcome: "reconciled", sha: check.landed.sha, strategy: check.landed.strategy, baseBranch: mergeTarget.branch };
+  }
+
+  /**
+   * FNXC:WorkflowRecovery 2026-09-17-06:00 (FN-9304):
+   * Operator finalizers run from a separate CLI process or a dashboard request, neither of which can prove idleness from its own registries.
+   * Layer the in-process liveness signals with durable pause, status and checkout-lease evidence so neither can finalize a card another process still owns.
+   * Every canonical merge-active status (reviewing, landing, ...) proves a merger may still own the card, not only "executing".
+   */
+  private findReviewCardOwnerRefusal(task: Task, settings: Settings): ReviewCardOwnerRefusal | null {
+    if (task.paused) return "paused";
+    if (task.userPaused) return "user-paused";
+    const livePaths = activeSessionRegistry.pathsForTask(task.id).filter((path) => activeSessionRegistry.isPathActive(path));
+    if (livePaths.length > 0) return "live-session";
+    if (executingTaskLock.has(task.id) || this.options.isTaskActive?.(task.id) === true) return "executing";
+    if (task.status === "executing" || task.status === "in-progress" || isMergeActiveStatus(task.status)) return "executing";
+    const graceMs = (settings.taskStuckTimeoutMs ?? STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS) * PHANTOM_EXECUTOR_BINDING_AGE_MULTIPLIER;
+    const leaseAge = task.checkoutLeaseRenewedAt ? Date.now() - Date.parse(task.checkoutLeaseRenewedAt) : Number.POSITIVE_INFINITY;
+    if (task.checkoutRunId && Number.isFinite(leaseAge) && leaseAge >= 0 && leaseAge < graceMs) return "checkout-leased";
+    return null;
+  }
+
+  /**
+   * Finalizes a card parked by the empty-merge no-landed-proof guard after an operator attests that its work is already on the integration branch.
+   *
+   * FNXC:CloseAsLanded 2026-10-10-17:20:
+   * A branch superseded by other landed work (for example a dependent that landed a rebased copy of its commits) merges to nothing, and no mechanical proof shows its work landed.
+   * The AI merge finalizes such a card itself when its reviewer confirms the merge agent's "already on the target" claim in two passes; this action is the fallback when the reviewer disputed the claim or could not check it, and Retry would only repeat the same merge.
+   * It is operator-only (CLI and dashboard, never an agent tool) and requires a reason, recorded in the task log and in the card's no-op merge details.
+   * It accepts only the empty-merge park, keeps the required pre-merge approvals and every liveness fence of landed-review reconciliation, finalizes as a confirmed no-op merge like the proven no-op finalizers, and logs the branch tip so the original commits stay findable after branch cleanup.
+   * Workspace tasks are refused: they land per repository and have no single branch to close.
+   */
+  async closeEmptyMergeParkAsLanded(
+    taskId: string,
+    options: { reason: string; actor: string; source: "cli" | "dashboard" },
+  ): Promise<CloseAsLandedResult> {
+    const reason = options.reason.trim();
+    if (!reason) return { outcome: "ineligible", reason: "reason-required" };
+    const task = await this.store.getTask(taskId).catch(() => null);
+    if (!task) return { outcome: "ineligible", reason: "not-in-review" };
+    const settings = await this.store.getSettings();
+    if (settings.globalPause || settings.enginePaused) return { outcome: "ineligible", reason: "engine-paused" };
+    if (isWorkspaceTask(task)) return { outcome: "ineligible", reason: "workspace" };
+    const reviewColumns = await resolveProjectColumnsForRoles(this.store, REVIEW_ROLES);
+    if (!reviewColumns.has(task.column)) return { outcome: "ineligible", reason: "not-in-review" };
+    if (!isEmptyMergeNoLandedProofPark(task) || task.mergeDetails?.mergeConfirmed) return { outcome: "ineligible", reason: "not-empty-merge-park" };
+    const requiredPreMergeStepIds = await resolveNoOpFinalizeGateIds(this.store, task);
+    if (getTaskHardMergeBlocker(task, { reviewColumns, requiredPreMergeStepIds })) return { outcome: "ineligible", reason: "workflow-approval-blocked" };
+    const ownerRefusal = this.findReviewCardOwnerRefusal(task, settings);
+    if (ownerRefusal) return { outcome: "ineligible", reason: ownerRefusal };
+
+    const mergeTarget = await this.resolveSelfHealingMergeTarget(task, settings, "close-as-landed");
+    const branchTipSha = task.branch ? await this.readBranchTipSha(task.branch) : undefined;
+    const fingerprint = reviewCardFingerprint(task);
+    const mergeDetails: MergeDetails = {
+      ...(task.mergeDetails ?? {}),
+      mergeConfirmed: true,
+      noOpMerge: true,
+      noOpReason: `closed as already landed by ${options.actor}: ${reason}`,
+      landedFiles: [],
+      mergedAt: new Date().toISOString(),
+      mergeTargetBranch: mergeTarget.branch,
+      mergeTargetSource: mergeTarget.source,
+    };
+    let committed = false;
+    await this.store.updateTaskAtomic(task.id, (current: Task) => {
+      if (reviewCardFingerprint(current) !== fingerprint || current.error !== task.error) return undefined;
+      if (getTaskHardMergeBlocker(current, { reviewColumns, requiredPreMergeStepIds })) return undefined;
+      committed = true;
+      return { mergeDetails, status: null, error: null, paused: false };
+    });
+    if (!committed) return { outcome: "raced", reason: "task-state-changed" };
+    await this.store.logEntry(
+      task.id,
+      `Closed as already landed by ${options.actor} (${options.source}): ${reason}`,
+      JSON.stringify({ branch: task.branch ?? null, branchTipSha: branchTipSha ?? null, baseBranch: mergeTarget.branch }, null, 2),
+    );
+    await this.recordSelfHealingBranchGroupMemberLanding(task, mergeTarget, "close-as-landed");
+    const completeLane = (await resolveTaskLifecycleColumns(this.store, task.id))?.complete ?? "done";
+    const movedTask = await this.moveToCompleteLaneAfterLandedCleanup(task, completeLane, "close-as-landed", mergeDetails);
+    this.emitTaskMerged(movedTask, { mergeConfirmed: true });
+    await this.reconcileCompletedTask(task.id, { worktreeHint: task.worktree ?? undefined });
+    /* FNXC:RunAudit 2026-10-10-17:20: bounded seam after the CAS mutation lands; the operator's reason prose stays in the task log, never in run-audit. */
+    await emitBoundedRunAudit(this.store, { taskId: task.id, agentId: "self-healing", runId: generateSyntheticRunId("close-as-landed", task.id), domain: "database", mutationType: "task:closed-as-landed", target: task.id, metadata: { taskId: task.id, source: options.source, baseBranch: mergeTarget.branch, ...(branchTipSha ? { branchTipSha } : {}) } }, { log });
+    return { outcome: "closed", baseBranch: mergeTarget.branch, ...(branchTipSha ? { branchTipSha } : {}) };
+  }
+
+  private async readBranchTipSha(branch: string): Promise<string | undefined> {
+    try {
+      const { stdout } = await execAsync(`git rev-parse --verify ${shellQuote(`refs/heads/${branch}`)}`, { cwd: this.options.rootDir, timeout: 30_000 });
+      return String(stdout).trim() || undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   async recoverBranchMisboundInReviewTasks(): Promise<number> {

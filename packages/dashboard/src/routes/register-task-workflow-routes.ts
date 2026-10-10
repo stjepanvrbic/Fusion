@@ -150,6 +150,7 @@ import {
   type PrepareWorkspaceRevertPrBranchesResult,
   type WorkspaceRepoRevertPrBranch,
   type LandedReviewReconcileResult,
+  type CloseAsLandedResult,
 } from "@fusion/engine";
 import { buildBoardWorkflowsPayload } from "./board-workflows.js";
 import { resolveNativeStructurePreview } from "../native-structure-preview.js";
@@ -1060,6 +1061,7 @@ interface TaskWorkflowRouteDeps {
     rootDir: string;
     reconcileInReviewBranchRebind: (opts?: { includeTaskIds?: Set<string> }) => Promise<import("@fusion/engine").RebindResult>;
     reconcileLandedReviewTask: (taskId: string, options: { source: "self-healing" | "manual"; requireAutoMergeEligible?: boolean }) => Promise<LandedReviewReconcileResult>;
+    closeEmptyMergeParkAsLanded: (taskId: string, options: { reason: string; actor: string; source: "cli" | "dashboard" }) => Promise<CloseAsLandedResult>;
     getActiveMergeTaskId: () => string | null;
     getStaleMergingStatusMinAgeMs: () => number;
   } | undefined;
@@ -5282,6 +5284,32 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         return res.json(result);
       }
       return res.status(409).json(result);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      rethrowTaskApiError(err, req.params.id);
+    }
+  });
+
+  /*
+  FNXC:CloseAsLanded 2026-10-10-17:20:
+  Operator fallback for a card parked with "branch had no net changes vs main" whose work the operator has checked is already on main (the AI merge closes such a card by itself when its reviewer confirms the merge agent's claim).
+  A reason is required and the actor is the server-derived dashboard operator, as for bypass-review; every eligibility fence lives in the shared engine seam that `fn task close-landed` also calls.
+  */
+  router.post("/tasks/:id/close-as-landed", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const { reason } = (req.body ?? {}) as { reason?: unknown };
+      if (typeof reason !== "string" || reason.trim().length === 0) {
+        throw badRequest("reason is required to close a card as already landed");
+      }
+      const task = await scopedStore.getTask(req.params.id);
+      if (!task) throw notFound(`Task ${req.params.id} not found`);
+      const selfHealingManager = _resolveSelfHealingManager(scopedStore);
+      if (!selfHealingManager) {
+        return res.status(503).json({ outcome: "unavailable", reason: "self-healing-manager-unavailable" });
+      }
+      const result = await selfHealingManager.closeEmptyMergeParkAsLanded(task.id, { reason: reason.trim(), actor: "dashboard-operator", source: "dashboard" });
+      return res.status(result.outcome === "closed" ? 200 : 409).json(result);
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
       rethrowTaskApiError(err, req.params.id);

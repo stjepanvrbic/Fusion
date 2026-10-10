@@ -450,6 +450,49 @@ export function buildReviewPrompt(input: {
   return lines.join("\n");
 }
 
+/*
+FNXC:AIMergeSupersededClaim 2026-10-10-17:20:
+When the merge agent makes no commit and says the integration branch already contains the task branch's work (a dependent landed a rebased copy of it, for example), the same reviewer checks that claim against the real diffs before the card can finalize as landed with no squash.
+There is no squash commit, so the candidate under review is the integration tip itself and only branch preservation is judged: every change the branch introduces must already be present on the tip.
+*/
+export function buildNoCommitClaimReviewPrompt(input: {
+  taskId: string;
+  branch: string;
+  integrationBranch: string;
+  tipSha: string;
+  branchTipSha: string;
+  mergeBaseSha: string;
+  branchDiffStat: string;
+  mergeAgentClaim: string;
+}): string {
+  return [
+    `Verify a no-commit claim for task ${input.taskId} (branch ${input.branch} → ${input.integrationBranch}).`,
+    "",
+    "The merge agent made NO squash commit. Its explanation:",
+    `  ${input.mergeAgentClaim}`,
+    "",
+    "There is no squash to audit: the candidate is the integration tip itself. Judge only branch preservation —",
+    "is every change the task branch introduces already present on the integration tip?",
+    "",
+    `Integration tip:  ${input.tipSha}`,
+    `Branch tip:       ${input.branchTipSha}`,
+    `Merge base:       ${input.mergeBaseSha}`,
+    "",
+    "Inspect with read-only commands:",
+    `  git diff ${input.mergeBaseSha}..${input.branchTipSha}          (the branch's own changes)`,
+    `  git diff ${input.branchTipSha} ${input.tipSha} -- <path>      (how the tip differs from the branch per file)`,
+    `  git log --oneline ${input.mergeBaseSha}..${input.tipSha} -- <path>  (which landed work touched it)`,
+    "",
+    "Branch changes (git diff --stat merge-base..branch tip):",
+    input.branchDiffStat.trim() || "(none reported)",
+    "",
+    "Approve only if, for every hunk the branch introduces, the integration tip contains the same change or a later",
+    "evolution of it made by other landed work. Reject if any branch change is missing, was reverted on the tip, or",
+    "cannot be verified; name each missing change as its own bullet. When approving, first state in one or two",
+    "sentences which landed work carries the branch's changes.",
+  ].join("\n");
+}
+
 export function buildStashResolveSystemPrompt(): string {
   return [
     "You are resolving a conflict between the user's restored local working-tree",

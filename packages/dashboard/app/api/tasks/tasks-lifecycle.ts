@@ -365,6 +365,24 @@ export function rejectPlan(id: string, projectId?: string): Promise<Task> {
 }
 
 
+export type CloseTaskAsLandedResult =
+  | { outcome: "closed"; baseBranch: string; branchTipSha?: string }
+  | { outcome: "raced"; reason: string }
+  | { outcome: "ineligible"; reason: string };
+
+/*
+FNXC:CloseAsLanded 2026-10-10-17:20:
+Operator fallback for a card parked with "branch had no net changes vs main": the server attributes the dashboard operator, requires the reason, and applies every eligibility fence.
+A refusal answers 409 with its reason, which `api` raises as an error for the caller's toast.
+*/
+export function closeTaskAsLanded(id: string, reason: string, projectId?: string): Promise<CloseTaskAsLandedResult> {
+  return api<CloseTaskAsLandedResult>(withProjectId(`/tasks/${id}/close-as-landed`, projectId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+}
+
 /** Dismiss one durable AI merge finding; this is intentionally separate from workflow-step bypass. */
 export function dismissAiMergeReviewFinding(taskId: string, findingId: string, reason: string, projectId?: string): Promise<Task> {
   return api<Task>(withProjectId(`/tasks/${taskId}/ai-merge-review-findings/${findingId}/dismiss`, projectId), {

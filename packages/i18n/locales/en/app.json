@@ -7959,6 +7959,11 @@
     "cacheRead": "Cache read",
     "cacheWrite": "Cache write",
     "checkoutLink": "checkout {{id}}",
+    "closeAsLanded": {
+      "btn": "Close as landed",
+      "promptMessage": "This card's branch merged to nothing. If you have checked that its work is already on main, give the reason to close it as landed (required, audit-logged):",
+      "success": "Closed {{id}} as already landed"
+    },
     "delete": {
       "actionClosed": "closed",
       "actionDeleted": "deleted",

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const reconcile = vi.hoisted(() => vi.fn());
+const closeAsLanded = vi.hoisted(() => vi.fn());
 const close = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("@fusion/core", () => ({
@@ -13,6 +14,7 @@ vi.mock("@fusion/core", () => ({
 vi.mock("@fusion/engine", () => ({
   SelfHealingManager: class {
     reconcileLandedReviewTask = reconcile;
+    closeEmptyMergeParkAsLanded = closeAsLanded;
   },
   isInReviewMissingWorktreeSessionStartFailure: vi.fn(),
   isFailedNoVerdictPreMergeReviewResult: vi.fn(() => false),
@@ -49,7 +51,7 @@ vi.mock("node:fs", () => ({
   readFileSync: vi.fn(),
 }));
 
-import { runTaskReconcile } from "../task.js";
+import { runTaskCloseLanded, runTaskReconcile } from "../task.js";
 
 describe("runTaskReconcile", () => {
   const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -94,6 +96,41 @@ describe("runTaskReconcile", () => {
   ])("refuses unsafe result %# without mutating", async (result, message) => {
     reconcile.mockResolvedValue(result);
     await expect(runTaskReconcile("FN-9304", "project")).rejects.toThrow("exit:1");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining(message as string));
+    expect(close).toHaveBeenCalled();
+  });
+});
+
+describe("runTaskCloseLanded", () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+    throw new Error(`exit:${code}`);
+  }) as never);
+
+  afterEach(() => {
+    closeAsLanded.mockReset();
+    close.mockClear();
+    log.mockClear();
+    error.mockClear();
+    exit.mockClear();
+  });
+
+  it("closes through the shared engine seam as the CLI operator and reports the recorded branch tip", async () => {
+    closeAsLanded.mockResolvedValue({ outcome: "closed", baseBranch: "main", branchTipSha: "5e55bf98463ec87b" });
+    await runTaskCloseLanded("KB-057", "KB-062 landed a superset", "project");
+    expect(closeAsLanded).toHaveBeenCalledWith("KB-057", { reason: "KB-062 landed a superset", actor: "cli-operator", source: "cli" });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("5e55bf98"));
+    expect(exit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ outcome: "ineligible", reason: "not-empty-merge-park" }, "only a card parked with"],
+    [{ outcome: "raced", reason: "task-state-changed" }, "changed while closing"],
+    [{ outcome: "ineligible", reason: "live-session" }, "something is still working"],
+  ])("refuses result %# and exits nonzero", async (result, message) => {
+    closeAsLanded.mockResolvedValue(result);
+    await expect(runTaskCloseLanded("KB-057", "superseded", "project")).rejects.toThrow("exit:1");
     expect(error).toHaveBeenCalledWith(expect.stringContaining(message as string));
     expect(close).toHaveBeenCalled();
   });

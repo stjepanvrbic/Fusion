@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 import { Pencil, Bot, X, ChevronDown, ChevronRight, GitBranch, ArrowLeft, Zap, Loader2, AlertTriangle, Sparkles, Maximize2, Minimize2, Send, Square, Info, Paperclip, Eye, EyeOff, Copy } from "lucide-react";
 import { useViewportMode } from "../hooks/useViewportMode";
 import { mergeTaskSnapshot } from "../hooks/useTasks";
-import { dismissAiMergeReviewFinding } from "../api/tasks/tasks-lifecycle";
+import { closeTaskAsLanded, dismissAiMergeReviewFinding } from "../api/tasks/tasks-lifecycle";
 import { FloatingWindow } from "./FloatingWindow";
 import { ExternalBlockNotice } from "./TaskCard";
 import { TaskResetDialog } from "./TaskResetDialog";
@@ -3565,6 +3565,25 @@ export function TaskDetailContent({
   }, [task.id, onBypassReview, onTaskUpdated, addToast, t]);
 
   /*
+  FNXC:CloseAsLanded 2026-10-10-17:20:
+  Operator fallback for a card parked with "branch had no net changes vs main" (the AI merge closes such a card itself when its reviewer confirms the merge agent's claim).
+  The reason is required and audit-logged, so it is collected with window.prompt like the review bypass; the card's move to complete arrives through the normal task events.
+  */
+  const handleCloseAsLanded = useCallback(() => {
+    const reason = window.prompt(
+      t("taskDetail.closeAsLanded.promptMessage", "This card's branch merged to nothing. If you have checked that its work is already on main, give the reason to close it as landed (required, audit-logged):"),
+    );
+    if (!reason?.trim()) return;
+    closeTaskAsLanded(task.id, reason.trim(), projectId)
+      .then(() => {
+        addToast(t("taskDetail.closeAsLanded.success", "Closed {{id}} as already landed", { id: task.id }), "success");
+      })
+      .catch((err) => {
+        addToast(getErrorMessage(err), "error");
+      });
+  }, [task.id, projectId, addToast, t]);
+
+  /*
   FNXC:AIMergeReviewReconciliation 2026-08-20-22:14:
   A dismissal is an explicit, audited operator decision, so eligible active findings collect a
   required reason and use their dedicated reconciliation endpoint rather than workflow bypass.
@@ -4469,6 +4488,7 @@ export function TaskDetailContent({
     onCheckPrStatus: handleCheckPrStatus,
     onBypassReview: handleBypassReview,
     bypassableReviewStepId,
+    onCloseAsLanded: handleCloseAsLanded,
   }), [
     task,
     t,
@@ -4478,6 +4498,7 @@ export function TaskDetailContent({
     onResetTask,
     onBypassReview,
     bypassableReviewStepId,
+    handleCloseAsLanded,
     mergeStrategy,
     effectiveAutoMerge,
     prAutomationLabel,

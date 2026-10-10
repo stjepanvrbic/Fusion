@@ -7926,6 +7926,11 @@
     "cacheRead": "缓存读取",
     "cacheWrite": "缓存写入",
     "checkoutLink": "检出 {{id}}",
+    "closeAsLanded": {
+      "btn": "标记为已合入并关闭",
+      "promptMessage": "此卡片的分支没有可合并的改动。如果你已确认其工作已在 main 上，请填写原因以将其标记为已合入并关闭（必填，会记入审计）：",
+      "success": "已将 {{id}} 标记为已合入并关闭"
+    },
     "delete": {
       "actionClosed": "关闭了",
       "actionDeleted": "删除了",

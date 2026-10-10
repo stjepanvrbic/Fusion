@@ -7927,6 +7927,11 @@
     "cacheRead": "Lectura de caché",
     "cacheWrite": "Escritura de caché",
     "checkoutLink": "checkout {{id}}",
+    "closeAsLanded": {
+      "btn": "Cerrar como integrada",
+      "promptMessage": "La rama de esta tarjeta no aporta cambios. Si comprobaste que su trabajo ya está en main, indica el motivo para cerrarla como integrada (obligatorio, queda registrado):",
+      "success": "{{id}} cerrada como ya integrada"
+    },
     "delete": {
       "actionClosed": "cerrada",
       "actionDeleted": "eliminada",
