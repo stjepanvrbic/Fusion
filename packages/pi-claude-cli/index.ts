@@ -141,7 +141,8 @@ function ensureMcpConfig(
   userMcpServers: UserMcpServerSpec[] = [],
 ): string | undefined {
   try {
-    let toolDefs: McpToolDef[] = toolsFromContext(contextTools);
+    // The `-p` route runs the CLI without its own tools, so every pi tool is offered through the schema server.
+    let toolDefs: McpToolDef[] = toolsFromContext(contextTools, "all");
     if (contextTools && contextTools.length > 0) {
       debugMcp(
         `MCP config from current transcript: ${contextTools.map((tool) => tool.name).join(", ")}`,
@@ -154,7 +155,7 @@ function ensureMcpConfig(
       if (!Array.isArray(allTools)) {
         return cachedMcpConfig?.configPath;
       }
-      toolDefs = getCustomToolDefs(pi);
+      toolDefs = getCustomToolDefs(pi, "all");
     }
 
     if (toolDefs.length === 0 && userMcpServers.length === 0) {

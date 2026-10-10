@@ -3277,7 +3277,6 @@
       "files": {
         "packages/pi-claude-cli/src/__tests__/acp-dispatch.test.ts": 100,
         "packages/pi-claude-cli/src/__tests__/acp-driver.test.ts": 800,
-        "packages/pi-claude-cli/src/__tests__/control-handler.test.ts": 100,
         "packages/pi-claude-cli/src/__tests__/event-bridge.test.ts": 100,
         "packages/pi-claude-cli/src/__tests__/execsync-guard.test.ts": 100,
         "packages/pi-claude-cli/src/__tests__/mcp-config.test.ts": 100,

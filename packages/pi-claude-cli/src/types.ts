@@ -44,8 +44,17 @@ export interface ClaudeControlRequest {
   };
 }
 
+/** A user-role message the CLI echoes; carries the `tool_result` blocks it recorded for the preceding tool calls. */
+export interface ClaudeUserMessage {
+  type: "user";
+  message?: { content?: unknown };
+  /** Present on sub-agent messages; null/undefined for top-level ones. */
+  parent_tool_use_id?: string | null;
+}
+
 export type NdjsonMessage =
   | ClaudeStreamEventMessage
+  | ClaudeUserMessage
   | ClaudeResultMessage
   | ClaudeSystemMessage
   | ClaudeControlRequest;

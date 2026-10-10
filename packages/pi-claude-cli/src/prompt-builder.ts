@@ -372,6 +372,7 @@ function findFinalUserMessageIndex(messages: PiMessage[]): number {
 export function buildSystemPrompt(
   context: PiContext,
   cwd: string,
+  options?: { allToolsViaMcp?: boolean },
 ): string {
   const parts: string[] = [];
 
@@ -400,7 +401,7 @@ export function buildSystemPrompt(
     );
   }
 
-  const customToolsAddendum = buildCustomToolsAddendum(context.tools);
+  const customToolsAddendum = buildCustomToolsAddendum(context.tools, options?.allToolsViaMcp === true);
   if (customToolsAddendum) {
     parts.push(customToolsAddendum);
   }
@@ -469,11 +470,12 @@ function rewriteCustomToolReferences(
  */
 function buildCustomToolsAddendum(
   tools: ReadonlyArray<PiToolLike> | undefined,
+  allToolsViaMcp: boolean,
 ): string {
   if (!tools || tools.length === 0) return "";
   const customNames = tools
     .map((t) => t.name)
-    .filter((name) => !BUILT_IN_PI_TOOLS.has(name));
+    .filter((name) => allToolsViaMcp || !BUILT_IN_PI_TOOLS.has(name));
   if (customNames.length === 0) return "";
 
   const lines = customNames
