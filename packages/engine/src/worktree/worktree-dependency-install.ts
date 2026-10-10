@@ -536,10 +536,15 @@ async function runPlanCommand(
   }
   const durationMs = Date.now() - startedAt;
   const success = commandSucceeded(result);
+  /*
+  FNXC:WorktreeDependencies 2026-10-10-17:21:
+  An exit code alone does not say why an install failed, so the failure entry also carries the tail of the command's output.
+  */
+  const output = success ? "" : [result?.stderr, result?.stdout].map((stream) => tail(stream?.trim() ?? "")).filter(Boolean).join("\n");
   await logDependencyEvent(
     options,
     `Worktree dependency install [${entry.ecosystem}] ${success ? "completed" : "failed"} in ${durationMs}ms`,
-    `${command}${entry.rationale ? `\n${entry.rationale}` : ""}${success ? "" : `\n${tail(commandFailureReason(result))}`}`,
+    `${command}${entry.rationale ? `\n${entry.rationale}` : ""}${success ? "" : `\n${tail(commandFailureReason(result))}${output ? `\n${output}` : ""}`}`,
   );
   return result;
 }

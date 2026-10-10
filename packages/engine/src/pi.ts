@@ -1757,8 +1757,18 @@ export async function resolveSessionBoundaryRoot(
   }
 
   const root = descriptor.writableRoot ?? cwd;
-  if (!existsSync(root) || !existsSync(descriptor.projectRoot)) {
-    throw new Error(`Refusing to start declared ${descriptor.kind} session: boundary root is missing`);
+  /*
+  FNXC:WorktreeSessionRecovery 2026-10-10-17:21:
+  A task checkout can be removed between acquisition and session start (a sweep, or a partial Windows removal).
+  The refusal uses the canonical missing-worktree session-start message so every lane's existing recovery
+  re-acquires the checkout instead of spending its generic retry budget on a path that is gone.
+  A missing project root is not a lost task checkout and keeps a distinct refusal.
+  */
+  if (!existsSync(root)) {
+    throw new Error(`Refusing to start coding agent in missing worktree: ${root}`);
+  }
+  if (!existsSync(descriptor.projectRoot)) {
+    throw new Error(`Refusing to start declared ${descriptor.kind} session: project root is missing`);
   }
   if (!isSameOrInsidePath(resolve(root), resolve(cwd))) {
     throw new Error(`Refusing to start declared ${descriptor.kind} session outside its boundary root`);

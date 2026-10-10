@@ -462,4 +462,49 @@ describe("self-healing ghost branch reclaim", () => {
       expect(execMock).not.toHaveBeenCalledWith(expect.stringContaining("git branch -D"), expect.anything());
     });
   });
+
+  /*
+  FNXC:WorktreeSessionRecovery 2026-10-10-17:21:
+  Symptom: a planning card's freshly acquired worktree was removed while its dependency install ran and before the planner
+  registered the path as a live session; the planning session then refused to start ("boundary root is missing").
+  A just-created task branch has no commits, so its tip is the integration ref and reads as `tip-already-merged`; the
+  sweep's liveness veto saw no executor, heartbeat, lease or registered path and reclaimed the checkout.
+  Invariant: a card the planner owns is live for the whole planning run, including worktree acquisition, so the reclaim
+  sweep never inspects or removes its checkout. The control shows the same card is reclaimed once planning lets go.
+  */
+  describe("planner-owned checkout", () => {
+    const planningCard = { id: "FN-9701", column: "todo", checkedOutBy: null, branch: "fusion/fn-9701", worktree: "/tmp/fn-9701", baseCommitSha: "m0" };
+
+    function sweepWithPlanner(planningTaskIds: Set<string>) {
+      manager = new SelfHealingManager(store, { rootDir: "/tmp/test", getPlanningTaskIds: () => planningTaskIds });
+      (store.listTasks as any).mockImplementation(async ({ column }: { column?: string }) => (column === "todo" ? [planningCard] : []));
+      (store.getTask as any).mockResolvedValue(planningCard);
+      return vi.spyOn(branchConflicts, "inspectBranchConflict").mockResolvedValue({
+        kind: "tip-already-merged",
+        livePath: "/tmp/fn-9701",
+        tipSha: "a05be4484011aaaabbbbccccddddeeeeffff0000",
+        integrationRef: "main",
+      } as any);
+    }
+
+    it("leaves the checkout of a card the planner owns untouched", async () => {
+      const inspect = sweepWithPlanner(new Set(["FN-9701"]));
+
+      const recovered = await manager.reclaimSelfOwnedBranchConflicts();
+
+      expect(recovered).toBe(0);
+      expect(inspect).not.toHaveBeenCalled();
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-9701", expect.objectContaining({ worktree: null }));
+      expect(store.logEntry).not.toHaveBeenCalledWith("FN-9701", expect.stringContaining("tip-already-merged"));
+    });
+
+    it("reclaims the same checkout once no planner owns the card", async () => {
+      sweepWithPlanner(new Set());
+
+      const recovered = await manager.reclaimSelfOwnedBranchConflicts();
+
+      expect(recovered).toBe(1);
+      expect(store.updateTask).toHaveBeenCalledWith("FN-9701", expect.objectContaining({ worktree: null, branch: null }));
+    });
+  });
 });
