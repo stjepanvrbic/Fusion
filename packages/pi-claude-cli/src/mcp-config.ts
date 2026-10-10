@@ -28,7 +28,7 @@ interface PiInstance {
   getAllTools(): unknown;
 }
 
-/** The 6 built-in tools that pi handles natively (match pi tool names). */
+/** The 6 pi tools that have a native Claude Code counterpart (match pi tool names). */
 const BUILT_IN_TOOL_NAMES = new Set([
   "read",
   "write",
@@ -37,6 +37,13 @@ const BUILT_IN_TOOL_NAMES = new Set([
   "grep",
   "find",
 ]);
+
+/**
+ * Which pi tools the schema server offers.
+ * `all` is for the `claude -p` route, which runs the CLI without its own tools so every pi tool, built-ins included, reaches the model through this server.
+ * `custom-only` is for the ACP route, whose bridge still offers Claude Code's native tools.
+ */
+export type McpToolSet = "all" | "custom-only";
 
 /** A custom tool definition with MCP-compatible schema. */
 export interface McpToolDef {
@@ -51,7 +58,7 @@ export interface McpToolDef {
  * @param pi - The pi ExtensionAPI instance
  * @returns Array of custom tool definitions (empty if all tools are built-in)
  */
-export function getCustomToolDefs(pi: PiInstance): McpToolDef[] {
+export function getCustomToolDefs(pi: PiInstance, toolSet: McpToolSet = "custom-only"): McpToolDef[] {
   const allTools = pi.getAllTools();
 
   if (!Array.isArray(allTools)) {
@@ -59,7 +66,7 @@ export function getCustomToolDefs(pi: PiInstance): McpToolDef[] {
   }
 
   return (allTools as PiToolInfo[])
-    .filter((tool) => !BUILT_IN_TOOL_NAMES.has(tool.name))
+    .filter((tool) => toolSet === "all" || !BUILT_IN_TOOL_NAMES.has(tool.name))
     .map((tool) => ({
       name: tool.name,
       description: tool.description,
@@ -81,10 +88,11 @@ interface PiAiToolLike {
  */
 export function toolsFromContext(
   contextTools: ReadonlyArray<PiAiToolLike> | undefined,
+  toolSet: McpToolSet = "custom-only",
 ): McpToolDef[] {
   if (!Array.isArray(contextTools)) return [];
   return contextTools
-    .filter((tool) => !BUILT_IN_TOOL_NAMES.has(tool.name))
+    .filter((tool) => toolSet === "all" || !BUILT_IN_TOOL_NAMES.has(tool.name))
     .map((tool) => ({
       name: tool.name,
       description: tool.description,

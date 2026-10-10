@@ -227,6 +227,31 @@ const CONVERSATION = () => ({
   systemPrompt: "Be helpful",
 });
 
+/** The CLI's echo of the result it recorded for a tool call. */
+function toolAcknowledgement(...toolUseIds: string[]): string {
+  return JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: toolUseIds.map((id) => ({ type: "tool_result", tool_use_id: id, content: [{ type: "text", text: "Result pending" }] })),
+    },
+  });
+}
+
+function toolUseBlock(index: number, id: string, name: string, partialJson: string): string[] {
+  return [
+    JSON.stringify({ type: "stream_event", event: { type: "content_block_start", index, content_block: { type: "tool_use", id, name, input: "" } } }),
+    JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: partialJson } } }),
+    JSON.stringify({ type: "stream_event", event: { type: "content_block_stop", index } }),
+  ];
+}
+
+const MESSAGE_START = JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 0 } } } });
+const TOOL_MESSAGE_END = [
+  JSON.stringify({ type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } } }),
+  JSON.stringify({ type: "stream_event", event: { type: "message_stop" } }),
+];
+
 function spawnArgs(index: number): string[] {
   return (spawn as any).mock.calls[index][1] as string[];
 }
@@ -1793,7 +1818,8 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       for (const line of lines) {
         proc.stdout.write(line + "\n");
       }
-      // Break-early kills and closes readline
+      proc.stdout.write(toolAcknowledgement("tool_read") + "\n");
+      // The acknowledged tool call is handed off: the CLI is stopped and readline closes
       await vi.advanceTimersByTimeAsync(100);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
@@ -2379,6 +2405,101 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       expect(spawn).toHaveBeenCalledTimes(2);
       const failure = expectSingleFailure(MockAssistantMessageEventStream.mock.instances[0], "error");
       expect(failure.error.errorMessage).toContain("No conversation found");
+    });
+  });
+
+  /*
+  FNXC:ClaudeCliToolOwnership 2026-10-10-20:56:
+  pi is the only executor of a tool call. The CLI has no tools of its own, and it is stopped once it has recorded the schema server's acknowledgement for every call, so its transcript never holds an unanswered or natively executed call.
+  */
+  describe("tool call hand-off", () => {
+    const EDIT = "mcp__custom-tools__edit";
+    const write = (proc: any, lines: string[]) => {
+      for (const line of lines) proc.stdout.write(line + "\n");
+    };
+    const terminalTypes = () => terminalEvents(MockAssistantMessageEventStream.mock.instances[0]).map((e: any) => [e.type, e.reason]);
+
+    it("runs the CLI without built-in tools or MCP servers of its own", async () => {
+      streamViaCli(mockModels[0] as any, { messages: [{ role: "user", content: "Hello" }] } as any, { mcpConfigPath: "/tmp/mcp.json" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(spawnArgs(0)).toContain("--tools=");
+      expect(spawnArgs(0)).toContain("--strict-mcp-config");
+      expect(spawnArgs(0)[spawnArgs(0).indexOf("--allowedTools") + 1]).toBe("mcp__custom-tools");
+      (spawn as any).mock.results[0].value.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    it("keeps the CLI running at message_stop until the tool call is acknowledged", async () => {
+      streamViaCli(mockModels[0] as any, { messages: [{ role: "user", content: "Edit" }] } as any);
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[0].value;
+
+      write(proc, [MESSAGE_START, ...toolUseBlock(0, "tool_a", EDIT, '{"path":"/a"}'), ...TOOL_MESSAGE_END]);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(proc.kill).not.toHaveBeenCalled();
+      expect(terminalTypes()).toEqual([]);
+
+      write(proc, [toolAcknowledgement("tool_a")]);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+      expect(terminalTypes()).toEqual([["done", "toolUse"]]);
+    });
+
+    it("waits for every parallel tool call, including acknowledgements that arrive before message_stop", async () => {
+      streamViaCli(mockModels[0] as any, { messages: [{ role: "user", content: "Edit three files" }] } as any);
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[0].value;
+
+      write(proc, [
+        MESSAGE_START,
+        ...toolUseBlock(0, "tool_a", EDIT, '{"path":"/a"}'),
+        ...toolUseBlock(1, "tool_b", EDIT, '{"path":"/b"}'),
+        toolAcknowledgement("tool_a"),
+        ...toolUseBlock(2, "tool_c", EDIT, '{"path":"/c"}'),
+        toolAcknowledgement("tool_b"),
+        ...TOOL_MESSAGE_END,
+      ]);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(proc.kill).not.toHaveBeenCalled();
+
+      write(proc, [toolAcknowledgement("tool_c")]);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+
+      const done = terminalEvents(MockAssistantMessageEventStream.mock.instances[0])[0];
+      expect([done.type, done.reason]).toEqual(["done", "toolUse"]);
+      expect(done.message.content.filter((c: any) => c.type === "toolCall").map((c: any) => c.name)).toEqual(["edit", "edit", "edit"]);
+    });
+
+    it("ignores a sub-agent's tool results when counting acknowledgements", async () => {
+      streamViaCli(mockModels[0] as any, { messages: [{ role: "user", content: "Edit" }] } as any);
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[0].value;
+
+      write(proc, [MESSAGE_START, ...toolUseBlock(0, "tool_a", EDIT, '{"path":"/a"}'), ...TOOL_MESSAGE_END]);
+      write(proc, [JSON.stringify({ ...JSON.parse(toolAcknowledgement("tool_a")), parent_tool_use_id: "tool_parent" })]);
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(proc.kill).not.toHaveBeenCalled();
+      write(proc, [toolAcknowledgement("tool_a")]);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+    });
+
+    it("hands the tool call off anyway when no acknowledgement arrives within the grace period", async () => {
+      streamViaCli(mockModels[0] as any, { messages: [{ role: "user", content: "Edit" }] } as any);
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[0].value;
+
+      write(proc, [MESSAGE_START, ...toolUseBlock(0, "tool_a", EDIT, '{"path":"/a"}'), ...TOOL_MESSAGE_END]);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(proc.kill).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+      expect(terminalTypes()).toEqual([["done", "toolUse"]]);
     });
   });
 });

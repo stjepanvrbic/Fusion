@@ -599,13 +599,29 @@ describe("mcp-config flag", () => {
     expect(args).not.toContain("--mcp-config");
   });
 
-  it("spawnClaude NEVER includes --strict-mcp-config in args", () => {
+  /*
+  FNXC:ClaudeCliToolOwnership 2026-10-10-20:56:
+  Fusion is the only executor of a tool call, so the CLI is launched with no built-in tools and only the MCP servers Fusion passes.
+  This replaces the earlier rule that the CLI kept the operator's own Claude Code MCP servers; Fusion's `mcpServers` setting is the way to give a session an MCP server.
+  */
+  it("launches the CLI with no built-in tools and no MCP servers of its own", () => {
+    spawnClaude("claude-sonnet-4-5-20250929");
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--tools=");
+    expect(args).toContain("--strict-mcp-config");
+    expect(args).not.toContain("--allowedTools");
+  });
+
+  it("pre-approves the schema server's tools when Fusion passes an MCP config", () => {
     spawnClaude("claude-sonnet-4-5-20250929", undefined, {
       mcpConfigPath: "/tmp/mcp-config.json",
     });
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).not.toContain("--strict-mcp-config");
+    expect(args).toContain("--tools=");
+    expect(args).toContain("--strict-mcp-config");
+    expect(args[args.indexOf("--allowedTools") + 1]).toBe("mcp__custom-tools");
   });
 
   it("backward compatibility - existing calls with only effort/cwd still work", () => {

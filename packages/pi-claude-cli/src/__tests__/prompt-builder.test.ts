@@ -1204,3 +1204,43 @@ describe("buildResumePrompt", () => {
     expect((result as any[])[1].type).toBe("image");
   });
 });
+
+/*
+FNXC:ClaudeCliToolOwnership 2026-10-10-20:56:
+On the `claude -p` route the CLI has no tools of its own, so the system prompt names every pi tool by its schema-server name, built-ins included.
+*/
+describe("buildSystemPrompt tool naming", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doMock("node:fs", () => ({ existsSync: () => false, readFileSync: () => "" }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const context = {
+    systemPrompt: "Base prompt.",
+    messages: [],
+    tools: [
+      { name: "bash", description: "Run a command", parameters: {} },
+      { name: "fn_task_done", description: "Finish the task", parameters: {} },
+    ],
+  } as unknown as any;
+
+  it("names built-in pi tools by their schema-server name when every tool goes through it", async () => {
+    const { buildSystemPrompt: bsp } = await import("../prompt-builder");
+    const result = bsp(context, "/some/project", { allToolsViaMcp: true });
+
+    expect(result).toContain("`bash` is exposed as `mcp__custom-tools__bash`");
+    expect(result).toContain("`fn_task_done` is exposed as `mcp__custom-tools__fn_task_done`");
+  });
+
+  it("names only custom tools when built-ins stay native", async () => {
+    const { buildSystemPrompt: bsp } = await import("../prompt-builder");
+    const result = bsp(context, "/some/project");
+
+    expect(result).not.toContain("mcp__custom-tools__bash");
+    expect(result).toContain("`fn_task_done` is exposed as `mcp__custom-tools__fn_task_done`");
+  });
+});

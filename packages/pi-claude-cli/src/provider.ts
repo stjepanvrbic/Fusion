@@ -68,6 +68,11 @@ import type { ClaudeResultMessage } from "./types.js";
 const INACTIVITY_TIMEOUT_MS = 30 * 60_000;
 /** How long a turn whose output ended without a result waits for the exit code and stderr before reporting the failure without them. */
 const EXIT_REPORT_GRACE_MS = 1_000;
+/**
+ * How long a tool-call turn waits for the CLI to record the schema server's acknowledgements before it is stopped anyway.
+ * The acknowledgement is a local stdio round trip that takes milliseconds; a turn stopped without it still runs each tool once, and the CLI records the unanswered calls as interrupted.
+ */
+const TOOL_ACKNOWLEDGEMENT_GRACE_MS = 5_000;
 const ABORTED_MESSAGE = "Claude CLI request was aborted";
 
 function isDebugStreamEnabled(): boolean {
@@ -153,6 +158,7 @@ export function streamViaCli(
     let promptFile: SystemPromptFile | undefined;
     let abortHandler: (() => void) | undefined;
     let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+    let toolAcknowledgementTimer: ReturnType<typeof setTimeout> | undefined;
     let sessionFallback: CliSessionMode | undefined;
     // Events from a rejected attempt's process may arrive after the next attempt has started.
     let attemptOver = false;
@@ -185,7 +191,7 @@ export function streamViaCli(
         : buildPrompt(context);
       const systemPrompt = resumeSessionId
         ? undefined
-        : buildSystemPrompt(context, cwd);
+        : buildSystemPrompt(context, cwd, { allToolsViaMcp: true });
 
       // Compute effort level from reasoning options
       const effort = mapThinkingEffort(
@@ -218,8 +224,14 @@ export function streamViaCli(
         `spawned claude subprocess pid=${spawned.pid ?? "unknown"} args=${JSON.stringify(buildClaudeSpawnArgs(model.id, promptFile?.path, sessionOptions))}`,
       );
 
-      // Track tool_use blocks for break-early decision at message_stop
-      let sawBuiltInOrCustomTool = false;
+      /*
+      FNXC:ClaudeCliToolOwnership 2026-10-10-20:56:
+      A tool call is handed to pi, which executes it; the CLI process is stopped and the next turn resumes the session with pi's result.
+      The CLI is stopped only after it has recorded the schema server's acknowledgement for every call of the message. Stopping at `message_stop` left the calls unanswered in the transcript, and the CLI then told the model on resume that each call was interrupted with an unknown outcome, next to the real result.
+      */
+      const unacknowledgedToolUseIds = new Set<string>();
+      let sawPiTool = false;
+      let toolMessageStopped = false;
       let firstLineReceived = false;
       let resultReceived = false;
       // Guard against buffered readline lines firing after rl.close()
@@ -301,6 +313,17 @@ export function streamViaCli(
         }
       });
 
+      /** Stop the CLI and end the turn with the tool calls pi will execute. */
+      function handOffToolCalls() {
+        if (broken) return;
+        debugLog(`handing off tool calls to pi (unacknowledged=${unacknowledgedToolUseIds.size})`);
+        broken = true; // Set guard BEFORE rl.close() to prevent buffered lines
+        clearTimeout(inactivityTimer);
+        clearTimeout(toolAcknowledgementTimer);
+        forceKillProcess(spawned);
+        rl.close();
+      }
+
       // Process NDJSON lines from stdout using event-based callback
       // NOTE: Using 'line' event instead of `for await` because the async
       // iterator batches lines, breaking real-time streaming to pi.
@@ -339,28 +362,30 @@ export function streamViaCli(
                 `top-level tool_use seen: ${toolName} (piKnown=${piKnownTool ? "yes" : "no"})`,
               );
               if (piKnownTool) {
-                // Built-in tool (Read/Write/etc.) OR custom MCP tool (mcp__custom-tools__*)
-                // Internal Claude Code tools (ToolSearch, Task, etc.) are excluded
-                sawBuiltInOrCustomTool = true;
+                sawPiTool = true;
+                const toolUseId = msg.event.content_block.id;
+                if (toolUseId) unacknowledgedToolUseIds.add(toolUseId);
               }
             }
           }
 
-          // Break-early at message_stop: kill subprocess before CLI auto-executes tools
           // Only on top-level message_stop — sub-agent message_stop is internal
-          if (
-            isTopLevel &&
-            msg.event.type === "message_stop" &&
-            sawBuiltInOrCustomTool
-          ) {
-            debugLog("break-early triggered at message_stop after pi-known tool_use");
-            broken = true; // Set guard BEFORE rl.close() to prevent buffered lines
-            clearTimeout(inactivityTimer);
-            // Pi will execute these tools. Kill subprocess to prevent CLI from executing them.
-            forceKillProcess(spawned);
-            rl.close();
-            return; // Done event pushed after readline closes
+          if (isTopLevel && msg.event.type === "message_stop" && sawPiTool) {
+            toolMessageStopped = true;
+            if (unacknowledgedToolUseIds.size === 0) {
+              handOffToolCalls();
+              return; // Done event pushed after readline closes
+            }
+            toolAcknowledgementTimer = setTimeout(handOffToolCalls, TOOL_ACKNOWLEDGEMENT_GRACE_MS);
           }
+        } else if (msg.type === "user") {
+          if (msg.parent_tool_use_id) return;
+          const content = msg.message?.content;
+          if (!Array.isArray(content)) return;
+          for (const block of content as Array<{ type?: string; tool_use_id?: string }>) {
+            if (block.type === "tool_result" && block.tool_use_id) unacknowledgedToolUseIds.delete(block.tool_use_id);
+          }
+          if (toolMessageStopped && unacknowledgedToolUseIds.size === 0) handOffToolCalls();
         } else if (msg.type === "control_request") {
           debugLog(
             `unexpected control_request received (stdin already closed): ${msg.request_id}`,
@@ -387,6 +412,8 @@ export function streamViaCli(
 
       if (streamEnded) return undefined;
       if (sessionFallback) return sessionFallback;
+      // Output that ends after a complete tool-call message still hands the calls to pi, with or without their acknowledgements.
+      if (toolMessageStopped) handOffToolCalls();
 
       if (!broken && !resultReceived) {
         // Output ended without a result: the turn did not complete. Wait briefly for the exit code and stderr so the failure says why.
@@ -447,6 +474,7 @@ export function streamViaCli(
     } finally {
       attemptOver = true;
       clearTimeout(inactivityTimer);
+      clearTimeout(toolAcknowledgementTimer);
       if (options?.signal && abortHandler) {
         options.signal.removeEventListener("abort", abortHandler);
       }

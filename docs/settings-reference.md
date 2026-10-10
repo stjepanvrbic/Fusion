@@ -972,6 +972,12 @@ Anthropic has three independent authentication/routing paths:
 
 Anthropic can be connected with a raw API key from both Model Onboarding and **Settings → Authentication**. Anthropic API-key auth appears as a separate **Anthropic API Key** card, while Claude subscription OAuth appears as **Anthropic Subscription** with Login/Logout controls. On Fusion desktop, Anthropic Subscription OAuth login URLs are delegated to the operating system browser instead of an Electron child window so the existing polling/callback flow can complete. `/api/auth/status` returns only masked key hints for the API-key card.
 
+#### Claude CLI tools and MCP servers
+
+Fusion executes every tool call of a `pi-claude-cli` session itself, so its logging, containment, activity tracking and tool-failure detection apply as they do for other providers. The `claude` process is started without Claude Code's built-in tools (`--tools=`) and without the MCP servers configured in Claude Code (`--strict-mcp-config`). The model sees Fusion's tools as `mcp__custom-tools__<name>`, including `read`, `write`, `edit`, `bash`, `grep` and `find`.
+
+MCP servers and claude.ai connectors set up in Claude Code itself are not available inside Fusion sessions. To give sessions an MCP server, declare it in Fusion's [`mcpServers`](#mcp-server-settings) setting; those servers are passed to the CLI and run by it.
+
 #### Claude CLI rate-limit retries
 
 A rate limit from the `pi-claude-cli` provider is retried in place before Fusion's normal rate-limit handling runs. This is for account switchers such as `cswap auto`, which move the local `claude` login to another subscription account shortly after one hits its limit. Fusion starts a new `claude` process for every attempt, so a retry uses whichever account is logged in at that moment.

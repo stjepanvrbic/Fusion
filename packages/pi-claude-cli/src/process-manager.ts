@@ -58,6 +58,9 @@ export function createSystemPromptFile(systemPrompt: string, options: SystemProm
   };
 }
 
+/** Permission rule covering every tool of the schema-only `custom-tools` MCP server. */
+const CUSTOM_TOOLS_MCP_SERVER_RULE = "mcp__custom-tools";
+
 /**
  * Build the Claude CLI argv for stream-json communication. Pure: writes no files.
  *
@@ -85,6 +88,14 @@ export function buildClaudeSpawnArgs(
     "--include-partial-messages",
     "--model",
     modelId,
+    /*
+    FNXC:ClaudeCliToolOwnership 2026-10-10-20:56:
+    Fusion must be the only executor of a tool call: its logging, containment, activity tracking and tool-failure detection all sit on pi's execution.
+    The CLI starts its own tools as soon as the model asks for them, before the provider can stop it, so a native Edit or Write ran alongside pi's and the model saw two results for one call.
+    `--tools=` (the documented empty value) removes every built-in tool, and `--strict-mcp-config` keeps the operator's personal Claude Code MCP servers out, so the CLI has nothing it can execute except the servers Fusion passes in `--mcp-config`.
+    */
+    "--tools=",
+    "--strict-mcp-config",
   ];
 
   if (options?.resumeSessionId) {
@@ -104,7 +115,8 @@ export function buildClaudeSpawnArgs(
   }
 
   if (options?.mcpConfigPath) {
-    args.push("--mcp-config", options.mcpConfigPath);
+    // The schema server only acknowledges calls, so its tools are pre-approved; a permission refusal would be recorded as the tool's result.
+    args.push("--mcp-config", options.mcpConfigPath, "--allowedTools", CUSTOM_TOOLS_MCP_SERVER_RULE);
   }
 
   return args;

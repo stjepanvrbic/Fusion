@@ -308,3 +308,51 @@ describe("writeMcpConfig", () => {
     expect(schemaPathB).toContain("bbbbbbbbbbbb");
   });
 });
+
+/*
+FNXC:ClaudeCliToolOwnership 2026-10-10-20:56:
+On the `claude -p` route every pi tool reaches the model through the schema server, built-ins included, and the server acknowledges a call without executing anything.
+*/
+describe("tool ownership", () => {
+  const tools = [
+    { name: "bash", description: "Run a command", parameters: { type: "object" } },
+    { name: "edit", description: "Edit a file", parameters: { type: "object" } },
+    { name: "fn_task_done", description: "Finish the task", parameters: { type: "object" } },
+  ];
+
+  it("offers built-in pi tools through the schema server only when all tools are requested", () => {
+    expect(toolsFromContext(tools, "all").map((tool) => tool.name)).toEqual(["bash", "edit", "fn_task_done"]);
+    expect(toolsFromContext(tools).map((tool) => tool.name)).toEqual(["fn_task_done"]);
+
+    const pi = { getAllTools: () => tools };
+    expect(getCustomToolDefs(pi, "all").map((tool) => tool.name)).toEqual(["bash", "edit", "fn_task_done"]);
+    expect(getCustomToolDefs(pi).map((tool) => tool.name)).toEqual(["fn_task_done"]);
+  });
+
+  it("acknowledges a tool call with a notice instead of a result", async () => {
+    const server = (await import("../mcp-schema-server.cjs")) as unknown as {
+      respond: (msg: unknown, tools: unknown[]) => { id: unknown; result: { content: Array<{ type: string; text: string }>; isError?: boolean } } | undefined;
+      HOST_EXECUTION_NOTICE: string;
+    };
+
+    const response = server.respond(
+      { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "bash", arguments: { command: "echo tick >> counter.txt" } } },
+      [],
+    );
+
+    expect(response?.id).toBe(7);
+    expect(response?.result.isError).toBeUndefined();
+    expect(response?.result.content).toEqual([{ type: "text", text: server.HOST_EXECUTION_NOTICE }]);
+    expect(server.HOST_EXECUTION_NOTICE).toContain("host application runs this tool");
+  });
+
+  it("lists the schemas it was given and stays silent on notifications", async () => {
+    const server = (await import("../mcp-schema-server.cjs")) as unknown as {
+      respond: (msg: unknown, tools: unknown[]) => { result: { tools?: unknown[] } } | undefined;
+    };
+    const defs = toolsFromContext(tools, "all");
+
+    expect(server.respond({ jsonrpc: "2.0", id: 1, method: "tools/list" }, defs)?.result.tools).toEqual(defs);
+    expect(server.respond({ jsonrpc: "2.0", method: "notifications/initialized" }, defs)).toBeUndefined();
+  });
+});

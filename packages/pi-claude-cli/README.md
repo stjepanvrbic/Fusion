@@ -27,9 +27,9 @@ Then select a Claude model via `/model` in the interactive UI. All Claude models
 ## Features
 
 - Streams text, thinking, and tool call tokens in real-time
-- Maps tool names and arguments bidirectionally between Claude and pi
-- Exposes custom pi tools to Claude via MCP (schema-only, no execution)
-- Break-early pattern prevents Claude CLI from auto-executing tools
+- Runs the CLI without its own tools (`--tools=`, `--strict-mcp-config`), so pi is the only executor of a tool call
+- Exposes every pi tool to Claude via MCP (schema-only; a call is acknowledged, never executed)
+- Stops the CLI once it has recorded the acknowledgements, then resumes the session with pi's results
 - Session resume via `--resume` eliminates history replay on follow-up turns
 - Configurable thinking effort with elevated budgets for Opus models
 - Cross-platform subprocess management (Windows, macOS, Linux)
