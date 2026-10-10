@@ -2,7 +2,7 @@ import "./TaskContextMenu.css";
 import type { KeyboardEvent, PointerEvent as ReactPointerEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { TFunction } from "i18next";
-import type { ColumnId, Task, TaskDetail } from "@fusion/core";
+import { isEmptyMergeNoLandedProofPark, type ColumnId, type Task, type TaskDetail } from "@fusion/core";
 
 /*
 FNXC:TaskRecoveryVocabulary 2026-08-28-00:38:
@@ -113,6 +113,11 @@ export interface BuildTaskActionMenuModelOptions {
   The server is the sole eligibility authority, so this model never re-derives the rule from `workflowStepResults`.
   */
   bypassableReviewStepId?: string | null;
+  /*
+  FNXC:CloseAsLanded 2026-10-10-17:20:
+  Operator fallback for the empty-merge park only. Like bypass, only TaskDetailModal wires it, and it is offered only for a card the shared core predicate recognises as that park; the server re-applies every other fence.
+  */
+  onCloseAsLanded?: () => void;
 }
 
 export function getTaskPrAutomationLabel(t: TFunction<"app">, status?: string): string | undefined {
@@ -324,6 +329,14 @@ export function buildTaskActionMenuModel(options: BuildTaskActionMenuModelOption
       KB-019: default tone, not `note`. TaskContextMenu renders a `note` as an inert `<span role="note">` and `selectAction` ignores it, so the action was visible but could never be selected.
       */
       onSelect: options.onBypassReview,
+    });
+  }
+
+  if (options.onCloseAsLanded && isEmptyMergeNoLandedProofPark(task)) {
+    actions.push({
+      id: "close-as-landed",
+      label: t("taskDetail.closeAsLanded.btn", "Close as landed"),
+      onSelect: options.onCloseAsLanded,
     });
   }
 

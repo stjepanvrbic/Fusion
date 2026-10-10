@@ -93,6 +93,7 @@ function buildApp(input: {
     rerouteFailedNoVerdictPreMergeReview?: ReturnType<typeof vi.fn>;
   };
   reconcileLandedReviewTask?: ReturnType<typeof vi.fn>;
+  closeEmptyMergeParkAsLanded?: ReturnType<typeof vi.fn>;
   workflowIr?: unknown;
 }) {
   const updateTask = vi.fn(async (_id: string, patch: Partial<Task>) => Object.assign(input.task, patch));
@@ -172,6 +173,7 @@ function buildApp(input: {
     // The seam the fix reads for live-merge proof.
     resolveSelfHealingManager: () => ({
       reconcileLandedReviewTask: input.reconcileLandedReviewTask ?? vi.fn().mockResolvedValue({ outcome: "not-landed", baseBranch: "main" }),
+      closeEmptyMergeParkAsLanded: input.closeEmptyMergeParkAsLanded ?? vi.fn().mockResolvedValue({ outcome: "ineligible", reason: "not-empty-merge-park" }),
       getActiveMergeTaskId: () => input.activeMergeTaskId ?? null,
       getStaleMergingStatusMinAgeMs: () => input.staleMergingStatusMinAgeMs ?? DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS,
     }),
@@ -257,6 +259,38 @@ describe("POST /api/tasks/:id/reconcile-landed-review", () => {
 
     expect(res.status).toBe(409);
     expect(res.body).toEqual({ outcome: "ineligible", reason: "foreign-ownership" });
+  });
+});
+
+describe("POST /api/tasks/:id/close-as-landed", () => {
+  it("closes through the project-scoped engine seam as the dashboard operator with the trimmed reason", async () => {
+    const closeEmptyMergeParkAsLanded = vi.fn().mockResolvedValue({ outcome: "closed", baseBranch: "main", branchTipSha: "5e55bf98" });
+    const { app } = buildApp({ task: mkMergeTask({ id: "KB-057", status: "failed" }), closeEmptyMergeParkAsLanded });
+
+    const res = await performRequest(app, "POST", "/api/tasks/KB-057/close-as-landed", JSON.stringify({ reason: "  KB-062 landed a superset  ", actor: "someone-else" }), { "content-type": "application/json" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ outcome: "closed", baseBranch: "main", branchTipSha: "5e55bf98" });
+    expect(closeEmptyMergeParkAsLanded).toHaveBeenCalledWith("KB-057", { reason: "KB-062 landed a superset", actor: "dashboard-operator", source: "dashboard" });
+  });
+
+  it("requires a reason before touching the engine", async () => {
+    const closeEmptyMergeParkAsLanded = vi.fn();
+    const { app } = buildApp({ task: mkMergeTask({ id: "KB-057", status: "failed" }), closeEmptyMergeParkAsLanded });
+
+    const res = await performRequest(app, "POST", "/api/tasks/KB-057/close-as-landed", JSON.stringify({ reason: " " }), { "content-type": "application/json" });
+
+    expect(res.status).toBe(400);
+    expect(closeEmptyMergeParkAsLanded).not.toHaveBeenCalled();
+  });
+
+  it("returns engine refusals as structured conflicts", async () => {
+    const { app } = buildApp({ task: mkMergeTask({ id: "KB-057", status: "failed" }) });
+
+    const res = await performRequest(app, "POST", "/api/tasks/KB-057/close-as-landed", JSON.stringify({ reason: "superseded" }), { "content-type": "application/json" });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ outcome: "ineligible", reason: "not-empty-merge-park" });
   });
 });
 

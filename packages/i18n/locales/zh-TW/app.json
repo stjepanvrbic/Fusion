@@ -7926,6 +7926,11 @@
     "cacheRead": "快取讀取",
     "cacheWrite": "快取寫入",
     "checkoutLink": "檢出 {{id}}",
+    "closeAsLanded": {
+      "btn": "標記為已合入並關閉",
+      "promptMessage": "此卡片的分支沒有可合併的變更。如果你已確認其工作已在 main 上，請填寫原因以將其標記為已合入並關閉（必填，會記入稽核）：",
+      "success": "已將 {{id}} 標記為已合入並關閉"
+    },
     "delete": {
       "actionClosed": "關閉了",
       "actionDeleted": "刪除了",

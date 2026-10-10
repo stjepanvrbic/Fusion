@@ -7926,6 +7926,11 @@
     "cacheRead": "캐시 읽기",
     "cacheWrite": "캐시 쓰기",
     "checkoutLink": "{{id}} 체크아웃",
+    "closeAsLanded": {
+      "btn": "반영됨으로 닫기",
+      "promptMessage": "이 카드의 브랜치는 병합할 변경이 없습니다. 작업이 이미 main에 있는지 확인했다면 반영됨으로 닫는 이유를 입력하세요(필수, 감사 기록됨):",
+      "success": "{{id}}을(를) 이미 반영됨으로 닫았습니다"
+    },
     "delete": {
       "actionClosed": "닫힘",
       "actionDeleted": "삭제됨",

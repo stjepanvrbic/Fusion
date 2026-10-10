@@ -7644,6 +7644,25 @@
       "axis1Evidence": "Deliberately unfenced append-only audit or post-finalization bookkeeping surface; it does not clobber a successor task row."
     },
     {
+      "callSiteId": "packages/engine/src/merge/merger-ai.ts::recordConfirmedNoCommitClaim::store.logEntry::#1",
+      "callSiteFingerprint": "store.logEntry(taskId,`AI merge: ${branch} already on ${integrationBranch} per the merge agent, confirmed by two review passes — finalizing as,JSON.stringify({ branch, branchTipSha: claim.branchTipSha, integrationBranch, integrationTipSha }, null, 2))",
+      "file": "packages/engine/src/merge/merger-ai.ts",
+      "enclosingSymbolPath": "recordConfirmedNoCommitClaim",
+      "writer": "store.logEntry",
+      "ordinal": 1,
+      "owningEntryPoint": "runAiMerge",
+      "reachableDataStates": [
+        "pre-land"
+      ],
+      "axis1": "checkpoint-covered",
+      "axis1Evidence": "Called only from runAiMerge's empty-merge lane before the no-op finalize; the write runs through the per-boundary merge write fence.",
+      "axis2Provisional": "unresolved",
+      "axis2Final": "already-fenced",
+      "observedInSuite": "layerB-observed",
+      "executionProof": "static:per-call-site merge write fence or ownership checkpoint",
+      "followUpTaskId": "none:no-follow-up-required"
+    },
+    {
       "callSiteId": "packages/engine/src/merge/merger-ai.ts::recordWorkspaceLandIntentForCandidate::store.recordWorkspaceLandIntent::#1",
       "callSiteFingerprint": "store.recordWorkspaceLandIntent({?,taskId,?,remoteUrl,integrationRef,intendedSha,expectedTip})",
       "file": "packages/engine/src/merge/merger-ai.ts",
@@ -14063,6 +14082,44 @@
       "executionProof": "none:out-of-frontier",
       "followUpTaskId": "none:out-of-frontier",
       "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to clearStaleBlockedBy>transition; SelfHealingManager maintenance and recovery sweeps own this write."
+    },
+    {
+      "callSiteId": "packages/engine/src/self-healing.ts::closeEmptyMergeParkAsLanded::this.store.logEntry::#1",
+      "callSiteFingerprint": "this.store.logEntry(task.id,`Closed as already landed by ${options.actor} (${options.source}): ${reason}`,JSON.stringify({ branch: task.branch ?? null, branchTipSha: branchTipSha ?? null, baseBranch: mergeTarget.branch }, null)",
+      "file": "packages/engine/src/self-healing.ts",
+      "enclosingSymbolPath": "closeEmptyMergeParkAsLanded",
+      "writer": "this.store.logEntry",
+      "ordinal": 1,
+      "owningEntryPoint": "other",
+      "reachableDataStates": [
+        "unobservable:closure-wide production fixture pending"
+      ],
+      "axis1": "out-of-frontier",
+      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to closeEmptyMergeParkAsLanded; the operator close-as-landed action (CLI and dashboard) owns this write.",
+      "axis2Provisional": "out-of-frontier",
+      "axis2Final": "out-of-frontier",
+      "observedInSuite": "out-of-frontier",
+      "executionProof": "none:out-of-frontier",
+      "followUpTaskId": "none:out-of-frontier"
+    },
+    {
+      "callSiteId": "packages/engine/src/self-healing.ts::closeEmptyMergeParkAsLanded::this.store.updateTaskAtomic::#1",
+      "callSiteFingerprint": "this.store.updateTaskAtomic(task.id,(current: Task) => { if (reviewCardFingerprint(current) !== fingerprint || current.error !== task.error) return undefine)",
+      "file": "packages/engine/src/self-healing.ts",
+      "enclosingSymbolPath": "closeEmptyMergeParkAsLanded",
+      "writer": "this.store.updateTaskAtomic",
+      "ordinal": 1,
+      "owningEntryPoint": "other",
+      "reachableDataStates": [
+        "unobservable:closure-wide production fixture pending"
+      ],
+      "axis1": "out-of-frontier",
+      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to closeEmptyMergeParkAsLanded; the operator close-as-landed action (CLI and dashboard) owns this write.",
+      "axis2Provisional": "out-of-frontier",
+      "axis2Final": "out-of-frontier",
+      "observedInSuite": "out-of-frontier",
+      "executionProof": "none:out-of-frontier",
+      "followUpTaskId": "none:out-of-frontier"
     },
     {
       "callSiteId": "packages/engine/src/self-healing.ts::emitTaskMerged::this.store.emit::#1",

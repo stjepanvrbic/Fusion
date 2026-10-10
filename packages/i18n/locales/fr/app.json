@@ -7927,6 +7927,11 @@
     "cacheRead": "Lecture du cache",
     "cacheWrite": "Écriture du cache",
     "checkoutLink": "checkout {{id}}",
+    "closeAsLanded": {
+      "btn": "Clore comme intégrée",
+      "promptMessage": "La branche de cette carte n'apporte aucun changement. Si vous avez vérifié que son travail est déjà sur main, indiquez la raison pour la clore comme intégrée (obligatoire, journalisée) :",
+      "success": "{{id}} close comme déjà intégrée"
+    },
     "delete": {
       "actionClosed": "fermé",
       "actionDeleted": "supprimé",

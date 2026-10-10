@@ -752,6 +752,7 @@ fn task steer FN-001 "Reuse existing auth middleware"
 fn task attach FN-001 ./trace.log
 fn task merge FN-001
 fn task reconcile FN-001
+fn task close-landed FN-001 --reason "FN-002 landed a superset of this branch"
 fn task duplicate FN-001
 fn task refine FN-001 --feedback "Add rollback handling"
 fn task archive FN-001
@@ -762,6 +763,7 @@ fn task delete FN-001 --force
 
 Notes:
 - `fn task reconcile <id>` closes an in-review card only when its base branch carries ownership-anchored landed content. The recorded branch may already be cleaned up or may remain present, but a present branch is accepted only when it has no unlanded task-owned commits. It refuses paused, leased, live, raced, foreign-owned, or unproven cards and never bypasses review approval; use `fn task merge` for normal live merge work.
+- `fn task close-landed <id> --reason <why>` closes an in-review card parked with "branch had no net changes vs main" when you have checked that its work is already on main, for example because a dependent task landed it. The AI merge already finalizes such a card by itself when its reviewer confirms the merge agent's claim in two passes; this command is the fallback when the reviewer disputed it or could not check it. It requires a reason, keeps the review-approval and liveness refusals of `fn task reconcile`, records the reason and the branch tip in the task log, and refuses any other kind of failed card and workspace tasks.
 - Interrupting `fn task merge` aborts its merge and clears its transient merge status: Ctrl-C (`SIGINT`) exits 130, `SIGTERM` exits 143, and a closed terminal (`SIGHUP`) exits 129. Unlike `fn serve`, `fn dashboard`, and the daemon, this one-shot foreground command deliberately does not survive terminal disconnects.
 - `fn task archive` accepts live-board tasks and preserves the original column for restore. It refuses tasks in a WIP lane or active merge pipeline to protect another process's worktrees; a human operator may use `--force` to override this destructive guard.
 - The agent-facing `fn_task_archive` tool returns a structured error for the same live-task refusal and deliberately has no force parameter.

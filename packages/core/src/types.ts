@@ -581,6 +581,11 @@ export {
   EXTERNAL_BLOCK_AUTO_RESUME_BUDGET,
 } from "./tasks/task-external-block.js";
 export type { TaskExternalBlock, TaskExternalBlockOrigin, TaskExternalBlockReport, TaskExternalBlockAutoResume, TaskExternalBlockResumeRequest } from "./tasks/task-external-block.js";
+export {
+  EMPTY_MERGE_NO_LANDED_PROOF_REASON,
+  buildEmptyMergeNoLandedProofReason,
+  isEmptyMergeNoLandedProofPark,
+} from "./tasks/empty-merge-park.js";
 
 export type { OverlapWaitPhase, OverlapWaitDecision, OverlapWaitFreshness, OverlapWaitLandedPath, OverlapWaitDeliverySnapshot, OverlapWaitDeliveryProof, OverlapWaitReceipt, TaskOverlapWait, OverlapWaitClaim, OverlapWaitExecutionIdentity } from "./types/task/task-overlap-wait.js";
 

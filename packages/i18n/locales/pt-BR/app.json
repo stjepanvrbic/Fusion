@@ -7937,6 +7937,11 @@
     "cacheRead": "Leitura de cache",
     "cacheWrite": "Escrita de cache",
     "checkoutLink": "checkout {{id}}",
+    "closeAsLanded": {
+      "btn": "Fechar como integrada",
+      "promptMessage": "O branch deste cartão não traz alterações. Se você verificou que o trabalho já está na main, informe o motivo para fechá-lo como integrado (obrigatório, registrado em auditoria):",
+      "success": "{{id}} fechada como já integrada"
+    },
     "delete": {
       "actionClosed": "fechada",
       "actionDeleted": "excluída",
