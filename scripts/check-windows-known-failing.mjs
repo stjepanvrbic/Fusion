@@ -11,6 +11,10 @@ Timeout-only files render in a separate informational "Load timeouts" summary se
 FNXC:CI 2026-10-08-13:12:
 KB-062 extends the lane to five suites: core, engine, dashboard (dashboard-api project), CLI (@runfusion/fusion) and the scripts/__tests__ node:test suite, whose report comes from scripts/lib/node-test-json-reporter.mjs.
 PACKAGE_DIRS is exported so the ledger test validates keys against the same map, and the usage message lists every key. A package with no ledger key compares against an empty known list.
+
+FNXC:CI 2026-10-10-21:33:
+A real Vitest 4.1.10 JSON report never carries the timeout text for a timed-out test. The runner gives the timeout error the stack captured where the test or per-test hook was registered, whose first line is the placeholder "Error: STACK_TRACE_ERROR", and the reporter writes `stack || message` into failureMessages. Only a file-level hook timeout keeps the "Hook timed out in Nms" text, in the file result's `message`.
+The classifier therefore accepts that exact placeholder line as timeout evidence. Without it the motivating case (tests hitting the fifteen-second testTimeout) was still reported under "Unexpected failures". No other Vitest path leaves the placeholder as the first line: expect.poll, vi.waitFor and vi.waitUntil substitute their own message into the copied stack.
 */
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -25,7 +29,9 @@ export const PACKAGE_DIRS = {
   "@runfusion/fusion": "packages/cli",
   scripts: "scripts",
 };
-// Matches the first line of @vitest/runner's timeout error in stack form ("Error: Test timed out in 15000ms.") or message form.
+// First line of the stack @vitest/runner assigns to a test or per-test hook timeout error; the JSON reporter emits it in place of the timeout text.
+const TIMEOUT_STACK_FIRST_LINE = "Error: STACK_TRACE_ERROR";
+// The timeout text itself, as a file result's `message` carries it for a file-level hook, with or without an error-name prefix.
 const TIMEOUT_FIRST_LINE = /^(?:[A-Za-z]*Error:\s*)?(?:Test|Hook) timed out in \d+ms\b/;
 
 export function readKnownFailing(ledgerPath = LEDGER_PATH) {
@@ -41,7 +47,7 @@ function toPackageRelative(packageDir, file) {
 export function isTimeoutMessage(text) {
   if (typeof text !== "string") return false;
   const firstLine = text.trimStart().split(/\r?\n/, 1)[0] ?? "";
-  return TIMEOUT_FIRST_LINE.test(firstLine);
+  return firstLine === TIMEOUT_STACK_FIRST_LINE || TIMEOUT_FIRST_LINE.test(firstLine);
 }
 
 function failureMessages(fileResult) {

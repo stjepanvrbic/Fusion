@@ -28,7 +28,13 @@ function report(results, dir = packageDir) {
   };
 }
 
-const TIMEOUT_STACK = "Error: Test timed out in 15000ms.\nIf this is a long-running test, pass a timeout value as the last argument or configure it globally with \"testTimeout\".\n    at x (file.ts:1:1)";
+/*
+FNXC:CI 2026-10-10-21:33:
+The shape Vitest 4.1.10's JSON reporter writes into failureMessages for a test that hit its timeout, captured from a real run. The runner replaces the timeout error's stack with the one captured at registration, so the timeout text never reaches the report. Fixtures must use this shape: a hand-written "Error: Test timed out in 15000ms." let the classifier pass its tests while it matched nothing a real lane produces.
+*/
+const TIMEOUT_STACK = "Error: STACK_TRACE_ERROR\n    at task (file:///D:/a/Fusion/Fusion/node_modules/.pnpm/@vitest+runner@4.1.10/node_modules/@vitest/runner/dist/chunk-artifact.js:1784:27)\n    at D:/a/Fusion/Fusion/packages/core/src/__tests__/slow.test.ts:4:3";
+// What the same report carries for a top-level beforeAll that hit hookTimeout: the timeout text, in the file result's message.
+const HOOK_TIMEOUT_MESSAGE = "Hook timed out in 15000ms.\nIf this is a long-running hook, pass a timeout value as the last argument or configure it globally with \"hookTimeout\".";
 const failedWith = (...messages) => ({ assertionResults: [{ status: "failed", title: "t", fullName: "t", failureMessages: messages }, { status: "passed", title: "ok", fullName: "ok", failureMessages: [] }] });
 
 test("passes when only known Windows failures fail, and flags known files that now pass", () => {
@@ -84,10 +90,10 @@ test("an unexpected timeout-only file still fails, but is classified as a load t
 });
 
 test("a file-level hook timeout is timeout-only, and a known file timing out stays a known failure", () => {
-  assert.deepEqual(classifyLoadTimeout({ status: "failed", message: "Hook timed out in 15000ms.", assertionResults: [] }), { timeoutOnly: true, timeouts: 1 });
+  assert.deepEqual(classifyLoadTimeout({ status: "failed", message: HOOK_TIMEOUT_MESSAGE, assertionResults: [{ status: "skipped", failureMessages: [] }] }), { timeoutOnly: true, timeouts: 1 });
   const file = "src/__tests__/known.test.ts";
   const result = compareWindowsRun({
-    report: report([[file, "failed", { message: "Hook timed out in 15000ms.", assertionResults: [] }]]),
+    report: report([[file, "failed", { message: HOOK_TIMEOUT_MESSAGE, assertionResults: [{ status: "skipped", failureMessages: [] }] }]]),
     exitCode: 1,
     known: [file],
     packageDir,
@@ -138,10 +144,11 @@ test("the summary separates real unexpected failures from load timeouts", () => 
 });
 
 test("isTimeoutMessage matches only Vitest test and hook timeouts", () => {
-  for (const text of ["Error: Test timed out in 15000ms.\nmore", "Test timed out in 15000ms.", "Error: Hook timed out in 10000ms.", "Hook timed out in 10000ms."]) {
+  for (const text of [TIMEOUT_STACK, HOOK_TIMEOUT_MESSAGE, "Error: Test timed out in 15000ms.\nmore", "Test timed out in 15000ms.", "Error: Hook timed out in 10000ms.", "Hook timed out in 10000ms."]) {
     assert.equal(isTimeoutMessage(text), true, text);
   }
-  for (const text of ["Error: expected promise to resolve in 15000ms", "", undefined]) assert.equal(isTimeoutMessage(text), false, String(text));
+  const realFailures = ["Error: expected 1 to be 2 // Object.is equality\n    at x", "Error: Timed out in waitUntil!\n    at x", "AssertionError: expected 1 to be 2 // Object.is equality", "Error: STACK_TRACE_ERROR leaked into a message"];
+  for (const text of [...realFailures, "Error: expected promise to resolve in 15000ms", "", undefined]) assert.equal(isTimeoutMessage(text), false, String(text));
 });
 
 /*
@@ -160,7 +167,7 @@ test("CLI: run 37720611351's load-only core timeouts fail the shard but render a
   try {
     const reportPath = path.join(fixtureDir, "core-1.json");
     const exitPath = path.join(fixtureDir, "core-1.exit");
-    writeFileSync(reportPath, JSON.stringify(report(files.map((file) => [file, "failed", failedWith("Error: Test timed out in 15000ms.")]), coreDir)));
+    writeFileSync(reportPath, JSON.stringify(report(files.map((file) => [file, "failed", failedWith(TIMEOUT_STACK)]), coreDir)));
     writeFileSync(exitPath, "1\n");
     const env = { ...process.env };
     delete env.GITHUB_STEP_SUMMARY;
