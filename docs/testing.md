@@ -1212,6 +1212,8 @@ When a test owns a process-wide singleton that has asynchronous owners (timers, 
 
 In this pnpm workspace, one dependency version can resolve to several peer-hashed instances. A `vi.mock` declared in a `packages/cli` test is keyed by the resolved module path, so it does not automatically reach `@fusion/dashboard` or `@fusion/engine` source that imports another instance. For `@earendil-works/pi-coding-agent`, retain the anchored package-root alias in `packages/cli/vitest.config.ts` (with subpath aliases ordered first). The symptom is a mocked function with zero calls alongside real runtime/provider log noise. Use an `importOriginal()`-spread factory when cross-package consumers need unmocked exports, and keep a guard that fails when the alias is removed.
 
+A workspace plugin aliased to its source entry follows the same rule. Vite string aliases also match as a path prefix, so mocking `<plugin-package>/dist/<module>.js` when the package key maps to `src/index.ts` rewrites the specifier to a path that does not exist, and the mock silently never applies. Mock the module id the importer actually resolves (the plugin's `src/<module>.js`, by relative path) and assert the mock was called, so a mock that stops applying fails the test.
+
 ## Standing Rule: Do Not Add Slow Tests (FN-5048)
 
 - Default new tests to narrow seams, in-memory fakes, shared harnesses, and targeted assertions.

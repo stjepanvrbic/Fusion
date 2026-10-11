@@ -12,7 +12,7 @@ additive.test.ts (auth surface).
 */
 
 import express from "express";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TaskStore, GlobalSettings, CustomProvider } from "@fusion/core";
 import { createApiRoutes } from "../../routes.js";
 import { request as performRequest } from "../../test-request.js";
@@ -28,9 +28,20 @@ vi.mock("../../project-store-resolver.js", async () => {
   };
 });
 
-// Mock the Hermes plugin's own CLI/skill-install seams so its real onLoad/
-// onUnload hooks can run without spawning a real subprocess or touching disk.
-const { mockResolveCli, mockInstallFusionSkill } = vi.hoisted(() => ({
+/*
+FNXC:ProviderAuth 2026-10-11-13:05:
+The Hermes plugin's real onLoad must run here without resolving real CLI settings or installing skills into a Hermes home.
+The mocks name the plugin's source modules because the dashboard vitest alias maps the package key to `src/index.ts`, which rewrites any `dist` subpath to a path that does not exist, so a `dist` mock never applies.
+Every case asserts the mocks were called, so a mock that stops applying fails the test.
+`shouldInstallComputerUseSkill` is forced true so the computer-use installer mock is exercised on every platform, not only macOS.
+`HERMES_HOME` is cleared per case so a regressed mock can write only into the per-run test home set up by the shared vitest setup.
+*/
+const {
+  mockResolveCli,
+  mockShouldInstallComputerUseSkill,
+  mockInstallFusionSkill,
+  mockInstallComputerUseSkill,
+} = vi.hoisted(() => ({
   mockResolveCli: vi.fn().mockReturnValue({
     binaryPath: "hermes",
     model: undefined,
@@ -40,21 +51,46 @@ const { mockResolveCli, mockInstallFusionSkill } = vi.hoisted(() => ({
     cliTimeoutMs: 300_000,
     profile: undefined,
   }),
+  mockShouldInstallComputerUseSkill: vi.fn().mockReturnValue(true),
   mockInstallFusionSkill: vi.fn().mockReturnValue({
     outcome: "installed",
     sourceDir: "/tmp/source",
     targetDir: "/tmp/target",
   }),
+  mockInstallComputerUseSkill: vi.fn().mockReturnValue({
+    outcome: "installed",
+    sourceDir: "/tmp/source",
+    targetDir: "/tmp/computer-use",
+  }),
 }));
 
-vi.mock("@fusion-plugin-examples/hermes-runtime/dist/cli-spawn.js", async () => {
-  const actual = await vi.importActual<Record<string, unknown>>("@fusion-plugin-examples/hermes-runtime/dist/cli-spawn.js");
+vi.mock("../../../../../plugins/fusion-plugin-hermes-runtime/src/cli-spawn.js", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>(
+    "../../../../../plugins/fusion-plugin-hermes-runtime/src/cli-spawn.js",
+  );
   return { ...actual, resolveCliSettings: mockResolveCli };
 });
-vi.mock("@fusion-plugin-examples/hermes-runtime/dist/fusion-skill-install.js", async () => {
-  const actual = await vi.importActual<Record<string, unknown>>("@fusion-plugin-examples/hermes-runtime/dist/fusion-skill-install.js");
-  return { ...actual, installComputerUseSkillIntoHermesHome: mockInstallComputerUseSkill, installFusionSkillIntoHermesHome: mockInstallFusionSkill };
+vi.mock("../../../../../plugins/fusion-plugin-hermes-runtime/src/fusion-skill-install.js", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>(
+    "../../../../../plugins/fusion-plugin-hermes-runtime/src/fusion-skill-install.js",
+  );
+  return {
+    ...actual,
+    installComputerUseSkillIntoHermesHome: mockInstallComputerUseSkill,
+    installFusionSkillIntoHermesHome: mockInstallFusionSkill,
+    shouldInstallComputerUseSkill: mockShouldInstallComputerUseSkill,
+  };
 });
+
+function expectHermesSeamsMocked(settings: Record<string, unknown>) {
+  expect(mockResolveCli).toHaveBeenCalledTimes(1);
+  expect(mockResolveCli).toHaveBeenCalledWith(settings);
+  expect(mockShouldInstallComputerUseSkill).toHaveBeenCalled();
+  expect(mockInstallFusionSkill).toHaveBeenCalledTimes(1);
+  expect(mockInstallFusionSkill).toHaveBeenCalledWith({ profile: undefined });
+  expect(mockInstallComputerUseSkill).toHaveBeenCalledTimes(1);
+  expect(mockInstallComputerUseSkill).toHaveBeenCalledWith({ profile: undefined });
+}
 
 function createMockGlobalSettingsStore(settings: GlobalSettings) {
   return {
@@ -146,6 +182,15 @@ describe("FN-7630 symptom verification: customProviders + Hermes runtime connect
   beforeEach(() => {
     mockInvalidateAllGlobalSettingsCaches.mockReset();
     vi.unstubAllGlobals();
+    mockResolveCli.mockClear();
+    mockShouldInstallComputerUseSkill.mockClear();
+    mockInstallFusionSkill.mockClear();
+    mockInstallComputerUseSkill.mockClear();
+    vi.stubEnv("HERMES_HOME", undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it("leaves the persisted customProviders list byte-identical across the Hermes plugin's onLoad/onUnload lifecycle", async () => {
@@ -177,6 +222,7 @@ describe("FN-7630 symptom verification: customProviders + Hermes runtime connect
       taskStore: { getTask: vi.fn() },
     };
     await hermesPlugin.hooks!.onLoad!(ctx as never);
+    expectHermesSeamsMocked(ctx.settings);
 
     const during = await REQUEST(app, "GET", "/api/custom-providers");
     expect(during.status).toBe(200);
@@ -197,13 +243,15 @@ describe("FN-7630 symptom verification: customProviders + Hermes runtime connect
     const app = createApp(settings);
 
     const hermesPlugin = (await import("@fusion-plugin-examples/hermes-runtime")).default;
+    const pluginSettings = {};
     await hermesPlugin.hooks!.onLoad!({
       pluginId: "fusion-plugin-hermes-runtime",
-      settings: {},
+      settings: pluginSettings,
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
       emitEvent: vi.fn(),
       taskStore: { getTask: vi.fn() },
     } as never);
+    expectHermesSeamsMocked(pluginSettings);
 
     const res = await REQUEST(app, "GET", "/api/custom-providers");
     expect(res.status).toBe(200);
@@ -220,13 +268,15 @@ describe("FN-7630 symptom verification: customProviders + Hermes runtime connect
     const app = createApp(settings);
 
     const hermesPlugin = (await import("@fusion-plugin-examples/hermes-runtime")).default;
+    const pluginSettings = {};
     await hermesPlugin.hooks!.onLoad!({
       pluginId: "fusion-plugin-hermes-runtime",
-      settings: {},
+      settings: pluginSettings,
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
       emitEvent: vi.fn(),
       taskStore: { getTask: vi.fn() },
     } as never);
+    expectHermesSeamsMocked(pluginSettings);
 
     const res = await REQUEST(app, "GET", "/api/custom-providers");
     expect(res.status).toBe(200);
