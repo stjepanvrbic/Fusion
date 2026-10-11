@@ -26,6 +26,7 @@ import {
   readlinkSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -64,6 +65,8 @@ export interface FnBinaryLocalPaths {
   fusionShimPath: string;
   /** Shim flavor for this layout (`cmd` on win32). */
   shimStyle: FnBinaryShimStyle;
+  /** Extensionless POSIX shell shims (`fn`, `fusion`) written beside the batch shims on win32; empty on POSIX layouts. */
+  shellShimPaths: string[];
   /** Platform whose path rules (separator, case sensitivity) govern containment checks. */
   platform: NodeJS.Platform;
 }
@@ -77,6 +80,10 @@ export interface FnBinaryLocalPaths {
  * Symlinks need the SeCreateSymbolicLink privilege that non-admin Windows users lack, so Windows PATH entries are `fn.cmd`/`fusion.cmd` batch shims (plain files) forwarding to the binary.
  * The binary stays in `installDir` (never copied into `binDir`) because the compiled server resolves `client/` and `runtime/` next to `process.execPath`.
  * `platform` selects the layout only; paths are joined with the host `node:path` so either layout can be exercised against a real temp dir on any host.
+ *
+ * FNXC:SystemPanelFnBinary 2026-10-11-07:35:
+ * Git Bash and other MSYS shells do not apply PATHEXT to `.cmd`, so the bare names `fn` and `fusion` are not found there when only the batch shims exist.
+ * The win32 layout therefore also has extensionless POSIX shell shims `binDir/fn` and `binDir/fusion`; cmd.exe and PowerShell keep resolving the batch shims.
  */
 export function resolveFnBinaryLocalPaths(
   home = homedir(),
@@ -92,6 +99,7 @@ export function resolveFnBinaryLocalPaths(
     fnShimPath: join(binDir, isWindows ? "fn.cmd" : "fn"),
     fusionShimPath: join(binDir, isWindows ? "fusion.cmd" : "fusion"),
     shimStyle: isWindows ? "cmd" : "symlink",
+    shellShimPaths: isWindows ? [join(binDir, "fn"), join(binDir, "fusion")] : [],
     platform,
   };
 }
@@ -109,10 +117,35 @@ export function renderFnCmdShim(binDir: string, binaryPath: string): string {
   return `@echo off\r\n"%~dp0${rel}" %*\r\n`;
 }
 
+/**
+ * Body of a POSIX shell shim that runs `binaryPath` with every argument, for MSYS shells such as Git Bash on Windows.
+ *
+ * FNXC:SystemPanelFnBinary 2026-10-11-07:35:
+ * The shim directory comes from `$0` with parameter expansion only, so the shim needs no external tool (`sed` and `dirname` are missing when Git's `usr\bin\bash.exe` starts with a bare PATH) and keeps working if the home directory moves.
+ * `exec` hands the process to the binary, so its exit code and signals reach the caller; LF endings only, because a CR would become part of the command.
+ * The binary stays in `installDir` because the compiled server resolves `client/` and `runtime/` next to `process.execPath`.
+ * The relative target uses win32 rules with `/` separators so the body is identical on every host.
+ * It holds only the fixed layout segments (`binDir` and `installDir` share the `.local` directory), so it never contains `"`, `$`, a backtick or a backslash and needs no shell escaping.
+ */
+export function renderFnShellShim(binDir: string, binaryPath: string): string {
+  const rel = win32Path.relative(binDir, binaryPath).replace(/\\/g, "/");
+  return [
+    "#!/bin/sh",
+    "case $0 in",
+    "  *[/\\\\]*) basedir=${0%[/\\\\]*} ;;",
+    "  *) basedir=. ;;",
+    "esac",
+    `exec "$basedir/${rel}" "$@"`,
+    "",
+  ].join("\n");
+}
+
 /** Same shape as `SHIM_TARGET` in @fusion/core's windows-launch: a quoted shim-relative target forwarding `%*`. */
 const CMD_SHIM_TARGET = /"(?:%~dp0|%dp0%)([^"%]*)"\s+%\*/i;
-/** Upper bound on bytes read from a candidate `.cmd` shim during removal. */
-const CMD_SHIM_READ_LIMIT = 4096;
+/** The `exec` line of a `renderFnShellShim` body; the captured target has no quote, `$`, backtick, backslash or line break. */
+const SHELL_SHIM_TARGET = /^exec "\$basedir\/([^"$`\\\r\n]+)" "\$@"$/m;
+/** Files larger than this are not Fusion shims and are never read during removal; a foreign `fn` can be a large native binary. */
+const SHIM_READ_LIMIT = 4096;
 
 /**
  * True when `child` is `parent` or lies inside it, using `platform` path rules.
@@ -416,6 +449,9 @@ function sweepInstallLeftovers(paths: FnBinaryLocalPaths, onLog: FnBinaryLogFn, 
  * KB-097: on the `cmd` layout (Windows) shims are written as batch files and `symlinkSync` is never called, so a non-admin Windows user can install without the symlink privilege.
  * Any prior file or symlink at a shim path is replaced, so re-installing leaves exactly one shim per name.
  *
+ * FNXC:SystemPanelFnBinary 2026-10-11-07:35:
+ * The win32 layout also writes the extensionless `renderFnShellShim` files as regular files, so `fn` and `fusion` run by bare name in Git Bash; a legacy symlink at those paths is replaced and its target is left alone.
+ *
  * FNXC:SystemPanelFnBinary 2026-10-11-06:32:
  * KB-109: re-linking must work while a previously installed `fn` is running.
  * Windows refuses to overwrite or delete a running executable or a loaded native module, but allows renaming them and the directories that hold them.
@@ -508,7 +544,7 @@ export function installLocalFnBinary(
     }
   }
 
-  for (const shim of [paths.fnShimPath, paths.fusionShimPath]) {
+  for (const shim of [paths.fnShimPath, paths.fusionShimPath, ...paths.shellShimPaths]) {
     try {
       if (existsSync(shim) || isSymlink(shim)) {
         unlinkSync(shim);
@@ -516,7 +552,10 @@ export function installLocalFnBinary(
     } catch {
       // Replace below; a missing prior shim is fine.
     }
-    if (paths.shimStyle === "cmd") {
+    if (paths.shellShimPaths.includes(shim)) {
+      onLog("system", `Write shim ${shim} → ${paths.binaryPath}`);
+      writeFileSync(shim, renderFnShellShim(paths.binDir, paths.binaryPath), { mode: 0o755 });
+    } else if (paths.shimStyle === "cmd") {
       onLog("system", `Write shim ${shim} → ${paths.binaryPath}`);
       writeFileSync(shim, renderFnCmdShim(paths.binDir, paths.binaryPath));
     } else {
@@ -538,7 +577,7 @@ export function installLocalFnBinary(
     }
   }
 
-  const shimKind = paths.shimStyle === "cmd" ? "batch shims" : "symlinks";
+  const shimKind = paths.shimStyle === "cmd" ? "batch and sh shims" : "symlinks";
   onLog(
     "system",
     `Default fn is now ${paths.fnShimPath} (${shimKind} → ${paths.binaryPath}; PATH should prefer ~/.local/bin).`,
@@ -554,12 +593,13 @@ function isSymlink(path: string): boolean {
 }
 
 /**
- * Target of a `"%~dp0<rel>" %*` batch shim, resolved against the shim's directory, or undefined when the body is not that shape.
- * Backslash segments are re-joined with the host path API so the result is a real filesystem path on every host.
+ * Target of a batch (`CMD_SHIM_TARGET`) or shell (`SHELL_SHIM_TARGET`) shim, resolved against the shim's directory, or undefined when the body is not that shape.
+ * A file over `SHIM_READ_LIMIT` bytes is not read and yields undefined.
+ * Captured segments are re-joined with the host path API so the result is a real filesystem path on every host.
  */
-function readCmdShimTarget(shim: string): string | undefined {
-  const body = readFileSync(shim).subarray(0, CMD_SHIM_READ_LIMIT).toString("utf8");
-  const match = CMD_SHIM_TARGET.exec(body);
+function readShimTarget(shim: string, pattern: RegExp): string | undefined {
+  if (statSync(shim).size > SHIM_READ_LIMIT) return undefined;
+  const match = pattern.exec(readFileSync(shim, "utf8"));
   if (!match) return undefined;
   const segments = match[1].split(/[\\/]+/).filter(Boolean);
   if (segments.length === 0) return undefined;
@@ -573,7 +613,12 @@ function readCmdShimTarget(shim: string): string | undefined {
  * FNXC:SystemPanelFnBinary 2026-10-08-19:30:
  * KB-097: containment uses `isPathInsideOrEqual` with Windows path rules whenever the layout or host is Windows, because the old `installDir + "/"` prefix never matched backslash paths.
  * `.cmd` shims are removed only when their `"%~dp0<rel>" %*` target lies inside `installDir`; unreadable or unrecognized files are left in place and logged.
- * On the `cmd` layout, legacy extensionless `fn`/`fusion` entries from a pre-KB-097 (admin) install are removed only when they are symlinks into `installDir`.
+ *
+ * FNXC:SystemPanelFnBinary 2026-10-11-07:35:
+ * On the `cmd` layout the extensionless `fn`/`fusion` paths hold the Git Bash shell shims, and an operator may keep an unrelated program under the same name there.
+ * A regular file at those paths is removed only when its `exec "$basedir/<rel>"` target lies inside `installDir`; a file over the read cap, an unreadable file or any other script (an npm shim, for example) is left and logged.
+ * A symlink or junction there, left by a pre-KB-097 (admin) install, is removed only when it points into `installDir`.
+ * Removal order is the `.cmd` shims, then the shell shims; the function logs failures and never throws.
  */
 export function removeLocalFnShims(
   onLog: FnBinaryLogFn,
@@ -585,6 +630,30 @@ export function removeLocalFnShims(
     paths.platform === "win32" || process.platform === "win32" ? "win32" : paths.platform;
   const insideInstall = (target: string): boolean =>
     isPathInsideOrEqual(paths.installDir, target, containmentPlatform);
+  const removeWhenInside = (shim: string, target: string, label: string): void => {
+    if (insideInstall(target)) {
+      unlinkSync(shim);
+      removed.push(shim);
+      onLog("system", `Removed ${label} ${shim}`);
+    } else {
+      onLog("system", `Leaving ${shim} (points at ${target}, not the local Fusion install)`);
+    }
+  };
+  const linkTarget = (link: string): string => resolve(dirname(link), readlinkSync(link));
+  const removeScriptShim = (shim: string, pattern: RegExp, kind: string): void => {
+    let target: string | undefined;
+    try {
+      target = readShimTarget(shim, pattern);
+    } catch (err) {
+      onLog("system", `Leaving ${shim} (unreadable: ${errorMessage(err)})`);
+      return;
+    }
+    if (target === undefined) {
+      onLog("system", `Leaving ${shim} (not a recognized Fusion ${kind} shim)`);
+      return;
+    }
+    removeWhenInside(shim, target, "local shim");
+  };
 
   for (const shim of [paths.fnShimPath, paths.fusionShimPath]) {
     try {
@@ -593,35 +662,11 @@ export function removeLocalFnShims(
         continue;
       }
       if (isSymlink(shim)) {
-        const target = resolve(dirname(shim), readlinkSync(shim));
-        if (insideInstall(target)) {
-          unlinkSync(shim);
-          removed.push(shim);
-          onLog("system", `Removed local shim ${shim}`);
-          continue;
-        }
-        onLog("system", `Leaving ${shim} (points at ${target}, not the local Fusion install)`);
+        removeWhenInside(shim, linkTarget(shim), "local shim");
         continue;
       }
       if (paths.shimStyle === "cmd") {
-        let target: string | undefined;
-        try {
-          target = readCmdShimTarget(shim);
-        } catch (err) {
-          onLog("system", `Leaving ${shim} (unreadable: ${err instanceof Error ? err.message : String(err)})`);
-          continue;
-        }
-        if (target === undefined) {
-          onLog("system", `Leaving ${shim} (not a recognized Fusion batch shim)`);
-          continue;
-        }
-        if (insideInstall(target)) {
-          unlinkSync(shim);
-          removed.push(shim);
-          onLog("system", `Removed local shim ${shim}`);
-        } else {
-          onLog("system", `Leaving ${shim} (points at ${target}, not the local Fusion install)`);
-        }
+        removeScriptShim(shim, CMD_SHIM_TARGET, "batch");
         continue;
       }
       // Non-symlink binary in ~/.local/bin — only remove if identical path under installDir.
@@ -637,21 +682,23 @@ export function removeLocalFnShims(
     }
   }
 
-  if (paths.shimStyle === "cmd") {
-    for (const legacy of [join(paths.binDir, "fn"), join(paths.binDir, "fusion")]) {
-      try {
-        if (!isSymlink(legacy)) continue;
-        const target = resolve(dirname(legacy), readlinkSync(legacy));
-        if (insideInstall(target)) {
-          unlinkSync(legacy);
-          removed.push(legacy);
-          onLog("system", `Removed legacy local shim ${legacy}`);
-        } else {
-          onLog("system", `Leaving ${legacy} (points at ${target}, not the local Fusion install)`);
-        }
-      } catch (err) {
-        onLog("stderr", `Failed to inspect/remove ${legacy}: ${err instanceof Error ? err.message : String(err)}`);
+  for (const shim of paths.shellShimPaths) {
+    try {
+      if (isSymlink(shim)) {
+        removeWhenInside(shim, linkTarget(shim), "legacy local shim");
+        continue;
       }
+      if (!existsSync(shim)) {
+        onLog("system", `No shim at ${shim}`);
+        continue;
+      }
+      if (!lstatSync(shim).isFile()) {
+        onLog("system", `Leaving ${shim} (not a regular file)`);
+        continue;
+      }
+      removeScriptShim(shim, SHELL_SHIM_TARGET, "shell");
+    } catch (err) {
+      onLog("stderr", `Failed to inspect/remove ${shim}: ${errorMessage(err)}`);
     }
   }
 

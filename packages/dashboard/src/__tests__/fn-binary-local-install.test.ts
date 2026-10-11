@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   chmodSync,
@@ -14,12 +14,13 @@ import {
   readlinkSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { PassThrough } from "node:stream";
-import { resolveShellFreeLaunch } from "@fusion/core";
+import { resolvePosixShell, resolveShellFreeLaunch } from "@fusion/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const spawnMock = vi.hoisted(() => ({ fn: undefined as unknown as ReturnType<typeof vi.fn> }));
@@ -37,6 +38,7 @@ import {
   isPathInsideOrEqual,
   removeLocalFnShims,
   renderFnCmdShim,
+  renderFnShellShim,
   resolveFnBinaryLocalPaths,
   runLinkLocalFnBinary,
   runStreamingCommand,
@@ -227,6 +229,7 @@ describe("resolveFnBinaryLocalPaths", () => {
     expect(paths.fnShimPath).toBe(join(home, ".local", "bin", "fn.cmd"));
     expect(paths.fusionShimPath).toBe(join(home, ".local", "bin", "fusion.cmd"));
     expect(paths.shimStyle).toBe("cmd");
+    expect(paths.shellShimPaths).toEqual([join(home, ".local", "bin", "fn"), join(home, ".local", "bin", "fusion")]);
     expect(paths.platform).toBe("win32");
   });
 
@@ -238,6 +241,7 @@ describe("resolveFnBinaryLocalPaths", () => {
       expect(paths.fnShimPath).toBe(join(home, ".local", "bin", "fn"));
       expect(paths.fusionShimPath).toBe(join(home, ".local", "bin", "fusion"));
       expect(paths.shimStyle).toBe("symlink");
+      expect(paths.shellShimPaths).toEqual([]);
     }
   });
 });
@@ -261,8 +265,13 @@ describe("installLocalFnBinary", () => {
       expect(lstatSync(shim).isFile()).toBe(true);
       expect(readFileSync(shim, "utf8")).toBe(expectedShim);
     }
-    // The binary stays in installDir; binDir holds exactly the two shims.
-    expect(readdirSync(paths.binDir).sort()).toEqual(["fn.cmd", "fusion.cmd"]);
+    for (const shim of paths.shellShimPaths) {
+      expect(lstatSync(shim).isSymbolicLink()).toBe(false);
+      expect(lstatSync(shim).isFile()).toBe(true);
+      expect(readFileSync(shim, "utf8")).toBe(renderFnShellShim(paths.binDir, paths.binaryPath));
+    }
+    // The binary stays in installDir; binDir holds exactly one batch and one shell shim per name.
+    expect(readdirSync(paths.binDir).sort()).toEqual(["fn", "fn.cmd", "fusion", "fusion.cmd"]);
     expect(logs.some((line) => line.startsWith("Write shim"))).toBe(true);
     expect(logs.some((line) => line.startsWith("Link "))).toBe(false);
   });
@@ -273,11 +282,33 @@ describe("installLocalFnBinary", () => {
     );
   });
 
+  it("renders an LF shell shim that execs the binary relative to the shim", () => {
+    const body = renderFnShellShim("C:\\h\\.local\\bin", "C:\\h\\.local\\share\\fusion\\fn.exe");
+    expect(body).toBe(
+      [
+        "#!/bin/sh",
+        "case $0 in",
+        "  *[/\\\\]*) basedir=${0%[/\\\\]*} ;;",
+        "  *) basedir=. ;;",
+        "esac",
+        'exec "$basedir/../share/fusion/fn.exe" "$@"',
+        "",
+      ].join("\n"),
+    );
+    expect(body).not.toContain("\r");
+  });
+
   it("produces a shim that resolveShellFreeLaunch unwraps to the installed fn.exe", () => {
     const shimPath = "C:\\h\\.local\\bin\\fn.cmd";
     const binaryPath = "C:\\h\\.local\\share\\fusion\\fn.exe";
     const body = renderFnCmdShim("C:\\h\\.local\\bin", binaryPath);
-    const files = new Map([[shimPath, body], [binaryPath, "MZ"]]);
+    // The extensionless Git Bash shim beside it is never a launch candidate.
+    const shellShimPath = "C:\\h\\.local\\bin\\fn";
+    const files = new Map([
+      [shimPath, body],
+      [shellShimPath, renderFnShellShim("C:\\h\\.local\\bin", binaryPath)],
+      [binaryPath, "MZ"],
+    ]);
     const launch = resolveShellFreeLaunch("fn", ["--version"], {
       platform: "win32",
       env: { PATH: "C:\\h\\.local\\bin", PATHEXT: ".EXE;.CMD" },
@@ -335,6 +366,97 @@ describe("installLocalFnBinary", () => {
         expect(readFileSync(shim, "utf8")).toBe(renderFnCmdShim(paths.binDir, paths.binaryPath));
       }
     }
+    for (const shim of paths.shellShimPaths) {
+      expect(lstatSync(shim).isFile()).toBe(true);
+      expect(readFileSync(shim, "utf8")).toBe(renderFnShellShim(paths.binDir, paths.binaryPath));
+    }
+  });
+});
+
+/*
+FNXC:SystemPanelFnBinary 2026-10-11-07:35:
+Git Bash does not apply PATHEXT to `.cmd`, so after a win32-layout install `fn` and `fusion` must run by bare name through a POSIX shell.
+The installed binary is a `#!/bin/sh` fake that echoes its arguments and exits 5, which MSYS and Linux shells both execute, so these cases run on Windows (Git Bash) and Linux hosts.
+*/
+const FAKE_BINARY = "#!/bin/sh\nprintf '<%s>' \"$@\"\nexit 5\n";
+
+/** Prepends `/usr/bin` (which `<git>\usr\bin\bash.exe` does not add itself) and the shim directory to PATH, then runs `$2` by bare name. */
+const RUN_BY_NAME =
+  'PATH="/usr/bin:/bin:$PATH"; d=$1; n=$2; shift 2; ' +
+  'if command -v cygpath >/dev/null 2>&1; then d=$(cygpath -u "$d"); fi; PATH="$d:$PATH"; "$n" "$@"';
+
+/** The host POSIX shell: Git Bash on Windows (never bare `sh`, which can be the WSL launcher), `/bin/sh` elsewhere. */
+function hostPosixShell(): string {
+  if (process.platform !== "win32") return "/bin/sh";
+  const shell = resolvePosixShell();
+  expect(shell, "a Git Bash shell is required on Windows").toBeDefined();
+  return shell as string;
+}
+
+/**
+ * Environment whose PATH holds only system directories, so an `fn` installed on the host (for example an npm shim) can never answer for the shim under test.
+ * Git's `bin\bash.exe` adds its own `/mingw64/bin:/usr/bin`; every PATH-like key is dropped first because Windows env keys are case-insensitive.
+ */
+function systemOnlyEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.toUpperCase() !== "PATH") env[key] = value;
+  }
+  env.PATH = process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32") : "/usr/bin:/bin";
+  return env;
+}
+
+function runHostShell(args: string[]): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync(hostPosixShell(), args, {
+    cwd: makeTemp("fn-bin-cwd-"),
+    env: systemOnlyEnv(),
+    encoding: "utf8",
+    timeout: 20_000,
+    windowsHide: true,
+  });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+
+function installWithFakeBinary(platform: NodeJS.Platform): FnBinaryLocalPaths {
+  const dist = makeDist();
+  writeFileSync(join(dist, fnBinaryFileName()), FAKE_BINARY);
+  const paths = resolveFnBinaryLocalPaths(makeTemp("fn bin home "), platform);
+  installLocalFnBinary(dist, () => {}, paths);
+  return paths;
+}
+
+describe("win32 layout from a POSIX shell", () => {
+  it.each(["fn", "fusion"])("runs %s by bare name with arguments and exit code passed through", (name) => {
+    const paths = installWithFakeBinary("win32");
+
+    const result = runHostShell(["-c", RUN_BY_NAME, "sh", paths.binDir, name, "a b", "c&d", ""]);
+
+    expect(result).toEqual({
+      status: 5,
+      stdout: "<a b><c&d><>",
+      stderr: "",
+    });
+  });
+
+  it("runs the shell shim invoked by its full path from another directory", () => {
+    const paths = installWithFakeBinary("win32");
+
+    expect(runHostShell([paths.shellShimPaths[0], "x y"])).toEqual({ status: 5, stdout: "<x y>", stderr: "" });
+  });
+
+  it("replaces a legacy link at a shell shim path without touching its target", () => {
+    const home = makeTemp("fn-bin-home-legacy-");
+    const paths = resolveFnBinaryLocalPaths(home, "win32");
+    const outsideDir = makeTemp("fn-bin-outside-");
+    writeFileSync(join(outsideDir, "marker.txt"), "marker");
+    mkdirSync(paths.binDir, { recursive: true });
+    symlinkSync(outsideDir, paths.shellShimPaths[0], "junction");
+
+    installLocalFnBinary(makeDist(), () => {}, paths);
+
+    expect(lstatSync(paths.shellShimPaths[0]).isFile()).toBe(true);
+    expect(readFileSync(paths.shellShimPaths[0], "utf8")).toBe(renderFnShellShim(paths.binDir, paths.binaryPath));
+    expect(readFileSync(join(outsideDir, "marker.txt"), "utf8")).toBe("marker");
   });
 });
 
@@ -606,12 +728,74 @@ describe("removeLocalFnShims", () => {
 
     const result = removeLocalFnShims(onLog, paths);
 
-    expect(result.removed).toEqual([paths.fnShimPath, paths.fusionShimPath]);
-    expect(existsSync(paths.fnShimPath)).toBe(false);
-    expect(existsSync(paths.fusionShimPath)).toBe(false);
+    expect(result.removed).toEqual([paths.fnShimPath, paths.fusionShimPath, ...paths.shellShimPaths]);
+    for (const shim of result.removed) expect(existsSync(shim)).toBe(false);
     expect(logs.some((line) => line.includes("Removed local shim"))).toBe(true);
+    expect(readdirSync(paths.binDir)).toEqual(["other-tool"]);
     expect(readFileSync(otherTool, "utf8")).toBe("keep-me");
     expect(existsSync(paths.binaryPath)).toBe(true);
+  });
+
+  it("leaves shell shims that forward elsewhere or are other scripts", () => {
+    const paths = installWin32();
+    const [fnShell, fusionShell] = paths.shellShimPaths;
+    const elsewhere = renderFnShellShim(paths.binDir, paths.binaryPath).replace("../share/fusion/fn.exe", "../other/fn.exe");
+    const npmShim = '#!/bin/sh\nbasedir=$(dirname "$0")\nexec node "$basedir/node_modules/@runfusion/fusion/dist/bin.js" "$@"\n';
+    writeFileSync(fnShell, elsewhere);
+    writeFileSync(fusionShell, npmShim);
+    const { logs, onLog } = collect();
+
+    const result = removeLocalFnShims(onLog, paths);
+
+    expect(result.removed).toEqual([paths.fnShimPath, paths.fusionShimPath]);
+    expect(readFileSync(fnShell, "utf8")).toBe(elsewhere);
+    expect(readFileSync(fusionShell, "utf8")).toBe(npmShim);
+    expect(logs.filter((line) => line.startsWith("Leaving"))).toEqual([
+      expect.stringContaining(fnShell),
+      expect.stringContaining(fusionShell),
+    ]);
+  });
+
+  it("never reads a shell-shim-shaped file larger than the read cap", () => {
+    const paths = installWin32();
+    const oversize = `${renderFnShellShim(paths.binDir, paths.binaryPath)}#${"x".repeat(8192)}\n`;
+    writeFileSync(paths.shellShimPaths[0], oversize);
+    const { onLog } = collect();
+
+    const result = removeLocalFnShims(onLog, paths);
+
+    expect(result.removed).toEqual([paths.fnShimPath, paths.fusionShimPath, paths.shellShimPaths[1]]);
+    expect(readFileSync(paths.shellShimPaths[0], "utf8")).toBe(oversize);
+  });
+
+  it("removes only the batch shims after an install that wrote no shell shims", () => {
+    const paths = installWin32();
+    for (const shim of paths.shellShimPaths) rmSync(shim);
+    const streams: string[] = [];
+
+    const result = removeLocalFnShims((stream) => streams.push(stream), paths);
+
+    expect(result.removed).toEqual([paths.fnShimPath, paths.fusionShimPath]);
+    expect(streams).not.toContain("stderr");
+  });
+
+  it("removes a legacy link into the install and leaves one that points elsewhere", () => {
+    const paths = installWin32();
+    const [fnShell, fusionShell] = paths.shellShimPaths;
+    const runtimeDir = join(paths.installDir, "runtime");
+    const outsideDir = makeTemp("fn-bin-outside-");
+    for (const shim of paths.shellShimPaths) rmSync(shim);
+    symlinkSync(runtimeDir, fnShell, "junction");
+    symlinkSync(outsideDir, fusionShell, "junction");
+    const { logs, onLog } = collect();
+
+    const result = removeLocalFnShims(onLog, paths);
+
+    expect(result.removed).toEqual([paths.fnShimPath, paths.fusionShimPath, fnShell]);
+    expect(logs).toContain(`Removed legacy local shim ${fnShell}`);
+    expect(existsSync(join(runtimeDir, "win32-x64", "pty.node"))).toBe(true);
+    expect(lstatSync(fusionShell).isSymbolicLink()).toBe(true);
+    expect(existsSync(outsideDir)).toBe(true);
   });
 
   it("leaves .cmd shims that forward elsewhere or are not recognized shims", () => {
@@ -623,10 +807,13 @@ describe("removeLocalFnShims", () => {
 
     const result = removeLocalFnShims(onLog, paths);
 
-    expect(result.removed).toEqual([]);
+    expect(result.removed).toEqual(paths.shellShimPaths);
     expect(readFileSync(paths.fnShimPath, "utf8")).toBe(foreign);
     expect(readFileSync(paths.fusionShimPath, "utf8")).toBe("garbage that is not a shim");
-    expect(logs.filter((line) => line.startsWith("Leaving")).length).toBe(2);
+    expect(logs.filter((line) => line.startsWith("Leaving"))).toEqual([
+      expect.stringContaining(paths.fnShimPath),
+      expect.stringContaining(paths.fusionShimPath),
+    ]);
   });
 
   it("removes the host-native shims after a host-native install", () => {
@@ -639,7 +826,7 @@ describe("removeLocalFnShims", () => {
 
     const result = removeLocalFnShims(onLog, paths);
 
-    expect(result.removed).toEqual([paths.fnShimPath, paths.fusionShimPath]);
+    expect(result.removed).toEqual([paths.fnShimPath, paths.fusionShimPath, ...paths.shellShimPaths]);
     expect(logs.some((line) => line.includes("Removed local shim"))).toBe(true);
     expect(existsSync(paths.fnShimPath)).toBe(false);
     expect(existsSync(paths.fusionShimPath)).toBe(false);

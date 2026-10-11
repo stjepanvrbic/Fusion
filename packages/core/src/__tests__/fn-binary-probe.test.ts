@@ -215,6 +215,38 @@ describe("detectFnBinary", () => {
     expect(spawnMock).toHaveBeenCalledWith("where", ["fn"], expect.any(Object));
   });
 
+  /*
+  FNXC:FnBinaryProbe 2026-10-11-07:35:
+  A Windows link-local install puts an extensionless Git Bash shell shim beside `fn.cmd`, and `where fn` lists that shim first.
+  Detection must still report the local fn as installed under the bare name.
+  */
+  it("reports a link-local install as installed when where lists the Git Bash shell shim first", async () => {
+    const lookupPath = "C:\\Users\\test\\.local\\bin\\fn";
+    const { mod } = await importWithMocks({
+      lookupPath,
+      realPath: lookupPath,
+      platform: "win32",
+      scriptContents: {
+        [lookupPath]: [
+          "#!/bin/sh",
+          "case $0 in",
+          "  *[/\\\\]*) basedir=${0%[/\\\\]*} ;;",
+          "  *) basedir=. ;;",
+          "esac",
+          'exec "$basedir/../share/fusion/fn.exe" "$@"',
+          "",
+        ].join("\n"),
+      },
+    });
+
+    await expect(mod.detectFnBinary()).resolves.toMatchObject({
+      installed: true,
+      binary: "fn",
+      path: lookupPath,
+      invocation: "fn",
+    });
+  });
+
   it("falls back to fn --version when no package manifest can be derived from the resolved path", async () => {
     const lookupPath = "/usr/local/bin/fn";
     const { mod, spawnMock } = await importWithMocks({
