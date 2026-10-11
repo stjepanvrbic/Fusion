@@ -43,6 +43,8 @@ KB-001 landed, but the card stayed In Review forever. Every `post-merge-verifica
 - Never treat a non-zero `git worktree remove` as all-or-nothing. Re-probe with `classifyTaskWorktree` before reporting what happened.
 - `existsSync` is not a liveness check for a worktree; use the shared classifier.
 - Symptom coverage lives in `packages/engine/src/__tests__/post-merge-gate-unusable-worktree.test.ts` and `post-landing-worktree-partial-removal.test.ts`.
+- The partial-removal coverage (`post-landing-worktree-partial-removal.test.ts` and the `runAiMerge` finalization case in `merger-ai.test.ts`) simulates git's half-deletion at the `NativeWorktreeBackend.remove` seam through `packages/engine/src/__tests__/_partial-worktree-removal.ts`. The helper deletes the work-tree files and the admin entry, leaves one survivor and rejects with a git-shaped error; everything after that is real product code. It has no platform, user or permission-bit branch, so the coverage runs on Windows, on POSIX and as root.
+- New coverage of this state reuses that helper. File locks and permission bits are not portable triggers: Windows needs an open handle, POSIX needs permission bits, and root ignores permission bits, so a test built on them is skipped exactly where the state occurs.
 
 ## Follow-up: every defensive removal path
 

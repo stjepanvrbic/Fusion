@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterAll, beforeAll } from "vitest";
-import { chmodSync, cpSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -41,6 +41,8 @@ import { getBuiltinWorkflow } from "@fusion/core";
 import { resolveAiMergeRootPath, resolveLegacyAiMergeRootPath } from "../worktree/worktree-paths.js";
 import { withBranchWriteProvenance } from "./branch-write-provenance-store-stub.js";
 import { armSiblingStashRace, stashEntries } from "./_sibling-stash-race.js";
+import { armPartialWorktreeRemoval } from "./_partial-worktree-removal.js";
+import { CHECKOUT_REMOVAL_RESIDUE_MARKER } from "../worktree/remove-checkout.js";
 
 const RM = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as const;
 const tracked = new Set<string>();
@@ -1460,25 +1462,22 @@ describe("runAiMerge", () => {
   });
 
   /*
-  FNXC:WorktreeCleanup 2026-10-07-05:29:
-  KB-003: a removal that git only partly completes (Windows file lock; reproduced on POSIX with a
-  non-writable tracked directory) unregisters the checkout. Finalization must still reach done, report
-  the truthful cleanup outcome, clear the pointer and delete the landed Fusion branch.
+  FNXC:WorktreeCleanup 2026-10-11-11:14:
+  A removal that git only partly completes (a locked file on Windows) leaves an unregistered folder with residual files.
+  Finalization must still reach done, report the cleanup truthfully, clear the worktree pointer and delete the landed Fusion branch.
+  The partial removal is simulated at the backend removal seam, so this case runs on Windows, on POSIX and as root.
   */
-  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("reports a partially failed post-landing removal truthfully and still finalizes", async () => {
+  it("reports a partially failed post-landing removal truthfully and still finalizes", async () => {
     const branch = "fusion/fn-1";
     const { dir } = initRepoWithBranch({ branch });
     const worktree = mkdtempSync(join(tmpdir(), "fusion-kb-003-partial-"));
     rmSync(worktree, RM);
     tracked.add(worktree);
     git(dir, ["worktree", "add", "-q", worktree, branch]);
-    mkdirSync(join(worktree, "locked"), { recursive: true });
-    writeFileSync(join(worktree, "locked", "file.txt"), "tracked\n");
-    git(worktree, ["add", "-A"]);
-    git(worktree, ["commit", "-q", "-m", "feat: locked dir"]);
-    const locked = join(worktree, "locked");
-    chmodSync(locked, 0o555);
+    const registration = `branch refs/heads/${branch}`;
+    expect(git(dir, ["worktree", "list", "--porcelain"]).split(/\r?\n/)).toContain(registration);
     const { store, task, logs } = makeStore(dir, { branch, worktree });
+    const partialRemoval = armPartialWorktreeRemoval(worktree, { shape: "incomplete", holdResidue: true });
 
     try {
       const result = await runAiMerge(store, dir, "FN-1", { manual: true }, {
@@ -1486,15 +1485,30 @@ describe("runAiMerge", () => {
         reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
       });
 
+      expect(partialRemoval.fired()).toBe(true);
       expect(result.merged).toBe(true);
       expect(task.column).toBe("done");
       expect(task.worktree).toBeNull();
-      expect(result.worktreeRemoved).toBe(!existsSync(worktree));
-      expect(git(dir, ["worktree", "list", "--porcelain"])).not.toContain(worktree);
+      expect(result.worktreeRemoved).toBe(false);
+      expect(existsSync(join(worktree, partialRemoval.survivor))).toBe(true);
+      expect(existsSync(join(worktree, ".git"))).toBe(false);
+      expect(existsSync(join(worktree, CHECKOUT_REMOVAL_RESIDUE_MARKER))).toBe(true);
+      expect(git(dir, ["worktree", "list", "--porcelain"]).split(/\r?\n/)).not.toContain(registration);
       expect(branchExists(dir, branch)).toBe(false);
       expect(logs.some((line) => line.includes("Post-landing worktree cleanup preserved"))).toBe(false);
+      expect(logs.some((line) => line.includes("Post-landing worktree cleanup partially removed") && line.includes("residual files remain"))).toBe(true);
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "worktree:removal-partial",
+        metadata: expect.objectContaining({
+          taskId: "FN-1",
+          source: "ai-merge-finalize",
+          classification: "incomplete",
+          phase: "during-removal",
+          residual: true,
+        }),
+      }));
     } finally {
-      try { chmodSync(locked, 0o755); } catch { /* residue already removed */ }
+      partialRemoval.restore();
     }
   });
 

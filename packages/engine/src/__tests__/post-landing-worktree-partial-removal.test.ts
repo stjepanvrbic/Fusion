@@ -1,17 +1,16 @@
 /*
-FNXC:WorktreeCleanup 2026-10-07-05:29:
-KB-003 real-git coverage for post-landing cleanup when `git worktree remove` only partly succeeds
-(KB-001: a Windows file lock left the checkout `.git`-less and unregistered while the log said
-"preserved … deliverable"). The chmod reproduction runs on POSIX as a non-root user; the simulated
-pre-existing states use only portable filesystem operations and run on every platform.
+FNXC:WorktreeCleanup 2026-10-11-11:14:
+Real-git coverage for post-landing cleanup when `git worktree remove` only partly succeeds: a Windows file lock left the checkout `.git`-less and unregistered while the log said it was preserved as a deliverable.
+The partial removal is simulated at the backend removal seam and the pre-existing states use only portable filesystem operations, so every case runs on every platform and for every user.
 */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupLandedTaskWorktree } from "../merge/post-landing-worktree-cleanup.js";
-import { canonicalizePath } from "../worktree/worktree-pool.js";
+import { isAuthorizedCheckoutResidue } from "../worktree/remove-checkout.js";
+import { armPartialWorktreeRemoval, type PartialWorktreeRemoval, type PartialWorktreeRemovalShape } from "./_partial-worktree-removal.js";
 
 const GIT_ENV = {
   ...process.env,
@@ -21,12 +20,10 @@ const GIT_ENV = {
   GIT_COMMITTER_EMAIL: "t@t.t",
 };
 const tracked: string[] = [];
-const lockedDirs: string[] = [];
+const armed: PartialWorktreeRemoval[] = [];
 
 afterEach(() => {
-  for (const dir of lockedDirs.splice(0)) {
-    try { chmodSync(dir, 0o755); } catch { /* already removed */ }
-  }
+  for (const removal of armed.splice(0)) removal.restore();
   for (const dir of tracked.splice(0)) {
     try { rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch { /* best effort */ }
   }
@@ -69,22 +66,34 @@ function store() {
   };
 }
 
-function registeredPaths(root: string): string[] {
-  return git(root, ["worktree", "list", "--porcelain"])
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("worktree "))
-    .map((line) => canonicalizePath(line.slice("worktree ".length)));
+const REGISTRATION = "branch refs/heads/fusion/fn-x";
+
+/** Whether the task checkout is registered, read from its branch line: git prints registered paths with forward slashes on every platform. */
+function isRegistered(root: string): boolean {
+  return git(root, ["worktree", "list", "--porcelain"]).split(/\r?\n/).includes(REGISTRATION);
 }
 
-const canChmodLock = process.platform !== "win32" && process.getuid?.() !== 0;
+function armRemoval(worktree: string, shape: PartialWorktreeRemovalShape): PartialWorktreeRemoval {
+  const removal = armPartialWorktreeRemoval(worktree, { shape, survivor: "locked" });
+  armed.push(removal);
+  return removal;
+}
 
-describe.skipIf(!canChmodLock)("post-landing cleanup when git removal fails partway (real git, POSIX)", () => {
-  it("reports removed or partially-removed, unregisters the checkout and clears the pointer", async () => {
+function auditSink() {
+  return { git: vi.fn(async (_event: { type: string; target?: string; metadata?: Record<string, unknown> }) => undefined) };
+}
+
+function partialAudits(audit: ReturnType<typeof auditSink>) {
+  return audit.git.mock.calls.map(([event]) => event).filter((event) => event.type === "worktree:removal-partial");
+}
+
+describe("post-landing cleanup when git removal fails partway (real git, all platforms)", () => {
+  it.each<PartialWorktreeRemovalShape>(["incomplete", "unregistered"])("reports partially-removed, marks the %s residue and clears the pointer when residue remains", async (shape) => {
     const { root, worktree, landedSha } = landedTaskWorktree();
-    const locked = join(worktree, "locked");
-    chmodSync(locked, 0o555);
-    lockedDirs.push(locked);
+    const removal = armRemoval(worktree, shape);
     const fixture = store();
+    const audit = auditSink();
+    expect(isRegistered(root)).toBe(true);
 
     const result = await cleanupLandedTaskWorktree({
       store: fixture.store as never,
@@ -93,14 +102,54 @@ describe.skipIf(!canChmodLock)("post-landing cleanup when git removal fails part
       rootDir: root,
       landedSha,
       source: "ai-merge-finalize",
+      audit: audit as never,
       removeResidualDirectory: async () => ({ removed: false }),
     });
 
-    expect(["removed", "partially-removed"]).toContain(result.outcome);
-    expect(result.outcome.startsWith("preserved")).toBe(false);
-    expect(registeredPaths(root)).not.toContain(canonicalizePath(worktree));
+    expect(removal.fired()).toBe(true);
+    expect(result).toEqual({ outcome: "partially-removed", removed: false });
     expect(fixture.store.updateTask).toHaveBeenCalledWith("FN-X", { worktree: null });
+    expect(existsSync(join(worktree, "locked", "file.txt"))).toBe(true);
+    expect(existsSync(join(worktree, ".git"))).toBe(shape === "unregistered");
+    expect(await isAuthorizedCheckoutResidue(worktree)).toBe(true);
+    expect(isRegistered(root)).toBe(false);
+    expect(partialAudits(audit)).toEqual([{
+      type: "worktree:removal-partial",
+      target: worktree,
+      metadata: { taskId: "FN-X", source: "ai-merge-finalize", classification: shape, phase: "during-removal", residual: true },
+    }]);
+    expect(fixture.logs.some((line) => line.includes("partially removed") && line.includes(`(${shape})`) && line.includes("residual files remain"))).toBe(true);
     expect(fixture.logs.some((line) => line.includes("cleanup preserved"))).toBe(false);
+  });
+
+  it("reports removed and clears the pointer when the engine finishes deleting the residue", async () => {
+    const { root, worktree, landedSha } = landedTaskWorktree();
+    const removal = armRemoval(worktree, "incomplete");
+    const fixture = store();
+    const audit = auditSink();
+    expect(isRegistered(root)).toBe(true);
+
+    const result = await cleanupLandedTaskWorktree({
+      store: fixture.store as never,
+      taskId: "FN-X",
+      worktreePath: worktree,
+      rootDir: root,
+      landedSha,
+      source: "ai-merge-finalize",
+      audit: audit as never,
+    });
+
+    expect(removal.fired()).toBe(true);
+    expect(result).toEqual({ outcome: "removed", removed: true });
+    expect(existsSync(worktree)).toBe(false);
+    expect(fixture.store.updateTask).toHaveBeenCalledWith("FN-X", { worktree: null });
+    expect(isRegistered(root)).toBe(false);
+    expect(partialAudits(audit)).toEqual([{
+      type: "worktree:removal-partial",
+      target: worktree,
+      metadata: { taskId: "FN-X", source: "ai-merge-finalize", classification: "incomplete", phase: "during-removal", residual: false },
+    }]);
+    expect(fixture.logs.some((line) => line.includes("residual files deleted"))).toBe(true);
   });
 });
 
