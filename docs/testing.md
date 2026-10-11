@@ -967,7 +967,10 @@ wrappers that launch Vitest (including `@fusion/desktop`) must forward caller re
 arguments unchanged: shard telemetry uses `--reporter=json` plus a package-relative
 `--outputFile.json=.timings/timings-*.json`. Wrappers may default to dot only when callers do
 not select a reporter; a successful artifact set must include parseable, non-empty desktop
-`testResults` under `packages/desktop/.timings/`.
+`testResults` under `packages/desktop/.timings/`. Desktop's forwarding is covered by
+`packages/desktop/scripts/__tests__/test-args.test.ts`, which runs in the `desktop` Vitest project,
+and `packages/desktop/src/__tests__/vitest-project-coverage.test.ts` fails when any desktop test
+file matches no desktop Vitest project include (such a file runs in no lane).
 
 ## Weekly test velocity baseline
 

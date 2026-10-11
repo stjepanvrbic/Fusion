@@ -47,7 +47,12 @@ export default defineConfig({
         },
         test: {
           name: "desktop",
-          include: ["src/__tests__/**/*.test.ts"],
+          /*
+          FNXC:DesktopTests 2026-10-11-13:29:
+          Desktop package-script tests run in this project because Vitest is the desktop package's only test lane (package `test` script, CI Full Suite shards, changed-only `pnpm test`).
+          They must be Vitest files: Vitest does not collect `node:test` cases.
+          */
+          include: ["src/__tests__/**/*.test.ts", "scripts/__tests__/**/*.test.ts"],
           pool: "threads",
           isolate: true,
         },
