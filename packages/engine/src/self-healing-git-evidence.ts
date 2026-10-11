@@ -24,6 +24,10 @@ close over `this.options`. Converting them to free functions would change every
 signature, which is a behavior-adjacent edit riding in a file move — exactly the
 combination that hid the last four safeguard regressions. An abstract base keeps
 `this` semantics and every body unchanged.
+
+FNXC:LandedCommitProvenance 2026-10-11-07:40:
+The byte-identical claim above no longer holds for `findLandedTaskCommit`: it now routes every candidate through the shared landed-commit provenance verdict, with the stored-sha, scope and task-branch probes added beside it (`assessStoredLandedCommit`, `assessLandedCommitCandidate`, `landedCommitScope`, `isCommitOnTaskBranch`).
+The local `commitOwnedByTask` regex was replaced by the shared `getCommitTaskOwnership` classifier.
 */
 import { promisify } from "node:util";
 import { exec } from "node:child_process";
@@ -34,6 +38,13 @@ import { bindPosixShell } from "@fusion/core";
    pre-dates the move and is preserved exactly. */
 import { findAlreadyMergedTaskCommit, getCommitTaskOwnership } from "./merge/already-merged-detector.js";
 import { createLogger } from "./logger.js";
+import {
+  parseCommitTimeSeconds,
+  resolveLandedCommitProvenance,
+  type LandedCommitProvenanceVerdict,
+  type LandedCommitScope,
+} from "./merge/landed-commit-provenance.js";
+import { resolveTaskWorkingBranch } from "./worktree/worktree-names.js";
 import type { Task } from "@fusion/core";
 
 const log = createLogger("self-healing");
@@ -74,23 +85,11 @@ export interface LandedTaskCommit {
   rebaseBaseSha?: string;
 }
 
-export function commitOwnedByTask(taskId: string, lineageId: string | undefined, subject: string, body: string): boolean {
-  if (lineageId && new RegExp(`(?:^|\\n)Fusion-Task-Lineage: ${escapeRegex(lineageId)}\\s*(?:\\n|$)`).test(body)) {
-    return true;
-  }
-  if (new RegExp(`(?:^|\\n)Fusion-Task-Id: ${escapeRegex(taskId)}\\s*(?:\\n|$)`).test(body)) {
-    return true;
-  }
-  // Subject anchor: `<type>(<…taskId…>): …` or `<taskId>: …` at start.
-  // The conventional scope group is intentionally NOT optional: a bare
-  // `<type>: …` (e.g. `feat: unrelated change`) carries no task ID and is NOT
-  // ownership evidence, even if the body mentions the task in prose (incident
-  // bug #2 — a prose-mention must never claim a task).
-  const subjectAnchor = new RegExp(
-    `^(?:[A-Za-z]+\\([^)]*\\b${escapeRegex(taskId)}\\b[^)]*\\):|${escapeRegex(taskId)}:)`,
-  );
-  return subjectAnchor.test(subject);
-}
+/** Outcome of re-proving a stored `mergeDetails.commitSha` against the landed-commit provenance verdict. */
+export type StoredLandedCommitAssessment =
+  | { kind: "absent" }
+  | { kind: "unreachable" }
+  | { kind: "assessed"; sha: string; subject: string; verdict: LandedCommitProvenanceVerdict };
 
 export function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -122,13 +121,20 @@ export abstract class SelfHealingGitEvidence {
   protected abstract readonly options: SelfHealingOptions;
 
 
+  /*
+  FNXC:LandedCommitProvenance 2026-10-11-07:40:
+  "Did this task land?" is answered only by a commit PROVEN to belong to the task (see `merge/landed-commit-provenance.ts`).
+  A subject or trailer naming the ID is not enough on its own: recycled IDs make old commits match, and accepting one finalizes the card and lets cleanup delete the unmerged branch and worktree.
+  Every candidate from every strategy and range goes through `assessLandedCommitProvenance`. A strategy whose candidates are all rejected falls through to the next candidate, then to the full-HEAD re-scan, then to the next strategy; when nothing is accepted the finder returns null and each caller's "not landed" branch runs.
+  The legitimate fallbacks are preserved: squash with a rewritten subject (trailers), includeTaskIdInCommit=false (lineage trailer), and a baseCommitSha advanced past the landing (full-HEAD re-scan with the creation-time guard).
+  */
   protected async findLandedTaskCommit(
     task: Task,
     options?: { preferEarliestOwnedCommit?: boolean },
   ): Promise<LandedTaskCommit | null> {
     // Search strategies, tried in order of reliability:
     //   1. mergeDetails.commitSha — already stored by the merger; verify it's
-    //      reachable from HEAD before trusting it.
+    //      reachable from HEAD and still provably owned before trusting it.
     //   2. Fusion-Task-Lineage trailer — canonical immutable lineage marker.
     //   3. Fusion-Task-Id trailer — legacy human task-id marker.
     //   4. Subject grep — legacy/AI commits where the task ID lives in the
@@ -137,40 +143,42 @@ export abstract class SelfHealingGitEvidence {
     // (1) gives us the right sha even if the commit subject is exotic; (2)
     // covers includeTaskIdInCommit=false setups where (3) would silently
     // miss; (3) catches commits authored before the trailer was introduced.
+    const nowMs = Date.now();
+    const rejected: string[] = [];
+    const reportRejections = () => {
+      if (rejected.length === 0) return;
+      log.warn(
+        `Landed-commit lookup for ${task.id} declined ${rejected.length} candidate(s) without ownership proof: ${rejected.slice(0, 5).join(", ")}`,
+      );
+    };
+    const noteRejection = (sha: string, verdict: LandedCommitProvenanceVerdict) => {
+      if (!verdict.accepted && (verdict.reason === "predates-task" || verdict.reason === "subject-only-outside-task-range")) {
+        rejected.push(`${sha.slice(0, 8)} (${verdict.reason})`);
+      }
+    };
 
     // ── (1) Stored sha ────────────────────────────────────────────────────
     const rebaseBaseSha = task.mergeDetails?.rebaseBaseSha;
-    const storedSha = task.mergeDetails?.commitSha;
-    if (storedSha) {
-      try {
-        await execAsync(
-          `git merge-base --is-ancestor ${shellQuote(storedSha)} HEAD`,
-          { cwd: this.options.rootDir },
-        );
-        const { stdout } = await execAsync(
-          `git log -1 --format=%H%x1f%s%x1f%b ${shellQuote(storedSha)}`,
-          { cwd: this.options.rootDir, maxBuffer: 1024 * 1024 },
-        );
-        const [sha, subject = "", body = ""] = stdout.trim().split("\x1f");
-        if (sha && commitOwnedByTask(task.id, task.lineageId, subject, body)) {
-          const commit: LandedTaskCommit = { sha, subject, rebaseBaseSha };
-          try {
-            const shortstat = await this.readShortstatForSha(sha, rebaseBaseSha);
-            if (shortstat) {
-              Object.assign(commit, shortstat);
-            }
-          } catch { /* stats are optional */ }
-          return commit;
-        }
-      } catch {
-        // Not reachable (rebased away, branch reset, etc.) — fall through.
+    const stored = await this.assessStoredLandedCommit(task, nowMs);
+    if (stored.kind === "assessed") {
+      if (stored.verdict.accepted) {
+        const commit: LandedTaskCommit = { sha: stored.sha, subject: stored.subject, rebaseBaseSha };
+        try {
+          const shortstat = await this.readShortstatForSha(stored.sha, rebaseBaseSha);
+          if (shortstat) {
+            Object.assign(commit, shortstat);
+          }
+        } catch { /* stats are optional */ }
+        reportRejections();
+        return commit;
       }
+      noteRejection(stored.sha, stored.verdict);
     }
 
     const readLog = async (range: string, grepArg: string, fixedStrings: boolean) => {
       const command = [
         "git log",
-        "--format=%H%x1f%s",
+        "--format=%H%x1f%s%x1f%ct",
         "--max-count=20",
         ...(options?.preferEarliestOwnedCommit ? ["--reverse"] : []),
         ...(fixedStrings ? ["--fixed-strings"] : ["-E"]),
@@ -184,81 +192,78 @@ export abstract class SelfHealingGitEvidence {
       });
     };
 
-    // Search canonical lineage trailer, then legacy task-id trailer, then
-    // legacy subject fallback. All share bounded/full HEAD range resolution.
-    const search = async (grepArg: string, fixedStrings: boolean): Promise<string> => {
-      let out: string;
-      try {
-        const r = await readLog(
-          task.baseCommitSha ? `${task.baseCommitSha}..HEAD` : "HEAD",
-          grepArg,
-          fixedStrings,
-        );
-        out = r.stdout;
-      } catch (err: unknown) {
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        log.warn(
-          `Failed to read git log for landed commit lookup (${task.id}): ${errorMessage} — retrying with HEAD range`,
-        );
-        if (!task.baseCommitSha) return "";
-        const r = await readLog("HEAD", grepArg, fixedStrings);
-        out = r.stdout;
-      }
-      // Bounded range may exclude the landed commit when baseCommitSha was
-      // advanced past it; re-scan all of HEAD if empty.
-      if (!out.trim() && task.baseCommitSha) {
-        const r = await readLog("HEAD", grepArg, fixedStrings);
-        out = r.stdout;
-      }
-      return out;
-    };
-
-    // (2) Canonical lineage trailer.
-    let stdout = "";
-    if (task.lineageId) {
-      const lineagePattern = `^Fusion-Task-Lineage: ${task.lineageId}$`;
-      stdout = await search(shellQuote(lineagePattern), false);
-    }
-
-    // (3) Legacy task-id trailer.
-    if (!stdout.trim()) {
-      const trailerPattern = `^Fusion-Task-Id: ${task.id}$`;
-      stdout = await search(shellQuote(trailerPattern), false);
-    }
-
-    // (4) Subject grep fallback (legacy commits).
-    if (!stdout.trim()) {
-      stdout = await search(shellQuote(task.id), true);
-    }
+    // A verdict depends only on the commit, so a sha rejected under one
+    // strategy or range is never re-evaluated under another.
+    const evaluated = new Set<string>(stored.kind === "assessed" ? [stored.sha] : []);
 
     // FN-5441/FN-5446 regression: `git log --grep=FN-XXXX` matches the entire
-    // commit message, including prose body mentions. The previous code blindly
-    // accepted the first match — which is how FN-5441/5446 got attributed to
-    // an unrelated FN-5483 commit that *mentioned* them by name. Walk the
-    // candidates and accept only the first one that actually owns the task
-    // (anchored lineage/id trailer or subject-anchored conventional commit).
-    const candidateLines = stdout.trim().split("\n").filter(Boolean);
-    let sha = "";
-    let subject = "";
-    for (const line of candidateLines) {
-      const [candidateSha, candidateSubject = ""] = line.split("\x1f");
-      if (!candidateSha) continue;
-      try {
-        const { stdout: bodyOut } = await execAsync(
-          `git log -1 --format=%b ${shellQuote(candidateSha)}`,
-          { cwd: this.options.rootDir, maxBuffer: 1024 * 1024 },
-        );
-        if (commitOwnedByTask(task.id, task.lineageId, candidateSubject, bodyOut)) {
-          sha = candidateSha;
-          subject = candidateSubject;
-          break;
+    // commit message, including prose body mentions, so every candidate's body
+    // is classified by the shared ownership anchor before the provenance verdict.
+    const acceptFirstProven = async (stdout: string): Promise<{ sha: string; subject: string } | null> => {
+      for (const line of stdout.trim().split("\n").filter(Boolean)) {
+        const [candidateSha, candidateSubject = "", candidateTime] = line.split("\x1f");
+        if (!candidateSha || evaluated.has(candidateSha)) continue;
+        evaluated.add(candidateSha);
+        try {
+          const { stdout: bodyOut } = await execAsync(
+            `git log -1 --format=%b ${shellQuote(candidateSha)}`,
+            { cwd: this.options.rootDir, maxBuffer: 1024 * 1024 },
+          );
+          const verdict = await this.assessLandedCommitCandidate(task, {
+            sha: candidateSha,
+            subject: candidateSubject,
+            body: bodyOut,
+            commitTimeMs: parseCommitTimeSeconds(candidateTime),
+            nowMs,
+          });
+          if (verdict.accepted) return { sha: candidateSha, subject: candidateSubject };
+          noteRejection(candidateSha, verdict);
+        } catch {
+          // If we can't read the body, conservatively skip this candidate.
         }
-      } catch {
-        // If we can't read the body, conservatively skip this candidate.
       }
-    }
-    if (!sha) return null;
+      return null;
+    };
 
+    // Search the bounded range first, then all of HEAD whenever the bounded
+    // walk produced no accepted candidate: a baseCommitSha advanced past the
+    // landing excludes it from the bounded range.
+    const search = async (grepArg: string, fixedStrings: boolean): Promise<{ sha: string; subject: string } | null> => {
+      const ranges = task.baseCommitSha ? [`${task.baseCommitSha}..HEAD`, "HEAD"] : ["HEAD"];
+      for (const range of ranges) {
+        let out: string;
+        try {
+          out = (await readLog(range, grepArg, fixedStrings)).stdout;
+        } catch (err: unknown) {
+          // A failing full-HEAD read after a bounded attempt is a real git failure; surface it as before.
+          if (range === "HEAD" && task.baseCommitSha) throw err;
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          log.warn(
+            `Failed to read git log for landed commit lookup (${task.id}): ${errorMessage} — retrying with HEAD range`,
+          );
+          continue;
+        }
+        const accepted = await acceptFirstProven(out);
+        if (accepted) return accepted;
+      }
+      return null;
+    };
+
+    // (2) Canonical lineage trailer, (3) legacy task-id trailer, (4) subject grep.
+    let found: { sha: string; subject: string } | null = null;
+    if (task.lineageId) {
+      found = await search(shellQuote(`^Fusion-Task-Lineage: ${task.lineageId}$`), false);
+    }
+    if (!found) {
+      found = await search(shellQuote(`^Fusion-Task-Id: ${task.id}$`), false);
+    }
+    if (!found) {
+      found = await search(shellQuote(task.id), true);
+    }
+    reportRejections();
+    if (!found) return null;
+
+    const { sha, subject } = found;
     const commit: LandedTaskCommit = { sha, subject, rebaseBaseSha };
     try {
       const shortstat = await this.readShortstatForSha(sha, rebaseBaseSha);
@@ -274,6 +279,101 @@ export abstract class SelfHealingGitEvidence {
     }
 
     return commit;
+  }
+
+  /**
+   * Re-prove the stored `mergeDetails.commitSha`: `unreachable` when it is not an
+   * ancestor of HEAD (or unreadable), otherwise the provenance verdict.
+   * `recoverDoneTaskMergeMetadata` uses this to clear a stored sha only when it is
+   * positively disproven, not merely unprovable.
+   */
+  protected async assessStoredLandedCommit(task: Task, nowMs: number = Date.now()): Promise<StoredLandedCommitAssessment> {
+    const storedSha = task.mergeDetails?.commitSha;
+    if (!storedSha) return { kind: "absent" };
+    let sha: string;
+    let subject: string;
+    let commitTime: string | undefined;
+    let body: string;
+    try {
+      await execAsync(
+        `git merge-base --is-ancestor ${shellQuote(storedSha)} HEAD`,
+        { cwd: this.options.rootDir },
+      );
+      const { stdout } = await execAsync(
+        `git log -1 --format=%H%x1f%s%x1f%ct%x1f%b ${shellQuote(storedSha)}`,
+        { cwd: this.options.rootDir, maxBuffer: 1024 * 1024 },
+      );
+      const [resolvedSha = "", resolvedSubject = "", resolvedTime, ...bodyParts] = stdout.trim().split("\x1f");
+      sha = resolvedSha;
+      subject = resolvedSubject;
+      commitTime = resolvedTime;
+      body = bodyParts.join("\x1f");
+    } catch {
+      // Not reachable (rebased away, branch reset, etc.).
+      return { kind: "unreachable" };
+    }
+    if (!sha) return { kind: "unreachable" };
+    const verdict = await this.assessLandedCommitCandidate(task, {
+      sha,
+      subject,
+      body,
+      commitTimeMs: parseCommitTimeSeconds(commitTime),
+      nowMs,
+    });
+    return { kind: "assessed", sha, subject, verdict };
+  }
+
+  /** Classify ownership, then probe scope and task-branch membership only as far as the verdict needs. */
+  protected async assessLandedCommitCandidate(
+    task: Task,
+    candidate: { sha: string; subject: string; body: string; commitTimeMs?: number; nowMs: number },
+  ): Promise<LandedCommitProvenanceVerdict> {
+    const ownership = getCommitTaskOwnership(task.id, task.lineageId, candidate.subject, candidate.body);
+    const input = {
+      ownership,
+      scope: "unbounded" as LandedCommitScope,
+      commitTimeMs: candidate.commitTimeMs,
+      taskCreatedAt: task.createdAt,
+      taskLineageId: task.lineageId,
+      nowMs: candidate.nowMs,
+    };
+    if (ownership.owned) {
+      input.scope = await this.landedCommitScope(candidate.sha, task.baseCommitSha);
+    }
+    return resolveLandedCommitProvenance(input, () => this.isCommitOnTaskBranch(candidate.sha, task));
+  }
+
+  /** `bounded` only when the commit strictly descends from the task's recorded base. */
+  protected async landedCommitScope(sha: string, baseCommitSha: string | undefined): Promise<LandedCommitScope> {
+    if (!baseCommitSha) return "unbounded";
+    const isAncestor = async (ancestor: string, descendant: string) => {
+      try {
+        await execAsync(
+          `git merge-base --is-ancestor ${shellQuote(ancestor)} ${shellQuote(descendant)}`,
+          { cwd: this.options.rootDir },
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (!(await isAncestor(baseCommitSha, sha))) return "unbounded";
+    return (await isAncestor(sha, baseCommitSha)) ? "unbounded" : "bounded";
+  }
+
+  /** Whether the commit is in the history of the task's own working branch (which must still exist). */
+  protected async isCommitOnTaskBranch(sha: string, task: Task): Promise<boolean> {
+    const branchRef = `refs/heads/${resolveTaskWorkingBranch(task)}`;
+    try {
+      await execAsync(`git rev-parse --verify --quiet ${shellQuote(branchRef)}`, { cwd: this.options.rootDir });
+      await execAsync(
+        `git merge-base --is-ancestor ${shellQuote(sha)} ${shellQuote(branchRef)}`,
+        { cwd: this.options.rootDir },
+      );
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   protected async findAlreadyMergedTaskCommit(input: {

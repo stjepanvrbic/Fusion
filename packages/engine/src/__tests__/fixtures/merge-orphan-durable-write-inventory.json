@@ -170,6 +170,7 @@
     "packages/engine/src/merge/engine-shutdown-error.ts",
     "packages/engine/src/merge/group-merge-coordinator.ts",
     "packages/engine/src/merge/integration-branch.ts",
+    "packages/engine/src/merge/landed-commit-provenance.ts",
     "packages/engine/src/merge/landed-commit-publication.ts",
     "packages/engine/src/merge/merge-active-status.ts",
     "packages/engine/src/merge/merge-content-capture.ts",
@@ -12719,10 +12720,10 @@
       "followUpTaskId": "none:out-of-frontier"
     },
     {
-      "callSiteId": "packages/engine/src/runtimes/in-process-runtime.ts::settlePlanningContinuationDispatch>transitioned::input.store.transitionWorkflowWorkItem::#1",
-      "callSiteFingerprint": "input.store.transitionWorkflowWorkItem(input.itemId,targetState,{expectedState,leaseOwner,leaseExpiresAt,retryAfter,lastError,blockedReason})",
+      "callSiteId": "packages/engine/src/runtimes/in-process-runtime.ts::settlePlanningContinuationDispatch>settleFrom::input.store.transitionWorkflowWorkItem::#1",
+      "callSiteFingerprint": "input.store.transitionWorkflowWorkItem(input.itemId,targetState,{?,leaseOwner,leaseExpiresAt,retryAfter,lastError,blockedReason})",
       "file": "packages/engine/src/runtimes/in-process-runtime.ts",
-      "enclosingSymbolPath": "settlePlanningContinuationDispatch>transitioned",
+      "enclosingSymbolPath": "settlePlanningContinuationDispatch>settleFrom",
       "writer": "input.store.transitionWorkflowWorkItem",
       "ordinal": 1,
       "owningEntryPoint": "other",
@@ -12735,7 +12736,7 @@
       "observedInSuite": "out-of-frontier",
       "executionProof": "none:out-of-frontier",
       "followUpTaskId": "none:out-of-frontier",
-      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to settlePlanningContinuationDispatch>transitioned; the in-process runtime lifecycle and workflow work-item dispatch own this write."
+      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to settlePlanningContinuationDispatch>settleFrom; the in-process runtime lifecycle and workflow work-item dispatch own this write."
     },
     {
       "callSiteId": "packages/engine/src/runtimes/in-process-runtime.ts::setupEventForwarding::this.taskStore.transitionWorkflowWorkItem::#1",
@@ -16691,7 +16692,7 @@
     },
     {
       "callSiteId": "packages/engine/src/self-healing.ts::recoverDoneTaskMergeMetadata::this.store.logEntry::#4",
-      "callSiteFingerprint": "this.store.logEntry(task.id,\"Auto-recovered: cleared unowned done-task mergeDetails commitSha\")",
+      "callSiteFingerprint": "this.store.logEntry(task.id,`Done-task merge metadata kept: stored commit ${storedSha.slice(0, 8)} is owned but not provable (${storedAssessment.ver)",
       "file": "packages/engine/src/self-healing.ts",
       "enclosingSymbolPath": "recoverDoneTaskMergeMetadata",
       "writer": "this.store.logEntry",
@@ -16710,7 +16711,7 @@
     },
     {
       "callSiteId": "packages/engine/src/self-healing.ts::recoverDoneTaskMergeMetadata::this.store.logEntry::#5",
-      "callSiteFingerprint": "this.store.logEntry(task.id,`Done-task merge metadata repair skipped: invalid repaired workflow merge proof (${repairedProofVerdict.reason})`)",
+      "callSiteFingerprint": "this.store.logEntry(task.id,\"Auto-recovered: cleared unowned done-task mergeDetails commitSha\")",
       "file": "packages/engine/src/self-healing.ts",
       "enclosingSymbolPath": "recoverDoneTaskMergeMetadata",
       "writer": "this.store.logEntry",
@@ -16729,11 +16730,30 @@
     },
     {
       "callSiteId": "packages/engine/src/self-healing.ts::recoverDoneTaskMergeMetadata::this.store.logEntry::#6",
-      "callSiteFingerprint": "this.store.logEntry(task.id,`Auto-recovered: reconciled done-task mergeDetails to owned commit ${landed.sha.slice(0, 8)}`)",
+      "callSiteFingerprint": "this.store.logEntry(task.id,`Done-task merge metadata repair skipped: invalid repaired workflow merge proof (${repairedProofVerdict.reason})`)",
       "file": "packages/engine/src/self-healing.ts",
       "enclosingSymbolPath": "recoverDoneTaskMergeMetadata",
       "writer": "this.store.logEntry",
       "ordinal": 6,
+      "owningEntryPoint": "other",
+      "reachableDataStates": [
+        "unobservable:closure-wide production fixture pending"
+      ],
+      "axis1": "out-of-frontier",
+      "axis2Provisional": "out-of-frontier",
+      "axis2Final": "out-of-frontier",
+      "observedInSuite": "out-of-frontier",
+      "executionProof": "none:out-of-frontier",
+      "followUpTaskId": "none:out-of-frontier",
+      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to recoverDoneTaskMergeMetadata; SelfHealingManager maintenance and recovery sweeps own this write."
+    },
+    {
+      "callSiteId": "packages/engine/src/self-healing.ts::recoverDoneTaskMergeMetadata::this.store.logEntry::#7",
+      "callSiteFingerprint": "this.store.logEntry(task.id,`Auto-recovered: reconciled done-task mergeDetails to owned commit ${landed.sha.slice(0, 8)}`)",
+      "file": "packages/engine/src/self-healing.ts",
+      "enclosingSymbolPath": "recoverDoneTaskMergeMetadata",
+      "writer": "this.store.logEntry",
+      "ordinal": 7,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"

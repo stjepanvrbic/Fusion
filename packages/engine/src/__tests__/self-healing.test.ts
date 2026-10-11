@@ -184,6 +184,15 @@ const mockedReaddirSync = vi.mocked(readdirSync);
 const mockedCreateLogger = vi.mocked(createLogger);
 const mockedClassifyOwnedLandedEvidence = vi.mocked(classifyOwnedLandedEvidence);
 
+/*
+FNXC:LandedCommitProvenance 2026-10-11-08:20:
+Landed-commit lookups read `%H%x1f%s%x1f%ct`: a candidate outside the task's bounded range is accepted only when its committer time does not predate the task.
+Mocked `git log` candidate lines therefore carry a recent committer time; a line without one is rejected as commit-time-unknown.
+*/
+function landedLogLine(sha: string, subject: string): string {
+  return `${sha}\x1f${subject}\x1f${Math.floor(Date.now() / 1_000)}\n`;
+}
+
 type MockLogger = {
   log: ReturnType<typeof vi.fn>;
   debug: ReturnType<typeof vi.fn>;
@@ -4141,7 +4150,7 @@ describe("SelfHealingManager", () => {
       mockedExecSync.mockImplementation((command) => {
         const cmd = String(command);
         if (cmd.includes("git log")) {
-          return "979ba2c04\u001ffeat(FN-1673): add editable AI suggestion drafts before acceptance\n" as any;
+          return landedLogLine("979ba2c04", "feat(FN-1673): add editable AI suggestion drafts before acceptance") as any;
         }
         if (cmd.includes("git show --shortstat")) {
           return " 1 file changed, 2 insertions(+), 2 deletions(-)\n" as any;
@@ -4209,7 +4218,7 @@ describe("SelfHealingManager", () => {
           // Recovery searches by trailer first; only the trailer-grep result
           // returns a match. Subject grep would be empty (no task ID in subj).
           if (cmd.includes("Fusion-Task-Id: FN-2900")) {
-            return "trailerSha123feat: ship something opaque\n" as any;
+            return landedLogLine("trailerSha123", "feat: ship something opaque") as any;
           }
           // Ownership-verification body fetch (FN-5441/5446): the real commit
           // located via trailer grep carries the anchored trailer in its body,
@@ -4272,7 +4281,7 @@ describe("SelfHealingManager", () => {
       mockedExecSync.mockImplementation((command) => {
         const cmd = String(command);
         if (cmd.includes("git log") && cmd.includes("Fusion-Task-Id: FN-2901")) {
-          return "rangeSha901\u001ffeat: ship something opaque\n" as any;
+          return landedLogLine("rangeSha901", "feat: ship something opaque") as any;
         }
         // Ownership-verification body fetch (FN-5441/5446): real trailer-grep
         // hit carries the anchored trailer in its body.
@@ -4336,23 +4345,12 @@ describe("SelfHealingManager", () => {
         },
       ]);
       mockedExistsSync.mockReturnValue(true);
-      mockedExecSync.mockImplementation((command) => {
-        const cmd = String(command);
-        if (cmd.includes("git log") && cmd.includes("headsha0..HEAD")) {
-          return "" as any; // bounded range is empty (baseCommitSha === HEAD)
-        }
-        if (cmd.includes("git log") && cmd.includes("HEAD")) {
-          return "3b212b928feat(FN-2221): constrain setup wizard modal shell\n" as any;
-        }
-        if (cmd.includes("git show --shortstat")) {
-          return " 2 files changed, 154 insertions(+), 0 deletions(-)\n" as any;
-        }
-        return "" as any;
-      });
+      mockAdvancedBaseSubjectLanding({ branchPresent: true });
 
       const result = await managerWithRecovery.recoverInterruptedMergingTasks();
 
       expect(result).toBe(1);
+      expect(mockedExecSync.mock.calls.some(([cmd]) => String(cmd).includes("merge-base --is-ancestor '3b212b928' 'refs/heads/fusion/fn-2221'"))).toBe(true);
       expect(store.updateTask).toHaveBeenCalledWith("FN-2221", {
         status: null,
         error: null,
@@ -4371,6 +4369,77 @@ describe("SelfHealingManager", () => {
         "FN-2221",
         expect.stringContaining("stale merge status finalized from landed commit 3b212b9"),
       );
+
+      managerWithRecovery.stop();
+    });
+
+    /*
+    FNXC:LandedCommitProvenance 2026-10-11-08:20:
+    A subject-only hit outside the task's bounded range is a landing only when the commit is in the task branch's history.
+    Without the branch, the same subject could be a recycled task ID on an older commit, so the merge is retried instead of finalized.
+    */
+    function mockAdvancedBaseSubjectLanding({ branchPresent }: { branchPresent: boolean }): void {
+      mockedExecSync.mockImplementation((command) => {
+        const cmd = String(command);
+        if (cmd.includes("git log") && cmd.includes("headsha0..HEAD")) {
+          return "" as any; // bounded range is empty (baseCommitSha === HEAD)
+        }
+        if (cmd.includes("git log") && cmd.includes("HEAD")) {
+          return landedLogLine("3b212b928", "feat(FN-2221): constrain setup wizard modal shell") as any;
+        }
+        // The landing is an ancestor of the advanced base, so it is outside the task's bounded range.
+        if (cmd.includes("merge-base --is-ancestor 'headsha0' '3b212b928'")) {
+          throw new Error("not an ancestor");
+        }
+        if (!branchPresent && cmd.includes("rev-parse --verify --quiet 'refs/heads/fusion/fn-2221'")) {
+          throw new Error("branch deleted");
+        }
+        if (!branchPresent && cmd.includes("merge-base --is-ancestor '3b212b928' 'refs/heads/fusion/fn-2221'")) {
+          throw new Error("branch deleted");
+        }
+        if (cmd.includes("git show --shortstat")) {
+          return " 2 files changed, 154 insertions(+), 0 deletions(-)\n" as any;
+        }
+        return "" as any;
+      });
+    }
+
+    it("retries instead of finalizing when an out-of-range subject-only hit is not on the task branch", async () => {
+      const enqueueMerge = vi.fn();
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        enqueueMerge,
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        taskStuckTimeoutMs: 60_000,
+      });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: "FN-2221",
+          column: "in-review",
+          status: "merging",
+          error: null,
+          paused: false,
+          worktree: "/tmp/test-project/.worktrees/amber-lotus",
+          branch: "fusion/fn-2221",
+          baseCommitSha: "headsha0",
+          updatedAt: new Date(Date.now() - 61_000).toISOString(),
+          steps: [{ name: "Ship it", status: "done" }],
+          workflowStepResults: [],
+          mergeDetails: undefined,
+          log: [],
+        },
+      ]);
+      mockedExistsSync.mockReturnValue(true);
+      mockAdvancedBaseSubjectLanding({ branchPresent: false });
+
+      const result = await managerWithRecovery.recoverInterruptedMergingTasks();
+
+      expect(result).toBe(1);
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(store.updateTask).toHaveBeenCalledWith("FN-2221", { status: null, error: null });
+      expect((store.updateTask as ReturnType<typeof vi.fn>).mock.calls.some(([, patch]) => (patch as Partial<Task>)?.mergeDetails)).toBe(false);
+      expect(enqueueMerge).toHaveBeenCalledWith("FN-2221");
 
       managerWithRecovery.stop();
     });
@@ -6105,7 +6174,7 @@ describe("SelfHealingManager", () => {
         .mockResolvedValueOnce([]);
       mockedExecSync.mockImplementation((command: string | Buffer) => {
         const cmd = String(command);
-        if (cmd.includes("Fusion-Task-Id: FN-stuck")) return "abc12345\x1fRecovered subject\n" as any;
+        if (cmd.includes("Fusion-Task-Id: FN-stuck")) return landedLogLine("abc12345", "Recovered subject") as any;
         // FN-5441 ownership verification: post-grep body fetch must contain
         // the anchored trailer so commitOwnedByTask accepts the candidate.
         if (cmd.includes("--format=%b") && cmd.includes("abc12345")) return "Fusion-Task-Id: FN-stuck\n" as any;
@@ -6198,7 +6267,7 @@ describe("SelfHealingManager", () => {
         .mockResolvedValueOnce([])
         .mockResolvedValueOnce([])
         .mockResolvedValueOnce([]);
-      mockedExecSync.mockImplementation((command: string | Buffer) => String(command).includes("Fusion-Task-Id: FN-stuck") ? ("abc12345\x1fRecovered subject\n" as any) : ("" as any));
+      mockedExecSync.mockImplementation((command: string | Buffer) => String(command).includes("Fusion-Task-Id: FN-stuck") ? (landedLogLine("abc12345", "Recovered subject") as any) : ("" as any));
 
       const first = await managerWithRecovery.recoverStuckMergeDeadlocks();
       const second = await managerWithRecovery.recoverStuckMergeDeadlocks();
@@ -6259,8 +6328,8 @@ describe("SelfHealingManager", () => {
         .mockResolvedValueOnce([]);
       mockedExecSync.mockImplementation((command: string | Buffer) => {
         const cmd = String(command);
-        if (cmd.includes("Fusion-Task-Id: FN-ok")) return "def67890\x1fok\n" as any;
-        if (cmd.includes("Fusion-Task-Id: FN-err")) return "abcabc12\x1ferr\n" as any;
+        if (cmd.includes("Fusion-Task-Id: FN-ok")) return landedLogLine("def67890", "ok") as any;
+        if (cmd.includes("Fusion-Task-Id: FN-err")) return landedLogLine("abcabc12", "err") as any;
         return "" as any;
       });
       (store.updateTask as ReturnType<typeof vi.fn>).mockImplementation(async (id: string) => {
@@ -6296,7 +6365,7 @@ describe("SelfHealingManager", () => {
       mockedExecSync.mockImplementation((command: string | Buffer) => {
         const cmd = String(command);
         // grep step finds the unrelated FN-5483 commit whose body mentions FN-5441 in prose
-        if (cmd.includes("FN-5441") && cmd.includes("--grep")) return "e3dbfaae\x1ffix(FN-5483): allow merger commits past identity-guard\n" as any;
+        if (cmd.includes("FN-5441") && cmd.includes("--grep")) return landedLogLine("e3dbfaae", "fix(FN-5483): allow merger commits past identity-guard") as any;
         // ownership-verification body fetch returns prose-mention body, no anchored trailer
         if (cmd.includes("--format=%b") && cmd.includes("e3dbfaae")) {
           return "The refusal surfaced as merge-deadlock-detected on FN-5441 and FN-5446. ...\n" as any;
@@ -6335,9 +6404,9 @@ describe("SelfHealingManager", () => {
         .mockResolvedValueOnce([]);
       mockedExecSync.mockImplementation((command: string | Buffer) => {
         const cmd = String(command);
-        if (cmd.includes("Fusion-Task-Id: FN-3794")) return "278a2825\x1fone\n" as any;
-        if (cmd.includes("Fusion-Task-Id: FN-3814")) return "69c25e2b\x1ftwo\n" as any;
-        if (cmd.includes("Fusion-Task-Id: FN-3829")) return "0d3f51b6\x1fthree\n" as any;
+        if (cmd.includes("Fusion-Task-Id: FN-3794")) return landedLogLine("278a2825", "one") as any;
+        if (cmd.includes("Fusion-Task-Id: FN-3814")) return landedLogLine("69c25e2b", "two") as any;
+        if (cmd.includes("Fusion-Task-Id: FN-3829")) return landedLogLine("0d3f51b6", "three") as any;
         // FN-5441 ownership verification: post-grep body fetch must contain
         // the anchored trailer so commitOwnedByTask accepts each candidate.
         if (cmd.includes("--format=%b") && cmd.includes("278a2825")) return "Fusion-Task-Id: FN-3794\n" as any;

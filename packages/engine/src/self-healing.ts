@@ -959,6 +959,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
 
   // ── Per-task deadlock recovery cooldown ─────────────────────────────
   private deadlockRecoveryCooldown: Map<string, number> = new Map();
+  /** `taskId:sha` pairs whose kept-but-unprovable done metadata was already logged, so each maintenance pass does not repeat it. */
+  private keptUnprovenDoneMetadata = new Set<string>();
   private mergeStarvationDrops: Map<string, number> = new Map();
   /*
   FNXC:WorkflowRecovery 2026-09-17-06:00 (FN-9304):
@@ -12804,6 +12806,28 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           const landed = await this.findLandedTaskCommit(task, { preferEarliestOwnedCommit: true });
           if (!landed) {
             if (!storedSha) {
+              continue;
+            }
+            /*
+            FNXC:LandedCommitProvenance 2026-10-11-07:40:
+            A null finder result now also means "owned but not proven strongly enough", for example a legacy subject-only landing whose task branch post-landing cleanup already deleted.
+            Clearing then would erase legitimate merge metadata, so the stored sha is cleared only when it is positively disproven: unreachable from HEAD, foreign, not owned, or older than the task (a recycled ID).
+            */
+            const storedAssessment = await this.assessStoredLandedCommit(task);
+            if (
+              storedAssessment.kind === "assessed" &&
+              !storedAssessment.verdict.accepted &&
+              (storedAssessment.verdict.reason === "subject-only-outside-task-range" ||
+                storedAssessment.verdict.reason === "commit-time-unknown")
+            ) {
+              const keptKey = `${task.id}:${storedSha}`;
+              if (!this.keptUnprovenDoneMetadata.has(keptKey)) {
+                this.keptUnprovenDoneMetadata.add(keptKey);
+                await this.store.logEntry(
+                  task.id,
+                  `Done-task merge metadata kept: stored commit ${storedSha.slice(0, 8)} is owned but not provable (${storedAssessment.verdict.reason})`,
+                );
+              }
               continue;
             }
             await this.store.updateTask(task.id, { mergeDetails: undefined });
