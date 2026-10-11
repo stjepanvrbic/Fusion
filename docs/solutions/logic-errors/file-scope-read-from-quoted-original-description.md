@@ -72,23 +72,55 @@ merge was refused needs an operator Retry.
 Locate a PROMPT.md section through one shared locator that skips the Original
 Description region, never through a private regular expression or a generic
 "first heading with this name" reader. A reader and a writer of the same section
-must share that locator, or additions land where readers never look. When a
-section reader must exist for a new heading, add it next to the File Scope
-locator and extend the ratchet.
+must share that locator, or additions land where readers never look. A reader
+for a new heading calls `locatePlanSection` / `extractPlanSection` /
+`extractPlanSectionWithHeading` from `@fusion/core` with the heading name; it
+never spells the heading as a pattern.
+
+## Generalized to every plan section
+
+The File Scope fix left every other plan heading on first-match readers. A
+request that quoted `## Mission`, `## Dependencies`, `## Do NOT`,
+`## Context to Read First`, `## Completion Criteria` or `## Steps` above the
+plan's own section was read as the plan: step sessions received the quoted
+rules, reading list and completion criteria, quoted `### Step N:` headings
+became stored task steps (a malformed quoted `(depends: …)` annotation threw),
+triage stored a quoted `- **Task:**` line as a dependency, the reviewer and
+session compaction summarized the quoted Mission, and Plan Review spec checks
+judged quoted content. Section writers (frontend UX criteria, Mission rewrite,
+review-gate failure and advisory notes) wrote next to a quoted heading, inside
+the region, where hygiene discarded the write.
+
+The File Scope algorithm is now the generic primitive in
+`packages/core/src/tasks/original-description-region.ts`:
+`listPlanHeadings(content)` returns every unfenced level-two heading outside
+the region, and `locatePlanSection`, `extractPlanSection` and
+`extractPlanSectionWithHeading` take a heading name. Matching is case-sensitive
+on whitespace-collapsed text with no trailing-colon or prefix variants; a
+section ends at the next unfenced level-one or level-two heading.
+`locateFileScopeSection` delegates to it. `matchStepHeadings` drops step
+headings inside the region (offsets stay relative to the full prompt), and
+every engine and core reader and writer listed above locates through the
+primitive. `packages/engine/src/__tests__/plan-section-single-locator.test.ts`
+refuses a new private locator: a heading-anchored regular expression, a string
+search for a level-two heading, or a heading template, outside a four-file
+allowlist (the region-boundary terminators, MEMORY.md, git status porcelain, a
+GitHub issue body).
+
+A planning-time scan of all 77 stored prompts (71 with a region) found no
+region quoting one of these headings, a step heading or a dependency line, so
+no persisted step or dependency list changes and no prompt was rewritten.
+`stripOriginalDescriptionSection` and the spec-lock and approval hashes are
+unchanged.
 
 ## Pitfalls
 
-- **Generic section readers still read other headings from the request.**
-  `Mission`, `Steps`, `Dependencies`, `Do NOT`, `Context to Read First` and
-  `Completion Criteria` are still found by the first matching heading anywhere
-  in the document.
 - **The shared resolver is not fence-aware.** A prompt with no real section that
   shows an Original Description heading inside a fenced sample is read as having
   a region from that line.
-- **A request that mentions the start marker cannot be wrapped.** The resolver
-  takes the first start-marker occurrence after the heading as an envelope start,
-  so hygiene leaves such a section unwrapped. The File Scope locator bounds it
-  like an unmarked section, but the spec lock does not strip it.
+- **Only a positional start marker opens the envelope.** A request that mentions
+  the start marker anywhere else resolves as an unmarked section, so hygiene can
+  wrap it and every plan-section reader bounds it like any unmarked region.
 
 ## Verification
 
@@ -101,3 +133,8 @@ locator and extend the ratchet.
 - `packages/engine/src/__tests__/file-scope-consumers-original-description.test.ts`
   covers each engine reader; `merger-ai-squash-gates.test.ts` lands the stored
   shape under strict policy; `file-scope-single-locator.test.ts` is the ratchet.
+- `packages/core/src/__tests__/original-description-region.test.ts` ("plan
+  sections") and `plan-section-consumers.test.ts`, and the engine
+  `plan-section-consumers-original-description.test.ts` and
+  `review-findings-injection.test.ts`, cover every other plan section;
+  `plan-section-single-locator.test.ts` is their ratchet.

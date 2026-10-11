@@ -9,6 +9,7 @@
  */
 import type { TaskLogEntry } from "../types.js";
 import { buildBootstrapPrompt } from "../mesh/mesh-task-replication.js";
+import { locatePlanSection } from "../tasks/original-description-region.js";
 
 const DEFAULT_TASK_ACTIVITY_LOG_ENTRY_LIMIT = 1_000;
 const DEFAULT_TASK_ACTIVITY_LOG_OUTCOME_LIMIT = 4_000;
@@ -117,19 +118,19 @@ export function rewriteHeadingLine(content: string, newHeading: string): string 
  * regen would silently drop.
  *
  * Returns the original content unchanged if there is no `## Mission` section.
+ *
+ * FNXC:PlanSections 2026-10-11-17:08:
+ * The Mission section is the plan's, found by the shared plan-section locator; a Mission quoted in the Original Description is never rewritten.
+ * The heading line is kept without its line break, so the result always has exactly one blank line after the heading (the previous pattern kept the break whenever a blank line followed, producing two).
  */
 export function rewriteMissionSection(content: string, newDescription: string): string {
-  const missionMatch = content.match(/^##\s+Mission\s*$/m);
-  if (!missionMatch || missionMatch.index === undefined) {
+  const mission = locatePlanSection(content, "Mission");
+  if (!mission) {
     return content;
   }
-  const headerEnd = missionMatch.index + missionMatch[0].length;
-  const rest = content.slice(headerEnd);
-  // Find the next `## ` heading (start of next section). The match position is
-  // relative to `rest`, so we re-anchor to the absolute offset.
-  const nextHeading = rest.search(/\n##\s/);
-  const sectionEndAbsolute = nextHeading === -1 ? content.length : headerEnd + nextHeading;
-  const before = content.slice(0, headerEnd);
+  // The next heading starts at sectionEnd; keep the newline before it with the trailing content.
+  const sectionEndAbsolute = mission.sectionEnd < content.length ? mission.sectionEnd - 1 : content.length;
+  const before = content.slice(0, mission.sectionStart).trimEnd();
   const after = content.slice(sectionEndAbsolute);
   // Reconstruct: header line + blank line + new description + blank line +
   // trailing content (which begins with the newline before the next heading).

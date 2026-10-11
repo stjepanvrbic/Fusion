@@ -1,5 +1,6 @@
 import type { Task } from "../types.js";
 import { normalizeSymbolLockKey } from "../task-store/symbol-locks.js";
+import { extractPlanSection } from "./original-description-region.js";
 
 /**
  * FNXC:SymbolLock 2026-07-31-10:00:
@@ -26,12 +27,11 @@ export function normalizeDeclaredSymbols(raw: readonly string[]): string[] {
   return [...values].sort();
 }
 
+/** FNXC:PlanSections 2026-10-11-17:08: symbols come from the plan's Declared Symbols section only, never from one quoted in the Original Description. */
 export function extractDeclaredSymbolsFromPrompt(content: string): string[] {
-  const heading = content.match(/^##\s+Declared\s+Symbols\s*$/m);
-  if (!heading) return [];
-  const rest = content.slice(heading.index! + heading[0].length);
-  const next = rest.search(/\n##?\s/);
-  return Array.from((next === -1 ? rest : rest.slice(0, next)).matchAll(/`([^`]+)`/g), match => match[1]);
+  const section = extractPlanSection(content, "Declared Symbols");
+  if (section === null) return [];
+  return Array.from(section.matchAll(/`([^`]+)`/g), match => match[1]);
 }
 
 /** Own property absence alone permits create-time prompt hydration. */

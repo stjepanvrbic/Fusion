@@ -1,5 +1,4 @@
-import { extractFileScopeSectionWithHeading } from "@fusion/core";
-import { extractSection } from "../execution/step-session-executor.js";
+import { extractFileScopeSectionWithHeading, extractPlanSectionWithHeading } from "@fusion/core";
 
 export interface ExternalIntegrationEvidenceFinding {
   integrationHint: string;
@@ -46,12 +45,15 @@ const DUPLICATE_GITHUB_REPO_PATTERN = /^https:\/\/github\.com\/([^/]+)\/([^/]+)(
 /**
  * FNXC:FileScope 2026-10-11-14:50:
  * File Scope joins in through the core locator, so integration keywords in a File Scope list quoted in the Original Description do not demand evidence from the plan.
+ *
+ * FNXC:PlanSections 2026-10-11-17:08:
+ * Every other section is read through the same core plan-section locator, so a Mission, Steps or reading list quoted in the request is never judged as the plan.
  */
 function collectSections(promptContent: string): string {
   return [
-    ...LEADING_SECTION_NAMES.map((name) => extractSection(promptContent, name)),
+    ...LEADING_SECTION_NAMES.map((name) => extractPlanSectionWithHeading(promptContent, name)),
     extractFileScopeSectionWithHeading(promptContent),
-    ...TRAILING_SECTION_NAMES.map((name) => extractSection(promptContent, name)),
+    ...TRAILING_SECTION_NAMES.map((name) => extractPlanSectionWithHeading(promptContent, name)),
   ].join("\n");
 }
 

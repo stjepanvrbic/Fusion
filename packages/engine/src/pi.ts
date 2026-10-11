@@ -53,7 +53,7 @@ import {
   runWithFusionSessionIdentity,
   resolvePiExtensionProjectRoot,
   resolveToolOutputBudget,
-  matchStepHeadings, extractFileScopeSectionWithHeading,
+  matchStepHeadings, extractFileScopeSectionWithHeading, extractPlanSectionWithHeading,
 } from "@fusion/core";
 import type {
   AgentPermissionPolicyActionCategory,
@@ -724,22 +724,6 @@ function compactExistingSpecificationSectionBody(body: string): string {
   return `${head}\n\n_... existing specification middle trimmed ..._\n\n${tail}`;
 }
 
-function extractMarkdownSection(document: string, headingName: string): string {
-  const heading = `## ${headingName}`;
-  const start = document.indexOf(heading);
-  if (start === -1) {
-    return "";
-  }
-
-  const afterHeading = start + heading.length;
-  const nextH2 = document.indexOf("\n## ", afterHeading);
-  const nextH1 = document.indexOf("\n# ", afterHeading);
-  const endCandidates = [nextH2, nextH1].filter((value) => value !== -1);
-  const end = endCandidates.length > 0 ? Math.min(...endCandidates) : document.length;
-
-  return document.slice(start, end).trim();
-}
-
 function compactTaskPromptStepsSection(section: string): string {
   const stepTitles = matchStepHeadings(section).map(({ index, headingLineEnd }) => section.slice(index, headingLineEnd).trim());
   if (stepTitles.length === 0) {
@@ -779,10 +763,11 @@ function compactTaskPromptSectionBody(body: string): string {
   const promptContent = fencedMatch ? fencedMatch[1].trim() : trimmed;
   const firstSectionIndex = promptContent.indexOf("\n## ");
   const preamble = (firstSectionIndex === -1 ? promptContent : promptContent.slice(0, firstSectionIndex)).trim();
-  const missionSection = extractMarkdownSection(promptContent, "Mission");
-  const dependenciesSection = extractMarkdownSection(promptContent, "Dependencies");
-  const fileScopeSection = extractFileScopeSectionWithHeading(promptContent); // FNXC:FileScope 2026-10-11-14:50: core locator skips a list quoted in the Original Description.
-  const stepsSection = compactTaskPromptStepsSection(extractMarkdownSection(promptContent, "Steps"));
+  // FNXC:PlanSections 2026-10-11-17:08: the core plan-section locator skips sections quoted in the Original Description, so compaction keeps the plan, not the request's copy.
+  const missionSection = extractPlanSectionWithHeading(promptContent, "Mission");
+  const dependenciesSection = extractPlanSectionWithHeading(promptContent, "Dependencies");
+  const fileScopeSection = extractFileScopeSectionWithHeading(promptContent);
+  const stepsSection = compactTaskPromptStepsSection(extractPlanSectionWithHeading(promptContent, "Steps"));
 
   const compactedContent = [
     truncateCompactedSection(preamble, 400, "task header"),

@@ -25,6 +25,7 @@ import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 import * as schema from "../postgres/schema/index.js";
 import { runCommandAsync } from "../process/run-command.js";
 import { getStepParser } from "../tasks/step-parsers.js";
+import { extractPlanSection } from "../tasks/original-description-region.js";
 import { getTaskMergeBlocker } from "../merge/task-merge.js";
 import { resolveRequiredPreMergeStepIds } from "../merge/required-pre-merge-steps.js";
 import { deleteTaskDocument as deleteTaskDocumentAsync, getArtifact as getArtifactAsync, getArtifacts as getArtifactsAsync, getLiveTaskColumn, getTaskDocument as getTaskDocumentAsync, getTaskDocumentRevisions as getTaskDocumentRevisionsAsync, listTaskDocuments as listTaskDocumentsAsync, updateArtifactRow as updateArtifactRowAsync } from "./async/async-comments-attachments.js";
@@ -191,16 +192,12 @@ export async function parseDependenciesFromPromptImpl(store: TaskStore, id: stri
 
     const content = await readFile(promptPath, "utf-8");
 
-    // Find the ## Dependencies section.
-    // We locate the heading then slice to the next heading (or end of file)
-    // to avoid multiline `$` anchor issues with lazy quantifiers.
-    const headingMatch = content.match(/^##\s+Dependencies\s*$/m);
-    if (!headingMatch) return [];
-
-    const startIdx = headingMatch.index! + headingMatch[0].length;
-    const rest = content.slice(startIdx);
-    const nextHeading = rest.search(/\n##?\s/);
-    const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading);
+    /*
+    FNXC:PlanSections 2026-10-11-17:08:
+    Triage stores these ids as task dependencies, so only the plan's own Dependencies section counts; a `- **Task:**` line quoted in the Original Description used to become a real dependency edge.
+    */
+    const section = extractPlanSection(content, "Dependencies");
+    if (section === null) return [];
 
     const ids: string[] = [];
     const taskIdRegex = /^-\s+\*\*Task:\*\*\s+([A-Z]+-\d+)/gm;

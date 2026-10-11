@@ -161,6 +161,7 @@ export * from "./tasks/terminal-failure-auto-recovery.js";
 export * from "./tasks/original-description-policy.js";
 export * from "./planner/planning-plan-md.js";
 export * from "./tasks/file-scope-classification.js";
+export { listPlanHeadings, locatePlanSection, extractPlanSection, extractPlanSectionWithHeading, type PlanHeading } from "./tasks/original-description-region.js";
 export { MAX_TASK_LIST_TEXT_CHARS, clampTaskListText, formatTaskListText } from "./tasks/task-list-format.js";
 export {
   DEFAULT_TOOL_OUTPUT_MAX_CHARS,

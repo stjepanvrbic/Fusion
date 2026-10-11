@@ -21,6 +21,7 @@ import {
   resolveValidatorFallbackModel,
   matchStepHeadings,
   extractFileScopeSectionWithHeading,
+  extractPlanSectionWithHeading,
 } from "@fusion/core";
 import { recordRetry } from "../errors/retry-burned-logger.js";
 import { createAssistantStreamCapture } from "./assistant-text-capture.js";
@@ -909,21 +910,6 @@ function isReviewerSessionReuseError(error: unknown): boolean {
   return /prompt is in progress|session (?:is )?(?:closed|disposed|ended)|conversation already active/i.test(message);
 }
 
-function extractPromptSection(promptContent: string, sectionName: string): string {
-  const heading = `## ${sectionName}`;
-  const start = promptContent.indexOf(heading);
-  if (start === -1) {
-    return "";
-  }
-
-  const afterHeading = start + heading.length;
-  const nextH2 = promptContent.indexOf("\n## ", afterHeading);
-  const nextH1 = promptContent.indexOf("\n# ", afterHeading);
-  const endCandidates = [nextH2, nextH1].filter((value) => value !== -1);
-  const end = endCandidates.length > 0 ? Math.min(...endCandidates) : promptContent.length;
-  return promptContent.slice(start, end).trim();
-}
-
 function summarizePromptSteps(promptContent: string): string {
   const stepTitles = matchStepHeadings(promptContent).map(({ index, headingLineEnd }) => promptContent.slice(index, headingLineEnd).trim());
   if (stepTitles.length === 0) {
@@ -938,9 +924,9 @@ function buildReducedTaskPromptSummary(promptContent: string): string {
   const header = (firstSectionIndex === -1 ? promptContent : promptContent.slice(0, firstSectionIndex)).trim();
   const sections = [
     header,
-    extractPromptSection(promptContent, "Mission"),
-    extractPromptSection(promptContent, "Dependencies"),
-    // FNXC:FileScope 2026-10-11-14:50: the core locator skips a File Scope list quoted in the Original Description.
+    // FNXC:PlanSections 2026-10-11-17:08: sections and step titles come from the core plan-section locator, which skips anything quoted in the Original Description.
+    extractPlanSectionWithHeading(promptContent, "Mission"),
+    extractPlanSectionWithHeading(promptContent, "Dependencies"),
     extractFileScopeSectionWithHeading(promptContent),
     summarizePromptSteps(promptContent),
     "_... additional PROMPT.md sections omitted after context-limit retry ..._",

@@ -4,6 +4,7 @@
  */
 
 import type { ReviewArtifactsMode } from "../ui/execution-and-ui.js";
+import { locatePlanSection } from "../../tasks/original-description-region.js";
 
 export interface TaskDocument {
   /** UUID primary key */
@@ -230,11 +231,14 @@ otherwise a task with the standard frontend UX contract is user-facing and all
 other work conservatively remains backend. This keeps trivial/backend work from
 silently producing review media while allowing `on` or the existing mode header
 to explicitly opt in.
+
+FNXC:PlanSections 2026-10-11-17:08:
+Only the plan's own Frontend UX Criteria section makes a task user-facing; one quoted in the Original Description does not.
 */
 export function classifyReviewArtifactTask(prompt: string | undefined): ReviewArtifactTaskClassification {
   const explicit = prompt?.match(/^\*\*Review Artifact Task Type:\*\*\s*(user-facing|backend|trivial)\s*$/im)?.[1]?.toLowerCase();
   if (explicit === "user-facing" || explicit === "backend" || explicit === "trivial") return explicit;
-  if (/^##\s+Frontend UX Criteria\s*$/im.test(prompt ?? "")) return "user-facing";
+  if (locatePlanSection(prompt ?? "", "Frontend UX Criteria")) return "user-facing";
   return "backend";
 }
 

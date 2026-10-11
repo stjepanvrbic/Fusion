@@ -3,12 +3,13 @@ import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { Task, WorkflowReviewFinding } from "@fusion/core";
+import { applyOriginalDescription, type Task, type WorkflowReviewFinding } from "@fusion/core";
 
 import {
   injectReviewAdvisoryNotes,
   injectWorkflowStepFailureInstructions,
 } from "../executor/workflow-step-failure-injection.js";
+import { originalDescriptionRegionText } from "./_quoted-file-scope-prompt.js";
 
 /*
 FNXC:ReviewSeverityGate 2026-08-10-17:33:
@@ -164,5 +165,114 @@ describe("injectReviewAdvisoryNotes", () => {
     await expect(
       injectReviewAdvisoryNotes(store, task, "Plan Review", [finding({ severity: "low" })]),
     ).resolves.toBeUndefined();
+  });
+});
+
+/*
+FNXC:PlanSections 2026-10-11-17:08:
+A request that quotes the injected headings must not capture the injection: a quoted section counts as absent, the write lands in the plan, and the Original Description region keeps its bytes.
+A region-free prompt keeps the exact bytes the injection always produced.
+*/
+describe("sections quoted in the Original Description", () => {
+  const request = [
+    "The requester pasted an older review.",
+    "",
+    "## Workflow Step Failure",
+    "",
+    "DECOY failure body.",
+    "",
+    "## Review Advisory Notes",
+    "",
+    "DECOY advisory body.",
+    "",
+    "## Acceptance Criteria",
+    "",
+    "- DECOY criterion",
+  ].join("\n");
+
+  function planned(acceptance: boolean): string {
+    return applyOriginalDescription(
+      [
+        "# Task: FN-TEST - Example",
+        "",
+        "## What This Delivers",
+        "",
+        "- Value.",
+        "",
+        "## Mission",
+        "",
+        "Do the planned work.",
+        "",
+        ...(acceptance ? ["## Acceptance Criteria", "", "- Plan criterion", ""] : []),
+      ].join("\n"),
+      request,
+    );
+  }
+
+  function planPart(content: string): string {
+    const region = originalDescriptionRegionText(content);
+    return content.slice(content.indexOf(region) + region.length);
+  }
+
+  it.each([true, false])("writes the failure section into the plan (plan has Acceptance Criteria: %s) and replaces it there", async (acceptance) => {
+    const prompt = planned(acceptance);
+    await writeFile(promptPath, prompt);
+
+    await injectWorkflowStepFailureInstructions(store, task, "first", "Code Review", { attempt: 1, max: 3 });
+    const once = await readFile(promptPath, "utf-8");
+    expect(originalDescriptionRegionText(once)).toBe(originalDescriptionRegionText(prompt));
+    expect(planPart(once).match(/## Workflow Step Failure/g)).toHaveLength(1);
+    if (acceptance) {
+      expect(planPart(once).indexOf("## Workflow Step Failure")).toBeLessThan(planPart(once).indexOf("## Acceptance Criteria"));
+    } else {
+      expect(once.startsWith(prompt)).toBe(true);
+    }
+
+    await injectWorkflowStepFailureInstructions(store, task, "second", "Code Review", { attempt: 2, max: 3 });
+    const twice = await readFile(promptPath, "utf-8");
+    expect(originalDescriptionRegionText(twice)).toBe(originalDescriptionRegionText(prompt));
+    expect(planPart(twice).match(/## Workflow Step Failure/g)).toHaveLength(1);
+    expect(planPart(twice)).toContain("second");
+    expect(planPart(twice)).not.toContain("first");
+  });
+
+  it("writes advisory notes into the plan and replaces them there", async () => {
+    const prompt = planned(true);
+    await writeFile(promptPath, prompt);
+
+    await injectReviewAdvisoryNotes(store, task, "Plan Review", [finding({ title: "first note", body: "x", severity: "low" })]);
+    await injectReviewAdvisoryNotes(store, task, "Plan Review", [finding({ title: "second note", body: "y", severity: "low" })]);
+
+    const content = await readFile(promptPath, "utf-8");
+    expect(originalDescriptionRegionText(content)).toBe(originalDescriptionRegionText(prompt));
+    expect(planPart(content).match(/## Review Advisory Notes/g)).toHaveLength(1);
+    expect(planPart(content)).toContain("second note");
+    expect(content).not.toContain("first note");
+    expect(content).toContain("DECOY advisory body.");
+  });
+
+  it("keeps the region-free bytes: inserts before Acceptance Criteria after removing revision instructions", async () => {
+    await writeFile(
+      promptPath,
+      "# Task\n\n## Mission\n\nGo.\n\n## Workflow Revision Instructions\n\nOld revision.\n\n## Acceptance Criteria\n\n- ok\n",
+    );
+
+    await injectWorkflowStepFailureInstructions(store, task, "feedback", "Code Review", { attempt: 1, max: 3 });
+
+    const content = await readFile(promptPath, "utf-8");
+    expect(content.startsWith("# Task\n\n## Mission\n\nGo.\n\n\n## Workflow Step Failure\n")).toBe(true);
+    expect(content.endsWith("remediating.\n\n\n## Acceptance Criteria\n\n- ok\n")).toBe(true);
+    expect(content).not.toContain("Old revision.");
+  });
+
+  it("keeps the region-free bytes when replacing advisory notes before the next heading", async () => {
+    await writeFile(promptPath, "# Task\n\n## Review Advisory Notes\n\nold\n\n## Steps\n\n- go\n");
+
+    await injectReviewAdvisoryNotes(store, task, "Plan Review", [finding({ title: "note", body: "x", severity: "low" })]);
+
+    const content = await readFile(promptPath, "utf-8");
+    expect(content.startsWith("# Task\n\n## Review Advisory Notes\n")).toBe(true);
+    expect(content.endsWith("\n\n\n## Steps\n\n- go\n")).toBe(true);
+    expect(content).not.toContain("old\n");
   });
 });

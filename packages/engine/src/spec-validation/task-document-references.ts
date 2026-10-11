@@ -1,7 +1,6 @@
 import { access } from "node:fs/promises";
 import { join } from "node:path";
-import { extractFileScopeSectionWithHeading, matchStepHeadings } from "@fusion/core";
-import { extractSection } from "../execution/step-session-executor.js";
+import { extractFileScopeSectionWithHeading, extractPlanSectionWithHeading, matchStepHeadings } from "@fusion/core";
 
 export interface DanglingTaskDocReference {
   path: string;
@@ -95,8 +94,9 @@ export async function detectDanglingTaskDocReferences(
     }
   });
 
-  const contextSection = extractSection(promptContent, "Context to Read First");
-  const stepsSection = extractSection(promptContent, "Steps");
+  // FNXC:PlanSections 2026-10-11-17:08: the plan's own sections only; a reference quoted in the Original Description is request text, not a plan reference.
+  const contextSection = extractPlanSectionWithHeading(promptContent, "Context to Read First");
+  const stepsSection = extractPlanSectionWithHeading(promptContent, "Steps");
   const producedArtifacts = collectProducedArtifacts(stepsSection);
   const fileScopePaths = collectFileScopePaths(promptContent);
 

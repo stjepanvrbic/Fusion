@@ -1,4 +1,4 @@
-import { locateOriginalDescriptionRegion } from "./original-description-region.js";
+import { locatePlanSection } from "./original-description-region.js";
 
 export type FileScopeClassificationReason =
   | "included-write-scope"
@@ -215,62 +215,16 @@ function classifyToken(
  * Lines inside the Original Description region do not exist for this scan: they never match the heading and never toggle the fence state, so an unbalanced fence in operator text cannot hide the plan's section.
  * A region never promotes its content: a planned prompt whose plan has no File Scope section declares no scope, even when the request quotes one.
  * Seed prompts (bootstrap stub, refinement seed, a specified prompt that copies the request under Mission) have no Original Description heading, so a File Scope heading in their operator text stays the provisional declared scope until planning moves the text into the region.
+ *
+ * FNXC:PlanSections 2026-10-11-17:08:
+ * The scan is the generic plan-section locator (`locatePlanSection`), which applies the same region, fence and section-end rules to every plan heading.
  */
 export function locateFileScopeSection(content: string): {
   headingStart: number;
   sectionStart: number;
   sectionEnd: number;
 } | null {
-  const region = locateOriginalDescriptionRegion(content);
-  let inFence = false;
-  let offset = 0;
-  const lines = content.split("\n");
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i] ?? "";
-    const lineStart = offset;
-    const nextOffset = offset + line.length + (i < lines.length - 1 ? 1 : 0);
-
-    if (region && lineStart >= region.start && lineStart < region.end) {
-      offset = nextOffset;
-      continue;
-    }
-
-    if (/^```/.test(line)) {
-      inFence = !inFence;
-      offset = nextOffset;
-      continue;
-    }
-
-    if (!inFence && /^##\s+File\s+Scope\s*$/.test(line)) {
-      const sectionStart = nextOffset;
-      let sectionEnd = content.length;
-      let scanOffset = sectionStart;
-      let scanInFence = false;
-
-      for (let j = i + 1; j < lines.length; j++) {
-        const scanLine = lines[j] ?? "";
-        const scanLineStart = scanOffset;
-        scanOffset += scanLine.length + (j < lines.length - 1 ? 1 : 0);
-
-        if (/^```/.test(scanLine)) {
-          scanInFence = !scanInFence;
-          continue;
-        }
-        if (!scanInFence && /^#{1,2}\s/.test(scanLine)) {
-          sectionEnd = scanLineStart;
-          break;
-        }
-      }
-      if (region && region.start >= sectionStart && region.start < sectionEnd) sectionEnd = region.start;
-
-      return { headingStart: lineStart, sectionStart, sectionEnd };
-    }
-
-    offset = nextOffset;
-  }
-
-  return null;
+  return locatePlanSection(content, "File Scope");
 }
 
 /** Body of the located File Scope section (heading line excluded), or `null` when the prompt declares none. */

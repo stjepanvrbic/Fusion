@@ -6,7 +6,7 @@
 import { join } from "node:path";
 import { readFile, writeFile } from "node:fs/promises";
 import type { Task, TaskStore, WorkflowReviewFinding } from "@fusion/core";
-import { formatFindingsByPriority, formatResolvedFindings, isOpenWorkflowReviewFinding } from "@fusion/core";
+import { formatFindingsByPriority, formatResolvedFindings, isOpenWorkflowReviewFinding, locatePlanSection } from "@fusion/core";
 import { executorLog } from "../logger.js";
 import { buildWorkflowFailureScopeGuard } from "./workflow-failure-scope-guard.js";
 
@@ -21,6 +21,22 @@ observation, which is what turned a single REVISE into a multi-round negotiation
 so prose-only reviewers (custom nodes, older workflows) keep working unchanged.
 */
 const ADVISORY_SECTION_HEADER = "## Review Advisory Notes";
+
+/**
+ * FNXC:PlanSections 2026-10-11-17:08:
+ * Injected sections are found through the core plan-section locator, so a section quoted in the Original Description counts as absent.
+ * Replacing or anchoring to a quoted copy wrote the notes inside the region, where hygiene replaced them with the verbatim request and the remediation instructions silently vanished.
+ * The replaced range runs from the heading to the newline before the next heading (or the end), which keeps the bytes of a region-free prompt unchanged.
+ */
+function locateInjectedSection(content: string, name: string): { start: number; end: number } | null {
+  const located = locatePlanSection(content, name);
+  if (!located) return null;
+  return { start: located.headingStart, end: located.sectionEnd < content.length ? located.sectionEnd - 1 : content.length };
+}
+
+function replaceRange(content: string, range: { start: number; end: number }, replacement: string): string {
+  return content.slice(0, range.start) + replacement + content.slice(range.end);
+}
 
 /**
  * Write non-blocking review findings into PROMPT.md.
@@ -58,8 +74,8 @@ ${formatFindingsByPriority(findings)}
 
 `;
 
-  const sectionRegex = new RegExp(`${ADVISORY_SECTION_HEADER}[\\s\\S]*?(?=\\n## |\\n# |$)`, "i");
-  const newContent = sectionRegex.test(content) ? content.replace(sectionRegex, section) : `${content}\n${section}`;
+  const existing = locateInjectedSection(content, "Review Advisory Notes");
+  const newContent = existing ? replaceRange(content, existing, section) : `${content}\n${section}`;
 
   try {
     await writeFile(promptPath, newContent);
@@ -126,33 +142,21 @@ ${scopeGuard}
 `;
 
   let newContent: string;
-  if (content.includes(failureSectionHeader)) {
+  const existingFailure = locateInjectedSection(content, "Workflow Step Failure");
+  if (existingFailure) {
     // Replace existing section
-    const sectionRegex = new RegExp(
-      `${failureSectionHeader}[\\s\\S]*?(?=\\n## |\\n# |$)`,
-      "i"
-    );
-    if (sectionRegex.test(content)) {
-      newContent = content.replace(sectionRegex, failureSectionContent);
-    } else {
-      // Fallback: append at end
-      newContent = content + "\n" + failureSectionContent;
-    }
+    newContent = replaceRange(content, existingFailure, failureSectionContent);
   } else {
     // Remove any existing Workflow Revision Instructions section first (conflicting state)
-    const revisionSectionHeader = "## Workflow Revision Instructions";
-    if (content.includes(revisionSectionHeader)) {
-      const revisionRegex = new RegExp(
-        `${revisionSectionHeader}[\\s\\S]*?(?=\\n## |\\n# |$)`,
-        "i"
-      );
-      content = content.replace(revisionRegex, "");
+    const revision = locateInjectedSection(content, "Workflow Revision Instructions");
+    if (revision) {
+      content = replaceRange(content, revision, "");
     }
 
-    // Append new section before any closing markers or at end
-    const acceptanceCriteriaMatch = content.match(/\n##\s+Acceptance Criteria\n/);
-    if (acceptanceCriteriaMatch) {
-      const insertIdx = acceptanceCriteriaMatch.index!;
+    // Insert before the plan's Acceptance Criteria (keeping the newline that precedes it), or append at end
+    const acceptanceCriteria = locatePlanSection(content, "Acceptance Criteria");
+    if (acceptanceCriteria && acceptanceCriteria.headingStart > 0) {
+      const insertIdx = acceptanceCriteria.headingStart - 1;
       newContent = content.slice(0, insertIdx) + "\n" + failureSectionContent + content.slice(insertIdx);
     } else {
       newContent = content + "\n" + failureSectionContent;

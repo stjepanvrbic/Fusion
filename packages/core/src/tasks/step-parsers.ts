@@ -21,6 +21,7 @@
  */
 
 import type { TaskStep } from "../types.js";
+import { extractPlanSection, locateOriginalDescriptionRegion } from "./original-description-region.js";
 
 // ── Parser contract ──────────────────────────────────────────────────────────
 
@@ -186,15 +187,22 @@ export interface StepHeadingMatch {
 FNXC:WorkflowSteps 2026-09-05-22:06:
 Every consumer deciding whether text is a step heading must use this matcher. A private stricter
 matcher hid documented `(depends: …)` headings, causing false contiguity failures and empty step bodies.
+
+FNXC:PlanSections 2026-10-11-17:08:
+A step heading quoted in the Original Description region is request text, never a plan step: it used to become a stored task step (or throw on a malformed quoted annotation).
+Matches inside the region are dropped; offsets stay relative to the full content, so slicing callers keep working, and an extracted section (no region) is unaffected.
+Step headings get no fence awareness, matching their historical behavior.
 */
 export function matchStepHeadings(content: string): StepHeadingMatch[] {
   const stepRegex = /^###\s+Step\s+\d+[^:]*:\s*(.+)$/gm;
+  const region = locateOriginalDescriptionRegion(content);
   const matches: StepHeadingMatch[] = [];
   let match: RegExpExecArray | null;
   while ((match = stepRegex.exec(content)) !== null) {
     const heading = /^###\s+Step\s+(\d+)/.exec(match[0]);
     if (!heading) continue;
     const index = match.index;
+    if (region && index >= region.start && index < region.end) continue;
     const newline = content.indexOf("\n", index);
     matches.push({
       headingNumber: Number(heading[1]),
@@ -334,14 +342,12 @@ export function parseStepHeadings(content: string): TaskStep[] {
 /*
 FNXC:WorkflowSteps 2026-06-30-00:54:
 Default Coding parses PROMPT.md before step execution. FN-7260/FN-7271 specs used plain `### Preflight`/`### Implementation` headings under `## Steps`; the previous parser returned zero steps, so fast-mode tasks reached merge with no implementation session. Accept plain third-level headings only inside the Steps section, and only when no legacy `### Step N:` headings were found, so unrelated spec sections do not become executable work.
+
+FNXC:PlanSections 2026-10-11-17:08:
+The Steps section is the plan's, located by the shared plan-section locator, so a `## Steps` quoted in the Original Description never contributes plain headings.
 */
 function extractStepsSection(content: string): string | undefined {
-  const sectionMatch = /^##\s+Steps\s*$/gim.exec(content);
-  if (!sectionMatch) return undefined;
-  const start = sectionMatch.index + sectionMatch[0].length;
-  const rest = content.slice(start);
-  const nextSection = /^##\s+(?!#)/gm.exec(rest);
-  return nextSection ? rest.slice(0, nextSection.index) : rest;
+  return extractPlanSection(content, "Steps") ?? undefined;
 }
 
 /*

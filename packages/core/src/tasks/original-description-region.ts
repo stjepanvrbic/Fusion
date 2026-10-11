@@ -101,3 +101,107 @@ export function locateOriginalDescriptionRegion(promptText: string): { start: nu
     end: terminatorOffset === -1 ? promptText.length : headerEnd + terminatorOffset,
   };
 }
+
+/** A level-two plan heading located outside the Original Description region. */
+export interface PlanHeading {
+  /** Heading text after `## `, trimmed (a CRLF `\r` is stripped). */
+  text: string;
+  /** Offset of the heading line. */
+  headingStart: number;
+  /** Offset just past the heading line. */
+  sectionStart: number;
+  /** Offset of the next unfenced level-one or level-two heading, the region start, or the end of the content. */
+  sectionEnd: number;
+}
+
+const PLAN_HEADING_LINE = /^##\s+(.*?)\s*$/;
+const SECTION_TERMINATOR_LINE = /^#{1,2}\s/;
+const FENCE_LINE = /^```/;
+
+function normalizeHeadingText(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+/**
+ * FNXC:PlanSections 2026-10-11-17:08:
+ * Operator text under `## Original Description` is the request, never the plan, for every plan heading, not only File Scope.
+ * A request that quoted `## Mission`, `## Dependencies`, `## Steps` or `## Do NOT` above the plan's own section used to win a first-match search, so executors read quoted rules and steps, triage stored quoted dependencies, and section writers put notes inside the region where hygiene replaced them with the verbatim request.
+ * Every reader and writer that locates a plan section goes through this one scan, so they cannot disagree about which section is the plan's.
+ *
+ * Grammar: a heading is an unfenced `## <text>` line with non-empty text; matching is case-sensitive and compares text with whitespace runs collapsed, with no trailing-colon or prefix variants.
+ * Lines inside the region do not exist for the scan: they never match a heading and never toggle the fence state, so an unbalanced fence in operator text cannot hide a plan section.
+ * A section ends at the next unfenced level-one or level-two heading (fresh fence state after the heading) and is clamped to the region start when the region begins inside it.
+ * A region never promotes its content: a planned prompt whose plan lacks a section has none, even when the request quotes one.
+ * Seed prompts (bootstrap stub, refinement seed, a specified prompt that copies the request) have no Original Description heading, so their quoted headings stay provisional plan content.
+ * Never logs, because section readers run on every scheduler pass.
+ */
+export function listPlanHeadings(content: string): PlanHeading[] {
+  const region = locateOriginalDescriptionRegion(content);
+  const lines = content.split("\n");
+  const lineStarts: number[] = [];
+  let offset = 0;
+  for (let i = 0; i < lines.length; i++) {
+    lineStarts.push(offset);
+    offset += (lines[i] ?? "").length + (i < lines.length - 1 ? 1 : 0);
+  }
+  const lineEnd = (i: number): number => (i + 1 < lines.length ? lineStarts[i + 1]! : content.length);
+
+  const headings: PlanHeading[] = [];
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    const lineStart = lineStarts[i]!;
+    if (region && lineStart >= region.start && lineStart < region.end) continue;
+    if (FENCE_LINE.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    const text = PLAN_HEADING_LINE.exec(line)?.[1];
+    if (!text) continue;
+
+    const sectionStart = lineEnd(i);
+    let sectionEnd = content.length;
+    let scanInFence = false;
+    for (let j = i + 1; j < lines.length; j++) {
+      const scanLine = lines[j] ?? "";
+      if (FENCE_LINE.test(scanLine)) {
+        scanInFence = !scanInFence;
+        continue;
+      }
+      if (!scanInFence && SECTION_TERMINATOR_LINE.test(scanLine)) {
+        sectionEnd = lineStarts[j]!;
+        break;
+      }
+    }
+    if (region && region.start >= sectionStart && region.start < sectionEnd) sectionEnd = region.start;
+
+    headings.push({ text, headingStart: lineStart, sectionStart, sectionEnd });
+  }
+  return headings;
+}
+
+/** The first plan section titled `name` (see `listPlanHeadings`), or `null` when the plan has none. */
+export function locatePlanSection(
+  content: string,
+  name: string,
+): { headingStart: number; sectionStart: number; sectionEnd: number } | null {
+  const wanted = normalizeHeadingText(name);
+  const heading = listPlanHeadings(content).find((entry) => normalizeHeadingText(entry.text) === wanted);
+  return heading ? { headingStart: heading.headingStart, sectionStart: heading.sectionStart, sectionEnd: heading.sectionEnd } : null;
+}
+
+/** Body of the plan section titled `name` (heading line excluded, untrimmed), or `null` when the plan has none. */
+export function extractPlanSection(content: string, name: string): string | null {
+  const located = locatePlanSection(content, name);
+  return located ? content.slice(located.sectionStart, located.sectionEnd) : null;
+}
+
+/**
+ * The plan section titled `name` including its heading line, trimmed, or `""` when the plan has none.
+ * For readers that quote the section into another prompt (step prompts, review summaries, spec checks).
+ */
+export function extractPlanSectionWithHeading(content: string, name: string): string {
+  const located = locatePlanSection(content, name);
+  return located ? content.slice(located.headingStart, located.sectionEnd).trim() : "";
+}

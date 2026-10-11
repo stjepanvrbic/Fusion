@@ -3,16 +3,18 @@
  * noCommitsExpected eligibility heuristics peeled from executor.ts (wave18 / U4 Slice A).
  */
 import type { Task } from "@fusion/core";
-import { extractFileScopeSection } from "@fusion/core";
+import { extractFileScopeSection, extractPlanSection, listPlanHeadings } from "@fusion/core";
 
+/*
+FNXC:PlanSections 2026-10-11-17:08:
+Mission and Review Level come from the core plan-section locator, so coordination-only wording or a Plan Only level quoted in the Original Description cannot exempt a source task from producing commits.
+*/
 function getPromptSection(prompt: string, heading: string): string {
-  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = prompt.match(new RegExp(`^##\\s+${escapedHeading}\\s*$([\\s\\S]*?)(?=^##\\s+|$(?![\\s\\S]))`, "im"));
-  return match?.[1]?.trim() ?? "";
+  return extractPlanSection(prompt, heading)?.trim() ?? "";
 }
 
 function promptDeclaresReviewLevelOnePlanOnly(prompt: string): boolean {
-  return /^##\s+Review Level:\s*1\b[^\n]*\bPlan Only\b/im.test(prompt);
+  return listPlanHeadings(prompt).some((heading) => /^Review Level:\s*1\b.*\bPlan Only\b/i.test(heading.text));
 }
 
 function promptDeclaresNoSourceChangeIntent(prompt: string): boolean {

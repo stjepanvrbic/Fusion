@@ -12,6 +12,7 @@
  * already covered by rules 2 and 3.
  */
 import { extractFileScopeSection } from "./file-scope-classification.js";
+import { locatePlanSection } from "./original-description-region.js";
 
 export const FRONTEND_UX_PATH_GLOBS = [
   "packages/dashboard/**",
@@ -37,15 +38,16 @@ export const FRONTEND_UX_CRITERIA_SECTION = `## Frontend UX Criteria
 - [ ] **Visual hierarchy preserved** — new elements must not disrupt heading levels, content flow, or information architecture established in the surrounding page
 `;
 
-const FRONTEND_UX_HEADING = "## Frontend UX Criteria";
-
 /**
  * Pure deterministic injection helper. When `fileScopePaths` is omitted, the
  * helper parses `## File Scope` from the supplied prompt markdown using the same
  * section shape as the engine triage parser.
+ *
+ * FNXC:PlanSections 2026-10-11-17:08:
+ * Presence and the Mission anchor come from the shared plan-section locator. A criteria section quoted in the Original Description used to suppress insertion, and an insertion after a quoted Mission landed inside the region, where hygiene replaced it with the verbatim request.
  */
 export function applyFrontendUxCriteria(promptMarkdown: string, fileScopePaths?: string[]): string {
-  if (promptMarkdown.includes(FRONTEND_UX_HEADING)) {
+  if (locatePlanSection(promptMarkdown, "Frontend UX Criteria")) {
     return promptMarkdown;
   }
 
@@ -99,15 +101,13 @@ function normalizeFileScopeLine(line: string): string {
 }
 
 function insertFrontendUxCriteriaAfterMission(content: string): string {
-  const missionMatch = content.match(/^##\s+Mission\s*$/m);
-  if (!missionMatch || missionMatch.index === undefined) {
+  const mission = locatePlanSection(content, "Mission");
+  if (!mission) {
     return content;
   }
 
-  const headerEnd = missionMatch.index + missionMatch[0].length;
-  const rest = content.slice(headerEnd);
-  const nextHeading = rest.search(/\n##\s/);
-  const sectionEndAbsolute = nextHeading === -1 ? content.length : headerEnd + nextHeading;
+  // The next heading starts at sectionEnd; the newline before it stays with the following content.
+  const sectionEndAbsolute = mission.sectionEnd < content.length ? mission.sectionEnd - 1 : content.length;
   const before = content.slice(0, sectionEndAbsolute).trimEnd();
   const after = content.slice(sectionEndAbsolute);
   return `${before}\n\n${FRONTEND_UX_CRITERIA_SECTION}${after}`;

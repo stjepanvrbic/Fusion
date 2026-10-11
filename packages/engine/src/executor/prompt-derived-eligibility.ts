@@ -4,28 +4,22 @@
  * Complements no-commit-eligibility.ts (getNoCommitEligibilityReason).
  */
 import type { Task } from "@fusion/core";
-import { extractFileScopeSection } from "@fusion/core";
+import { extractFileScopeSection, extractPlanSection, listPlanHeadings } from "@fusion/core";
 
+/**
+ * FNXC:PlanSections 2026-10-11-17:08:
+ * Review Level and named sections come from the core plan-section locator: a level quoted in the Original Description never decides plan-only handling, and a level-three or unanchored "Review Level" mention no longer counts.
+ */
 export function parseReviewLevelFromPrompt(prompt: string): number {
-  const reviewMatch = prompt.match(/##\s*Review Level[:\s]*(\d)/);
-  return reviewMatch ? parseInt(reviewMatch[1], 10) : 0;
+  for (const heading of listPlanHeadings(prompt)) {
+    const reviewMatch = /^Review Level[:\s]*(\d)/.exec(heading.text);
+    if (reviewMatch) return parseInt(reviewMatch[1]!, 10);
+  }
+  return 0;
 }
 
 export function extractPromptSection(prompt: string, heading: string): string {
-  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const headingPattern = new RegExp(`^##\\s+${escaped}\\s*:?\\s*$`, "i");
-  const nextHeadingPattern = /^##\s+/;
-  const lines = prompt.split(/\r?\n/);
-  const start = lines.findIndex((line) => headingPattern.test(line.trim()));
-  if (start === -1) return "";
-
-  const sectionLines: string[] = [];
-  for (let i = start + 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (nextHeadingPattern.test(line.trim())) break;
-    sectionLines.push(line);
-  }
-  return sectionLines.join("\n").trim();
+  return (extractPlanSection(prompt, heading) ?? "").trim();
 }
 
 export function extractPromptListEntries(section: string): string[] {

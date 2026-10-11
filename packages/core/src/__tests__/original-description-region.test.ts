@@ -1,12 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  extractPlanSection,
+  extractPlanSectionWithHeading,
   findGeneratedOriginalDescriptionEnd,
+  listPlanHeadings,
   locateOriginalDescriptionRegion,
+  locatePlanSection,
   stripOriginalDescriptionSection,
 } from "../tasks/original-description-region.js";
+import { locateFileScopeSection } from "../tasks/file-scope-classification.js";
 import {
   ORIGINAL_DESCRIPTION_END_MARKER,
   ORIGINAL_DESCRIPTION_START_MARKER,
+  applyOriginalDescription,
   resolveOriginalDescriptionEnd,
   resolveOriginalDescriptionSection,
 } from "../tasks/original-description-policy.js";
@@ -236,5 +242,177 @@ describe("a start marker outside the positional slot", () => {
       end: prompt.indexOf("## What This Delivers"),
     });
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+/*
+FNXC:PlanSections 2026-10-11-17:08:
+A request that quotes any plan heading must never be read as plan structure once it sits in the Original Description region.
+Seed prompts keep their quoted headings as provisional plan content, and a region never promotes its content.
+*/
+describe("plan sections", () => {
+  const names = [
+    "Mission",
+    "Dependencies",
+    "Do NOT",
+    "Context to Read First",
+    "Completion Criteria",
+    "Steps",
+    "Git Commit Convention",
+    "External Integration Evidence",
+    "Declared Symbols",
+    "Frontend UX Criteria",
+    "Acceptance Criteria",
+    "Workflow Step Failure",
+  ] as const;
+  const decoy = (name: string): string => `DECOY quoted body for ${name}.`;
+  const planBody = (name: string): string => `\nPlan body for ${name}.\n\n`;
+
+  function request(name: string): string {
+    return ["The requester quotes an earlier plan.", "", `## ${name}`, "", decoy(name), ""].join("\n");
+  }
+
+  function plan(name: string, options: { include?: boolean; firstHeading?: string } = {}): string {
+    return [
+      "# Task: KB-1 - Example",
+      "",
+      options.firstHeading ?? "## What This Delivers\n\n- Value.",
+      "",
+      "## Review Level: 2 (Plan and Code)",
+      "",
+      ...(options.include === false ? [] : [`## ${name}`, `${planBody(name)}## Notes`]),
+      ...(options.include === false ? ["## Notes"] : []),
+      "",
+      "Trailer.",
+      "",
+    ].join("\n");
+  }
+
+  function stripMarkers(prompt: string): string {
+    return prompt
+      .replace(`${ORIGINAL_DESCRIPTION_START_MARKER}\n`, "")
+      .replace(`${ORIGINAL_DESCRIPTION_END_MARKER}\n`, "");
+  }
+
+  const shapes = {
+    marked: (name: string) => applyOriginalDescription(plan(name), request(name)),
+    unmarked: (name: string) => stripMarkers(applyOriginalDescription(plan(name), request(name))),
+    "unresolved marker with an end marker": (name: string) =>
+      applyOriginalDescription(plan(name, { firstHeading: "## Rollout Notes\n\nShip gradually." }), request(name)),
+    "unresolved marker without an end marker": (name: string) =>
+      applyOriginalDescription(plan(name), request(name)).replace(`${ORIGINAL_DESCRIPTION_END_MARKER}\n`, ""),
+  } as const;
+  const expectedKind = {
+    marked: "marked",
+    unmarked: "unmarked",
+    "unresolved marker with an end marker": "unresolved-marker",
+    "unresolved marker without an end marker": "unresolved-marker",
+  } as const;
+
+  const cases = (Object.keys(shapes) as (keyof typeof shapes)[]).flatMap((shape) =>
+    names.map((name) => [shape, name] as const),
+  );
+
+  it.each(cases)("%s region quoting %s: reads only the plan's section", (shape, name) => {
+    const prompt = shapes[shape](name);
+    expect(resolveOriginalDescriptionSection(prompt).kind).toBe(expectedKind[shape]);
+    expect(prompt.indexOf(decoy(name))).toBeGreaterThan(-1);
+    expect(prompt.indexOf(`## ${name}\n`)).toBeLessThan(prompt.lastIndexOf(`## ${name}\n`));
+
+    expect(extractPlanSection(prompt, name)).toBe(planBody(name));
+    expect(extractPlanSectionWithHeading(prompt, name)).toBe(`## ${name}\n${planBody(name)}`.trim());
+    expect(locatePlanSection(prompt, name)?.headingStart).toBe(prompt.lastIndexOf(`## ${name}\n`));
+  });
+
+  it.each(names)("keeps a seed prompt's quoted %s section as provisional plan content", (name) => {
+    const prompt = `# Task: KB-1 - Example\n\n${request(name)}`;
+    expect(locateOriginalDescriptionRegion(prompt)).toBeNull();
+    expect(extractPlanSection(prompt, name)).toBe(`\n${decoy(name)}\n`);
+  });
+
+  it.each(names)("never promotes a quoted %s section when the plan has none", (name) => {
+    const prompt = applyOriginalDescription(plan(name, { include: false }), request(name));
+    expect(prompt).toContain(decoy(name));
+    expect(locatePlanSection(prompt, name)).toBeNull();
+    expect(extractPlanSection(prompt, name)).toBeNull();
+    expect(extractPlanSectionWithHeading(prompt, name)).toBe("");
+  });
+
+  it("does not let an unbalanced fence in the request hide the plan's section", () => {
+    const quoted = ["Repro:", "", "```ts", "const broken = true;", "## Mission", "", decoy("Mission")].join("\n");
+    const prompt = applyOriginalDescription(plan("Mission"), quoted);
+    expect(extractPlanSection(prompt, "Mission")).toBe(planBody("Mission"));
+  });
+
+  it("ignores a heading inside a fenced sample outside the region", () => {
+    const sample = "```md\n## Mission\n\nFenced sample.\n```\n";
+    const withSample = plan("Mission").replace("## Review Level", `${sample}\n## Review Level`);
+    const prompt = applyOriginalDescription(withSample, "Operator request.");
+    expect(extractPlanSection(prompt, "Mission")).toBe(planBody("Mission"));
+    expect(locatePlanSection(prompt.replace(`## Mission\n${planBody("Mission")}`, ""), "Mission")).toBeNull();
+  });
+
+  it("reads the same section from a CRLF prompt", () => {
+    const prompt = shapes.marked("Steps").replaceAll("\n", "\r\n");
+    expect(extractPlanSection(prompt, "Steps")).toBe(planBody("Steps").replaceAll("\n", "\r\n"));
+    expect(listPlanHeadings(prompt).map((heading) => heading.text)).toEqual([
+      "What This Delivers",
+      "Review Level: 2 (Plan and Code)",
+      "Steps",
+      "Notes",
+    ]);
+  });
+
+  it("lists only out-of-region headings, in document order", () => {
+    const prompt = shapes.marked("Mission");
+    const headings = listPlanHeadings(prompt);
+    expect(headings.map((heading) => heading.text)).toEqual([
+      "What This Delivers",
+      "Review Level: 2 (Plan and Code)",
+      "Mission",
+      "Notes",
+    ]);
+    const region = locateOriginalDescriptionRegion(prompt)!;
+    for (const heading of headings) {
+      expect(heading.headingStart >= region.start && heading.headingStart < region.end).toBe(false);
+      expect(prompt.slice(heading.headingStart, heading.sectionStart)).toBe(`## ${heading.text}\n`);
+    }
+  });
+
+  it("uses one grammar: case-sensitive, collapsed whitespace, no colon or prefix variants", () => {
+    const prompt = [
+      "# T",
+      "",
+      "## mission",
+      "lowercase",
+      "## Mission:",
+      "colon",
+      "## Mission Lineage",
+      "prefix",
+      "##   Do \t NOT  ",
+      "spaced",
+      "##  File\tScope",
+      "- `a.ts`",
+      "",
+    ].join("\n");
+    expect(locatePlanSection(prompt, "Mission")).toBeNull();
+    expect(extractPlanSection(prompt, "Do NOT")).toBe("spaced\n");
+    expect(extractPlanSection(prompt, "File Scope")).toBe("- `a.ts`\n");
+    expect(locateFileScopeSection(prompt)).toEqual(locatePlanSection(prompt, "File Scope"));
+  });
+
+  it("ends a section at the next level-one or level-two heading, not at a level-three heading", () => {
+    const prompt = "## Steps\n\n### Step 0: Go\n\n- do\n\n# Appendix\n\nTail.\n";
+    expect(extractPlanSection(prompt, "Steps")).toBe("\n### Step 0: Go\n\n- do\n\n");
+  });
+
+  it("returns the first of duplicate plan headings outside the region", () => {
+    const prompt = "## Mission\n\nFirst.\n\n## Mission\n\nSecond.\n";
+    expect(extractPlanSection(prompt, "Mission")).toBe("\nFirst.\n\n");
+  });
+
+  it("finds nothing in an empty prompt", () => {
+    expect(listPlanHeadings("")).toEqual([]);
+    expect(extractPlanSection("", "Mission")).toBeNull();
   });
 });
