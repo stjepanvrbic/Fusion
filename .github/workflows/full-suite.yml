@@ -13,12 +13,14 @@ on:
   push:
     branches: [main]
 
-# Key the concurrency group by SHA, not ref: on push to main the ref is
-# always refs/heads/main, so a ref-keyed group with cancel-in-progress would
-# let consecutive merges cancel each other's runs — silently skipping the
-# only coverage for everything the gate dropped. Per-SHA groups never collide.
+# One run at a time on main. A run in progress is never cancelled; while it
+# runs, GitHub keeps only the newest pending run and cancels older pending ones.
+# Every landing is therefore covered by a completed run at or after its SHA,
+# which is the evidence post-merge verification asks for. A per-SHA group ran
+# the whole suite for every landing: about 100 runs of some 20 jobs on a busy
+# day, after which Actions stopped running on the repository.
 concurrency:
-  group: full-suite-${{ github.sha }}
+  group: full-suite-main
   cancel-in-progress: false
 
 # Least-privilege token: jobs only read the repo (checkout + cache) and upload
