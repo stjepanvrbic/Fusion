@@ -679,6 +679,11 @@ export default defineConfig({
         __dirname,
         "../../plugins/fusion-plugin-antigravity-runtime/src/index.ts",
       ),
+      // FNXC:DashboardTests 2026-10-11-16:16: The /probe key must precede the root key below; string aliases match by prefix, so the root key would rewrite it to `probes-entry.ts/probe`.
+      "@fusion-plugin-examples/claude-runtime/probe": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-claude-runtime/src/probe.ts",
+      ),
       /*
       FNXC:DashboardTests 2026-07-18-09:45:
       Alias Claude runtime to probes-entry (probe + model discovery only), not the full
@@ -688,10 +693,6 @@ export default defineConfig({
       "@fusion-plugin-examples/claude-runtime": resolve(
         __dirname,
         "../../plugins/fusion-plugin-claude-runtime/src/probes-entry.ts",
-      ),
-      "@fusion-plugin-examples/claude-runtime/probe": resolve(
-        __dirname,
-        "../../plugins/fusion-plugin-claude-runtime/src/probe.ts",
       ),
       /*
       FNXC:OmpAcp 2026-07-11-23:35:

@@ -24,6 +24,25 @@ const fusionAliases = {
   "@fusion/core": resolve(__dirname, "../core/src/index.ts"),
   "@fusion/dashboard": resolve(__dirname, "../dashboard/src/index.ts"),
   "@fusion/engine": resolve(__dirname, "../engine/src/index.ts"),
+  "@fusion/plugin-sdk": resolve(__dirname, "../plugin-sdk/src/index.ts"),
+  /*
+  FNXC:VitestAliases 2026-10-11-16:16:
+  `@fusion/dashboard` is aliased to source and statically imports these plugin entries; the plugin sources import `@fusion/plugin-sdk` (aliased above).
+  Their export maps all point at dist/, which a fresh checkout does not have, so a direct `vitest run` of a dashboard-loading test would fail to resolve them.
+  String aliases match by prefix, so a subpath key must stay above its package root key.
+  */
+  "@fusion-plugin-examples/droid-runtime/probe": resolve(__dirname, "../../plugins/fusion-plugin-droid-runtime/src/probe.ts"),
+  "@fusion-plugin-examples/hermes-runtime": resolve(__dirname, "../../plugins/fusion-plugin-hermes-runtime/src/index.ts"),
+  "@fusion-plugin-examples/openclaw-runtime": resolve(__dirname, "../../plugins/fusion-plugin-openclaw-runtime/src/index.ts"),
+  "@fusion-plugin-examples/paperclip-runtime": resolve(__dirname, "../../plugins/fusion-plugin-paperclip-runtime/src/index.ts"),
+  "@fusion-plugin-examples/cursor-runtime": resolve(__dirname, "../../plugins/fusion-plugin-cursor-runtime/src/index.ts"),
+  "@fusion-plugin-examples/antigravity-runtime": resolve(__dirname, "../../plugins/fusion-plugin-antigravity-runtime/src/index.ts"),
+  "@fusion-plugin-examples/grok-runtime": resolve(__dirname, "../../plugins/fusion-plugin-grok-runtime/src/index.ts"),
+  // Probe and model discovery only, as in the dashboard lane: the full adapter pulls the ACP SDK.
+  "@fusion-plugin-examples/claude-runtime": resolve(__dirname, "../../plugins/fusion-plugin-claude-runtime/src/probes-entry.ts"),
+  "@fusion-plugin-examples/omp-runtime": resolve(__dirname, "../../plugins/fusion-plugin-omp-runtime/src/index.ts"),
+  "@fusion-plugin-examples/roadmap/roadmap-suggestions": resolve(__dirname, "../../plugins/fusion-plugin-roadmap/src/roadmap-suggestions.ts"),
+  "@fusion-plugin-examples/roadmap": resolve(__dirname, "../../plugins/fusion-plugin-roadmap/src/index.ts"),
 };
 
 export default defineConfig({

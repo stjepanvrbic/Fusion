@@ -107,4 +107,21 @@ describe("FN-3298 regression: dashboard vitest runtime plugins resolve from sour
       expect(existsSync(target ?? ""), specifier).toBe(true);
     }
   });
+
+  // FNXC:DashboardTests 2026-10-11-16:16: String aliases match by prefix in key order, so a subpath key listed after its package root is rewritten to a path below a file.
+  it("resolves every alias key to its own existing target", () => {
+    const aliases = vitestConfig.resolve?.alias;
+    expect(aliases && !Array.isArray(aliases) && typeof aliases === "object").toBe(true);
+    const entries = Object.entries((aliases ?? {}) as Record<string, unknown>);
+    expect(entries.length).toBeGreaterThan(0);
+
+    const offenders: string[] = [];
+    for (const [key, target] of entries) {
+      const winner = entries.find(([candidate]) => key === candidate || key.startsWith(`${candidate}/`))?.[0];
+      if (typeof target !== "string") offenders.push(`${key} (non-string target)`);
+      else if (winner !== key) offenders.push(`${key} (shadowed by ${winner})`);
+      else if (!existsSync(target)) offenders.push(`${key} -> ${target} (missing)`);
+    }
+    expect(offenders).toEqual([]);
+  });
 });
