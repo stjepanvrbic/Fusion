@@ -1735,6 +1735,42 @@ Planner rewrote mission without the raw request.
     }
   });
 
+  it("wraps the original-description task document, not the plan-shaped task description, on finalize", async () => {
+    const operatorRequest = "Operator request kept apart from plan.md.";
+    const task = createTriageTask({
+      id: "FN-ORIG-DOC",
+      title: "Planning Mode task",
+      description: "# Planning Mode task\n\nPlan summary, not the operator request.\n\n## Size\nM\n\n## Suggested dependencies\n_None_\n\n## Key deliverables\n- One\n",
+      status: "planning",
+    });
+    const tempRoot = await mkdtemp(join(tmpdir(), "fusion-orig-doc-"));
+    try {
+      const taskDir = join(tempRoot, ".fusion", "tasks", task.id);
+      await mkdir(taskDir, { recursive: true });
+      const plannerWritten = `# Task: ${task.id} - Planning Mode task\n\n**Created:** 2026-10-11\n**Size:** M\n\n## Original Description\n\nPlanner paraphrase.\n\n## Mission\n\nDo the work.\n\n## Steps\n\n### Step 0: Implement\n\n- [ ] Do the work\n`;
+      await writeFile(join(taskDir, "PROMPT.md"), plannerWritten, "utf-8");
+      const getTaskDocument = vi.fn(async (_taskId: string, key: string) => key === "original-description"
+        ? { content: `  ${operatorRequest}\n` }
+        : null);
+      const localStore = createMockStore({
+        getTask: vi.fn().mockResolvedValue(task),
+        getTaskDocument: getTaskDocument as unknown as TaskStore["getTaskDocument"],
+      });
+      const localProcessor = new TriageProcessor(localStore, tempRoot);
+
+      await (localProcessor as unknown as {
+        finalizeApprovedTask(task: Task, writtenInput: string, settings: Settings): Promise<void>;
+      }).finalizeApprovedTask(task, plannerWritten, { requirePlanApproval: false } as Settings);
+
+      const onDisk = readFileSync(join(taskDir, "PROMPT.md"), "utf-8");
+      expect(onDisk).toContain(`## Original Description\n\n<!-- fusion-original-description:start -->\n${operatorRequest}\n<!-- fusion-original-description:end -->\n\n## Mission`);
+      expect(onDisk).not.toContain("Planner paraphrase.");
+      expect(onDisk).not.toContain("Plan summary, not the operator request.");
+    } finally {
+      await cleanupTriageFixtureRoot(tempRoot);
+    }
+  });
+
   it("does not release planning to todo when the authoritative PROMPT.md disappears before transition", async () => {
     const task = createTriageTask({ id: "FN-MISSING-RELEASE", status: "planning", recoveryRetryCount: 0 });
     const tempRoot = await mkdtemp(join(tmpdir(), "fusion-missing-release-"));

@@ -191,6 +191,29 @@ describe("plan artifact write-back", () => {
     await expect(readFile(join(rootDir, relativePromptPath(TASK_ID)), "utf-8")).resolves.toBe(REAL_SPEC);
   });
 
+  it("returns and mirrors the stored content when the store wraps an unmarked Original Description section", async () => {
+    const operator = "Operator request.\n\n## File Scope\n- operator/path.ts";
+    const planner = "## What This Delivers\n\n- Value.\n\n## Mission\n\nDo the thing.\n";
+    const worktreeCopy = `# Task: FN-9001 - Real spec\n\n## Original Description\n\n${operator}\n\n${planner}`;
+    const stored = `# Task: FN-9001 - Real spec\n\n## Original Description\n\n<!-- fusion-original-description:start -->\n${operator}\n<!-- fusion-original-description:end -->\n\n${planner}`;
+    store.updateTask.mockImplementation(async (id: string) => {
+      await writeSpec(rootDir, id, stored);
+    });
+    await writeSpec(worktreeDir, TASK_ID, worktreeCopy);
+
+    const result = await persistPlanArtifact({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      store: store as any,
+      taskId: TASK_ID,
+      rootDir,
+      planningCwd: worktreeDir,
+    });
+
+    expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, { prompt: worktreeCopy });
+    expect(result).toMatchObject({ outcome: "recovered", content: stored, mirrored: true });
+    expect(store.documents.get(`${TASK_ID}:${PLAN_DOCUMENT_KEY}`)).toBe(stored);
+  });
+
   it("skips redundant document revisions when the mirrored plan is unchanged", async () => {
     await expect(mirrorPlanToProjectDb(store as never, TASK_ID, REAL_SPEC)).resolves.toBe(true);
     await expect(mirrorPlanToProjectDb(store as never, TASK_ID, REAL_SPEC)).resolves.toBe(false);

@@ -125,7 +125,14 @@ export async function reconcileWorktreePlanArtifact(
     logger?.log?.(
       `${taskId}: recovered a worktree-local PROMPT.md into the project .fusion folder (${planningCwd})`,
     );
-    return { outcome: "recovered", content: worktreeContent };
+    /*
+    FNXC:OriginalDescriptionInPrompt 2026-10-11-10:09:
+    The store wraps an Original Description section in its marker envelope, so the authoritative
+    root copy can differ from the worktree copy that was submitted. Callers mirror and finalize the
+    returned content, which must therefore be what was stored.
+    */
+    const storedContent = await readIfPresent(join(rootDir, relPath));
+    return { outcome: "recovered", content: storedContent ?? worktreeContent };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger?.warn?.(

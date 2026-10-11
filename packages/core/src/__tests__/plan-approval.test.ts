@@ -196,6 +196,38 @@ describe("computePlanApprovalFingerprint", () => {
     );
   });
 
+  describe("across stored Original Description shapes", () => {
+    const plannerText = "# Task: FN-1\n\n**Created:** 2026-10-11\n**Size:** M\n\n## What This Delivers\n\n- Deliver the interface.\n\n## Mission\n\nBuild the interface.\n\n## File Scope\n\n- src/page.tsx\n";
+    const unmarked = (plan: string, sectionBody: string): string => plan.replace(
+      "## What This Delivers",
+      `## Original Description\n\n${sectionBody}\n\n## What This Delivers`,
+    );
+    const shapes: Array<[string, (plan: string, operatorBody: string) => string]> = [
+      ["bare unmarked", (plan, body) => unmarked(plan, body)],
+      ["fenced unmarked", (plan, body) => unmarked(plan, `\`\`\`text\n${body}\n\`\`\``)],
+      ["marked", (plan, body) => applyOriginalDescription(plan, body)],
+    ];
+    const bodies = [
+      "Operator request.",
+      "Operator request.\n\n## File Scope\n\n- operator/path.ts\n\n## Mission\n\nOperator prose.\n\n## Steps\n\n1. Operator step",
+      "",
+    ];
+
+    it.each(shapes)("gives a %s section the fingerprint of the plan without the section, for any body", (_shape, build) => {
+      for (const body of bodies) {
+        expect(computePlanApprovalFingerprint(build(plannerText, body))).toBe(computePlanApprovalFingerprint(plannerText));
+      }
+    });
+
+    it.each(shapes)("still changes when File Scope outside a %s section changes", (_shape, build) => {
+      const changedPlan = plannerText.replace("- src/page.tsx", "- src/page.tsx\n- src/other.tsx");
+
+      expect(computePlanApprovalFingerprint(build(changedPlan, bodies[1]))).not.toBe(
+        computePlanApprovalFingerprint(build(plannerText, bodies[1])),
+      );
+    });
+  });
+
   it("differs when the operator-authored plan content actually changes", () => {
     const original = "# Task: FN-1\n\n## File Scope\n\n- a.ts\n";
     const changed = "# Task: FN-1\n\n## File Scope\n\n- a.ts\n- b.ts\n";

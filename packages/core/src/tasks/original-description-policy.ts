@@ -37,7 +37,20 @@ tiebreak; (4) no selected heading runs to end-of-document. Heading-title evidenc
 custom heading can also appear in operator prose and title skipping would destroy that section. Empty
 operator text has no embedded-H2 risk, so it bypasses the allowlist. INSERT has no body to align and
 therefore changed from allowlist-preferred placement to anchoring before the first document H2.
+
+FNXC:OriginalDescriptionInPrompt 2026-10-11-10:00:
+An unknown operator body is a distinct case from a known empty one. Readers that feed persisted
+hashes (spec lock, approval fingerprint) cannot know the operator text, and an unmarked body may
+quote any H2, so for them rule (1) would end the section at the first quoted heading and count the
+rest of the operator prose as planner structure. Precedence for an unmarked section therefore starts
+with: (0) an unknown body (`undefined`) skips alignment and uses the allowlist-priority tiebreak of
+(3), then the first H2, then end-of-document. Rules (1) to (4) apply to a known body only. Residual:
+with the body unknown, operator prose that quotes the top-priority terminator still ends the section
+early, and a custom H2 placed before the first allowlisted heading is read as part of the section.
+The marker envelope is the only exact boundary, so every stored section must carry it.
 */
+
+import { parsePlanningPlanMd } from "../planner/planning-plan-md.js";
 
 export const ORIGINAL_DESCRIPTION_HEADING = "## Original Description";
 
@@ -154,6 +167,23 @@ export const PREFERRED_SECTION_TERMINATORS: readonly RegExp[] = [
   /^##\s+Notifications\s*$/im,
   /^##\s+External Integration Evidence\s*$/im,
 ];
+
+/**
+ * FNXC:OriginalDescriptionInPrompt 2026-10-11-10:09:
+ * Every writer of the section must wrap the same operator text, or two writers would keep
+ * replacing each other's body. Precedence: the `original-description` task document (Planning
+ * Mode keeps the operator request there, apart from plan.md), then the description carried inside
+ * a plan-shaped task description, then the task description itself.
+ */
+export function resolveOperatorDescription(
+  originalDescriptionDocument: string | null | undefined,
+  taskDescription: string | null | undefined,
+): string {
+  return originalDescriptionDocument?.trim()
+    || parsePlanningPlanMd(taskDescription ?? "")?.description
+    || taskDescription
+    || "";
+}
 
 /**
  * Build the `## Original Description` section body (heading + marked verbatim text).
@@ -276,17 +306,31 @@ export function resolveOriginalDescriptionEnd(
   return { resolved: false, end: -1, skippedCandidateCount, rejectedSuccessorHeading };
 }
 
+/** Where the Original Description section sits in a prompt, for every stored shape. */
+export type OriginalDescriptionSection =
+  | { kind: "absent" }
+  | { kind: "marked"; sectionStart: number; sectionEnd: number; body: string; skippedCandidateCount: number }
+  | { kind: "unresolved-marker"; sectionStart: number; skippedCandidateCount: number; rejectedSuccessorHeading?: string }
+  | { kind: "unmarked"; sectionStart: number; sectionEnd: number; body: string };
+
 /**
- * Absolute [start, end) range of the Original Description section and its body text.
- * Prefer HTML markers; otherwise align the known operator body before using legacy structure.
+ * FNXC:SpecLock 2026-10-11-10:00:
+ * One resolver decides the section boundary for the writer (hygiene, which knows the operator
+ * body) and for the readers behind the spec lock and the approval fingerprint (which do not).
+ * A reader that only understood the marker envelope let operator-quoted headings in an unmarked
+ * section count as planner structure and made an approved plan unlockable. `operatorBody` is the
+ * verbatim operator text when known; `undefined` means unknown, not empty.
+ *
+ * Absolute [sectionStart, sectionEnd) range plus the raw body. Prefer HTML markers; otherwise
+ * align the known operator body before using legacy structure.
  */
-function findOriginalDescriptionRange(
+export function resolveOriginalDescriptionSection(
   content: string,
-  originalDescription?: string,
-): { sectionStart: number; sectionEnd: number; body: string } | null {
+  operatorBody?: string,
+): OriginalDescriptionSection {
   const match = content.match(/^##\s+Original Description\s*$/m);
   if (!match || match.index === undefined) {
-    return null;
+    return { kind: "absent" };
   }
 
   const sectionStart = match.index;
@@ -304,27 +348,43 @@ function findOriginalDescriptionRange(
     past it could mistake a marker quote in planner prose for the region end and delete that prose.
     The writer remains silent because matching and conservative replacement are not read ambiguity.
     */
-    const expectedResolution = resolveOriginalDescriptionEnd(content, bodyStart, originalDescription);
-    const resolution = expectedResolution.resolved
+    const expectedResolution = resolveOriginalDescriptionEnd(content, bodyStart, operatorBody);
+    const resolution = expectedResolution.resolved || operatorBody === undefined
       ? expectedResolution
       : resolveOriginalDescriptionEnd(content, bodyStart);
-    if (!resolution.resolved) return null;
+    if (!resolution.resolved) {
+      return {
+        kind: "unresolved-marker",
+        sectionStart,
+        skippedCandidateCount: resolution.skippedCandidateCount,
+        rejectedSuccessorHeading: resolution.rejectedSuccessorHeading,
+      };
+    }
     const body = content.slice(bodyStart, resolution.end);
     const sectionEnd = resolution.end + ORIGINAL_DESCRIPTION_END_MARKER.length;
     // Consume a single trailing newline after the end marker when present.
     const absoluteEnd = content[sectionEnd] === "\n" ? sectionEnd + 1 : sectionEnd;
-    return { sectionStart, sectionEnd: absoluteEnd, body };
+    return { kind: "marked", sectionStart, sectionEnd: absoluteEnd, body, skippedCandidateCount: resolution.skippedCandidateCount };
   }
 
   // Unmarked planner output: preserve arbitrary custom H2 sections after the aligned body.
-  const terminatorOffset = findUnmarkedSectionTerminatorOffset(afterHeader, originalDescription);
+  const terminatorOffset = findUnmarkedSectionTerminatorOffset(afterHeader, operatorBody);
   const sectionEnd =
     terminatorOffset === -1 ? content.length : headerEnd + terminatorOffset;
   const body = afterHeader
     .slice(0, terminatorOffset === -1 ? undefined : terminatorOffset)
     .replace(/^\n+/, "")
     .trimEnd();
-  return { sectionStart, sectionEnd, body };
+  return { kind: "unmarked", sectionStart, sectionEnd, body };
+}
+
+/** The section range when its boundary is decided; an unresolved marker has none. */
+function findOriginalDescriptionRange(
+  content: string,
+  operatorBody?: string,
+): { sectionStart: number; sectionEnd: number; body: string } | null {
+  const section = resolveOriginalDescriptionSection(content, operatorBody);
+  return section.kind === "marked" || section.kind === "unmarked" ? section : null;
 }
 
 /**
@@ -389,37 +449,40 @@ function findFirstH2AtOrAfter(text: string, offset: number): number {
 
 /**
  * Find an unmarked section boundary using the operator body before legacy heading tiebreaks.
+ * An unknown body (`undefined`) has nothing to align and goes straight to the tiebreak.
  */
 function findUnmarkedSectionTerminatorOffset(
   text: string,
-  originalDescription?: string,
+  operatorBody?: string,
 ): number {
-  const descriptionLines = normalizeLines(originalDescription ?? "");
-  if (descriptionLines.length === 0) {
-    return findFirstH2AtOrAfter(text, 0);
+  if (operatorBody !== undefined) {
+    const descriptionLines = normalizeLines(operatorBody);
+    if (descriptionLines.length === 0) {
+      return findFirstH2AtOrAfter(text, 0);
+    }
+
+    const documentLines = normalizeLines(text);
+    let matched = 0;
+    while (
+      matched < descriptionLines.length &&
+      matched < documentLines.length &&
+      descriptionLines[matched].value === documentLines[matched].value
+    ) {
+      matched += 1;
+    }
+
+    const unmatchedDescriptionHasH2 = descriptionLines
+      .slice(matched)
+      .some((line) => isH2Heading(line.value));
+    const alignmentIsSafe = matched === descriptionLines.length ||
+      (matched > 0 && !unmatchedDescriptionHasH2);
+    if (alignmentIsSafe) {
+      const alignEnd = documentLines[matched - 1].endOffset;
+      return findFirstH2AtOrAfter(text, alignEnd);
+    }
   }
 
-  const documentLines = normalizeLines(text);
-  let matched = 0;
-  while (
-    matched < descriptionLines.length &&
-    matched < documentLines.length &&
-    descriptionLines[matched].value === documentLines[matched].value
-  ) {
-    matched += 1;
-  }
-
-  const unmatchedDescriptionHasH2 = descriptionLines
-    .slice(matched)
-    .some((line) => isH2Heading(line.value));
-  const alignmentIsSafe = matched === descriptionLines.length ||
-    (matched > 0 && !unmatchedDescriptionHasH2);
-  if (alignmentIsSafe) {
-    const alignEnd = documentLines[matched - 1].endOffset;
-    return findFirstH2AtOrAfter(text, alignEnd);
-  }
-
-  // Preserve historical allowlist-priority behavior only when alignment cannot prove a boundary.
+  // Allowlist priority applies when the body is unknown or alignment cannot prove a boundary.
   const preferredOffset = findPreferredSectionTerminatorOffset(text);
   return preferredOffset !== -1 ? preferredOffset : findFirstH2AtOrAfter(text, 0);
 }

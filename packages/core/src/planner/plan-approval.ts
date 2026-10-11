@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { stripGeneratedOriginalDescription } from "../tasks/original-description-region.js";
+import { stripOriginalDescriptionSection } from "../tasks/original-description-region.js";
 import { FRONTEND_UX_CRITERIA_SECTION } from "../tasks/frontend-ux-policy.js";
 import type { ProjectSettings, Task } from "../types.js";
 import type { WorkflowStepResult } from "../types/workflow/workflow-steps.js";
@@ -99,6 +99,13 @@ export function buildPreservedPlanRespecifyPatch(
  * may compare its pre-injection text. Keeping normalization here makes every producer and
  * consumer agree without treating an operator-authored Mission, Steps, or File Scope change
  * as unchanged.
+ *
+ * FNXC:PlanApproval 2026-10-11-10:00:
+ * The Original Description section is ignored in every stored shape, with or without its marker
+ * envelope, so the fingerprint and the spec lock always describe the same planner-authored text.
+ * Consequence: the fingerprint of a spec stored with an unmarked section differs from the one
+ * computed before this rule, so under manual approval such a spec is asked for approval once more
+ * when it is re-specified. Fingerprints of marked specs are unchanged.
  */
 export function computePlanApprovalFingerprint(promptText: string): string {
   const normalized = normalizePlanApprovalPrompt(promptText)
@@ -109,9 +116,9 @@ export function computePlanApprovalFingerprint(promptText: string): string {
   return createHash("sha256").update(normalized, "utf8").digest("hex");
 }
 
-/** Remove only the exact deterministic sections injected during specification hygiene. */
+/** Remove the operator's Original Description section and the injected Frontend UX hygiene section. */
 function normalizePlanApprovalPrompt(promptText: string): string {
-  return stripInjectedFrontendUxCriteria(stripGeneratedOriginalDescription(promptText));
+  return stripInjectedFrontendUxCriteria(stripOriginalDescriptionSection(promptText));
 }
 
 function stripInjectedFrontendUxCriteria(promptText: string): string {

@@ -1,9 +1,8 @@
 import { createLogger } from "../process/logger.js";
 import {
-  ORIGINAL_DESCRIPTION_END_MARKER,
-  ORIGINAL_DESCRIPTION_HEADING,
   ORIGINAL_DESCRIPTION_START_MARKER,
   resolveOriginalDescriptionEnd,
+  resolveOriginalDescriptionSection,
 } from "./original-description-policy.js";
 
 /**
@@ -31,33 +30,35 @@ export function findGeneratedOriginalDescriptionEnd(promptText: string, start: n
   return result.resolved ? result.end : -1;
 }
 
-/** Remove only the exact deterministic Original Description section injected during specification hygiene. */
-export function stripGeneratedOriginalDescription(promptText: string): string {
-  const start = promptText.indexOf(ORIGINAL_DESCRIPTION_START_MARKER);
-  if (start === -1) return promptText;
-  const result = resolveOriginalDescriptionEnd(
-    promptText,
-    start + ORIGINAL_DESCRIPTION_START_MARKER.length,
-  );
-  // The read path alone reports ambiguity: unresolved takes precedence over skipped candidates.
-  if (!result.resolved) {
+/**
+ * FNXC:SpecLock 2026-10-11-10:00:
+ * The spec lock and the approval fingerprint describe the planner-authored plan only, so operator
+ * prose under `## Original Description` must never reach them, whichever way the section was
+ * stored. An unmarked section (a prompt written without the hygiene envelope) used to pass through
+ * untouched: a heading the operator quoted there was counted next to the planner's own and an
+ * approved plan could never be locked. The boundary comes from the resolver the writer uses, with
+ * the operator body unknown, because both results are persisted hashes of the prompt text alone.
+ *
+ * Only an ambiguous marker region is reported: a start marker with no acceptable end marker
+ * leaves the prompt unchanged, and unresolved takes precedence over skipped candidates. An absent
+ * or unmarked section is an ordinary shape and never warns.
+ */
+export function stripOriginalDescriptionSection(promptText: string): string {
+  const section = resolveOriginalDescriptionSection(promptText);
+  if (section.kind === "absent") return promptText;
+  if (section.kind === "unresolved-marker") {
     createLogger("original-description-region").warn(
-      `Generated Original Description start marker has no acceptable end marker; successor heading: ${result.rejectedSuccessorHeading ?? "(no following H2 heading)"}; skipped candidates: ${result.skippedCandidateCount}`,
+      `Generated Original Description start marker has no acceptable end marker; successor heading: ${section.rejectedSuccessorHeading ?? "(no following H2 heading)"}; skipped candidates: ${section.skippedCandidateCount}`,
     );
     return promptText;
   }
-  if (result.skippedCandidateCount > 0) {
+  if (section.kind === "marked" && section.skippedCandidateCount > 0) {
     createLogger("original-description-region").warn(
-      `Generated Original Description skipped candidates before a resolved end marker: ${result.skippedCandidateCount}`,
+      `Generated Original Description skipped candidates before a resolved end marker: ${section.skippedCandidateCount}`,
     );
   }
-  const end = result.end;
 
-  const heading = promptText.lastIndexOf(ORIGINAL_DESCRIPTION_HEADING, start);
-  if (heading === -1) return promptText;
-
-  const sectionEnd = end + ORIGINAL_DESCRIPTION_END_MARKER.length;
-  const before = promptText.slice(0, heading).trimEnd();
-  const after = promptText.slice(sectionEnd).replace(/^\n+/, "");
+  const before = promptText.slice(0, section.sectionStart).trimEnd();
+  const after = promptText.slice(section.sectionEnd).replace(/^\n+/, "");
   return after ? `${before}\n\n${after}` : `${before}\n`;
 }

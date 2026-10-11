@@ -34,6 +34,14 @@ byte with the requested content. Missing, empty, changed, or unreadable
 read-backs remain errors. Mirroring the verified plan to the project database
 continues to be best-effort and occurs only afterwards.
 
+Update 2026-10-11: the store's prompt write now wraps an existing
+`## Original Description` section in its marker envelope, so the stored
+`PROMPT.md` can differ from the requested content. The comparison target is the
+content the store reports it wrote (the requested content when the store changed
+nothing), still read back through `store.getTask(taskId)` and still byte for
+byte. The mirror stores that same content. See
+`spec-lock-unmarked-original-description-wedge.md`.
+
 ## Rule
 
 A mutation return value is not a read-back when the mutated field lives outside

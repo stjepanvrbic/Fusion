@@ -27,10 +27,10 @@ import {validateNodeOverrideChange, resolveNodeOverrideLanes} from "../mesh/node
 import {shouldInvalidateEffectiveRoute} from "../mesh/effective-route-invalidation.js";
 import {isTaskTerminalNodeIdAsync} from "../workflows/workflow-ir-resolver.js";
 import {extractTaskIdTokens, normalizeTitleForTaskId} from "../tasks/task-title-id-drift.js";
-import {buildBootstrapPrompt} from "../mesh/mesh-task-replication.js";
+import {buildBootstrapPrompt, isUnplannedSeedPrompt} from "../mesh/mesh-task-replication.js";
 import {validateFileScopeInPromptContent} from "../task-store/file-scope.js";
 import {__setTaskActivityLogLimitsForTesting, isBootstrapPromptStub, rewriteHeadingLine} from "../task-store/comments.js";
-import {applyOriginalDescription} from "../tasks/original-description-policy.js";
+import {applyOriginalDescription, resolveOperatorDescription, resolveOriginalDescriptionSection} from "../tasks/original-description-policy.js";
 import {normalizeTaskReviewState} from "../task-store/review-state.js";
 import {hasOwnDeclaredSymbols, normalizeDeclaredSymbols, extractDeclaredSymbolsFromPrompt, resolveTaskSymbolsForTask} from "../tasks/task-symbol-resolution.js";
 import {assertValidProviderInstanceId} from "../provider-instance.js";
@@ -147,6 +147,27 @@ const PROMPT_DERIVED_SYMBOLS_PERSIST_ATTEMPTS = 3;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * FNXC:OriginalDescriptionInPrompt 2026-10-11-10:09:
+ * A stored `## Original Description` section always carries the marker envelope around the verbatim
+ * operator text, whichever agent or route wrote the prompt. Only triage finalization used to add
+ * it, so a Plan Review inline repair or an interrupted planning session stored the section bare,
+ * and a heading the operator had quoted there then read as planner structure. This is the single
+ * validated prompt write, so the invariant is enforced here.
+ *
+ * It never inserts a missing section (finalization owns that) and leaves bootstrap and refinement
+ * seed prompts byte-identical, because seed detection compares their exact content.
+ *
+ * The document read takes no task or planning lifecycle lock (the caller may hold both) and is
+ * best effort: without it the task description is the operator text.
+ */
+async function withOriginalDescriptionEnvelope(store: TaskStore, task: Task, content: string): Promise<string> {
+  if (isUnplannedSeedPrompt(content, task.id, task.title, task.description)) return content;
+  if (resolveOriginalDescriptionSection(content).kind === "absent") return content;
+  const document = await store.getTaskDocument(task.id, "original-description").catch(() => null);
+  return applyOriginalDescription(content, resolveOperatorDescription(document?.content, task.description));
 }
 
 async function persistPromptDerivedDeclaredSymbols(
@@ -1312,8 +1333,11 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
       while the old durable scope is still visible to review, completion, or land readers.
       */
       const promptPath = join(dir, "PROMPT.md");
-      if (updates.prompt !== undefined) {
-        const validation = validateFileScopeInPromptContent(updates.prompt);
+      const storedPrompt = updates.prompt === undefined
+        ? undefined
+        : await withOriginalDescriptionEnvelope(store, task, updates.prompt);
+      if (storedPrompt !== undefined) {
+        const validation = validateFileScopeInPromptContent(storedPrompt);
         if (validation.invalid.length > 0) {
           throw new InvalidFileScopeError(id, validation.invalid);
         }
@@ -1365,11 +1389,11 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
       so no reader can dispatch work from a new heading paired with the preceding scope generation.
       */
       let previousPromptContents: string | null = null;
-      if (updates.prompt !== undefined) {
+      if (storedPrompt !== undefined) {
         if (persistPromptDerivedSymbols && existsSync(promptPath)) {
           previousPromptContents = await readFile(promptPath, "utf-8");
         }
-        await writePromptFileAtomic(promptPath, updates.prompt);
+        await writePromptFileAtomic(promptPath, storedPrompt);
         /*
         FNXC:PromptReadBack 2026-09-04-05:45:
         The PG tasks row has no prompt column, so the row re-read never hydrates task.prompt.
@@ -1377,14 +1401,14 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
         an unwritten revision through the in-memory task, watcher cache, or fallback hydration.
         The prompt-write tool's read-back check still verifies against this returned value.
         */
-        task.prompt = updates.prompt;
+        task.prompt = storedPrompt;
         if (persistPromptDerivedSymbols) {
-          const normalized = normalizeDeclaredSymbols(extractDeclaredSymbolsFromPrompt(updates.prompt));
+          const normalized = normalizeDeclaredSymbols(extractDeclaredSymbolsFromPrompt(storedPrompt));
           task.declaredSymbols = normalized.length ? normalized : undefined;
         }
       }
 
-      if (persistPromptDerivedSymbols && updates.prompt !== undefined) {
+      if (persistPromptDerivedSymbols && storedPrompt !== undefined) {
         const prior = JSON.stringify(priorDeclaredSymbols ?? []);
         const next = JSON.stringify(task.declaredSymbols ?? []);
         if (prior !== next) {
@@ -1399,7 +1423,7 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
         }
       }
 
-      if (store.isBackendMode() && updates.prompt !== undefined) {
+      if (store.isBackendMode() && storedPrompt !== undefined) {
         /*
         FNXC:SpecLock 2026-09-04-05:45:
         Append current-plan evidence after PROMPT.md reaches disk. A PlanEvidenceAppendError or
@@ -1408,7 +1432,7 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
         and row in one success boundary and lets that repair path run.
         */
         try {
-          await store.captureCurrentPlanEvidenceWhilePlanningLocked(task.id, updates.prompt, Date.now(), task);
+          await store.captureCurrentPlanEvidenceWhilePlanningLocked(task.id, storedPrompt, Date.now(), task);
         } catch (error) {
           storeLog.warn(`[spec-lock] deferred current-plan evidence capture for ${id}: ${error instanceof Error ? error.message : String(error)}`);
         }

@@ -75,6 +75,47 @@ describe("planning prompt-write surfaces", () => {
     expect(getText(await runTool(createTriagePromptWriteTool(store, TASK_ID)))).toBe(`Updated PROMPT.md for ${TASK_ID}.`);
   });
 
+  /*
+  FNXC:OriginalDescriptionInPrompt 2026-10-11-10:09:
+  The store wraps an unmarked Original Description section, so on every surface the stored PROMPT.md
+  can differ from the submitted text. Each surface must confirm against what was stored, and must
+  still reject when the artifact on disk is not that content.
+  */
+  describe("when the store wraps an unmarked Original Description section", () => {
+    const planner = "## What This Delivers\n\n- Value.\n\n## Mission\n\nBuild it.\n";
+    const operator = "Operator request.\n\n## Mission\n\nOperator prose.";
+    const submitted = `# Task\n\n## Original Description\n\n${operator}\n\n${planner}`;
+    const stored = `# Task\n\n## Original Description\n\n<!-- fusion-original-description:start -->\n${operator}\n<!-- fusion-original-description:end -->\n\n${planner}`;
+    const surfaces: Array<[string, (store: TaskStore) => { execute: (...args: any[]) => Promise<any> }]> = [
+      ["triage and replanning", (store) => createTriagePromptWriteTool(store, TASK_ID)],
+      ["Plan Review repair", (store) => createPlanReviewPromptWriteTool({ store, getRunContextFor: vi.fn() } as any, TASK_ID)],
+    ];
+    const wrappingStore = (readBack: string) => {
+      const upsertTaskDocument = vi.fn().mockResolvedValue({ key: "plan", content: stored });
+      const store = {
+        updateTask: vi.fn().mockResolvedValue({ id: TASK_ID, prompt: stored }),
+        getTask: vi.fn().mockResolvedValue({ id: TASK_ID, prompt: readBack }),
+        getTaskDocument: vi.fn().mockResolvedValue(null),
+        upsertTaskDocument,
+      } as unknown as TaskStore;
+      return { store, upsertTaskDocument };
+    };
+
+    it.each(surfaces)("confirms a %s write and mirrors the stored content", async (_surface, createTool) => {
+      const { store, upsertTaskDocument } = wrappingStore(stored);
+
+      expect(getText(await runTool(createTool(store), submitted))).toBe(`Updated PROMPT.md for ${TASK_ID}.`);
+      expect(upsertTaskDocument).toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ key: "plan", content: stored }));
+    });
+
+    it.each(surfaces)("rejects a %s write whose artifact is not the stored content", async (_surface, createTool) => {
+      const { store, upsertTaskDocument } = wrappingStore(submitted);
+
+      expect(getText(await runTool(createTool(store), submitted))).toContain("could not be verified");
+      expect(upsertTaskDocument).not.toHaveBeenCalled();
+    });
+  });
+
   it("never treats a promptless updateTask row as verification evidence", async () => {
     const updateTask = vi.fn().mockResolvedValue({ id: TASK_ID });
     const getTask = vi.fn().mockResolvedValue(null);

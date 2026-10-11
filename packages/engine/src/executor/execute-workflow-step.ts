@@ -20,6 +20,7 @@ import type {
 } from "@fusion/core";
 import {
   applyReviewSeverityGate,
+  canonicalizePlan,
   computePlanApprovalFingerprint,
   isOpenWorkflowReviewFinding,
   MAX_WORKFLOW_REVIEW_FINDINGS,
@@ -33,6 +34,7 @@ import {
   resolveValidatorFallbackModel,
   resolveTaskOutputLanguage,
   startPlanningSegment,
+  unavailablePlanSections,
 } from "@fusion/core";
 import type { AgentSession, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { probeReviewCheckout } from "../worktree/review-checkout-clean.js";
@@ -383,6 +385,44 @@ export async function executeWorkflowStep(
         notes: diagnostic,
         failureValue: requiredArtifactMissingValue(["PROMPT.md"]),
       };
+    }
+
+    /*
+    FNXC:SpecLock 2026-10-11-10:17:
+    An approved plan is locked right after Plan Review, and the lock parser can reject it for a
+    structural reason no reviewer can change (a duplicated lockable section, a missing or empty
+    Mission). Reviewing such a plan spent a full AI session per dispatch and always ended in the same
+    rejection. Check the lock before any reviewer exists and return a deterministic REVISE, so the
+    plan goes back to the planner once through the normal plan-replan route and the card stays in
+    its column. The check is stateless, so it also covers a card whose previous attempt ended in the
+    post-approval rejection. It applies only where the lock itself does (backend storage).
+
+    Live bindings (dependencies, lineage) are not needed: they only extend sections that are already
+    available, so availability is a function of the prompt alone.
+
+    The diagnostic must not start with PLAN_LOCK_UNAVAILABLE_DIAGNOSTIC: that prefix classifies the
+    verdict-less row written after an approval, and remediation refuses it alongside a verdict.
+    */
+    const supportsSpecLock = (deps.store as unknown as { isBackendMode?: () => boolean }).isBackendMode?.() === true;
+    if (isPlanReviewStep && supportsSpecLock) {
+      const plan = canonicalizePlan(planReviewSpecText);
+      if (plan.status !== "available") {
+        const diagnostic = `The plan cannot be locked for execution: ${plan.reason ?? "unknown"} (${unavailablePlanSections(plan).join(", ") || "unknown section"}). `
+          + "Rewrite PROMPT.md so that, outside `## Original Description`, none of these headings is repeated: `## Mission`, `## File Scope`, "
+          + "`## Steps`, `## Completion Criteria`, `## Acceptance Criteria`, `## Do NOT`, `## Non-Goals`, `## Dependencies`, `## Mission Lineage`, "
+          + "`## Parent-Child Lineage`; and so that `## Mission` exists and is not empty.";
+        await deps.store.logEntry(
+          task.id,
+          `[pre-merge] Plan Review deterministic spec-lock check requested revision: ${diagnostic}`,
+        );
+        return {
+          success: false,
+          revisionRequested: true,
+          output: `REVISE: ${diagnostic}`,
+          verdict: "REVISE",
+          notes: diagnostic,
+        };
+      }
     }
 
     if (isPlanReviewStep && requireExternalIntegrationEvidence) {

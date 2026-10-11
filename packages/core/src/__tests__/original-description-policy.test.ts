@@ -21,7 +21,9 @@ import {
   decodeOriginalDescriptionBody,
   encodeOriginalDescriptionBody,
   extractOriginalDescriptionBody,
+  resolveOperatorDescription,
   resolveOriginalDescriptionEnd,
+  resolveOriginalDescriptionSection,
 } from "../tasks/original-description-policy.js";
 
 const SAMPLE_DESC = "Fix the board blank state when autoMerge is off on mobile Android.";
@@ -184,10 +186,45 @@ describe("original description policy", () => {
     expect(twice.split("## Extra section from operator").length - 1).toBe(1);
   });
 
-  it("uses the first H2 for an unmarked section when operator text is unavailable", () => {
+  it("ends an unmarked section at the highest-priority known heading when operator text is unknown", () => {
+    const bodyWithQuotedH2 = "Intro\n\n## Required behavior\n\n- do the thing\n\n## Mission\n\nOperator prose.";
+    const unmarked = sampleSpec({ withOriginal: true, originalBody: bodyWithQuotedH2, marked: false });
+    expect(extractOriginalDescriptionBody(unmarked)).toBe(bodyWithQuotedH2);
+  });
+
+  it("uses the first H2 for an unmarked section when operator text is unknown and no known heading follows", () => {
+    const prompt = "# Task: FN-1\n\n## Original Description\n\nIntro\n\n## Product Overview\n\nCustom planner context.\n";
+    expect(extractOriginalDescriptionBody(prompt)).toBe("Intro");
+  });
+
+  it("uses the first H2 for an unmarked section when operator text is known to be empty", () => {
     const bodyWithUnknownH2 = "Intro\n\n## Required behavior\n\n- do the thing";
     const unmarked = sampleSpec({ withOriginal: true, originalBody: bodyWithUnknownH2, marked: false });
-    expect(extractOriginalDescriptionBody(unmarked)).toBe("Intro");
+    expect(extractOriginalDescriptionBody(unmarked, "")).toBe("Intro");
+  });
+
+  it("resolves the operator text from the document, then a plan-shaped description, then the description", () => {
+    const planShaped = "# Plan title\n\nOperator request inside the plan.\n\n## Size\nM\n\n## Suggested dependencies\n_None_\n\n## Key deliverables\n- One\n";
+
+    expect(resolveOperatorDescription("  Stored operator request.\n", planShaped)).toBe("Stored operator request.");
+    expect(resolveOperatorDescription("   ", planShaped)).toBe("Operator request inside the plan.");
+    expect(resolveOperatorDescription(undefined, planShaped)).toBe("Operator request inside the plan.");
+    expect(resolveOperatorDescription(null, SAMPLE_DESC)).toBe(SAMPLE_DESC);
+    expect(resolveOperatorDescription(undefined, undefined)).toBe("");
+  });
+
+  it("tells apart absent, marked, unresolved-marker and unmarked sections", () => {
+    const marked = sampleSpec({ withOriginal: true, originalBody: SAMPLE_DESC, marked: true });
+    const unmarked = sampleSpec({ withOriginal: true, originalBody: SAMPLE_DESC, marked: false });
+    const unresolved = `${ORIGINAL_DESCRIPTION_HEADING}\n\n${ORIGINAL_DESCRIPTION_START_MARKER}\n${SAMPLE_DESC}\n${ORIGINAL_DESCRIPTION_END_MARKER}\n\n## Why\n\nUnknown successor.\n`;
+
+    expect(resolveOriginalDescriptionSection(sampleSpec())).toEqual({ kind: "absent" });
+    expect(resolveOriginalDescriptionSection(marked)).toMatchObject({ kind: "marked", skippedCandidateCount: 0, body: `\n${SAMPLE_DESC}\n` });
+    expect(resolveOriginalDescriptionSection(unresolved)).toMatchObject({ kind: "unresolved-marker", skippedCandidateCount: 1, rejectedSuccessorHeading: "## Why" });
+    const section = resolveOriginalDescriptionSection(unmarked);
+    expect(section).toMatchObject({ kind: "unmarked", body: SAMPLE_DESC });
+    expect(section.kind === "unmarked" && unmarked.slice(section.sectionEnd)).toMatch(/^## Before → After Transformation/);
+    expect(resolveOriginalDescriptionSection(unmarked, SAMPLE_DESC)).toEqual(section);
   });
 
   it("preserves a custom section after an unmarked non-empty description", () => {

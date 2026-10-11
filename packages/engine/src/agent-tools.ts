@@ -2410,6 +2410,14 @@ export function createTaskPromptWriteTool(
         }
         // Workspace membership is derived from workspace.json at task start; PROMPT.md is plan-only.
         const promptUpdate = { prompt: params.content };
+        /*
+        FNXC:OriginalDescriptionInPrompt 2026-10-11-10:09:
+        The store wraps a submitted `## Original Description` section in its marker envelope, so the
+        stored PROMPT.md can differ from the submitted text. The read-back check and the plan mirror
+        use the content the store reports it wrote; requiring the submitted bytes would reject every
+        such write and send the planner into another pass.
+        */
+        let storedContent = params.content;
         if (canPersist) {
           /*
           FNXC:TaskReset 2026-08-22-18:07:
@@ -2423,18 +2431,19 @@ export function createTaskPromptWriteTool(
               throw new Error(`Planning for ${taskId} was reset before PROMPT.md could be persisted`);
             }
             const updated = await store.withTaskLock(taskId, () => store.updateTaskUnlocked(taskId, promptUpdate, runContext));
+            storedContent = updated.prompt ?? storedContent;
             if (store.isBackendMode()) {
               await store.reconcileSpecDriftWhilePlanningLocked(updated).catch((error: unknown) => {
                 log.warn(`[spec-lock] deferred drift reconciliation for ${updated.id}: ${error instanceof Error ? error.message : String(error)}`);
               });
             }
             /* FNXC:TaskReset 2026-08-22-18:15: Reset clears agent-authored plan documents under this lifecycle lock. */
-            await mirrorPlanToProjectDb(store, taskId, params.content, {
+            await mirrorPlanToProjectDb(store, taskId, storedContent, {
               author: runContext?.agentId ?? "agent",
             });
           });
         } else {
-          await store.updateTask(taskId, promptUpdate, runContext);
+          storedContent = (await store.updateTask(taskId, promptUpdate, runContext)).prompt ?? storedContent;
         }
         /*
         FNXC:PlanArtifactPersistence 2026-08-22-03:37:
@@ -2449,7 +2458,7 @@ export function createTaskPromptWriteTool(
         } catch {
           throw new Error("authoritative PROMPT.md read-back did not match the requested content; persistence could not be verified");
         }
-        if (persisted?.prompt !== params.content) {
+        if (persisted?.prompt !== storedContent) {
           throw new Error("authoritative PROMPT.md read-back did not match the requested content; persistence could not be verified");
         }
         /*
@@ -2460,7 +2469,7 @@ export function createTaskPromptWriteTool(
         the document and then observing a stale mirror recreated after its transaction commits.
         */
         if (!canPersist) {
-          await mirrorPlanToProjectDb(store, taskId, params.content, {
+          await mirrorPlanToProjectDb(store, taskId, storedContent, {
             author: runContext?.agentId ?? "agent",
           });
         }

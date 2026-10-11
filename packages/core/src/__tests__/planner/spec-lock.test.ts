@@ -230,3 +230,94 @@ describe("spec lock canonicalization", () => {
     expect(isCurrentSpecDriftReport(report, originalLock, first, undefined)).toBe(false);
   });
 });
+
+describe("spec lock across stored Original Description shapes", () => {
+  const plannerSpec = [
+    "# Task: KB-1 - Safe widget",
+    "",
+    "**Created:** 2026-10-11",
+    "**Size:** M",
+    "",
+    "## What This Delivers",
+    "",
+    "- A safe widget.",
+    "",
+    "## Mission",
+    "",
+    "Build a safe widget.",
+    "",
+    "## File Scope",
+    "",
+    "- src/widget.ts",
+    "",
+    "## Steps",
+    "",
+    "1. Build widget",
+    "",
+    "## Completion Criteria",
+    "",
+    "- [ ] Widget works",
+    "",
+    "## Do NOT",
+    "",
+    "- Change API",
+    "",
+    "## Dependencies",
+    "",
+    "- **None**",
+    "",
+  ].join("\n");
+  const lockableAliases = [
+    "Mission", "File Scope", "Steps", "Completion Criteria", "Acceptance Criteria",
+    "Do NOT", "Non-Goals", "Dependencies", "Mission Lineage", "Parent-Child Lineage",
+  ];
+  const quoting = (aliases: string[]): string => [
+    "Operator request.",
+    ...aliases.map((alias) => `## ${alias}\n\nOperator prose under ${alias}.`),
+  ].join("\n\n");
+  const unmarked = (sectionBody: string): string => plannerSpec.replace(
+    "## What This Delivers",
+    `## Original Description\n\n${sectionBody}\n\n## What This Delivers`,
+  );
+  const shapes: Array<[string, (operatorBody: string) => string]> = [
+    ["bare unmarked", (body) => unmarked(body)],
+    ["fenced unmarked", (body) => unmarked(`\`\`\`text\n${body}\n\`\`\``)],
+    ["marked", (body) => applyOriginalDescription(plannerSpec, body)],
+  ];
+  const quotedBodies: Array<[string, string]> = [
+    ...lockableAliases.map((alias): [string, string] => [alias, quoting([alias])]),
+    ["every lockable heading", quoting(lockableAliases)],
+  ];
+  const cases = shapes.flatMap(([shapeName, build]) => quotedBodies.map(
+    ([quotedName, body]): [string, string, (operatorBody: string) => string, string] => [shapeName, quotedName, build, body],
+  ));
+
+  it.each(cases)("locks a %s section that quotes %s like the same spec without quoted headings", (_shape, _quoted, build, body) => {
+    const canonical = canonicalizePlan(build(body));
+
+    expect(canonical.status).toBe("available");
+    expect(canonical.contentHash).toBe(canonicalizePlan(build("Operator request.")).contentHash);
+    expect(canonical.contentHash).toBe(canonicalizePlan(plannerSpec).contentHash);
+  });
+
+  it.each(shapes)("gives the same lock for CRLF and LF text with a %s section", (_shape, build) => {
+    const lf = build(quoting(lockableAliases));
+    const crlf = lf.replace(/\n/g, "\r\n");
+
+    expect(canonicalizePlan(crlf)).toMatchObject({ status: "available", contentHash: canonicalizePlan(lf).contentHash });
+  });
+
+  it.each(shapes)("still reports a planner-authored duplicate File Scope after a %s section", (_shape, build) => {
+    const canonical = canonicalizePlan(`${build(quoting(lockableAliases))}\n## File Scope\n\n- src/other.ts\n`);
+
+    expect(canonical).toMatchObject({ status: "unavailable", reason: "section-duplicate" });
+    expect(canonical.sections["file-scope"]).toMatchObject({ status: "unavailable", reason: "section-duplicate" });
+    expect(canonical.sections.mission.status).toBe("available");
+  });
+
+  it.each(shapes)("still reports a planner-authored duplicate Mission after a %s section", (_shape, build) => {
+    const canonical = canonicalizePlan(`${build(quoting(lockableAliases))}\n## Mission\n\nDuplicate mission.\n`);
+
+    expect(canonical).toMatchObject({ status: "unavailable", reason: "mission-duplicate" });
+  });
+});

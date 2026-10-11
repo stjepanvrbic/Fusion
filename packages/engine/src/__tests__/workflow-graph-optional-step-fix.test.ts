@@ -784,6 +784,74 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
     );
   });
 
+  /*
+  FNXC:SpecLock 2026-10-11-10:17:
+  A plan the lock parser rejects gets a deterministic REVISE from the Plan Review step instead of a
+  reviewer session. That REVISE must take the ordinary Plan Review replan route: the card returns to
+  the planner in place, one revision attempt is counted, and it never leaves its column.
+  */
+  describe("Plan Review spec-lock preflight revision", () => {
+    const unlockablePlan = "# Task\n\n## Mission\n\nBuild it.\n\n## File Scope\n\n- src/a.ts\n\n## Steps\n\n### Step 0: Preflight\n\n- [ ] check\n\n## File Scope\n\n- src/b.ts\n";
+
+    async function preflightRevision(taskOverrides: Partial<Task> = {}) {
+      const store = createMockStore();
+      const liveTask = task({ column: "todo", steps: [], prompt: unlockablePlan, ...taskOverrides });
+      store.getTask.mockResolvedValue(liveTask);
+      store.getTaskDocument = vi.fn(async (_id: string, key: string) => (key === "PROMPT.md" ? { content: unlockablePlan } : undefined));
+      store.isBackendMode = vi.fn(() => true);
+      const executor = new TaskExecutor(store, "/tmp/test");
+      const revision = await (executor as any).executeWorkflowStep(liveTask, {
+        id: "graph:plan-review-step", name: "Plan Review", description: "", mode: "prompt", phase: "pre-merge",
+        gateMode: "gate", prompt: "Review the plan.", toolMode: "readonly", enabled: true,
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      }, "/tmp/wt", {}, undefined, undefined);
+      store.logEntry.mockClear();
+      return { store, executor, liveTask, revision: revision as { verdict: string; notes: string } };
+    }
+    const fixInfo = (feedback: string) => ({
+      stepName: "Plan Review", feedback, phase: "pre-merge" as const, status: "failed" as const, verdict: "REVISE", nodeId: "plan-review",
+    });
+
+    it("returns a card in todo to the planner in place and counts one revision attempt", async () => {
+      const { store, executor, liveTask, revision } = await preflightRevision();
+      expect(revision).toMatchObject({ verdict: "REVISE", notes: expect.stringContaining("section-duplicate (file-scope)") });
+
+      await expect((executor as any).requestPreMergeOptionalStepFix(liveTask.id, liveTask, fixInfo(revision.notes))).resolves.toBe(true);
+
+      expect(store.updateTask).toHaveBeenCalledWith(liveTask.id, expect.objectContaining({ status: "needs-replan" }), undefined);
+      expect(store.updateTask).toHaveBeenCalledWith(liveTask.id, { postReviewFixCount: 1 }, undefined);
+      expect(store.logEntry).toHaveBeenCalledWith(
+        liveTask.id,
+        "Plan Review requested a plan revision \u2014 task stays in 'todo' (attempt 1/unbounded)",
+        expect.stringContaining(revision.notes),
+        undefined,
+      );
+      for (const [, column] of store.moveTask.mock.calls) expect(column).toBe("todo");
+      expect(store.updateTask).not.toHaveBeenCalledWith(liveTask.id, expect.objectContaining({ status: "failed" }), undefined);
+    });
+
+    it("takes the same budget-exhausted route as any other Plan Review revision", async () => {
+      const exhausted = { postReviewFixCount: 1, workflowStepResults: [repeatedPlanReviewResult(2)] };
+      const settings = { maxPostReviewFixes: 9, planReviewMaxRevisions: 1 };
+      const preflight = await preflightRevision(exhausted);
+      preflight.store.getSettings.mockResolvedValue(settings);
+      const control = await preflightRevision(exhausted);
+      control.store.getSettings.mockResolvedValue(settings);
+      const normalize = (calls: unknown[][], feedback: string) => JSON.parse(JSON.stringify(calls).split(JSON.stringify(feedback).slice(1, -1)).join("<feedback>"));
+
+      await expect((preflight.executor as any).requestPreMergeOptionalStepFix(preflight.liveTask.id, preflight.liveTask, fixInfo(preflight.revision.notes))).resolves.toBe(true);
+      await expect((control.executor as any).requestPreMergeOptionalStepFix(control.liveTask.id, control.liveTask, fixInfo("A reviewer asked for a plan revision."))).resolves.toBe(true);
+
+      expect(normalize(preflight.store.updateTask.mock.calls, preflight.revision.notes))
+        .toEqual(normalize(control.store.updateTask.mock.calls, "A reviewer asked for a plan revision."));
+      expect(preflight.store.moveTask.mock.calls).toEqual(control.store.moveTask.mock.calls);
+      expect(preflight.store.logEntry.mock.calls.map(([, action]: [string, string]) => action))
+        .toEqual(control.store.logEntry.mock.calls.map(([, action]: [string, string]) => action));
+      expect(preflight.store.updateTask).not.toHaveBeenCalledWith(preflight.liveTask.id, { postReviewFixCount: 2 }, undefined);
+      for (const [, column] of preflight.store.moveTask.mock.calls) expect(column).toBe("todo");
+    });
+  });
+
   it.each(["plan-review", "custom-plan-review"])("keeps deterministic spec-lock failure at %s in review without backward replan", async (nodeId) => {
     const store = createMockStore();
     const liveTask = task({ column: "in-review", workflowStepResults: [{ workflowStepId: nodeId, status: "failed", notes: "Plan approved but spec lock unavailable: mission-missing (mission)." }] });

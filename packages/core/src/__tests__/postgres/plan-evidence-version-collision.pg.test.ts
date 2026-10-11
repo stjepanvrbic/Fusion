@@ -3,6 +3,7 @@ FNXC:SpecLock 2026-08-11-02:04:
 FN-8969 reproduces the operator-visible FN-8964 wedge against PostgreSQL: durable row versions,
 not stale snapshot payload versions, must advance every authoritative PROMPT.md write.
 */
+import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
@@ -12,7 +13,8 @@ import {
 } from "../../__test-utils__/pg-test-harness.js";
 import { type TaskStore } from "../../store.js";
 import * as schema from "../../postgres/schema/index.js";
-import { createCurrentPlanEvidence } from "../../planner/spec-lock.js";
+import { createCurrentPlanEvidence, SPEC_LOCK_PARSER_VERSION, type CurrentPlanEvidence } from "../../planner/spec-lock.js";
+import { computePlanApprovalFingerprint } from "../../planner/plan-approval.js";
 
 const prompt = (body: string) => `# Task\n\n## Mission\n\n${body}\n\n## File Scope\n\n- packages/core/src/store.ts\n\n## Steps\n\n1. Preserve plan evidence\n\n## Completion Criteria\n\n- [ ] Plan write succeeds\n\n## Do NOT\n\n- Drop evidence\n\n## Dependencies\n\n- None\n`;
 
@@ -68,5 +70,45 @@ pgDescribe("plan evidence version collisions", () => {
       .from(schema.project.currentPlanEvidence).where(eq(schema.project.currentPlanEvidence.taskId, task.id));
     const sameEvidence = createCurrentPlanEvidence({ version: 1, sourceRevision: 0, capturedAt: "", prompt: same });
     expect(rows.filter((row) => row.sourceHash === sameEvidence.sourceHash)).toHaveLength(1);
+  });
+
+  const quotedOperatorBody = "Operator request.\n\n## File Scope\n- operator/path.ts\n\nMore operator prose.";
+  const unmarkedPrompt = (sectionBody: string) => prompt("locked after a parser fix").replace(
+    "## Mission",
+    `## Original Description\n\n${sectionBody}\n\n## What This Delivers\n\n- An approved plan reaches execution.\n\n## Mission`,
+  );
+
+  it.sequential.each([
+    ["bare", unmarkedPrompt(quotedOperatorBody)],
+    ["fenced", unmarkedPrompt(`\`\`\`text\n${quotedOperatorBody}\n\`\`\``)],
+  ])("locks an unchanged prompt with a %s unmarked section despite a rejection stored by the previous parser", async (_shape, stuckPrompt) => {
+    const task = await store.createTask({ description: "stale parser evidence" });
+    await h.layer().db.delete(schema.project.currentPlanEvidence).where(eq(schema.project.currentPlanEvidence.taskId, task.id));
+    const current = createCurrentPlanEvidence({ version: 1, sourceRevision: 1, capturedAt: "2026-10-10T23:13:00.000Z", prompt: stuckPrompt, bindings: { dependencies: [] } });
+    const legacySourceHash = createHash("sha256").update(JSON.stringify({ prompt: stuckPrompt, bindings: {} }), "utf8").digest("hex");
+    const legacy: CurrentPlanEvidence = {
+      ...current,
+      sourceHash: legacySourceHash,
+      plan: {
+        parserVersion: 1,
+        status: "unavailable",
+        reason: "section-duplicate",
+        sections: { ...current.plan.sections, "file-scope": { status: "unavailable", reason: "section-duplicate", canonical: "" } },
+      },
+    };
+    await h.layer().db.insert(schema.project.currentPlanEvidence).values({
+      projectId: "", taskId: task.id, version: 1, sourceRevision: legacy.sourceRevision,
+      sourceHash: legacy.sourceHash, capturedAt: legacy.capturedAt, snapshot: legacy,
+    });
+
+    const lock = await store.lockCurrentPlan(task.id, computePlanApprovalFingerprint(stuckPrompt), stuckPrompt);
+
+    expect(lock.plan).toMatchObject({ status: "available", parserVersion: SPEC_LOCK_PARSER_VERSION });
+    expect(lock.currentPlanHash).toBe(createCurrentPlanEvidence({ version: 1, sourceRevision: 1, capturedAt: "", prompt: prompt("locked after a parser fix") }).plan.contentHash);
+    const latest = await store.getLatestCurrentPlanEvidence(task.id);
+    expect(latest).toMatchObject({ version: 2, plan: { status: "available", parserVersion: SPEC_LOCK_PARSER_VERSION } });
+    expect(latest?.sourceHash).not.toBe(legacySourceHash);
+    const stored = await store.listCurrentPlanEvidence(task.id);
+    expect(stored.map((row) => row.plan.status)).toEqual(["unavailable", "available"]);
   });
 });

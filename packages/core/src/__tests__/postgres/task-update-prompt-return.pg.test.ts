@@ -15,6 +15,14 @@ import {
   type SharedPgTaskStoreHarness,
 } from "../../__test-utils__/pg-test-harness.js";
 import { type TaskStore } from "../../store.js";
+import { buildBootstrapPrompt } from "../../mesh/mesh-task-replication.js";
+import { createCurrentPlanEvidence } from "../../planner/spec-lock.js";
+import {
+  ORIGINAL_DESCRIPTION_END_MARKER,
+  ORIGINAL_DESCRIPTION_START_MARKER,
+  resolveOriginalDescriptionSection,
+} from "../../tasks/original-description-policy.js";
+import { stripOriginalDescriptionSection } from "../../tasks/original-description-region.js";
 
 const { persistPromptFile } = vi.hoisted(() => {
   const persistPromptFile = vi.fn();
@@ -191,5 +199,72 @@ pgDescribe("updateTask prompt return (PostgreSQL backend mode)", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+
+  const operatorDescription = "Operator request.\n\n## File Scope\n- operator/path.ts\n\nMore operator prose.";
+  const plannerSpec = prompt("envelope contract body").replace(
+    "## Mission",
+    "## What This Delivers\n\n- The operator request stays protected.\n\n## Mission",
+  );
+  const withUnmarkedSection = (sectionBody: string) => plannerSpec.replace(
+    "## What This Delivers",
+    `## Original Description\n\n${sectionBody}\n\n## What This Delivers`,
+  );
+
+  it.sequential.each([
+    ["bare", withUnmarkedSection(operatorDescription)],
+    ["fenced", withUnmarkedSection(`\`\`\`text\n${operatorDescription}\n\`\`\``)],
+  ])("stores a %s unmarked Original Description section inside the marker envelope", async (_shape, submitted) => {
+    const task = await store.createTask({ description: operatorDescription });
+
+    const updated = await store.updateTask(task.id, { prompt: submitted });
+
+    const onDisk = await readFile(join(store.taskDir(task.id), "PROMPT.md"), "utf8");
+    expect(onDisk).toContain(`${ORIGINAL_DESCRIPTION_START_MARKER}\n${operatorDescription}\n${ORIGINAL_DESCRIPTION_END_MARKER}`);
+    expect(resolveOriginalDescriptionSection(onDisk).kind).toBe("marked");
+    expect(stripOriginalDescriptionSection(onDisk)).toBe(plannerSpec);
+    expect(updated.prompt).toBe(onDisk);
+    expect((await store.getTask(task.id)).prompt).toBe(onDisk);
+
+    const evidence = await store.getLatestCurrentPlanEvidence(task.id);
+    expect(evidence?.plan.status).toBe("available");
+    expect(evidence?.sourceHash).toBe(
+      createCurrentPlanEvidence({ version: 1, sourceRevision: 1, capturedAt: "", prompt: onDisk, bindings: { dependencies: [] } }).sourceHash,
+    );
+
+    const again = await store.updateTask(task.id, { prompt: onDisk });
+    expect(again.prompt).toBe(onDisk);
+    expect(await readFile(join(store.taskDir(task.id), "PROMPT.md"), "utf8")).toBe(onDisk);
+  });
+
+  it.sequential("wraps the original-description task document when the task has one", async () => {
+    const task = await store.createTask({ description: "# Plan title\n\nA plan-shaped description is not the operator request." });
+    await store.upsertTaskDocument(task.id, { key: "original-description", content: "  Operator request kept apart from the plan.\n", author: "user" });
+
+    const updated = await store.updateTask(task.id, { prompt: withUnmarkedSection("Planner paraphrase of the request.") });
+
+    expect(updated.prompt).toContain(`${ORIGINAL_DESCRIPTION_START_MARKER}\nOperator request kept apart from the plan.\n${ORIGINAL_DESCRIPTION_END_MARKER}`);
+    expect(updated.prompt).not.toContain("Planner paraphrase of the request.");
+    expect(stripOriginalDescriptionSection(updated.prompt ?? "")).toBe(plannerSpec);
+  });
+
+  it.sequential("stores a prompt without the section byte-identical and never inserts one", async () => {
+    const task = await store.createTask({ description: operatorDescription });
+
+    const updated = await store.updateTask(task.id, { prompt: plannerSpec });
+
+    expect(updated.prompt).toBe(plannerSpec);
+    expect(await readFile(join(store.taskDir(task.id), "PROMPT.md"), "utf8")).toBe(plannerSpec);
+  });
+
+  it.sequential("stores a bootstrap seed prompt byte-identical even when the description quotes the section heading", async () => {
+    const description = "Operator request.\n\n## Original Description\n\nQuoted by the operator.";
+    const task = await store.createTask({ description });
+    const seed = buildBootstrapPrompt(task.id, task.title, task.description);
+
+    const updated = await store.updateTask(task.id, { prompt: seed });
+
+    expect(updated.prompt).toBe(seed);
+    expect(await readFile(join(store.taskDir(task.id), "PROMPT.md"), "utf8")).toBe(seed);
   });
 });

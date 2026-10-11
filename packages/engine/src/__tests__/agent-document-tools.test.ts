@@ -355,6 +355,71 @@ describe("task_prompt_write tool", () => {
     expect(getText(result)).toBe(`Updated PROMPT.md for ${TASK_ID}.`);
   });
 
+  describe("when the store wraps an unmarked Original Description section", () => {
+    const planner = "## What This Delivers\n\n- Value.\n\n## Mission\n\nBuild it.\n\n## File Scope\n\n- src/a.ts\n";
+    const operator = "Operator request.\n\n## File Scope\n- operator/path.ts";
+    const submitted = `# Task\n\n## Original Description\n\n${operator}\n\n${planner}`;
+    const stored = `# Task\n\n## Original Description\n\n<!-- fusion-original-description:start -->\n${operator}\n<!-- fusion-original-description:end -->\n\n${planner}`;
+
+    it("confirms the write against the stored content and mirrors that content", async () => {
+      const updateTask = vi.fn().mockResolvedValue({ id: TASK_ID, prompt: stored });
+      const upsertTaskDocument = vi.fn().mockResolvedValue({ key: "plan", content: stored });
+      const store = {
+        updateTask,
+        getTask: vi.fn().mockResolvedValue({ id: TASK_ID, prompt: stored }),
+        getTaskDocument: vi.fn().mockResolvedValue(null),
+        upsertTaskDocument,
+      } as unknown as TaskStore;
+
+      const result = await runTool(createTaskPromptWriteTool(store, TASK_ID), "call-wrapped", { content: submitted });
+
+      expect(updateTask).toHaveBeenCalledWith(TASK_ID, { prompt: submitted }, undefined);
+      expect(getText(result)).toBe(`Updated PROMPT.md for ${TASK_ID}.`);
+      expect(upsertTaskDocument).toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ key: "plan", content: stored }));
+    });
+
+    it("confirms a reset-fenced write against the stored content and mirrors that content", async () => {
+      const updateTaskUnlocked = vi.fn().mockResolvedValue({ id: TASK_ID, prompt: stored });
+      const upsertTaskDocument = vi.fn().mockResolvedValue({ key: "plan", content: stored });
+      const store = {
+        updateTaskUnlocked,
+        getTask: vi.fn().mockResolvedValue({ id: TASK_ID, prompt: stored }),
+        getTaskDocument: vi.fn().mockResolvedValue(null),
+        upsertTaskDocument,
+        withPlanningLifecycleLock: vi.fn(async (_id: string, write: () => Promise<void>) => await write()),
+        withTaskLock: vi.fn(async (_id: string, write: () => Promise<unknown>) => await write()),
+        isBackendMode: vi.fn(() => false),
+      } as unknown as TaskStore;
+
+      const result = await runTool(createTaskPromptWriteTool(store, TASK_ID, undefined, () => true), "call-wrapped-fenced", { content: submitted });
+
+      expect(updateTaskUnlocked).toHaveBeenCalledWith(TASK_ID, { prompt: submitted }, undefined);
+      expect(getText(result)).toBe(`Updated PROMPT.md for ${TASK_ID}.`);
+      expect(upsertTaskDocument).toHaveBeenCalledTimes(1);
+      expect(upsertTaskDocument).toHaveBeenCalledWith(TASK_ID, expect.objectContaining({ key: "plan", content: stored }));
+    });
+
+    it.each([
+      ["the submitted text the store did not keep", submitted],
+      ["a truncated artifact", stored.slice(0, -10)],
+      ["an empty artifact", ""],
+    ])("fails closed when the read-back is %s", async (_state, readBack) => {
+      const upsertTaskDocument = vi.fn();
+      const store = {
+        updateTask: vi.fn().mockResolvedValue({ id: TASK_ID, prompt: stored }),
+        getTask: vi.fn().mockResolvedValue({ id: TASK_ID, prompt: readBack }),
+        getTaskDocument: vi.fn().mockResolvedValue(null),
+        upsertTaskDocument,
+      } as unknown as TaskStore;
+
+      const result = await runTool(createTaskPromptWriteTool(store, TASK_ID), "call-wrapped-mismatch", { content: submitted });
+
+      expect(getText(result)).toContain("ERROR:");
+      expect(getText(result)).toContain("could not be verified");
+      expect(upsertTaskDocument).not.toHaveBeenCalled();
+    });
+  });
+
   it("keeps a verified prompt write successful when the plan mirror fails", async () => {
     const content = "# Verified plan";
     const store = {

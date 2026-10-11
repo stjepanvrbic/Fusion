@@ -53,6 +53,7 @@ import {
   detectImageMimeFromBytes,
   applyFrontendUxCriteria,
   applyOriginalDescription,
+  resolveOperatorDescription,
   extractEffectiveWriteScopeFromPrompt,
   ApprovalRequestStore,
   AWAITING_APPROVAL_PAUSE_REASON,
@@ -797,7 +798,8 @@ export class TriageProcessor {
         });
       }
       if (mirrorPlan) {
-        await mirrorPlanToProjectDb(this.store, task.id, content, {
+        // The store may wrap an Original Description section; the plan document mirrors what it stored.
+        await mirrorPlanToProjectDb(this.store, task.id, updated.prompt ?? content, {
           author: "triage",
           logger: { log: (message: string) => planLog.log(message), warn: (message: string) => planLog.warn(message) },
         });
@@ -5415,11 +5417,11 @@ export class TriageProcessor {
       const originalDescriptionDocument = typeof getTaskDocument === "function"
         ? await getTaskDocument.call(this.store, task.id, "original-description").catch(() => null)
         : null;
-      const storedOriginalDescription = typeof originalDescriptionDocument?.content === "string"
-        ? originalDescriptionDocument.content.trim()
-        : "";
-      const parsedDescriptionPlan = parsePlanningPlanMd(task.description ?? "");
-      const originalDescription = storedOriginalDescription || parsedDescriptionPlan?.description || task.description || "";
+      // Shared with the store's prompt write so both writers wrap the same operator text.
+      const originalDescription = resolveOperatorDescription(
+        typeof originalDescriptionDocument?.content === "string" ? originalDescriptionDocument.content : undefined,
+        task.description,
+      );
       let nextPrompt = applyOriginalDescription(written, originalDescription);
       nextPrompt = applyFrontendUxCriteria(nextPrompt, parsedFileScope);
       if (nextPrompt !== written) {

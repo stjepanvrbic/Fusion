@@ -7,7 +7,7 @@ import { WEDGE_DELIVERY_RETRY_LEASE_MS, WEDGE_RENOTIFY_COOLDOWN_MS } from "./typ
 import { clearTerminalFailureAutoRecoveryBudget } from "./tasks/terminal-failure-auto-recovery.js";
 import { join } from "node:path";
 import { and, desc, eq, isNull, ne, sql } from "drizzle-orm";
-import { createCurrentPlanEvidence, diffSpecLocks, isSpecLockActive, UnavailablePlanLockError, type CurrentPlanEvidence, type PlanEvidenceBindings, type SpecLock } from "./planner/spec-lock.js";
+import { createCurrentPlanEvidence, diffSpecLocks, isSpecLockActive, unavailablePlanSections, UnavailablePlanLockError, type CurrentPlanEvidence, type PlanEvidenceBindings, type SpecLock } from "./planner/spec-lock.js";
 import { evaluateSpecDrift, hasPriorLockDivergence, type DriftReport } from "./planner/drift-report.js";
 import * as schema from "./postgres/schema/index.js";
 import { type FSWatcher } from "node:fs";
@@ -1530,10 +1530,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async lockCurrentPlanWhilePlanningLocked(taskId: string, approvalFingerprint: string, prompt: string): Promise<SpecLock> {
     const currentPlan = await this.captureCurrentPlanEvidenceLocked(taskId, prompt, Date.now());
     if (currentPlan.plan.status !== "available" || !currentPlan.plan.contentHash) {
-      const unavailableSections = (Object.entries(currentPlan.plan.sections) as Array<[import("./planner/spec-lock.js").SpecLockSection, import("./planner/spec-lock.js").CanonicalPlanSection]>)
-        .filter(([, section]) => section.status === "unavailable")
-        .map(([key]) => key);
-      throw new UnavailablePlanLockError(currentPlan.plan.reason ?? "unknown", unavailableSections, currentPlan.sourceHash);
+      throw new UnavailablePlanLockError(currentPlan.plan.reason ?? "unknown", unavailablePlanSections(currentPlan.plan), currentPlan.sourceHash);
     }
     const prior = await this.getLatestSpecLock(taskId);
     if (prior?.approvalFingerprint === approvalFingerprint && prior.currentPlanHash === currentPlan.plan.contentHash) return prior;

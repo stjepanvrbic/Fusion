@@ -1,7 +1,13 @@
 import { createHash } from "node:crypto";
-import { stripGeneratedOriginalDescription } from "../tasks/original-description-region.js";
+import { stripOriginalDescriptionSection } from "../tasks/original-description-region.js";
 
-export const SPEC_LOCK_PARSER_VERSION = 1;
+/**
+ * FNXC:SpecLock 2026-10-11-10:05:
+ * Version 2 removes the Original Description section in every stored shape. Evidence rows are
+ * immutable and deduplicated by source hash, so the version is part of that hash: a snapshot
+ * computed by an older parser must never answer for an unchanged prompt under the current one.
+ */
+export const SPEC_LOCK_PARSER_VERSION = 2;
 
 export type SpecLockSection = "mission" | "file-scope" | "steps" | "acceptance-criteria" | "non-goals" | "dependencies" | "lineage";
 export type SpecParseReason = "mission-missing" | "mission-empty" | "mission-duplicate" | "section-missing" | "section-duplicate";
@@ -113,11 +119,15 @@ export function canonicalizePlan(prompt: string, bindings?: PlanEvidenceBindings
   /*
   FNXC:SpecLock 2026-09-07-05:09:
   Operator prose is free text and may contain structural-looking H2 headings. Scan only the
-  planner-authored prompt after removing the marker-bounded description so user prose cannot make
-  a plan structurally unlockable. Unmarked legacy descriptions remain intentionally unstripped,
-  matching approval fingerprints; their deterministic failures are handled by lifecycle recovery.
+  planner-authored prompt after removing the description section so user prose cannot make a plan
+  structurally unlockable.
+
+  FNXC:SpecLock 2026-10-11-10:00:
+  The section is removed whether or not it carries the marker envelope, through the same reader
+  as the approval fingerprint. An unmarked section that quoted a lockable heading was counted as a
+  planner duplicate and rejected an approved plan on every review, with nothing able to change it.
   */
-  const normalized = stripGeneratedOriginalDescription(prompt.replace(/\r\n?/g, "\n"));
+  const normalized = stripOriginalDescriptionSection(prompt.replace(/\r\n?/g, "\n"));
   const headings = [...normalized.matchAll(/^##\s+(.+?)\s*$/gmi)].map((match) => ({ name: match[1].trim().toLowerCase(), start: match.index!, end: match.index! + match[0].length }));
   const result = {} as Record<SpecLockSection, CanonicalPlanSection>;
   for (const definition of sections) {
@@ -166,6 +176,11 @@ export function canonicalizePlan(prompt: string, bindings?: PlanEvidenceBindings
   if (unavailable) return { parserVersion: SPEC_LOCK_PARSER_VERSION, sections: result, status: "unavailable", reason: unavailable.reason };
   const content = JSON.stringify(Object.fromEntries(Object.entries(result).map(([key, section]) => [key, section.hash])));
   return { parserVersion: SPEC_LOCK_PARSER_VERSION, sections: result, contentHash: hash(content), status: "available" };
+}
+
+/** The lock sections the parser could not canonicalize, in section order. */
+export function unavailablePlanSections(plan: CanonicalPlan): SpecLockSection[] {
+  return sections.map(({ key }) => key).filter((key) => plan.sections[key]?.status === "unavailable");
 }
 
 export function diffSpecLocks(previous: CanonicalPlan, next: CanonicalPlan): SpecLockDiff {
@@ -221,8 +236,12 @@ export function createCurrentPlanEvidence(input: Omit<CurrentPlanEvidence, "plan
   const normalizedBindings = normalizedPlanEvidenceBindings(bindings);
   return {
     ...evidence,
-    /* Bindings are part of the authoritative source identity: same prompt plus a dependency edit is a new revision. */
-    sourceHash: hash(JSON.stringify({ prompt, bindings: normalizedBindings })),
+    /*
+    The authoritative source identity is prompt, bindings and parser version. Same prompt plus a
+    dependency edit is a new revision, and so is the same prompt read by a newer parser: without the
+    version, a parser fix could never reach a prompt whose rejection was already stored.
+    */
+    sourceHash: hash(JSON.stringify({ prompt, bindings: normalizedBindings, parserVersion: SPEC_LOCK_PARSER_VERSION })),
     plan: canonicalizePlan(prompt, normalizedBindings),
   };
 }
