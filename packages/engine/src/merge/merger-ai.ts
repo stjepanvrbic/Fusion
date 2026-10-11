@@ -3825,7 +3825,7 @@ async function mergeAndReview(input: {
     const task = await store.getTask(taskId);
     const activePriorFindings = state.findings.filter((finding) => finding.disposition === "pending" || finding.disposition === "still-present");
     const verdict = parseReviewVerdict(await reviewAgent(mergeRoot, buildReviewPrompt({ taskId, branch, integrationBranch, tipSha, squashSha: candidateSha, diffStat, priorReasons: activePriorFindings.map((finding) => finding.text), priorFindings: activePriorFindings.map((finding) => ({ id: finding.id, text: finding.text })), userComments: selectUserCommentsForAgentContext(task) })));
-    // A review response can arrive after an operator dismisses its finding or pushes a new source.
+    // FNXC:AIMergeReviewReconciliation 2026-10-11-13:45: A review response can arrive after an operator dismisses its finding or pushes a new source; this check must stay because the advisory landing return and the terminal block below pass no later identity check, and the approval log line and corrective merge would otherwise act on a stale verdict.
     await assertCurrentEpisodeIdentity();
     const ids = new Set(state.findings.map((finding) => finding.id));
     const dispositionCounts = new Map<string, number>();

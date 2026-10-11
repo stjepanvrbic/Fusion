@@ -473,7 +473,7 @@ describe("runAiMerge", () => {
   */
   it("rebuilds when the source changes between clean confirmation reviews", async () => {
     const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
-    const { store } = makeStore(dir);
+    const { store, logs } = makeStore(dir);
     let changedSource = false;
     const reviewAgent = vi.fn(async () => {
       if (!changedSource) {
@@ -494,6 +494,65 @@ describe("runAiMerge", () => {
     expect(git(dir, ["show", "main:after-review.txt"])).toContain("new source identity");
     // FNXC:MergeRunTimeout 2026-10-10-22:49: the rebuild is reported as a second attempt so the pump restarts its hung-merge bounds.
     expect(onMergeAttemptStarted).toHaveBeenCalledTimes(2);
+    // Self-healing reads these lines as approval evidence, so the candidate approved before the push must never be logged as approved.
+    const approvedShas = new Set(logs.flatMap((line) => {
+      const sha = line.match(/AI merge review \(pass \d+\): approved squash ([0-9a-f]{40})/)?.[1];
+      return sha ? [sha] : [];
+    }));
+    expect(approvedShas.size).toBe(1);
+    expect(result.commitSha).toBe([...approvedShas][0]);
+  });
+
+  /*
+  FNXC:AIMergeReviewReconciliation 2026-10-11-13:32:
+  A review verdict that returns after a source push must neither land nor block the stale candidate; the merge rebuilds from the new source.
+  The advisory landing return and the terminal block have no later identity check, so these cases depend on the check directly after the review.
+  */
+  it("rebuilds instead of landing when the source changes during a review that ends in an advisory veto", async () => {
+    const { dir } = initRepoWithBranch();
+    const { store } = makeStore(dir);
+    let changedSource = false;
+    const reviewAgent = vi.fn(async () => {
+      if (!changedSource) {
+        changedSource = true;
+        git(dir, ["update-ref", "refs/heads/fusion/fn-1", sourceAdvanceSha]);
+      }
+      return "REVIEW_VERDICT: reject\nSEVERITY: advisory\n- naming nit";
+    });
+    const mergeAgent = realMergeAgent("fusion/fn-1");
+    const onMergeAttemptStarted = vi.fn();
+
+    const result = await runAiMerge(store, dir, "FN-1", { manual: true, onMergeAttemptStarted }, { mergeAgent, reviewAgent });
+
+    expect(result.merged).toBe(true);
+    expect(reviewAgent).toHaveBeenCalledTimes(2);
+    expect(mergeAgent).toHaveBeenCalledTimes(2);
+    expect(onMergeAttemptStarted).toHaveBeenCalledTimes(2);
+    expect(git(dir, ["show", "main:after-review.txt"])).toContain("new source identity");
+  });
+
+  it("rebuilds instead of blocking when the source changes during the review that would exhaust the corrective budget", async () => {
+    const { dir } = initRepoWithBranch();
+    const { store, task, logs } = makeStore(dir, {}, { merger: { mode: "ai", maxReviewPasses: 0 } });
+    let changedSource = false;
+    const reviewAgent = vi.fn(async () => {
+      if (!changedSource) {
+        changedSource = true;
+        git(dir, ["update-ref", "refs/heads/fusion/fn-1", sourceAdvanceSha]);
+        return "REVIEW_VERDICT: reject\nSEVERITY: blocking\n- dropped a hunk";
+      }
+      return "REVIEW_VERDICT: reject\nSEVERITY: advisory\n- naming nit";
+    });
+    const mergeAgent = realMergeAgent("fusion/fn-1");
+
+    const result = await runAiMerge(store, dir, "FN-1", { manual: true, onMergeAttemptStarted: vi.fn() }, { mergeAgent, reviewAgent });
+
+    expect(result.merged).toBe(true);
+    expect(reviewAgent).toHaveBeenCalledTimes(2);
+    expect(mergeAgent).toHaveBeenCalledTimes(2);
+    expect(git(dir, ["show", "main:after-review.txt"])).toContain("new source identity");
+    expect(task.aiMergeReviewReconciliation ?? null).toBeNull();
+    expect(logs.some((line) => /AI merge BLOCKED/.test(line))).toBe(false);
   });
 
   it("passes explicit still-present findings to a corrective merger", async () => {
