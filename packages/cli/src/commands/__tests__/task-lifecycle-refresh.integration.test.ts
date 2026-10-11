@@ -3,7 +3,7 @@ import { chmodSync, cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@fusion/core", async () => {
   const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
@@ -32,7 +32,8 @@ function git(cwd: string, ...args: string[]): string {
 /*
 FNXC:CliTests 2026-10-08-15:30:
 KB-061: every case used to build its own ~25-spawn git fixture (bare remote, two clones, commits, pushes), and on Windows process spawn cost alone pushed cases past vitest's 5 s default.
-The base fixture is now built ONCE per file as a template and each case gets a recursive copy, so per-case cost is one copy plus the git work the case itself asserts on.
+The base fixture is now built ONCE per file as a template and each case gets a recursive copy.
+KB-103 narrowed the per-case contract: a case body runs only the product call it asserts on and its assertion reads, while the copy and arrange git work run in the case's own beforeEach (see caseWithArrange).
 Copies are isolated: each clone's origin URL is rewritten to the copy's own bare remote, so a case can never touch the template or another case's remote.
 Background gc/maintenance is disabled in the template repositories so no git call forks maintenance work.
 
@@ -126,8 +127,35 @@ function buildTemplate(): string {
   return root;
 }
 
+/*
+FNXC:CliTests 2026-10-11-04:22:
+KB-103: the fast-import template launches none of git's transport programs (fetch, ls-remote, push and their shell-started upload-pack/receive-pack helpers), `worktree add` or `rebase`.
+The clone/push build it replaced did, so after KB-091 the first refresh case paid their first launch inside its 5 s budget and timed out on the GitHub Windows runner (5131 ms in Full Suite run 37832714652, 1102 ms on the parent commit).
+The hook now launches each of them once on a disposable copy, under the unchanged 10 s hook budget: the fast-import build is 8 top-level git processes and priming adds 5, below the clone/push build's 25.
+The product's `ls-remote` is not primed separately because the primed fetch already starts the same shell and upload-pack programs.
+Priming never calls the product and never touches the template, which the topology case pins.
+*/
+/** Launch the product's refresh git programs once on a throwaway copy of the template. */
+function primeRefreshGitPrograms(template: string): void {
+  const root = mkdtempSync(join(tmpdir(), "fusion-pr-refresh-prime-"));
+  try {
+    cpSync(template, root, { recursive: true });
+    const project = join(root, "project");
+    repointOrigin(project, join(template, "remote.git"), join(root, "remote.git"));
+    const worktree = join(root, "prime-worktree");
+    git(project, "worktree", "add", worktree, TEMPLATE_HEAD);
+    git(worktree, "fetch", "origin", "main");
+    git(worktree, "rebase", "origin/main");
+    git(worktree, "push", "origin", "HEAD:refs/heads/fusion/prime");
+    git(project, "worktree", "remove", "--force", worktree);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 beforeAll(() => {
   templateRoot = buildTemplate();
+  primeRefreshGitPrograms(templateRoot);
 });
 
 afterAll(() => {
@@ -209,9 +237,27 @@ function gitSucceeds(cwd: string, ...args: string[]): boolean {
   }
 }
 
+/*
+FNXC:CliTests 2026-10-11-04:22:
+KB-103: a case's 5 s budget covers only the product call it asserts on and the reads that check the result.
+The fixture copy and arrange git work (checkouts, commits, publishing pushes, merge sentinels, conflicting changes) run in that case's own beforeEach under the 10 s hook budget.
+Measured before the split on a loaded Windows host, arrange alone took 1 to 6.7 s in the cases that publish a head, land a merge sentinel or build a conflict, and those cases timed out in every run because one budget held both arrange and a full refresh.
+On the GitHub Windows runner the same cases timed out in Full Suite runs 37823843450 and 37824921482.
+beforeEach (not a nested beforeAll) keeps an arrange failure serialized in the JSON report the Windows comparator reads; each case keeps its title, and only its suite path gains the title.
+*/
+/** Register one case whose arrange work runs in its own beforeEach, outside the case's budget. */
+function caseWithArrange<T>(title: string, arrange: () => T, body: (arranged: T) => Promise<void> | void): void {
+  describe(title, () => {
+    let arranged: T;
+    beforeEach(() => {
+      arranged = arrange();
+    });
+    it(title, () => body(arranged));
+  });
+}
+
 describe("refreshAutomatedPrHead local git fixture", () => {
-  it("template matches the clone/push fixture topology", () => {
-    const { root, remote, integration, head } = makeFixture();
+  caseWithArrange("template matches the clone/push fixture topology", () => makeFixture(), ({ root, remote, integration, head }) => {
     const base = git(root, "rev-parse", "refs/heads/main");
     const sentinel = git(remote, "rev-parse", "refs/heads/main");
 
@@ -240,9 +286,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(readFileSync(join(integration, "sentinel.txt"), "utf8")).toBe("late integration security fix\n");
   });
 
-  it("publishes a stale automated head only after it contains the late integration sentinel", async () => {
-    const { root, remote, head } = makeFixture();
-
+  caseWithArrange("publishes a stale automated head only after it contains the late integration sentinel", () => makeFixture(), async ({ root, remote, head }) => {
     /*
     FNXC:PullRequestFreshness 2026-08-09-03:20:
     An automated PR head created before a later integration security fix must be
@@ -261,20 +305,22 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(git(root, "worktree", "list", "--porcelain")).not.toContain("/.fusion/worktrees/pr-refresh-");
   });
 
-  it("refuses a head checked out at the primary project root", async () => {
-    const { root, head } = makeFixture("fusion/fn-8838-root-refusal");
-    git(root, "checkout", head);
-
+  caseWithArrange("refuses a head checked out at the primary project root", () => {
+    const fixture = makeFixture("fusion/fn-8838-root-refusal");
+    git(fixture.root, "checkout", fixture.head);
+    return fixture;
+  }, async ({ root, head }) => {
     await expect(refreshAutomatedPrHead({ projectRoot: root, headBranch: head, targetBranch: "main" }))
       .rejects.toThrow(/project root/);
     expect(git(root, "branch", "--show-current")).toBe(head);
   });
 
-  it("uses a verified existing task worktree without creating a temporary checkout", async () => {
-    const { root, remote, head } = makeFixture("fusion/fn-8838-verified-worktree");
-    const taskWorktree = join(root, "task-worktree");
-    git(root, "worktree", "add", taskWorktree, head);
-
+  caseWithArrange("uses a verified existing task worktree without creating a temporary checkout", () => {
+    const fixture = makeFixture("fusion/fn-8838-verified-worktree");
+    const taskWorktree = join(fixture.root, "task-worktree");
+    git(fixture.root, "worktree", "add", taskWorktree, fixture.head);
+    return { ...fixture, taskWorktree };
+  }, async ({ root, remote, head, taskWorktree }) => {
     const refreshed = await refreshAutomatedPrHead({
       projectRoot: root,
       headBranch: head,
@@ -292,11 +338,12 @@ describe("refreshAutomatedPrHead local git fixture", () => {
   FNXC:CliTests 2026-10-08-15:30:
   KB-061: the remote-only and missing-head scenarios are independent, so each owns its case and fixture; every assertion is preserved.
   */
-  it("materializes a remote-only head without GitHub boundaries", async () => {
+  caseWithArrange("materializes a remote-only head without GitHub boundaries", () => {
     const remoteOnly = makeFixture("fusion/fn-8838-remote-only");
     git(remoteOnly.root, "push", "origin", remoteOnly.head);
     git(remoteOnly.root, "branch", "-D", remoteOnly.head);
-
+    return remoteOnly;
+  }, async (remoteOnly) => {
     await expect(refreshAutomatedPrHead({
       projectRoot: remoteOnly.root,
       headBranch: remoteOnly.head,
@@ -305,8 +352,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     assertPublishedSentinel(remoteOnly.remote, remoteOnly.head);
   });
 
-  it("refuses a missing head without GitHub boundaries", async () => {
-    const missing = makeFixture("fusion/fn-8838-missing");
+  caseWithArrange("refuses a missing head without GitHub boundaries", () => makeFixture("fusion/fn-8838-missing"), async (missing) => {
     await expect(refreshAutomatedPrHead({
       projectRoot: missing.root,
       headBranch: "fusion/fn-8838-does-not-exist",
@@ -314,7 +360,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     })).rejects.toThrow(/missing local and origin head/);
   });
 
-  it("restores the canonical local head when a force-with-lease publication is rejected", async () => {
+  caseWithArrange("restores the canonical local head when a force-with-lease publication is rejected", () => {
     const { root, remote, head } = makeFixture("fusion/fn-8838-lease-rejection");
     // Make this an existing remote head, so the refresh publication must use a lease.
     git(root, "push", "origin", head);
@@ -323,7 +369,8 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     const hook = join(root, ".git", "hooks", "pre-push");
     writeFileSync(hook, `#!/bin/sh\ngit --git-dir='${remote}' update-ref 'refs/heads/${head}' '${remoteMain}'\n`);
     chmodSync(hook, 0o755);
-
+    return { root, remote, head, originalHead, remoteMain };
+  }, async ({ root, remote, head, originalHead, remoteMain }) => {
     /*
     FNXC:PullRequestFreshness 2026-08-09-04:52:
     A remote writer can win after refresh observes the old OID but before its
@@ -338,7 +385,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(git(root, "worktree", "list", "--porcelain")).not.toContain("/.fusion/worktrees/pr-refresh-");
   });
 
-  it("refuses to overwrite a head that advanced before refresh observes its push lease", async () => {
+  caseWithArrange("refuses to overwrite a head that advanced before refresh observes its push lease", () => {
     const { root, integration, remote, head } = makeFixture("fusion/fn-8838-pre-observation-race");
     git(root, "push", "origin", head);
     const originalHead = git(root, "rev-parse", `refs/heads/${head}`);
@@ -349,7 +396,8 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     git(integration, "commit", "-m", "concurrent head update");
     git(integration, "push", "origin", head);
     const concurrentHead = git(remote, "rev-parse", `refs/heads/${head}`);
-
+    return { root, remote, head, originalHead, concurrentHead };
+  }, async ({ root, remote, head, originalHead, concurrentHead }) => {
     /*
     FNXC:PullRequestFreshness 2026-08-09-05:32:
     A head update that reaches origin before refresh reads its lease must survive.
@@ -370,7 +418,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
   real-git fixtures (~4s) and flaked against vitest's 5s default; each adapter
   owns its own case so a boundary's coverage is sized like its siblings.
   */
-  it("refreshes the shared-group PR-create callback before GitHub sees the head", async () => {
+  caseWithArrange("refreshes the shared-group PR-create callback before GitHub sees the head", () => {
     const groupFixture = makeFixture("fusion/group-refresh-fixture");
     const groupGithub = {
       findPrForBranch: vi.fn(async () => null),
@@ -379,6 +427,8 @@ describe("refreshAutomatedPrHead local git fixture", () => {
         return { number: 1, url: "https://example.test/pr/1", status: "open" as const };
       }),
     };
+    return { groupFixture, groupGithub };
+  }, async ({ groupFixture, groupGithub }) => {
     await createGroupPrCallback(groupGithub as never)({
       cwd: groupFixture.root,
       group: { id: "BG-fixture", branchName: groupFixture.head } as never,
@@ -425,20 +475,20 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     git(fixture.integration, "push", "origin", "main");
   }
 
-  it("refreshes the workflow PR node create boundary before GitHub sees the head", async () => {
+  caseWithArrange("refreshes the workflow PR node create boundary before GitHub sees the head", () => {
     const workflowFixture = makeFixture("fusion/fn-8838-workflow");
     const workflowGithub = makeWorkflowGithub(workflowFixture);
+    return { workflowGithub, ...makeWorkflowTask(workflowFixture) };
+  }, async ({ workflowGithub, task, entity }) => {
     const workflowOps = createPrNodeGithubOps(workflowGithub as never);
-    const { task, entity } = makeWorkflowTask(workflowFixture);
     await workflowOps.createPr({ task, entity } as never);
     expect(workflowGithub.createPr).toHaveBeenCalledTimes(1);
   });
 
-  it("refreshes the workflow PR node merge boundary before GitHub sees the head", async () => {
+  caseWithArrange("refreshes the workflow PR node merge boundary before GitHub sees the head", () => {
     const workflowFixture = makeFixture("fusion/fn-8838-workflow");
     git(workflowFixture.root, "push", "origin", workflowFixture.head);
     const workflowGithub = makeWorkflowGithub(workflowFixture);
-    const workflowOps = createPrNodeGithubOps(workflowGithub as never);
     const { task, entity } = makeWorkflowTask(workflowFixture);
 
     pushMergeSentinel(workflowFixture, "merge-sentinel.txt", "merge sentinel");
@@ -446,8 +496,11 @@ describe("refreshAutomatedPrHead local git fixture", () => {
       assertPublishedSentinel(workflowFixture.remote, workflowFixture.head, "merge-sentinel.txt");
       return { number: 2, url: "https://example.test/pr/2", status: "merged" as const };
     });
+    return { workflowGithub, task, entity };
+  }, async ({ workflowGithub, task, entity }) => {
+    const workflowOps = createPrNodeGithubOps(workflowGithub as never);
     const persisted: string[] = [];
-    await workflowOps.mergePr({ task, entity, persistRefreshedHead: async (oid) => { persisted.push(oid); } } as never);
+    await workflowOps.mergePr({ task, entity, persistRefreshedHead: async (oid: string) => { persisted.push(oid); } } as never);
     expect(workflowGithub.getPrStatus).toHaveBeenCalledTimes(1);
     expect(persisted).toHaveLength(1);
   });
@@ -481,8 +534,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     return { lifecycleFixture, lifecycleTask, lifecycleGithub, merge };
   }
 
-  it("refreshes the PR-merge lifecycle create boundary before GitHub sees the head", async () => {
-    const { lifecycleFixture, lifecycleTask, lifecycleGithub } = makeLifecycleFixture();
+  caseWithArrange("refreshes the PR-merge lifecycle create boundary before GitHub sees the head", () => makeLifecycleFixture(), async ({ lifecycleFixture, lifecycleTask, lifecycleGithub }) => {
     const lifecycleResult = await processPullRequestMergeTask(
       makeLifecycleStore(lifecycleTask) as never,
       lifecycleFixture.root,
@@ -494,7 +546,7 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(lifecycleGithub.createPr).toHaveBeenCalledTimes(1);
   });
 
-  it("refreshes the PR-merge lifecycle merge boundary before GitHub sees the head", async () => {
+  caseWithArrange("refreshes the PR-merge lifecycle merge boundary before GitHub sees the head", () => {
     const { lifecycleFixture, lifecycleTask, lifecycleGithub, merge } = makeLifecycleFixture();
     // Post-create state: the PR recorded by updatePrInfo and the head published on origin.
     git(lifecycleFixture.root, "push", "origin", lifecycleFixture.head);
@@ -506,6 +558,8 @@ describe("refreshAutomatedPrHead local git fixture", () => {
       assertPublishedSentinel(lifecycleFixture.remote, lifecycleFixture.head, "lifecycle-merge-sentinel.txt");
       return { number: 3, url: "https://example.test/pr/3", status: "merged" as const };
     });
+    return { lifecycleFixture, lifecycleTask, lifecycleGithub };
+  }, async ({ lifecycleFixture, lifecycleTask, lifecycleGithub }) => {
     const lifecycleMergeResult = await processPullRequestMergeTask(
       makeLifecycleStore(lifecycleTask) as never,
       lifecycleFixture.root,
@@ -562,13 +616,12 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     return { fixture, task, store, github, merge, group };
   }
 
-  it("refreshes the shared-group creation boundary before GitHub sees the head", async () => {
-    const { fixture, task, store, github } = makeSharedGroupFixture();
+  caseWithArrange("refreshes the shared-group creation boundary before GitHub sees the head", () => makeSharedGroupFixture(), async ({ fixture, task, store, github }) => {
     await expect(processPullRequestMergeTask(store as never, fixture.root, task.id, github as never, () => undefined)).resolves.toBe("waiting");
     expect(github.createPr).toHaveBeenCalledTimes(1);
   });
 
-  it("refreshes the shared-group merge boundary before GitHub sees the head", async () => {
+  caseWithArrange("refreshes the shared-group merge boundary before GitHub sees the head", () => {
     const { fixture, task, store, github, merge, group } = makeSharedGroupFixture();
     // Post-create state: the group head is published on origin and the group records its PR (what updateBranchGroup persists after creation).
     git(fixture.root, "push", "origin", fixture.head);
@@ -579,7 +632,8 @@ describe("refreshAutomatedPrHead local git fixture", () => {
       assertPublishedSentinel(fixture.remote, fixture.head, "group-merge-sentinel.txt");
       return { number: 4, url: "https://example.test/pr/4", status: "merged" as const };
     });
-
+    return { fixture, task, store, github };
+  }, async ({ fixture, task, store, github }) => {
     await expect(processPullRequestMergeTask(store as never, fixture.root, task.id, github as never, () => undefined)).resolves.toBe("merged");
     expect(github.mergePr).toHaveBeenCalledWith(expect.objectContaining({ expectedHeadOid: expect.any(String) }));
   });
@@ -594,9 +648,11 @@ describe("refreshAutomatedPrHead local git fixture", () => {
   and flaked against vitest's 5s default. Every adapter's fail-closed assertion
   is preserved; only the per-case wall clock changed.
   */
-  it("fails closed at the shared-group promotion PR-create adapter when rebase conflicts", async () => {
+  caseWithArrange("fails closed at the shared-group promotion PR-create adapter when rebase conflicts", () => {
     const promotionFixture = makeConflictingFixture("fusion/groups/fn-8838-conflict-promotion");
     const promotionGithub = { findPrForBranch: vi.fn(async () => null), createPr: vi.fn() };
+    return { promotionFixture, promotionGithub };
+  }, async ({ promotionFixture, promotionGithub }) => {
     await expect(createGroupPrCallback(promotionGithub as never)({
       cwd: promotionFixture.root,
       group: { id: "BG-conflict", sourceType: "planning", sourceId: "P-conflict" } as never,
@@ -607,12 +663,14 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(promotionGithub.createPr).not.toHaveBeenCalled();
   });
 
-  it("fails closed at the workflow PR node create adapter when rebase conflicts", async () => {
+  caseWithArrange("fails closed at the workflow PR node create adapter when rebase conflicts", () => {
     const workflowFixture = makeConflictingFixture("fusion/fn-8838-conflict-workflow");
     const workflowGithub = {
       createPr: vi.fn(), getPrStatus: vi.fn(), mergePr: vi.fn(), replyToReviewThread: vi.fn(),
       resolveReviewThread: vi.fn(), getViewerLogin: vi.fn(), getPrReviewThreadsDetailed: vi.fn(),
     };
+    return { workflowFixture, workflowGithub };
+  }, async ({ workflowFixture, workflowGithub }) => {
     await expect(createPrNodeGithubOps(workflowGithub as never).createPr({
       task: { id: "FN-8838-CONFLICT-WORKFLOW", title: "fixture", description: "fixture", worktree: workflowFixture.root },
       entity: { id: "pr-conflict", sourceId: "FN-8838-CONFLICT-WORKFLOW", repo: "fixture-owner/fixture-repo", headBranch: workflowFixture.head, baseBranch: "main" },
@@ -620,12 +678,14 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(workflowGithub.createPr).not.toHaveBeenCalled();
   });
 
-  it("fails closed at the workflow PR node merge adapter when rebase conflicts", async () => {
+  caseWithArrange("fails closed at the workflow PR node merge adapter when rebase conflicts", () => {
     const workflowMergeFixture = makeConflictingFixture("fusion/fn-8838-conflict-workflow-merge");
     const workflowMergeGithub = {
       createPr: vi.fn(), getPrStatus: vi.fn(), mergePr: vi.fn(), replyToReviewThread: vi.fn(),
       resolveReviewThread: vi.fn(), getViewerLogin: vi.fn(), getPrReviewThreadsDetailed: vi.fn(),
     };
+    return { workflowMergeFixture, workflowMergeGithub };
+  }, async ({ workflowMergeFixture, workflowMergeGithub }) => {
     await expect(createPrNodeGithubOps(workflowMergeGithub as never).mergePr({
       task: { id: "FN-8838-CONFLICT-WORKFLOW-MERGE", worktree: workflowMergeFixture.root },
       entity: { id: "pr-conflict-merge", sourceId: "FN-8838-CONFLICT-WORKFLOW-MERGE", repo: "fixture-owner/fixture-repo", headBranch: workflowMergeFixture.head, baseBranch: "main", prNumber: 5 },
@@ -634,12 +694,14 @@ describe("refreshAutomatedPrHead local git fixture", () => {
     expect(workflowMergeGithub.mergePr).not.toHaveBeenCalled();
   });
 
-  it("fails closed at the PR-merge lifecycle create adapter when rebase conflicts", async () => {
+  caseWithArrange("fails closed at the PR-merge lifecycle create adapter when rebase conflicts", () => {
     const lifecycleFixture = makeConflictingFixture("fusion/fn-8838-conflict-lifecycle");
     const lifecycleGithub = {
       findPrForBranch: vi.fn(async () => null), createPr: vi.fn(), getPrMergeStatus: vi.fn(), mergePr: vi.fn(),
     };
     const lifecycleTask = { id: "FN-8838-CONFLICT-LIFECYCLE", title: "fixture", description: "fixture", branch: lifecycleFixture.head, worktree: lifecycleFixture.root, column: "in-review" };
+    return { lifecycleFixture, lifecycleGithub, lifecycleTask };
+  }, async ({ lifecycleFixture, lifecycleGithub, lifecycleTask }) => {
     await expect(processPullRequestMergeTask(
       makeLifecycleStore(lifecycleTask) as never, lifecycleFixture.root, lifecycleTask.id, lifecycleGithub as never, () => undefined,
     )).rejects.toThrow(/rebase/);
