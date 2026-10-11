@@ -4,6 +4,7 @@
  * Complements no-commit-eligibility.ts (getNoCommitEligibilityReason).
  */
 import type { Task } from "@fusion/core";
+import { extractFileScopeSection } from "@fusion/core";
 
 export function parseReviewLevelFromPrompt(prompt: string): number {
   const reviewMatch = prompt.match(/##\s*Review Level[:\s]*(\d)/);
@@ -33,6 +34,14 @@ export function extractPromptListEntries(section: string): string[] {
     .map((line) => line.trim())
     .map((line) => line.replace(/^[-*]\s+/, "").replace(/^`([^`]+)`.*$/, "$1").trim())
     .filter(Boolean);
+}
+
+/**
+ * FNXC:FileScope 2026-10-11-14:50:
+ * List entries of the plan's File Scope section, located by the core locator so a list quoted in the Original Description never decides no-commit eligibility or the remediation scope guard.
+ */
+export function extractPromptFileScopeEntries(prompt: string): string[] {
+  return extractPromptListEntries((extractFileScopeSection(prompt) ?? "").trim());
 }
 
 function isFusionTaskArtifactScopeEntry(entry: string): boolean {
@@ -101,7 +110,7 @@ function getTaskTextForNoCommitEligibility(task: Task, promptContent: string): s
 
 export function evaluatePromptDerivedNoCommitEligibility(task: Task, promptContent: string): { eligible: boolean; reason?: string } {
   const combined = getTaskTextForNoCommitEligibility(task, promptContent).toLowerCase();
-  const promptScopeEntries = extractPromptListEntries(extractPromptSection(promptContent, "File Scope"));
+  const promptScopeEntries = extractPromptFileScopeEntries(promptContent);
   const metadataScope = Array.isArray(task.sourceMetadata?.fileScope)
     ? task.sourceMetadata.fileScope.filter((entry): entry is string => typeof entry === "string")
     : [];

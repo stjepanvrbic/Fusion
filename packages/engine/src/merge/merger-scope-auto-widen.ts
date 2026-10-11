@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import type { Task, TaskStore, WorkflowIr } from "@fusion/core";
-import { resolveWorkflowIrForTask, columnsWithFlag } from "@fusion/core";
+import { appendFileScopeEntries, resolveWorkflowIrForTask, columnsWithFlag } from "@fusion/core";
 
 import { toTaskToken } from "../merger.js";
 
@@ -220,29 +220,10 @@ export async function evaluateScopeAutoWiden(params: EvaluateScopeAutoWidenParam
   return { widened, refused };
 }
 
-function splitPromptSections(prompt: string): { before: string; section: string; after: string } {
-  const headingMatch = prompt.match(/^##\s+File Scope\s*$/m);
-  if (!headingMatch || headingMatch.index == null) {
-    throw new ScopeAutoWidenPersistError("PROMPT.md missing ## File Scope section");
-  }
-
-  const sectionStart = headingMatch.index + headingMatch[0].length;
-  const rest = prompt.slice(sectionStart);
-  const nextHeadingIndex = rest.search(/\n##?\s/);
-  const sectionEnd = nextHeadingIndex === -1 ? prompt.length : sectionStart + nextHeadingIndex;
-
-  return {
-    before: prompt.slice(0, sectionStart),
-    section: prompt.slice(sectionStart, sectionEnd),
-    after: prompt.slice(sectionEnd),
-  };
-}
-
-function parseScopeEntries(section: string): Set<string> {
-  const tokens = section.match(/`([^`]+)`/g) ?? [];
-  return new Set(tokens.map((token) => token.slice(1, -1)));
-}
-
+/**
+ * FNXC:FileScope 2026-10-11-14:50:
+ * Merge-time widening writes through the shared File Scope writer, so the marked entries land in the plan's section that every scope reader returns, never in a File Scope list quoted in the Original Description.
+ */
 export async function appendAutoWidenedScopeToPrompt(params: {
   store: Pick<TaskStore, "getTaskDir">;
   taskId: string;
@@ -253,14 +234,13 @@ export async function appendAutoWidenedScopeToPrompt(params: {
 
   const promptPath = join(store.getTaskDir(taskId), "PROMPT.md");
   const prompt = await readFile(promptPath, "utf-8");
-  const { before, section, after } = splitPromptSections(prompt);
-  const existing = parseScopeEntries(section);
-  const toAdd = files.filter((file) => !existing.has(file));
+  const appended = appendFileScopeEntries(prompt, files, { lineSuffix: ` <!-- scopeAutoWiden ${taskId} -->` });
+  if (!appended) {
+    throw new ScopeAutoWidenPersistError("PROMPT.md missing ## File Scope section");
+  }
+  const toAdd = appended.added;
   if (toAdd.length === 0) return [];
 
-  const insertion = toAdd.map((file) => `- \`${file}\` <!-- scopeAutoWiden ${taskId} -->`).join("\n");
-  const sectionTrimmed = section.trimEnd();
-  const normalizedSection = sectionTrimmed.length === 0 ? `\n\n${insertion}\n` : `${sectionTrimmed}\n${insertion}\n`;
-  await writeFile(promptPath, `${before}${normalizedSection}${after}`, "utf-8");
+  await writeFile(promptPath, appended.content, "utf-8");
   return toAdd;
 }

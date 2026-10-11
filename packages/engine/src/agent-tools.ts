@@ -2513,23 +2513,16 @@ export function createTaskFileScopeAddTool(store: TaskStore, taskId: string, run
         const valid = requested.filter((f) => fusionCore.isValidFileScopeEntry(f));
 
         const task = await store.getTask(taskId);
-        const prompt = task.prompt ?? "";
-        const headingMatch = prompt.match(/^##\s+File Scope\s*$/m);
-        if (!headingMatch) {
+        // FNXC:FileScope 2026-10-11-14:50: the shared writer appends to the plan's section, never to a File Scope list quoted in the Original Description, which hygiene would overwrite.
+        const appended = fusionCore.appendFileScopeEntries(task.prompt ?? "", valid);
+        if (!appended) {
           return errorContent(
             `ERROR: ${taskId}'s PROMPT.md has no "## File Scope" section to extend. Use fn_task_prompt_write if the spec needs a scope section.`,
           );
         }
 
-        const sectionStart = headingMatch.index! + headingMatch[0].length;
-        const rest = prompt.slice(sectionStart);
-        const nextHeadingIdx = rest.search(/^##\s/m);
-        const sectionEnd = nextHeadingIdx === -1 ? prompt.length : sectionStart + nextHeadingIdx;
-        const section = prompt.slice(sectionStart, sectionEnd);
-
-        const existing = new Set((section.match(/`([^`]+)`/g) ?? []).map((t) => t.slice(1, -1)));
-        const alreadyPresent = valid.filter((f) => existing.has(f));
-        const toAdd = valid.filter((f) => !existing.has(f));
+        const toAdd = appended.added;
+        const alreadyPresent = valid.filter((f) => !toAdd.includes(f));
 
         if (toAdd.length === 0) {
           const parts = ["No files added to File Scope."];
@@ -2538,12 +2531,7 @@ export function createTaskFileScopeAddTool(store: TaskStore, taskId: string, run
           return errorContent(parts.join(" "));
         }
 
-        const insertion = toAdd.map((f) => `- \`${f}\``).join("\n");
-        const sectionTrimmed = section.replace(/\s+$/, "");
-        const newSection = sectionTrimmed.length === 0 ? `\n\n${insertion}\n` : `${sectionTrimmed}\n${insertion}\n`;
-        const newPrompt = prompt.slice(0, sectionStart) + newSection + prompt.slice(sectionEnd);
-
-        await store.updateTask(taskId, { prompt: newPrompt }, runContext);
+        await store.updateTask(taskId, { prompt: appended.content }, runContext);
         await store
           .appendAgentLog(
             taskId,

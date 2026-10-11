@@ -1,3 +1,5 @@
+import { locateOriginalDescriptionRegion } from "./original-description-region.js";
+
 export type FileScopeClassificationReason =
   | "included-write-scope"
   | "invalid-entry"
@@ -207,12 +209,19 @@ function classifyToken(
 /**
  * Locate the operator-declared `## File Scope` section, skipping fenced code blocks
  * so documentation/repro samples (GitHub issues, unit-test snippets) are not treated as scope.
+ *
+ * FNXC:FileScopeClassification 2026-10-11-14:50:
+ * Every File Scope reader and writer (validation, sanitizing, effective write scope, engine guards and prompts, scope appends, GitHub tracking dedup) locates the section here, so they cannot disagree about which list is the task's scope.
+ * Lines inside the Original Description region do not exist for this scan: they never match the heading and never toggle the fence state, so an unbalanced fence in operator text cannot hide the plan's section.
+ * A region never promotes its content: a planned prompt whose plan has no File Scope section declares no scope, even when the request quotes one.
+ * Seed prompts (bootstrap stub, refinement seed, a specified prompt that copies the request under Mission) have no Original Description heading, so a File Scope heading in their operator text stays the provisional declared scope until planning moves the text into the region.
  */
 export function locateFileScopeSection(content: string): {
   headingStart: number;
   sectionStart: number;
   sectionEnd: number;
 } | null {
+  const region = locateOriginalDescriptionRegion(content);
   let inFence = false;
   let offset = 0;
   const lines = content.split("\n");
@@ -221,6 +230,11 @@ export function locateFileScopeSection(content: string): {
     const line = lines[i] ?? "";
     const lineStart = offset;
     const nextOffset = offset + line.length + (i < lines.length - 1 ? 1 : 0);
+
+    if (region && lineStart >= region.start && lineStart < region.end) {
+      offset = nextOffset;
+      continue;
+    }
 
     if (/^```/.test(line)) {
       inFence = !inFence;
@@ -248,6 +262,7 @@ export function locateFileScopeSection(content: string): {
           break;
         }
       }
+      if (region && region.start >= sectionStart && region.start < sectionEnd) sectionEnd = region.start;
 
       return { headingStart: lineStart, sectionStart, sectionEnd };
     }
@@ -258,10 +273,58 @@ export function locateFileScopeSection(content: string): {
   return null;
 }
 
-function extractFileScopeSection(content: string): string | null {
+/** Body of the located File Scope section (heading line excluded), or `null` when the prompt declares none. */
+export function extractFileScopeSection(content: string): string | null {
   const located = locateFileScopeSection(content);
   if (!located) return null;
   return content.slice(located.sectionStart, located.sectionEnd);
+}
+
+/**
+ * The located File Scope section including its heading line, trimmed, or `""` when the prompt declares none.
+ * For readers that quote the section into another prompt (step prompts, review summaries, spec checks).
+ */
+export function extractFileScopeSectionWithHeading(content: string): string {
+  const located = locateFileScopeSection(content);
+  return located ? content.slice(located.headingStart, located.sectionEnd).trim() : "";
+}
+
+/**
+ * FNXC:FileScopeClassification 2026-10-11-14:50:
+ * The one File Scope writer for the scope tool, review-remediation widening and merge-time auto-widen.
+ * It appends to the section `locateFileScopeSection` returns, so what a writer adds is what every reader returns; a writer that found the request's quoted list instead put the addition inside the Original Description, where hygiene replaced it with the verbatim request and the addition vanished while the tool reported success.
+ * A file counts as present only when it is a backticked token of the located section. Bytes outside the section never change.
+ * Returns `null` when the prompt has no File Scope section.
+ */
+export function appendFileScopeEntries(
+  content: string,
+  files: readonly string[],
+  options?: { lineSuffix?: string },
+): { content: string; added: string[] } | null {
+  const located = locateFileScopeSection(content);
+  if (!located) return null;
+
+  const body = content.slice(located.sectionStart, located.sectionEnd);
+  const present = new Set(extractBacktickedTokens(body));
+  const added: string[] = [];
+  for (const raw of files) {
+    const file = raw.trim();
+    if (!file || present.has(file)) continue;
+    present.add(file);
+    added.push(file);
+  }
+  if (added.length === 0) return { content, added };
+
+  const suffix = options?.lineSuffix ?? "";
+  const newLines = added.map((file) => `- \`${file}\`${suffix}`).join("\n");
+  const trimmedBody = body.trimEnd();
+  const nextBody = trimmedBody ? `${trimmedBody}\n${newLines}\n` : `\n${newLines}\n`;
+  const prefix = content.slice(0, located.sectionStart);
+  const headingBreak = prefix.endsWith("\n") ? "" : "\n";
+  return {
+    content: `${prefix}${headingBreak}${nextBody}${content.slice(located.sectionEnd)}`,
+    added,
+  };
 }
 
 function extractBacktickedTokens(text: string): string[] {

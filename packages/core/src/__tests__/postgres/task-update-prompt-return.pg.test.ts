@@ -267,4 +267,73 @@ pgDescribe("updateTask prompt return (PostgreSQL backend mode)", () => {
     expect(updated.prompt).toBe(seed);
     expect(await readFile(join(store.taskDir(task.id), "PROMPT.md"), "utf8")).toBe(seed);
   });
+
+  /*
+  FNXC:FileScopeClassification 2026-10-11-14:50:
+  Requests routinely end with a quoted File Scope heading, a path list and an "Origin:" line.
+  Hygiene re-inserts that request verbatim before validation, so a locator that read it rejected every plan write over tokens only the request held, and the effective scope came from the request instead of the plan.
+  */
+  const quotedScopeDescription = (bullets: string[], origin: string) =>
+    ["The requester explains the defect.", "", "## File Scope", ...bullets, "", origin].join("\n");
+  const planEntries = ["packages/cli/vitest.config.ts", "docs/testing.md"];
+  const plannedPrompt = (scopeLines = planEntries.map((entry) => `- \`${entry}\``)) => [
+    "# Task",
+    "",
+    "## Original Description",
+    "",
+    "The requester wants the quoted scope ignored.",
+    "",
+    "## What This Delivers",
+    "",
+    "- Plans can be saved.",
+    "",
+    "## Mission",
+    "",
+    "Read the plan's scope.",
+    "",
+    "## File Scope",
+    "",
+    ...scopeLines,
+    "",
+    "## Steps",
+    "",
+    "1. Do it",
+    "",
+  ].join("\n");
+
+  it.sequential.each([
+    ["a backticked package specifier", quotedScopeDescription(["- packages/quoted/plain.ts"], "Origin: the `@fusion/core/memory-mcp` entry point.")],
+    ["a backticked path-like token", quotedScopeDescription(["- packages/quoted/plain.ts"], "Origin: the server at `commands/mcp-memory-server.js`.")],
+    ["no backticked tokens", quotedScopeDescription(["- packages/quoted/plain.ts", "- docs/quoted.md"], "Origin: an earlier planning session.")],
+  ])("accepts a plan whose request quotes File Scope with %s and parses the plan's entries", async (_label, description) => {
+    const task = await store.createTask({ description });
+
+    const updated = await store.updateTask(task.id, { prompt: plannedPrompt() });
+
+    const onDisk = await readFile(join(store.taskDir(task.id), "PROMPT.md"), "utf8");
+    expect(onDisk).toContain(`${ORIGINAL_DESCRIPTION_START_MARKER}\n${description}\n${ORIGINAL_DESCRIPTION_END_MARKER}`);
+    expect(updated.prompt).toBe(onDisk);
+    expect(await store.parseFileScopeFromPrompt(task.id)).toEqual(planEntries);
+  });
+
+  it.sequential("still rejects an invalid entry in the plan's own section, naming only that entry", async () => {
+    const task = await store.createTask({
+      description: quotedScopeDescription(["- `decoy/quoted-only.ts`"], "Origin: an earlier planning session."),
+    });
+
+    const write = store.updateTask(task.id, { prompt: plannedPrompt(["- `packages/cli/vitest.config.ts`", "- `origin/main`"]) });
+
+    await expect(write).rejects.toMatchObject({ name: "InvalidFileScopeError", invalidEntries: ["origin/main"] });
+  });
+
+  it.sequential("keeps a quoted File Scope in an unplanned stub as its provisional scope", async () => {
+    const task = await store.createTask({
+      description: quotedScopeDescription(
+        ["- `decoy/quoted-only.ts`"],
+        "Origin: `commands/mcp-memory-server.js` and `@fusion/core/memory-mcp`.",
+      ),
+    });
+
+    expect(await store.parseFileScopeFromPrompt(task.id)).toEqual(["decoy/quoted-only.ts", "commands/mcp-memory-server.js"]);
+  });
 });

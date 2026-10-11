@@ -16,6 +16,9 @@
  * Token extraction and section location are shared with classification so fenced
  * code-block File Scope headings (issue repros) are ignored consistently on create,
  * sanitize, and effective write-scope paths.
+ *
+ * FNXC:FileScopeClassification 2026-10-11-14:50:
+ * Validation and sanitizing inherit the Original Description boundary from the locator: a File Scope list quoted in the operator request is neither validated nor sanitized, so a plan write cannot be rejected for tokens it does not contain and sanitizing never edits the request.
  */
 export { isValidFileScopeEntry, extractFileScopeTokens } from "../tasks/file-scope-classification.js";
 import {

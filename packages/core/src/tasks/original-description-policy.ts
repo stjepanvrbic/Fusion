@@ -451,7 +451,7 @@ function findFirstH2AtOrAfter(text: string, offset: number): number {
  * Find an unmarked section boundary using the operator body before legacy heading tiebreaks.
  * An unknown body (`undefined`) has nothing to align and goes straight to the tiebreak.
  */
-function findUnmarkedSectionTerminatorOffset(
+export function findUnmarkedSectionTerminatorOffset(
   text: string,
   operatorBody?: string,
 ): number {

@@ -11,6 +11,8 @@
  * ending in `.css` or `.tsx`, excluding the `components/` and `hooks/` subtrees
  * already covered by rules 2 and 3.
  */
+import { extractFileScopeSection } from "./file-scope-classification.js";
+
 export const FRONTEND_UX_PATH_GLOBS = [
   "packages/dashboard/**",
   "packages/*/app/components/**",
@@ -71,12 +73,16 @@ export function matchesFrontendUxPath(path: string): boolean {
     && !matchGlob(normalized, FRONTEND_UX_PATH_GLOBS[2]);
 }
 
+/**
+ * FNXC:FileScopeClassification 2026-10-11-14:50:
+ * The section comes from the shared locator, so a File Scope list quoted in the Original Description never decides whether frontend criteria apply, and every entry of the plan's section is read (a private pattern here stopped after the first line).
+ */
 function parseFileScopeFromPromptMarkdown(text: string): string[] {
-  const match = text.match(/^##\s+File Scope\s*\n([\s\S]*?)(?=^##\s+|$)/m);
-  if (!match) return [];
+  const section = extractFileScopeSection(text);
+  if (section === null) return [];
 
   const entries: string[] = [];
-  for (const line of match[1].split("\n")) {
+  for (const line of section.split("\n")) {
     const cleaned = normalizeFileScopeLine(line);
     if (cleaned) entries.push(cleaned);
   }

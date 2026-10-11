@@ -53,7 +53,7 @@ import {
   runWithFusionSessionIdentity,
   resolvePiExtensionProjectRoot,
   resolveToolOutputBudget,
-  matchStepHeadings,
+  matchStepHeadings, extractFileScopeSectionWithHeading,
 } from "@fusion/core";
 import type {
   AgentPermissionPolicyActionCategory,
@@ -781,7 +781,7 @@ function compactTaskPromptSectionBody(body: string): string {
   const preamble = (firstSectionIndex === -1 ? promptContent : promptContent.slice(0, firstSectionIndex)).trim();
   const missionSection = extractMarkdownSection(promptContent, "Mission");
   const dependenciesSection = extractMarkdownSection(promptContent, "Dependencies");
-  const fileScopeSection = extractMarkdownSection(promptContent, "File Scope");
+  const fileScopeSection = extractFileScopeSectionWithHeading(promptContent); // FNXC:FileScope 2026-10-11-14:50: core locator skips a list quoted in the Original Description.
   const stepsSection = compactTaskPromptStepsSection(extractMarkdownSection(promptContent, "Steps"));
 
   const compactedContent = [

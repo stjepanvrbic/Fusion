@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { TaskStore } from "@fusion/core";
+import { extractEffectiveWriteScopeFromPrompt } from "@fusion/core";
 import { createTaskFileScopeAddTool } from "../agent-tools.js";
+import {
+  QUOTED_DECOY_PATH,
+  originalDescriptionRegionText,
+  plannedPromptWithQuotedScope,
+} from "./_quoted-file-scope-prompt.js";
 
 vi.mock("@fusion/core", async (importOriginal) => {
   const { createEngineCoreMock } = await import("../test/mockCore.js");
@@ -100,5 +106,37 @@ describe("fn_task_file_scope_add", () => {
 
     expect(updateTask).not.toHaveBeenCalled();
     expect(getText(result)).toMatch(/no "## File Scope" section/);
+  });
+
+  describe("with a File Scope list quoted in the Original Description", () => {
+    it("appends to the plan's section and leaves the request byte-identical", async () => {
+      const prompt = plannedPromptWithQuotedScope();
+      const { store, updateTask } = createMockStore(prompt);
+
+      await runTool(createTaskFileScopeAddTool(store, TASK_ID), { files: ["packages/engine/src/foo.ts"] });
+
+      const newPrompt = (updateTask.mock.calls[0]?.[1] as { prompt: string }).prompt;
+      expect(originalDescriptionRegionText(newPrompt)).toBe(originalDescriptionRegionText(prompt));
+      expect(extractEffectiveWriteScopeFromPrompt(newPrompt)).toEqual(["packages/engine/src/real.ts", "packages/engine/src/foo.ts"]);
+    });
+
+    it("adds a file that only the quoted request lists", async () => {
+      const { store, updateTask } = createMockStore(plannedPromptWithQuotedScope());
+
+      const result = await runTool(createTaskFileScopeAddTool(store, TASK_ID), { files: [QUOTED_DECOY_PATH] });
+
+      expect(getText(result)).toBe(`Added to File Scope: ${QUOTED_DECOY_PATH}.`);
+      const newPrompt = (updateTask.mock.calls[0]?.[1] as { prompt: string }).prompt;
+      expect(extractEffectiveWriteScopeFromPrompt(newPrompt)).toContain(QUOTED_DECOY_PATH);
+    });
+
+    it("reports the missing section when only the request has one", async () => {
+      const { store, updateTask } = createMockStore(plannedPromptWithQuotedScope(null));
+
+      const result = await runTool(createTaskFileScopeAddTool(store, TASK_ID), { files: ["packages/engine/src/foo.ts"] });
+
+      expect(updateTask).not.toHaveBeenCalled();
+      expect(getText(result)).toMatch(/no "## File Scope" section/);
+    });
   });
 });

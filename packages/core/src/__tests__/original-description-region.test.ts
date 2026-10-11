@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   findGeneratedOriginalDescriptionEnd,
+  locateOriginalDescriptionRegion,
   stripOriginalDescriptionSection,
 } from "../tasks/original-description-region.js";
 import {
@@ -130,5 +131,61 @@ describe("generated Original Description region", () => {
     const unmarked = `# Task\n\n${heading}\n\n${body}\n\n${planner}`;
 
     expect(stripOriginalDescriptionSection(`# Task\n\n${marked(body, `\n${planner}`)}`)).toBe(stripOriginalDescriptionSection(unmarked));
+  });
+});
+
+describe("locateOriginalDescriptionRegion", () => {
+  it("returns null when the prompt has no Original Description heading", () => {
+    expect(locateOriginalDescriptionRegion("# Task\n\nOperator request.\n\n## File Scope\n\n- `a.ts`\n")).toBeNull();
+  });
+
+  it("covers a marked section from the heading through the end marker", () => {
+    const prompt = `# Task\n\n${marked("Operator request.", "\n## Mission\n\nGo.")}`;
+    const region = locateOriginalDescriptionRegion(prompt)!;
+
+    expect(region.start).toBe(prompt.indexOf(heading));
+    expect(prompt.slice(region.start, region.end)).toBe(
+      `${heading}\n\n${ORIGINAL_DESCRIPTION_START_MARKER}\nOperator request.\n${ORIGINAL_DESCRIPTION_END_MARKER}\n`,
+    );
+  });
+
+  it("ends an unmarked section at the first known heading by list priority", () => {
+    const prompt = `# Task\n\n${heading}\n\nOperator request.\n\n## Mission\n\nQuoted.\n\n## What This Delivers\n\n- Value.\n`;
+    const region = locateOriginalDescriptionRegion(prompt)!;
+
+    expect(region).toEqual({ start: prompt.indexOf(heading), end: prompt.indexOf("## What This Delivers") });
+  });
+
+  it("ends an unresolved marker region just past the first end marker", () => {
+    const prompt = `# Task\n\n${marked("Operator request.", "\n## Rollout Notes\n\nCustom plan section.")}`;
+    const region = locateOriginalDescriptionRegion(prompt)!;
+
+    expect(region).toEqual({
+      start: prompt.indexOf(heading),
+      end: prompt.indexOf(ORIGINAL_DESCRIPTION_END_MARKER) + ORIGINAL_DESCRIPTION_END_MARKER.length,
+    });
+  });
+
+  it("bounds a start marker with no end marker like an unmarked section", () => {
+    const prompt = `# Task\n\n${heading}\n\nMentions ${ORIGINAL_DESCRIPTION_START_MARKER} inline.\n\n## File Scope\n\n- \`decoy.ts\`\n\n## Mission\n\nGo.\n`;
+    const region = locateOriginalDescriptionRegion(prompt)!;
+
+    expect(region).toEqual({ start: prompt.indexOf(heading), end: prompt.indexOf("## Mission") });
+  });
+
+  it("never logs, whatever the shape", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    for (const prompt of [
+      "# Task\n",
+      `${heading}\n\nLegacy prose.\n\n## Mission\n`,
+      marked("Operator request.", "\n## Why\n\nCustom."),
+      marked(`Operator.\n${ORIGINAL_DESCRIPTION_END_MARKER}\nmore.`, "\n## Mission\n"),
+      `${heading}\n\n${ORIGINAL_DESCRIPTION_START_MARKER}\nOperator request.\n## Mission`,
+    ]) {
+      locateOriginalDescriptionRegion(prompt);
+    }
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
   });
 });

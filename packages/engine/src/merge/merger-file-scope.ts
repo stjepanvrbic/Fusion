@@ -4,6 +4,7 @@
  * Re-exported from merger.ts for stable public/test import paths.
  */
 import type { Task, TaskStore } from "@fusion/core";
+import { extractFileScopeSection } from "@fusion/core";
 import { promisify } from "node:util";
 import { exec, execFile } from "node:child_process";
 import { matchGlob } from "./merger-glob.js";
@@ -69,22 +70,18 @@ export function parseDiffStat(diffStat: string): DiffFileEntry[] {
 /**
  * Extract the `## File Scope` section from a PROMPT.md string.
  * Returns an array of file/glob patterns (lines starting with `- \``).
+ *
+ * FNXC:FileScope 2026-10-11-14:50:
+ * The section comes from the core locator, so a File Scope list quoted in the Original Description never decides diff-scope warnings or remediation scope.
  */
 export function extractFileScope(promptContent: string): string[] {
-  const lines = promptContent.split("\n");
+  const section = extractFileScopeSection(promptContent);
+  if (section === null) return [];
   const patterns: string[] = [];
-  let inScope = false;
-  for (const line of lines) {
-    if (/^##\s+File Scope/.test(line)) {
-      inScope = true;
-      continue;
-    }
-    if (inScope && /^##\s/.test(line)) break; // next section
-    if (inScope) {
-      // Match "- `path/to/file`" or "- path/to/file"
-      const m = line.match(/^-\s+`?([^`\s]+)`?\s*(?:\(.*\))?\s*$/);
-      if (m) patterns.push(m[1]);
-    }
+  for (const line of section.split("\n")) {
+    // Match "- `path/to/file`" or "- path/to/file"
+    const m = line.match(/^-\s+`?([^`\s]+)`?\s*(?:\(.*\))?\s*$/);
+    if (m) patterns.push(m[1]);
   }
   return patterns;
 }

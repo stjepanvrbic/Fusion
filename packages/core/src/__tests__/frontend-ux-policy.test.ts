@@ -4,6 +4,7 @@ import {
   applyFrontendUxCriteria,
   matchesFrontendUxPath,
 } from "../tasks/frontend-ux-policy.js";
+import { applyOriginalDescription } from "../tasks/original-description-policy.js";
 
 const EXACT_FRONTEND_UX_CRITERIA = `## Frontend UX Criteria
 
@@ -112,5 +113,18 @@ Implement dashboard UI.
     expect(FRONTEND_UX_CRITERIA_SECTION).toContain("Component reuse");
     expect(FRONTEND_UX_CRITERIA_SECTION).toContain("Responsive scaffolding");
     expect(FRONTEND_UX_CRITERIA_SECTION).toContain("Visual hierarchy preserved");
+  });
+
+  it("ignores a frontend path that only the quoted Original Description lists", () => {
+    const request = "Make the page nicer.\n\n## File Scope\n- `packages/plugin/app/routes.tsx`";
+    const original = applyOriginalDescription(promptWithFileScope(["packages/engine/src/triage.ts"]), request);
+
+    expect(applyFrontendUxCriteria(original)).toBe(original);
+  });
+
+  it("reads every entry of the plan's section, not only the first", () => {
+    const original = promptWithFileScope(["packages/engine/src/triage.ts", "packages/plugin/app/routes.tsx"]);
+
+    expect(applyFrontendUxCriteria(original).match(/## Frontend UX Criteria/g)).toHaveLength(1);
   });
 });

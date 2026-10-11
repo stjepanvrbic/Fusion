@@ -3,6 +3,7 @@
  * noCommitsExpected eligibility heuristics peeled from executor.ts (wave18 / U4 Slice A).
  */
 import type { Task } from "@fusion/core";
+import { extractFileScopeSection } from "@fusion/core";
 
 function getPromptSection(prompt: string, heading: string): string {
   const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -38,8 +39,12 @@ function promptLooksCoordinationOnly(prompt: string): boolean {
   return hasCoordinationIntent && !hasImplementationDirective;
 }
 
+/**
+ * FNXC:FileScope 2026-10-11-14:50:
+ * The section comes from the core locator, so board-only wording in a File Scope list quoted in the Original Description cannot make a source task look coordination-only.
+ */
 function promptFileScopeIsBoardOnly(prompt: string): boolean {
-  const fileScope = getPromptSection(prompt, "File Scope");
+  const fileScope = (extractFileScopeSection(prompt) ?? "").trim();
   if (!fileScope.trim()) return false;
   const normalized = fileScope.toLowerCase();
   const sourcePathPattern = /(?:^|[\s`'"(])(?:packages|src|source|sources|app|apps|lib|libs|components|scripts|docs|\.github|config|test|tests|__tests__)\//m;

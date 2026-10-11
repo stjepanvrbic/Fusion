@@ -17,16 +17,26 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  appendFileScopeEntries,
+  classifyFileScopeFromPrompt,
   extractEffectiveWriteScopeFromPrompt,
   extractFileScopeTokens,
   isValidFileScopeEntry,
+  locateFileScopeSection,
 } from "../tasks/file-scope-classification.js";
 import {
   isValidFileScopeEntry as storeFileScopeIsValidFileScopeEntry,
+  sanitizeFileScopeInPromptContent,
   validateFileScopeInPromptContent,
 } from "../task-store/file-scope.js";
 import { isValidFileScopeEntry as storeIsValidFileScopeEntry } from "../store.js";
-import { buildBootstrapPrompt } from "../mesh/mesh-task-replication.js";
+import { buildBootstrapPrompt, buildRefinementSeedPrompt } from "../mesh/mesh-task-replication.js";
+import {
+  ORIGINAL_DESCRIPTION_END_MARKER,
+  ORIGINAL_DESCRIPTION_START_MARKER,
+  applyOriginalDescription,
+} from "../tasks/original-description-policy.js";
+import { locateOriginalDescriptionRegion } from "../tasks/original-description-region.js";
 
 describe("isValidFileScopeEntry", () => {
   it("accepts root-level repo files with letter-leading extensions", () => {
@@ -340,3 +350,194 @@ Only if changed:
   });
 });
 
+
+/*
+FNXC:FileScopeClassification 2026-10-11-14:50:
+Operator requests routinely end with a quoted File Scope heading, a path list and an "Origin:" line.
+Once planning wraps the request in the Original Description region, that quoted list must never be read, validated, sanitized or extended as the task's scope; only the plan's own section counts.
+*/
+describe("File Scope quoted inside the Original Description", () => {
+  const planEntries = ["packages/engine/src/real.ts", "docs/testing.md"];
+  const planScope = ["## File Scope", "", "- `packages/engine/src/real.ts`", "- `docs/testing.md`", ""].join("\n");
+
+  const variants = {
+    A: { bullets: ["- packages/quoted/plain.ts", "- docs/quoted.md"], origin: "Origin: an earlier planning session." },
+    B: { bullets: ["- `decoy/quoted-only.ts`"], origin: "Origin: an earlier planning session." },
+    C: { bullets: ["- packages/quoted/plain.ts"], origin: "Origin: the server at `commands/mcp-memory-server.js`." },
+    D: { bullets: ["- packages/quoted/plain.ts"], origin: "Origin: the `@fusion/core/memory-mcp` entry point." },
+    E: {
+      bullets: ["- `decoy/quoted-only.ts`"],
+      origin: "Origin: `commands/mcp-memory-server.js` and `@fusion/core/memory-mcp`.",
+    },
+  } as const;
+  type Variant = keyof typeof variants;
+
+  function description(variant: Variant): string {
+    const { bullets, origin } = variants[variant];
+    return ["The requester explains the defect here.", "", "## File Scope", ...bullets, "", origin].join("\n");
+  }
+
+  function plan(options: { firstHeading?: string; scope?: string } = {}): string {
+    const scope = options.scope ?? planScope;
+    return [
+      "# Task: KB-1 - Example",
+      "",
+      "**Created:** 2026-10-11",
+      "",
+      options.firstHeading ?? "## What This Delivers\n\n- Plans can be saved.",
+      "",
+      "## Mission",
+      "",
+      "Do the planned work.",
+      "",
+      scope,
+      "## Steps",
+      "",
+      "### Step 1: Work",
+      "",
+      "- [ ] Do it.",
+      "",
+    ].join("\n");
+  }
+
+  function stripMarkers(prompt: string): string {
+    return prompt
+      .replace(`${ORIGINAL_DESCRIPTION_START_MARKER}\n`, "")
+      .replace(`${ORIGINAL_DESCRIPTION_END_MARKER}\n`, "");
+  }
+
+  const shapes = {
+    marked: (variant: Variant) => applyOriginalDescription(plan(), description(variant)),
+    unmarked: (variant: Variant) => stripMarkers(applyOriginalDescription(plan(), description(variant))),
+    "custom successor": (variant: Variant) =>
+      applyOriginalDescription(plan({ firstHeading: "## Rollout Notes\n\nShip gradually." }), description(variant)),
+  } as const;
+
+  function planHeadingOffset(prompt: string): number {
+    return prompt.lastIndexOf("\n## File Scope\n") + 1;
+  }
+
+  const cases = (Object.keys(shapes) as (keyof typeof shapes)[]).flatMap((shape) =>
+    (Object.keys(variants) as Variant[]).map((variant) => [shape, variant] as const),
+  );
+
+  it.each(cases)("%s region, variant %s: reads, validates and sanitizes only the plan's section", (shape, variant) => {
+    const prompt = shapes[shape](variant);
+    expect(locateOriginalDescriptionRegion(prompt)).not.toBeNull();
+    expect(prompt.indexOf("## File Scope")).toBeLessThan(planHeadingOffset(prompt));
+
+    expect(locateFileScopeSection(prompt)?.headingStart).toBe(planHeadingOffset(prompt));
+    expect(extractFileScopeTokens(prompt)).toEqual(planEntries);
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual(planEntries);
+    expect(classifyFileScopeFromPrompt(prompt).entries.map((entry) => entry.token)).toEqual(planEntries);
+    expect(validateFileScopeInPromptContent(prompt)).toEqual({ valid: planEntries, invalid: [] });
+    expect(sanitizeFileScopeInPromptContent(prompt)).toEqual({ sanitized: prompt, dropped: [], kept: planEntries });
+  });
+
+  it("declares no scope when the plan has no File Scope section, whatever the request quotes", () => {
+    const prompt = applyOriginalDescription(plan({ scope: "" }), description("E"));
+    expect(locateFileScopeSection(prompt)).toBeNull();
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual([]);
+    expect(validateFileScopeInPromptContent(prompt)).toEqual({ valid: [], invalid: [] });
+  });
+
+  it("still reports and sanitizes an invalid token in the plan's own section, leaving the region untouched", () => {
+    const scope = ["## File Scope", "", "- `packages/engine/src/real.ts`", "- `origin/main`", ""].join("\n");
+    const prompt = applyOriginalDescription(plan({ scope }), description("D"));
+    const region = locateOriginalDescriptionRegion(prompt)!;
+
+    expect(validateFileScopeInPromptContent(prompt)).toEqual({
+      valid: ["packages/engine/src/real.ts"],
+      invalid: ["origin/main"],
+    });
+    const { sanitized, dropped } = sanitizeFileScopeInPromptContent(prompt);
+    expect(dropped).toEqual(["origin/main"]);
+    expect(sanitized).toBe(prompt.replace("- `origin/main`\n", ""));
+    expect(sanitized.slice(region.start, region.end)).toBe(prompt.slice(region.start, region.end));
+  });
+
+  it("does not let an unbalanced fence in the request hide the plan's section", () => {
+    const request = ["Repro:", "", "```ts", "const broken = true;", "## File Scope", "- `decoy/quoted-only.ts`"].join("\n");
+    const prompt = applyOriginalDescription(plan(), request);
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual(planEntries);
+  });
+
+  it("resolves the plan's section when the request quotes the marker comments literally", () => {
+    const request = [
+      `Hygiene writes ${ORIGINAL_DESCRIPTION_START_MARKER} and ${ORIGINAL_DESCRIPTION_END_MARKER} around requests.`,
+      "",
+      description("B"),
+    ].join("\n");
+    const prompt = applyOriginalDescription(plan(), request);
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual(planEntries);
+    expect(validateFileScopeInPromptContent(prompt)).toEqual({ valid: planEntries, invalid: [] });
+  });
+
+  it("resolves the plan's section in an unwrapped section whose request mentions the start marker with no end marker", () => {
+    const request = description("B").replace(
+      "The requester explains the defect here.",
+      `The requester mentions ${ORIGINAL_DESCRIPTION_START_MARKER} inline.`,
+    );
+    const prompt = plan().replace("## What This Delivers", `## Original Description\n\n${request}\n\n## What This Delivers`);
+    expect(prompt).not.toContain(ORIGINAL_DESCRIPTION_END_MARKER);
+    expect(locateFileScopeSection(prompt)?.headingStart).toBe(planHeadingOffset(prompt));
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual(planEntries);
+  });
+
+  it("resolves the plan's section when the prompt has CRLF line endings", () => {
+    const prompt = shapes.marked("E").replaceAll("\n", "\r\n");
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual(planEntries);
+    expect(validateFileScopeInPromptContent(prompt)).toEqual({ valid: planEntries, invalid: [] });
+  });
+
+  it.each([
+    ["bootstrap stub", () => buildBootstrapPrompt("KB-1", "Example", description("B"))],
+    ["refinement seed", () => buildRefinementSeedPrompt("Example", description("B"))],
+  ])("keeps a %s's quoted File Scope as its provisional declared scope", (_label, build) => {
+    const prompt = build();
+    expect(locateOriginalDescriptionRegion(prompt)).toBeNull();
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual(["decoy/quoted-only.ts"]);
+  });
+
+  describe("appendFileScopeEntries", () => {
+    it("appends to the plan's section and round-trips through the effective-scope reader", () => {
+      const prompt = shapes.marked("B");
+      const region = locateOriginalDescriptionRegion(prompt)!;
+      const result = appendFileScopeEntries(prompt, ["packages/engine/src/new.ts"])!;
+
+      expect(result.added).toEqual(["packages/engine/src/new.ts"]);
+      expect(result.content.slice(region.start, region.end)).toBe(prompt.slice(region.start, region.end));
+      expect(extractEffectiveWriteScopeFromPrompt(result.content)).toEqual([...planEntries, "packages/engine/src/new.ts"]);
+    });
+
+    it("adds a file listed only in the quoted section and skips one already in the plan's section", () => {
+      const prompt = shapes.marked("B");
+      const result = appendFileScopeEntries(prompt, ["  decoy/quoted-only.ts ", "docs/testing.md", "", "decoy/quoted-only.ts"])!;
+      expect(result.added).toEqual(["decoy/quoted-only.ts"]);
+      expect(extractEffectiveWriteScopeFromPrompt(result.content)).toEqual([...planEntries, "decoy/quoted-only.ts"]);
+
+      expect(appendFileScopeEntries(prompt, ["docs/testing.md"])).toEqual({ content: prompt, added: [] });
+    });
+
+    it("writes the scope-tool shape: one line per file, a single newline before the next heading", () => {
+      const prompt = "# T\n\n## File Scope\n\n- `a.ts`\n\n## Steps\n\n- go\n";
+      expect(appendFileScopeEntries(prompt, ["b.ts", "c.ts"])?.content).toBe(
+        "# T\n\n## File Scope\n\n- `a.ts`\n- `b.ts`\n- `c.ts`\n## Steps\n\n- go\n",
+      );
+      expect(appendFileScopeEntries("# T\n\n## File Scope\n\n## Steps\n", ["b.ts"])?.content).toBe(
+        "# T\n\n## File Scope\n\n- `b.ts`\n## Steps\n",
+      );
+    });
+
+    it("returns null when no section is located", () => {
+      expect(appendFileScopeEntries(applyOriginalDescription(plan({ scope: "" }), description("B")), ["a.ts"])).toBeNull();
+    });
+
+    it("appends the line suffix and the suffixed entry is still read back", () => {
+      const suffix = " <!-- scopeAutoWiden: merge -->";
+      const result = appendFileScopeEntries(shapes.marked("B"), ["packages/engine/src/new.ts"], { lineSuffix: suffix })!;
+      expect(result.content).toContain(`- \`packages/engine/src/new.ts\`${suffix}\n`);
+      expect(extractEffectiveWriteScopeFromPrompt(result.content)).toContain("packages/engine/src/new.ts");
+    });
+  });
+});

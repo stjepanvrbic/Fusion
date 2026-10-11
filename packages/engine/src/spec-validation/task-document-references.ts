@@ -1,6 +1,6 @@
 import { access } from "node:fs/promises";
 import { join } from "node:path";
-import { matchStepHeadings } from "@fusion/core";
+import { extractFileScopeSectionWithHeading, matchStepHeadings } from "@fusion/core";
 import { extractSection } from "../execution/step-session-executor.js";
 
 export interface DanglingTaskDocReference {
@@ -59,8 +59,9 @@ function collectProducedArtifacts(stepsSection: string): Set<string> {
   return produced;
 }
 
+/** FNXC:FileScope 2026-10-11-14:50: only the plan's File Scope (core locator) may declare task-local artifacts; a list quoted in the Original Description cannot excuse a dangling reference. */
 function collectFileScopePaths(promptContent: string): Set<string> {
-  const section = extractSection(promptContent, "File Scope");
+  const section = extractFileScopeSectionWithHeading(promptContent);
   const paths = new Set<string>();
   for (const token of collectTaskPaths(section)) {
     paths.add(token);

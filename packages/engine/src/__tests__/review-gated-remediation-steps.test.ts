@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Task, TaskStep } from "@fusion/core";
-import { hasOpenEquivalentRemediationStep, planRemediationPlacement } from "@fusion/core";
+import { extractEffectiveWriteScopeFromPrompt, hasOpenEquivalentRemediationStep, planRemediationPlacement } from "@fusion/core";
 import { deriveRemediationSteps } from "../executor/derive-remediation-steps.js";
 import { appendReviewRemediationSteps } from "../executor/append-review-remediation-steps.js";
+import { originalDescriptionRegionText, plannedPromptWithQuotedScope } from "./_quoted-file-scope-prompt.js";
 
 describe("deriveRemediationSteps", () => {
   const base = { gateStepId: "code-review", wave: 1, prompt: "## File Scope\n- `src/**`", changedFiles: [] } as const;
@@ -155,6 +156,18 @@ describe("review remediation release and fallback policy", () => {
       remediation: expect.objectContaining({ wave: 4 }),
     }));
     expect(store.logEntry).not.toHaveBeenCalled();
+  });
+
+  it("widens the plan's File Scope, not a list quoted in the Original Description", async () => {
+    const prompt = plannedPromptWithQuotedScope();
+    const changed = "packages/engine/src/changed.ts";
+    const task = subject({ worktree: "/tmp/kb-128-widen", prompt, modifiedFiles: [changed] });
+    const store = storeFor(task);
+    await expect(append(task, store, [{ id: "widen", title: "guard", body: "fix the changed guard", filePath: changed, severity: "critical" }]))
+      .resolves.toBe("appended");
+
+    expect(originalDescriptionRegionText(task.prompt ?? "")).toBe(originalDescriptionRegionText(prompt));
+    expect(extractEffectiveWriteScopeFromPrompt(task.prompt ?? "")).toEqual(["packages/engine/src/real.ts", changed]);
   });
 
   it("keeps wave as provenance beyond ten remediation passes", async () => {

@@ -1,3 +1,4 @@
+import { extractFileScopeSectionWithHeading } from "@fusion/core";
 import { extractSection } from "../execution/step-session-executor.js";
 
 export interface ExternalIntegrationEvidenceFinding {
@@ -22,10 +23,8 @@ export interface DetectExternalIntegrationEvidenceOptions {
   detectorOverrides?: ExternalIntegrationDetectorOverrides;
 }
 
-const SECTION_NAMES = [
-  "Mission",
-  "Steps",
-  "File Scope",
+const LEADING_SECTION_NAMES = ["Mission", "Steps"];
+const TRAILING_SECTION_NAMES = [
   "Context to Read First",
   "External Integration Evidence",
   "External-Integration Evidence",
@@ -44,8 +43,16 @@ const DEFAULT_INTEGRATION_PATTERN = /\b(?:worktrunk|cloudflared|tunnel|installer
 const DEFAULT_DOWNLOAD_VERB_PATTERN = /\b(?:install|download|probe|release|binary|cargo install|curl\s+[^\n]*-o|tar\s+-xz)\b/i;
 const DUPLICATE_GITHUB_REPO_PATTERN = /^https:\/\/github\.com\/([^/]+)\/([^/]+)(?:\/|$)/i;
 
+/**
+ * FNXC:FileScope 2026-10-11-14:50:
+ * File Scope joins in through the core locator, so integration keywords in a File Scope list quoted in the Original Description do not demand evidence from the plan.
+ */
 function collectSections(promptContent: string): string {
-  return SECTION_NAMES.map((name) => extractSection(promptContent, name)).join("\n");
+  return [
+    ...LEADING_SECTION_NAMES.map((name) => extractSection(promptContent, name)),
+    extractFileScopeSectionWithHeading(promptContent),
+    ...TRAILING_SECTION_NAMES.map((name) => extractSection(promptContent, name)),
+  ].join("\n");
 }
 
 function collectHints(text: string, pattern: RegExp): string[] {

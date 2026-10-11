@@ -3,13 +3,10 @@
  * Pure workflow remediation scope-guard builder peeled from TaskExecutor (U4).
  */
 import type { Task } from "@fusion/core";
-import {
-  extractPromptListEntries,
-  extractPromptSection,
-} from "./prompt-derived-eligibility.js";
+import { extractPromptFileScopeEntries } from "./prompt-derived-eligibility.js";
 
 export function buildWorkflowFailureScopeGuard(task: Task, promptContent: string): string {
-  const promptScopeEntries = extractPromptListEntries(extractPromptSection(promptContent, "File Scope"));
+  const promptScopeEntries = extractPromptFileScopeEntries(promptContent);
   const metadataScope = Array.isArray(task.sourceMetadata?.fileScope)
     ? task.sourceMetadata.fileScope.filter((entry): entry is string => typeof entry === "string")
     : [];

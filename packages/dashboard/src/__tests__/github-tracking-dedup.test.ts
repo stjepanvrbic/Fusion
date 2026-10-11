@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { applyOriginalDescription } from "@fusion/core";
 import {
   buildIssueSearchQueries,
   DEDUP_MATCH_THRESHOLD,
@@ -25,6 +26,20 @@ describe("extractFileScopePaths", () => {
 
   it("returns empty when file scope section is missing", () => {
     expect(extractFileScopePaths({ description: "no section" })).toEqual([]);
+  });
+
+  it("uses the plan's File Scope, not a list quoted in the Original Description", () => {
+    const request = "The requester explains the defect.\n\n## File Scope\n- `decoy/quoted-only.ts`\n\nOrigin: an earlier planning session.";
+    const plan = "# Task\n\n## Mission\n\nDo it.\n\n## File Scope\n\n- `packages/engine/src/real.ts`\n\n## Steps\n\n- go\n";
+    const prompt = applyOriginalDescription(plan, request);
+
+    expect(extractFileScopePaths({ description: request, prompt })).toEqual(["packages/engine/src/real.ts"]);
+  });
+
+  it("reads a File Scope heading from a description-only task", () => {
+    const description = "Fix the dedup search.\n\n## File Scope\n- `packages/dashboard/src/github-tracking-dedup.ts`\n";
+
+    expect(extractFileScopePaths({ description })).toEqual(["packages/dashboard/src/github-tracking-dedup.ts"]);
   });
 });
 

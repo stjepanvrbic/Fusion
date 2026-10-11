@@ -19,7 +19,7 @@ import { existsSync } from "node:fs";
 import { rollbackCreatedCheckout } from "../worktree/remove-checkout.js";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { AgentHeartbeatRun, AgentStore, MessageStore, PermanentAgentGatingContext, ProviderInstanceRef, ResolvedMcpServerDefinition, TaskDetail, Settings, SteeringComment, TaskStore, TaskStep } from "@fusion/core";
-import { isFastExecutionMode, isValidProviderInstanceId, resolvePersistAgentThinkingLog, resolveExecutorFallbackModel, resolveTrailingVerificationStepIndex, resolveAuthoredStepHeadingOffset, matchStepHeadings } from "@fusion/core";
+import { isFastExecutionMode, isValidProviderInstanceId, resolvePersistAgentThinkingLog, resolveExecutorFallbackModel, resolveTrailingVerificationStepIndex, resolveAuthoredStepHeadingOffset, matchStepHeadings, extractFileScopeSectionWithHeading } from "@fusion/core";
 
 export { resolveAuthoredStepHeadingOffset };
 
@@ -459,7 +459,7 @@ export function buildStepPrompt(
   const isLastStep = stepIndex === Math.max(totalSteps, taskDetail.steps.length) - 1;
 
   // Extract global sections from the prompt
-  const fileScopeSection = extractSection(prompt, "File Scope");
+  const fileScopeSection = extractFileScopeSectionWithHeading(prompt); // FNXC:FileScope 2026-10-11-14:50: core locator skips a File Scope list quoted in the Original Description; other headings stay on extractSection.
   const doNotSection = extractSection(prompt, "Do NOT");
   const contextSection = extractSection(prompt, "Context to Read First");
   const depsSection = extractSection(prompt, "Dependencies");

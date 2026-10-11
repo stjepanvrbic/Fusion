@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileScopeViolationError, readMechanicalSquashFiles } from "../merge/merger-file-scope.js";
 import { preflightAiMergeSquashFileScope, resolveRepoDeclaredScopeTransform } from "../merge/merger-ai-squash-gates.js";
-import { extractEffectiveWriteScopeFromPrompt } from "@fusion/core";
+import { applyOriginalDescription, extractEffectiveWriteScopeFromPrompt } from "@fusion/core";
 
 const policy = vi.hoisted(() => vi.fn());
 vi.mock("../merge/merge-trait.js", () => ({ resolveMergePolicy: policy }));
@@ -230,6 +230,63 @@ describe("runAiMerge approved-squash gates", () => {
     expect(git(dir, "rev-parse main")).not.toBe(before);
     expect(git(dir, "show --name-only --format= main")).toContain("packages/core/src/process/process-supervisor.ts");
     expect(store.recordRunAuditEvent.mock.calls.some(([event]: any[]) => event.mutationType === "merge:file-scope-violation")).toBe(false);
+  });
+
+  /*
+  FNXC:FileScopeInvariant 2026-10-11-14:50:
+  Symptom: a stored prompt whose Original Description ended with a quoted File Scope heading, one plain bullet and an "Origin:" line naming one backticked path parsed to that single path, so the squash invariant refused the plan's own files.
+  Reproduction: the same stored shape, three staged plan files, strict policy. Assertion: the squash lands; the scope the old parser produced is refused for the same files.
+  */
+  describe("a prompt whose Original Description quotes a File Scope list", () => {
+    const planFiles = ["packages/cli/vitest.config.ts", "packages/cli/src/__tests__/vitest-workspace-resolution.test.ts", "docs/testing.md"];
+    const prompt = applyOriginalDescription(
+      [
+        "# Task: Resolve CLI workspace sources in tests",
+        "",
+        "## Mission",
+        "",
+        "Alias workspace sources in the CLI test config.",
+        "",
+        "## File Scope",
+        "",
+        ...planFiles.map((file) => `- \`${file}\``),
+        "",
+        "## Steps",
+        "",
+        "### Step 1: Alias",
+        "",
+      ].join("\n"),
+      "CLI tests resolve workspace packages to stale builds.\n\n## File Scope\n- packages/cli/vitest.config.ts\n\nOrigin: the `commands/mcp-memory-server.js` import failed.",
+    );
+    const stagePlanFiles = (root: string) => {
+      for (const file of planFiles) {
+        mkdirSync(join(root, file, ".."), { recursive: true });
+        writeFileSync(join(root, file), "changed\n");
+      }
+    };
+
+    it("lands the plan's files under the scope parsed from that prompt", async () => {
+      setPolicy("strict");
+      expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual(planFiles);
+      const dir = createRepo(stagePlanFiles);
+      const { store } = makeStore(extractEffectiveWriteScopeFromPrompt(prompt));
+
+      await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, {
+        mergeAgent: squashAgent("fusion/fn-9050"), reviewAgent: approve,
+      })).resolves.toMatchObject({ merged: true });
+    });
+
+    it("refuses the same files under the scope the quoted Origin line used to produce", async () => {
+      setPolicy("strict");
+      const dir = createRepo(stagePlanFiles);
+      const before = git(dir, "rev-parse main");
+      const { store } = makeStore(["commands/mcp-memory-server.js"]);
+
+      await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, {
+        mergeAgent: squashAgent("fusion/fn-9050"), reviewAgent: approve,
+      })).rejects.toBeInstanceOf(FileScopeViolationError);
+      expect(git(dir, "rev-parse main")).toBe(before);
+    });
   });
 
   it("blocks a strict out-of-scope squash before main advances and records the violation", async () => {

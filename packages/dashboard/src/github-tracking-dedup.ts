@@ -1,6 +1,6 @@
 import type { Task } from "@fusion/core";
+import { extractFileScopeSection } from "@fusion/core";
 
-const FILE_SCOPE_HEADER = /^##\s+File\s+Scope\s*$/im;
 const FILE_SCOPE_BULLET = /^-\s+`?([^`\n]+?)`?\s*$/;
 const BACKTICK_IDENTIFIER_RE = /`([A-Za-z0-9_./-]{3,})`/g;
 const ERROR_NAME_RE = /\b([A-Z][A-Za-z0-9]*(?:Error|Exception))\b/g;
@@ -42,17 +42,17 @@ function escapeRegex(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * FNXC:FileScope 2026-10-11-14:50:
+ * GitHub tracking duplicate search uses the plan's File Scope, located by the core locator, so a list quoted in the Original Description never drives the search.
+ * A description-only task has no Original Description region, so its File Scope heading still counts.
+ */
 export function extractFileScopePaths(task: Pick<Task, "description"> & { prompt?: string }): string[] {
   const source = task.prompt ?? task.description ?? "";
-  const headerMatch = source.match(FILE_SCOPE_HEADER);
-  if (!headerMatch || headerMatch.index == null) {
+  const section = extractFileScopeSection(source);
+  if (section === null) {
     return [];
   }
-
-  const sectionStart = headerMatch.index + headerMatch[0].length;
-  const afterStart = source.slice(sectionStart);
-  const nextHeaderMatch = afterStart.match(/\n##\s+/);
-  const section = nextHeaderMatch ? afterStart.slice(0, nextHeaderMatch.index) : afterStart;
 
   const paths: string[] = [];
   const seen = new Set<string>();

@@ -20,6 +20,7 @@ import {
   resolveTaskSeamPrompt,
   resolveValidatorFallbackModel,
   matchStepHeadings,
+  extractFileScopeSectionWithHeading,
 } from "@fusion/core";
 import { recordRetry } from "../errors/retry-burned-logger.js";
 import { createAssistantStreamCapture } from "./assistant-text-capture.js";
@@ -939,7 +940,8 @@ function buildReducedTaskPromptSummary(promptContent: string): string {
     header,
     extractPromptSection(promptContent, "Mission"),
     extractPromptSection(promptContent, "Dependencies"),
-    extractPromptSection(promptContent, "File Scope"),
+    // FNXC:FileScope 2026-10-11-14:50: the core locator skips a File Scope list quoted in the Original Description.
+    extractFileScopeSectionWithHeading(promptContent),
     summarizePromptSteps(promptContent),
     "_... additional PROMPT.md sections omitted after context-limit retry ..._",
   ].filter(Boolean);

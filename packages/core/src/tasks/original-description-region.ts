@@ -1,6 +1,8 @@
 import { createLogger } from "../process/logger.js";
 import {
+  ORIGINAL_DESCRIPTION_END_MARKER,
   ORIGINAL_DESCRIPTION_START_MARKER,
+  findUnmarkedSectionTerminatorOffset,
   resolveOriginalDescriptionEnd,
   resolveOriginalDescriptionSection,
 } from "./original-description-policy.js";
@@ -61,4 +63,41 @@ export function stripOriginalDescriptionSection(promptText: string): string {
   const before = promptText.slice(0, section.sectionStart).trimEnd();
   const after = promptText.slice(section.sectionEnd).replace(/^\n+/, "");
   return after ? `${before}\n\n${after}` : `${before}\n`;
+}
+
+/**
+ * FNXC:FileScopeClassification 2026-10-11-14:50:
+ * Operator text under `## Original Description` is the request, never the plan, so section readers that locate plan structure (File Scope first) must not see it.
+ * Requests routinely end with a quoted `## File Scope` list; reading it made plan writes impossible, gave a task a wrong or empty declared scope, and sent scope additions into text that hygiene rewrites away.
+ * The boundary is the one `stripOriginalDescriptionSection` uses (operator body unknown), so a reader and the spec lock agree on what is plan.
+ *
+ * An unresolved marker has two shapes.
+ * When an end marker follows the start marker, the region ends just past the first one: hygiene encodes marker literals inside the body, so the first end marker closes every region the store wrote, even when a custom plan heading follows it.
+ * When no end marker follows, the start marker is operator prose in an unwrapped section, so the region is bounded like an unmarked section with the body unknown.
+ *
+ * Returns `null` when the prompt has no Original Description heading: a seed prompt keeps its operator text as provisional plan content.
+ * Never logs, because scope readers run on every scheduler pass.
+ */
+export function locateOriginalDescriptionRegion(promptText: string): { start: number; end: number } | null {
+  const section = resolveOriginalDescriptionSection(promptText);
+  if (section.kind === "absent") return null;
+  if (section.kind === "marked" || section.kind === "unmarked") {
+    return { start: section.sectionStart, end: section.sectionEnd };
+  }
+
+  const headingEnd = promptText.indexOf("\n", section.sectionStart);
+  const headerEnd = headingEnd === -1 ? promptText.length : headingEnd;
+  const startMarker = promptText.indexOf(ORIGINAL_DESCRIPTION_START_MARKER, headerEnd);
+  const endMarker = startMarker === -1
+    ? -1
+    : promptText.indexOf(ORIGINAL_DESCRIPTION_END_MARKER, startMarker + ORIGINAL_DESCRIPTION_START_MARKER.length);
+  if (endMarker !== -1) {
+    return { start: section.sectionStart, end: endMarker + ORIGINAL_DESCRIPTION_END_MARKER.length };
+  }
+
+  const terminatorOffset = findUnmarkedSectionTerminatorOffset(promptText.slice(headerEnd));
+  return {
+    start: section.sectionStart,
+    end: terminatorOffset === -1 ? promptText.length : headerEnd + terminatorOffset,
+  };
 }

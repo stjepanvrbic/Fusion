@@ -1,4 +1,5 @@
 import {
+  appendFileScopeEntries,
   buildStepLedgerReopenLog,
   formatRemediationStepName,
   hasOpenEquivalentRemediationStep,
@@ -350,6 +351,9 @@ async function release<T extends AppendReviewRemediationOutcome>(
  * FNXC:ReviewGatedRemediation 2026-08-23-05:23:
  * A remediation accepted from the branch diff may be outside the original prompt scope. Persist its
  * declared files before the bounce so the executor and scope-aware squash merge see the same contract.
+ *
+ * FNXC:ReviewGatedRemediation 2026-10-11-14:50:
+ * The widen goes through the shared File Scope writer, so it lands in the plan's section; an addition placed in a File Scope list quoted in the Original Description was overwritten by hygiene and lost.
  */
 async function widenPromptFileScope(store: TaskStore, taskId: string, prompt: string | undefined, files: readonly string[]): Promise<void> {
   const updated = widenPromptFileScopeContent(prompt, files);
@@ -357,20 +361,7 @@ async function widenPromptFileScope(store: TaskStore, taskId: string, prompt: st
 }
 
 function widenPromptFileScopeContent(prompt: string | undefined, files: readonly string[]): string | undefined {
-  const additions = [...new Set(files.map((file) => file.trim()).filter(Boolean))];
-  if (additions.length === 0 || !prompt) return prompt;
-  const heading = /^##\s+File Scope\s*$/m.exec(prompt);
-  if (!heading || heading.index === undefined) return prompt;
-  const sectionStart = heading.index + heading[0].length;
-  const rest = prompt.slice(sectionStart);
-  const nextHeading = rest.search(/^##\s/m);
-  const sectionEnd = nextHeading === -1 ? prompt.length : sectionStart + nextHeading;
-  const section = prompt.slice(sectionStart, sectionEnd);
-  const existing = new Set((section.match(/`([^`]+)`/g) ?? []).map((entry) => entry.slice(1, -1)));
-  const missing = additions.filter((file) => !existing.has(file));
-  if (missing.length === 0) return prompt;
-  const trimmed = section.replace(/\s+$/, "");
-  const insertion = missing.map((file) => `- \`${file}\``).join("\n");
-  const replacement = trimmed.length === 0 ? `\n\n${insertion}\n` : `${trimmed}\n${insertion}\n`;
-  return prompt.slice(0, sectionStart) + replacement + prompt.slice(sectionEnd);
+  if (!prompt) return prompt;
+  const appended = appendFileScopeEntries(prompt, files);
+  return appended && appended.added.length > 0 ? appended.content : prompt;
 }
