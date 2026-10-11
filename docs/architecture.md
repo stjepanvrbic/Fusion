@@ -616,6 +616,7 @@ Every qmd launch (and the install command's `bun`) goes shell-free through `reso
 QMD-backed memory behavior also applies to agent-private memory workspaces under `.fusion/agent-memory/{agentId}/`:
 - Agent memory search normalizes QMD hit paths (including `qmd://...`, absolute paths, and relative filenames) into canonical readable workspace paths (`MEMORY.md`, `DREAMS.md`, `YYYY-MM-DD.md`) so results can be passed directly into `fn_memory_get`.
 - Agent-memory writes from tool and non-tool paths (including `processAgentMemoryDreams()`) schedule agent-specific QMD refreshes so new dreams/long-term updates remain discoverable without manual reindexing.
+- Agent-memory index refresh and search launch qmd through the same shell-free core executor as project memory (`runQmdCommand`), so an npm/bun `qmd.cmd` shim works on Windows, background refreshes never hold a short-lived process open, and any launch failure falls back to agent file search.
 
 **Dashboard API:**
 - `GET /api/memory/backend` — Returns current backend status and capabilities

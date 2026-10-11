@@ -199,6 +199,37 @@ describe("default qmd executor launches shell-free via resolveShellFreeLaunch", 
     expect(spawnCalls).toEqual([expect.objectContaining({ command: "qmd", args: ["--help"] })]);
   });
 
+  it("runQmdCommand unwraps a win32 npm qmd.cmd shim and forwards args and cwd without a shell", async () => {
+    const { backend, spawnCalls } = await loadBackend(QMD_SHIM_FILES);
+    const rootDir = makeRoot();
+
+    await expect(
+      backend.runQmdCommand(["search", "q", "--json"], { cwd: rootDir, timeout: 4000, maxBuffer: 1024 * 1024 }),
+    ).resolves.toEqual(expect.objectContaining({ stdout: "[]" }));
+
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0].command).toBe(NODE);
+    expect(spawnCalls[0].args).toEqual([QMD_SCRIPT, "search", "q", "--json"]);
+    expect(spawnCalls[0].options.cwd).toBe(rootDir);
+    expect(spawnCalls[0].options.shell).toBeFalsy();
+  });
+
+  it("runQmdCommand launches qmd as-is on POSIX", async () => {
+    const { backend, spawnCalls } = await loadBackend(QMD_SHIM_FILES, { platform: "linux" });
+
+    await backend.runQmdCommand(["update"]);
+
+    expect(spawnCalls).toEqual([expect.objectContaining({ command: "qmd", args: ["update"] })]);
+  });
+
+  it("runQmdCommand rejects an unrecognized win32 qmd.bat without spawning anything", async () => {
+    const { backend, spawnCalls } = await loadBackend({ "C:\\npm\\qmd.bat": "@echo off\r\nsomething-else %*\r\n" });
+
+    await expect(backend.runQmdCommand(["update"])).rejects.toThrow();
+
+    expect(spawnCalls).toHaveLength(0);
+  });
+
   it("installQmd unwraps a win32 bun.cmd shim and forwards the install args", async () => {
     const { backend, spawnCalls } = await loadBackend({
       "C:\\npm\\bun.cmd": npmShim("node_modules\\bun\\bin\\bun.js"),

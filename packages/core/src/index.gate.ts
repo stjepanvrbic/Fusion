@@ -2117,6 +2117,7 @@ export {
   MEMORY_BACKEND_SETTINGS_KEYS,
   DEFAULT_MEMORY_BACKEND,
   isQmdAvailable,
+  runQmdCommand,
 } from "./memory/memory-backend.js";
 
 export {

@@ -1410,6 +1410,21 @@ export function scheduleQmdAgentMemoryRefresh(rootDir: string, agentId: string):
   });
 }
 
+/**
+ * FNXC:ProjectMemory 2026-10-11-00:59:
+ * Every qmd launch outside this module (the engine's agent-memory index refresh and search) must use this one executor instead of its own `execFile`.
+ * It is shell-free on every platform: an npm/bun `qmd.cmd` shim works on win32 and no shell ever sees the search query.
+ * The child and its stdio are unref'd, so a fire-and-forget refresh never holds a short-lived caller open.
+ * Pass `keepAlive` only for an awaited call that must retain its child until it settles.
+ */
+export async function runQmdCommand(
+  args: readonly string[],
+  options?: Parameters<ExecFileAsync>[2],
+): Promise<{ stdout: string; stderr: string }> {
+  const execFileAsync = await getDefaultExecFileAsync();
+  return execFileAsync("qmd", args, options);
+}
+
 export async function isQmdAvailable(): Promise<boolean> {
   try {
     const execFileAsync = await getDefaultExecFileAsync();

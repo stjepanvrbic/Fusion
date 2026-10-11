@@ -16,7 +16,7 @@ import * as fusionCore from "@fusion/core";
 import type { AgentState, AgentCapability, AgentUpdateInput, AgentLogEntry, Artifact, ArtifactCreateInput, ArtifactWithTask, Task, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore, ApprovalRequestStore, ProjectSettings, ChatStore, WorkflowSettingDefinition, GoalStatus, WorkflowIrNode, IdeationCandidate, MissionWithHierarchy, DbTransaction } from "@fusion/core";
 import { listTraits, isBuiltinWorkflowId, AgentStore, validateColumnAgentBindings, ColumnAgentBindingError, stripApprovalBypassFlags, WorkflowSettingRejectionError, resolveEffectiveSettingsById, resolveWorkflowIrById, findOrphanedSettingValues, BUILTIN_WORKFLOW_SETTINGS, MAX_TASK_LIST_TEXT_CHARS, formatCurrentTaskLine, normalizeWorkflowIcon, parseWorkflowIr, WorkflowIrError, assertColumnTraitsValid, ColumnTraitValidationError } from "@fusion/core";
 import { promoteHeldTask } from "./execution/hold-release.js";
-import { computeCrossParentDiagnosticClaim, computeCrossParentDiagnosticClaimId, computeParentIntentClaimId, DASHBOARD_USER_ID, dailyMemoryPath, ensureOpenClawMemoryFiles, evaluateImplementationTaskBind, extractAgentProvisioningRequest, findSameAgentDuplicates, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, reconcileDeterministicDuplicate, resolveAgentProvisioningPolicy, resolveMemoryBackend, resolveResearchSettings, resolveTaskGithubTracking, runDeterministicDuplicateGuard, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh } from "@fusion/core";
+import { computeCrossParentDiagnosticClaim, computeCrossParentDiagnosticClaimId, computeParentIntentClaimId, DASHBOARD_USER_ID, dailyMemoryPath, ensureOpenClawMemoryFiles, evaluateImplementationTaskBind, extractAgentProvisioningRequest, findSameAgentDuplicates, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, reconcileDeterministicDuplicate, resolveAgentProvisioningPolicy, resolveMemoryBackend, resolveResearchSettings, resolveTaskGithubTracking, runDeterministicDuplicateGuard, runQmdCommand, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh } from "@fusion/core";
 import { ResearchOrchestrator } from "./research/research-orchestrator.js";
 import { ResearchProviderRegistry } from "./research/provider-registry.js";
 import { ResearchStepRunner } from "./research/research-step-runner.js";
@@ -898,6 +898,12 @@ async function searchAgentMemoryFile(rootDir: string, agentMemory: AgentMemoryCo
   return results.slice(0, limit);
 }
 
+/**
+ * FNXC:AgentMemory 2026-10-11-00:59:
+ * Agent-memory qmd launches must reach an npm/bun `qmd.cmd` shim on win32 and must not hold a short-lived caller open.
+ * They use core's shared shell-free executor (`runQmdCommand`); a plain shell-free launch of `qmd` on win32 finds only `qmd.exe`/`qmd.com`.
+ * Any launch failure, including a command only a shell could run, falls back to agent file search.
+ */
 async function refreshAgentMemoryQmdIndex(rootDir: string, agentMemory: AgentMemoryContext): Promise<void> {
   if (shouldSkipBackgroundQmdRefresh()) {
     return;
@@ -914,11 +920,8 @@ async function refreshAgentMemoryQmdIndex(rootDir: string, agentMemory: AgentMem
   }
 
   const promise = (async () => {
-    const { execFile } = await import("node:child_process");
-    const { promisify } = await import("node:util");
-    const execFileAsync = promisify(execFile);
     try {
-      await execFileAsync("qmd", buildQmdAgentMemoryCollectionAddArgs(rootDir, agentMemory.agentId), {
+      await runQmdCommand(buildQmdAgentMemoryCollectionAddArgs(rootDir, agentMemory.agentId), {
         cwd: rootDir,
         timeout: 4000,
         maxBuffer: 512 * 1024,
@@ -930,8 +933,8 @@ async function refreshAgentMemoryQmdIndex(rootDir: string, agentMemory: AgentMem
         throw error;
       }
     }
-    await execFileAsync("qmd", ["update"], { cwd: rootDir, timeout: 30_000, maxBuffer: 1024 * 1024 });
-    await execFileAsync("qmd", ["embed"], { cwd: rootDir, timeout: 120_000, maxBuffer: 1024 * 1024 });
+    await runQmdCommand(["update"], { cwd: rootDir, timeout: 30_000, maxBuffer: 1024 * 1024 });
+    await runQmdCommand(["embed"], { cwd: rootDir, timeout: 120_000, maxBuffer: 1024 * 1024 });
   })();
 
   agentQmdRefreshState.set(key, { lastStartedAt: now, inFlight: promise });
@@ -989,16 +992,14 @@ function normalizeQmdAgentMemoryResultPath(rootDir: string, agentId: string, raw
   return fallbackPath;
 }
 
+/** FNXC:AgentMemory 2026-10-11-00:59: launches qmd through `runQmdCommand`; see `refreshAgentMemoryQmdIndex`. */
 async function searchAgentMemoryWithQmd(rootDir: string, agentMemory: AgentMemoryContext, query: string, limit: number): Promise<MemorySearchHit[]> {
   if (shouldSkipBackgroundQmdRefresh()) {
     return searchAgentMemoryFile(rootDir, agentMemory, query, limit);
   }
   try {
     await refreshAgentMemoryQmdIndex(rootDir, agentMemory);
-    const { execFile } = await import("node:child_process");
-    const { promisify } = await import("node:util");
-    const execFileAsync = promisify(execFile);
-    const { stdout } = await execFileAsync("qmd", buildQmdAgentMemorySearchArgs(rootDir, agentMemory.agentId, query, limit), {
+    const { stdout } = await runQmdCommand(buildQmdAgentMemorySearchArgs(rootDir, agentMemory.agentId, query, limit), {
       cwd: rootDir,
       timeout: 4000,
       maxBuffer: 1024 * 1024,

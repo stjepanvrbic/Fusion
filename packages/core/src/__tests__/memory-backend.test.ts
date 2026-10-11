@@ -49,10 +49,12 @@ import type { MemoryBackend } from "../memory/memory-backend.js";
 import {
   captureMemory as captureMemoryIndex,
   MemoryBackendError as MemoryBackendErrorIndex,
+  runQmdCommand as runQmdCommandIndex,
 } from "../index.js";
 import {
   captureMemory as captureMemoryGate,
   MemoryBackendError as MemoryBackendErrorGate,
+  runQmdCommand as runQmdCommandGate,
 } from "../index.gate.js";
 // Compile-time assertions that the type-only members are exported from both
 // barrels; erased at build so they add no runtime weight.
@@ -1300,6 +1302,12 @@ describe("memory-backend", () => {
       const _t3: MemoryCaptureEventTypeIndex | MemoryCaptureEventTypeGate | undefined = undefined;
       const _t4: MemoryBackendErrorCodeIndex | MemoryBackendErrorCodeGate | undefined = undefined;
       expect([_t1, _t2, _t3, _t4]).toHaveLength(4);
+    });
+
+    it("exposes the shared qmd runner from BOTH barrels as the same function", () => {
+      expect(typeof runQmdCommandIndex).toBe("function");
+      expect(typeof runQmdCommandGate).toBe("function");
+      expect(runQmdCommandIndex).toBe(runQmdCommandGate);
     });
   });
 });
