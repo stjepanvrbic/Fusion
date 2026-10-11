@@ -37,6 +37,7 @@ import { resetRuntimeLogSink, setRuntimeLogSink } from "../runtime-logger.js";
 import { resetDiagnosticsSink, setDiagnosticsSink, type LogEntry } from "../ai-session-diagnostics.js";
 import * as updateCheckModule from "../update-check.js";
 import { __setAgentReflectionServiceForTests } from "../routes/register-agent-reflection-rating-routes.js";
+import { shortAliasForTest } from "./short-alias.js";
 
 // Mock @fusion/core for gh CLI auth checks
 const mockCentralListProjects = vi.fn().mockResolvedValue([]);
@@ -463,6 +464,25 @@ describe("Git Management endpoints", () => {
         execFileSync("git", ["-C", gitRepoDir, "worktree", "remove", "--force", worktreePath], { stdio: "pipe" });
       }
     });
+
+    // FNXC:PathIdentity 2026-10-11-01:06: a registered worktree spelled with its Windows 8.3 alias is the same worktree git reports in long form (GitHub Windows runner returned 400).
+    it("allows read-only commit history for a registered worktree spelled with its 8.3 short alias", async () => {
+      const worktreePath = join(getSharedGitTestRepo().root, "registered-alias-worktree");
+      execFileSync("git", ["-C", gitRepoDir, "worktree", "add", "-B", "kb-095-alias-worktree", worktreePath, "HEAD"], { stdio: "pipe" });
+      try {
+        const shortPath = shortAliasForTest(worktreePath, "registered commit-history worktree");
+        const res = await GET(buildApp(), `/api/git/commits?worktreePath=${encodeURIComponent(shortPath)}&limit=1`);
+        expect(res.status).toBe(200);
+        expect(res.body).toHaveLength(1);
+        expect(res.body[0].hash).toBe(git(worktreePath, "rev-parse", "HEAD"));
+
+        const rejected = await GET(buildApp(), `/api/git/commits?worktreePath=${encodeURIComponent(join(getSharedGitTestRepo().root, "not-registered-alias"))}`);
+        expect(rejected.status).toBe(400);
+        expect(rejected.body.error).toContain("registered git worktree");
+      } finally {
+        execFileSync("git", ["-C", gitRepoDir, "worktree", "remove", "--force", worktreePath], { stdio: "pipe" });
+      }
+    });
   });
 
   describe("GET /git/commits/:hash/diff", () => {
@@ -504,6 +524,24 @@ describe("Git Management endpoints", () => {
         expect(res.body).toHaveProperty("patch");
 
         const rejected = await GET(buildApp(), `/api/git/commits/${headHash}/diff?worktreePath=${encodeURIComponent(join(getSharedGitTestRepo().root, "not-registered-diff"))}`);
+        expect(rejected.status).toBe(400);
+        expect(rejected.body.error).toContain("registered git worktree");
+      } finally {
+        execFileSync("git", ["-C", gitRepoDir, "worktree", "remove", "--force", worktreePath], { stdio: "pipe" });
+      }
+    });
+
+    it("allows read-only commit diffs for a registered worktree spelled with its 8.3 short alias", async () => {
+      const worktreePath = join(getSharedGitTestRepo().root, "registered-alias-diff-worktree");
+      execFileSync("git", ["-C", gitRepoDir, "worktree", "add", "-B", "kb-095-alias-diff-worktree", worktreePath, "HEAD"], { stdio: "pipe" });
+      try {
+        const headHash = git(worktreePath, "rev-parse", "HEAD");
+        const shortPath = shortAliasForTest(worktreePath, "registered commit-diff worktree");
+        const res = await GET(buildApp(), `/api/git/commits/${headHash}/diff?worktreePath=${encodeURIComponent(shortPath)}`);
+        expect(res.status).toBe(200);
+        expect(res.body.patch).toContain("README.md");
+
+        const rejected = await GET(buildApp(), `/api/git/commits/${headHash}/diff?worktreePath=${encodeURIComponent(join(getSharedGitTestRepo().root, "not-registered-alias-diff"))}`);
         expect(rejected.status).toBe(400);
         expect(rejected.body.error).toContain("registered git worktree");
       } finally {

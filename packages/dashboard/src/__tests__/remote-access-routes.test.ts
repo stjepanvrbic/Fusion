@@ -23,8 +23,11 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-import { writeFileSync } from "node:fs";
+import { existsSync, readdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { dirname } from "node:path";
+import { isPathInside } from "@fusion/core";
 import { createApiRoutes } from "../routes.js";
 import {
   __setCloudflaredManifestForTesting,
@@ -126,7 +129,18 @@ async function REQUEST(app: express.Express, method: string, path: string, body?
 }
 
 const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+/** The real host platform; path assertions must use host semantics while a test spoofs `process.platform`. */
+const hostPlatform = process.platform;
 const originalArchDescriptor = Object.getOwnPropertyDescriptor(process, "arch");
+
+/** Fake `curl -L --output <path> <url>`: write the payload to whatever staging path the product chose. */
+function writeCurlOutput(args: string[], payload: Buffer): void {
+  writeFileSync(args[args.indexOf("--output") + 1], payload);
+}
+
+function cloudflaredStagingDirs(): string[] {
+  return readdirSync(tmpdir()).filter((name) => name.startsWith("fusion-cloudflared-"));
+}
 
 function setProcessRuntime(platform: NodeJS.Platform, arch: string): void {
   Object.defineProperty(process, "platform", { value: platform, configurable: true });
@@ -454,7 +468,7 @@ describe("remote access provider/lifecycle contracts", () => {
         ? optionsOrCallback as (error: Error | null, stdout?: string, stderr?: string) => void
         : maybeCallback;
       if (command === "curl") {
-        writeFileSync("/tmp/cloudflared", payload);
+        writeCurlOutput(args, payload);
       }
       if (command === "mv" && args[1] === "/usr/local/bin/cloudflared") {
         callback?.(new Error("EPERM"), "", "EPERM");
@@ -477,7 +491,7 @@ describe("remote access provider/lifecycle contracts", () => {
     const payload = Buffer.from("cloudflared-darwin");
     const sha256 = createHash("sha256").update(payload).digest("hex");
     __setCloudflaredManifestForTesting(makeVerifiedManifest("cloudflared-darwin-arm64", sha256));
-    mockExecFile.mockImplementation((command: string, _args: string[], optionsOrCallback: unknown, maybeCallback?: (error: Error | null, stdout?: string, stderr?: string) => void) => {
+    mockExecFile.mockImplementation((command: string, args: string[], optionsOrCallback: unknown, maybeCallback?: (error: Error | null, stdout?: string, stderr?: string) => void) => {
       const callback = typeof optionsOrCallback === "function"
         ? optionsOrCallback as (error: Error | null, stdout?: string, stderr?: string) => void
         : maybeCallback;
@@ -486,7 +500,7 @@ describe("remote access provider/lifecycle contracts", () => {
         return;
       }
       if (command === "curl") {
-        writeFileSync("/tmp/cloudflared", payload);
+        writeCurlOutput(args, payload);
       }
       callback?.(null, "", "");
     });
@@ -576,9 +590,9 @@ describe("remote access provider/lifecycle contracts", () => {
       const payload = Buffer.from("verified-payload");
       const sha256 = createHash("sha256").update(payload).digest("hex");
       __setCloudflaredManifestForTesting(makeVerifiedManifest("cloudflared-linux-amd64", sha256));
-      mockExecFile.mockImplementation((command: string, _args: string[], optionsOrCallback: unknown, maybeCallback?: (error: Error | null, stdout?: string, stderr?: string) => void) => {
+      mockExecFile.mockImplementation((command: string, args: string[], optionsOrCallback: unknown, maybeCallback?: (error: Error | null, stdout?: string, stderr?: string) => void) => {
         const callback = typeof optionsOrCallback === "function" ? optionsOrCallback as (error: Error | null, stdout?: string, stderr?: string) => void : maybeCallback;
-        if (command === "curl") writeFileSync("/tmp/cloudflared", payload);
+        if (command === "curl") writeCurlOutput(args, payload);
         callback?.(null, "", "");
       });
       const { app } = createApp();
@@ -588,12 +602,57 @@ describe("remote access provider/lifecycle contracts", () => {
       expect(mockExecFile.mock.calls.some(([command]) => command === "mv")).toBe(true);
     });
 
+    /*
+    FNXC:RemoteAccess 2026-10-11-01:06:
+    Each direct download stages in a private directory under os.tmpdir() that is removed afterwards; the fixed `/tmp/cloudflared` path resolved to a nonexistent `D:\tmp` on a Windows checkout and let concurrent installs collide.
+    */
+    it("installCloudflared stages each direct download in its own removed temp directory", async () => {
+      setProcessRuntime("linux", "x64");
+      const payload = Buffer.from("staged-payload");
+      const sha256 = createHash("sha256").update(payload).digest("hex");
+      __setCloudflaredManifestForTesting(makeVerifiedManifest("cloudflared-linux-amd64", sha256));
+      const outputPaths: string[] = [];
+      mockExecFile.mockImplementation((command: string, args: string[], optionsOrCallback: unknown, maybeCallback?: (error: Error | null, stdout?: string, stderr?: string) => void) => {
+        const callback = typeof optionsOrCallback === "function" ? optionsOrCallback as (error: Error | null, stdout?: string, stderr?: string) => void : maybeCallback;
+        if (command === "curl") {
+          outputPaths.push(args[args.indexOf("--output") + 1]);
+          writeCurlOutput(args, payload);
+        }
+        callback?.(null, "", "");
+      });
+      const { app } = createApp();
+
+      const first = await REQUEST(app, "POST", "/api/remote/install-cloudflared", {});
+      const second = await REQUEST(app, "POST", "/api/remote/install-cloudflared", {});
+
+      expect(first.body.success).toBe(true);
+      expect(second.body.success).toBe(true);
+      expect(outputPaths).toHaveLength(2);
+      expect(outputPaths[0]).not.toBe(outputPaths[1]);
+      for (const outputPath of outputPaths) {
+        expect(outputPath).not.toBe("/tmp/cloudflared");
+        expect(isPathInside(tmpdir(), outputPath, { platform: hostPlatform })).toBe(true);
+        expect(existsSync(dirname(outputPath))).toBe(false);
+      }
+    });
+
+    it("installCloudflared creates no staging directory when the manifest is pending", async () => {
+      setProcessRuntime("linux", "x64");
+      const before = cloudflaredStagingDirs();
+      const { app } = createApp();
+
+      const result = await REQUEST(app, "POST", "/api/remote/install-cloudflared", {});
+
+      expect(result.body.success).toBe(false);
+      expect(cloudflaredStagingDirs()).toEqual(before);
+    });
+
     it("installCloudflared aborts when downloaded sha256 does not match", async () => {
       setProcessRuntime("linux", "x64");
       __setCloudflaredManifestForTesting(makeVerifiedManifest("cloudflared-linux-amd64", "a".repeat(64)));
-      mockExecFile.mockImplementation((command: string, _args: string[], optionsOrCallback: unknown, maybeCallback?: (error: Error | null, stdout?: string, stderr?: string) => void) => {
+      mockExecFile.mockImplementation((command: string, args: string[], optionsOrCallback: unknown, maybeCallback?: (error: Error | null, stdout?: string, stderr?: string) => void) => {
         const callback = typeof optionsOrCallback === "function" ? optionsOrCallback as (error: Error | null, stdout?: string, stderr?: string) => void : maybeCallback;
-        if (command === "curl") writeFileSync("/tmp/cloudflared", Buffer.from("mismatch"));
+        if (command === "curl") writeCurlOutput(args, Buffer.from("mismatch"));
         callback?.(null, "", "");
       });
       const { app } = createApp();

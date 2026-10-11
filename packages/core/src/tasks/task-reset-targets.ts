@@ -1,4 +1,5 @@
 import { join, resolve } from "node:path";
+import { pathIdentityKey } from "../fs/path-identity.js";
 import { isWorkspaceTask, type Settings, type Task } from "../types.js";
 import {
   assertWorkspaceRepoRelPath,
@@ -41,6 +42,11 @@ Reset derives its target directories and reservation roots from the same workspa
 math as acquisition, so a per-repository reset reservation excludes a concurrent acquire.
 A workspace task's singular pointer is ignored unless it aliases a recorded repository child:
 the workspace root is a coordinator, not a disposable Git worktree.
+
+FNXC:TaskReset 2026-10-11-02:27:
+Targets are deduplicated by path identity, not by spelling. A row pointer written with different case, a Windows 8.3 alias, or a symlinked parent names the same directory as the canonical singular path or a sibling workspace entry.
+Planning it twice makes Reset wait on its own path reservation, which is keyed by identity, until the request times out.
+The first spelling planned is kept as the target's `canonicalPath`.
 */
 export function buildTaskResetWorktreePlan(
   task: Pick<Task, "id" | "worktree" | "branch" | "workspaceWorktrees">,
@@ -56,14 +62,14 @@ export function buildTaskResetWorktreePlan(
   if (!isWorkspaceTask(task) && !hasWorkspaceRecord) {
     const worktreesDir = resolveWorktreesDirLayout(rootDir, settings);
     const canonicalSingularWorktreePath = join(worktreesDir, task.id.toLowerCase());
-    const targetsByCanonical = new Map<string, TaskResetWorktreeTarget>();
+    const targetsByIdentity = new Map<string, TaskResetWorktreeTarget>();
     const addTarget = (worktreePath: string) => {
-      const canonicalPath = resolve(worktreePath);
-      if (targetsByCanonical.has(canonicalPath)) return;
-      targetsByCanonical.set(canonicalPath, {
+      const identity = pathIdentityKey(worktreePath);
+      if (targetsByIdentity.has(identity)) return;
+      targetsByIdentity.set(identity, {
         repoRel: SINGULAR_RESET_WORKTREE_REPO_REL,
         worktreePath,
-        canonicalPath,
+        canonicalPath: resolve(worktreePath),
         branch: task.branch,
         repoRootDir: rootDir,
         containmentRoot: worktreesDir,
@@ -77,7 +83,7 @@ export function buildTaskResetWorktreePlan(
     return {
       kind: "singular",
       layout: "singular",
-      targets: [...targetsByCanonical.values()],
+      targets: [...targetsByIdentity.values()],
       branchCleanupTargets: [{ repoRootDir: rootDir, recordedBranches: recordedBranch ? [recordedBranch] : [] }],
       canonicalSingularWorktreePath: resolve(canonicalSingularWorktreePath),
     };
@@ -85,7 +91,7 @@ export function buildTaskResetWorktreePlan(
 
   const workspaceTaskDir = resolveWorkspaceTaskWorktreeDir(rootDir, settings, task.id);
   const legacy = isLegacyWorkspaceWorktreeLayout(task, workspaceTaskDir);
-  const targetsByCanonical = new Map<string, TaskResetWorktreeTarget>();
+  const targetsByIdentity = new Map<string, TaskResetWorktreeTarget>();
   for (const [repoRel, entry] of Object.entries(task.workspaceWorktrees ?? {}).sort(([left], [right]) => left.localeCompare(right))) {
     assertWorkspaceRepoRelPath(repoRel);
     const repoRootDir = join(rootDir, repoRel);
@@ -93,16 +99,16 @@ export function buildTaskResetWorktreePlan(
       workspaceRootDir: rootDir,
       repoRelPath: repoRel,
     });
-    const canonicalPath = resolve(entry.worktreePath);
-    const existing = targetsByCanonical.get(canonicalPath);
+    const identity = pathIdentityKey(entry.worktreePath);
+    const existing = targetsByIdentity.get(identity);
     if (existing) {
       existing.aliasRepoRels.push(repoRel);
       continue;
     }
-    targetsByCanonical.set(canonicalPath, {
+    targetsByIdentity.set(identity, {
       repoRel,
       worktreePath: entry.worktreePath,
-      canonicalPath,
+      canonicalPath: resolve(entry.worktreePath),
       branch: entry.branch,
       repoRootDir,
       containmentRoot: legacy ? reservationWorktreesDir : workspaceTaskDir,
@@ -113,11 +119,11 @@ export function buildTaskResetWorktreePlan(
 
   let ignoredSingularWorktree: string | undefined;
   if (task.worktree) {
-    const existing = targetsByCanonical.get(resolve(task.worktree));
+    const existing = targetsByIdentity.get(pathIdentityKey(task.worktree));
     if (existing) existing.aliasRepoRels.push(SINGULAR_RESET_WORKTREE_REPO_REL);
     else ignoredSingularWorktree = task.worktree;
   }
-  const targets = [...targetsByCanonical.values()];
+  const targets = [...targetsByIdentity.values()];
   const branchCleanupByRoot = new Map<string, Set<string>>();
   for (const target of targets) {
     const branches = branchCleanupByRoot.get(target.repoRootDir) ?? new Set<string>();

@@ -13,6 +13,7 @@ import { describe, expect, it, vi } from "vitest";
 import { inspectBareBranchCollision } from "../../../engine/src/execution/branch-conflicts.js";
 import { createApiRoutes } from "../routes.js";
 import { request as performRequest } from "../test-request.js";
+import { nativeRealPath, shortAliasForTest } from "./short-alias.js";
 
 const execFileAsync = promisify(execFile);
 const taskId = "FN-400";
@@ -250,11 +251,84 @@ describe("POST /api/tasks/:id/reset branch cleanup with real git", () => {
     const response = await reset(store);
     expect(response.status).toBe(409);
     expect(response.body.error).toContain(taskBranch);
-    expect(response.body.error).toContain(holder);
+    // The refusal names the holder as git registered it, which is the native long spelling of a temp-derived path.
+    expect(response.body.error).toContain(nativeRealPath(holder));
     expect(await branchExists(root, taskBranch)).toBe(true);
     expect((await collision(root, holder)).kind).toBe("live-foreign");
     expect(existsSync(prompt)).toBe(true);
     expect(existsSync(holder)).toBe(true);
+    expect(publication).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:TaskReset 2026-10-11-02:17:
+  A store root or worktree pointer spelled with a Windows 8.3 alias names the same directory git registered under its long name.
+  Reset must prove ownership of that worktree and remove it, and must keep refusing a foreign holder, whichever spelling the store recorded.
+  */
+  it("resets a worktree whose store root and row pointer are spelled with an 8.3 short alias", async () => {
+    const root = await createRepo();
+    const worktree = await addTaskWorktree(root);
+    const prompt = await writePrompt(root);
+    const task = taskFixture({ worktree: shortAliasForTest(worktree, "singular reset worktree pointer") });
+    const { store, publication } = createStore(shortAliasForTest(root, "singular reset store root"), task);
+
+    const response = await reset(store);
+
+    expect(response.status).toBe(200);
+    expect(await branchExists(root, taskBranch)).toBe(false);
+    expect(existsSync(worktree)).toBe(false);
+    expect(await collision(root, worktree)).toEqual({ kind: "missing" });
+    await expect(readFile(prompt, "utf8")).resolves.toBe(buildBootstrapPrompt(task.id, task.title, task.description));
+    expect(publication).toHaveBeenCalledOnce();
+  });
+
+  it("recovers canonical worktree ownership when only the store root is spelled with an 8.3 short alias", async () => {
+    const root = await createRepo();
+    const worktree = await addTaskWorktree(root);
+    await writePrompt(root);
+    const { store, publication } = createStore(shortAliasForTest(root, "canonical-owner reset store root"), taskFixture({ worktree: undefined, branch: undefined }));
+
+    expect((await reset(store)).status).toBe(200);
+    expect(existsSync(worktree)).toBe(false);
+    expect(await branchExists(root, taskBranch)).toBe(false);
+    expect(publication).toHaveBeenCalledOnce();
+  });
+
+  it("still fails closed on a foreign holder when the store root is spelled with an 8.3 short alias", async () => {
+    const root = await createRepo();
+    const holder = await addTaskWorktree(root, join(root, ".worktrees", "fn-400-stale"));
+    const prompt = await writePrompt(root);
+    const { store, publication } = createStore(shortAliasForTest(root, "foreign-holder reset store root"), taskFixture({ worktree: undefined }));
+
+    const response = await reset(store);
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toContain(taskBranch);
+    expect(response.body.error).toContain(nativeRealPath(holder));
+    expect(await branchExists(root, taskBranch)).toBe(true);
+    expect(existsSync(prompt)).toBe(true);
+    expect(existsSync(holder)).toBe(true);
+    expect(publication).not.toHaveBeenCalled();
+  });
+
+  it("still refuses an unregistered directory at a short-alias worktree pointer", async () => {
+    const root = await createRepo();
+    const worktree = await addTaskWorktree(root);
+    await rm(worktree, { recursive: true, force: true });
+    await git(root, "worktree", "prune");
+    await mkdir(worktree, { recursive: true });
+    const prompt = await writePrompt(root);
+    const { store, publication } = createStore(
+      shortAliasForTest(root, "unproven-owner reset store root"),
+      taskFixture({ worktree: shortAliasForTest(worktree, "unproven-owner reset worktree pointer") }),
+    );
+
+    const refused = await reset(store);
+
+    expect(refused.status).toBe(409);
+    expect(refused.body.error).toMatch(/managed task ownership cannot be proven/);
+    expect(existsSync(worktree)).toBe(true);
+    expect(existsSync(prompt)).toBe(true);
     expect(publication).not.toHaveBeenCalled();
   });
 

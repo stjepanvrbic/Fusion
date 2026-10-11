@@ -3,7 +3,6 @@ import { bindPosixShell, createLogger, createIngestedCheckResolver, resolveRequi
 const severityAuditLog = createLogger("dashboard-register-git-github");
 import { type NextFunction, type Request, type Response } from "express";
 import { isAbsolute, resolve } from "node:path";
-import { realpathSync } from "node:fs";
 import { exec as execCb, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import type {
@@ -20,7 +19,7 @@ import type {
   Task,
   TaskStore,
 } from "@fusion/core";
-import { addWorkspaceRepo, classifyGhError, detectWorkspaceRepos, getCurrentRepo, isGhAuthenticated, loadWorkspaceConfig, WorkspaceRepoValidationError } from "@fusion/core";
+import { addWorkspaceRepo, classifyGhError, detectWorkspaceRepos, getCurrentRepo, isGhAuthenticated, isSamePath, loadWorkspaceConfig, pathIdentityKey, WorkspaceRepoValidationError } from "@fusion/core";
 import {
   dropAutostashHandle,
   generateSyntheticRunId,
@@ -711,18 +710,16 @@ async function computeStashCount(cwd: string): Promise<number | undefined> {
   }
 }
 
-/** Canonicalize a filesystem path for cross-process equality checks. The
- *  merger emits audit events with `worktreePath` run through `realpath` (via
- *  `canonicalizePath` in worktree-pool.ts); the route is called with the
- *  store's raw `rootDir`. On macOS the two routinely differ through
- *  `/private` symlinks. Resolving both ends through `realpathSync` (with a
- *  graceful fallback if the path no longer exists) gives a stable key. */
+/** Comparison key for cross-process path equality checks; never a path to open or display.
+ *  The merger emits audit events with `worktreePath` run through native
+ *  `canonicalizePath`; the route is called with the store's raw `rootDir`.
+ *  On macOS the two routinely differ through `/private` symlinks.
+ *
+ *  FNXC:PathIdentity 2026-10-11-01:06:
+ *  JavaScript `realpathSync` keeps a Windows 8.3 alias (`C:\Users\RUNNER~1\...`) while git and native realpath report the long spelling, so the GitHub Windows runner rejected registered worktrees with 400.
+ *  Use the core identity key, which expands aliases and folds Windows case. */
 function canonicalForCompare(p: string): string {
-  try {
-    return realpathSync(p);
-  } catch {
-    return p;
-  }
+  return pathIdentityKey(p);
 }
 
 async function getPatchFingerprint(cwd: string, sha: string): Promise<string | null> {
@@ -2722,8 +2719,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
     The Commits panel may inspect commit history and diffs for a Git-reported worktree of the currently selected repository checkout, but mutation routes must continue to target only resolveGitDir(repoPath). Validate this read-only override against `git worktree list` for the current repo instead of treating `repoPath` or `worktreePath` as arbitrary absolute filesystem access.
     */
     const registeredWorktrees = await listRegisteredWorktreePaths(baseGitDir);
-    const canonicalResolved = canonicalForCompare(resolved);
-    const registered = registeredWorktrees.find((candidate) => canonicalForCompare(candidate) === canonicalResolved);
+    const registered = registeredWorktrees.find((candidate) => isSamePath(candidate, resolved));
     if (!registered) {
       throw badRequest("worktreePath is not a registered git worktree for this repository");
     }

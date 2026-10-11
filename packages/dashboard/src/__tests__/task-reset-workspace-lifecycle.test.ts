@@ -23,6 +23,7 @@ import {
 } from "@fusion/engine";
 import { createApiRoutes } from "../routes.js";
 import { request as performRequest } from "../test-request.js";
+import { nativeRealPath, shortAliasForTest } from "./short-alias.js";
 
 vi.mock("@fusion/engine", async () => {
   const actual = await vi.importActual<typeof import("@fusion/engine")>("@fusion/engine");
@@ -592,6 +593,78 @@ describe("POST /api/tasks/:id/reset workspace lifecycle", () => {
     registerWorkspaceBranches(root, rootTarget);
     scenario = createStore(root, rootTarget);
     expect((await reset(scenario.store)).status).toBe(400);
+  });
+
+  /*
+  FNXC:TaskReset 2026-10-11-02:33:
+  A workspace root spelled with a Windows 8.3 alias names the same directories that native realpath and git report under their long names.
+  Reset must accept those targets as inside the workspace task directory and as owned, and must keep refusing a containment-root, repository-root, or project-root target in either spelling.
+  */
+  it("resets a workspace whose root is spelled with an 8.3 short alias", async () => {
+    const longRoot = nativeRealPath(await mkdtemp(join(tmpdir(), "fusion-workspace-reset-short-alias-")));
+    const root = shortAliasForTest(longRoot, "workspace reset root");
+    const task = workspaceTask(root);
+    await createWorkspace(root, task);
+    // git registers worktrees under their native long spelling.
+    vi.mocked(getRegisteredWorktreeBranches).mockImplementation(async (repoRoot) => {
+      const entry = task.workspaceWorktrees?.[relative(root, repoRoot).split(sep).join("/")];
+      return entry ? [{ branch: entry.branch, worktreePath: nativeRealPath(entry.worktreePath) }] : [];
+    });
+    const { store, publication } = createStore(root, task);
+
+    const res = await reset(store);
+
+    expect(res.status).toBe(200);
+    expect(publication).toHaveBeenCalledOnce();
+    for (const repo of ["apps/a", "apps/b"]) expect(existsSync(join(coordinatorPath(longRoot), repo))).toBe(false);
+    expect(existsSync(coordinatorPath(longRoot))).toBe(false);
+    await expect(readFile(join(longRoot, ".fusion", "tasks", task.id, "PROMPT.md"), "utf8")).resolves.toBe(buildBootstrapPrompt(task.id, task.title, task.description));
+  });
+
+  it("refuses containment-root, repository-root, and project-root targets spelled with an 8.3 short alias", async () => {
+    const longRoot = nativeRealPath(await mkdtemp(join(tmpdir(), "fusion-workspace-reset-short-alias-unsafe-")));
+    const shortRoot = shortAliasForTest(longRoot, "unsafe workspace reset root");
+    const promptPath = join(longRoot, ".fusion", "tasks", "FN-401", "PROMPT.md");
+    const scenarios: Array<{ storeRoot: string; unsafeTarget: string }> = [
+      { storeRoot: shortRoot, unsafeTarget: coordinatorPath(shortRoot) },
+      { storeRoot: longRoot, unsafeTarget: coordinatorPath(shortRoot) },
+      { storeRoot: longRoot, unsafeTarget: join(shortRoot, "apps/a") },
+      { storeRoot: shortRoot, unsafeTarget: longRoot },
+      { storeRoot: longRoot, unsafeTarget: shortRoot },
+    ];
+    for (const { storeRoot, unsafeTarget } of scenarios) {
+      const task = workspaceTask(storeRoot);
+      task.workspaceWorktrees!["apps/a"]!.worktreePath = unsafeTarget;
+      await createWorkspace(storeRoot, task);
+      registerWorkspaceBranches(storeRoot, task);
+      const { store, publication } = createStore(storeRoot, task);
+
+      const res = await reset(store);
+
+      expect(res.status, `${storeRoot} -> ${unsafeTarget}`).toBe(400);
+      expect(publication).not.toHaveBeenCalled();
+      expect(existsSync(unsafeTarget)).toBe(true);
+      expect(existsSync(task.workspaceWorktrees!["apps/b"]!.worktreePath)).toBe(true);
+      await expect(readFile(promptPath, "utf8")).resolves.toContain("Discarded plan");
+    }
+  });
+
+  it("refuses a short-alias target that another task records under its long spelling", async () => {
+    const longRoot = nativeRealPath(await mkdtemp(join(tmpdir(), "fusion-workspace-reset-short-alias-owner-")));
+    const root = shortAliasForTest(longRoot, "other-owner workspace reset root");
+    const task = workspaceTask(root);
+    await createWorkspace(root, task);
+    registerWorkspaceBranches(root, task);
+    const claimed = task.workspaceWorktrees!["apps/a"]!;
+    const owner = { ...task, id: "FN-OTHER", workspaceWorktrees: { "apps/a": { ...claimed, worktreePath: nativeRealPath(claimed.worktreePath) } } };
+    const { store, publication } = createStore(root, task, [owner]);
+
+    const res = await reset(store);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/owned by another task.*apps\/a/i);
+    expect(publication).not.toHaveBeenCalled();
+    expect(existsSync(claimed.worktreePath)).toBe(true);
   });
 
   it("refuses a target claimed by another task's workspace entry", async () => {

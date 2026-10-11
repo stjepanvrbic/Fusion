@@ -1,5 +1,7 @@
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { Task } from "../types.js";
 import {
   buildTaskResetWorktreePlan,
@@ -27,7 +29,23 @@ function task(overrides: Partial<Task>): Task {
   } as Task;
 }
 
+/** A real directory and a second spelling of it (junction on Windows, symlink elsewhere). */
+const fixtureDirs: string[] = [];
+function twoSpellingsOfOneRoot(): { realRoot: string; linkedRoot: string } {
+  const fixture = mkdtempSync(join(tmpdir(), "fusion-reset-targets-"));
+  fixtureDirs.push(fixture);
+  const realRoot = join(fixture, "real");
+  const linkedRoot = join(fixture, "linked");
+  mkdirSync(realRoot);
+  symlinkSync(realRoot, linkedRoot, "junction");
+  return { realRoot, linkedRoot };
+}
+
 describe("buildTaskResetWorktreePlan", () => {
+  afterEach(() => {
+    for (const dir of fixtureDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
   it("plans a singular task worktree using the project worktrees root", () => {
     const worktreePath = join(rootDir, ".fusion", "worktrees", "fn-203");
     const plan = buildTaskResetWorktreePlan(task({ worktree: worktreePath, branch: "fusion/fn-203" }), { rootDir, settings: {} });
@@ -67,6 +85,15 @@ describe("buildTaskResetWorktreePlan", () => {
     const plan = buildTaskResetWorktreePlan(task({ worktree: canonicalPath }), { rootDir, settings: {} });
     expect(plan.targets).toHaveLength(1);
     expect(plan.targets[0]?.canonicalPath).toBe(canonicalPath);
+  });
+
+  it("plans one singular target when the row pointer spells the canonical worktree differently", () => {
+    const { realRoot, linkedRoot } = twoSpellingsOfOneRoot();
+    const plan = buildTaskResetWorktreePlan(task({
+      worktree: join(linkedRoot, ".fusion", "worktrees", "fn-203"),
+    }), { rootDir: realRoot, settings: {} });
+    expect(plan.targets).toHaveLength(1);
+    expect(plan.targets[0]?.canonicalPath).toBe(resolve(realRoot, ".fusion", "worktrees", "fn-203"));
   });
 
   it("retains a legacy recorded singular worktree beside the canonical target", () => {
@@ -158,6 +185,23 @@ describe("buildTaskResetWorktreePlan", () => {
     expect(plan.branchCleanupTargets).toEqual([
       { repoRootDir: join(rootDir, "api"), recordedBranches: ["fusion/fn-203"] },
     ]);
+  });
+
+  it("folds workspace entries and a singular pointer that spell one directory differently", () => {
+    const { realRoot, linkedRoot } = twoSpellingsOfOneRoot();
+    const realTaskDir = resolveWorkspaceTaskWorktreeDir(realRoot, {}, taskId);
+    const linkedTaskDir = resolveWorkspaceTaskWorktreeDir(linkedRoot, {}, taskId);
+    const plan = buildTaskResetWorktreePlan(task({ worktree: join(linkedTaskDir, "api"), workspaceWorktrees: {
+      api: { worktreePath: join(realTaskDir, "api"), branch: "fusion/fn-203" },
+      duplicate: { worktreePath: join(linkedTaskDir, "api"), branch: "fusion/fn-203" },
+    } }), { rootDir: realRoot, settings: {} });
+    expect(plan.targets).toHaveLength(1);
+    expect(plan.targets[0]).toMatchObject({
+      repoRel: "api",
+      canonicalPath: resolve(realTaskDir, "api"),
+      aliasRepoRels: ["duplicate", SINGULAR_RESET_WORKTREE_REPO_REL],
+    });
+    expect(plan.ignoredSingularWorktree).toBeUndefined();
   });
 
   it("folds a workspace singular pointer into an equal target", () => {

@@ -21,7 +21,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { existsSync } from "node:fs";
 import { readFile, rm, rmdir, stat, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import type {
   TaskStore,
   Task,
@@ -100,6 +100,9 @@ import {
   resolveProjectColumnsForRoles,
   REVIEW_ROLES,
   canonicalizeWorktreePath,
+  isPathInside,
+  isSamePath,
+  pathIdentityKey,
   acquireWorktreePathReservation,
   disposeTaskBeforeReset,
   buildTaskResetWorktreePlan,
@@ -4042,7 +4045,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         const reservations: Awaited<ReturnType<typeof acquireWorktreePathReservation>>[] = [];
         const targetSuffix = (repoRel: string) => repoRel === SINGULAR_RESET_WORKTREE_REPO_REL ? "" : ` (${repoRel})`;
         const branchTargetSuffix = (repoRootDir: string) => {
-          const target = resetPlan.targets.find((entry) => resolve(entry.repoRootDir) === resolve(repoRootDir));
+          const target = resetPlan.targets.find((entry) => isSamePath(entry.repoRootDir, repoRootDir));
           return target ? targetSuffix(target.repoRel) : "";
         };
         const branchBlockMessage = (blocked: Awaited<ReturnType<typeof planTaskResetBranchCleanup>>["blocked"]) => {
@@ -4058,20 +4061,25 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         const logBlockedBranches = async (blocked: Awaited<ReturnType<typeof planTaskResetBranchCleanup>>["blocked"]) => {
           await scopedStore.logEntry(req.params.id, `Reset blocked by task branches: ${blocked.map((entry) => `${entry.branch} [${entry.reason}]${entry.holderWorktreePath ? ` at ${entry.holderWorktreePath}` : ""}`).join(", ")}`);
         };
-        const isStrictDescendant = (root: string, candidate: string) => {
-          const pathRelative = relative(resolve(root), resolve(candidate));
-          return pathRelative !== "" && !pathRelative.startsWith("..") && !isAbsolute(pathRelative);
-        };
+        /*
+        FNXC:TaskReset 2026-10-11-01:06:
+        Reset compares the task's recorded paths against git-reported and natively resolved paths, which use the long on-disk spelling.
+        A store root or worktree pointer spelled with a Windows 8.3 alias (`C:\Users\RUNNER~1\...`) names the same directory, so every equality, containment, and membership decision below uses core path identity (`isSamePath`, `isPathInside`, `pathIdentityKey`).
+        Raw string comparison refused owned worktrees (409, ownership unproven; 400, outside the worktree root) and would let a differently spelled project, repository, or containment root slip past the root-removal guard.
+        Only comparisons use identity: the spellings handed to removal, reservation, logs, and responses stay as recorded.
+        */
         const targetPaths = (plan: ReturnType<typeof buildTaskResetWorktreePlan>) => plan.targets
           .map((target) => target.canonicalPath)
           .sort();
-        const registeredWorktreePathsByRepoRoot = new Map<string, Promise<Set<string>>>();
-        const getRegisteredPathsForRepo = (repoRootDir: string) => {
-          const key = resolve(repoRootDir);
-          let registered = registeredWorktreePathsByRepoRoot.get(key);
+        /** Identity keys of the worktrees git has registered for a repository, read once per repository. */
+        const registeredWorktreePathKeysByRepoRoot = new Map<string, Promise<Set<string>>>();
+        const getRegisteredPathKeysForRepo = (repoRootDir: string) => {
+          const key = pathIdentityKey(repoRootDir);
+          let registered = registeredWorktreePathKeysByRepoRoot.get(key);
           if (!registered) {
-            registered = getRegisteredWorktreePaths(repoRootDir);
-            registeredWorktreePathsByRepoRoot.set(key, registered);
+            registered = getRegisteredWorktreePaths(repoRootDir)
+              .then((paths) => new Set([...paths].map((path) => pathIdentityKey(path))));
+            registeredWorktreePathKeysByRepoRoot.set(key, registered);
           }
           return registered;
         };
@@ -4107,19 +4115,16 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         try {
           // FNXC:TaskReset 2026-08-27-22:20: Validate every target before cancellation so a later repository cannot leave an earlier one half-reset.
           for (const target of resetPlan.targets) {
-            const canonicalRoot = await canonicalizeWorktreePath(rootDir);
-            const canonicalRepoRoot = await canonicalizeWorktreePath(target.repoRootDir);
-            const canonicalContainmentRoot = await canonicalizeWorktreePath(target.containmentRoot);
             const workspaceContext = resetPlan.layout === "workspace-legacy"
               ? { workspaceRootDir: rootDir, repoRelPath: target.repoRel }
               : undefined;
             const contained = resetPlan.layout === "workspace-task-dir"
-              ? isStrictDescendant(target.containmentRoot, target.canonicalPath)
+              ? isPathInside(target.containmentRoot, target.canonicalPath)
               : isInsideConfiguredWorktreesDir(target.repoRootDir, settings, target.canonicalPath, workspaceContext);
             if (
-              target.canonicalPath === canonicalRoot
-              || target.canonicalPath === canonicalRepoRoot
-              || target.canonicalPath === canonicalContainmentRoot
+              isSamePath(target.canonicalPath, rootDir)
+              || isSamePath(target.canonicalPath, target.repoRootDir)
+              || isSamePath(target.canonicalPath, target.containmentRoot)
               || !contained
             ) {
               throw badRequest("Reset refuses an external, unsafe, foreign, or project-root worktree path");
@@ -4128,7 +4133,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
             if (targetExists) {
               const resolvedPath = await realpath(target.canonicalPath);
               const resolvedContained = resetPlan.layout === "workspace-task-dir"
-                ? isStrictDescendant(target.containmentRoot, resolvedPath)
+                ? isPathInside(target.containmentRoot, resolvedPath)
                 : isInsideConfiguredWorktreesDir(target.repoRootDir, settings, resolvedPath, workspaceContext);
               if (!resolvedContained) {
                 throw badRequest("Reset refuses an unsafe worktree path outside the configured worktree root");
@@ -4155,18 +4160,12 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
             if (targetExists) {
               const registeredBranches = await getRegisteredWorktreeBranches(target.repoRootDir).catch(unprovenOwnership);
               const targetBranch = typeof target.branch === "string" ? target.branch.trim() : "";
-              let registeredOwner = false;
-              if (targetBranch.length > 0) {
-                for (const entry of registeredBranches) {
-                  if (entry.branch === targetBranch && await canonicalizeWorktreePath(entry.worktreePath) === target.canonicalPath) {
-                    registeredOwner = true;
-                    break;
-                  }
-                }
-              }
+              const registeredOwner = targetBranch.length > 0
+                && registeredBranches.some((entry) => entry.branch === targetBranch && isSamePath(entry.worktreePath, target.canonicalPath));
               const recoveredCanonicalOwner = !registeredOwner
-                && target.canonicalPath === resetPlan.canonicalSingularWorktreePath
-                && (await getRegisteredPathsForRepo(target.repoRootDir).catch(unprovenOwnership)).has(target.canonicalPath);
+                && resetPlan.canonicalSingularWorktreePath !== undefined
+                && isSamePath(target.canonicalPath, resetPlan.canonicalSingularWorktreePath)
+                && (await getRegisteredPathKeysForRepo(target.repoRootDir).catch(unprovenOwnership)).has(pathIdentityKey(target.canonicalPath));
               if (!registeredOwner && !recoveredCanonicalOwner) {
                 throw conflict(`Reset refuses a worktree whose managed task ownership cannot be proven${targetSuffix(target.repoRel)}`);
               }
@@ -4181,13 +4180,13 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
           }).listTasks;
           if (typeof listTasks === "function") {
             const otherOwners = await listTasks.call(scopedStore, { includeArchived: true, slim: true });
+            const targetsByPathKey = new Map(resetPlan.targets.map((entry) => [pathIdentityKey(entry.canonicalPath), entry] as const));
             for (const candidate of otherOwners) {
               if (candidate.id === task.id) continue;
               const candidatePaths = [candidate.worktree, ...Object.values(candidate.workspaceWorktrees ?? {}).map((entry) => entry.worktreePath)]
                 .filter((path): path is string => typeof path === "string");
               for (const candidatePath of candidatePaths) {
-                const canonicalCandidatePath = await canonicalizeWorktreePath(candidatePath);
-                const target = resetPlan.targets.find((entry) => entry.canonicalPath === canonicalCandidatePath);
+                const target = targetsByPathKey.get(pathIdentityKey(candidatePath));
                 if (target) throw conflict(`Reset refuses a worktree path owned by another task${targetSuffix(target.repoRel)}`);
               }
             }
@@ -4303,7 +4302,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
             // FNXC:TaskReset 2026-08-27-22:20: Nested repository paths leave empty parents that Reset removes only one directory at a time before attempting the task directory.
             for (const target of resetPlan.targets) {
               let emptyParent = dirname(target.canonicalPath);
-              while (isStrictDescendant(resetPlan.workspaceTaskDir, emptyParent)) {
+              while (isPathInside(resetPlan.workspaceTaskDir, emptyParent)) {
                 try {
                   await rmdir(emptyParent);
                 } catch {

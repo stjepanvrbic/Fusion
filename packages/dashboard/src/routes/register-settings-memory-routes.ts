@@ -68,8 +68,9 @@ import QRCode from "qrcode";
 import crypto from "node:crypto";
 import { createReadStream } from "node:fs";
 import { execFile } from "node:child_process";
-import { homedir } from "node:os";
-import { mkdir } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { ApiError, badRequest } from "../api-error.js";
 import { resolveGithubTrackingAuth } from "../github-auth.js";
@@ -343,8 +344,14 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
     const downloadBinaryName = process.platform === "darwin" || process.platform === "linux"
       ? resolveCloudflaredBinaryName()
       : "cloudflared-linux-amd64";
-    const tempPath = "/tmp/cloudflared";
 
+    /*
+    FNXC:RemoteAccess 2026-10-11-01:06:
+    Each direct download is staged in its own private `mkdtemp` directory under `os.tmpdir()` and removed afterwards.
+    The former fixed `/tmp/cloudflared` literal is drive-relative on Windows hosts (a checkout on `D:` resolved it to a nonexistent `D:\tmp`), lets concurrent installs overwrite each other's download, and is a predictable path in a world-writable directory.
+    The directory is created only once a verified asset will actually be downloaded, so the pending-manifest, brew and winget paths create nothing.
+    `resolveCloudflaredInstallCommand` intentionally keeps `/tmp` in the copy-paste guidance shown to operators.
+    */
     const installFromDirectDownload = async (): Promise<void> => {
       const asset = manifest.assets[downloadBinaryName];
       if (manifest.source === "upstream-pending-verification" || !asset) {
@@ -356,6 +363,17 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
         throw Object.assign(error, { stage: "manifest-unverified" });
       }
 
+      const stagingDir = await mkdtemp(join(tmpdir(), "fusion-cloudflared-"));
+      try {
+        await downloadVerifyAndInstall(join(stagingDir, "cloudflared"), asset);
+      } finally {
+        await rm(stagingDir, { recursive: true, force: true }).catch((cleanupError: unknown) => {
+          severityAuditLog.warn(`[remote-access] Failed to remove cloudflared staging directory ${stagingDir}: ${formatExecError(cleanupError)}`);
+        });
+      }
+    };
+
+    const downloadVerifyAndInstall = async (tempPath: string, asset: CloudflaredReleaseAsset): Promise<void> => {
       attemptedCommands.push(`curl -L --output ${tempPath} ${asset.url}`);
       await execFileAsync("curl", ["-L", "--output", tempPath, asset.url], { timeout: 120_000 });
       attemptedCommands.push(`verify sha256 of ${tempPath} against pinned manifest`);

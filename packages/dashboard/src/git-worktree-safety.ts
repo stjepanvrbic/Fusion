@@ -1,11 +1,22 @@
 import { isAbsolute, relative, resolve } from "node:path";
-import type { TaskStore } from "@fusion/core";
+import { isPathInside, type TaskStore } from "@fusion/core";
 import { badRequest } from "./api-error.js";
 import { runGitCommand } from "./routes/resolve-diff-base.js";
 
 export function isPathWithin(parent: string, candidate: string): boolean {
   const rel = relative(parent, candidate);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/*
+FNXC:PathIdentity 2026-10-11-01:06:
+Git reports registered worktrees in their native long spelling, while an operator- or store-supplied path may use a Windows 8.3 alias (`C:\Users\RUNNER~1\...`) or a different case.
+Matching the allowlist lexically rejected registered worktrees on the GitHub Windows runner, so allowlist membership compares path identity.
+`isPathWithin` and the project-root checks stay lexical: both sides share the store's spelling there, and symlinked workspace sub-repos keep their lexical containment semantics.
+*/
+/** True when `candidate` is a git-registered worktree in `allowlisted` or a path inside one, compared by path identity. */
+function isInsideRegisteredWorktree(allowlisted: readonly string[], candidate: string): boolean {
+  return allowlisted.some((allowed) => isPathInside(allowed, candidate, { allowEqual: true }));
 }
 
 export async function listRegisteredWorktreePaths(rootDir: string): Promise<string[]> {
@@ -48,7 +59,7 @@ export async function assertWorktreePathSafe(
     cache.set(rootDir, allowlisted);
   }
 
-  const cachedMatch = allowlisted.some((allowed) => isPathWithin(allowed, resolved));
+  const cachedMatch = isInsideRegisteredWorktree(allowlisted, resolved);
   if (cachedMatch && !hadCachedAllowlist) {
     return resolved;
   }
@@ -59,7 +70,7 @@ export async function assertWorktreePathSafe(
   */
   allowlisted = await listRegisteredWorktreePaths(rootDir);
   cache.set(rootDir, allowlisted);
-  if (allowlisted.some((allowed) => isPathWithin(allowed, resolved))) {
+  if (isInsideRegisteredWorktree(allowlisted, resolved)) {
     return resolved;
   }
 
@@ -93,7 +104,7 @@ export async function isAuthorizedProjectOrRegisteredWorktreePath(
     cache.set(root, allowlisted);
   }
 
-  const cachedMatch = allowlisted.some((allowed) => isPathWithin(allowed, candidate));
+  const cachedMatch = isInsideRegisteredWorktree(allowlisted, candidate);
   if (cachedMatch && !hadCachedAllowlist) {
     return true;
   }
@@ -109,5 +120,5 @@ export async function isAuthorizedProjectOrRegisteredWorktreePath(
   }
   cache.set(root, allowlisted);
 
-  return allowlisted.some((allowed) => isPathWithin(allowed, candidate));
+  return isInsideRegisteredWorktree(allowlisted, candidate);
 }
