@@ -23,7 +23,6 @@ import {normalizeTaskPriority} from "../tasks/task-priority.js";
 import {extractTaskIdTokens, normalizeTitleForTaskId} from "../tasks/task-title-id-drift.js";
 import {generateTaskLineageId} from "../tasks/task-lineage.js";
 import {deriveFallbackTaskTitle} from "../ai/ai-summarize.js";
-import {sanitizeFileScopeInPromptContent} from "../task-store/file-scope.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {supersedePlanReviewResults} from "../planner/plan-approval.js";
 import {writePromptFileAtomic} from "./prompt-file.js";
@@ -175,12 +174,15 @@ export async function refineTaskImpl(store: TaskStore, id: string, feedback: str
 
         const newDir = store.taskDir(newId);
         await store.atomicCreateTaskJson(newDir, newTask, "refineTask");
-        // Shared builder: isUnplannedSeedPrompt detects this exact shape so promoted
-        // refinements are planned instead of executing the feedback text as a spec.
+        /*
+        FNXC:TaskRefinementWorkflow 2026-10-11-16:12:
+        The refinement seed is the operator's request, stored verbatim like the createTask bootstrap stub.
+        It must not be File Scope sanitized: isUnplannedSeedPrompt recognizes a seed by its exact content, so dropping a quoted `## File Scope` line with an invalid token (e.g. `origin/main`) made an unplanned refinement read as planned.
+        Readers already exclude invalid tokens from the effective write scope, so sanitizing a seed buys nothing.
+        */
         const prompt = buildRefinementSeedPrompt(newTask.title ?? newId, newTask.description);
-        const sanitizedPrompt = sanitizeFileScopeInPromptContent(prompt);
         await mkdir(newDir, { recursive: true });
-        await writePromptFileAtomic(join(newDir, "PROMPT.md"), sanitizedPrompt.sanitized);
+        await writePromptFileAtomic(join(newDir, "PROMPT.md"), prompt);
 
         if (sourceTask.attachments && sourceTask.attachments.length > 0) {
           const sourceAttachDir = join(store.taskDir(id), "attachments");

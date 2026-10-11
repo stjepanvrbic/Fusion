@@ -499,6 +499,22 @@ describe("File Scope quoted inside the Original Description", () => {
     expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual(["decoy/quoted-only.ts"]);
   });
 
+  /*
+  FNXC:TaskRefinementWorkflow 2026-10-11-16:10:
+  Seeds are stored verbatim, never File Scope sanitized, because seed detection compares their exact content.
+  Skipping the sanitizer costs nothing: the reader already excludes an invalid token from the effective write scope.
+  */
+  it.each([
+    ["bootstrap stub", (request: string) => buildBootstrapPrompt("KB-1", "Example", request)],
+    ["refinement seed", (request: string) => buildRefinementSeedPrompt("Example", request)],
+  ])("excludes an invalid token from a %s's provisional scope without sanitizing", (_label, build) => {
+    const request = "Tighten the guard.\n\n## File Scope\n- `packages/core/src/example.ts`\n- `origin/main`\n\nRefines: KB-0";
+    const prompt = build(request);
+    expect(extractEffectiveWriteScopeFromPrompt(prompt)).toEqual(["packages/core/src/example.ts"]);
+    expect(extractEffectiveWriteScopeFromPrompt(sanitizeFileScopeInPromptContent(prompt).sanitized))
+      .toEqual(extractEffectiveWriteScopeFromPrompt(prompt));
+  });
+
   describe("appendFileScopeEntries", () => {
     it("appends to the plan's section and round-trips through the effective-scope reader", () => {
       const prompt = shapes.marked("B");

@@ -26,6 +26,7 @@ import type {TaskColumnSortMode} from "../tasks/task-priority.js";
 import {clearTerminalFailureAutoRecoveryBudget} from "../tasks/terminal-failure-auto-recovery.js";
 import {generateTaskLineageId} from "../tasks/task-lineage.js";
 import {sanitizeFileScopeInPromptContent} from "../task-store/file-scope.js";
+import {isUnplannedSeedPrompt} from "../mesh/mesh-task-replication.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {softDeleteTaskRowInTransaction, readTaskRow as readTaskRowAsync, readTaskRowInTransaction} from "../task-store/async/async-persistence.js";
 import {supersedePlanReviewResults} from "../planner/plan-approval.js";
@@ -878,8 +879,12 @@ async function runPostCommitArchiveCleanup(store: TaskStore, task: Task, dir: st
 }
 
 /**
- * Publish the task-directory files an archive snapshot carries: PROMPT.md (byte-for-byte, File Scope sanitized) and the attachments directory.
+ * Publish the task-directory files an archive snapshot carries: PROMPT.md and the attachments directory.
  * `if-missing` keeps a PROMPT.md that survived a cleanup-free archive, because the live file is the authority.
+ *
+ * FNXC:ArchiveRestore 2026-10-11-16:12:
+ * A seed prompt (bootstrap stub or refinement seed of a card archived before it was planned) is written byte-for-byte, because seed detection compares its exact content and File Scope sanitizing a quoted invalid token would make the restored card read as planned.
+ * Every other prompt is still File Scope sanitized.
  */
 async function publishArchivedTaskFiles(store: TaskStore, entry: ArchivedTaskEntry, mode: "always" | "if-missing"): Promise<void> {
   const dir = store.taskDir(entry.id);
@@ -887,12 +892,16 @@ async function publishArchivedTaskFiles(store: TaskStore, entry: ArchivedTaskEnt
   const promptExists = mode === "if-missing" && await access(promptPath).then(() => true, () => false);
   if (!promptExists) {
     const prompt = entry.prompt ?? store.generatePromptFromArchiveEntry(entry);
-    const sanitizedPrompt = sanitizeFileScopeInPromptContent(prompt);
-    if (sanitizedPrompt.dropped.length > 0) {
-      storeLog.log(`[file-scope-sanitize] restore ${entry.id}: dropped=[${sanitizedPrompt.dropped.join(",")}]`);
+    let restoredPrompt = prompt;
+    if (!isUnplannedSeedPrompt(prompt, entry.id, entry.title, entry.description)) {
+      const sanitizedPrompt = sanitizeFileScopeInPromptContent(prompt);
+      if (sanitizedPrompt.dropped.length > 0) {
+        storeLog.log(`[file-scope-sanitize] restore ${entry.id}: dropped=[${sanitizedPrompt.dropped.join(",")}]`);
+      }
+      restoredPrompt = sanitizedPrompt.sanitized;
     }
     await mkdir(dir, { recursive: true });
-    await writePromptFileAtomic(promptPath, sanitizedPrompt.sanitized);
+    await writePromptFileAtomic(promptPath, restoredPrompt);
   }
   if (entry.attachments && entry.attachments.length > 0) {
     await mkdir(join(dir, "attachments"), { recursive: true });

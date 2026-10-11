@@ -10,7 +10,11 @@
 import { describe, it, expect } from "vitest";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { buildRefinementSeedPrompt } from "../../mesh/mesh-task-replication.js";
+import {
+  buildRefinementSeedPrompt,
+  isTaskAwaitingPlanning,
+  isUnplannedSeedPrompt,
+} from "../../mesh/mesh-task-replication.js";
 import {
   pgDescribe,
   createTaskStoreForTest,
@@ -409,6 +413,36 @@ pgDescribe("refineTask / duplicateTask backend mode (PostgreSQL)", () => {
       const refined = await h.store.refineTask(source.id, "Follow-up polish request");
       const fetched = await h.store.getTask(refined.id);
       expect(fetched.sourceParentTaskId).toBe(source.id);
+    } finally {
+      await teardown();
+    }
+  });
+
+  /*
+  FNXC:TaskRefinementWorkflow 2026-10-11-16:12:
+  A refinement whose request quotes a `## File Scope` section with an invalid backticked token must be stored as the exact seed and stay unplanned.
+  Before the fix refineTask File Scope sanitized the seed, dropping the `origin/main` line, so the stored PROMPT.md no longer matched the seed shape and the card read as planned.
+  Covers the invalid token on its own line and sharing a line with a valid path.
+  */
+  it.each([
+    ["on its own line", "- `packages/core/src/example.ts`\n- `origin/main`", "- `origin/main`"],
+    ["on a line with a valid path", "- `packages/core/src/example.ts` (rebased on `origin/main`)", "(rebased on `origin/main`)"],
+  ])("stores a refinement seed quoting an invalid File Scope token %s verbatim and unplanned", async (_label, scopeLines, invalidLine) => {
+    const h = await makeHarness();
+    try {
+      const source = await h.store.createTask({
+        title: "Scoped source",
+        description: "Completed scoped work",
+        column: "done",
+      });
+
+      const refined = await h.store.refineTask(source.id, `Tighten the guard.\n\n## File Scope\n${scopeLines}`);
+      const prompt = await readFile(join(h.store.taskDir(refined.id), "PROMPT.md"), "utf-8");
+
+      expect(prompt).toBe(buildRefinementSeedPrompt(refined.title ?? refined.id, refined.description));
+      expect(prompt).toContain(invalidLine);
+      expect(isUnplannedSeedPrompt(prompt, refined.id, refined.title, refined.description)).toBe(true);
+      expect(isTaskAwaitingPlanning(await h.store.getTask(refined.id), prompt)).toBe(true);
     } finally {
       await teardown();
     }

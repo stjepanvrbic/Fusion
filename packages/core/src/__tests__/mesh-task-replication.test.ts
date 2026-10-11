@@ -14,6 +14,7 @@ import {
   isUnplannedSeedPrompt,
 } from "../mesh/mesh-task-replication.js";
 import { applyOriginalDescription } from "../tasks/original-description-policy.js";
+import { sanitizeFileScopeInPromptContent } from "../task-store/file-scope.js";
 
 describe("mesh-task-replication", () => {
   it("buildBootstrapPrompt matches task bootstrap format", () => {
@@ -87,6 +88,38 @@ describe("mesh-task-replication", () => {
       expect(
         isUnplannedSeedPrompt(buildBootstrapPrompt("FN-2", "Title", "desc"), "FN-1", "Title", "desc"),
       ).toBe(false);
+    });
+  });
+
+  /*
+  FNXC:TaskRefinementWorkflow 2026-10-11-16:10:
+  A seed has no Original Description region, so a File Scope section quoted in the request is the seed's
+  provisional declared scope, and File Scope sanitizing drops its invalid lines. The stored seed then no
+  longer matches its builder output and the unplanned card reads as planned. Seed writers therefore store
+  the builder output verbatim; these cases pin why.
+  */
+  describe("File Scope sanitizing changes a seed so it no longer reads as unplanned", () => {
+    const request = [
+      "Tighten the guard.",
+      "",
+      "## File Scope",
+      "- `packages/core/src/example.ts`",
+      "- `origin/main`",
+      "",
+      "Refines: KB-1",
+    ].join("\n");
+
+    it.each([
+      ["refinement seed", () => buildRefinementSeedPrompt("Example", request)],
+      ["bootstrap stub", () => buildBootstrapPrompt("KB-2", "Example", request)],
+    ])("recognizes the verbatim %s and rejects its sanitized form", (_label, build) => {
+      const seed = build();
+      expect(isUnplannedSeedPrompt(seed, "KB-2", "Example", request)).toBe(true);
+
+      const { sanitized, dropped } = sanitizeFileScopeInPromptContent(seed);
+      expect(dropped).toEqual(["origin/main"]);
+      expect(sanitized).not.toBe(seed);
+      expect(isUnplannedSeedPrompt(sanitized, "KB-2", "Example", request)).toBe(false);
     });
   });
 });

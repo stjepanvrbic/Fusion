@@ -21,6 +21,10 @@ The single source of truth for the refinement seed shape. TaskStore.refineTask w
 exact content and isUnplannedSeedPrompt detects it by byte-equality — keep both on this
 builder or the detector silently stops matching when the seed format changes, and unplanned
 refinements release into execution again.
+
+FNXC:TaskRefinementWorkflow 2026-10-11-16:12:
+Every seed writer (create, refine, dashboard Reset, archive restore) stores this builder's output verbatim.
+Never File Scope sanitize a seed: a request quoting `## File Scope` with an invalid token loses that line, the stored bytes stop matching, and the unplanned card reads as planned.
 */
 export function buildRefinementSeedPrompt(title: string, description: string): string {
   return `# ${title}\n\n${description}\n`;
@@ -59,6 +63,10 @@ while the scheduler called it planned (so it was also a dispatch candidate), lea
 as the only thing between a refinement seed and an executor running on the operator's feedback
 text. Callers: triage todo-discovery (plan-in-place workflows), the scheduler dispatch filter, and
 hold-release's isUnplannedForExecution guard. Do not re-open-code either equality check.
+
+FNXC:TaskRefinementWorkflow 2026-10-11-16:12:
+The predicate stays an exact-shape test; seed writers must not rewrite seed bytes (File Scope sanitizing included) instead of this predicate tolerating near-matches.
+Loosening it would let a real spec normalize into a seed.
 */
 export function isUnplannedSeedPrompt(
   content: string,
