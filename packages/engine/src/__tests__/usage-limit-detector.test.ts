@@ -170,6 +170,31 @@ describe("UsageLimitPauser", () => {
     expect(store.updateSettings).toBeUndefined();
   });
 
+  /*
+  FNXC:WorkflowSettings 2026-10-10-23:03:
+  Model lanes are workflow settings. A peer whose workflow stores its execution lane on the limited provider runs on that provider and must be paused with the trigger; a peer whose workflow lane is elsewhere keeps running.
+  */
+  it("pauses a peer whose workflow-stored execution lane uses the limited provider", async () => {
+    const store = createMockStore([
+      { id: "FN-001", column: "in-progress", modelProvider: "anthropic", modelId: "claude-sonnet" },
+      { id: "FN-ON-LANE", column: "in-progress" },
+      { id: "FN-OFF-LANE", column: "in-progress" },
+    ]);
+    Object.assign(store, {
+      getTaskWorkflowSelection: vi.fn((taskId: string) => ({ workflowId: taskId === "FN-ON-LANE" ? "WF-anthropic" : "builtin:coding", stepIds: [] })),
+      getWorkflowDefinition: vi.fn(async () => undefined),
+      getWorkflowSettingValues: vi.fn((workflowId: string) => workflowId === "WF-anthropic"
+        ? { executionProvider: "anthropic", executionModelId: "claude-sonnet" }
+        : {}),
+      getWorkflowSettingsProjectId: vi.fn(() => "proj-1"),
+    });
+
+    await new UsageLimitPauser(store).onUsageLimitHit("executor", "FN-001", "rate limit", "anthropic");
+
+    expect(store.pauseTask).toHaveBeenCalledWith("FN-ON-LANE", true, undefined, { pausedReason: "provider-rate-limit:anthropic" });
+    expect(store.pauseTask).not.toHaveBeenCalledWith("FN-OFF-LANE", expect.anything(), expect.anything(), expect.anything());
+  });
+
   it("logs the triggering error on the task via store.logEntry", async () => {
     const store = createMockStore();
     const pauser = new UsageLimitPauser(store);

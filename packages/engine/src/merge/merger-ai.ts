@@ -1,4 +1,5 @@
 import { commitIdentityArgs, resolveCommitIdentity } from "../git-identity.js";
+import { mergeEffectiveSettings } from "../project/effective-settings.js";
 /**
  * Standalone AI merge path (FN-5633).
  *
@@ -1062,6 +1063,8 @@ export interface LandRepoContext {
   trailers: string[];
   taskTitle?: string;
   signal?: AbortSignal;
+  /** Reports each clean-room attempt to the merge pump; see `MergerOptions.onMergeAttemptStarted`. */
+  onAttemptStarted?: () => void;
   allowDirtyLocalCheckoutSync?: boolean;
   /*
   FNXC:Workspace 2026-06-24-23:50 (resilient workspace land):
@@ -1241,6 +1244,7 @@ export async function landOneRepo(
   let outstandingReviewReasons: string[] = [];
   while (true) {
     throwIfAborted(signal, taskId);
+    ctx.onAttemptStarted?.();
     const tipSha = await git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], repoRootDir);
 
     // Short-circuit a branch with zero commits ahead of the integration tip
@@ -1814,7 +1818,11 @@ export async function runAiMerge(
   The helper's own comment records this exact defect being fixed in `moves.ts`; these two merge
   entry points were missed. Resolve the task's own review lanes and pass them.
   */
-  const settings = await store.getSettings();
+  /*
+  FNXC:WorkflowSettings 2026-10-10-23:03:
+  The merge reviewer runs on the validator lane, a workflow setting. Read the task's effective workflow settings so a lane the operator stored for the workflow reaches the reviewer instead of the project default.
+  */
+  const settings = await mergeEffectiveSettings(store, task, await store.getSettings());
   let mergeGate;
   try {
     mergeGate = await resolvePreMergeGateForTask(store, taskId, task.enabledWorkflowSteps, task);
@@ -2130,6 +2138,7 @@ export async function runAiMerge(
     taskId, settings, audit, log, setStatus, maxPasses,
     mergeAgent, reviewAgent, stashResolveAgent,
     includeTaskId, trailers, taskTitle, signal: options.signal,
+    onAttemptStarted: options.onMergeAttemptStarted,
     allowDirtyLocalCheckoutSync,
     // FNXC:MergeNoCommits 2026-07-17-12:00: no-commits tasks skip dependency sync in the clean room
     noCommitsExpected: task.noCommitsExpected === true,
@@ -2739,7 +2748,8 @@ export async function landWorkspaceTask(
 ): Promise<WorkspaceMergeResult> {
   const taskId = task.id;
   assertMergeGenerationOwned(options.signal, taskId);
-  const settings = await store.getSettings();
+  // FNXC:WorkflowSettings 2026-10-10-23:03: the per-repository merge reviewers read the same effective validator lane as runAiMerge.
+  const settings = await mergeEffectiveSettings(store, task, await store.getSettings());
   const publishToRemote = isPushAfterMergeEnabled(settings, { lane: "workspace" });
   const audit = createRunAuditor(store, {
     runId: generateSyntheticRunId("ai-merge", taskId),
@@ -3239,6 +3249,7 @@ export async function landWorkspaceTask(
         taskId, settings, audit, log, setStatus, maxPasses,
         mergeAgent, reviewAgent, stashResolveAgent,
         includeTaskId, trailers, taskTitle, signal: landSignal,
+        onAttemptStarted: options.onMergeAttemptStarted,
         allowDirtyLocalCheckoutSync,
         // FNXC:Workspace 2026-06-24-23:50: one sub-repo's dependency-sync failure must not block
         // landing the others — degrade verification for that repo, still land the git squash.

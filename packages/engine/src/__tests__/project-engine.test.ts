@@ -1795,6 +1795,160 @@ describe("ProjectEngine shutdown merge handling", () => {
   });
 });
 
+/*
+FNXC:MergeRunTimeout 2026-10-10-22:49:
+A merge that waits its turn must not be treated as hung, and a merge its requester gave up on must not fail the next request.
+
+Original symptom (KB-097): approved behind two queued merges, aborted 30 minutes after its request with 9 minutes of run time, then parked `AUTO_MERGE_RETRY_REJECTED: This operation was aborted`.
+Three pump defects combined. The pump watchdog timed the whole drain pass instead of one merge, so after 30 minutes of back-to-back merges it opened a second concurrent pass. That pass started a second merge beside the running one and, on finishing, dropped the running merge's abort handle. The requester's abort then only disposed the session, the merge body failed with the provider's bare abort error, and the bounded retry that had joined the dying merge received that error as its own outcome.
+
+Surface enumeration (engine only, no UI):
+- Run-start notification: queued requester, requester joining a running merge, attempt restart reported by the merger.
+- Pump watchdog: a queue of healthy back-to-back merges that outlasts the threshold, and one merge that really outlives it.
+- Abort ownership: a pump pass that claimed nothing, with another task's merge running.
+- Requester abort: a request arriving while the aborted merge unwinds; pause and stop keep rejecting their waiters (covered by the pause and shutdown suites).
+*/
+describe("ProjectEngine merge run ownership", () => {
+  const WATCHDOG_MS = 30 * 60_000;
+  type Body = { taskId: string; signal: AbortSignal; restart: () => void; finish: (result?: unknown) => void; fail: (err: Error) => void };
+  let bodies: Body[];
+
+  function holdEveryMerge(): void {
+    mocks.runAiMerge.mockImplementation((...args: unknown[]) => new Promise((resolve, reject) => {
+      const taskId = args[2] as string;
+      const options = args[3] as { signal: AbortSignal; onMergeAttemptStarted?: () => void };
+      bodies.push({
+        taskId,
+        signal: options.signal,
+        restart: () => options.onMergeAttemptStarted?.(),
+        finish: (result = { merged: true, task: { id: taskId } }) => resolve(result),
+        fail: reject,
+      });
+    }));
+  }
+
+  const settle = (pending: Promise<unknown>) => pending.then((value) => ({ value }), (error: Error) => ({ error }));
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    bodies = [];
+    projectAdmissionCoordinator.clearReservationsForTests();
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mocks.currentStore = mockStore.store;
+    holdEveryMerge();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    mocks.runAiMerge.mockReset();
+  });
+
+  it("reports the run start to a queued requester only when the pump reaches its merge", async () => {
+    const engine = createEngine();
+    await engine.start();
+    const started = vi.fn();
+    void settle(engine.onMerge("FN-first"));
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    void settle(engine.onMerge("FN-second", { onMergeRunStarted: started }));
+
+    expect(started).not.toHaveBeenCalled();
+
+    bodies[0].finish();
+    await vi.waitFor(() => expect(bodies).toHaveLength(2));
+    expect(started).toHaveBeenCalledTimes(1);
+    await engine.stop();
+  });
+
+  it("reports the run start at once to a requester that joins a running merge", async () => {
+    const engine = createEngine();
+    await engine.start();
+    void settle(engine.onMerge("FN-first"));
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    const started = vi.fn();
+
+    void settle(engine.onMerge("FN-first", { onMergeRunStarted: started }));
+    await vi.waitFor(() => expect(started).toHaveBeenCalledTimes(1));
+    await engine.stop();
+  });
+
+  it("reports a merge that restarts on a new integration tip as a new run", async () => {
+    const engine = createEngine();
+    await engine.start();
+    const started = vi.fn();
+    void settle(engine.onMerge("FN-first", { onMergeRunStarted: started }));
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    const before = started.mock.calls.length;
+
+    bodies[0].restart();
+
+    expect(started).toHaveBeenCalledTimes(before + 1);
+    await engine.stop();
+  });
+
+  it("keeps merges single-flight when a queue of healthy merges outlasts the pump watchdog", async () => {
+    vi.useFakeTimers();
+    const engine = createEngine();
+    await engine.start();
+    (engine as unknown as { mergeBodySettleTimeoutMs: number }).mergeBodySettleTimeoutMs = 1;
+    void settle(engine.onMerge("FN-first"));
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    void settle(engine.onMerge("FN-second"));
+    vi.setSystemTime(Date.now() + WATCHDOG_MS - 5 * 60_000);
+    bodies[0].finish();
+    await vi.waitFor(() => expect(bodies).toHaveLength(2));
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+
+    void settle(engine.onMerge("FN-third"));
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(bodies.map((body) => body.taskId)).toEqual(["FN-first", "FN-second"]);
+    await engine.stop();
+  });
+
+  it("still aborts a running merge after another pump pass ends without claiming a merge", async () => {
+    vi.useFakeTimers();
+    const engine = createEngine();
+    await engine.start();
+    const requester = new AbortController();
+    void settle(engine.onMerge("FN-first", { signal: requester.signal }));
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    vi.setSystemTime(Date.now() + WATCHDOG_MS + 60_000);
+    const store = mocks.currentStore as { getTask: ReturnType<typeof vi.fn> };
+    store.getTask.mockImplementation(async (taskId: string) => ({
+      id: taskId, column: taskId === "FN-moved" ? "todo" : "in-review", paused: false, mergeRetries: 0, status: null, steps: [], enabledWorkflowSteps: [],
+    }));
+    const getTaskCalls = store.getTask.mock.calls.length;
+    engine.enqueueMerge("FN-moved");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(store.getTask.mock.calls.slice(getTaskCalls).some((call) => call[0] === "FN-moved")).toBe(true);
+
+    requester.abort();
+
+    expect(bodies[0].signal.aborted).toBe(true);
+    await engine.stop();
+  });
+
+  it("runs a fresh merge for a request that arrives while the merge its requester aborted is still unwinding", async () => {
+    const engine = createEngine();
+    await engine.start();
+    const requester = new AbortController();
+    const first = settle(engine.onMerge("FN-first", { signal: requester.signal }));
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+
+    requester.abort();
+    const retry = settle(engine.onMerge("FN-first"));
+    expect((await first).error?.message).toContain("Merge request for FN-first aborted");
+    const providerAbort = new Error("This operation was aborted");
+    providerAbort.name = "AbortError";
+    bodies[0].fail(providerAbort);
+    await vi.waitFor(() => expect(bodies).toHaveLength(2));
+    bodies[1].finish();
+
+    expect(await retry).toEqual({ value: expect.objectContaining({ merged: true }) });
+    await engine.stop();
+  });
+});
+
 describe("ProjectEngine manual merge plumbing", () => {
   beforeEach(() => {
     vi.clearAllMocks();

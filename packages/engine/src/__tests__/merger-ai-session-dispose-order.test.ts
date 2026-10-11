@@ -201,6 +201,34 @@ describe("AI merge clean-room cleanup cannot change a landed outcome", () => {
   });
 });
 
+/*
+FNXC:WorkflowSettings 2026-10-10-23:03:
+The AI merge reviewer runs on the validator lane, a workflow setting. A lane the operator stored for the task's workflow must reach the reviewer session; project settings no longer carry the key.
+*/
+describe("AI merge reviewer model lane", () => {
+  it("runs the reviewer on the validator lane stored for the task's workflow", async () => {
+    const dir = repoWithTaskBranch();
+    const reviewerLanes: Array<{ defaultProvider?: string; defaultModelId?: string }> = [];
+    createResolvedAgentSessionMock.mockClear();
+    createResolvedAgentSessionMock.mockImplementation(async (opts: { defaultProvider?: string; defaultModelId?: string }) => {
+      if (createResolvedAgentSessionMock.mock.calls.length === 1) return { session: mergeSession(vi.fn()) };
+      reviewerLanes.push({ defaultProvider: opts.defaultProvider, defaultModelId: opts.defaultModelId });
+      // The lane is decided once the reviewer session exists; stop here rather than pay for the landing.
+      throw new Error("reviewer lane captured");
+    });
+    const store = makeStore();
+    Object.assign(store, {
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: "builtin:coding", stepIds: [] })),
+      getWorkflowSettingValues: vi.fn(() => ({ validatorProvider: "openai", validatorModelId: "gpt-reviewer" })),
+      getWorkflowSettingsProjectId: vi.fn(() => "proj-1"),
+    });
+
+    await runAiMerge(store, dir, "FN-1", { manual: true }).catch(() => undefined);
+
+    expect(reviewerLanes).toEqual([{ defaultProvider: "openai", defaultModelId: "gpt-reviewer" }]);
+  });
+});
+
 describe("merge-path helper agent sessions are disposed before their factory settles", () => {
   const settings = { merger: { mode: "ai" } } as never;
 

@@ -18,6 +18,7 @@ type MergeLaneState = {
   activeMergeStartedAtMs: number | null;
   mergeBodyInFlight: Promise<unknown> | null;
   mergeAbortController: AbortController | null;
+  requesterAbandonedMergeSignals: WeakSet<AbortSignal>;
   mergeRetryTimer: ReturnType<typeof setTimeout> | null;
   prMergeRetryTimers: Map<string, ReturnType<typeof setTimeout>>;
   workspaceBusyReenqueues: Map<string, number>;
@@ -64,6 +65,8 @@ export function seedMergeLaneState<T extends object>(
     activeMergeStartedAtMs: null,
     mergeBodyInFlight: null,
     mergeAbortController: null,
+    /* FNXC:MergeRetryReliability 2026-10-10-23:03: a fresh engine has no merge abandoned by its requester. */
+    requesterAbandonedMergeSignals: new WeakSet(),
     mergeRetryTimer: null,
     prMergeRetryTimers: new Map(),
     workspaceBusyReenqueues: new Map(),

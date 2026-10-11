@@ -2293,6 +2293,40 @@ describe("TaskExecutor executor model hot-swap", () => {
     expect(setModel).toHaveBeenCalledTimes(1);
   });
 
+  /*
+  FNXC:WorkflowSettings 2026-10-10-23:03:
+  The execution lane is a workflow setting. When a running task drops its own model, the session must move to the lane stored for the task's workflow, the same lane a fresh session would start on.
+  */
+  it("hot-swaps to the execution lane stored for the task's workflow when the task override is cleared", async () => {
+    const store = createMockStore();
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    const findModel = vi.fn().mockReturnValue({ provider: { name: "openai" }, id: "gpt-workflow", name: "Workflow lane" });
+    store.getSettings.mockResolvedValue({ defaultProvider: "anthropic", defaultModelId: "claude-sonnet-4-5" });
+    Object.assign(store, {
+      getTaskWorkflowSelection: vi.fn(() => ({ workflowId: "builtin:coding", stepIds: [] })),
+      getWorkflowSettingValues: vi.fn(() => ({ executionProvider: "openai", executionModelId: "gpt-workflow" })),
+      getWorkflowSettingsProjectId: vi.fn(() => "proj-1"),
+    });
+
+    const executor = createRoutingExecutor(store, "/tmp/test");
+    (executor as any)._modelRegistry = { find: findModel };
+    (executor as any).activeSessions.set("FN-001", {
+      session: { setModel, dispose: vi.fn() },
+      seenSteeringIds: new Set(),
+      lastResolvedModelProvider: "anthropic",
+      lastResolvedModelId: "claude-task",
+      lastTaskModelProvider: "anthropic",
+      lastTaskModelId: "claude-task",
+      lastAssignedAgentId: null,
+    });
+
+    await store._triggerAsync("task:updated", buildUpdatedTask({ modelProvider: undefined, modelId: undefined }));
+    await flushTaskUpdated();
+
+    expect(findModel).toHaveBeenCalledWith("openai", "gpt-workflow");
+    expect(setModel).toHaveBeenCalledTimes(1);
+  });
+
   it("falls back to global default when project default override pair is incomplete", async () => {
     const store = createMockStore();
     const setModel = vi.fn().mockResolvedValue(undefined);

@@ -276,6 +276,7 @@ describe("the other merge-lane surfaces on a renamed board", () => {
       canMergeTask: (ProjectEngine.prototype as unknown as { canMergeTask: (...args: unknown[]) => boolean }).canMergeTask,
       schedulePrMergeRetry: vi.fn(),
       clearActiveMergeClaim: vi.fn(),
+      releaseMergeAbortController: vi.fn(),
       clearMergeActive: vi.fn(),
     };
 

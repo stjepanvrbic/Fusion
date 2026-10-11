@@ -577,7 +577,7 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
             undefined,
             deps.getRunContextFor(task.id),
           ).catch((err: unknown) => executorLog.warn(`${task.id}: failed to log column-agent release: ${err instanceof Error ? err.message : String(err)}`));
-          const settings = await deps.store.getSettings();
+          const settings = await mergeEffectiveSettings(deps.store, task, await deps.store.getSettings());
           const assignedRuntimeConfig = await deps.getAssignedAgentRuntimeConfig(task.assignedAgentId);
           const { provider: ownProvider, modelId: ownModelId } = resolveExecutorSessionModel(
             task.modelProvider,
@@ -626,7 +626,7 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
                 deps.effectiveColumnAgentByTask.delete(task.id);
               }
             } else {
-              const settings = await deps.store.getSettings();
+              const settings = await mergeEffectiveSettings(deps.store, task, await deps.store.getSettings());
               /*
               FNXC:ColumnAgentModel 2026-06-27-10:05:
               Override column agents own the active session model even when a mid-flight task edit adds its own modelProvider/modelId; ignore task-level model fields during column-agent re-resolution so the watcher cannot clobber the governing agent's runtime model.
@@ -697,12 +697,17 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
         const taskModelIdChanged = task.modelId !== activeEntry.lastTaskModelId;
         const assignedAgentChanged = (task.assignedAgentId ?? null) !== (activeEntry.lastAssignedAgentId ?? null);
 
+        /*
+        FNXC:WorkflowSettings 2026-10-10-23:03:
+        Every mid-flight model re-resolution in this watcher reads the task's effective workflow settings, the same lanes the session was created from.
+        The execution lane is a workflow setting, so re-resolving against raw project settings swapped a running session off the operator's stored lane whenever the task or agent changed.
+        */
         if (!overrideColumnGoverns && (taskModelProviderChanged || taskModelIdChanged || assignedAgentChanged)) {
           activeEntry.lastTaskModelProvider = task.modelProvider;
           activeEntry.lastTaskModelId = task.modelId;
           activeEntry.lastAssignedAgentId = task.assignedAgentId ?? null;
 
-          const settings = await deps.store.getSettings();
+          const settings = await mergeEffectiveSettings(deps.store, task, await deps.store.getSettings());
           const assignedRuntimeConfig = await deps.getAssignedAgentRuntimeConfig(task.assignedAgentId);
           const { provider: newProvider, modelId: newModelId } = resolveExecutorSessionModel(
             task.modelProvider,

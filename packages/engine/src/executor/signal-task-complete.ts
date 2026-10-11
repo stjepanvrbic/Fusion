@@ -13,6 +13,7 @@
 import type { Task, TaskStore } from "@fusion/core";
 import { executorLog } from "../logger.js";
 import { triggerTaskMemoryCapture } from "./memory-capture.js";
+import { mergeEffectiveSettings } from "../project/effective-settings.js";
 
 export type SignalTaskCompleteDeps = {
   store: TaskStore;
@@ -55,7 +56,8 @@ export function triggerPostTaskReflectionCapture(
 
   void (async () => {
     try {
-      const settings = await deps.store.getSettings();
+      // FNXC:WorkflowSettings 2026-10-10-23:03: `reflectionEnabled` is a workflow setting; the raw project map no longer carries an operator's stored value.
+      const settings = await mergeEffectiveSettings(deps.store, task, await deps.store.getSettings());
       if (!settings.reflectionEnabled) return;
       await reflectionService.captureTaskPerformance(assignedAgentId, task.id);
     } catch (error) {

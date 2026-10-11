@@ -117,6 +117,7 @@
     "packages/engine/src/executor/graph-failure-pure.ts",
     "packages/engine/src/executor/is-backward-move-out-of-planning.ts",
     "packages/engine/src/executor/lifecycle-columns.ts",
+    "packages/engine/src/executor/merge-run-timeout.ts",
     "packages/engine/src/executor/no-commit-eligibility.ts",
     "packages/engine/src/executor/prompt-derived-eligibility.ts",
     "packages/engine/src/executor/resolve-remediation-checkout.ts",
