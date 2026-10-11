@@ -173,6 +173,9 @@ importers:
       ink-testing-library:
         specifier: ^4.0.0
         version: 4.0.0(@types/react@19.2.14)
+      npm-packlist:
+        specifier: 10.0.2
+        version: 10.0.2
       tsup:
         specifier: ^8.5.1
         version: 8.5.1(@swc/core@1.15.40)(jiti@2.7.0)(postcss@8.5.8)(tsx@4.21.0)(typescript@5.9.3)(yaml@2.9.0)
@@ -5943,6 +5946,10 @@ packages:
   ieee754@1.2.1:
     resolution: {integrity: sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==}
 
+  ignore-walk@8.0.0:
+    resolution: {integrity: sha512-FCeMZT4NiRQGh+YkeKMtWrOmBgWjHjMJ26WQWrRQyoyzqevdaGSakUaJW5xQYmjLlUVk2qUnCjYVBax9EKKg8A==}
+    engines: {node: ^20.17.0 || >=22.9.0}
+
   ignore@5.3.2:
     resolution: {integrity: sha512-hsBTNUqQTDwkWtcdYI2i06Y/nUBEsNEDJKjWdigLvegy8kDuJAS8uRlpkkcQpyEXL0Z/pjDy5HBmMjRCJ2gq+g==}
     engines: {node: '>= 4'}
@@ -6791,6 +6798,10 @@ packages:
     resolution: {integrity: sha512-DlL+XwOy3NxAQ8xuC0okPgK46iuVNAK01YN7RueYBqqFeGsBjV9XmCAzAdgt+667bCl5kPh9EqKKDwnaPG1I7A==}
     engines: {node: '>=10'}
 
+  npm-packlist@10.0.2:
+    resolution: {integrity: sha512-DrIWNiWT0FTdDRjGOYfEEZUNe1IzaSZ+up7qBTKnrQDySpdmuOQvytrqQlpK5QrCA4IThMvL4wTumqaa1ZvVIQ==}
+    engines: {node: ^20.17.0 || >=22.9.0}
+
   npm-run-path@6.0.0:
     resolution: {integrity: sha512-9qny7Z9DsQU8Ou39ERsPU4OZQlSTP47ShQzuKZ6PRXpYLtIFgl/DEBYEXKlvcEa+9tHVcK8CF81Y2V72qaZhWA==}
     engines: {node: '>=18'}
@@ -7160,6 +7171,10 @@ packages:
   pretty-ms@9.3.0:
     resolution: {integrity: sha512-gjVS5hOP+M3wMm5nmNOucbIrqudzs9v/57bWRHQWLYklXqoXKrVfYW2W9+glfGsqtPgpiz5WwyEEB+ksXIx3gQ==}
     engines: {node: '>=18'}
+
+  proc-log@5.0.0:
+    resolution: {integrity: sha512-Azwzvl90HaF0aCz1JrDdXQykFakSSNPaPoiZ9fm5qJIMHioDZEi7OAdRwSm6rSoPtY3Qutnm3L7ogmg3dc+wbQ==}
+    engines: {node: ^18.17.0 || >=20.5.0}
 
   proc-log@6.1.0:
     resolution: {integrity: sha512-iG+GYldRf2BQ0UDUAd6JQ/RwzaQy6mXmsk/IzlYyal4A4SNFw54MeH4/tLkF4I5WoWG9SQwuqWzS99jaFQHBuQ==}
@@ -13606,6 +13621,10 @@ snapshots:
 
   ieee754@1.2.1: {}
 
+  ignore-walk@8.0.0:
+    dependencies:
+      minimatch: 10.2.6
+
   ignore@5.3.2: {}
 
   ignore@7.0.6: {}
@@ -14633,6 +14652,11 @@ snapshots:
 
   normalize-url@6.1.0: {}
 
+  npm-packlist@10.0.2:
+    dependencies:
+      ignore-walk: 8.0.0
+      proc-log: 5.0.0
+
   npm-run-path@6.0.0:
     dependencies:
       path-key: 4.0.0
@@ -14994,6 +15018,8 @@ snapshots:
   pretty-ms@9.3.0:
     dependencies:
       parse-ms: 4.0.0
+
+  proc-log@5.0.0: {}
 
   proc-log@6.1.0: {}
 

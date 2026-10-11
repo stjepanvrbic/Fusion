@@ -1,11 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { builtinModules } from "node:module";
-import { execFileSync } from "node:child_process";
+import packlist from "npm-packlist";
 import { parse } from "yaml";
-import { resolveShellFreeLaunch } from "@fusion/core";
 import { applyPrepackTransform } from "../../scripts/prepare-publish-manifest.mjs";
 
 const workspaceRoot = join(__dirname, "..", "..", "..", "..");
@@ -625,36 +624,56 @@ describe("Workflow YAML validity", () => {
   });
 });
 
+/*
+FNXC:ShippedSkillPacklist 2026-10-11-22:21:
+The shipped-skill check needs npm's file-selection rules, not an npm process: `npm pack --dry-run` took 0.6 s on an idle Windows host and over 13 s on a loaded Windows runner, which does not fit the 5 s test budget.
+`npm-packlist` is the library `npm pack` uses, so the list is computed in-process from a fixture holding the manifest and a copy of the skill tree. The real package directory is not walked because its `dist/` size depends on build state.
+The node is marked `isProjectRoot` because the library otherwise treats it as a bundled dependency and looks up every runtime dependency in `edgesOut`.
+*/
+async function packlistForSkillFixture(manifest: Record<string, unknown>): Promise<Set<string>> {
+  const fixture = mkdtempSync(join(tmpdir(), "fusion-cli-packlist-"));
+  try {
+    writeFileSync(join(fixture, "package.json"), JSON.stringify(manifest));
+    cpSync(join(workspaceRoot, "packages", "cli", "skill"), join(fixture, "skill"), { recursive: true });
+    const paths: string[] = await packlist({ path: fixture, package: manifest, isProjectRoot: true, edgesOut: new Map() });
+    return new Set(paths);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
 describe("shipped agent skills", () => {
-  it("keeps computer-use in the published skill tree", () => {
+  /* FNXC:ShippedSkillPacklist 2026-10-11-22:21: every case runs with an empty PATH, so a package-manager process on this path fails here instead of timing out on a loaded runner. */
+  let emptyPath: string;
+
+  beforeEach(() => {
+    emptyPath = mkdtempSync(join(tmpdir(), "fusion-cli-empty-path-"));
+    vi.stubEnv("PATH", emptyPath);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(emptyPath, { recursive: true, force: true });
+  });
+
+  it("keeps computer-use in the published skill tree", async () => {
     /* FNXC:ComputerUseSkill 2026-08-11-07:19: package files globs, manifest transform, and the
-     * actual npm pack file list together prevent a source-only skill from being mistaken for shipped. */
+     * actual npm packlist together prevent a source-only skill from being mistaken for shipped. */
     const cli = loadPackageJson("cli");
     expect(cli.pi.skills).toContain("./skill");
     expect(cli.files).toContain("skill/**");
     expect(applyPrepackTransform(cli).files).toContain("skill/**");
-    const packageDir = join(workspaceRoot, "packages", "cli");
-    const packFixture = mkdtempSync(join(tmpdir(), "fusion-cli-packlist-"));
-    try {
-      /* Keep npm's real packlist semantics without making this focused manifest test scan the
-       * multi-megabyte built CLI and dashboard bundles. Source presence is still proven by cpSync. */
-      writeFileSync(join(packFixture, "package.json"), JSON.stringify(cli));
-      cpSync(join(packageDir, "skill"), join(packFixture, "skill"), { recursive: true });
-      /*
-      FNXC:WindowsNpmLaunch 2026-10-08-06:19:
-      npm is a `.cmd` batch shim on Windows, so a bare `execFileSync("npm")` fails with ENOENT and `shell: true` is forbidden.
-      `resolveShellFreeLaunch` unwraps the shim to `node npm-cli.js` on win32 and is the identity launch on POSIX.
-      */
-      const npmLaunch = resolveShellFreeLaunch("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"]);
-      const packed = JSON.parse(execFileSync(npmLaunch.command, npmLaunch.args, {
-        cwd: packFixture,
-        encoding: "utf8",
-      })) as Array<{ files: Array<{ path: string }> }>;
-      const packedPaths = new Set(packed[0]!.files.map((file) => file.path));
-      expect(packedPaths).toContain("skill/fusion/SKILL.md");
-      expect(packedPaths).toContain("skill/computer-use/SKILL.md");
-    } finally {
-      rmSync(packFixture, { recursive: true, force: true });
-    }
+    const packedPaths = await packlistForSkillFixture(cli);
+    expect(packedPaths).toContain("skill/fusion/SKILL.md");
+    expect(packedPaths).toContain("skill/computer-use/SKILL.md");
+  });
+
+  it("leaves a skill out of the packlist when the manifest does not ship the skill tree", async () => {
+    const cli = loadPackageJson("cli");
+    const withoutSkillTree = { ...cli, files: cli.files.filter((entry: string) => entry !== "skill/**") };
+    const packedPaths = await packlistForSkillFixture(withoutSkillTree);
+    expect(packedPaths).toContain("package.json");
+    expect(packedPaths).not.toContain("skill/fusion/SKILL.md");
+    expect(packedPaths).not.toContain("skill/computer-use/SKILL.md");
   });
 });
