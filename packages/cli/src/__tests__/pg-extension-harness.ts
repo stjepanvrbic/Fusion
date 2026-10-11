@@ -8,7 +8,8 @@
  * SQLite `new TaskStore(rootDir)` — that runtime was removed (VAL-REMOVAL-005).
  *
  * This harness reuses core's `createSharedPgTaskStoreTestHarness` (one isolated
- * PG database per describe block, truncated between tests) and injects the
+ * PG database per describe block, emptied between tests; a test that leaves a
+ * transaction or statement open fails by name) and injects the
  * resulting store into the extension's per-root cache via
  * `__setCachedStoreForTesting`, so every tool call for the harness rootDir
  * resolves to the SAME PostgreSQL-backed store the test seeds against. No

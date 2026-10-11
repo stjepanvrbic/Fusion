@@ -89,7 +89,22 @@ The configured identity follows `postgres@3.4.9`: role is URL username, then `PG
 
 The shared harness empties the database before each test with a `DELETE` of non-empty tables plus a `setval` on every sequence, issued on its admin connection. For a quiescent database this equals `TRUNCATE ... RESTART IDENTITY`. It differs for a write still in flight on another connection: `TRUNCATE` waits for that writer, while the `DELETE` neither sees the uncommitted row nor waits for it. A row inserted before the reset and committed after it survives with its old identity value while the sequence restarts at 1, and the next test's insert then fails with a duplicate primary key.
 
-So every write a test causes must be committed or abandoned before the test returns. Await everything the test starts, and when the product code under test reports completion (a heartbeat run, an executor lane), that report must mean its writes have settled. A duplicate-key failure on an identity column at the start of a test usually means the previous test leaked a write; fix the leak in that test or in the product code, not in the failing test.
+So every write a test causes must be committed or abandoned before the test returns. Await everything the test starts, and when the product code under test reports completion (a heartbeat run, an executor lane), that report must mean its writes have settled.
+
+<!-- FNXC:PgTestHarnessResetSpeed 2026-10-11-12:56: The harness enforces the contract: a write that outlives its test fails that test by name instead of surfacing as a duplicate key in the next one, without slowing the reset materially. -->
+
+The harness enforces this. It looks for any other client backend on the test database with an open transaction or a running statement (the store's pool, its direct connection, a second harness admin connection, or a client the test opened), at two points:
+
+- **End of test.** An `onTestFinished` callback, registered by the harness `beforeEach`, runs after every `afterEach` hook and cleanup. If work is still open it fails the test that just finished with `PgHarnessLeakedWriteError`, phase `end of test`, naming that test and its file. A manual mid-test `h.beforeEach()` does not add a second check.
+- **Start of reset.** The reset statement checks before it changes anything. If work is still open it raises SQLSTATE `ZL001` (`PG_HARNESS_LEAKED_WRITE_SQLSTATE`) and rolls back, so a refused reset leaves the database as it was. `beforeEach` turns that into `PgHarnessLeakedWriteError`, phase `start of reset`, naming the test that ran since the previous reset (or `harness setup (beforeAll)` when no test has run yet). The test that fails here is not the cause: read the name in the message.
+
+Both checks first wait, inside one server-side statement, for the open work to finish: up to the settle window (default 5 s, `settleWaitMs` option), re-probing without sleeping for the first 5 ms and then backing off. Product code detaches some best-effort work by design (the store's activity-log insert after each task event, some run-audit emits, background reads by engine runtimes), and a test has nothing to await for it. Work that finishes inside the window cannot straddle the reset, so it is not a leak. Each message lists every open backend with its pid, `application_name` (`fusion-test-harness-admin` marks the harness's own connections), state, how long its transaction has been open, and the first 200 characters of its query.
+
+A transaction that keeps a reset waiting the full window fails that reset; the next reset that finds the same transaction still open fails at once instead of waiting again, so a hung leak costs one window, not one per remaining test. Nothing is terminated or rolled back by the harness.
+
+Limits: a write still queued in JavaScript when a check samples the server is invisible to it (only work the server has started can collide on identity), and the last test of a file has no following reset, so its end-of-test check is the only one. The per-test databases of `createTaskStoreForTest` and `usePgTaskStore` are dropped after each test and are not checked.
+
+Cost, measured on win32 against a Linux container server and the native Windows server, paired with the unchanged harness: the reset is unchanged within noise (median about 7.5 ms and 6.5 ms), and the end-of-test check adds 0.3 to 0.6 ms per test on a quiet database, most of it one round trip. When a detached write is still in flight at the end of a test the check takes 0.5 to 1.1 ms, the extra being that write finishing.
 
 ### PostgreSQL setup-boundary participation and measurement
 

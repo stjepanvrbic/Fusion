@@ -439,7 +439,7 @@ Confirmed mechanism: the two signatures are one defect, a usage-event write that
 - **Not an earlier run.** Each harness database is cloned from the golden template under a unique name, so no row can come from a previous run.
 - **Why Windows (inferred, not measured).** The Windows legs use the runner's preinstalled PostgreSQL, where new pool connections and commits are slower, which widens the gap between run completion and insert commit. The archived 12-worker Linux sighting of the same pair fits a timing race and not a Windows-only defect.
 
-The harness reset amplifies the defect but is not its cause, and it is unchanged. The comment above it in `pg-test-harness.ts` now states the contract: no write may outlive the test that issued it.
+The harness reset amplifies the defect but is not its cause, and KB-099 left it unchanged. The comment above it in `pg-test-harness.ts` states the contract: no write may outlive the test that issued it. The harness has since enforced that contract: a write left open past a bounded settle window fails the test that leaked it, by name, and the reset refuses to run while it is open (see [Shared PostgreSQL harness data reset](../../testing.md#shared-postgresql-harness-data-reset-no-write-may-outlive-its-test)).
 
 | run | result |
 |---|---|

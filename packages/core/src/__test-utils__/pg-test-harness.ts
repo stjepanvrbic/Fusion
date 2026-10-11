@@ -40,6 +40,11 @@
  * is not available. The required `test:pg-gate` lane is the exception and fails
  * loudly. Run locally with PG on 5432 (or FUSION_PG_TEST_URL_BASE) to exercise
  * the PG paths.
+ *
+ * `createSharedPgTaskStoreTestHarness()` reuses one database per file instead.
+ * It enforces that no write outlives its test: an end-of-test check and the
+ * per-test reset both fail with PgHarnessLeakedWriteError, naming the test that
+ * left a transaction or statement open (see FNXC:PgTestHarnessResetSpeed).
  */
 
 import { randomUUID } from "node:crypto";
@@ -59,7 +64,12 @@ import {
   getPgTeardownDiagnosticsStatementTimeoutMs,
   type PgTeardownActivityRow,
 } from "./pg-teardown-diagnostics.js";
-import { describe as vitestDescribe, expect as vitestExpect } from "vitest";
+import {
+  describe as vitestDescribe,
+  expect as vitestExpect,
+  onTestFinished as vitestOnTestFinished,
+  TestRunner as VitestTestRunner,
+} from "vitest";
 import postgres, { type Sql } from "postgres";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
@@ -279,6 +289,9 @@ export interface PgTestHarness {
   /** Drop the test database, close connections, and remove the temp dir. */
   teardown(): Promise<void>;
 }
+
+/** `application_name` of the harness admin client, so a leak report tells its backends from the store's. */
+export const PG_HARNESS_ADMIN_APPLICATION_NAME = "fusion-test-harness-admin";
 
 let dbNameCounter = 0;
 
@@ -1098,6 +1111,7 @@ export async function createTaskStoreForTest(options?: {
   const adminSql = postgres(testUrl, {
     max: 2,
     prepare: false,
+    connection: { application_name: PG_HARNESS_ADMIN_APPLICATION_NAME },
     onnotice: () => {},
   });
   const adminDb = drizzle(adminSql);
@@ -1211,10 +1225,18 @@ export async function usePgTaskStore(
  *
  * Design — one PG database is created in `beforeAll` and reused across every
  * test in the describe block. `beforeEach` resets state by:
- *   1. TRUNCATE-ing every application table (project/central/archive schemas)
- *      with RESTART IDENTITY CASCADE, so sequences reset and FK chains clear.
+ *   1. Emptying every non-empty application table (project/central/archive
+ *      schemas) and restarting every sequence, in one statement that first
+ *      refuses to run while another connection still has an open transaction
+ *      or statement (see fastResetSql). Any other failure falls back to
+ *      TRUNCATE ... RESTART IDENTITY CASCADE.
  *   2. Resetting the singleton `config` row to DEFAULT_PROJECT_SETTINGS.
  *   3. Clearing the TaskStore's in-memory caches so no cross-test state leaks.
+ *   4. Registering an end-of-test check that fails the test if it leaves a
+ *      transaction or statement open past the settle window.
+ *
+ * No write may outlive the test that issued it. A leak fails with
+ * PgHarnessLeakedWriteError naming the test that caused it.
  *
  * This is dramatically faster than `createTaskStoreForTest()` (which creates a
  * fresh database per test) because the expensive CREATE DATABASE + schema apply
@@ -1358,12 +1380,181 @@ The fast reset is NOT equivalent to TRUNCATE for a write still in flight on anot
 TRUNCATE takes an ACCESS EXCLUSIVE lock and waits for the writer; the DELETE does not see an uncommitted row and does not wait for it.
 A row inserted before the reset and committed after it survives with its pre-reset identity value while the sequence restarts, so the next test's insert collides on the primary key.
 Harness contract: no write may outlive the test that issued it. Product code under test must settle its writes before it reports completion, and a test must await everything it starts.
+
+FNXC:PgTestHarnessResetSpeed 2026-10-11-10:38:
+The contract is enforced: a write that outlives its test must fail that test, by name, instead of surfacing as a duplicate primary key in the next test.
+One predicate (PG_HARNESS_OPEN_BACKENDS_SQL) finds every other client backend on the test database with an open transaction or a running statement. It is applied at two points.
+  1. End of test: an onTestFinished callback registered from beforeEach runs after every afterEach hook and fails the finished test with PgHarnessLeakedWriteError. It never terminates or rolls back anything.
+  2. Reset: the DO block checks before it changes anything and raises PG_HARNESS_LEAKED_WRITE_SQLSTATE with the open backends as JSON detail, so a refused reset changes nothing. beforeEach turns that into PgHarnessLeakedWriteError naming the test that ran since the previous reset.
+Backend status is cached per transaction, so every check and every re-read calls pg_stat_clear_snapshot() first; without it a check would re-read the first snapshot.
+The first check precedes set_config so a role that may not set session_replication_role is still checked before the TRUNCATE fallback.
+
+FNXC:PgTestHarnessResetSpeed 2026-10-11-11:02:
+Both points wait, server-side and bounded by the settle window (default 5 s), for open work to finish before they fail.
+Failing on the first sample was measured and rejected. Product code detaches best-effort work by design: the store inserts an activity-log row after each task event without awaiting it, some run-audit emits are detached, and engine runtimes read in the background. With no wait, 46 tests in 25 of the 201 core consumer files and 18 tests in the 50 engine consumer files failed with nothing left for the test to await.
+A write that finishes inside the window cannot straddle the reset, which removes the duplicate-key symptom. One that does not finish fails by name, at the end of its own test or, if it appeared later, at the next reset.
+The wait is a pg_sleep loop inside the statement, so fake timers left on by a test cannot stall it. It is never unbounded: an unbounded wait would turn a hung leak into an anonymous hook timeout.
+A reset that has already waited the full window on a transaction fails at once while that transaction stays open, so a hung leak does not cost every later test another window.
+Limits: a write still queued in JavaScript when a check samples the server is invisible to it, and the last test of a file has no following reset, so only its end-of-test check runs.
+
+FNXC:PgTestHarnessResetSpeed 2026-10-11-12:56:
+The checks must not slow the reset materially. Measured on win32 against a Linux container server and a native Windows server, paired with the unchanged harness: the reset statement is unchanged within noise, and the end-of-test check adds 0.3 to 0.6 ms per test on a quiet database, most of it one round trip.
+A check re-probes without sleeping for the first SETTLE_SPIN_MS before it backs off to pg_sleep. A detached write usually lands within a millisecond, while a sleep tick cost 3 ms on the Linux server and up to 15 ms on Windows.
+The reset does not re-check after the wipe. That second check cost 0.11 to 0.18 ms per reset, pushed the total over the 1 ms per-test budget, and only caught a write still open when the wipe finished.
 */
-const FAST_RESET_SQL = `DO $fusion_reset$
+
+/** Default settle window: how long a check waits for open work to finish before it fails by name. */
+const DEFAULT_SETTLE_WAIT_MS = 5_000;
+
+/**
+ * SQLSTATE the harness raises when another client backend still has an open transaction or statement.
+ * Class `ZL` is outside the classes the SQL standard and PostgreSQL define.
+ */
+export const PG_HARNESS_LEAKED_WRITE_SQLSTATE = "ZL001";
+
+/** One client backend with an open transaction or running statement on the shared test database. */
+export interface PgHarnessOpenBackend {
+  readonly pid: number;
+  readonly application_name: string | null;
+  readonly state: string | null;
+  readonly backend_type: string | null;
+  /** Transaction start in UTC with microseconds; together with `pid` it identifies one transaction. */
+  readonly xact_start: string;
+  readonly xact_age_ms: number;
+  readonly query: string | null;
+}
+
+/**
+ * The single detection predicate: every other client backend on the current database with an open transaction or a running statement (`xact_start` is set for both).
+ * Idle pooled connections, idle sessions holding only session-level locks, autovacuum workers and probes on the maintenance database do not match.
+ * It reads pg_stat_get_activity directly: planning the pg_stat_activity view's joins cost about 0.15 ms more per read, measured.
+ */
+const OPEN_BACKENDS_PREDICATE_SQL = `FROM pg_stat_get_activity(NULL) AS backend
+WHERE backend.datid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND backend.backend_type = 'client backend'
+  AND backend.pid <> pg_backend_pid()
+  AND backend.xact_start IS NOT NULL`;
+
+/** The rows of the detection predicate. The end-of-test check and the reset both embed it, so they read the same rows. */
+export const PG_HARNESS_OPEN_BACKENDS_SQL = `SELECT backend.pid, backend.application_name, backend.state, backend.backend_type,
+  to_char(backend.xact_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS xact_start,
+  round(extract(epoch FROM clock_timestamp() - backend.xact_start) * 1000)::int AS xact_age_ms,
+  left(backend.query, 200) AS query
+${OPEN_BACKENDS_PREDICATE_SQL}
+ORDER BY 5, 1`;
+
+export type PgHarnessLeakPhase = "end of test" | "start of reset";
+
+/** Owner named when a reset finds open work before any test has run on the harness. */
+export const PG_HARNESS_SETUP_OWNER = "harness setup (beforeAll)";
+
+/**
+ * A test left a transaction or statement open on the shared test database past the settle window.
+ * `end of test`: the named test is the one that just finished. `start of reset`: the named test ran since the previous reset, and the test failing now is not the cause.
+ */
+export class PgHarnessLeakedWriteError extends Error {
+  readonly testName: string;
+  readonly testFile: string | undefined;
+  readonly phase: PgHarnessLeakPhase;
+  readonly waitedMs: number;
+  readonly backends: readonly PgHarnessOpenBackend[];
+
+  constructor(leak: {
+    readonly testName: string;
+    readonly testFile: string | undefined;
+    readonly phase: PgHarnessLeakPhase;
+    readonly waitedMs: number;
+    readonly backends: readonly PgHarnessOpenBackend[];
+  }) {
+    const subject = `"${leak.testName}"${leak.testFile ? ` (${leak.testFile})` : ""}`;
+    const open = `${leak.backends.length} open transaction(s)/statement(s) on the shared test database`;
+    const waited = `still open after the harness waited ${leak.waitedMs} ms`;
+    const headline = leak.phase === "end of test"
+      ? `${subject} left ${open}, detected at end of test and ${waited}.`
+      : `${subject} left ${open}, detected at start of reset and ${waited}. It ran since the previous reset; the reset was refused and the test failing now is not the cause.`;
+    super([
+      `Shared PostgreSQL test harness: ${headline}`,
+      "No write may outlive the test that issued it: a test must await everything it starts, and product code must settle its writes before it reports completion.",
+      ...leak.backends.map((backend) =>
+        `  pid ${backend.pid} [${backend.application_name || "no application name"}] ${backend.state ?? "unknown state"}, open ${backend.xact_age_ms} ms: ${backend.query ?? ""}`),
+    ].join("\n"));
+    this.name = "PgHarnessLeakedWriteError";
+    this.testName = leak.testName;
+    this.testFile = leak.testFile;
+    this.phase = leak.phase;
+    this.waitedMs = leak.waitedMs;
+    this.backends = leak.backends;
+  }
+}
+
+/** The open backends carried by a harness refusal, or null when the error is not that refusal. */
+function openBackendsFromRefusal(error: unknown): PgHarnessOpenBackend[] | null {
+  const refusal = error as { code?: unknown; detail?: unknown } | null;
+  if (refusal?.code !== PG_HARNESS_LEAKED_WRITE_SQLSTATE || typeof refusal.detail !== "string") return null;
+  return JSON.parse(refusal.detail) as PgHarnessOpenBackend[];
+}
+
+function openTransactionKey(backend: PgHarnessOpenBackend): string {
+  return `${backend.pid}:${backend.xact_start}`;
+}
+
+/** How long a check re-probes without sleeping before it backs off to pg_sleep. */
+const SETTLE_SPIN_MS = 5;
+
+/**
+ * PL/pgSQL that waits until no open backend remains and raises the leak SQLSTATE once `waitMs` has passed. A `waitMs` of 0 checks once.
+ * The quiet case is one existence probe; the detail rows are built only for the refusal.
+ * It re-probes without sleeping for the first SETTLE_SPIN_MS, then sleeps 1 to 50 ms between probes.
+ * The enclosing block must declare `open_backends jsonb`, `settle_deadline timestamptz`, `settle_spin_until timestamptz` and `settle_pause double precision`.
+ */
+function waitForQuietPlpgsql(waitMs: number): string {
+  return `PERFORM pg_stat_clear_snapshot();
+  IF EXISTS (SELECT 1 ${OPEN_BACKENDS_PREDICATE_SQL}) THEN
+    settle_deadline := clock_timestamp() + interval '${waitMs} milliseconds';
+    settle_spin_until := clock_timestamp() + interval '${SETTLE_SPIN_MS} milliseconds';
+    settle_pause := 0.001;
+    LOOP
+      PERFORM pg_stat_clear_snapshot();
+      EXIT WHEN NOT EXISTS (SELECT 1 ${OPEN_BACKENDS_PREDICATE_SQL});
+      IF clock_timestamp() >= settle_deadline THEN
+        SELECT jsonb_agg(to_jsonb(open_backend)) INTO open_backends FROM (${PG_HARNESS_OPEN_BACKENDS_SQL}) AS open_backend;
+        RAISE EXCEPTION 'shared PostgreSQL test harness: a transaction or statement is still open on the test database'
+          USING ERRCODE = '${PG_HARNESS_LEAKED_WRITE_SQLSTATE}', DETAIL = open_backends::text;
+      END IF;
+      IF clock_timestamp() >= settle_spin_until THEN
+        PERFORM pg_sleep(settle_pause);
+        settle_pause := least(settle_pause * 2, 0.05);
+      END IF;
+    END LOOP;
+  END IF;`;
+}
+
+/** The end-of-test check: waits for the database to go quiet and changes nothing. */
+function settleSql(waitMs: number): string {
+  return `DO $fusion_settle$
+DECLARE
+  open_backends jsonb;
+  settle_deadline timestamptz;
+  settle_spin_until timestamptz;
+  settle_pause double precision;
+BEGIN
+  ${waitForQuietPlpgsql(waitMs)}
+END
+$fusion_settle$`;
+}
+
+/** The per-test reset: waits up to `waitMs` for the database to go quiet, refuses if it does not, and otherwise wipes. */
+function fastResetSql(waitMs: number): string {
+  return `DO $fusion_reset$
 DECLARE
   tbl text;
   has_rows boolean;
+  open_backends jsonb;
+  settle_deadline timestamptz;
+  settle_spin_until timestamptz;
+  settle_pause double precision;
 BEGIN
+  ${waitForQuietPlpgsql(waitMs)}
   PERFORM set_config('session_replication_role', 'replica', true);
   FOREACH tbl IN ARRAY ARRAY[${ALL_APPLICATION_TABLES.map((t) => `'${t}'`).join(", ")}] LOOP
     EXECUTE 'SELECT EXISTS(SELECT 1 FROM ' || tbl || ')' INTO has_rows;
@@ -1379,6 +1570,7 @@ BEGIN
       AND n.nspname IN ('${PROJECT_SCHEMA}', '${CENTRAL_SCHEMA}', '${ARCHIVE_SCHEMA}');
 END
 $fusion_reset$`;
+}
 
 export function createSharedPgTaskStoreTestHarness(options?: {
   readonly poolMax?: number;
@@ -1397,14 +1589,74 @@ export function createSharedPgTaskStoreTestHarness(options?: {
    * Set false only for a suite that deliberately shares per-test listeners across tests, with a justification comment.
    */
   readonly resetListenersAfterEach?: boolean;
+  /** Settle window in milliseconds: how long the end-of-test check and the reset each wait for open work to finish before failing by name. Default 5000. */
+  readonly settleWaitMs?: number;
 }): SharedPgTaskStoreHarness {
   const boundProjectId = options?.projectId ?? "";
+  const settleWaitMs = options?.settleWaitMs ?? DEFAULT_SETTLE_WAIT_MS;
   const resetListenersAfterEach = options?.resetListenersAfterEach ?? true;
   let harness: PgTestHarness | null = null;
   let store: TaskStore | null = null;
   let listenerSnapshot: StoreListenerSnapshot | null = null;
   const disposables: HarnessDisposable[] = [];
   let bodyHandle: import("./pg-timeout-boundary-observer.js").PgTimeoutBoundaryHandle | null = null;
+  // The test running since the last successful reset; null until a test has run on this harness.
+  let resetOwner: { readonly testName: string; readonly testFile: string | undefined } | null = null;
+  // Transactions a reset already waited the full settle window on, keyed by pid and transaction start.
+  const stuckAtReset = new Set<string>();
+  // True from registration until the callback runs, so a manual mid-test beforeEach() does not register a second check.
+  let endOfTestCheckRegistered = false;
+  const quietResetSql = fastResetSql(settleWaitMs);
+  const refuseAtOnceResetSql = fastResetSql(0);
+  const quietSettleSql = settleSql(settleWaitMs);
+
+  /**
+   * Fails the test that just finished when work it left open has not finished inside the settle window.
+   * It runs after every afterEach hook and never terminates or rolls back the open work.
+   */
+  const failTestOnOpenBackends = async (
+    h: PgTestHarness,
+    owner: { readonly testName: string; readonly testFile: string | undefined },
+  ): Promise<void> => {
+    try {
+      await h.adminSql.unsafe(quietSettleSql);
+    } catch (error) {
+      const open = openBackendsFromRefusal(error);
+      if (!open) throw error;
+      throw new PgHarnessLeakedWriteError({ ...owner, phase: "end of test", waitedMs: settleWaitMs, backends: open });
+    }
+  };
+
+  /**
+   * Empties the database and restarts every identity once no other backend has open work.
+   * It waits one settle window, except for transactions an earlier reset already waited that window on.
+   */
+  const resetApplicationData = async (h: PgTestHarness): Promise<void> => {
+    for (;;) {
+      let open: PgHarnessOpenBackend[] | null;
+      try {
+        await h.adminSql.unsafe(stuckAtReset.size > 0 ? refuseAtOnceResetSql : quietResetSql);
+        // A reset that ran found the database quiet, so every transaction recorded as stuck has ended.
+        stuckAtReset.clear();
+        return;
+      } catch (error) {
+        open = openBackendsFromRefusal(error);
+      }
+      if (!open) {
+        // Legacy full TRUNCATE for any other fast-path failure, e.g. a role that may not set session_replication_role.
+        await h.adminSql.unsafe(TRUNCATE_ALL_SQL);
+        return;
+      }
+      if (stuckAtReset.size > 0 && !open.every((backend) => stuckAtReset.has(openTransactionKey(backend)))) {
+        // Work other than the transactions already waited on gets the full window.
+        stuckAtReset.clear();
+        continue;
+      }
+      for (const backend of open) stuckAtReset.add(openTransactionKey(backend));
+      const owner = resetOwner ?? { testName: PG_HARNESS_SETUP_OWNER, testFile: vitestExpect.getState().testPath };
+      throw new PgHarnessLeakedWriteError({ ...owner, phase: "start of reset", waitedMs: settleWaitMs, backends: open });
+    }
+  };
   // Lazily import DEFAULT_PROJECT_SETTINGS to avoid pulling the full types
   // graph at module load in environments that only use createTaskStoreForTest.
   let defaultSettingsCache: Record<string, unknown> | null = null;
@@ -1482,12 +1734,8 @@ export function createSharedPgTaskStoreTestHarness(options?: {
       if (!harness || !store) throw new Error("SharedPgTaskStoreHarness: beforeAll not called yet");
       // Wipe all application data and reset sequences in one statement.
       // FNXC:PgTestHarnessResetSpeed 2026-08-15-03:52: fast DELETE-based reset
-      // (see FAST_RESET_SQL) with the legacy full TRUNCATE as an error fallback.
-      try {
-        await harness.adminDb.execute(sql.raw(FAST_RESET_SQL));
-      } catch {
-        await harness.adminDb.execute(sql.raw(TRUNCATE_ALL_SQL));
-      }
+      // (see fastResetSql) with the legacy full TRUNCATE as an error fallback.
+      await resetApplicationData(harness);
       // Re-seed the singleton config row with default project settings so the
       // store sees a clean project on every test.
       const defaults = await ensureDefaults();
@@ -1538,6 +1786,27 @@ export function createSharedPgTaskStoreTestHarness(options?: {
       bodyHandle = harness.timeoutObserver.openBoundary("body", "shared.body", `${process.pid}:${process.env.VITEST_WORKER_ID ?? "main"}:${testFile}`);
       // FNXC:ExecutorLifecycle 2026-10-08-08:13: snapshot last, so beforeAll and store-init listeners are the baseline afterEach restores to.
       listenerSnapshot = resetListenersAfterEach ? snapshotStoreListeners(store as unknown as ListenerResettableEmitter) : null;
+      const currentTest = VitestTestRunner.getCurrentTest();
+      if (!currentTest) {
+        resetOwner = null;
+        return;
+      }
+      const owner = {
+        testName: vitestExpect.getState().currentTestName ?? currentTest.name,
+        testFile: vitestExpect.getState().testPath,
+      };
+      resetOwner = owner;
+      if (!endOfTestCheckRegistered) {
+        endOfTestCheckRegistered = true;
+        const checkedHarness = harness;
+        // Registered here, ahead of anything the test body registers, so it runs last: onTestFinished callbacks run in reverse order.
+        vitestOnTestFinished(async () => {
+          endOfTestCheckRegistered = false;
+          // A test that tore the harness down itself has no database left to check.
+          if (harness !== checkedHarness) return;
+          await failTestOnOpenBackends(checkedHarness, owner);
+        });
+      }
     },
     afterEach: async () => {
       // Close before watcher cleanup so teardown work is never body cost.
