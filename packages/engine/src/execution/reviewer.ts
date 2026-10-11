@@ -612,7 +612,7 @@ export async function reviewStep(
       };
       // FNXC:CommandCenterActivity 2026-08-09-15:18: Review boundaries are recorded only after a real reviewer runtime exists, including fallback attempts.
       attachAgentUsageTelemetry(agentLogger, telemetryContext);
-      emitAgentSessionStart(telemetryContext);
+      emitAgentSessionStart(telemetryContext, agentLogger);
     }
 
     const reviewerModelDesc = describeModel(session);

@@ -3449,7 +3449,7 @@ export class HeartbeatMonitor {
           lane: "heartbeat",
           ephemeral: isAgentEphemeral,
           runId: run.id,
-        });
+        }, agentLogger);
 
         /*
          * FNXC:TokenAnalytics 2026-07-17-14:00:
@@ -4014,7 +4014,7 @@ export class HeartbeatMonitor {
                   lane: "heartbeat",
                   ephemeral: isAgentEphemeral,
                   runId: run.id,
-                });
+                }, agentLogger);
                 return next;
               },
             } : undefined,

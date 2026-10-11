@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { AgentLogger, summarizeToolArgs } from "../agents/agent-logger.js";
+import { AgentLogger, summarizeToolArgs, USAGE_EVENT_DRAIN_TIMEOUT_MS } from "../agents/agent-logger.js";
 import { DEFAULT_GLOBAL_SETTINGS, type TaskStore } from "@fusion/core";
 
 const loggerWarnSpy = vi.hoisted(() => vi.fn());
@@ -951,6 +951,133 @@ describe("AgentLogger", () => {
       // Let the rejected emit-promise settle; the .catch must absorb it.
       await vi.advanceTimersByTimeAsync(0);
       expect(loggerWarnSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to emit usage event"));
+    });
+  });
+
+  /*
+   * FNXC:CommandCenterActivity 2026-10-11-01:20:
+   * A lane reports completion after it flushes its logger, so a resolved flush() must mean every usage-event write the logger issued has settled.
+   * Otherwise Activity read right after a run misses the run, and a late write outlives the run that issued it.
+   */
+  describe("usage_events drain on flush", () => {
+    function createDeferredUsageStore() {
+      const pending: Array<(value: boolean) => void> = [];
+      const store = {
+        appendAgentLog: vi.fn().mockResolvedValue(undefined),
+        emitUsageEvent: vi.fn(() => new Promise<boolean>((resolve) => { pending.push(resolve); })),
+      } as unknown as TaskStore & { emitUsageEvent: ReturnType<typeof vi.fn> };
+      return { store, settleAll: () => pending.splice(0).forEach((resolve) => resolve(true)) };
+    }
+
+    function trackFlush(logger: AgentLogger) {
+      const state = { resolved: false };
+      const promise = logger.flush().then(() => { state.resolved = true; });
+      return { state, promise };
+    }
+
+    it("does not resolve flush() while a tool usage-event write is in flight", async () => {
+      const { store, settleAll } = createDeferredUsageStore();
+      const logger = new AgentLogger({ store, taskId: "FN-UE-DRAIN" });
+      logger.setUsageContext({ model: "m", provider: "p", nodeId: "n", agentId: "a" });
+
+      logger.onToolStart("Read", { path: "a.ts" });
+      logger.onToolEnd("Read", false, "ok");
+      expect(store.emitUsageEvent).toHaveBeenCalledTimes(2);
+
+      const flush = trackFlush(logger);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(flush.state.resolved).toBe(false);
+
+      settleAll();
+      await flush.promise;
+      expect(flush.state.resolved).toBe(true);
+    });
+
+    it.each([
+      ["rejects", () => Promise.reject(new Error("insert rejected"))],
+      ["throws synchronously", () => { throw new Error("sink exploded"); }],
+    ])("resolves flush() and keeps tool log entries when the usage sink %s", async (_label, emit) => {
+      const store = {
+        appendAgentLog: vi.fn().mockResolvedValue(undefined),
+        emitUsageEvent: vi.fn(emit),
+      } as unknown as TaskStore & { appendAgentLog: ReturnType<typeof vi.fn> };
+      const logger = new AgentLogger({ store, taskId: "FN-UE-DRAIN-FAIL" });
+      logger.setUsageContext({ model: "m", provider: "p", nodeId: "n", agentId: "a" });
+
+      logger.onToolStart("Read", { path: "a.ts" });
+      logger.onToolEnd("Read", false, "ok");
+      await logger.flush();
+
+      expect(store.appendAgentLog.mock.calls.map((call) => call[2])).toEqual(["tool", "tool_result"]);
+      expect(loggerWarnSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to emit usage event"));
+    });
+
+    it("stops waiting for a never-settling usage write at the bound and does not wait for it again", async () => {
+      const store = {
+        appendAgentLog: vi.fn().mockResolvedValue(undefined),
+        emitUsageEvent: vi.fn(() => new Promise<boolean>(() => {})),
+      } as unknown as TaskStore;
+      const logger = new AgentLogger({ store, taskId: "FN-UE-DRAIN-STALL" });
+      logger.setUsageContext({ model: "m", provider: "p", nodeId: "n", agentId: "a" });
+      logger.onToolStart("Read", { path: "a.ts" });
+
+      const flush = trackFlush(logger);
+      await vi.advanceTimersByTimeAsync(USAGE_EVENT_DRAIN_TIMEOUT_MS - 1);
+      expect(flush.state.resolved).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(flush.state.resolved).toBe(true);
+      expect(loggerWarnSpy).toHaveBeenCalledWith(`Stopped waiting for 1 usage event write(s) after ${USAGE_EVENT_DRAIN_TIMEOUT_MS}ms`);
+      expect(vi.getTimerCount()).toBe(0);
+
+      const second = trackFlush(logger);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(second.state.resolved).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("clears the bound timer when the writes settle first", async () => {
+      const { store, settleAll } = createDeferredUsageStore();
+      const logger = new AgentLogger({ store, taskId: "FN-UE-DRAIN-TIMER" });
+      logger.setUsageContext({ model: "m", provider: "p", nodeId: "n", agentId: "a" });
+      logger.onToolStart("Read", { path: "a.ts" });
+
+      const flush = trackFlush(logger);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(1);
+      settleAll();
+      await flush.promise;
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("emits nothing and flushes as before without a usage store or usage context", async () => {
+      const appendLog = vi.fn().mockResolvedValue(undefined);
+      const withoutStore = new AgentLogger({ appendLog });
+      withoutStore.setUsageContext({ model: "m", provider: "p", nodeId: "n", agentId: "a" });
+      withoutStore.onToolStart("Read", { path: "a.ts" });
+      await withoutStore.flush();
+      expect(appendLog).toHaveBeenCalledWith(expect.objectContaining({ type: "tool", text: "Read" }));
+
+      const { store } = createDeferredUsageStore();
+      const withoutContext = new AgentLogger({ store, taskId: "FN-UE-DRAIN-NOCTX" });
+      withoutContext.onToolStart("Read", { path: "a.ts" });
+      await withoutContext.flush();
+      expect(store.emitUsageEvent).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("drains a usage write issued after an earlier flush resolved on the next flush", async () => {
+      const { store, settleAll } = createDeferredUsageStore();
+      const logger = new AgentLogger({ store, taskId: "FN-UE-DRAIN-LATE" });
+      logger.setUsageContext({ model: "m", provider: "p", nodeId: "n", agentId: "a" });
+      await logger.flush();
+
+      logger.onToolStart("Read", { path: "a.ts" });
+      const flush = trackFlush(logger);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(flush.state.resolved).toBe(false);
+      settleAll();
+      await flush.promise;
+      expect(flush.state.resolved).toBe(true);
     });
   });
 });

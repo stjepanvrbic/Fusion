@@ -654,7 +654,7 @@ function makeMutatingAgent(store: TaskStore, settings: Settings, taskId: string,
       mcpServers: (await resolveMcpServersForStore(store)).servers,
       taskId,
     });
-    emitAgentSessionStart({ store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger" });
+    emitAgentSessionStart({ store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger" }, logger);
     options.onSession?.(session);
     try {
       await withRateLimitRetry(async () => {
@@ -729,7 +729,7 @@ function makeReviewAgent(store: TaskStore, settings: Settings, taskId: string, o
       mcpServers: (await resolveMcpServersForStore(store)).servers,
       taskId,
     });
-    emitAgentSessionStart({ store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger" });
+    emitAgentSessionStart({ store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger" }, logger);
     options.onSession?.(session);
     try {
       await withRateLimitRetry(async () => {

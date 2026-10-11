@@ -3585,7 +3585,7 @@ export class TriageProcessor {
           permanentAgentGating: this.buildPermanentAgentGatingContext(task.id, triageRunContext.runId, assignedAgent, settings.defaultAgentPermissionPolicy),
           onFallbackModelUsed,
         });
-        emitAgentSessionStart({ store: this.store, agentId: task.assignedAgentId ?? "triage", taskId: task.id, nodeId: task.effectiveNodeId ?? task.nodeId ?? null, model: planningModel.modelId ?? null, provider: planningModel.provider ?? null, lane: "triage" });
+        emitAgentSessionStart({ store: this.store, agentId: task.assignedAgentId ?? "triage", taskId: task.id, nodeId: task.effectiveNodeId ?? task.nodeId ?? null, model: planningModel.modelId ?? null, provider: planningModel.provider ?? null, lane: "triage" }, agentLogger);
 
         const modelDesc = formatModelMarkerDetails(describeModel(session), resolvePlanningThinkingLevel(settings, task.planningThinkingLevel ?? task.thinkingLevel));
         /*

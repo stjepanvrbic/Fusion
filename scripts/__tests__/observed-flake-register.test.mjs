@@ -240,6 +240,10 @@ KB-084 closed entry 36 in place on its first sighting with a product fix: the to
 edge at pick time instead of capturing it when the dialog opens. The active inventory drops entry 36 and the stated count
 drops by one; the record keeps its evidence in place, like closed entry 27.
 KB-085 had already closed entry 38 in place without syncing this inventory or the intro count, so KB-084 drops it too.
+
+FNXC:TestFlakeRegister 2026-10-11-03:34:
+Entry 35 closed in place with a product fix: an agent run now settles its usage telemetry before it reports completion, so a usage-event write can no longer outlive the run and read as zero Activity sessions or straddle the harness reset.
+The active inventory drops entry 35 and the stated count drops by one; the record keeps its evidence in place, like closed entries 27 and 36.
 */
 /*
 FNXC:TestFlakeRegister 2026-10-08-01:13:
@@ -284,10 +288,6 @@ test("observed-flake register active count, escalation state, and owners stay sy
     },
     {
       heading: "33. AutomationStore due-run claim minute-boundary clock race",
-      status: "Active first sighting — recorded 2026-10-08, unattributed.",
-    },
-    {
-      heading: "35. Durable agent Activity analytics heartbeat session count and usage-event identity",
       status: "Active first sighting — recorded 2026-10-08, unattributed.",
     },
     {

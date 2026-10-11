@@ -68,21 +68,22 @@ pgDescribe("durable agent Activity analytics", () => {
   });
 
   /*
-  FNXC:CommandCenterActivity 2026-08-09-16:48:
-  The durable-agent symptom must cross the production logger, canonical usage-event store, and
-  Activity aggregation boundary. Seeding rows alone cannot prove permanent-agent callbacks emit them.
-  */
-  it("turns a production durable no-task heartbeat into Activity sessions and tool usage", async () => {
+   * FNXC:CommandCenterActivity 2026-08-09-17:16:
+   * The production heartbeat lane is under test; disable only optional MCP discovery so this
+   * isolated PG harness never attempts to open a user-level secrets directory.
+   *
+   * FNXC:CommandCenterActivity 2026-10-11-01:20:
+   * `emitUsageEvent` can be replaced so a case can make usage telemetry slower than the rest of the heartbeat.
+   */
+  async function runProductionDurableHeartbeat(emitUsageEvent?: (target: ReturnType<typeof h.store>, event: Parameters<ReturnType<typeof h.store>["emitUsageEvent"]>[0]) => Promise<boolean>) {
     const layer = h.layer();
     const taskStore = h.store();
-    /*
-     * FNXC:CommandCenterActivity 2026-08-09-17:16:
-     * The production heartbeat lane is under test; disable only optional MCP discovery so this
-     * isolated PG harness never attempts to open a user-level secrets directory.
-     */
     const heartbeatTaskStore = new Proxy(taskStore, {
       get(target, property, receiver) {
         if (property === "getSettingsByScope") return undefined;
+        if (property === "emitUsageEvent" && emitUsageEvent) {
+          return (event: Parameters<typeof target.emitUsageEvent>[0]) => emitUsageEvent(target, event);
+        }
         return Reflect.get(target, property, receiver);
       },
     });
@@ -115,7 +116,7 @@ pgDescribe("durable agent Activity analytics", () => {
       projectId, id: agent.id, name: agent.name, role: agent.role, state: "active",
       createdAt: IN_RANGE, updatedAt: IN_RANGE,
     });
-    const result = await new HeartbeatMonitor({
+    return new HeartbeatMonitor({
       agentStore,
       store: agentStore,
       taskStore: heartbeatTaskStore,
@@ -123,8 +124,12 @@ pgDescribe("durable agent Activity analytics", () => {
       secretsStore: { listEnvExportable: vi.fn(async () => []) },
     })
       .executeHeartbeat({ agentId: agent.id, source: "on_demand" });
-    expect(result.status).toBe("completed");
+  }
 
+  /** Reads Activity and the run's usage rows immediately, with no wait, as a dashboard reader would after the run. */
+  async function expectDurableHeartbeatActivity() {
+    const layer = h.layer();
+    const projectId = layer.projectId ?? "";
     const activity = await aggregateActivityAnalytics(layer, { from: "2000-01-01T00:00:00.000Z", to: "2100-01-01T00:00:00.000Z" });
     expect(activity.sessions).toBeGreaterThan(0);
     expect(activity.activeAgents).toBe(1);
@@ -137,6 +142,32 @@ pgDescribe("durable agent Activity analytics", () => {
       { kind: "tool_call", agent_id: "durable-e2e", task_id: null, category: "read" },
       { kind: "tool_result", agent_id: "durable-e2e", task_id: null, category: "read" },
     ].sort((left, right) => left.kind.localeCompare(right.kind)));
+  }
+
+  /*
+  FNXC:CommandCenterActivity 2026-08-09-16:48:
+  The durable-agent symptom must cross the production logger, canonical usage-event store, and
+  Activity aggregation boundary. Seeding rows alone cannot prove permanent-agent callbacks emit them.
+  */
+  it("turns a production durable no-task heartbeat into Activity sessions and tool usage", async () => {
+    const result = await runProductionDurableHeartbeat();
+    expect(result.status).toBe("completed");
+    await expectDurableHeartbeatActivity();
+  });
+
+  /*
+  FNXC:CommandCenterActivity 2026-10-11-01:20:
+  A completed run must already have its usage events persisted, even when the usage-event write is slower than the rest of the heartbeat (a slow PostgreSQL commit).
+  A write that outlived its run read as zero Activity sessions, then committed after the harness reset with a pre-reset identity value, colliding with the next case's first insert.
+  The following case therefore also guards that no write leaks out of this one.
+  */
+  it("persists usage events before a heartbeat whose usage store is slow reports completion", async () => {
+    const result = await runProductionDurableHeartbeat(async (target, event) => {
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      return target.emitUsageEvent(event);
+    });
+    expect(result.status).toBe("completed");
+    await expectDurableHeartbeatActivity();
   });
 
   it("sums CLI and agent sessions, honors the range, and isolates the bound project", async () => {

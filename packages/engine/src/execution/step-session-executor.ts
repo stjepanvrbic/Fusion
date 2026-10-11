@@ -1706,7 +1706,7 @@ Follow instructions precisely and avoid unrelated changes.`,
             AgentSession. Record its boundary only when that session is constructed, not on each
             reuse, so the Activity Sessions metric remains a session count rather than a step count.
             */
-            emitAgentSessionStart({ store: this.store, agentId: taskDetail.assignedAgentId ?? null, taskId: taskDetail.id, nodeId: taskDetail.effectiveNodeId ?? taskDetail.nodeId ?? null, model: executorModelId ?? null, provider: executorProvider ?? null, lane: "workflow-step", ephemeral: true });
+            emitAgentSessionStart({ store: this.store, agentId: taskDetail.assignedAgentId ?? null, taskId: taskDetail.id, nodeId: taskDetail.effectiveNodeId ?? taskDetail.nodeId ?? null, model: executorModelId ?? null, provider: executorProvider ?? null, lane: "workflow-step", ephemeral: true }, agentLogger);
             if (reusePrimarySession) {
               this.reusablePrimarySession = session;
             }

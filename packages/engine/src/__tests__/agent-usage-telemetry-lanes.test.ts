@@ -18,7 +18,7 @@ describe("agent usage telemetry lane seam", () => {
     const logger = new AgentLogger({ taskId: taskId ?? undefined, appendLog: vi.fn().mockResolvedValue(undefined) });
     const context = { store, lane, agentId, taskId, nodeId: taskId ? "mesh-node" : null, model: "resolved-model", provider: "resolved-provider" } as const;
     attachAgentUsageTelemetry(logger, context);
-    emitAgentSessionStart(context);
+    emitAgentSessionStart(context, logger);
     logger.onToolStart("Read", { path: "private-path" });
     logger.onToolEnd("Read", false, "private-result");
     return { emitUsageEvent, appendAgentLog };
@@ -39,7 +39,7 @@ describe("agent usage telemetry lane seam", () => {
     const context = { store, lane: "heartbeat" as const, agentId: "durable-heartbeat", taskId: null };
     expect(() => {
       attachAgentUsageTelemetry(logger, context);
-      emitAgentSessionStart(context);
+      emitAgentSessionStart(context, logger);
       logger.onToolStart("Read", { path: "x" });
       logger.onToolEnd("Read", false, "ok");
     }).not.toThrow();
@@ -80,5 +80,62 @@ describe("agent usage telemetry lane seam", () => {
     expect(emitUsageEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: "tool_call", agentId: "durable-agent", taskId: null, toolName: "Read" }));
     expect(emitUsageEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: "tool_result", agentId: "durable-agent", taskId: null, toolName: "Read" }));
     expect(taskStore.appendAgentLog).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:CommandCenterActivity 2026-10-11-01:20:
+  A completed heartbeat run must imply its session and tool usage events have settled.
+  The run-completion write happens after the logger flush, so a slow usage store must hold completion until all three writes settle.
+  */
+  async function runDurableHeartbeat(emitUsageEvent: TaskStore["emitUsageEvent"], onRunSaved: (run: { status: string }) => void) {
+    const runs = new Map<string, any>();
+    const heartbeatStore = {
+      startHeartbeatRun: vi.fn().mockResolvedValue({ id: "run-1", agentId: "durable-agent", status: "active", startedAt: new Date().toISOString() }),
+      getRunDetail: vi.fn(async (_agentId: string, runId: string) => runs.get(runId) ?? { id: runId, agentId: "durable-agent", status: "active", startedAt: new Date().toISOString() }),
+      saveRun: vi.fn(async (run: any) => { onRunSaved(run); runs.set(run.id, run); }),
+      updateAgentState: vi.fn(), updateAgent: vi.fn(), endHeartbeatRun: vi.fn(),
+      assignTask: vi.fn(), getBudgetStatus: vi.fn().mockResolvedValue({ isOverBudget: false, isOverThreshold: false, usagePercent: 0 }),
+      getCachedAgent: vi.fn().mockReturnValue(null), getLastBlockedState: vi.fn(), setLastBlockedState: vi.fn(), clearLastBlockedState: vi.fn(),
+      appendRunLog: vi.fn().mockResolvedValue(undefined), getAgentsByReportsTo: vi.fn().mockResolvedValue([]), recordHeartbeat: vi.fn(),
+      getAgent: vi.fn().mockResolvedValue({ id: "durable-agent", name: "Durable", role: "executor", state: "active", createdAt: "", updatedAt: "", metadata: {}, soul: "patrol" }),
+    };
+    const taskStore = { getSettings: vi.fn().mockResolvedValue({}), emitUsageEvent, appendAgentLog: vi.fn(), listTasks: vi.fn().mockResolvedValue([]), selectNextTaskForAgent: vi.fn().mockResolvedValue(null) } as unknown as TaskStore;
+    const sessionSpy = vi.spyOn(sessionHelpers, "createResolvedAgentSession").mockImplementation(async (options: any) => {
+      options.onToolStart("Read", { path: "private-heartbeat-input" });
+      options.onToolEnd("Read", false, "private-heartbeat-output");
+      return { session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(), subscribe: vi.fn() } } as any;
+    });
+    try {
+      return await new HeartbeatMonitor({ store: heartbeatStore as any, taskStore, rootDir: "/repo" }).executeHeartbeat({ agentId: "durable-agent", source: "on_demand" });
+    } finally {
+      sessionSpy.mockRestore();
+    }
+  }
+
+  it("writes heartbeat run completion only after every usage-event write has settled", async () => {
+    let settled = 0;
+    const emitUsageEvent = vi.fn(() => new Promise<boolean>((resolve) => {
+      setTimeout(() => { settled++; resolve(true); }, 25);
+    }));
+    const settledAtTerminalSave: number[] = [];
+    const result = await runDurableHeartbeat(emitUsageEvent as unknown as TaskStore["emitUsageEvent"], (run) => {
+      if (run.status !== "active") settledAtTerminalSave.push(settled);
+    });
+
+    expect(result.status).toBe("completed");
+    expect(emitUsageEvent).toHaveBeenCalledTimes(3);
+    expect(settledAtTerminalSave).toEqual([3]);
+  });
+
+  it("completes the heartbeat run when every usage-event write rejects", async () => {
+    const emitUsageEvent = vi.fn().mockRejectedValue(new Error("usage store offline"));
+    const terminalStatuses: string[] = [];
+    const result = await runDurableHeartbeat(emitUsageEvent, (run) => {
+      if (run.status !== "active") terminalStatuses.push(run.status);
+    });
+
+    expect(emitUsageEvent).toHaveBeenCalledTimes(3);
+    expect(result.status).toBe("completed");
+    expect(terminalStatuses).toEqual(["completed"]);
   });
 });

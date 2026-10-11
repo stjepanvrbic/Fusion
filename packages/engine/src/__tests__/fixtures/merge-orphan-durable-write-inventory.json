@@ -4303,21 +4303,25 @@
       "followUpTaskId": "none:out-of-frontier"
     },
     {
-      "callSiteId": "packages/engine/src/agents/agent-logger.ts::emitToolUsageEvent>maybePromise::store.emitUsageEvent::#1",
-      "callSiteFingerprint": "store.emitUsageEvent({?,taskId,agentId,nodeId,model,provider,?,category,?})",
+      "callSiteId": "packages/engine/src/agents/agent-logger.ts::emitUsageEventFailSoft::store.emitUsageEvent::#1",
+      "callSiteFingerprint": "store.emitUsageEvent(event)",
       "file": "packages/engine/src/agents/agent-logger.ts",
-      "enclosingSymbolPath": "emitToolUsageEvent>maybePromise",
+      "enclosingSymbolPath": "emitUsageEventFailSoft",
       "writer": "store.emitUsageEvent",
       "ordinal": 1,
-      "owningEntryPoint": "none:out-of-frontier",
-      "reachableDataStates": [],
-      "axis1": "out-of-frontier",
-      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo; this scanned closure call belongs to another engine caller.",
-      "axis2Provisional": "out-of-frontier",
-      "axis2Final": "out-of-frontier",
-      "observedInSuite": "out-of-frontier",
-      "executionProof": "none:out-of-frontier",
-      "followUpTaskId": "none:out-of-frontier"
+      "owningEntryPoint": "runAiMerge",
+      "reachableDataStates": [
+        "pre-land",
+        "mid-review",
+        "post-ref-advance"
+      ],
+      "axis1": "checkpoint-gap",
+      "axis1Evidence": "makeMutatingAgent/makeReviewAgent attach usage telemetry to the merge-agent AgentLogger, pass its onToolStart/onToolEnd to the session, and call emitAgentSessionStart with that logger, so every merge-agent session boundary and tool event reaches this single write through AgentLogger.trackUsageEvent; the append-only usage event cannot clobber a successor task row, and AgentLogger.flush only waits (bounded) for writes already issued, adding none.",
+      "axis2Provisional": "benign-unfenced",
+      "axis2Final": "benign-unfenced",
+      "observedInSuite": "static-only:call-edge trace from merger-ai session construction through AgentLogger.trackUsageEvent; no Layer B production-body observation",
+      "executionProof": "static:usage event is insert-only telemetry and never mutates task lifecycle state",
+      "followUpTaskId": "none:no-follow-up-required"
     },
     {
       "callSiteId": "packages/engine/src/agents/agent-logger.ts::flushPendingEntries::this.store.appendAgentLogBatch::#1",
@@ -4380,27 +4384,6 @@
       "axis2Final": "benign-unfenced",
       "observedInSuite": "static-only:KB-047 call-edge trace; no Layer B production-body observation",
       "executionProof": "static:agent-log append is insert-only and never mutates task lifecycle state",
-      "followUpTaskId": "none:no-follow-up-required"
-    },
-    {
-      "callSiteId": "packages/engine/src/agents/agent-usage-telemetry.ts::emitAgentSessionStart>result::ctx.store.emitUsageEvent::#1",
-      "callSiteFingerprint": "ctx.store.emitUsageEvent({kind,taskId,agentId,nodeId,model,provider,category,meta})",
-      "file": "packages/engine/src/agents/agent-usage-telemetry.ts",
-      "enclosingSymbolPath": "emitAgentSessionStart>result",
-      "writer": "ctx.store.emitUsageEvent",
-      "ordinal": 1,
-      "owningEntryPoint": "runAiMerge",
-      "reachableDataStates": [
-        "pre-land",
-        "mid-review",
-        "post-ref-advance"
-      ],
-      "axis1": "checkpoint-gap",
-      "axis1Evidence": "makeMutatingAgent/makeReviewAgent call emitAgentSessionStart for every merge-agent session; the append-only usage event cannot clobber a successor task row.",
-      "axis2Provisional": "benign-unfenced",
-      "axis2Final": "benign-unfenced",
-      "observedInSuite": "static-only:KB-047 call-edge trace; no Layer B production-body observation",
-      "executionProof": "static:usage event is insert-only telemetry and never mutates task lifecycle state",
       "followUpTaskId": "none:no-follow-up-required"
     },
     {
@@ -19840,6 +19823,25 @@
       "executionProof": "none:out-of-frontier",
       "followUpTaskId": "none:out-of-frontier",
       "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to specifyTask>agentWork; the triage planning lane owns this write."
+    },
+    {
+      "callSiteId": "packages/engine/src/triage.ts::specifyTask>agentWorkReacquiringLostWorktree::this.store.logEntry::#1",
+      "callSiteFingerprint": "this.store.logEntry(task.id,`Planning worktree was unusable at session start; re-acquiring it and starting planning again: ${message}`)",
+      "file": "packages/engine/src/triage.ts",
+      "enclosingSymbolPath": "specifyTask>agentWorkReacquiringLostWorktree",
+      "writer": "this.store.logEntry",
+      "ordinal": 1,
+      "owningEntryPoint": "other",
+      "reachableDataStates": [
+        "unobservable:closure-wide production fixture pending"
+      ],
+      "axis1": "out-of-frontier",
+      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to specifyTask>agentWorkReacquiringLostWorktree; the triage planning lane owns this write.",
+      "axis2Provisional": "out-of-frontier",
+      "axis2Final": "out-of-frontier",
+      "observedInSuite": "out-of-frontier",
+      "executionProof": "none:out-of-frontier",
+      "followUpTaskId": "none:out-of-frontier"
     },
     {
       "callSiteId": "packages/engine/src/triage.ts::specifyTask>retryableWork::this.store.logEntry::#1",

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { TaskStore, AgentLogEntry, AgentRole } from "@fusion/core";
+import type { TaskStore, AgentLogEntry, AgentRole, UsageEventInput } from "@fusion/core";
 import { categorizeToolName, redactSecrets } from "@fusion/core";
 import { createLogger } from "../logger.js";
 
@@ -20,11 +20,31 @@ export interface AgentLoggerUsageContext {
   agentId?: string | null;
 }
 
+/**
+ * Write one usage event without letting a telemetry failure reach the caller.
+ * Returns a promise that settles (never rejects) when the write does, or `undefined` when the store threw synchronously; either failure is reported to `onFailure` with the error message.
+ */
+export function emitUsageEventFailSoft(store: TaskStore, event: UsageEventInput, onFailure: (message: string) => void): Promise<void> | undefined {
+  const report = (err: unknown) => onFailure(err instanceof Error ? err.message : String(err));
+  try {
+    return Promise.resolve(store.emitUsageEvent(event)).then(() => undefined, report);
+  } catch (err) {
+    report(err);
+    return undefined;
+  }
+}
+
 /** Default byte threshold before an automatic flush. */
 const FLUSH_SIZE_BYTES = 1024;
 /** Default timer interval (ms) for periodic flush of small writes. */
 const FLUSH_INTERVAL_MS = 500;
 const ENTRY_BATCH_SIZE = 50;
+/**
+ * FNXC:CommandCenterActivity 2026-10-11-01:25:
+ * Upper bound on how long `flush()` waits for in-flight usage-event writes.
+ * A lane reports completion after flushing its logger, so the wait makes "run completed" imply "run telemetry settled"; the bound (the same as the engine's bounded run-audit seam) keeps a stalled telemetry sink from holding a run open.
+ */
+export const USAGE_EVENT_DRAIN_TIMEOUT_MS = 2_000;
 const TOOL_RESULT_DETAIL_LIMIT = 4_096;
 const TOOL_RESULT_DETAIL_TRUNCATION_NOTICE = "\n\n[tool output truncated to keep dashboard log views responsive]";
 const TOOL_RESULT_MAX_ARRAY_ITEMS = 25;
@@ -308,6 +328,12 @@ export class AgentLogger {
    * Tool completion rows need non-sensitive processing duration for Bash and every other tool. Store only start timestamps in FIFO order per tool name so overlapping same-name calls do not leak arguments/results or collapse into one duration.
    */
   private readonly toolStartedAt = new Map<string, number[]>();
+  /*
+   * FNXC:CommandCenterActivity 2026-10-11-01:25:
+   * Usage-event writes issued by this logger that have not settled yet.
+   * Emission stays non-blocking on the tool and session callbacks; `flush()` drains this set so a write cannot outlive the run that issued it, which made Activity read zero sessions right after a run and let a late insert commit after a test database reset.
+   */
+  private readonly inFlightUsageEvents = new Set<Promise<void>>();
 
   constructor(options: AgentLoggerOptions) {
     this.store = options.store;
@@ -370,25 +396,29 @@ export class AgentLogger {
     const ctx = this.usageContext;
     const store = this.usageStore ?? this.store;
     if (!ctx || !store) return;
-    try {
-      const maybePromise = store.emitUsageEvent({
-        kind,
-        taskId: this.taskId || null,
-        agentId: ctx.agentId ?? null,
-        nodeId: ctx.nodeId ?? null,
-        model: ctx.model ?? null,
-        provider: ctx.provider ?? null,
-        toolName,
-        category: categorizeToolName(toolName),
-        ...(meta !== undefined && { meta }),
-      });
-      // Swallow async rejections too so a Promise-returning store stays fail-soft.
-      void Promise.resolve(maybePromise).catch((err) => {
-        this.log.warn(`Failed to emit usage event (${kind}) for "${toolName}" on ${this.taskId || "<no task>"}: ${err instanceof Error ? err.message : String(err)}`);
-      });
-    } catch (err) {
-      this.log.warn(`Failed to emit usage event (${kind}) for "${toolName}" on ${this.taskId || "<no task>"}: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    this.trackUsageEvent(store, {
+      kind,
+      taskId: this.taskId || null,
+      agentId: ctx.agentId ?? null,
+      nodeId: ctx.nodeId ?? null,
+      model: ctx.model ?? null,
+      provider: ctx.provider ?? null,
+      toolName,
+      category: categorizeToolName(toolName),
+      ...(meta !== undefined && { meta }),
+    }, `Failed to emit usage event (${kind}) for "${toolName}" on ${this.taskId || "<no task>"}`);
+  }
+
+  /**
+   * Issue a usage-event write without blocking the caller and track it until it settles, so the next `flush()` waits for it.
+   * Fail-soft: a synchronous throw or a rejection is logged as `${failureMessage}: <error>` and never propagates.
+   * Lanes route their session boundary through this so it settles before the lane reports completion.
+   */
+  trackUsageEvent(store: TaskStore, event: UsageEventInput, failureMessage: string): void {
+    const settled = emitUsageEventFailSoft(store, event, (message) => this.log.warn(`${failureMessage}: ${message}`));
+    if (!settled) return;
+    this.inFlightUsageEvents.add(settled);
+    void settled.then(() => { this.inFlightUsageEvents.delete(settled); });
   }
 
   /**
@@ -499,16 +529,33 @@ export class AgentLogger {
     await this.flushTextBuffer();
     await this.flushThinkingBuffer();
     await this.flushPendingEntries();
+    await this.drainUsageEvents();
   }
 
   // ── Internal helpers ───────────────────────────────────────────────
 
   /**
-   * Write a single structured entry through whichever sink(s) are configured.
-   * When both `store`+`taskId` and `appendLogCb` are set, both receive the entry.
-   * When only `appendLogCb` is set (no store/taskId), only the callback is used.
-   * @param storeWarnMsg - Warning message prefix used when the task-store write fails.
+   * Wait, at most {@link USAGE_EVENT_DRAIN_TIMEOUT_MS}, for the usage-event writes in flight when the wait begins.
+   * On expiry, warn once with the count and stop tracking the stalled writes so a later `flush()` does not wait for them again.
    */
+  private async drainUsageEvents(): Promise<void> {
+    if (this.inFlightUsageEvents.size === 0) return;
+    const pending = [...this.inFlightUsageEvents];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      Promise.all(pending).then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), USAGE_EVENT_DRAIN_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+    clearTimeout(timer);
+    if (!timedOut) return;
+    const stalled = pending.filter((write) => this.inFlightUsageEvents.has(write));
+    for (const write of stalled) this.inFlightUsageEvents.delete(write);
+    this.log.warn(`Stopped waiting for ${stalled.length} usage event write(s) after ${USAGE_EVENT_DRAIN_TIMEOUT_MS}ms`);
+  }
+
   private markFirstVisibleOutput(): number {
     this.firstVisibleOutputRecorded = true;
     return Math.max(0, Date.now() - this.requestStartedAtMs);
@@ -524,6 +571,12 @@ export class AgentLogger {
     return startedAt;
   }
 
+  /**
+   * Write a single structured entry through whichever sink(s) are configured.
+   * When both `store`+`taskId` and `appendLogCb` are set, both receive the entry.
+   * When only `appendLogCb` is set (no store/taskId), only the callback is used.
+   * @param storeWarnMsg - Warning message prefix used when the task-store write fails.
+   */
   private writeEntry(
     text: string,
     type: AgentLogEntry["type"],

@@ -1307,7 +1307,7 @@ Do not refactor, rename broadly, or make opportunistic improvements.
     model: mergerSessionModel.modelId ?? null,
     provider: mergerSessionModel.provider ?? null,
     lane: "merger",
-  });
+  }, logger);
     options.onSession?.(session);
 
     const runId = mergeRunContext?.runId;
@@ -2545,7 +2545,7 @@ ${fileList}
     model: mergerSessionModel.modelId ?? null,
     provider: mergerSessionModel.provider ?? null,
     lane: "merger",
-  });
+  }, agentLogger);
   options.onSession?.(session);
 
   try {
@@ -2989,7 +2989,7 @@ ${fileList}
     model: mergerSessionModel.modelId ?? null,
     provider: mergerSessionModel.provider ?? null,
     lane: "merger",
-  });
+  }, agentLogger);
   options.onSession?.(session);
 
   try {
@@ -6112,7 +6112,7 @@ You are assisting with a paused \`git pull --rebase\`.
     model: mergerSessionModel.modelId ?? null,
     provider: mergerSessionModel.provider ?? null,
     lane: "merger",
-  });
+  }, agentLogger);
   options?.onSession?.(session);
 
   const prompt = [
@@ -11188,7 +11188,7 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     model: mergerSessionModel.modelId ?? null,
     provider: mergerSessionModel.provider ?? null,
     lane: "merger",
-  });
+  }, agentLogger);
   options.onSession?.(session);
 
   try {

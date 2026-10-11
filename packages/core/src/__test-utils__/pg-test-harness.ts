@@ -1338,10 +1338,17 @@ hold rows. Replace it with one DO block that:
      start value, reproducing RESTART IDENTITY exactly (including sequences
      advanced by insert-then-delete tests whose tables ended empty — the full
      TRUNCATE reset those too, so the sweep must be unconditional).
-Observable semantics are identical: every application table is empty and every
-identity restarts, so ID-reuse assertions (KB-001) keep holding. The caller
-falls back to the legacy full TRUNCATE if this fast path errors (e.g. a
-non-superuser test role that may not set session_replication_role).
+For a quiescent database the observable semantics are identical: every
+application table is empty and every identity restarts, so ID-reuse assertions
+(KB-001) keep holding. The caller falls back to the legacy full TRUNCATE if
+this fast path errors (e.g. a non-superuser test role that may not set
+session_replication_role).
+
+FNXC:PgTestHarnessResetSpeed 2026-10-11-01:51:
+The fast reset is NOT equivalent to TRUNCATE for a write still in flight on another connection.
+TRUNCATE takes an ACCESS EXCLUSIVE lock and waits for the writer; the DELETE does not see an uncommitted row and does not wait for it.
+A row inserted before the reset and committed after it survives with its pre-reset identity value while the sequence restarts, so the next test's insert collides on the primary key.
+Harness contract: no write may outlive the test that issued it. Product code under test must settle its writes before it reports completion, and a test must await everything it starts.
 */
 const FAST_RESET_SQL = `DO $fusion_reset$
 DECLARE

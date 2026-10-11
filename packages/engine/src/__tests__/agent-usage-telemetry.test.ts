@@ -26,8 +26,41 @@ describe("agent usage telemetry", () => {
   it("emits content-free agent session boundaries fail-soft", async () => {
     const emitUsageEvent = vi.fn().mockRejectedValue(new Error("offline"));
     const store = { emitUsageEvent } as unknown as TaskStore;
-    expect(() => emitAgentSessionStart({ store, agentId: "reviewer", taskId: "FN-8868", nodeId: null, model: "validator", provider: "test", lane: "reviewer", ephemeral: false, runId: "run-1" })).not.toThrow();
+    expect(() => emitAgentSessionStart({ store, agentId: "reviewer", taskId: "FN-8868", nodeId: null, model: "validator", provider: "test", lane: "reviewer", ephemeral: false, runId: "run-1" }, null)).not.toThrow();
     expect(emitUsageEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: "session_start", category: AGENT_SESSION_USAGE_CATEGORY, meta: { lane: "reviewer", ephemeral: false, runId: "run-1" } }));
     expect(() => attachAgentUsageTelemetry(null, { store, lane: "reviewer" })).not.toThrow();
+  });
+
+  it("makes the lane logger's flush wait for its session boundary write", async () => {
+    let settle!: (value: boolean) => void;
+    const emitUsageEvent = vi.fn(() => new Promise<boolean>((resolve) => { settle = resolve; }));
+    const store = { emitUsageEvent } as unknown as TaskStore;
+    const logger = new AgentLogger({ appendLog: vi.fn().mockResolvedValue(undefined) });
+    emitAgentSessionStart({ store, agentId: "durable-agent", taskId: null, lane: "heartbeat" }, logger);
+
+    let flushed = false;
+    const flushing = logger.flush().then(() => { flushed = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(flushed).toBe(false);
+
+    settle(true);
+    await flushing;
+    expect(flushed).toBe(true);
+  });
+
+  it("keeps a logger-tracked session boundary fail-soft and its payload unchanged", async () => {
+    const emitUsageEvent = vi.fn().mockRejectedValue(new Error("offline"));
+    const store = { emitUsageEvent } as unknown as TaskStore;
+    const logger = new AgentLogger({ appendLog: vi.fn().mockResolvedValue(undefined) });
+    expect(() => emitAgentSessionStart({ store, agentId: "merger", taskId: "FN-1", nodeId: "node-1", model: "m", provider: "p", lane: "merger", runId: "run-2" }, logger)).not.toThrow();
+    await expect(logger.flush()).resolves.toBeUndefined();
+    expect(emitUsageEvent).toHaveBeenCalledWith({ kind: "session_start", taskId: "FN-1", agentId: "merger", nodeId: "node-1", model: "m", provider: "p", category: AGENT_SESSION_USAGE_CATEGORY, meta: { lane: "merger", runId: "run-2" } });
+  });
+
+  it("emits a detached boundary without a logger even when the store throws synchronously", () => {
+    const emitUsageEvent = vi.fn(() => { throw new Error("no sink"); });
+    const store = { emitUsageEvent } as unknown as TaskStore;
+    expect(() => emitAgentSessionStart({ store, lane: "reviewer" }, undefined)).not.toThrow();
+    expect(emitUsageEvent).toHaveBeenCalledTimes(1);
   });
 });

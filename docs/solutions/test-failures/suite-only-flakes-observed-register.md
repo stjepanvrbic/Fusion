@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **9 active observation records** (entries 2, 13, 20, 21, 25, 32, 33, 35, and 37): eight **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, 18, 27, 36, and 38 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **22 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **8 active observation records** (entries 2, 13, 20, 21, 25, 32, 33, and 37): seven **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, 18, 27, 35, 36, and 38 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **22 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -417,23 +417,43 @@ The local runs did not land on a minute edge, so they neither confirm nor refute
 
 ### 35. Durable agent Activity analytics heartbeat session count and usage-event identity
 
-- **Status:** Active first sighting — recorded 2026-10-08, unattributed.
+- **Status:** Closed 2026-10-11 — root cause fixed by KB-099 (product fix: agent usage telemetry settles before a run reports completion); no quarantine. One check is outstanding: the Windows core-1 leg of the first Full Suite run after landing.
+- **Root cause and fix:** the engine's two usage-event emitters discarded the `emitUsageEvent` promise and `AgentLogger.flush()` did not wait for it, so a heartbeat reported `completed` while its `session_start`, `tool_call` and `tool_result` inserts were still in flight. KB-099 makes the logger track every usage-event write it issues and makes `flush()` wait for the ones in flight (bounded at 2 000 ms, fail-soft), and routes each lane's session boundary through its logger at all 16 call sites. Regressions at the logger, telemetry-module, heartbeat-lane and PostgreSQL levels failed on the unfixed code.
 - **File:** `packages/core/src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts`
 - **Exact tests:** two cases in `durable agent Activity analytics`: `turns a production durable no-task heartbeat into Activity sessions and tool usage` and `sums CLI and agent sessions, honors the range, and isolates the bound project`.
 - **Observed tree/SHA:** fork Full Suite (non-blocking) run [37742324890](https://github.com/stjepanvrbic/Fusion/actions/runs/37742324890) at `668244c5ed0e2b23eee7e0c9814d82a0f5e3587e`, job `Windows tests` (`113195659917`), `@fusion/core`. The Windows lane flagged the file as outside its known-failing list. The same file is not excluded on Linux, and no Linux shard of that run failed it. The file was never in the Windows ledger, and the KB-035 commit did not touch the core entries.
-- **Observed frequency:** 2 failures in the 4 cases of the file, both assertion or query failures, not timeouts. The file did not appear among the unexpected failures of Windows runs 37720328009, 37720611351, 37735335086, or 37744337717 (`74d0bdf8a`), so it failed in 1 of 5 recent Windows runs.
+- **Observed frequency:** 2 failures in the 4 cases of the file, both assertion or query failures, not timeouts. The file did not appear among the unexpected failures of Windows runs 37720328009, 37720611351, 37735335086, or 37744337717 (`74d0bdf8a`), so it failed in 1 of 5 recent Windows runs. Later sightings: the first case alone in runs 37693147198 and 37702452940, and both cases again in run [37827485906](https://github.com/stjepanvrbic/Fusion/actions/runs/37827485906) at `1bc906a2f`, job `Windows tests (core-1)` (`113483962969`).
 
 The first case ran the production heartbeat to `completed` (the log shows one tool call), then failed `expect(activity.sessions).toBeGreaterThan(0)` with `expected 0 to be greater than 0` at test line 129. The second case failed at its first statement, the insert into `project.usage_events` at line 145, with `duplicate key value violates unique constraint "usage_events_pkey"` and `Key (project_id, id)=(durable-project, 2) already exists`. That column is `generatedAlwaysAsIdentity` and the insert supplies no id, so the identity counter had handed out an id that a row for the same project already held.
 
-Hypothesis, not measured: both failures are one defect in the usage-event identity state of the shared database. A pre-existing row at id 2 for `durable-project` would explain the rejected insert, and a rejected or misattributed heartbeat write would explain zero sessions. The first case's log shows no insert error, so the link between the two is unproven. The `Windows tests` job connects to the runner's PostgreSQL service on port 5432, a path the Linux lanes do not use, so a runner-specific database state is also possible.
+Confirmed mechanism: the two signatures are one defect, a usage-event write that outlives the run that issued it.
+
+- **Zero sessions.** The test's agent store is mocked, so after the three emissions the heartbeat has almost no awaited database work left. `aggregateActivityAnalytics` read before the `session_start` insert committed. The write was late, not rejected: `emitUsageEvent` logs a warning when an insert fails, and the failing CI log was read at planning time as showing none. Measured on the unfixed code at `62be9959e`: with the usage store delayed 75 ms, the production heartbeat returned `completed` and the read failed with the same `expected 0 to be greater than 0`.
+- **Duplicate key.** The shared harness resets between cases with a `DELETE` of non-empty tables plus `setval` on every sequence, on its admin connection. Unlike `TRUNCATE`, that reset neither sees nor waits for an uncommitted insert. A row that took its identity value before the reset and committed after it keeps that value while the sequence restarts at 1. Measured on the shared harness: one committed `usage_events` row (id 1), a second insert held open in a transaction on another connection (id 2), the harness reset, then the commit. The surviving row was `{id: 2, kind: tool_call}` and the next case's three-row insert failed with `duplicate key value violates unique constraint "usage_events_pkey"` and `Key (project_id, id)=(durable-project, 2) already exists`, the CI text.
+- **Why id 2.** The `session_start` row (id 1) committed before the reset and was deleted. The `tool_call` row (id 2) committed after it. The next case took id 1, which was free, then id 2, which was taken.
+- **Not an earlier run.** Each harness database is cloned from the golden template under a unique name, so no row can come from a previous run.
+- **Why Windows (inferred, not measured).** The Windows legs use the runner's preinstalled PostgreSQL, where new pool connections and commits are slower, which widens the gap between run completion and insert commit. The archived 12-worker Linux sighting of the same pair fits a timing race and not a Windows-only defect.
+
+The harness reset amplifies the defect but is not its cause, and it is unchanged. The comment above it in `pg-test-harness.ts` now states the contract: no write may outlive the test that issued it.
 
 | run | result |
 |---|---|
 | Full Suite 37742324890 (`668244c5e`), Windows `@fusion/core` | **failed** (both cases) |
 | Full Suite 37744337717 (`74d0bdf8a`), Windows `@fusion/core` | not among the unexpected failures |
 | `pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts --reporter=dot` with `FUSION_PG_TEST_URL_BASE=postgresql://postgres:postgres@localhost:55432`, local Windows, `c89b0ea0b` plus the quarantine commit | passed, 4 tests |
+| Full Suite 37693147198 and 37702452940, Windows `@fusion/core` | **failed** (first case) |
+| Full Suite 37826361182 (`5e54f21d9`), Windows core-1, the parent commit (as reported when KB-099 was opened; not re-inspected) | passed |
+| Full Suite 37827485906 (`1bc906a2f`), Windows core-1 | **failed** (both cases) |
+| Full Suite 37828982122 (`ad3a46e94`), Windows core-1, the next commit (as reported when KB-099 was opened; not re-inspected) | passed |
+| Unfixed `62be9959e` plus the new case `persists usage events before a heartbeat whose usage store is slow reports completion`, local Windows, Docker PostgreSQL 16 | **failed**, 1 failed and 4 passed, `expected 0 to be greater than 0` |
+| Fixed tree `a4589fc19`, local Windows 11, Docker PostgreSQL 16, `FUSION_PG_TEST_REQUIRED=1` | passed 20 of 20 consecutive runs, 5 cases each, none skipped |
+| Fixed tree `a4589fc19`, Linux x86_64 `node:24` container (Node 24.21.0) with its own checkout and `pnpm install --frozen-lockfile`, the same PostgreSQL 16 container over a Docker network | passed 20 of 20 consecutive runs, 5 cases each, none skipped |
 
-No timeout, retry, or assertion changed, and the file is not quarantined because this is a first sighting. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and the core vitest config. Before quarantining, check whether the harness database for these cases can carry rows from an earlier case or a prior run, and whether the heartbeat's usage-event write can be rejected without failing the heartbeat.
+An earlier Linux invocation passed its setup run and first counted run and was then stopped by an output-parsing error in the measuring script; it is not counted above. No run in either lane logged a failed usage-event write or a drain that reached its bound.
+
+The 20 local runs show the file is stable with the fix; they do not prove the fix on their own, because the unfixed file also passed locally in ordinary runs. The proof is the deterministic regressions that fail on the unfixed code. No timeout, retry, or assertion changed, and the file is not quarantined or in the Windows ledger.
+
+**Outstanding:** the Windows core-1 leg of the first Full Suite run after this lands. Until that run is observed passing this file, treat the Windows confirmation as pending. A recurrence of either signature after the fix is a new defect and needs a fresh diagnosis, starting from whether any write still outlives its test.
 
 ### 36. WorkflowNodeEditor edge-targeted fragment pick splice
 
@@ -1026,7 +1046,7 @@ AssertionError: expected [ { id: 'fusion-system', …(1) }, …(4) ] to deeply e
 
 **Resolved 2026-08-16 (FN-9129):** This was not configuration-provenance loss. A direct table dump retained in the FN-9129 `evidence` task document and `/tmp/fn-9129-instrumented.log` showed all five explicit actors physically persisted among 19 rows. The shared harness intentionally restarts identities between tests; consequently `ORDER BY sequence ASC` has duplicate values across reset boundaries, and the test's `.slice(before.length)` count window selected previous system rows. The assertion now identifies each explicit write by its test-owned `taskPrefix`, retains its immutable revision UUID, and re-reads only those IDs; regression coverage adds a post-snapshot background system write to prove it cannot enter the provenance assertion. This preserves the provenance invariant without retries, waits, quarantines, timeout changes, or a broad harness mutation.
 
-The two command-center durable-agent activity cases observed once at 12 workers are classified as co-observed identity-reuse risk, not this subject's cause: the repaired 12-worker campaign passed them. Core PostgreSQL quarantine remains forbidden and `quarantinedCoreTests` remains empty.
+The two command-center durable-agent activity cases observed once at 12 workers are classified as co-observed identity-reuse risk, not this subject's cause: the repaired 12-worker campaign passed them. Core PostgreSQL quarantine remains forbidden and `quarantinedCoreTests` remains empty. Entry 35 later confirmed a mechanism that produces exactly this pair under load (a usage-event write outliving its heartbeat run and straddling the harness reset); the 12-worker sighting itself was not re-examined.
 
 ### 9. Create Room picker loaded-lane state ordering
 
@@ -1306,6 +1326,8 @@ Each file passed in every other run of the five, and the engine files passed in 
 
 **Already a second sighting, escalated rather than recorded:** `packages/core/src/__tests__/postgres/command-center-activity-durable-agents.pg.test.ts > durable agent Activity analytics > turns a production durable no-task heartbeat into Activity sessions and tool usage` failed with `expected 0 to be greater than 0` on `activity.sessions` in runs 37693147198 and 37702452940, and passed in the other three. Core PostgreSQL quarantine is policy-forbidden, so this goes to its owner for a decision. The zero-session read fits usage events landing after the aggregation, but that mechanism is unconfirmed.
 
+**Resolved 2026-10-11 (KB-099):** the escalation ended in a root-cause product fix, not a quarantine or an owner waiver. The mechanism above is confirmed: the heartbeat reported completion while its usage-event writes were still in flight, so the aggregation read before `session_start` committed. The same late write explains the duplicate-key signature of the file's next case. Agent runs now settle their usage telemetry before they report completion. See [entry 35](#35-durable-agent-activity-analytics-heartbeat-session-count-and-usage-event-identity) for the evidence, the verification runs, and the outstanding post-landing Windows core-1 check.
+
 ### Record 2026-10-08: `merger-ai.test.ts` Windows 30 s timeouts (KB-089, resolved at the test seam)
 
 <!--
@@ -1337,3 +1359,18 @@ Two merger-ai files each failed once when all eleven merger-ai test files ran in
 | `packages/engine/src/__tests__/merger-ai-dependency-install.slow.test.ts` | `runAiMerge dependency install > skips inferred installs on a matching marker but never skips configured init commands` | same run at `d5b7f7826` | assertion text not captured |
 
 `merger-ai-squash-gates.test.ts` then passed alone in 3 of 3 runs on the branch and 1 of 1 at `d5b7f7826` (28 cases each). The dependency-install file was not rerun alone.
+
+### Record 2026-10-11: `merger-ai.test.ts` further Windows timeout (quarantined)
+
+<!--
+FNXC:TestFlakeRegister 2026-10-11-02:39:
+The 2026-10-08 record above makes any further Windows timeout of merger-ai.test.ts an immediate same-change file-level quarantine. One was observed locally while verifying an unrelated engine change, so the file is quarantined here rather than recorded as a first sighting, with no widened timeout and no retry.
+-->
+
+- **File:** `packages/engine/src/__tests__/merger-ai.test.ts` (84 cases; one is platform-skipped on win32).
+- **Lane:** local Windows host, eighteen engine test files in one `pnpm --filter @fusion/engine exec vitest run ...` invocation with default worker fan-out, while a PostgreSQL 16 container ran on the same machine. Other load on the host during the run is not known.
+- **Sighting:** `runAiMerge > finalizes a superseded branch as landed with no squash when two review passes confirm the merge agent's claim`, `Test timed out in 30000ms`. The invocation reported 1 failed, 1044 passed and 1 skipped across the eighteen files in 368.5 s. The tree was a branch based on `62be9959e` that makes `AgentLogger.flush()` wait, bounded, for in-flight usage-event writes (entry 35).
+- **Not caused by that change:** a temporary probe in the `AgentLogger` constructor and in `flush()` printed nothing while the timed-out case ran alone, and printed three constructions and three flushes (each with zero writes in flight) for `persists AI merge agent text/thinking/tool output to agent logs` in the same file. The timed-out case injects both agents as test doubles, so it constructs no logger and the changed code does not run in it. The same eighteen-file invocation was not run on the base commit.
+- **Alone:** the case passed in 2.5 s and 2.8 s in two single-case runs. The whole file passed alone in six invocations (one at 164.6 s, three in 568.5 s, two in 335.2 s). One further whole-file invocation was killed at a 600 s tool limit with no per-test output captured; its cause is not determined and it did not recur in the six invocations that followed.
+- **Action:** quarantined under the 2026-10-08 escalation rule: entry in `scripts/lib/test-quarantine.json` (`quarantinedAt` 2026-10-11, deletion clock 2026-10-25) with the matching `engine-default` exclude in `packages/engine/vitest.config.ts`. The file is not in the Windows ledger and no timeout, retry or assertion changed.
+- **Rescue:** the mechanism matches the 2026-10-08 record (real-git process spawns under worker fan-out push a two-pass case past 30 s). A rescue needs a measured reduction of that case's git spawn count with assertions and timeouts unchanged, plus evidence that the file catches real regressions; it is the main `runAiMerge` coverage.

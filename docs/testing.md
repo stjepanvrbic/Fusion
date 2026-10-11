@@ -81,6 +81,14 @@ The configured identity follows `postgres@3.4.9`: role is URL username, then `PG
 
 `TaskExecutor.dispose()` is idempotent. It removes the executor's four store listeners (`task:moved`, `task:deleted`, `task:updated`, `settings:updated`), its task-move/archive disposer registrations, and its chat-memory capture, and it fences any handler that was already captured. It does not abort sessions; `abortAllInFlight` still does that. `InProcessRuntime.stop()` always disposes the executor, even when the abort fails, and replacing an executor at start disposes the previous one.
 
+### Shared PostgreSQL harness data reset: no write may outlive its test
+
+<!-- FNXC:PgTestHarnessResetSpeed 2026-10-11-03:14: A late usage-event insert survived the per-test reset with a pre-reset identity value and broke the next test's first insert, so the reset's contract is stated here. -->
+
+The shared harness empties the database before each test with a `DELETE` of non-empty tables plus a `setval` on every sequence, issued on its admin connection. For a quiescent database this equals `TRUNCATE ... RESTART IDENTITY`. It differs for a write still in flight on another connection: `TRUNCATE` waits for that writer, while the `DELETE` neither sees the uncommitted row nor waits for it. A row inserted before the reset and committed after it survives with its old identity value while the sequence restarts at 1, and the next test's insert then fails with a duplicate primary key.
+
+So every write a test causes must be committed or abandoned before the test returns. Await everything the test starts, and when the product code under test reports completion (a heartbeat run, an executor lane), that report must mean its writes have settled. A duplicate-key failure on an identity column at the start of a test usually means the previous test leaked a write; fix the leak in that test or in the product code, not in the failing test.
+
 ### PostgreSQL setup-boundary participation and measurement
 
 <!-- FNXC:PgTestPreAdmission 2026-08-17-03:20: FN-9139 requires the shared Vitest setup path to remain connectionless for every non-PostgreSQL lane. Participation is an explicit environment signal, rather than a reachability probe, because importing the harness itself performs a TCP probe. -->
