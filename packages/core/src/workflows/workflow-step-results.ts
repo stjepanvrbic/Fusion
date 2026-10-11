@@ -382,7 +382,8 @@ export function upsertWorkflowStepResult(
     && previous.startedAt === incoming.startedAt;
 
   let priorAttempts = previous.priorAttempts ? [...previous.priorAttempts] : [];
-  if (!isSameAttempt && (isTerminalFailure(previous) || isSupersededPlanningEvidence(previous))) {
+  // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: a prior evidence wait stays visible in history when the next attempt replaces it.
+  if (!isSameAttempt && (isTerminalFailure(previous) || isSupersededPlanningEvidence(previous) || previous.status === "awaiting-evidence")) {
     priorAttempts = [toSnapshot(previous), ...priorAttempts];
   }
   if (priorAttempts.length > maxPriorAttempts) {
@@ -487,6 +488,8 @@ const TERMINAL_STEP_STATUSES: ReadonlySet<WorkflowStepResult["status"]> = new Se
   "failed",
   "advisory_failure",
   "skipped",
+  // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: a settled WAIT is not a lease, so the orphaned-pending sweep never rewrites it.
+  "awaiting-evidence",
 ]);
 
 /** Is a stored result a terminal (settled) record rather than a live/stale lease? */

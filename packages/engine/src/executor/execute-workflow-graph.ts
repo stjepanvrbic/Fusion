@@ -535,7 +535,14 @@ export async function persistWorkflowStepResultWithOutcome(
         deps.getRunContextFor(taskId),
       ).catch(() => undefined);
     }
-    if (isTerminalStepResult(persistedResult)) {
+    /*
+    FNXC:PostMergeEvidenceWait 2026-10-10-21:39:
+    KB-080: `awaiting-evidence` is terminal so it is never treated as a lease, but it is neither a passed nor a
+    failed gate. Recording it here would add a red "Workflow gate failed" activity row on every automatic recheck
+    of a landed card whose CI run is still pending. Only the real verdict that ends the wait (or the 8-hour
+    exhausted failed row) is gate activity.
+    */
+    if (isTerminalStepResult(persistedResult) && persistedResult.status !== "awaiting-evidence") {
       const passed = persistedResult.status === "passed"
         || persistedResult.status === "skipped"
         || persistedResult.verdict === "APPROVE"
@@ -1099,6 +1106,26 @@ export async function executeWorkflowGraph(
         }),
         discardWorkflowStepLease: (taskId: string, workflowStepId: string, startedAt: string) =>
           discardWorkflowStepLease(deps, taskId, workflowStepId, startedAt),
+        /*
+        FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+        KB-080: the 8-hour evidence-wait ceiling is surfaced through the FN-9175 bounded seam. Metadata is
+        exactly ids, the fixed wait state enum and counts; reviewer prose and CI run ids never enter run-audit.
+        */
+        onPostMergeEvidenceWaitExhausted: (taskId, metadata) => emitBoundedRunAudit(deps.store, {
+          taskId,
+          agentId: "executor",
+          runId: resolvedRunId ?? `post-merge-evidence-wait:${taskId}`,
+          domain: "database",
+          mutationType: "task:post-merge-evidence-wait-exhausted",
+          target: taskId,
+          metadata: {
+            taskId: metadata.taskId,
+            nodeId: metadata.nodeId,
+            state: metadata.state,
+            checkCount: metadata.checkCount,
+            waitedMs: metadata.waitedMs,
+          },
+        }),
         isRepositoryScopeReviewEdgeCurrent: async (taskId: string, workflowStepId: string, revision: number): Promise<boolean> => {
           const current = await deps.store.getTask(taskId);
           const result = current.workflowStepResults?.find((entry) => entry.workflowStepId === workflowStepId);

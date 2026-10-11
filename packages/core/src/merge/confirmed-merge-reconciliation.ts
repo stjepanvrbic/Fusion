@@ -11,7 +11,7 @@ export type ConfirmedMergeChecklistReconciliation = {
 export type RequiredPostMergeEvidenceDecision =
   | { outcome: "finalizable" }
   | { outcome: "resumable"; gateId: string }
-  | { outcome: "blocked"; gateId: string; reason: "duplicate" | "pending" | "failed" | "skipped" | "not-approved" };
+  | { outcome: "blocked"; gateId: string; reason: "duplicate" | "pending" | "failed" | "skipped" | "not-approved" | "awaiting-evidence" };
 
 /*
 FNXC:ConfirmedMergeFinalization 2026-08-23-07:42:
@@ -67,6 +67,8 @@ export async function getRequiredPostMergeEvidenceDecision(
     if (results.length > 1) return { outcome: "blocked", gateId, reason: "duplicate" };
     const [result] = results;
     if (result.status === "pending") return { outcome: "blocked", gateId, reason: "pending" };
+    // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: pending post-landing CI evidence blocks finalization without being a rejection.
+    if (result.status === "awaiting-evidence") return { outcome: "blocked", gateId, reason: "awaiting-evidence" };
     if (result.status === "failed") return { outcome: "blocked", gateId, reason: "failed" };
     if (result.status === "skipped") return { outcome: "blocked", gateId, reason: "skipped" };
     if (result.status !== "passed" || (result.verdict !== "APPROVE" && result.verdict !== "APPROVE_WITH_NOTES")) {
@@ -83,6 +85,7 @@ export async function getRequiredPostMergeEvidenceBlocker(
   const decision = await getRequiredPostMergeEvidenceDecision(store, task);
   if (decision.outcome === "finalizable") return undefined;
   if (decision.outcome === "resumable") return `required post-merge evidence gate '${decision.gateId}' has not reported`;
+  if (decision.reason === "awaiting-evidence") return `required post-merge evidence gate '${decision.gateId}' is waiting for post-landing CI evidence`;
   return `required post-merge evidence gate '${decision.gateId}' is not approved`;
 }
 

@@ -418,3 +418,48 @@ describe("post-merge gate after a half-deleted task worktree (KB-003, real git)"
     expect(fixture.task.column).toBe("done");
   });
 });
+
+/*
+FNXC:PostMergeEvidenceWait 2026-10-10-22:34:
+KB-080: the graph recorder writes awaiting-evidence only from the node result of the real custom-node seam.
+That seam must declare the post-merge phase to the step session (the phase is what makes WAIT a legal verdict)
+and must carry the reviewer's pending-evidence state and run id through unchanged. A blocking gate reports the
+wait as a failure so finalization stays blocked; an advisory step reports success and never blocks.
+*/
+describe("post-merge gate WAIT through the custom-node seam (KB-080, real git)", () => {
+  const WAIT_OUTCOME = {
+    success: false,
+    verdict: "WAIT",
+    failureValue: "post-merge-evidence-pending",
+    output: "Run 37759591738 is queued.",
+    notes: "Run 37759591738 is queued.",
+    evidencePending: { state: "run-queued", runId: "37759591738" },
+  };
+
+  it.each([
+    ["gate", "failure"],
+    ["advisory", "success"],
+  ] as const)("maps a %s step's WAIT outcome to a %s node result carrying the pending evidence", async (gateMode, outcome) => {
+    const { root, worktree, landedSha } = landedTask("healthy");
+    const fixture = createStore(landedTaskRecord(worktree, landedSha));
+    const deps = buildDeps(root, fixture.store, async () => undefined);
+    const executeWorkflowStep = vi.fn(async () => WAIT_OUTCOME);
+    deps.executeWorkflowStep = executeWorkflowStep as never;
+    const node = { ...POST_MERGE_NODE, config: { ...POST_MERGE_NODE.config, gateMode } };
+    const live = await (fixture.store as unknown as { getTask: () => Promise<TaskDetail> }).getTask();
+
+    const result = await runGraphCustomNode(deps, node as never, live, {} as Settings, undefined, POST_MERGE_CONTEXT);
+
+    expect(executeWorkflowStep).toHaveBeenCalledOnce();
+    expect((executeWorkflowStep.mock.calls[0] as unknown[])[1]).toMatchObject({ phase: "post-merge", gateMode });
+    expect(result.outcome).toBe(outcome);
+    expect(result.value).toBe("post-merge-evidence-pending");
+    expect(result.contextPatch).toMatchObject({
+      evidencePending: { state: "run-queued", runId: "37759591738" },
+      notes: "Run 37759591738 is queued.",
+    });
+    expect(fixture.task.status).toBeNull();
+    expect(fixture.task.error).toBeNull();
+    expect(fixture.task.column).toBe("in-review");
+  });
+});

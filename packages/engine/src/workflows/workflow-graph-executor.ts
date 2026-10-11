@@ -11,7 +11,7 @@ import type {
   WorkflowStepResult,
   WorkflowStepNotRunReason,
 } from "@fusion/core";
-import { BUILTIN_CODING_WORKFLOW_IR, FAST_LANE_SKIP_VALUE, FAST_MODE_BYPASS_ACTOR, PLAN_REVIEW_GROUP_ID, WORKFLOW_STEP_NOT_RUN_REASONS, WorkflowIrError, computeWorkflowIrPin, getWorkflowExtensionRegistry, instanceNodeId, resolveFastLaneRoute, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled, isPlanReviewSatisfied, parseNoOpCompletionMarker, requiresContentReviewProof, resolveRequiredPreMergeStepIds } from "@fusion/core";
+import { BUILTIN_CODING_WORKFLOW_IR, FAST_LANE_SKIP_VALUE, FAST_MODE_BYPASS_ACTOR, PLAN_REVIEW_GROUP_ID, WORKFLOW_STEP_NOT_RUN_REASONS, WorkflowIrError, computeWorkflowIrPin, getWorkflowExtensionRegistry, instanceNodeId, resolveFastLaneRoute, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled, isPlanReviewSatisfied, nextPostMergeEvidenceWait, normalizePostMergeEvidencePending, postMergeEvidenceWaitBackoffMs, POST_MERGE_EVIDENCE_PENDING_VALUE, parseNoOpCompletionMarker, requiresContentReviewProof, resolveRequiredPreMergeStepIds } from "@fusion/core";
 import {
   DEPENDENCY_BOOTSTRAP_CONFIGURATION_REQUIRED_VALUE,
   isDependencyBootstrapConfigurationBlock,
@@ -349,6 +349,16 @@ export interface WorkflowGraphExecutorDeps {
   initialContext?: Record<string, unknown>;
   /** Test seam for bounded loop timeout checks. Defaults to Date.now. */
   runLoopNowForTests?: () => number;
+  /*
+   * FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+   * Best-effort audit sink invoked once when a required post-merge gate's evidence wait reaches its 8-hour
+   * ceiling. Production wires it to emitBoundedRunAudit; the graph never awaits it past a synchronous call,
+   * so an absent, throwing, rejecting or hanging sink cannot change the recorded row or the run outcome.
+   */
+  onPostMergeEvidenceWaitExhausted?: (
+    taskId: string,
+    metadata: { taskId: string; nodeId: string; state: string; checkCount: number; waitedMs: number },
+  ) => void | Promise<void>;
   /**
    * Step-inversion (KTD-3, U3): fresh `Task.steps[]` accessor used by a `foreach`
    * node at expansion time. Defaults to reading `task.steps` off the run's task.
@@ -1200,6 +1210,10 @@ export class WorkflowGraphExecutor {
             node.config?.phase === "post-merge" ? "post-merge" : "pre-merge";
           const logPrefix = stepPhase === "post-merge" ? "[post-merge]" : "[pre-merge]";
           const stepStartedAt = new Date().toISOString();
+          // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: capture the gate row before this run's pending lease replaces it; it carries the wait window.
+          const priorGateRow = stepPhase === "post-merge"
+            ? task.workflowStepResults?.find((entry) => entry.workflowStepId === node.id)
+            : undefined;
           const pendingLease = await this.recordOptionalGroupStepResult(task.id, {
             workflowStepId: node.id,
             workflowStepName: groupName,
@@ -1277,14 +1291,42 @@ export class WorkflowGraphExecutor {
           merge, retry, and status-switch behavior non-blocking. Plan Review is excluded because its
           fail-closed satisfaction gate would turn this record into an automatic hold with no exit.
           */
+          /*
+          FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+          A required post-merge gate reporting WAIT (pending post-landing CI evidence) records awaiting-evidence,
+          never failed or REVISE, so the reseed seam re-dispatches it on its own backoff. The window is carried
+          from the gate row as it stood before this run's pending lease; past the 8-hour ceiling the row becomes a
+          visible failed result that is not polled automatically. Advisory groups record advisory_failure.
+          */
+          const requiredPostMergeGate = node.kind === "optional-group"
+            && node.config?.phase === "post-merge"
+            && isWorkflowOptionalGroupEnabled(task.enabledWorkflowSteps, node.id, node.config.defaultOn === true)
+            && (node.config.template as { nodes?: Array<{ config?: { gateMode?: unknown } }> } | undefined)
+              ?.nodes?.some((inner) => inner.config?.gateMode === "gate") === true;
+          const reportsEvidencePending = stepPhase === "post-merge" && groupResult.value === POST_MERGE_EVIDENCE_PENDING_VALUE;
+          const evidenceWaitOutcome = reportsEvidencePending && groupResult.outcome === "failure" && requiredPostMergeGate
+            ? nextPostMergeEvidenceWait(
+              priorGateRow,
+              normalizePostMergeEvidencePending(exitContextPatch?.evidencePending),
+              new Date().toISOString(),
+            )
+            : undefined;
           let stepStatus: WorkflowStepResult["status"];
-          if (groupResult.outcome === "failure") stepStatus = "failed";
+          if (evidenceWaitOutcome) stepStatus = evidenceWaitOutcome.exhausted ? "failed" : "awaiting-evidence";
+          else if (reportsEvidencePending && groupResult.outcome === "success") stepStatus = "advisory_failure";
+          else if (groupResult.outcome === "failure") stepStatus = "failed";
           else if (groupResult.value === "advisory_failure") stepStatus = "advisory_failure";
           else if (verdict === "REVISE") stepStatus = "advisory_failure";
           else if (notRunReason) stepStatus = "skipped";
           else stepStatus = "passed";
           let stepOutput = typeof exitContextPatch?.output === "string" ? exitContextPatch.output : undefined;
           const stepNotes = typeof exitContextPatch?.notes === "string" ? exitContextPatch.notes : undefined;
+          const evidenceWait = evidenceWaitOutcome?.exhausted
+            ? { ...evidenceWaitOutcome.evidenceWait, exhaustedAt: new Date().toISOString() }
+            : evidenceWaitOutcome?.evidenceWait;
+          if (evidenceWait?.exhaustedAt) {
+            stepOutput = `Post-merge CI evidence did not conclude within 8 hours (last state: ${evidenceWait.state}${evidenceWait.runId ? `, run ${evidenceWait.runId}` : ""}). Automatic checks have stopped. Check the CI run, then Retry this step.`;
+          }
           const closeMarker = verdict === "CLOSE_NO_OP" ? parseNoOpCompletionMarker(stepNotes) : null;
           if (verdict === "CLOSE_NO_OP" && !closeMarker) {
             stepStatus = "failed";
@@ -1323,7 +1365,7 @@ export class WorkflowGraphExecutor {
            * failure `value` (e.g. "exception", "aborted"). Genuine REVISE/APPROVE
            * records already carry `stepOutput`/`stepNotes` and are unaffected.
            */
-          if (stepStatus === "failed" && !verdict && stepOutput === undefined && stepNotes === undefined) {
+          if (stepStatus === "failed" && !verdict && !evidenceWait && stepOutput === undefined && stepNotes === undefined) {
             const lastVisited = groupResult.visitedNodeIds[groupResult.visitedNodeIds.length - 1];
             const templateNodeId = lastVisited?.includes("::") ? lastVisited.slice(lastVisited.indexOf("::") + 2) : undefined;
             stepOutput = this.synthesizeNonVerdictFailureOutput({
@@ -1346,7 +1388,7 @@ export class WorkflowGraphExecutor {
           const terminalFence = pendingLease.persisted
             ? { requireAttemptStartedAt: stepStartedAt }
             : { requireAttemptStartedAtOrAbsent: stepStartedAt };
-          const providerFailure = stepStatus === "failed" && !verdict ? readProviderFailure(exitContextPatch) : undefined;
+          const providerFailure = stepStatus === "failed" && !verdict && !evidenceWait ? readProviderFailure(exitContextPatch) : undefined;
           const terminalPersistence = await this.recordOptionalGroupStepResult(task.id, {
             workflowStepId: node.id,
             workflowStepName: groupName,
@@ -1359,6 +1401,7 @@ export class WorkflowGraphExecutor {
             ...(stepOutput !== undefined ? { output: stepOutput } : {}),
             ...(stepNotes !== undefined ? { notes: stepNotes } : {}),
             ...(providerFailure ? { providerFailure } : {}),
+            ...(evidenceWait ? { evidenceWait } : {}),
             ...(stepFindings?.length ? { findings: stepFindings } : {}),
             ...(repositoryReviewOutcomes?.length ? { repositoryReviewOutcomes } : {}),
             ...(repositoryScopeRevision !== undefined ? { repositoryScopeRevision } : {}),
@@ -1395,13 +1438,9 @@ export class WorkflowGraphExecutor {
           observation. A stale scope or continuation fence may refuse its terminal write, but
           must not turn the optimistic handler success into a graph success: the pending durable
           obligation remains for the replacement run. Explicitly disabled and advisory groups
-          retain their non-blocking behavior.
+          retain their non-blocking behavior. (`requiredPostMergeGate` is computed above the
+          status mapping because the evidence wait needs it.)
           */
-          const requiredPostMergeGate = node.kind === "optional-group"
-            && node.config?.phase === "post-merge"
-            && isWorkflowOptionalGroupEnabled(task.enabledWorkflowSteps, node.id, node.config.defaultOn === true)
-            && (node.config.template as { nodes?: Array<{ config?: { gateMode?: unknown } }> } | undefined)
-              ?.nodes?.some((inner) => inner.config?.gateMode === "gate") === true;
           const requiredGate = verdictRequired
             || requiredPostMergeGate
             || resolveRequiredPreMergeStepIds(ir, task.enabledWorkflowSteps, task).has(node.id);
@@ -1427,6 +1466,32 @@ export class WorkflowGraphExecutor {
             // A durable REVISE is genuine reviewer evidence and must retain its authored remediation route.
             && effectiveVerdict !== "REVISE"
             && (authoritativeResult.status !== "passed" || (requiresAuthoritativeApproval && !hasAuthoritativeApproval));
+          if (evidenceWait && !persistenceUnavailable) {
+            // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: a wait is neither a failure log nor remediation; never move columns or write task status.
+            const waitDetail = `${evidenceWait.state}${evidenceWait.runId ? ` run ${evidenceWait.runId}` : ""}`;
+            if (evidenceWait.exhaustedAt) {
+              this.deps.logTaskEntry?.(`${logPrefix} Post-merge CI evidence wait exhausted: ${groupName}`, stepOutput);
+              const waitedMs = Math.max(0, Date.parse(evidenceWait.exhaustedAt) - Date.parse(evidenceWait.firstObservedAt));
+              try {
+                const pending = this.deps.onPostMergeEvidenceWaitExhausted?.(task.id, {
+                  taskId: task.id, nodeId: node.id, state: evidenceWait.state, checkCount: evidenceWait.checkCount, waitedMs,
+                });
+                if (pending && typeof (pending as Promise<void>).catch === "function") (pending as Promise<void>).catch(() => {});
+              } catch {
+                // Best-effort telemetry never changes the recorded row or the run outcome.
+              }
+            } else {
+              const nextMinutes = Math.round(postMergeEvidenceWaitBackoffMs(evidenceWait.checkCount) / 60_000);
+              this.deps.logTaskEntry?.(
+                `${logPrefix} Waiting for post-landing CI evidence: ${waitDetail}; next automatic check in ${nextMinutes} min (check ${evidenceWait.checkCount}, waiting since ${evidenceWait.firstObservedAt}).`,
+                stepNotes ?? stepOutput,
+              );
+            }
+            visitedNodeIds.push(...groupResult.visitedNodeIds);
+            context[`node:${node.id}:outcome`] = "failure";
+            context[`node:${node.id}:value`] = POST_MERGE_EVIDENCE_PENDING_VALUE;
+            return { outcome: "failure", value: POST_MERGE_EVIDENCE_PENDING_VALUE };
+          }
           if (requiredGate && (persistenceUnavailable || authoritativeFailure)) {
             const value = persistenceUnavailable ? "gate-persistence-unavailable" : "gate-result-not-approved";
             this.deps.logTaskEntry?.(`${logPrefix} Workflow step failed: ${groupName}`, authoritativeResult?.output ?? authoritativeResult?.notes ?? stepOutput);

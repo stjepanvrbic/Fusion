@@ -131,6 +131,9 @@ function getStatusLabel(result: WorkflowStepResult, t: ReturnType<typeof useTran
       return t("app:workflow.statusSkipped", "Skipped");
     case "pending":
       return t("app:workflow.statusRunning", "Running…");
+    case "awaiting-evidence":
+      // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: KB-080 a post-merge gate waiting for CI evidence is not a failure and re-runs automatically.
+      return t("app:workflow.statusAwaitingEvidence", "Waiting for CI evidence");
     default:
       return result.status;
   }
@@ -184,7 +187,7 @@ function getAggregateWorkflowResult(
   if (results.some((result) => result.status === "advisory_failure")) {
     return { label: t("app:workflow.aggregateAdvisory", "Advisory"), badgeClass: "workflow-result-badge--advisory_failure", testId: "advisory" };
   }
-  if (results.some((result) => result.status === "pending")) {
+  if (results.some((result) => result.status === "pending" || result.status === "awaiting-evidence")) {
     return { label: t("app:workflow.aggregateInProgress", "In progress"), badgeClass: "workflow-result-badge--pending", testId: "pending" };
   }
   if (results.length === 0) {
@@ -965,7 +968,7 @@ export function WorkflowResultsTab({
                     </span>
                   )}
                   <span
-                    className={`workflow-result-badge ${isWorkflowStepNotRun(result) ? "workflow-result-badge--not-run" : `workflow-result-badge--${result.status}`}`}
+                    className={`workflow-result-badge ${isWorkflowStepNotRun(result) ? "workflow-result-badge--not-run" : `workflow-result-badge--${result.status === "awaiting-evidence" ? "pending" : result.status}`}`}
                     data-testid={`workflow-result-badge-${result.workflowStepId}`}
                   >
                     {getStatusLabel(result, t)}

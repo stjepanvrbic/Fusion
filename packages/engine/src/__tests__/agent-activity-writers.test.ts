@@ -193,6 +193,80 @@ describe("engine agent activity writers", () => {
     }
   });
 
+  /*
+  FNXC:PostMergeEvidenceWait 2026-10-10-21:39:
+  KB-080: a post-merge gate waiting for post-landing CI evidence is neither a passed nor a failed gate.
+  Each automatic recheck must not add a red "Workflow gate failed" row to the agent activity feed; the
+  real verdict that ends the wait is still recorded.
+  */
+  it("records no gate activity for a post-merge gate awaiting CI evidence, then records its real verdict", async () => {
+    const task = {
+      id: "KB-080",
+      assignedAgentId: "agent-reviewer",
+      description: "activity",
+      column: "in-review",
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      workflowStepResults: [],
+    } as any;
+    const store = {
+      on: vi.fn(),
+      getRootDir: vi.fn().mockReturnValue("/repo"),
+      getTask: vi.fn().mockResolvedValue(task),
+      updateTask: vi.fn().mockImplementation(async (_taskId, patch) => {
+        Object.assign(task, patch);
+        return task;
+      }),
+      getSettings: vi.fn().mockResolvedValue({ experimentalFeatures: { workflowGraphExecutor: true } }),
+      getTaskWorkflowSelectionAsync: vi.fn().mockResolvedValue({ workflowId: "WF-activity", stepIds: [] }),
+      getWorkflowDefinition: vi.fn().mockResolvedValue({ id: "WF-activity", ir: { version: "v1", name: "Activity", nodes: [], edges: [] } }),
+      listWorkflowWorkItemsForTask: vi.fn().mockResolvedValue([]),
+      recordAgentActivity: vi.fn().mockResolvedValue({ seq: "1" }),
+    } as any;
+    const executor = new TaskExecutor(store, "/repo", {
+      agentStore: {
+        workflowProjectId: "/repo",
+        acquireWorkflowSessionCapacity: vi.fn().mockResolvedValue("acquired"),
+        releaseWorkflowSessionCapacity: vi.fn().mockResolvedValue(undefined),
+        listAgents: vi.fn().mockResolvedValue([{ id: "agent-reviewer", state: "active", roles: ["reviewer"] }]),
+      } as any,
+    });
+    const gateRow = { workflowStepId: "post-merge-verification", workflowStepName: "Post-merge verification", phase: "post-merge" };
+    const replies = [
+      { status: "awaiting-evidence", evidenceWait: { state: "run-queued", firstObservedAt: "2026-10-08T10:02:00.000Z", checkCount: 1 } },
+      { status: "awaiting-evidence", evidenceWait: { state: "run-in-progress", firstObservedAt: "2026-10-08T10:02:00.000Z", checkCount: 2 } },
+      { status: "passed", verdict: "APPROVE" },
+    ];
+    let runCount = 0;
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockImplementation(async function () {
+      const reply = replies[runCount++];
+      await (this as any).deps.recordWorkflowStepResult(task.id, {
+        ...gateRow,
+        ...reply,
+        startedAt: `2026-10-08T10:0${runCount}:00.000Z`,
+        completedAt: `2026-10-08T10:0${runCount}:30.000Z`,
+      });
+      return { disposition: "completed", outcome: reply.status === "passed" ? "success" : "failure", visitedNodeIds: [gateRow.workflowStepId] } as any;
+    });
+
+    try {
+      const gateEvents = () => store.recordAgentActivity.mock.calls
+        .map(([input]: [any]) => input)
+        .filter((input: any) => input.type === "workflow:gate-failed" || input.type === "workflow:gate-passed");
+
+      await (executor as any).executeWorkflowGraph(task);
+      await (executor as any).executeWorkflowGraph(task);
+      expect(task.workflowStepResults[0]).toMatchObject({ status: "awaiting-evidence", evidenceWait: { checkCount: 2 } });
+      expect(gateEvents()).toEqual([]);
+
+      await (executor as any).executeWorkflowGraph(task);
+      expect(gateEvents().map((input: any) => input.type)).toEqual(["workflow:gate-passed"]);
+    } finally {
+      run.mockRestore();
+    }
+  });
+
   it("deduplicates replayed self-healing handoffs on the durable handoff transition", async () => {
     const task = {
       id: "FN-8864",

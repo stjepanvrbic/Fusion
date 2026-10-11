@@ -4,6 +4,7 @@ import {
   computeWorkflowIrPin,
   getPostMergeFinalizeBlocker,
   getRequiredPostMergeEvidenceDecision,
+  isPostMergeEvidenceWaitRecheckDue,
   POST_MERGE_VERIFICATION_GROUP_ID,
   resolveWorkflowIrForTaskWithProvenance,
   type MergeDetails,
@@ -177,7 +178,18 @@ branch-mismatched or unrecoverable repository checkout) uses this same 15/30/60-
 landings skip the publication probe (`requiresPublishedLanding`), so this check alone governs their recheck, and
 each recheck reruns the per-repository in-place recovery in `runGraphCustomNode`.
 */
+/*
+FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+KB-080: a gate that reported WAIT (post-landing CI evidence not available yet) is an `awaiting-evidence` row, not a
+rejection, and has its own backoff: 5, 10, 20, then every 30 minutes (`isPostMergeEvidenceWaitRecheckDue`). A wait
+that reached the 8-hour ceiling is persisted failed with `evidenceWait.exhaustedAt` and is excluded from this ladder,
+so it is never polled automatically; an operator Retry or reconcile (`manualRetry`) starts a new window. Legacy
+evidence REVISE rows written before WAIT existed, and KB-042 `post-merge-checkout-missing-landed-commit` failures,
+stay on the 15/30/60-then-hourly rejected-evidence ladder below. Every reseed refusal (pause, auto-merge off, live
+session, checkout lease, active work item, publication probe) still applies, and a reseed never moves the card.
+*/
 function isRejectedGateRecheckDue(result: WorkflowStepResult): boolean {
+  if (result.evidenceWait?.exhaustedAt) return false;
   const failures = (result.priorAttempts ?? []).filter((entry) => entry.status === "failed").length;
   const completedAt = Date.parse(result.completedAt ?? "");
   return result.status === "failed" && Number.isFinite(completedAt)
@@ -190,9 +202,11 @@ export function isPostMergeGateRecoveryDue(
 ): boolean {
   if (hasLegacyRecoveryFailure(task)) return true;
   if (decision.outcome === "resumable") return true;
-  if (decision.outcome !== "blocked" || decision.reason !== "failed") return false;
+  if (decision.outcome !== "blocked") return false;
   const result = task.workflowStepResults?.find((entry) => entry.workflowStepId === decision.gateId);
-  return !!result && isRejectedGateRecheckDue(result);
+  if (!result) return false;
+  if (decision.reason === "awaiting-evidence") return isPostMergeEvidenceWaitRecheckDue(result, Date.now());
+  return decision.reason === "failed" && isRejectedGateRecheckDue(result);
 }
 
 export async function resumeMissingPostMergeGate(
@@ -240,7 +254,8 @@ export async function resumeMissingPostMergeGate(
   }
 
   const decision = await getRequiredPostMergeEvidenceDecision(store, task);
-  const manualRetry = options.manualRetry === true && decision.outcome === "blocked" && decision.reason === "failed";
+  const manualRetry = options.manualRetry === true && decision.outcome === "blocked"
+    && (decision.reason === "failed" || decision.reason === "awaiting-evidence");
   if (decision.outcome === "finalizable" || (!manualRetry && !isPostMergeGateRecoveryDue(task, decision))) return { outcome: "not-resumable" };
   const selection = await store.getTaskWorkflowSelectionAsync(task.id);
   const resolved = await resolveWorkflowIrForTaskWithProvenance(store, task.id);
@@ -285,6 +300,6 @@ export async function resumeMissingPostMergeGate(
     expectedTaskUpdatedAt: task.updatedAt,
   }));
   if (!seeded?.seeded) return { outcome: "not-resumable" };
-  await fence.write("log", () => store.logEntry(task.id, `[post-merge] ${decision.outcome === "resumable" ? "Resuming missing verification" : "Rechecking rejected evidence"} at '${node.id}'; already-landed implementation and merge will not run again.`));
+  await fence.write("log", () => store.logEntry(task.id, `[post-merge] ${decision.outcome === "resumable" ? "Resuming missing verification" : decision.reason === "awaiting-evidence" ? "Rechecking pending CI evidence" : "Rechecking rejected evidence"} at '${node.id}'; already-landed implementation and merge will not run again.`));
   return { outcome: "resumed", gateId: node.id };
 }

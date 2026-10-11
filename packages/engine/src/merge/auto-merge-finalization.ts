@@ -85,6 +85,13 @@ export interface AutoMergeFinalizationResult {
   deferredPostMergeEvidence?: boolean;
   /** Required post-merge evidence blocks completion independently of its retry/traversal state. */
   postMergeEvidenceBlocked?: boolean;
+  /**
+   * FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+   * KB-080: the required gate reported WAIT (post-landing CI evidence not available yet). The landing is
+   * confirmed and the reseed seam re-dispatches the gate on its own backoff, so callers must defer, never park
+   * the task failed. Distinct from `deferredPostMergeEvidence`, which stays the resumable-only traversal signal.
+   */
+  awaitingPostMergeEvidence?: boolean;
   /** True when this invocation installed the missing graph-owned post-merge continuation. */
   resumedPostMergeEvidence?: boolean;
   /** True when this post-merge deferral is identical to the one already reported for the task; callers skip their task-log line. */
@@ -400,6 +407,7 @@ export async function finalizeProvenAutoMergeTask({
       */
       deferredPostMergeEvidence: evidenceDecision.outcome === "resumable" || undefined,
       postMergeEvidenceBlocked: true,
+      awaitingPostMergeEvidence: (evidenceDecision.outcome === "blocked" && evidenceDecision.reason === "awaiting-evidence") || undefined,
       resumedPostMergeEvidence: resumeResult?.outcome === "resumed" || undefined,
     };
   }

@@ -145,6 +145,7 @@ export interface WorkflowGraphTaskRunnerDeps {
   recordWorkflowStepResult?: WorkflowGraphExecutorDeps["recordWorkflowStepResult"];
   /** Removes a pending step lease held by an aborted graph attempt. */
   discardWorkflowStepLease?: WorkflowGraphExecutorDeps["discardWorkflowStepLease"];
+  onPostMergeEvidenceWaitExhausted?: WorkflowGraphExecutorDeps["onPostMergeEvidenceWaitExhausted"];
   /** Completes an accepted Plan Review close through the authoritative task lifecycle. */
   completePlanReviewNoOp?: WorkflowGraphExecutorDeps["completePlanReviewNoOp"];
   /** Persists the resumable Plan Review hold for a rejected close request. */
@@ -422,6 +423,7 @@ export class WorkflowGraphTaskRunner {
         logTaskEntry: this.deps.logTaskEntry,
         recordWorkflowStepResult: this.deps.recordWorkflowStepResult,
         discardWorkflowStepLease: this.deps.discardWorkflowStepLease,
+        onPostMergeEvidenceWaitExhausted: this.deps.onPostMergeEvidenceWaitExhausted,
         completePlanReviewNoOp: this.deps.completePlanReviewNoOp,
         holdPlanReviewNoOp: this.deps.holdPlanReviewNoOp,
         requestPreMergeOptionalStepFix: this.deps.requestPreMergeOptionalStepFix,

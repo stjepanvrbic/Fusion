@@ -1633,6 +1633,55 @@ Ship FIVE kinds. Do NOT add roadmap-item in this task.
       expect(cap.last?.systemPrompt).not.toContain("## Output Format");
     });
 
+    /*
+    FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+    KB-080: WAIT is offered and accepted only for post-merge phase gates; pre-merge gates keep the exact
+    three-value contract, and a WAIT outcome never becomes an approval or a REVISE.
+    */
+    it("offers WAIT only to post-merge gate steps", async () => {
+      const store = createMockStore();
+      const { executor } = makeExecutor(store);
+      const cap = captureSession();
+
+      await (executor as any).executeWorkflowStep(baseStepTask(), makeStep({ gateMode: "gate", phase: "post-merge" }), "/tmp/wt", {}, undefined, undefined);
+      expect(cap.last?.systemPrompt).toContain('{"verdict":"APPROVE|APPROVE_WITH_NOTES|REVISE|WAIT"');
+      expect(cap.last?.systemPrompt).toContain("evidencePending");
+      expect(cap.last?.systemPrompt).toContain("Return WAIT only when the post-landing evidence");
+
+      await (executor as any).executeWorkflowStep(baseStepTask(), makeStep({ gateMode: "gate", phase: "pre-merge" }), "/tmp/wt", {}, undefined, undefined);
+      expect(cap.last?.systemPrompt).toContain('{"verdict":"APPROVE|APPROVE_WITH_NOTES|REVISE","notes":"..."}');
+      expect(cap.last?.systemPrompt).not.toContain("WAIT");
+      expect(cap.last?.systemPrompt).not.toContain("evidencePending");
+    });
+
+    it("maps a post-merge WAIT to the evidence-pending failure value without a REVISE", async () => {
+      const store = createMockStore();
+      const { executor } = makeExecutor(store);
+      captureSession('{"verdict":"WAIT","notes":"Run 37759591738 is queued.","evidencePending":{"state":"run-queued","runId":"37759591738"}}');
+
+      const outcome = await (executor as any).executeWorkflowStep(baseStepTask(), makeStep({ gateMode: "gate", phase: "post-merge" }), "/tmp/wt", {}, undefined, undefined);
+      expect(outcome).toMatchObject({
+        success: false,
+        verdict: "WAIT",
+        failureValue: "post-merge-evidence-pending",
+        notes: "Run 37759591738 is queued.",
+        evidencePending: { state: "run-queued", runId: "37759591738" },
+      });
+      expect(outcome.revisionRequested).toBeUndefined();
+    });
+
+    it("never accepts WAIT from a pre-merge gate", async () => {
+      const store = createMockStore();
+      const { executor } = makeExecutor(store);
+      captureSession('{"verdict":"WAIT","notes":"Run is queued.","evidencePending":{"state":"run-queued"}}');
+
+      const outcome = await (executor as any).executeWorkflowStep(baseStepTask(), makeStep({ gateMode: "gate", phase: "pre-merge" }), "/tmp/wt", {}, undefined, undefined);
+      expect(outcome.verdict).not.toBe("WAIT");
+      expect(outcome.success).toBe(false);
+      expect(outcome.failureValue).not.toBe("post-merge-evidence-pending");
+      expect(outcome.evidencePending).toBeUndefined();
+    });
+
     it("a skill-LESS prompt step requires the verdict JSON (legacy reviewer contract)", async () => {
       const store = createMockStore();
       const { executor } = makeExecutor(store);

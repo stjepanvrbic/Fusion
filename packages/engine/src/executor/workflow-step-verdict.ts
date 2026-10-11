@@ -5,12 +5,19 @@
  * FNXC:PlanReviewNoOp 2026-08-09-22:10:
  * CLOSE_NO_OP is Plan Review only (FN-8841). Exact match + optionalGroupId gate so unrelated
  * review groups and prose cannot open a terminal lifecycle path.
+ *
+ * FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+ * WAIT (aliases AWAIT_EVIDENCE, EVIDENCE_PENDING) is accepted only when the caller declares the post-merge
+ * phase; elsewhere it is skipped like any unknown token. Prose never infers WAIT. Its evidencePending payload
+ * is normalized through the core helper so reviewer text cannot inject arbitrary state or run ids.
  */
 import { proseSignalsClearApproval, extractJsonObjectCandidates, textHasStructuredVerdictKey } from "../execution/reviewer.js";
-import { normalizeSupersededFindingIds, normalizeWorkflowReviewFindings, PLAN_REVIEW_GROUP_ID, type WorkflowReviewFinding, type WorkflowRepositoryReviewOutcome, type WorkflowStepNotRunReason } from "@fusion/core";
+import { normalizePostMergeEvidencePending, normalizeSupersededFindingIds, normalizeWorkflowReviewFindings, PLAN_REVIEW_GROUP_ID, type PostMergeEvidencePending, type WorkflowReviewFinding, type WorkflowRepositoryReviewOutcome, type WorkflowStepNotRunReason } from "@fusion/core";
 
-/** Machine-readable workflow-step verdicts, including Plan Review CLOSE_NO_OP. */
-export type WorkflowStepVerdict = "APPROVE" | "APPROVE_WITH_NOTES" | "REVISE" | "CLOSE_NO_OP";
+/** Machine-readable workflow-step verdicts, including Plan Review CLOSE_NO_OP and post-merge WAIT. */
+export type WorkflowStepVerdict = "APPROVE" | "APPROVE_WITH_NOTES" | "REVISE" | "CLOSE_NO_OP" | "WAIT";
+
+const POST_MERGE_WAIT_TOKENS: ReadonlySet<string> = new Set(["WAIT", "AWAIT_EVIDENCE", "EVIDENCE_PENDING"]);
 
 export const MAX_DERIVED_WORKFLOW_STEP_NOTES_CHARS = 2_000;
 
@@ -183,6 +190,8 @@ export interface WorkflowStepOutcome {
   malformed?: boolean;
   /** Machine-readable graph failure used for deterministic recovery routing. */
   failureValue?: string;
+  /** Normalized pending post-landing CI evidence reported with a post-merge WAIT verdict. */
+  evidencePending?: PostMergeEvidencePending;
 }
 
 /**
@@ -197,8 +206,8 @@ export type WorkflowStepResult =
 
 export function parseWorkflowStepVerdict(
   rawOutput: string,
-  options: { optionalGroupId?: string } = {},
-): { verdict: WorkflowStepVerdict; notes: string; findings?: WorkflowReviewFinding[]; supersededFindingSourceWorkflowStepId?: string; supersededFindingIds?: string[] } | null {
+  options: { optionalGroupId?: string; postMergePhase?: boolean } = {},
+): { verdict: WorkflowStepVerdict; notes: string; findings?: WorkflowReviewFinding[]; supersededFindingSourceWorkflowStepId?: string; supersededFindingIds?: string[]; evidencePending?: PostMergeEvidencePending } | null {
   const trimmed = rawOutput.trim();
   const candidates: string[] = [];
   const fencedMatches = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
@@ -213,7 +222,7 @@ export function parseWorkflowStepVerdict(
 
   for (let i = candidates.length - 1; i >= 0; i -= 1) {
     try {
-      const parsed = JSON.parse(candidates[i]) as { verdict?: unknown; notes?: unknown; findings?: unknown; supersededFindingIds?: unknown; supersededFindingSourceWorkflowStepId?: unknown };
+      const parsed = JSON.parse(candidates[i]) as { verdict?: unknown; notes?: unknown; findings?: unknown; supersededFindingIds?: unknown; supersededFindingSourceWorkflowStepId?: unknown; evidencePending?: unknown };
       if (!parsed || typeof parsed.verdict !== "string") continue;
       /*
       FNXC:ReviewLeniency 2026-07-01-23:30:
@@ -230,6 +239,8 @@ export function parseWorkflowStepVerdict(
          * prevents prose or unrelated review groups from acquiring a terminal lifecycle path.
          */
         verdict = "CLOSE_NO_OP";
+      } else if (POST_MERGE_WAIT_TOKENS.has(token) && options.postMergePhase === true) {
+        verdict = "WAIT";
       } else if (token.startsWith("REVISE") || token.startsWith("REQUEST_REVISION") || token.startsWith("REJECT")) {
         verdict = "REVISE";
       }
@@ -248,6 +259,7 @@ export function parseWorkflowStepVerdict(
         ...(findings ? { findings } : {}),
         ...(supersededFindingSourceWorkflowStepId && supersededFindingIds ? { supersededFindingSourceWorkflowStepId } : {}),
         ...(supersededFindingSourceWorkflowStepId && supersededFindingIds ? { supersededFindingIds } : {}),
+        ...(verdict === "WAIT" ? { evidencePending: normalizePostMergeEvidencePending(parsed.evidencePending) } : {}),
       };
     } catch {
       // continue
@@ -303,7 +315,7 @@ PR #3317 nit: drop the incomplete overload set. The prior pair covered no-option
 { requireVerdict: false } only, so { requireVerdict: true } failed to typecheck despite
 being supported by the implementation. One optional-options signature is enough.
 */
-export function parseWorkflowStepOutput(rawOutput: string, options: { requireVerdict?: boolean; optionalGroupId?: string } = {}): {
+export function parseWorkflowStepOutput(rawOutput: string, options: { requireVerdict?: boolean; optionalGroupId?: string; postMergePhase?: boolean } = {}): {
   output: string;
   verdict?: WorkflowStepVerdict;
   notes?: string;
@@ -312,6 +324,7 @@ export function parseWorkflowStepOutput(rawOutput: string, options: { requireVer
   supersededFindingIds?: string[];
   malformed?: boolean;
   notesMissing?: boolean;
+  evidencePending?: PostMergeEvidencePending;
 } {
   const trimmed = rawOutput.trim();
   const parsed = parseWorkflowStepVerdict(trimmed, options);
@@ -340,6 +353,7 @@ export function parseWorkflowStepOutput(rawOutput: string, options: { requireVer
       verdict: parsed.verdict,
       notes: notes ?? "",
       ...(!notes ? { notesMissing: true } : {}),
+      ...(parsed.evidencePending ? { evidencePending: parsed.evidencePending } : {}),
       ...(parsed.findings ? { findings: parsed.findings } : {}),
       ...(parsed.supersededFindingSourceWorkflowStepId && parsed.supersededFindingIds ? { supersededFindingSourceWorkflowStepId: parsed.supersededFindingSourceWorkflowStepId, supersededFindingIds: parsed.supersededFindingIds } : {}),
     };

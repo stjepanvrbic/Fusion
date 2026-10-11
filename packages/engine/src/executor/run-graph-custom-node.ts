@@ -1397,6 +1397,8 @@ export async function runGraphCustomNode(
     if (outcome.repositoryScopeRevision !== undefined) contextPatch.repositoryScopeRevision = outcome.repositoryScopeRevision;
     if (outcome.reviewInputFingerprint !== undefined) contextPatch.reviewInputFingerprint = outcome.reviewInputFingerprint;
     if (outcome.reviewedCommitSha !== undefined) contextPatch.reviewedCommitSha = outcome.reviewedCommitSha;
+    // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: the graph recorder turns a post-merge WAIT into an awaiting-evidence row from this payload.
+    if (outcome.evidencePending) contextPatch.evidencePending = outcome.evidencePending;
     if (outcome.supersededFindingIds?.length && outcome.supersededFindingSourceWorkflowStepId) {
       contextPatch.supersededFindingSourceWorkflowStepId = outcome.supersededFindingSourceWorkflowStepId;
       contextPatch.supersededFindingIds = outcome.supersededFindingIds;

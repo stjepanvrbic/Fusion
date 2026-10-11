@@ -17,7 +17,8 @@ function countWorkflow(results: WorkflowStepResult[] | undefined): Deterministic
   for (const result of list) {
     if (result.status === "passed") passed += 1;
     else if (result.status === "failed" || result.status === "advisory_failure") failed += 1;
-    else if (result.status === "pending") pending += 1;
+    // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: a gate waiting for post-landing CI evidence is still pending, not failed.
+    else if (result.status === "pending" || result.status === "awaiting-evidence") pending += 1;
   }
   return { total: list.length, passed, failed, pending };
 }

@@ -8,6 +8,7 @@
 import type { WorkflowStepNotRunReason } from "../../workflows/workflow-step-results.js";
 import type { ThinkingLevel } from "../board/board.js";
 import type { TaskExternalBlockOrigin } from "../../tasks/task-external-block.js";
+import type { PostMergeEvidenceWait } from "../../merge/post-merge-evidence-wait.js";
 
 /*
  * FNXC:CredentialInstanceSelection 2026-08-01-05:38:
@@ -301,8 +302,22 @@ export interface WorkflowStepResult {
   phase?: WorkflowStepPhase;
   /** Runtime source for distinguishing graph-authored node progress from optional-toggle checks. */
   source?: "optional-group" | "node";
-  /** Execution status */
-  status: "passed" | "failed" | "advisory_failure" | "skipped" | "pending";
+  /**
+   * Execution status.
+   *
+   * FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+   * `awaiting-evidence` is written only by a required post-merge gate whose post-landing CI evidence does not
+   * exist yet (WAIT verdict). Pending evidence is not a task defect, so it is never REVISE or failed. The status
+   * is terminal (not a lease), blocks finalization, is never an approval and is not displayed red. The reseed
+   * seam re-dispatches it on a backoff with an 8-hour visible ceiling, and a wait never moves the card backward.
+   */
+  status: "passed" | "failed" | "advisory_failure" | "skipped" | "pending" | "awaiting-evidence";
+  /**
+   * FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+   * Wait record of a post-merge gate waiting for post-landing CI evidence. Present on `awaiting-evidence` rows
+   * and, with `exhaustedAt`, on the failed row written when the 8-hour ceiling is reached.
+   */
+  evidenceWait?: PostMergeEvidenceWait;
   /**
    * Author-declared direct-review category snapshotted when a supported top-level
    * graph node starts. Absent preserves historical and non-review semantics.

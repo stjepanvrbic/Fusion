@@ -1044,6 +1044,43 @@ describe("runAiMerge", () => {
   });
 
   /*
+  FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+  KB-080: a direct landing whose required post-merge gate is waiting for post-landing CI evidence (awaiting-evidence)
+  is a confirmed-landing deferral like an unreported gate; it must not throw into the merge pump's failed park.
+  */
+  it("returns a confirmed-landing deferral for a direct landing while the post-merge gate awaits CI evidence", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+    const { store, task, logs } = makeStore(dir, {
+      enabledWorkflowSteps: ["post-merge-verification"],
+      workflowStepResults: [{
+        workflowStepId: "post-merge-verification",
+        workflowStepName: "Post-Merge Verification",
+        phase: "post-merge",
+        status: "awaiting-evidence",
+        completedAt: new Date().toISOString(),
+        evidenceWait: { state: "run-queued", runId: "37759591738", firstObservedAt: new Date().toISOString(), checkCount: 1 },
+      }],
+    });
+    const selection = { workflowId: "builtin:coding", stepIds: ["post-merge-verification"] };
+    store.getTaskWorkflowSelection = vi.fn(() => selection);
+    store.getTaskWorkflowSelectionAsync = vi.fn(async () => selection);
+
+    const result = await runAiMerge(store, dir, "FN-1", { manual: true }, {
+      mergeAgent: realMergeAgent("fusion/fn-1"),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    });
+
+    expect(result).toMatchObject({ merged: true, mergeConfirmed: true });
+    expect(task.status).not.toBe("failed");
+    expect(String(task.error ?? "")).not.toContain("finalization blocked");
+    expect(task.column).toBe("in-review");
+    expect(task.workflowStepResults?.[0]).toMatchObject({ status: "awaiting-evidence" });
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-1", "done", expect.anything());
+    expect(store.emit).not.toHaveBeenCalledWith("task:merged", expect.anything());
+    expect(logs.some((line) => line.includes("awaiting required post-merge verification"))).toBe(true);
+  });
+
+  /*
   FNXC:PostMergeEvidenceOrderingTest 2026-10-08-15:24:
   KB-079 companion: only an absent gate result defers. A reported non-approved gate is durable evidence and must keep failing visibly.
   */

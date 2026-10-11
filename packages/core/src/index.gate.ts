@@ -1215,6 +1215,16 @@ export {
 export { getPostMergeFinalizeBlocker, getRequiredPostMergeEvidenceBlocker, getRequiredPostMergeEvidenceDecision, planConfirmedMergeChecklistReconciliation } from "./merge/confirmed-merge-reconciliation.js";
 export type { RequiredPostMergeEvidenceDecision } from "./merge/confirmed-merge-reconciliation.js";
 export type { ConfirmedMergeChecklistReconciliation } from "./merge/confirmed-merge-reconciliation.js";
+export {
+  isPostMergeEvidenceWaitRecheckDue,
+  nextPostMergeEvidenceWait,
+  normalizePostMergeEvidencePending,
+  postMergeEvidenceWaitBackoffMs,
+  POST_MERGE_EVIDENCE_PENDING_VALUE,
+  POST_MERGE_EVIDENCE_WAIT_CEILING_MS,
+  POST_MERGE_EVIDENCE_WAIT_STATES,
+} from "./merge/post-merge-evidence-wait.js";
+export type { PostMergeEvidencePending, PostMergeEvidenceWait, PostMergeEvidenceWaitState } from "./merge/post-merge-evidence-wait.js";
 export type { PreMergeApproval, PreMergeApprovalState } from "./merge/pre-merge-approval.js";
 export {
   isBranchGroupMemberLanded,

@@ -394,6 +394,19 @@ describe("getUnifiedTaskProgress", () => {
     expect(progress.completed).toBe(1);
   });
 
+  // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: KB-080 waiting post-merge evidence is non-red and incomplete.
+  it("maps a post-merge gate awaiting CI evidence to pending, not failed, and leaves it incomplete", () => {
+    const awaiting = {
+      workflowStepId: "post-merge-verification", workflowStepName: "Post-merge verification", phase: "post-merge" as const,
+      status: "awaiting-evidence" as const, startedAt: "2026-10-08T10:00:00Z", completedAt: "2026-10-08T10:02:00Z",
+      evidenceWait: { state: "run-queued" as const, firstObservedAt: "2026-10-08T10:02:00Z", checkCount: 1 },
+    };
+    expect(mapWorkflowStatus(awaiting)).toBe("pending");
+    const progress = getUnifiedTaskProgress(makeTask({ enabledWorkflowSteps: ["post-merge-verification"], workflowStepResults: [awaiting] }));
+    expect(progress.items.find((i) => i.id === "workflow-post-merge-verification")?.status).toBe("pending");
+    expect(progress.completed).toBe(0);
+  });
+
   it("excludes a disabled step (absent from enabledWorkflowSteps) from the count", () => {
     const progress = getUnifiedTaskProgress(
       makeTask({

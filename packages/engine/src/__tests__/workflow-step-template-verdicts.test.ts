@@ -29,6 +29,21 @@ describe("workflow step verdict parsing", () => {
     });
   });
 
+  /*
+  FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+  KB-080: the built-in post-merge verification prompt's own verdict shape lists WAIT, and a WAIT in that
+  shape parses only in the post-merge phase.
+  */
+  it("accepts the built-in post-merge WAIT payload only in the post-merge phase", () => {
+    const payload = '{"verdict":"WAIT","notes":"Full Suite run 37763174330 is still queued.","evidencePending":{"state":"run-queued","runId":"37763174330"}}';
+    expect(parseWorkflowStepVerdict(payload, { postMergePhase: true })).toEqual({
+      verdict: "WAIT",
+      notes: "Full Suite run 37763174330 is still queued.",
+      evidencePending: { state: "run-queued", runId: "37763174330" },
+    });
+    expect(parseWorkflowStepVerdict(payload)).toBeNull();
+  });
+
   it("infers REVISE from the legacy prose fallback", () => {
     expect(inferWorkflowStepVerdictFromProse("REQUEST REVISION\nfix packages/foo.ts")).toEqual({
       verdict: "REVISE",

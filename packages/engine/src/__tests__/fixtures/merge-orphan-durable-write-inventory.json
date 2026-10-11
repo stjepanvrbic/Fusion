@@ -8273,7 +8273,7 @@
     },
     {
       "callSiteId": "packages/engine/src/merge/post-merge-gate-reseed.ts::resumeMissingPostMergeGate::store.logEntry::#1",
-      "callSiteFingerprint": "store.logEntry(task.id,`[post-merge] ${decision.outcome === \"resumable\" ? \"Resuming missing verification\" : \"Rechecking rejected evidence\"} at )",
+      "callSiteFingerprint": "store.logEntry(task.id,`[post-merge] ${decision.outcome === \"resumable\" ? \"Resuming missing verification\" : decision.reason === \"awaiting-evide)",
       "file": "packages/engine/src/merge/post-merge-gate-reseed.ts",
       "enclosingSymbolPath": "resumeMissingPostMergeGate",
       "writer": "store.logEntry",

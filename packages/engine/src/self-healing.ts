@@ -14395,7 +14395,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       */
       const decision = await getRequiredPostMergeEvidenceDecision(this.store, task);
       if (isPostMergeGateRecoveryDue(task, decision)
-        || (options.source === "manual" && decision.outcome === "blocked" && decision.reason === "failed")) {
+        // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: a manual reconcile re-dispatches a waiting gate immediately and restarts an exhausted wait window.
+        || (options.source === "manual" && decision.outcome === "blocked" && (decision.reason === "failed" || decision.reason === "awaiting-evidence"))) {
         const resumed = await resumeMissingPostMergeGate(this.store, task.id, { manualRetry: options.source === "manual" });
         /* FNXC:PostMergePublication 2026-10-08-00:20: an awaiting-publication gate is passed through so the operator sees why the gate did not reseed, instead of a generic "raced" or "awaiting-finalization". */
         if (resumed.outcome === "resumed" || resumed.outcome === "awaiting-publication") return resumed;

@@ -49,6 +49,7 @@ describe("required post-merge evidence", () => {
     [{ status: "pending" }, "is not approved"],
     [{ status: "skipped" }, "is not approved"],
     [{ status: "failed", verdict: "REVISE" }, "is not approved"],
+    [{ status: "awaiting-evidence" }, "is waiting for post-landing CI evidence"],
   ])("blocks enabled gate evidence that %s", async (result, expected) => {
     await expect(getRequiredPostMergeEvidenceBlocker(store as never, {
       id: "FN-PM",
@@ -65,6 +66,7 @@ describe("required post-merge evidence", () => {
     [[{ workflowStepId: "post-merge-verification", status: "failed", verdict: "REVISE" }], { outcome: "blocked", gateId: "post-merge-verification", reason: "failed" }],
     [[{ workflowStepId: "post-merge-verification", status: "skipped" }], { outcome: "blocked", gateId: "post-merge-verification", reason: "skipped" }],
     [[{ workflowStepId: "post-merge-verification", status: "passed" }], { outcome: "blocked", gateId: "post-merge-verification", reason: "not-approved" }],
+    [[{ workflowStepId: "post-merge-verification", status: "awaiting-evidence", evidenceWait: { state: "run-queued", firstObservedAt: "2026-10-08T10:00:00Z", checkCount: 1 } }], { outcome: "blocked", gateId: "post-merge-verification", reason: "awaiting-evidence" }],
     [[{ workflowStepId: "post-merge-verification", status: "passed", verdict: "APPROVE" }], { outcome: "finalizable" }],
     [[{ workflowStepId: "post-merge-verification", status: "passed", verdict: "APPROVE_WITH_NOTES" }], { outcome: "finalizable" }],
   ])("classifies durable gate state structurally", async (workflowStepResults, expected) => {

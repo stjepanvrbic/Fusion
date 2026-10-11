@@ -578,6 +578,102 @@ describe("missing post-merge continuation recovery", () => {
     expect(items[0]).toMatchObject({ nodeId: "delivery-evidence" });
   });
 
+  /*
+  FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+  KB-080: an awaiting-evidence gate (WAIT) is rechecked on its own 5/10/20/30-minute backoff, an exhausted wait is
+  not polled automatically but a manual Retry restarts it, and every reseed refusal still applies.
+  */
+  describe("awaiting post-landing CI evidence", () => {
+    const awaiting = (completedAgoMs: number, checkCount: number) => ({
+      workflowStepId: "post-merge-verification", phase: "post-merge", status: "awaiting-evidence",
+      completedAt: new Date(Date.now() - completedAgoMs).toISOString(),
+      evidenceWait: { state: "run-queued", firstObservedAt: new Date(Date.now() - completedAgoMs).toISOString(), checkCount },
+    });
+
+    it("is not due four minutes after the first wait", async () => {
+      const { task, store, items } = recoveryFixture();
+      task.workflowStepResults = [awaiting(4 * 60_000, 1)] as Task["workflowStepResults"];
+      await expect(resumeMissingPostMergeGate(store, task.id)).resolves.toEqual({ outcome: "not-resumable" });
+      await finalizeProvenAutoMergeTask({ store, taskId: task.id, source: "self-healing" });
+      expect(items).toHaveLength(0);
+      expect(store.moveTask).not.toHaveBeenCalled();
+    });
+
+    it("automatically reseeds in place five minutes after the first wait", async () => {
+      const { task, store, items } = recoveryFixture();
+      task.workflowStepResults = [awaiting(5 * 60_000, 1)] as Task["workflowStepResults"];
+      const evidence = structuredClone(task.workflowStepResults);
+      await expect(resumeMissingPostMergeGate(store, task.id)).resolves.toEqual({ outcome: "resumed", gateId: "post-merge-verification" });
+      expect(items).toEqual([expect.objectContaining({ nodeId: "post-merge-verification", state: "runnable", sourceColumn: "in-review", targetColumn: "in-review" })]);
+      expect(store.logEntry).toHaveBeenCalledWith(task.id, expect.stringContaining("Rechecking pending CI evidence at 'post-merge-verification'"));
+      expect(task.workflowStepResults).toEqual(evidence);
+      expect(task.status).toBeUndefined();
+      expect(store.moveTask).not.toHaveBeenCalled();
+    });
+
+    it("waits thirty minutes after the fourth consecutive wait", async () => {
+      const { task, store, items } = recoveryFixture();
+      task.workflowStepResults = [awaiting(29 * 60_000, 4)] as Task["workflowStepResults"];
+      await expect(resumeMissingPostMergeGate(store, task.id)).resolves.toEqual({ outcome: "not-resumable" });
+      task.workflowStepResults = [awaiting(30 * 60_000, 4)] as Task["workflowStepResults"];
+      await expect(resumeMissingPostMergeGate(store, task.id)).resolves.toMatchObject({ outcome: "resumed" });
+      expect(items).toHaveLength(1);
+    });
+
+    it("never polls an exhausted wait automatically, but a manual Retry restarts it", async () => {
+      const { task, store, items } = recoveryFixture();
+      task.workflowStepResults = [{
+        workflowStepId: "post-merge-verification", phase: "post-merge", status: "failed",
+        completedAt: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+        evidenceWait: { state: "run-queued", firstObservedAt: new Date(Date.now() - 10 * 60 * 60_000).toISOString(), checkCount: 20, exhaustedAt: new Date(Date.now() - 2 * 60 * 60_000).toISOString() },
+      }] as Task["workflowStepResults"];
+      await expect(resumeMissingPostMergeGate(store, task.id)).resolves.toEqual({ outcome: "not-resumable" });
+      await finalizeProvenAutoMergeTask({ store, taskId: task.id, source: "self-healing" });
+      expect(items).toHaveLength(0);
+      await expect(resumeMissingPostMergeGate(store, task.id, { manualRetry: true })).resolves.toMatchObject({ outcome: "resumed" });
+      expect(items).toHaveLength(1);
+    });
+
+    it("accepts a manual Retry of a wait before its backoff elapses", async () => {
+      const { task, store, items } = recoveryFixture();
+      task.workflowStepResults = [awaiting(60_000, 1)] as Task["workflowStepResults"];
+      await expect(resumeMissingPostMergeGate(store, task.id, { manualRetry: true })).resolves.toMatchObject({ outcome: "resumed" });
+      expect(items).toHaveLength(1);
+    });
+
+    it.each([{ paused: true }, { userPaused: true }, { autoMerge: false }])("refuses to reseed a due wait for %j", async (hold) => {
+      const { task, store, items } = recoveryFixture();
+      Object.assign(task, hold);
+      task.workflowStepResults = [awaiting(60 * 60_000, 1)] as Task["workflowStepResults"];
+      await expect(resumeMissingPostMergeGate(store, task.id)).resolves.toEqual({ outcome: "not-resumable" });
+      await expect(resumeMissingPostMergeGate(store, task.id, { manualRetry: true })).resolves.toEqual({ outcome: "not-resumable" });
+      expect(items).toHaveLength(0);
+    });
+
+    it("reseeds a due workspace wait without a publication probe", async () => {
+      const { task, store, items } = recoveryFixture();
+      Object.assign(task, {
+        workspaceWorktrees: { "repo-a": { worktreePath: "ws/repo-a", branch: "fusion/fn-9368-repo-a" } },
+        mergeDetails: { mergeConfirmed: true, commitSha: "a".repeat(40), workspaceLandedShas: { "repo-a": "a".repeat(40) } },
+      });
+      task.workflowStepResults = [awaiting(5 * 60_000, 1)] as Task["workflowStepResults"];
+      const gitRun = vi.fn();
+      await expect(resumeMissingPostMergeGate(store, task.id, { git: gitRun as never })).resolves.toMatchObject({ outcome: "resumed" });
+      expect(gitRun).not.toHaveBeenCalled();
+      expect(items).toHaveLength(1);
+    });
+
+    it("keeps a KB-042 checkout failure on the fifteen-minute rejected-evidence ladder", async () => {
+      const { task, store, items } = recoveryFixture();
+      const failure = { workflowStepId: "post-merge-verification", phase: "post-merge", status: "failed", verdict: "post-merge-checkout-missing-landed-commit" };
+      task.workflowStepResults = [{ ...failure, completedAt: new Date(Date.now() - 6 * 60_000).toISOString() }] as Task["workflowStepResults"];
+      await expect(resumeMissingPostMergeGate(store, task.id)).resolves.toEqual({ outcome: "not-resumable" });
+      task.workflowStepResults = [{ ...failure, completedAt: new Date(Date.now() - 16 * 60_000).toISOString() }] as Task["workflowStepResults"];
+      await expect(resumeMissingPostMergeGate(store, task.id)).resolves.toMatchObject({ outcome: "resumed" });
+      expect(items).toHaveLength(1);
+    });
+  });
+
   it("does not claim recovery after the fenced insert loses a task-state race", async () => {
     const { task, store } = recoveryFixture();
     store.seedWorkspaceCodeReviewContinuationIfIdle = vi.fn(async () => ({ seeded: false, reason: "task-state-changed" }));

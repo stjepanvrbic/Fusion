@@ -4420,10 +4420,17 @@ async function finalizeTask(
       await publishLanding(result);
     }
   }
-  if (finalization.outcome === "blocked" && !finalization.deferredPostMergeEvidence) {
+  /*
+  FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+  KB-080: a required gate waiting for post-landing CI evidence (awaiting-evidence) is the same confirmed-landing
+  deferral as an unreported gate: the reseed seam re-dispatches it on its backoff, so throwing here would only park
+  landed work failed in the merge pump. Genuine non-approval (failed, REVISE, not-approved) still throws visibly.
+  */
+  const confirmedLandingDeferral = finalization.deferredPostMergeEvidence === true || finalization.awaitingPostMergeEvidence === true;
+  if (finalization.outcome === "blocked" && !confirmedLandingDeferral) {
     throw new Error(`AI merge finalization blocked for ${taskId}: ${finalization.reason ?? "unknown"}`);
   }
-  if (finalization.deferredPostMergeEvidence) {
+  if (confirmedLandingDeferral) {
     /*
     FNXC:PostMergeEvidenceOrdering 2026-10-08-15:24:
     KB-079: every direct, manual, workspace and graph caller receives the same "merge confirmed, gate pending" deferral as the shared finalizer.

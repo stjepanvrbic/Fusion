@@ -140,6 +140,54 @@ describe("parseWorkflowStepVerdict", () => {
     expect(parseWorkflowStepVerdict(response)).toBeNull();
   });
 
+  /*
+  FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+  KB-080: WAIT is a post-merge-only verdict for pending CI evidence. Outside that phase it is skipped like
+  an unknown token, and prose can never infer it.
+  */
+  it.each(["run-not-started", "run-queued", "run-in-progress", "artifacts-pending"])("accepts post-merge WAIT for state %s", (state) => {
+    const response = `{"verdict":"WAIT","notes":"Evidence pending.","evidencePending":{"state":"${state}","runId":"37759591738"}}`;
+    expect(parseWorkflowStepVerdict(response, { postMergePhase: true })).toEqual({
+      verdict: "WAIT",
+      notes: "Evidence pending.",
+      evidencePending: { state, runId: "37759591738" },
+    });
+    expect(parseWorkflowStepOutput(response, { postMergePhase: true })).toMatchObject({
+      verdict: "WAIT",
+      notes: "Evidence pending.",
+      evidencePending: { state, runId: "37759591738" },
+    });
+  });
+
+  it("accepts the WAIT aliases only in the post-merge phase", () => {
+    for (const token of ["AWAIT_EVIDENCE", "evidence_pending"]) {
+      expect(parseWorkflowStepVerdict(`{"verdict":"${token}","notes":"x"}`, { postMergePhase: true })?.verdict).toBe("WAIT");
+    }
+  });
+
+  it("rejects WAIT outside the post-merge phase as an unknown verdict", () => {
+    const response = '{"verdict":"WAIT","notes":"Run is queued.","evidencePending":{"state":"run-queued"}}';
+    expect(parseWorkflowStepVerdict(response)).toBeNull();
+    expect(parseWorkflowStepVerdict(response, { postMergePhase: false })).toBeNull();
+    const output = parseWorkflowStepOutput(response, { postMergePhase: false });
+    expect(output.verdict).toBeUndefined();
+    expect(output.malformed).toBe(true);
+    expect(output.evidencePending).toBeUndefined();
+  });
+
+  it("normalizes an invalid WAIT state to unspecified and drops an over-long run id", () => {
+    const response = `{"verdict":"WAIT","notes":"x","evidencePending":{"state":"soon","runId":"${"9".repeat(200)}"}}`;
+    expect(parseWorkflowStepVerdict(response, { postMergePhase: true })?.evidencePending).toEqual({ state: "unspecified" });
+    expect(parseWorkflowStepVerdict('{"verdict":"WAIT","notes":"x"}', { postMergePhase: true })?.evidencePending).toEqual({ state: "unspecified" });
+  });
+
+  it("never infers WAIT from prose", () => {
+    for (const prose of ["Waiting for CI to finish.", "Verdict: WAIT", "WAIT\nThe run is still queued."]) {
+      expect(inferWorkflowStepVerdictFromProse(prose)?.verdict).not.toBe("WAIT");
+      expect(parseWorkflowStepOutput(prose, { postMergePhase: true }).verdict).not.toBe("WAIT");
+    }
+  });
+
   it("prefers a trailing Plan Review close JSON payload", () => {
     const response = 'Example: {"verdict":"REVISE"}\n{"verdict":"CLOSE_NO_OP","notes":"PREMISE STALE: already shipped"}';
     expect(parseWorkflowStepVerdict(response, { optionalGroupId: "plan-review" })).toEqual({

@@ -24,6 +24,7 @@ import {
   isOpenWorkflowReviewFinding,
   MAX_WORKFLOW_REVIEW_FINDINGS,
   PLAN_REVIEW_GROUP_ID,
+  POST_MERGE_EVIDENCE_PENDING_VALUE,
   finalizePlanningSegment,
   resolveExecutorFallbackModel,
   resolvePersistAgentThinkingLog,
@@ -738,7 +739,17 @@ CRITICAL SCOPING RULES — read before doing anything else:
     A new UNAVAILABLE enum value would model it better, but `WorkflowStepVerdict` has no such member
     and adding one reaches the parser, step results, merge admission and the dashboard — out of
     proportion to a prompt repair, so the honest case is expressed with the values that already exist.
+
+    FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+    Superseded for one scoped case. KB-080: a post-merge gate judging post-landing CI evidence that does not
+    exist yet (run not started, queued, in progress, artifacts unpublished) had no honest value: REVISE
+    recorded a red failure an executor cannot fix and parked landed cards. WAIT is offered ONLY to post-merge
+    phase steps and is persisted as the awaiting-evidence status (never as a verdict) that the reseed seam
+    re-dispatches on a backoff. Pre-merge steps keep the exact three-value contract above.
     */
+    const allowEvidenceWait = workflowStep.phase === "post-merge";
+    const verdictEnum = allowEvidenceWait ? "APPROVE|APPROVE_WITH_NOTES|REVISE|WAIT" : "APPROVE|APPROVE_WITH_NOTES|REVISE";
+    const evidencePendingField = allowEvidenceWait ? ",\"evidencePending\":{\"state\":\"run-not-started|run-queued|run-in-progress|artifacts-pending\",\"runId\":\"...\"}" : "";
     const verdictBlock = requireVerdict
       ? `
 
@@ -747,12 +758,12 @@ CRITICAL SCOPING RULES — read before doing anything else:
   When your review is complete, your final line MUST be a single JSON object (a \`\`\`json fence around it is also accepted):
 
   ${reviewFindingsContract
-    ? "{\"verdict\":\"APPROVE|APPROVE_WITH_NOTES|REVISE\",\"notes\":\"...\",\"findings\":[{\"id\":\"stable-id\",\"title\":\"concise issue\",\"body\":\"actionable detail\",\"filePath\":\"optional/path\",\"line\":1,\"severity\":\"low|medium|high|critical\",\"resolution\":\"open|resolved-in-review|superseded\"}],\"supersededFindingSourceWorkflowStepId\":\"prior-review-step-id\",\"supersededFindingIds\":[\"prior-finding-id\"]}"
-    : "{\"verdict\":\"APPROVE|APPROVE_WITH_NOTES|REVISE\",\"notes\":\"...\"}"}
+    ? `{"verdict":"${verdictEnum}","notes":"..."${evidencePendingField},"findings"` + ":[{\"id\":\"stable-id\",\"title\":\"concise issue\",\"body\":\"actionable detail\",\"filePath\":\"optional/path\",\"line\":1,\"severity\":\"low|medium|high|critical\",\"resolution\":\"open|resolved-in-review|superseded\"}],\"supersededFindingSourceWorkflowStepId\":\"prior-review-step-id\",\"supersededFindingIds\":[\"prior-finding-id\"]}"
+    : `{"verdict":"${verdictEnum}","notes":"..."${evidencePendingField}}`}
 
   Rules:
   - Output exactly one trailing JSON object and stop.
-  - verdict must be exactly APPROVE, APPROVE_WITH_NOTES, or REVISE.
+  - verdict must be exactly ${allowEvidenceWait ? "APPROVE, APPROVE_WITH_NOTES, REVISE, or WAIT" : "APPROVE, APPROVE_WITH_NOTES, or REVISE"}.${allowEvidenceWait ? "\n  - Return WAIT only when the post-landing evidence you must judge does not exist yet (run not started, queued, in progress, or artifacts not yet published); include evidencePending. The gate re-runs automatically. Never return WAIT for a concluded run." : ""}
   - notes MUST contain one to three non-empty sentences naming what was checked and why the verdict was reached. An empty notes string is a protocol violation.
   - For out-of-scope fast-bail responses, use: {"verdict":"APPROVE","notes":"I checked the diff scope and found no UI file changes, so this review is out of scope."}
   - If you CANNOT SEE the change you were asked to review — the described files appear absent, or the scope you were given looks empty when work was expected — that is NOT an approval and NOT out-of-scope. Return REVISE and state plainly in notes what you looked for and where. Never describe that situation in prose alone: a response with no verdict cannot be acted on and is treated as a failed review.${reviewFindingsContract ? "\n  - Every finding MUST carry a `severity`. Put each blocking issue in `findings` — prose in `notes` alone does not block.\n  - Omit resolution (or use open) for work still needed; use resolved-in-review only for an issue you fixed in this session.\n  - supersededFindingIds may list only IDs from one named Prior Findings result that you re-verified no longer apply; include that result’s workflow step ID in supersededFindingSourceWorkflowStepId; never list your own findings." : ""}${blockingSeverityRule}
@@ -1257,9 +1268,10 @@ CRITICAL SCOPING RULES — read before doing anything else:
         FNXC:PlanReviewNoOp 2026-08-09-22:10:
         Thread optionalGroupId so Plan Review CLOSE_NO_OP is accepted only for that group.
         */
+        // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: the phase decides whether WAIT is a legal verdict.
         let parsed = requireVerdict
-          ? parseWorkflowStepOutput(output, { optionalGroupId })
-          : parseWorkflowStepOutput(output, { requireVerdict: false, optionalGroupId });
+          ? parseWorkflowStepOutput(output, { optionalGroupId, postMergePhase: allowEvidenceWait })
+          : parseWorkflowStepOutput(output, { requireVerdict: false, optionalGroupId, postMergePhase: allowEvidenceWait });
 
         /*
         FNXC:ReviewVerdictNotes 2026-08-28-21:23:
@@ -1332,6 +1344,22 @@ CRITICAL SCOPING RULES — read before doing anything else:
           });
         session.dispose();
         await agentLogger.flush();
+        if (parsed.verdict === "WAIT") {
+          /*
+          FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+          Pending post-landing evidence is neither approval nor rejection, so it bypasses the severity gate,
+          the uncommitted-approval refusal and the inline-fix identity recapture. The failure value routes it
+          to the graph recorder, which persists awaiting-evidence and never a REVISE or failed verdict.
+          */
+          return {
+            success: false,
+            verdict: "WAIT",
+            failureValue: POST_MERGE_EVIDENCE_PENDING_VALUE,
+            output: parsed.output,
+            notes: parsed.notes,
+            evidencePending: parsed.evidencePending ?? { state: "unspecified" },
+          };
+        }
         if (parsed.verdict) {
           /*
            * FNXC:ReviewSeverityGate 2026-08-10-17:33:

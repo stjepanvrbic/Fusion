@@ -60,6 +60,9 @@ export function mapWorkflowStatus(result: WorkflowStepResult): UnifiedTaskProgre
       return "advisory_failure";
     case "skipped":
       return isWorkflowStepNotRun(result) ? "not_run" : "skipped";
+    case "awaiting-evidence":
+      // FNXC:PostMergeEvidenceWait 2026-10-08-19:12: a post-merge gate waiting for CI evidence is neither red nor complete; it shows as pending until a real verdict arrives.
+      return "pending";
     case "pending":
     default:
       // The graph upserts a `pending` entry when a step starts running. A started-but-not-completed

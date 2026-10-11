@@ -65,6 +65,13 @@ push-to-main run at or after the landed SHA has recorded every shard conclusion 
 FNXC:ReviewRecovery 2026-10-04-02:24:
 FN-9375 retained failed-lane evidence for explicit disposition. Requiring green non-blocking lanes
 contradicts that policy and strands every unrelated landed task; require honest disposition instead.
+
+FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
+KB-080: evidence that does not exist yet is not a task defect. The prompt used to demand REVISE while the
+required run was still queued, which recorded a red failed row with nothing for an executor to fix and left
+re-judging to the hourly rejected-evidence ladder (KB-049, KB-008). The gate now returns WAIT with
+evidencePending; the engine records awaiting-evidence and re-dispatches it automatically on a bounded backoff.
+A concluded run is never WAIT: it needs a real verdict, and an unattributed red lane is never approved.
 */
 const POST_MERGE_VERIFICATION_PROMPT = `You are a post-merge verification reviewer. Verify that the task's merged result is safe after integration.
 
@@ -92,15 +99,17 @@ Full Suite and Pipeline smoke are non-blocking signals. A failed lane requires a
 
 Judge failures against this task's landed changes. For evidence-backed unrelated failures, a linked follow-up with an accountable owner satisfies the disposition requirement; that follow-up may still be open, running, or failed. Do not require unrelated follow-up completion, disposition of the entire repository backlog, or a green non-blocking Full Suite before approving this task. You must perform this task's attribution from the available diff, logs, and failure artifact rather than defer it wholesale to the follow-up. If attribution remains unknown, name the specific failure and missing evidence that prevents the decision; a red shard count or an open follow-up alone is not a task regression.
 
-Pre-landing, unrelated-main, or partial evidence does not satisfy this contract. If the required run is still running or required evidence is unavailable, return REVISE and state that final completion remains blocked pending the post-landing evidence. Record verified evidence and every non-success disposition in the task delivery record before approving.
+Pre-landing, unrelated-main, or partial evidence does not satisfy this contract. Return WAIT, never REVISE, when the evidence you must judge does not exist yet: no Full Suite push run at or after the landed SHA exists yet (state "run-not-started"), the run is queued ("run-queued") or in progress ("run-in-progress"), or the run is still running and its timing artifacts are not yet published ("artifacts-pending"). Include evidencePending with that state and the run ID when known, and record what you observed in the delivery record. The gate re-runs automatically until the run concludes. Never return WAIT for a concluded run: a concluded red lane needs the attribution and follow-up disposition above, and an unattributed red lane is never approved. Record verified evidence and every non-success disposition in the task delivery record before approving.
 
 ## Output Requirements
 - APPROVE: post-merge verification is acceptable.
 - APPROVE_WITH_NOTES: completion may proceed with non-blocking notes only when every post-landing evidence item above is recorded.
 - REVISE: completion should be blocked; include the concrete post-merge issue and the needed follow-up.
+- WAIT: the required post-landing run has not started, is queued or in progress, or has not published its artifacts yet; include evidencePending. This is not a rejection and the gate re-runs automatically.
 - \`notes\` MUST contain one to three non-empty sentences naming what was checked and why the verdict was reached. An empty \`notes\` string is a protocol violation.
 - Final output: output exactly one trailing JSON object on the final line (no markdown fences, no surrounding prose):
-{"verdict":"APPROVE|APPROVE_WITH_NOTES|REVISE","notes":"..."}`;
+{"verdict":"APPROVE|APPROVE_WITH_NOTES|REVISE|WAIT","notes":"...","evidencePending":{"state":"run-not-started|run-queued|run-in-progress|artifacts-pending","runId":"..."}}
+Include evidencePending only with WAIT.`;
 
 export interface PostMergeOptionalGroupSpec {
   /** Stable per-task enable key + group node id. */
