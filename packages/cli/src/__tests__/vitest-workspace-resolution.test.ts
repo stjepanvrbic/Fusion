@@ -1,15 +1,13 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import type { WorkerGlobalState } from "vitest";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import vitestConfig from "../../vitest.config";
 
 const cliRoot = join(__dirname, "..", "..");
 const workspaceRoot = join(cliRoot, "..", "..");
-const hiddenDistRootPrefix = ".tmp-fn-vitest-workspace-resolution-";
-const hiddenDistRoot = join(workspaceRoot, `${hiddenDistRootPrefix}${process.pid}`);
-
-const internalPackages = ["core", "engine", "dashboard"] as const;
-const movedDistDirs: Array<{ from: string; to: string }> = [];
+const realWorkspaceRoot = realpathSync(workspaceRoot);
 
 type AliasEntry = { find: string | RegExp; replacement: string };
 
@@ -41,7 +39,7 @@ function effectiveAlias(specifier: string): AliasEntry | undefined {
 /*
 FNXC:CliTests 2026-10-11-13:45:
 Every plugin entry that dashboard server source or CLI source imports must be aliased to plugin source, because each plugin's export map points its "import" condition at `dist/`.
-The set is derived from the imports themselves, never hardcoded, and the dist-absent case moves the `dist` of exactly these plugin packages aside, so a missing alias fails in a built checkout too instead of being satisfied by a stale build.
+The set is derived from the imports themselves, never hardcoded.
 Dashboard tests are skipped because the CLI graph never loads them; CLI tests are included because they import plugin entries directly.
 */
 const pluginSpecifiers: ReadonlyMap<string, string> = (() => {
@@ -57,121 +55,56 @@ const pluginSpecifiers: ReadonlyMap<string, string> = (() => {
   }
   return specifiers;
 })();
-const pluginShortNames = [...new Set(pluginSpecifiers.values())];
-
-function rmSyncWithRetry(path: string) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      rmSync(path, { recursive: true, force: true });
-      return;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EEXIST") {
-        throw error;
-      }
-      if (attempt === 4) {
-        throw error;
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (attempt + 1));
-    }
+/**
+FNXC:CliTests 2026-10-11-14:15:
+The guard must prove that workspace packages resolve from source without moving, renaming or deleting any shared build output.
+Parallel test files and a concurrent package lane read the same checkout, and an owner-blind cleanup of moved output could delete what a killed or concurrent run had moved aside.
+It inspects the modules this test file actually loaded through Vitest's evaluated module graph, which is reachable only through the `__vitest_worker__` global, and fails when that state is missing so a Vitest upgrade cannot turn the check into a silent pass.
+Returns the absolute paths of every loaded file; builtins and virtual ids are dropped.
+*/
+function loadedModuleFiles(): string[] {
+  const evaluated = (globalThis as { __vitest_worker__?: WorkerGlobalState }).__vitest_worker__?.evaluatedModules;
+  if (!evaluated) {
+    throw new Error("Vitest worker state __vitest_worker__.evaluatedModules is unavailable; cannot inspect loaded modules");
   }
+  const files: string[] = [];
+  for (const key of evaluated.fileToModulesMap.keys()) {
+    const path = key.startsWith("file:")
+      ? fileURLToPath(key)
+      : key.startsWith("///")
+        ? fileURLToPath(`file:${key}`)
+        : key;
+    if (isAbsolute(path)) files.push(resolve(path));
+  }
+  return files;
 }
 
-function cleanupStaleHiddenDistRoots() {
-  for (const entry of readdirSync(workspaceRoot)) {
-    if (!entry.startsWith(hiddenDistRootPrefix)) {
-      continue;
-    }
-
-    const fullPath = join(workspaceRoot, entry);
-    try {
-      if (!lstatSync(fullPath).isDirectory()) {
-        continue;
-      }
-      rmSyncWithRetry(fullPath);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT") {
-        throw error;
-      }
-    }
-  }
+/** A loaded file inside the workspace, outside `node_modules`, under a `dist` directory. */
+function isWorkspaceBuildOutput(path: string): boolean {
+  const fromRoot = relative(realWorkspaceRoot, path);
+  if (fromRoot.startsWith("..") || isAbsolute(fromRoot)) return false;
+  const segments = fromRoot.split(sep).flatMap((segment) => segment.split("/"));
+  return !segments.includes("node_modules") && segments.includes("dist");
 }
 
-function hideDistDir(name: string, distPath: string) {
-  if (!existsSync(distPath)) {
-    return;
-  }
+/** Fails if any loaded module came from workspace `dist`, or if the source alias target of a specifier was not loaded. */
+function expectLoadedFromSourceOnly(specifiers: readonly string[]) {
+  const loaded = loadedModuleFiles();
+  const buildOutput = loaded.filter(isWorkspaceBuildOutput).map((path) => relative(realWorkspaceRoot, path));
+  expect(buildOutput, `modules loaded from workspace dist:\n${buildOutput.join("\n")}`).toEqual([]);
 
-  const hiddenPath = join(hiddenDistRoot, `${name}-dist`);
-  if (existsSync(hiddenPath)) {
-    rmSyncWithRetry(hiddenPath);
-  }
-  renameSync(distPath, hiddenPath);
-  movedDistDirs.push({ from: distPath, to: hiddenPath });
-}
-
-function hideInternalPackageDistDirs() {
-  cleanupStaleHiddenDistRoots();
-  mkdirSync(hiddenDistRoot, { recursive: true });
-
-  for (const pkg of internalPackages) {
-    hideDistDir(pkg, join(workspaceRoot, "packages", pkg, "dist"));
-  }
-
-  for (const short of pluginShortNames) {
-    hideDistDir(`plugin-${short}`, join(workspaceRoot, "plugins", `fusion-plugin-${short}`, "dist"));
+  for (const specifier of specifiers) {
+    const target = effectiveAlias(specifier)?.replacement;
+    expect(target, `${specifier} has no source alias`).toBeDefined();
+    const realTarget = realpathSync(target ?? "");
+    expect(
+      loaded.some((path) => relative(realTarget, path) === ""),
+      `${specifier} source entry ${target} was not loaded`,
+    ).toBe(true);
   }
 }
-
-function restoreInternalPackageDistDirs() {
-  for (let i = movedDistDirs.length - 1; i >= 0; i--) {
-    const { from, to } = movedDistDirs[i];
-    if (!existsSync(to)) {
-      continue;
-    }
-
-    if (existsSync(from)) {
-      rmSyncWithRetry(from);
-    }
-
-    renameSync(to, from);
-  }
-  movedDistDirs.length = 0;
-  rmSyncWithRetry(hiddenDistRoot);
-}
-
-describe("vitest workspace temp dir cleanup", () => {
-  it("cleans stale workspace-resolution temp dirs without touching unrelated tmp dirs", () => {
-    const staleDir = join(workspaceRoot, `${hiddenDistRootPrefix}stale-test-${process.pid}-${Date.now()}`);
-    const staleMarker = join(staleDir, "marker.txt");
-    const unrelatedTmpDir = join(workspaceRoot, ".tmp-fn-other-marker-test");
-
-    rmSyncWithRetry(staleDir);
-    rmSyncWithRetry(unrelatedTmpDir);
-
-    mkdirSync(staleDir, { recursive: true });
-    writeFileSync(staleMarker, "stale");
-    mkdirSync(unrelatedTmpDir, { recursive: true });
-
-    cleanupStaleHiddenDistRoots();
-
-    expect(existsSync(staleDir)).toBe(false);
-    expect(existsSync(unrelatedTmpDir)).toBe(true);
-
-    rmSyncWithRetry(unrelatedTmpDir);
-  });
-});
 
 describe("CLI Vitest workspace resolution", () => {
-  beforeAll(() => {
-    hideInternalPackageDistDirs();
-  });
-
-  afterAll(() => {
-    restoreInternalPackageDistDirs();
-  });
-
   it("uses exact source-entry aliases for internal workspace packages", () => {
     const aliases = vitestConfig.resolve?.alias;
     expect(Array.isArray(aliases)).toBe(true);
@@ -315,9 +248,7 @@ describe("CLI Vitest workspace resolution", () => {
     }
   });
 
-  it("resolves the core subpath aliases from source when core dist is absent", async () => {
-    expect(existsSync(join(workspaceRoot, "packages", "core", "dist"))).toBe(false);
-
+  it("resolves the core subpath aliases from source, never from core dist", async () => {
     const { MemoryMcpHandler, createMemoryMcpBackends } = await import("@fusion/core/memory-mcp");
     const { buildFusionMemoryBuiltIns } = await import("@fusion/core/mcp-builtin-servers");
     const { isGhAvailable } = await import("@fusion/core/gh-cli");
@@ -326,6 +257,7 @@ describe("CLI Vitest workspace resolution", () => {
     expect(typeof createMemoryMcpBackends).toBe("function");
     expect(typeof buildFusionMemoryBuiltIns).toBe("function");
     expect(typeof isGhAvailable).toBe("function");
+    expectLoadedFromSourceOnly(["@fusion/core/memory-mcp", "@fusion/core/mcp-builtin-servers", "@fusion/core/gh-cli"]);
   });
 
   it("aliases every plugin entry that dashboard and CLI source import to plugin source", () => {
@@ -367,7 +299,7 @@ describe("CLI Vitest workspace resolution", () => {
     );
   });
 
-  it("resolves non-mocked symbols from internal workspace packages and Claude runtime when dist outputs are absent", async () => {
+  it("resolves non-mocked symbols from internal workspace packages and runtime plugins from source, never from workspace dist", async () => {
     const [
       { tempWorkspace },
       { PRIORITY_EXECUTE },
@@ -399,5 +331,14 @@ describe("CLI Vitest workspace resolution", () => {
         description: "desc",
       },
     });
+    expectLoadedFromSourceOnly([
+      "@fusion/core",
+      "@fusion/test-utils",
+      "@fusion/engine",
+      "@fusion/dashboard",
+      "@fusion/dashboard/planning",
+      "@fusion-plugin-examples/claude-runtime",
+      "@fusion-plugin-examples/antigravity-runtime/probe",
+    ]);
   }, 30_000);
 });
