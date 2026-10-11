@@ -413,10 +413,9 @@ export default defineConfig({
             KB-056 rescued executor-task-done-summary.test.ts into engine-default (not admitted to engine-core). Files sharing the "/tmp/test" FN-001 path contended for one real worktree-reservation claim; a claim abandoned by a torn-down worker (shared pid under threads) stalled the next acquisition for 30 s while its routing dropped later executes. The executor harness now isolates reservation state per file and the file drains its in-place retry loop per test; the exclude and ledger row were removed in lockstep.
             */
             /*
-            FNXC:AuthStorageDurabilityQuarantine 2026-10-08-11:22:
-            Second Full Suite sighting of register entry 30: the hanging-refresh case polled fake timers for 200 iterations and the mocked fetch was still uncalled, on two different commits. Quarantined on sight under the deletion ratchet with timeouts and assertions unchanged; a rescue needs a root-cause fix, starting at the file and lock I/O the refresh path does before it calls fetch.
+            FNXC:AuthStorageDurabilityQuarantine 2026-10-11-20:43:
+            KB-074 rescued auth-storage-durability.test.ts into engine-default (not admitted to engine-core). Register entry 30's uncalled fetch was a 200-iteration fake-timer poll, about a millisecond of event-loop turns, racing the real lock and file I/O the refresh path does before its request. The case now waits on the request itself, its seeded expiry is out of reach of real time, and a slow-lock case pins the fix. Timeouts and assertions are unchanged. The exclude and ledger row were removed in lockstep.
             */
-            "src/__tests__/auth-storage-durability.test.ts",
             /*
             FNXC:MergerAiWindowsTimeoutQuarantine 2026-10-11-09:13:
             KB-114 rescued merger-ai.test.ts into engine-default (not admitted to engine-core). Its Windows 30 s timeouts were process count under worker fan-out: each two-cycle case started 60 to 98 git and shell processes. Test-side git calls and the already-landed detector's single commands now run without a shell, per-case repository states are prebuilt templates, and each review fence reads its two refs in one process. Timeouts and assertions are unchanged. The exclude and ledger row were removed in lockstep.

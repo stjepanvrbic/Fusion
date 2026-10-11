@@ -185,6 +185,10 @@ FNXC:TestFlakeRegister 2026-10-08-17:49:
 KB-086 rescued entry 29 with a test-only root-cause fix, so the archived record must also name the rescue and its
 task while keeping every quarantine-evidence string and the Closed status prefix.
 
+FNXC:TestFlakeRegister 2026-10-11-20:43:
+KB-074 rescued entry 30 the same way, so its archived record must name the rescue in its Status line while keeping
+every quarantine-evidence string and the Closed status prefix.
+
 FNXC:TestFlakeRegister 2026-10-08-08:12:
 Entries 33 and 34 record first sightings from the fork's Full Suite: an AutomationStore due-run claim that
 straddled a cron minute edge, and an AgentDetailView log-stream subscription read before its effect flushed.
@@ -455,10 +459,12 @@ test("archived instance-scoped OAuth refresh quarantine retains both-sighting ev
     "expected \"vi.fn()\" to be called 1 times, but got 0 times",
     "quarantined 2026-10-08",
     "deletion deadline 2026-10-22",
+    "Rescued",
+    "KB-074",
   ]) {
     assert.ok(entry.includes(evidence), `Archived instance-scoped OAuth refresh entry is missing ${evidence}`);
   }
-  assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined/m);
+  assert.match(entry, /^- \*\*Status:\*\* Closed — quarantined[^\n]*\*\*Rescued 2026-10-11 by KB-074\*\*/m);
 });
 
 test("archived AgentDetailView log history quarantine retains both-sighting evidence", () => {

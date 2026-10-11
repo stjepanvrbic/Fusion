@@ -25,6 +25,50 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
+const lockControl = vi.hoisted(() => ({
+  gate: undefined as Promise<void> | undefined,
+  reached: undefined as (() => void) | undefined,
+  abandon: undefined as (() => void) | undefined,
+}));
+
+vi.mock("proper-lockfile", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("proper-lockfile")>();
+  const lock: typeof actual.lock = (file, options) => {
+    const gate = lockControl.gate;
+    if (!gate) return actual.lock(file, options);
+    lockControl.reached?.();
+    return gate.then(() => actual.lock(file, options));
+  };
+  const gated = { ...actual, lock };
+  return { ...gated, default: gated };
+});
+
+/** Hold every lock acquisition that starts from now on. `reached` resolves when the first one arrives; `release` lets them proceed. */
+function holdLockAcquisition(): { reached: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const reached = new Promise<void>((resolve) => {
+    lockControl.reached = resolve;
+  });
+  const gate = new Promise<void>((resolve, reject) => {
+    release = () => {
+      lockControl.gate = undefined;
+      resolve();
+    };
+    lockControl.abandon = () => reject(new Error("lock acquisition abandoned by test teardown"));
+  });
+  gate.catch(() => undefined);
+  lockControl.gate = gate;
+  return { reached, release };
+}
+
+/** A lock acquisition still held at teardown is failed, so its caller settles instead of proceeding after the test. */
+function abandonHeldLockAcquisition(): void {
+  lockControl.abandon?.();
+  lockControl.abandon = undefined;
+  lockControl.reached = undefined;
+  lockControl.gate = undefined;
+}
+
 const CORRUPT = '{"openrouter": {"type": "api_key", "key": "keep-me"}, "groq": {"type": "api_';
 
 describe("auth.json durability", () => {
@@ -110,6 +154,7 @@ describe("instance-scoped OAuth refresh", () => {
   });
 
   afterEach(async () => {
+    abandonHeldLockAcquisition();
     vi.useRealTimers();
     globalThis.fetch = originalFetch;
     if (originalHome === undefined) delete process.env.HOME;
@@ -118,6 +163,38 @@ describe("instance-scoped OAuth refresh", () => {
   });
 
   const instance = { providerId: "anthropic-subscription", instanceId: "work" };
+
+  /*
+  FNXC:ProviderAuth 2026-10-11-20:27:
+  Between getApiKey and the token request the refresh path takes a file lock and rereads auth.json: real I/O that fake timers do not drive and that has no upper bound on a loaded runner.
+  The hanging-request cases therefore wait on the request itself, and fail at once if getApiKey settles first, which is how a swallowed lock failure shows.
+  The slow-lock case first waits until the refresh path is held at its lock, so it cannot pass with a lock that was never held.
+  The fallback token is checked against the real clock, so the seeded expiry sits inside the proactive refresh window but beyond the test timeout: real time cannot expire it while a case runs.
+  */
+  const refreshableExpiry = () => Date.now() + 60_000;
+
+  function hangingRefreshRequest() {
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const fetchMock = vi.fn((_url: string, init?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+      markStarted();
+      init?.signal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+    }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    return { fetchMock, started };
+  }
+
+  /** Resolve when `event` happens; fail at once if one of the named `unexpected` outcomes happens first. */
+  function expectFirst(event: Promise<void>, unexpected: Record<string, Promise<unknown>>): Promise<void> {
+    return Promise.race([
+      event,
+      ...Object.entries(unexpected).map(([outcome, happened]) => happened.then(() => {
+        throw new Error(`${outcome} happened first`);
+      })),
+    ]);
+  }
 
   it("refreshes a rotating instance token exactly once across concurrent sessions", async () => {
     const seed = createFusionAuthStorage();
@@ -147,16 +224,36 @@ describe("instance-scoped OAuth refresh", () => {
 
   it("bounds a hanging refresh request instead of waiting on it indefinitely", async () => {
     const seed = createFusionAuthStorage();
-    await seed.setInstance(instance, { type: "oauth", access: "expiring-access", refresh: "r", expires: Date.now() + 1_000 });
-
-    const fetchMock = vi.fn((_url: string, init?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
-      init?.signal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
-    }));
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    await seed.setInstance(instance, { type: "oauth", access: "expiring-access", refresh: "r", expires: refreshableExpiry() });
+    const { fetchMock, started } = hangingRefreshRequest();
 
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const pending = createFusionAuthStorage().getApiKey("anthropic-subscription", instance);
-    for (let i = 0; i < 200 && fetchMock.mock.calls.length === 0; i++) await vi.advanceTimersByTimeAsync(5);
+    await expectFirst(started, { "getApiKey settling before the refresh request": pending });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    await expect(pending).resolves.toBe("expiring-access");
+  });
+
+  it("bounds a hanging refresh request even when refresh-lock acquisition is slow", async () => {
+    const seed = createFusionAuthStorage();
+    await seed.setInstance(instance, { type: "oauth", access: "expiring-access", refresh: "r", expires: refreshableExpiry() });
+    const { fetchMock, started } = hangingRefreshRequest();
+
+    const heldLock = holdLockAcquisition();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const pending = createFusionAuthStorage().getApiKey("anthropic-subscription", instance);
+    await expectFirst(heldLock.reached, {
+      "getApiKey settling before the refresh lock": pending,
+      "the refresh request starting without the held lock": started,
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    heldLock.release();
+    await expectFirst(started, { "getApiKey settling before the refresh request": pending });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
     await vi.advanceTimersByTimeAsync(60_000);
