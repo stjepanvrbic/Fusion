@@ -1,8 +1,11 @@
 import { access, constants as fsConstants, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { dirname, join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { GATE_BUNDLE_OUTDIR } from "../../../../../scripts/build-engine-core-gate-bundle.mjs";
 import {
+  REGENERABLE_IGNORED_REPO_PATHS,
   RemovalReason,
   removeWorktree,
 } from "../../worktree/worktree-backend.js";
@@ -33,7 +36,11 @@ describe.skipIf(!hasGit)("reliability interactions: defensive removal preserves 
     git(root, 'git config user.email "test@example.com"');
     git(root, 'git config user.name "Test User"');
     await writeFile(join(root, "README.md"), "# repo\n", "utf-8");
-    await writeFile(join(root, ".gitignore"), ".fusion/\ndist/\nnode_modules/\n.env\n", "utf-8");
+    await writeFile(
+      join(root, ".gitignore"),
+      ".fusion/\ndist/\nnode_modules/\n.env\npackages/core/.gate-bundle/\npackages/engine/.gate-bundle/\n",
+      "utf-8",
+    );
     git(root, "git add README.md .gitignore");
     git(root, 'git commit -m "init"');
     await mkdir(join(root, ".worktrees"), { recursive: true });
@@ -151,6 +158,94 @@ describe.skipIf(!hasGit)("reliability interactions: defensive removal preserves 
 
     await expect(removeWorktree({ rootDir: root, worktreePath, settings: {}, reason })).resolves.toMatchObject({ removed: true });
     expect(await pathExists(worktreePath)).toBe(false);
+  });
+
+  async function writeGateBundle(worktreePath: string): Promise<void> {
+    await mkdir(join(worktreePath, "packages", "core", ".gate-bundle"), { recursive: true });
+    await writeFile(join(worktreePath, "packages", "core", ".gate-bundle", "core.mjs"), "export {};\n", "utf-8");
+    await writeFile(join(worktreePath, "packages", "core", ".gate-bundle", "core.meta.json"), "{}\n", "utf-8");
+  }
+
+  it("tip-already-merged cleanup discards a checkout whose only leftover is the engine-core gate bundle", async () => {
+    const root = await setupRepo();
+    const worktreePath = await createWorktree(root, "gate-bundle-only");
+    await writeGateBundle(worktreePath);
+    const audit = { git: vi.fn().mockResolvedValue(undefined) };
+
+    await expect(removeWorktree({
+      rootDir: root,
+      worktreePath,
+      settings: {},
+      reason: RemovalReason.SelfHealingBranchConflict,
+      taskId: "KB-135",
+      audit: audit as never,
+    })).resolves.toMatchObject({ removed: true });
+
+    expect(await pathExists(worktreePath)).toBe(false);
+    expect(audit.git).toHaveBeenCalledWith(expect.objectContaining({ type: "worktree:removal-discarded-regenerable-content" }));
+    expect(audit.git).not.toHaveBeenCalledWith(expect.objectContaining({ type: "worktree:removal-preserved" }));
+  });
+
+  it.each([
+    RemovalReason.MergerCleanup,
+    RemovalReason.MergerPostMerge,
+    RemovalReason.PoolPrune,
+    RemovalReason.SelfHealingBranchConflict,
+    RemovalReason.SelfHealingIdleSweep,
+    RemovalReason.SelfHealingReclaim,
+    RemovalReason.SelfHealingStaleActiveBranch,
+    RemovalReason.StepSessionCleanup,
+  ])("%s removes a checkout with dependency directories plus the gate bundle", async (reason) => {
+    const root = await setupRepo();
+    const worktreePath = await createWorktree(root, `gate-bundle-${reason}`);
+    await mkdir(join(worktreePath, "node_modules", "pkg"), { recursive: true });
+    await mkdir(join(worktreePath, "packages", "core", "node_modules", "pkg"), { recursive: true });
+    await writeFile(join(worktreePath, "node_modules", "pkg", "index.js"), "generated\n", "utf-8");
+    await writeFile(join(worktreePath, "packages", "core", "node_modules", "pkg", "index.js"), "generated\n", "utf-8");
+    await writeGateBundle(worktreePath);
+
+    await expect(removeWorktree({ rootDir: root, worktreePath, settings: {}, reason })).resolves.toMatchObject({ removed: true });
+
+    expect(await pathExists(worktreePath)).toBe(false);
+  });
+
+  it("preserves the gate bundle alongside an ignored env file", async () => {
+    const root = await setupRepo();
+    const worktreePath = await createWorktree(root, "gate-bundle-env");
+    await writeGateBundle(worktreePath);
+    await writeFile(join(worktreePath, ".env"), "TOKEN=ignored\n", "utf-8");
+
+    await expect(removeWorktree({
+      rootDir: root,
+      worktreePath,
+      settings: {},
+      reason: RemovalReason.SelfHealingBranchConflict,
+    })).rejects.toThrow(/preserving/);
+
+    expect(await readFile(join(worktreePath, ".env"), "utf-8")).toBe("TOKEN=ignored\n");
+  });
+
+  it("preserves a look-alike gate bundle outside packages/core", async () => {
+    const root = await setupRepo();
+    const worktreePath = await createWorktree(root, "gate-bundle-look-alike");
+    await mkdir(join(worktreePath, "packages", "engine", ".gate-bundle"), { recursive: true });
+    await writeFile(join(worktreePath, "packages", "engine", ".gate-bundle", "core.mjs"), "keep\n", "utf-8");
+
+    await expect(removeWorktree({
+      rootDir: root,
+      worktreePath,
+      settings: {},
+      reason: RemovalReason.SelfHealingBranchConflict,
+    })).rejects.toThrow(/preserving/);
+
+    expect(await readFile(join(worktreePath, "packages", "engine", ".gate-bundle", "core.mjs"), "utf-8")).toBe("keep\n");
+  });
+
+  it("allowlists the directory the gate bundle builder actually writes", () => {
+    const repoRoot = fileURLToPath(new URL("../../../../../", import.meta.url));
+    const outputPath = relative(repoRoot, GATE_BUNDLE_OUTDIR).split(sep).join("/");
+
+    expect(REGENERABLE_IGNORED_REPO_PATHS.has(outputPath)).toBe(true);
   });
 
   it("preserves Fusion scratch with an unexpected child", async () => {

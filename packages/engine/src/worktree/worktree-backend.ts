@@ -1205,6 +1205,17 @@ export const REGENERABLE_IGNORED_DIR_NAMES = new Set([
   ".mypy_cache", "__pycache__", ".gradle", ".venv", "venv",
 ]);
 
+/*
+FNXC:WorktreeCleanup 2026-10-11-15:34:
+The engine-core merge gate rebuilds its test bundle on every run into packages/core/.gate-bundle/ of whichever checkout runs the gate.
+Without this entry every such checkout was unremovable by defensive cleanup, so tip-already-merged recovery looped and the card never ran.
+The match is an exact repository-relative porcelain path, so a look-alike .gate-bundle directory elsewhere stays operator content.
+*/
+/** Repository-relative, forward-slash paths of ignored directories that hold reproducible build output. */
+export const REGENERABLE_IGNORED_REPO_PATHS: ReadonlySet<string> = new Set([
+  "packages/core/.gate-bundle",
+]);
+
 export type WorktreeRemovalContentClassification = "clean" | "regenerable-ignored" | "ignored-only" | "deliverable";
 
 /*
@@ -1231,6 +1242,7 @@ function isRegenerableIgnoredPorcelainEntry(entry: string, provenScratchRootEntr
   const path = entry.slice(3).replace(/\/$/, "");
   if (!path || path.startsWith('"')) return false;
   if (provenScratchRootEntries?.has(path) && isTopLevelUnquotedDirectoryEntry(entry, path)) return true;
+  if (REGENERABLE_IGNORED_REPO_PATHS.has(path)) return true;
   const lastSegment = path.split("/").at(-1);
   return lastSegment !== undefined && REGENERABLE_IGNORED_DIR_NAMES.has(lastSegment);
 }

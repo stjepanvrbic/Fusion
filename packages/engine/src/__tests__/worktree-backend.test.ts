@@ -107,6 +107,15 @@ describe("classifyWorktreeRemovalContent", () => {
     { name: "preserves quoted Fusion scratch", porcelain: '!! ".fusion/"\n', options: { provenScratchRootEntries: new Set([".fusion"]) }, expected: "ignored-only" },
     { name: "preserves mixed proven scratch and env file", porcelain: "!! .fusion/\n!! .env\n", options: { provenScratchRootEntries: new Set([".fusion"]) }, expected: "ignored-only" },
     { name: "does not let proven scratch mask an untracked file", porcelain: "!! .fusion/\n?? wip.txt\n", options: { provenScratchRootEntries: new Set([".fusion"]) }, expected: "deliverable" },
+    { name: "classifies the engine-core gate bundle as regenerable", porcelain: "!! packages/core/.gate-bundle/\n", expected: "regenerable-ignored" },
+    { name: "classifies the gate bundle plus dependency directories as regenerable", porcelain: "!! node_modules/\n!! packages/core/node_modules/\n!! packages/core/.gate-bundle/\n!! packages/engine/node_modules/\n", expected: "regenerable-ignored" },
+    { name: "preserves the gate bundle shape plus one unknown ignored file", porcelain: "!! node_modules/\n!! packages/core/node_modules/\n!! packages/core/.gate-bundle/\n!! packages/engine/node_modules/\n!! scratch.txt\n", expected: "ignored-only" },
+    { name: "preserves a root-level look-alike gate bundle", porcelain: "!! .gate-bundle/\n", expected: "ignored-only" },
+    { name: "preserves a gate bundle look-alike in another package", porcelain: "!! packages/engine/.gate-bundle/\n", expected: "ignored-only" },
+    { name: "preserves a gate bundle prefix look-alike", porcelain: "!! packages/core/.gate-bundle-old/\n", expected: "ignored-only" },
+    { name: "preserves a file entry nested inside the gate bundle", porcelain: "!! packages/core/.gate-bundle/notes.txt\n", expected: "ignored-only" },
+    { name: "does not let the gate bundle mask an untracked file", porcelain: "!! packages/core/.gate-bundle/\n?? wip.txt\n", expected: "deliverable" },
+    { name: "fails closed for a quoted gate bundle path", porcelain: '!! "packages/core/.gate-bundle/"\n', expected: "ignored-only" },
   ])("$name", ({ porcelain, options, expected }) => {
     expect(classifyWorktreeRemovalContent(porcelain, options)).toBe(expected);
   });
@@ -1102,6 +1111,28 @@ describe("removeWorktree", () => {
       target: "/repo/.worktrees/fn-9233",
       metadata: { taskId: "FN-9233", reason: RemovalReason.PoolPrune, entryCount: 1 },
     });
+  });
+
+  it("removes the engine-core gate bundle during defensive cleanup and audits the discard", async () => {
+    execFileMock.mockResolvedValueOnce({ stdout: "!! node_modules/\n!! packages/core/.gate-bundle/\n", stderr: "" });
+    execMock.mockResolvedValueOnce({ stdout: "", stderr: "" });
+    const audit = { git: vi.fn().mockResolvedValue(undefined) } as any;
+
+    await expect(removeWorktree({
+      rootDir: "/repo",
+      worktreePath: "/repo/.worktrees/kb-135",
+      settings: {},
+      audit,
+      taskId: "KB-135",
+      reason: RemovalReason.SelfHealingBranchConflict,
+    })).resolves.toMatchObject({ removed: true });
+
+    expect(audit.git).toHaveBeenCalledWith({
+      type: "worktree:removal-discarded-regenerable-content",
+      target: "/repo/.worktrees/kb-135",
+      metadata: { taskId: "KB-135", reason: RemovalReason.SelfHealingBranchConflict, entryCount: 2 },
+    });
+    expect(audit.git).not.toHaveBeenCalledWith(expect.objectContaining({ type: "worktree:removal-preserved" }));
   });
 
   it("removes proven Fusion scratch and audits it as regenerable", async () => {

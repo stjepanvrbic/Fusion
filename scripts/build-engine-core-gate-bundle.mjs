@@ -26,9 +26,12 @@
  * closure with esbuild is typically sub-second — cheap enough that a
  * content-hash cache (this script's own alternative design) is unnecessary.
  *
- * Output is written under `packages/engine/node_modules/.gate-bundle/`,
- * which is gitignored: this is a rebuilt-every-run, non-committed artifact,
- * never a checked-in build output.
+ * Output is written under `packages/core/.gate-bundle/`, which is
+ * gitignored: this is a rebuilt-every-run, non-committed artifact, never a
+ * checked-in build output. Defensive worktree cleanup allowlists that exact
+ * path as regenerable output, so a task checkout that ran the gate can still
+ * be removed automatically; moving the output requires updating that
+ * allowlist (a drift test enforces it).
  */
 
 import { build } from "esbuild";
