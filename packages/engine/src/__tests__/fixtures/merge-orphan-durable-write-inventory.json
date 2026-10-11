@@ -88,7 +88,6 @@
     "packages/engine/src/execution/prompt-layers.ts",
     "packages/engine/src/execution/replan-target.ts",
     "packages/engine/src/execution/required-workflow-artifacts.ts",
-    "packages/engine/src/execution/resolve-activity-run-agent-id.ts",
     "packages/engine/src/execution/review-checkout.ts",
     "packages/engine/src/execution/reviewer.ts",
     "packages/engine/src/execution/runtime-primitives.ts",
@@ -96,7 +95,6 @@
     "packages/engine/src/execution/session-token-usage.ts",
     "packages/engine/src/execution/spec-staleness.ts",
     "packages/engine/src/execution/step-integration.ts",
-    "packages/engine/src/execution/step-session-executor.ts",
     "packages/engine/src/execution/streaming-delta.ts",
     "packages/engine/src/execution/task-completion.ts",
     "packages/engine/src/execution/tool-availability.ts",
@@ -4938,63 +4936,6 @@
       "executionProof": "none:out-of-frontier",
       "followUpTaskId": "none:out-of-frontier",
       "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to accumulateSessionTokenUsage; this imported module belongs to the legacy/independent subsystem closure."
-    },
-    {
-      "callSiteId": "packages/engine/src/execution/step-session-executor.ts::executeStep::this.store.appendAgentLog::#1",
-      "callSiteFingerprint": "this.store.appendAgentLog(taskDetail.id,`[step-exec] Context limit error after auto-compaction on step ${stepIndex}: ${errorMessage}`,\"tool_error\")",
-      "file": "packages/engine/src/execution/step-session-executor.ts",
-      "enclosingSymbolPath": "executeStep",
-      "writer": "this.store.appendAgentLog",
-      "ordinal": 1,
-      "owningEntryPoint": "other",
-      "reachableDataStates": [
-        "unobservable:closure-wide production fixture pending"
-      ],
-      "axis1": "out-of-frontier",
-      "axis2Provisional": "out-of-frontier",
-      "axis2Final": "out-of-frontier",
-      "observedInSuite": "out-of-frontier",
-      "executionProof": "none:out-of-frontier",
-      "followUpTaskId": "none:out-of-frontier",
-      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to executeStep; executor step sessions own this write."
-    },
-    {
-      "callSiteId": "packages/engine/src/execution/step-session-executor.ts::executeStep::this.store.appendAgentLog::#2",
-      "callSiteFingerprint": "this.store.appendAgentLog(taskDetail.id,`[step-exec] Reduced-prompt recovery succeeded for step ${stepIndex}`,\"status\")",
-      "file": "packages/engine/src/execution/step-session-executor.ts",
-      "enclosingSymbolPath": "executeStep",
-      "writer": "this.store.appendAgentLog",
-      "ordinal": 2,
-      "owningEntryPoint": "other",
-      "reachableDataStates": [
-        "unobservable:closure-wide production fixture pending"
-      ],
-      "axis1": "out-of-frontier",
-      "axis2Provisional": "out-of-frontier",
-      "axis2Final": "out-of-frontier",
-      "observedInSuite": "out-of-frontier",
-      "executionProof": "none:out-of-frontier",
-      "followUpTaskId": "none:out-of-frontier",
-      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to executeStep; executor step sessions own this write."
-    },
-    {
-      "callSiteId": "packages/engine/src/execution/step-session-executor.ts::executeStep::this.store.appendAgentLog::#3",
-      "callSiteFingerprint": "this.store.appendAgentLog(taskDetail.id,`[step-exec] Reduced-prompt recovery failed for step ${stepIndex}: ${reducedErrorMessage}`,\"tool_error\")",
-      "file": "packages/engine/src/execution/step-session-executor.ts",
-      "enclosingSymbolPath": "executeStep",
-      "writer": "this.store.appendAgentLog",
-      "ordinal": 3,
-      "owningEntryPoint": "other",
-      "reachableDataStates": [
-        "unobservable:closure-wide production fixture pending"
-      ],
-      "axis1": "out-of-frontier",
-      "axis2Provisional": "out-of-frontier",
-      "axis2Final": "out-of-frontier",
-      "observedInSuite": "out-of-frontier",
-      "executionProof": "none:out-of-frontier",
-      "followUpTaskId": "none:out-of-frontier",
-      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to executeStep; executor step sessions own this write."
     },
     {
       "callSiteId": "packages/engine/src/execution/verification-utils.ts::runVerificationCommandUnlocked::store.appendAgentLog::#1",

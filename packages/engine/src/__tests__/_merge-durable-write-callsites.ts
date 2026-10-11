@@ -1007,7 +1007,6 @@ export const NON_TASK_STORE_RECEIVERS: readonly { module: string; shape: string;
   { module: "packages/engine/src/scheduler.ts", shape: "this", reason: "Scheduler's private transitionQueuedEpisode; its TaskStore writes are inventoried at this.store call sites" },
   { module: "packages/engine/src/self-healing.ts", shape: "this", reason: "SelfHealingManager.reconcileStaleSymbolLocks; its TaskStore writes are inventoried at this.store call sites" },
   { module: "packages/engine/src/workflows/workflow-graph-task-runner.ts", shape: "this", reason: "WorkflowGraphTaskRunner's private telemetry emit" },
-  { module: "packages/engine/src/execution/step-session-executor.ts", shape: "stuckTaskDetector", reason: "StuckTaskDetector.recordActivity in-memory heartbeat" },
   { module: "packages/engine/src/triage.ts", shape: "stuckDetector", reason: "StuckTaskDetector.recordActivity in-memory heartbeat" },
   { module: "packages/engine/src/pi.ts", shape: "extensionRunner", reason: "pi ExtensionRunner session_shutdown event emit" },
   { module: "packages/engine/src/scheduler.ts", shape: "this.options.prMonitor", reason: "PrMonitor.updatePrInfo in-memory PR tracking" },

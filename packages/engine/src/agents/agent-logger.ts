@@ -38,13 +38,16 @@ export function emitUsageEventFailSoft(store: TaskStore, event: UsageEventInput,
 const FLUSH_SIZE_BYTES = 1024;
 /** Default timer interval (ms) for periodic flush of small writes. */
 const FLUSH_INTERVAL_MS = 500;
-const ENTRY_BATCH_SIZE = 50;
 /**
  * FNXC:CommandCenterActivity 2026-10-11-01:25:
  * Upper bound on how long `flush()` waits for in-flight usage-event writes.
  * A lane reports completion after flushing its logger, so the wait makes "run completed" imply "run telemetry settled"; the bound (the same as the engine's bounded run-audit seam) keeps a stalled telemetry sink from holding a run open.
+ *
+ * FNXC:AgentLogging 2026-10-11-20:29:
+ * The same bound covers in-flight agent-log batches, so "run completed" also implies "run log saved".
+ * `flush()` drains both sets concurrently: a finished run waits at most one bound, not one per set.
  */
-export const USAGE_EVENT_DRAIN_TIMEOUT_MS = 2_000;
+export const FLUSH_DRAIN_TIMEOUT_MS = 2_000;
 const TOOL_RESULT_DETAIL_LIMIT = 4_096;
 const TOOL_RESULT_DETAIL_TRUNCATION_NOTICE = "\n\n[tool output truncated to keep dashboard log views responsive]";
 const TOOL_RESULT_MAX_ARRAY_ITEMS = 25;
@@ -271,6 +274,10 @@ export interface AgentLoggerOptions {
  * Produces `onText` and `onToolStart` callbacks compatible with
  * `createFnAgent`'s `AgentOptions` interface.
  *
+ * Writes are started without blocking those callbacks. `flush()` resolves once the
+ * writes this logger started have settled or exceeded {@link FLUSH_DRAIN_TIMEOUT_MS},
+ * so await it before reporting a run complete.
+ *
  * @example
  * ```ts
  * const logger = new AgentLogger({ store, taskId, onAgentText, onAgentTool });
@@ -293,7 +300,6 @@ export class AgentLogger {
   private thinkingBuffer = "";
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private thinkingFlushTimer: ReturnType<typeof setTimeout> | null = null;
-  private entryFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingEntries: AgentLogEntry[] = [];
   private readonly flushSizeBytes: number;
   private readonly flushIntervalMs: number;
@@ -334,6 +340,12 @@ export class AgentLogger {
    * Emission stays non-blocking on the tool and session callbacks; `flush()` drains this set so a write cannot outlive the run that issued it, which made Activity read zero sessions right after a run and let a late insert commit after a test database reset.
    */
   private readonly inFlightUsageEvents = new Set<Promise<void>>();
+  /*
+   * FNXC:AgentLogging 2026-10-11-20:29:
+   * Agent-log batches this logger started that have not settled yet.
+   * A batch empties `pendingEntries` before its first await, so the pending list cannot tell `flush()` that a write is still running; `flush()` drains this set so a lane cannot report completion before its last text, thinking and tool rows are saved.
+   */
+  private readonly inFlightEntryBatches = new Set<Promise<void>>();
 
   constructor(options: AgentLoggerOptions) {
     this.store = options.store;
@@ -505,7 +517,7 @@ export class AgentLogger {
     const detail = summarizeToolResultDetail(result);
     const startedAt = this.shiftToolStart(name);
     const durationMs = startedAt !== undefined ? Math.max(0, Date.now() - startedAt) : undefined;
-    this.writeEntry(name, type, detail, `Failed to log tool end "${name}" (${type}) for ${this.taskId}`, false, durationMs !== undefined ? { durationMs } : undefined);
+    this.writeEntry(name, type, detail, `Failed to log tool end "${name}" (${type}) for ${this.taskId}`, durationMs !== undefined ? { durationMs } : undefined);
     // Record completion as tool_result/tool_error with a duration descriptor.
     // meta NEVER includes the tool result payload — only non-sensitive metrics.
     const meta: Record<string, unknown> = {};
@@ -519,41 +531,47 @@ export class AgentLogger {
   }
 
   /**
-   * Flush any remaining buffered text/thinking and clear timers.
+   * Write any remaining buffered text/thinking, clear the flush timers, and wait for the agent-log batches and usage-event writes this logger has in flight.
    * Call this in a `finally` block before disposing the agent session.
+   *
+   * FNXC:AgentLogging 2026-10-11-20:29:
+   * Lanes report completion after `flush()`, so a resolved `flush()` means every agent-log write and usage-event write this logger started has settled, failed and been logged, or exceeded {@link FLUSH_DRAIN_TIMEOUT_MS}.
+   * It never rejects because of a log or telemetry sink, and the two sets drain concurrently so a stalled sink holds a finished run open for one bound at most.
    */
   async flush(): Promise<void> {
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
     if (this.thinkingFlushTimer) { clearTimeout(this.thinkingFlushTimer); this.thinkingFlushTimer = null; }
-    if (this.entryFlushTimer) { clearTimeout(this.entryFlushTimer); this.entryFlushTimer = null; }
-    await this.flushTextBuffer();
-    await this.flushThinkingBuffer();
-    await this.flushPendingEntries();
-    await this.drainUsageEvents();
+    this.flushTextBuffer();
+    this.flushThinkingBuffer();
+    await Promise.all([
+      this.drainInFlight(this.inFlightEntryBatches, "agent log batch(es)"),
+      this.drainInFlight(this.inFlightUsageEvents, "usage event write(s)"),
+    ]);
   }
 
   // ── Internal helpers ───────────────────────────────────────────────
 
   /**
-   * Wait, at most {@link USAGE_EVENT_DRAIN_TIMEOUT_MS}, for the usage-event writes in flight when the wait begins.
+   * Wait, at most {@link FLUSH_DRAIN_TIMEOUT_MS}, for the writes of `inFlight` that are in flight when the wait begins.
    * On expiry, warn once with the count and stop tracking the stalled writes so a later `flush()` does not wait for them again.
+   * @param label - Plural noun for the warning, e.g. `usage event write(s)`.
    */
-  private async drainUsageEvents(): Promise<void> {
-    if (this.inFlightUsageEvents.size === 0) return;
-    const pending = [...this.inFlightUsageEvents];
+  private async drainInFlight(inFlight: Set<Promise<void>>, label: string): Promise<void> {
+    if (inFlight.size === 0) return;
+    const pending = [...inFlight];
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timedOut = await Promise.race([
       Promise.all(pending).then(() => false),
       new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => resolve(true), USAGE_EVENT_DRAIN_TIMEOUT_MS);
+        timer = setTimeout(() => resolve(true), FLUSH_DRAIN_TIMEOUT_MS);
         timer.unref?.();
       }),
     ]);
     clearTimeout(timer);
     if (!timedOut) return;
-    const stalled = pending.filter((write) => this.inFlightUsageEvents.has(write));
-    for (const write of stalled) this.inFlightUsageEvents.delete(write);
-    this.log.warn(`Stopped waiting for ${stalled.length} usage event write(s) after ${USAGE_EVENT_DRAIN_TIMEOUT_MS}ms`);
+    const stalled = pending.filter((write) => inFlight.has(write));
+    for (const write of stalled) inFlight.delete(write);
+    this.log.warn(`Stopped waiting for ${stalled.length} ${label} after ${FLUSH_DRAIN_TIMEOUT_MS}ms`);
   }
 
   private markFirstVisibleOutput(): number {
@@ -572,7 +590,7 @@ export class AgentLogger {
   }
 
   /**
-   * Write a single structured entry through whichever sink(s) are configured.
+   * Write a single structured entry through whichever sink(s) are configured, without blocking the caller.
    * When both `store`+`taskId` and `appendLogCb` are set, both receive the entry.
    * When only `appendLogCb` is set (no store/taskId), only the callback is used.
    * @param storeWarnMsg - Warning message prefix used when the task-store write fails.
@@ -582,7 +600,6 @@ export class AgentLogger {
     type: AgentLogEntry["type"],
     detail: string | undefined,
     _storeWarnMsg: string,
-    immediate = false,
     timing?: Pick<AgentLogEntry, "durationMs" | "timeToFirstTokenMs">,
   ): void {
     const isToolEntry = type === "tool" || type === "tool_result" || type === "tool_error";
@@ -607,29 +624,23 @@ export class AgentLogger {
     };
 
     this.pendingEntries.push(entry);
-    if (immediate || (type !== "text" && type !== "thinking")) {
-      if (this.entryFlushTimer) {
-        clearTimeout(this.entryFlushTimer);
-        this.entryFlushTimer = null;
-      }
-      void this.flushPendingEntries();
-      return;
-    }
-
-    if (this.pendingEntries.length >= ENTRY_BATCH_SIZE) {
-      if (this.entryFlushTimer) {
-        clearTimeout(this.entryFlushTimer);
-        this.entryFlushTimer = null;
-      }
-      void this.flushPendingEntries();
-      return;
-    }
-
-    this.scheduleEntryFlush();
+    this.startEntryBatch();
   }
 
-  private flushTextBuffer(): Promise<void> {
-    if (this.textBuffer.length === 0) return Promise.resolve();
+  /**
+   * Start writing the pending entries and track the batch until it settles, so the next `flush()` waits for it.
+   * Fail-soft: a sink that throws synchronously rejects the batch, which is logged here and never propagates.
+   */
+  private startEntryBatch(): void {
+    const batch = this.flushPendingEntries().catch((err) => {
+      this.log.warn(`Failed to flush agent log batch for ${this.taskId || "<no task>"}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    this.inFlightEntryBatches.add(batch);
+    void batch.then(() => { this.inFlightEntryBatches.delete(batch); });
+  }
+
+  private flushTextBuffer(): void {
+    if (this.textBuffer.length === 0) return;
     const chunk = this.textBuffer;
     this.textBuffer = "";
     const timeToFirstTokenMs = this.textTimeToFirstTokenMs;
@@ -639,18 +650,16 @@ export class AgentLogger {
       "text",
       undefined,
       `Failed to flush text buffer for ${this.taskId}`,
-      true,
       timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs } : undefined,
     );
-    return this.flushPendingEntries();
   }
 
-  private flushThinkingBuffer(): Promise<void> {
-    if (this.thinkingBuffer.length === 0) return Promise.resolve();
+  private flushThinkingBuffer(): void {
+    if (this.thinkingBuffer.length === 0) return;
     const chunk = this.thinkingBuffer;
     this.thinkingBuffer = "";
     if (!this.persistAgentThinkingLog) {
-      return Promise.resolve();
+      return;
     }
     const timeToFirstTokenMs = this.thinkingTimeToFirstTokenMs;
     this.thinkingTimeToFirstTokenMs = undefined;
@@ -659,10 +668,8 @@ export class AgentLogger {
       "thinking",
       undefined,
       `Failed to flush thinking buffer for ${this.taskId}`,
-      true,
       timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs } : undefined,
     );
-    return this.flushPendingEntries();
   }
 
   private scheduleFlush(): void {
@@ -678,14 +685,6 @@ export class AgentLogger {
     this.thinkingFlushTimer = setTimeout(() => {
       this.thinkingFlushTimer = null;
       this.flushThinkingBuffer();
-    }, this.flushIntervalMs);
-  }
-
-  private scheduleEntryFlush(): void {
-    if (this.entryFlushTimer) return;
-    this.entryFlushTimer = setTimeout(() => {
-      this.entryFlushTimer = null;
-      void this.flushPendingEntries();
     }, this.flushIntervalMs);
   }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { AgentLogger, summarizeToolArgs, USAGE_EVENT_DRAIN_TIMEOUT_MS } from "../agents/agent-logger.js";
+import { AgentLogger, summarizeToolArgs, FLUSH_DRAIN_TIMEOUT_MS, type AgentLoggerOptions } from "../agents/agent-logger.js";
 import { DEFAULT_GLOBAL_SETTINGS, type TaskStore } from "@fusion/core";
 
 const loggerWarnSpy = vi.hoisted(() => vi.fn());
@@ -72,6 +72,12 @@ function createMockStore(withBatch = false) {
     appendAgentLog: vi.fn().mockResolvedValue(undefined),
     ...(withBatch ? { appendAgentLogBatch: vi.fn().mockResolvedValue(undefined) } : {}),
   } as unknown as TaskStore;
+}
+
+function trackFlush(logger: AgentLogger) {
+  const state = { resolved: false };
+  const promise = logger.flush().then(() => { state.resolved = true; });
+  return { state, promise };
 }
 
 describe("AgentLogger", () => {
@@ -969,12 +975,6 @@ describe("AgentLogger", () => {
       return { store, settleAll: () => pending.splice(0).forEach((resolve) => resolve(true)) };
     }
 
-    function trackFlush(logger: AgentLogger) {
-      const state = { resolved: false };
-      const promise = logger.flush().then(() => { state.resolved = true; });
-      return { state, promise };
-    }
-
     it("does not resolve flush() while a tool usage-event write is in flight", async () => {
       const { store, settleAll } = createDeferredUsageStore();
       const logger = new AgentLogger({ store, taskId: "FN-UE-DRAIN" });
@@ -1022,11 +1022,11 @@ describe("AgentLogger", () => {
       logger.onToolStart("Read", { path: "a.ts" });
 
       const flush = trackFlush(logger);
-      await vi.advanceTimersByTimeAsync(USAGE_EVENT_DRAIN_TIMEOUT_MS - 1);
+      await vi.advanceTimersByTimeAsync(FLUSH_DRAIN_TIMEOUT_MS - 1);
       expect(flush.state.resolved).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       expect(flush.state.resolved).toBe(true);
-      expect(loggerWarnSpy).toHaveBeenCalledWith(`Stopped waiting for 1 usage event write(s) after ${USAGE_EVENT_DRAIN_TIMEOUT_MS}ms`);
+      expect(loggerWarnSpy).toHaveBeenCalledWith(`Stopped waiting for 1 usage event write(s) after ${FLUSH_DRAIN_TIMEOUT_MS}ms`);
       expect(vi.getTimerCount()).toBe(0);
 
       const second = trackFlush(logger);
@@ -1076,6 +1076,178 @@ describe("AgentLogger", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(flush.state.resolved).toBe(false);
       settleAll();
+      await flush.promise;
+      expect(flush.state.resolved).toBe(true);
+    });
+  });
+
+  /*
+   * FNXC:AgentLogging 2026-10-11-20:27:
+   * A lane reports completion after it flushes its logger, so a resolved flush() must mean every agent-log write the logger started has settled, failed and been logged, or exceeded the bound.
+   * Otherwise a run reports completion while its last text, thinking and tool rows are still being saved.
+   */
+  describe("agent-log batch drain on flush", () => {
+    function createDeferredWrite() {
+      const pending: Array<() => void> = [];
+      const write = vi.fn(() => new Promise<void>((resolve) => { pending.push(resolve); }));
+      return {
+        write,
+        settleOne: () => pending.shift()?.(),
+        settleAll: () => pending.splice(0).forEach((resolve) => resolve()),
+      };
+    }
+    type DeferredWrite = ReturnType<typeof createDeferredWrite>["write"];
+
+    function createBatchStore(appendAgentLogBatch: (...args: never[]) => unknown) {
+      return { appendAgentLog: vi.fn().mockResolvedValue(undefined), appendAgentLogBatch } as unknown as TaskStore;
+    }
+
+    async function expectFlushWaitsFor(logger: AgentLogger, write: DeferredWrite, settleAll: () => void) {
+      const flush = trackFlush(logger);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(write).toHaveBeenCalled();
+      expect(flush.state.resolved).toBe(false);
+      settleAll();
+      await flush.promise;
+      expect(flush.state.resolved).toBe(true);
+    }
+
+    it("does not resolve flush() while a tool entry batch is in flight", async () => {
+      const { write, settleAll } = createDeferredWrite();
+      const logger = new AgentLogger({ store: createBatchStore(write), taskId: "FN-LOG-DRAIN" });
+
+      logger.onToolStart("Read", { path: "a.ts" });
+
+      await expectFlushWaitsFor(logger, write, settleAll);
+    });
+
+    it.each([
+      ["text", (logger: AgentLogger) => logger.onText("hello")],
+      ["thinking", (logger: AgentLogger) => logger.onThinking("hello")],
+    ] as const)("does not resolve flush() while the %s row it flushed itself is in flight", async (type, buffer) => {
+      const { write, settleAll } = createDeferredWrite();
+      const logger = new AgentLogger({
+        store: createBatchStore(write),
+        taskId: "FN-LOG-DRAIN-BUFFER",
+        persistAgentThinkingLog: true,
+        flushSizeBytes: 1024 * 1024,
+      });
+
+      buffer(logger);
+      expect(write).not.toHaveBeenCalled();
+
+      await expectFlushWaitsFor(logger, write, settleAll);
+      expect(write).toHaveBeenCalledWith([expect.objectContaining({ type, text: "hello" })]);
+    });
+
+    it.each<[string, (write: DeferredWrite) => AgentLoggerOptions]>([
+      ["a per-entry store write", (write) => ({ store: { appendAgentLog: write } as unknown as TaskStore, taskId: "FN-LOG-DRAIN-SINK" })],
+      ["the appendLog callback", (write) => ({ appendLog: write })],
+      ["the onEntriesFlushed callback", (write) => ({ store: createMockStore(true), taskId: "FN-LOG-DRAIN-SINK", onEntriesFlushed: write })],
+    ])("does not resolve flush() while %s is in flight", async (_label, options) => {
+      const { write, settleAll } = createDeferredWrite();
+      const logger = new AgentLogger(options(write));
+
+      logger.onToolStart("Read", { path: "a.ts" });
+
+      await expectFlushWaitsFor(logger, write, settleAll);
+    });
+
+    it("stops waiting for a never-settling batch at the bound and does not wait for it again", async () => {
+      const logger = new AgentLogger({
+        store: createBatchStore(vi.fn(() => new Promise<void>(() => {}))),
+        taskId: "FN-LOG-DRAIN-STALL",
+      });
+      logger.onToolStart("Read", { path: "a.ts" });
+
+      const flush = trackFlush(logger);
+      await vi.advanceTimersByTimeAsync(FLUSH_DRAIN_TIMEOUT_MS - 1);
+      expect(flush.state.resolved).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(flush.state.resolved).toBe(true);
+      expect(loggerWarnSpy).toHaveBeenCalledWith(`Stopped waiting for 1 agent log batch(es) after ${FLUSH_DRAIN_TIMEOUT_MS}ms`);
+      expect(vi.getTimerCount()).toBe(0);
+
+      const second = trackFlush(logger);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(second.state.resolved).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("waits for every batch in flight, not only the first to settle", async () => {
+      const { write, settleOne, settleAll } = createDeferredWrite();
+      const logger = new AgentLogger({ store: createBatchStore(write), taskId: "FN-LOG-DRAIN-MANY" });
+      logger.onToolStart("Read", { path: "a.ts" });
+      logger.onToolEnd("Read", false, "ok");
+      expect(write).toHaveBeenCalledTimes(2);
+
+      const flush = trackFlush(logger);
+      settleOne();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(flush.state.resolved).toBe(false);
+
+      settleAll();
+      await flush.promise;
+      expect(flush.state.resolved).toBe(true);
+    });
+
+    it.each<[string, () => AgentLoggerOptions]>([
+      ["the batch write rejects", () => ({ store: createBatchStore(vi.fn(() => Promise.reject(new Error("insert rejected")))), taskId: "FN-LOG-DRAIN-FAIL" })],
+      ["the batch write throws synchronously", () => ({ store: createBatchStore(vi.fn(() => { throw new Error("sink exploded"); })), taskId: "FN-LOG-DRAIN-FAIL" })],
+      ["the appendLog callback throws synchronously", () => ({ appendLog: vi.fn(() => { throw new Error("sink exploded"); }) })],
+    ])("resolves flush() with a warning and no unhandled rejection when %s", async (_label, options) => {
+      const unhandledRejection = vi.fn();
+      process.on("unhandledRejection", unhandledRejection);
+      try {
+        const logger = new AgentLogger(options());
+
+        expect(() => logger.onToolStart("Read", { path: "a.ts" })).not.toThrow();
+        await logger.flush();
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(loggerWarnSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to flush agent log batch for"));
+        expect(unhandledRejection).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        process.off("unhandledRejection", unhandledRejection);
+      }
+    });
+
+    it("waits one bound, not two, when a usage write and an agent-log batch both never settle", async () => {
+      const store = {
+        ...createBatchStore(vi.fn(() => new Promise<void>(() => {}))),
+        emitUsageEvent: vi.fn(() => new Promise<boolean>(() => {})),
+      } as unknown as TaskStore;
+      const logger = new AgentLogger({ store, taskId: "FN-LOG-DRAIN-BOTH" });
+      logger.setUsageContext({ model: "m", provider: "p", nodeId: "n", agentId: "a" });
+      logger.onToolStart("Read", { path: "a.ts" });
+
+      const flush = trackFlush(logger);
+      await vi.advanceTimersByTimeAsync(FLUSH_DRAIN_TIMEOUT_MS - 1);
+      expect(flush.state.resolved).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(flush.state.resolved).toBe(true);
+      expect(loggerWarnSpy).toHaveBeenCalledWith(`Stopped waiting for 1 agent log batch(es) after ${FLUSH_DRAIN_TIMEOUT_MS}ms`);
+      expect(loggerWarnSpy).toHaveBeenCalledWith(`Stopped waiting for 1 usage event write(s) after ${FLUSH_DRAIN_TIMEOUT_MS}ms`);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("waits on the next flush for a batch started after an earlier flush resolved", async () => {
+      const { write, settleAll } = createDeferredWrite();
+      const logger = new AgentLogger({ store: createBatchStore(write), taskId: "FN-LOG-DRAIN-LATE" });
+      await logger.flush();
+
+      logger.onToolStart("Read", { path: "a.ts" });
+
+      await expectFlushWaitsFor(logger, write, settleAll);
+    });
+
+    it("resolves flush() without a drain timer when nothing was written", async () => {
+      const logger = new AgentLogger({ store: createMockStore(true), taskId: "FN-LOG-DRAIN-EMPTY" });
+      logger.setUsageContext({ model: "m", provider: "p", nodeId: "n", agentId: "a" });
+
+      const flush = trackFlush(logger);
+      expect(vi.getTimerCount()).toBe(0);
       await flush.promise;
       expect(flush.state.resolved).toBe(true);
     });
