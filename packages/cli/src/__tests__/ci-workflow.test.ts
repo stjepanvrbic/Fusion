@@ -527,6 +527,18 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     }
 
     /*
+    FNXC:CI 2026-10-11-07:04:
+    The runner's PostgreSQL cluster is discarded with the job, so every leg makes it non-durable before any test runs: on native Windows
+    PostgreSQL flush-bound DROP DATABASE calls timed out a 15 s case on core-1. The step must run unconditionally and declare --throwaway.
+    */
+    const nonDurable = indexOf("node scripts/pg-test-cluster-non-durable.mjs");
+    expect(nonDurable).toBeGreaterThan(indexOf("Start-Service"));
+    expect(nonDurable).toBeLessThan(indexOf("pnpm test:gate"));
+    expect(nonDurable).toBeLessThan(indexOf("pnpm --filter ${{ matrix.package }} test"));
+    expect(runs[nonDurable]).toContain("--throwaway");
+    expect(job?.steps?.[nonDurable]?.if).toBeUndefined();
+
+    /*
     FNXC:CI 2026-10-07-21:10:
     Known Windows-only failures must not keep Full Suite permanently red, and they must not hide new ones. Each unit lane records its
     Vitest JSON report and exit code, then the known-failing comparator decides the step. No step may use continue-on-error.

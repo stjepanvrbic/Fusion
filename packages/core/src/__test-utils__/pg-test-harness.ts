@@ -657,15 +657,24 @@ async function withMaintenanceSql<T>(
 /** Test-only lifecycle controls for deterministic template-state regression tests. */
 export const __pgTestTemplateTestHooks = {
   templateName: templateDbName,
-  async templateExists(): Promise<boolean> {
-    const templateName = templateDbName();
+  async databaseExists(name: string): Promise<boolean> {
     return withMaintenanceSql(async (client) => {
       const rows = await client<{ exists: boolean }[]>`
-        SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = ${templateName}) AS exists
+        SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = ${name}) AS exists
       `;
       return rows[0]?.exists === true;
     });
   },
+  async templateExists(): Promise<boolean> {
+    return __pgTestTemplateTestHooks.databaseExists(templateDbName());
+  },
+  /*
+  FNXC:PgTestTemplateDb 2026-10-11-06:37:
+  Dead-owner reclamation and run-shared golden readiness belong to suite setup, not to a case that measures something else.
+  On native Windows PostgreSQL the reclamation drops are flush-bound, and a module's first harness use inside a 15 s case body timed it out.
+  Exposed so a suite can pay that cost in `beforeAll`; behavior and memoization are unchanged.
+  */
+  ensureGoldenTemplate,
   async dropTemplate(): Promise<void> {
     const templateName = templateDbName();
     await withMaintenanceSql(async (client) => {

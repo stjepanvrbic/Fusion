@@ -1411,3 +1411,40 @@ The 2026-10-08 record above makes any further Windows timeout of merger-ai.test.
 - **Alone:** the case passed in 2.5 s and 2.8 s in two single-case runs. The whole file passed alone in six invocations (one at 164.6 s, three in 568.5 s, two in 335.2 s). One further whole-file invocation was killed at a 600 s tool limit with no per-test output captured; its cause is not determined and it did not recur in the six invocations that followed.
 - **Action:** quarantined under the 2026-10-08 escalation rule: entry in `scripts/lib/test-quarantine.json` (`quarantinedAt` 2026-10-11, deletion clock 2026-10-25) with the matching `engine-default` exclude in `packages/engine/vitest.config.ts`. The file is not in the Windows ledger and no timeout, retry or assertion changed.
 - **Rescue:** the mechanism matches the 2026-10-08 record (real-git process spawns under worker fan-out push a two-pass case past 30 s). A rescue needs a measured reduction of that case's git spawn count with assertions and timeouts unchanged, plus evidence that the file catches real regressions; it is the main `runAiMerge` coverage.
+
+### Record 2026-10-11: `pg-test-harness-template-concurrency.pg.test.ts` Windows 15 s timeout (KB-102, resolved at the cause)
+
+<!--
+FNXC:TestFlakeRegister 2026-10-11-07:07:
+KB-102 reproduced the Windows core-1 timeout on native Windows PostgreSQL and removed its cause: dead-owner reclamation billed to the concurrent case body, six per-module templates the file never dropped, and a lane cluster paying for durability it discards. Timeouts, assertions, the Windows ledger and the quarantine list are unchanged. A further Windows timeout of this case or of one of the file's hooks is an owner decision, never a ledger entry or a widened timeout.
+-->
+
+- **File:** `packages/core/src/__tests__/postgres/pg-test-harness-template-concurrency.pg.test.ts` (not in `scripts/lib/windows-known-failing-tests.json` or `scripts/lib/test-quarantine.json`).
+- **Exact test:** `PG template database lifecycle across isolated harness modules > creates usable isolated stores concurrently from fresh same-pid module instances`.
+- **Sightings:**
+  - `Test timed out in 15000ms`, case duration 29,292 ms, [run 37829637990](https://github.com/stjepanvrbic/Fusion/actions/runs/37829637990) (job 113491329922, Windows tests (core-1)) at `9e5b807a6`. The commit changed only engine harness files and a doc.
+  - Earlier file-level failure: [run 37720611351](https://github.com/stjepanvrbic/Fusion/actions/runs/37720611351) (job 113127146189, single-job lane) at `a05be4484` listed the file as failing; the case was not recorded because no report artifact existed then. The ledger `$comment` records that the file was added after that run and removed by KB-050. So this is the first register record, but the second lane failure of the file.
+- **Reproduction data:**
+
+  Runner, core-1 leg (`windows-lane-reports-core-1` artifacts; durations include `afterEach`):
+
+  | run | SHA | leg wall | case 1 | case 2 | case 3 | case 4 |
+  |---|---|---:|---:|---:|---:|---:|
+  | 37828982122 | `ad3a46e94` | 914 s | 8,885 ms | 5,098 ms | 5,904 ms | 5,014 ms |
+  | 37829637990 | `9e5b807a6` | 1,271 s | 29,292 ms (timed out) | 11,515 ms | 16,008 ms | 13,506 ms |
+  | 37831541785 | `0366ead16` | 952 s | 8,960 ms | 4,373 ms | 5,714 ms | 5,135 ms |
+  | 37832714652 | `28e7c1244` | 1,126 s | 14,141 ms | 8,356 ms | 10,830 ms | 8,532 ms |
+
+  Case 1 was the slowest PostgreSQL case of the leg in all four runs. In the red run the leg wall time grew 1.39x, while the cases containing a module's first harness use grew 2.3x to 3.3x and plain clone-and-drop cases did not grow.
+
+  Local (KB-102): Windows 11, Node 24.12, throwaway native PostgreSQL 15.18 cluster, default durability, `VITEST_MAX_WORKERS=1`, boundary observer at threshold 0. At base `c5d43057a`, run 1 on a fresh cluster passed (case 1 10,807 ms, `template.ensure-schema` 3.4 s). Run 2 immediately after, with run 1's seven dead-owner template databases present, failed case 1 with `Test timed out in 15000ms`: its three `template.ensure-schema` boundaries completed at 15.2 s. After the change, a two-run sequence from an empty cluster passed both runs and every hook (`beforeAll` 4.2 / 8.2 s, case 1 body 4-5 s, `afterAll` 6.4 / 3.8 s), and ten runs on the same cluster made non-durable passed with case 1's `template.ensure-schema` at 1.1 to 2.9 s in nine runs and 4.5 to 6.3 s in the first run after switching the live cluster. No per-module template remained after any run.
+- **Mechanism:**
+  - Concurrent template copies do not serialize: three concurrent clones each took as long as one (about 1.1 s).
+  - Database drops do serialize and are flush-bound on native Windows: three concurrent teardown drops took 9.7 to 10.4 s with default durability and 2.1 to 2.6 s non-durable.
+  - A module's first harness use runs `ensureGoldenTemplate()`, which drops every template and per-file database whose owner pid is dead, inside whichever case body or hook made that call. Case 1 makes it from three fresh module instances.
+  - The file created six per-module templates (16 MB each) and dropped none, leaving them for the next run or file to reclaim. That reclamation plus a golden rebuild took 20.3 s with default durability and 6.4 s non-durable.
+  - The `Patchnode requires AsyncDataLayer.projectId` stderr lines are unrelated: `TaskStore.init()` reconciles the Patchnode ledger, `requireProjectId()` throws before any query because the harness layer has no project id, and the warning is caught and logged. One line per `store.init()`; the red job's three lines show all three stores had finished template creation and cloning.
+- **Not measured:** how the runner's slow first-use time splits between reclamation and the per-module template copy. The lane records no harness boundary timing, and the runner runs PostgreSQL 17 where the local reproduction used 15.18.
+- **Resolution (KB-102):** the file runs dead-owner reclamation and golden readiness in `beforeAll` (seeding one dead-owner template that a new first case asserts is gone), and drops every template it creates: single-module cases in `afterEach`, the concurrent case's three in `afterAll`, which then asserts none of the six remain. The harness gained two additive test hooks (`ensureGoldenTemplate`, `databaseExists`). The Windows job runs `scripts/pg-test-cluster-non-durable.mjs --throwaway` after starting the runner's PostgreSQL. Assertions, `testTimeout`, `hookTimeout`, the Windows ledger and the quarantine list are unchanged.
+- **Known residual risk:** on a default-durability Windows cluster the new `beforeAll` timed out when about eight 16 MB dead-owner databases were waiting to be reclaimed, and case 1's unchanged store-teardown `afterEach` reached 13.9 s once. The lane cluster is non-durable, and the file no longer leaves a backlog.
+- **Escalation rule:** a further Windows timeout of this case or of one of this file's hooks is an owner decision raised as its own task (core PostgreSQL files cannot be quarantined inline), investigated with the boundary observer enabled for attribution. It is never a Windows ledger entry and never a widened timeout.

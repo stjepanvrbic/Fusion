@@ -391,6 +391,17 @@ jobs:
           & "$env:PGBIN\pg_isready.exe" -h localhost -p 5432 -U postgres -t 60
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # FNXC:CI 2026-10-11-07:04:
+      # The runner's cluster is discarded with the job, so durability is pure cost. On native Windows
+      # PostgreSQL the harness's DROP DATABASE calls are flush-bound: three concurrent teardown drops took
+      # 9.7-10.4 s with default durability and 2.1-2.6 s non-durable, and a dead-owner reclamation sweep
+      # plus golden rebuild 20.3 s against 6.4 s, which timed out a 15 s case on core-1. The script sets
+      # fsync, synchronous_commit and full_page_writes off (https://www.postgresql.org/docs/15/non-durability.html)
+      # and refuses to run without --throwaway. It runs on every leg and must not be skipped or tolerated.
+      - name: Make the throwaway PostgreSQL cluster non-durable
+        shell: bash
+        run: node scripts/pg-test-cluster-non-durable.mjs --throwaway
+
       - name: Route package scripts through Git Bash
         shell: bash
         run: pnpm config set script-shell "C:\\Program Files\\Git\\bin\\bash.exe"
