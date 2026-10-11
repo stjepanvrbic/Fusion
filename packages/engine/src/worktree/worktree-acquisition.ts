@@ -1090,7 +1090,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
           // FNXC:BranchWriteOrigin 2026-08-28-10:12: warm reuse can adopt an operator-override branch; derive origin (#3523 Greptile P1).
           await persistWorktreeAssignment({ worktree: pinnedPath, branch: resumedBranch, branchWriteOrigin: branchWriteOriginFor(resumedBranch) });
         }
-        return reuseWarmWorktree(pinnedPath, resumedBranch, "existing");
+        return await reuseWarmWorktree(pinnedPath, resumedBranch, "existing");
       }
       if (classification.ok && !isForeignTaskPinnedBranch(registeredBranch, resumedBranch)) {
         const snapshot = await store.getTask(task.id);
@@ -1124,7 +1124,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
         });
         await store.logEntry(task.id, "Rebound task-pinned checkout to its ownership-proven renamed branch", proof.branch, runContext);
         // This is identity repair, not a base refresh: preserve HEAD, dirty files and ignored evidence.
-        return guardAcquisitionReturn({ worktreePath: pinnedPath, branch: proof.branch, source: "existing", hydrated: false, isResume: true });
+        return await guardAcquisitionReturn({ worktreePath: pinnedPath, branch: proof.branch, source: "existing", hydrated: false, isResume: true });
       }
       // Invalid / foreign-branch / stale (crash leftover, archive→restore) → reclaim in place: remove the
       // registered worktree (owner probe via removeWorktree) then recreate fresh at the SAME path — never suffix.
@@ -1251,6 +1251,11 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
       const created = await createWorktreeImpl(branchName, pinnedPath, task.id, freshStartPoint, allowSiblingBranchRename, true, workingBranch.origin);
       return await finalizeCreatedWorktree(created, "fresh", "normal");
     } finally {
+      /*
+       * FNXC:TaskPinnedWorktrees 2026-10-11-02:27:
+       * The reservation must cover everything acquisition does to the pinned checkout, including the base refresh and dependency bootstrap of a reused or rebound checkout, and is released on success and on failure.
+       * Every return inside this `try` must therefore be awaited. Returning a pending promise runs this release first: the reservation is dropped while the checkout is still being prepared, and a refusal has no handler until the release finishes, so the process reports an unhandled rejection for an error the caller handles.
+       */
       if (reservation.state === "held") await reservation.release();
     }
   };

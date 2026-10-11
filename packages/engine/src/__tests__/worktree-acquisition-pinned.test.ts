@@ -88,8 +88,26 @@ vi.mock("node:fs", async () => {
   return { ...actual, existsSync: vi.fn().mockReturnValue(false) };
 });
 
+/*
+FNXC:TaskPinnedWorktrees 2026-10-11-02:27:
+Renamed-branch rebind proves ownership through real git and installs hooks in the checkout. Both are replaced here so the rebind return can be driven without a repository; the rebind proof itself is covered by the real-git acquisition suite.
+*/
+vi.mock("../worktree/prove-task-worktree-rebind.js", () => ({
+  proveTaskWorktreeRebind: vi.fn(),
+}));
+
+vi.mock("../worktree/worktree-hooks.js", async () => {
+  const actual = await vi.importActual<any>("../worktree/worktree-hooks.js");
+  return {
+    ...actual,
+    installTaskWorktreeIdentityGuard: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
 import { existsSync } from "node:fs";
 import { rename } from "node:fs/promises";
+import { acquireWorktreePathReservation } from "@fusion/core";
+import { proveTaskWorktreeRebind } from "../worktree/prove-task-worktree-rebind.js";
 import { classifyTaskWorktree, getRegisteredWorktreeBranches, removeWorktree } from "../worktree/worktree-pool.js";
 
 const ROOT = "/repo";
@@ -303,5 +321,71 @@ describe("acquireTaskWorktree — task-pinned mode", () => {
     expect(store.updateTask).toHaveBeenCalledWith("FN-7996", { worktree: PINNED });
     expect(result.worktreePath).toBe(PINNED);
     expect(result.source).toBe("fresh");
+  });
+
+  /*
+  FNXC:TaskPinnedWorktrees 2026-10-11-02:27:
+  The path reservation serializes everything acquisition does to the pinned checkout, so it must stay held until reuse has settled, on success and on failure.
+  Both ways of reusing an existing pinned checkout are covered: the branch-matched warm reuse and the ownership-proven renamed-branch rebind. Dependency bootstrap is the last reuse step, so a release recorded before it ends proves the reservation was dropped early.
+  */
+  describe.each([
+    { site: "warm reuse", registeredBranch: "fusion/fn-7996" },
+    { site: "renamed-branch rebind", registeredBranch: "fusion/renamed" },
+  ])("reservation lifetime across $site", ({ registeredBranch }) => {
+    const pinnedTask = { ...baseTask, worktree: PINNED, branch: "fusion/fn-7996" };
+
+    function arrange(settleReadiness: () => unknown) {
+      const events: string[] = [];
+      const handle = {
+        canonicalPath: PINNED,
+        token: "ordered-reservation",
+        previousState: "free" as const,
+        state: "held" as const,
+        release: vi.fn(async () => { events.push("release"); }),
+        quarantine: vi.fn(async () => undefined),
+      };
+      vi.mocked(acquireWorktreePathReservation).mockResolvedValueOnce(handle);
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(classifyTaskWorktree).mockResolvedValue({ ok: true } as any);
+      vi.mocked(getRegisteredWorktreeBranches).mockResolvedValue([{ branch: registeredBranch, worktreePath: PINNED }]);
+      vi.mocked(proveTaskWorktreeRebind).mockResolvedValue({ branch: registeredBranch, head: "0".repeat(40) });
+      const snapshot = { ...pinnedTask, updatedAt: "2026-10-04T00:00:00Z" };
+      const store = makeStore();
+      store.getTask = vi.fn().mockResolvedValue(snapshot);
+      store.updateTaskAtomic = vi.fn(async (_id: string, updater: (live: any) => any) => ({ ...snapshot, ...(await updater(snapshot)) }));
+      const ensureDependencyReadiness = vi.fn(async () => {
+        events.push("readiness:start");
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        events.push("readiness:end");
+        return settleReadiness();
+      });
+      const acquisition = acquireTaskWorktree({
+        task: pinnedTask,
+        rootDir: ROOT,
+        store,
+        settings: pinnedSettings,
+        createWorktree: vi.fn(),
+        runInitCommand: true,
+        ensureDependencyReadiness: ensureDependencyReadiness as any,
+      });
+      return { acquisition, events, handle };
+    }
+
+    it("releases only after dependency bootstrap has resolved", async () => {
+      const { acquisition, events, handle } = arrange(() => ({ readiness: "satisfied" }));
+
+      await expect(acquisition).resolves.toMatchObject({ source: "existing", isResume: true, worktreePath: PINNED, branch: registeredBranch });
+      expect(events).toEqual(["readiness:start", "readiness:end", "release"]);
+      expect(handle.release).toHaveBeenCalledTimes(1);
+    });
+
+    it("releases only after an aborted dependency bootstrap has rejected, and surfaces that same error", async () => {
+      const aborted = Object.assign(new Error("bootstrap aborted"), { name: "AbortError" });
+      const { acquisition, events, handle } = arrange(() => { throw aborted; });
+
+      await expect(acquisition).rejects.toBe(aborted);
+      expect(events).toEqual(["readiness:start", "readiness:end", "release"]);
+      expect(handle.release).toHaveBeenCalledTimes(1);
+    });
   });
 });

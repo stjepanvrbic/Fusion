@@ -11,6 +11,38 @@ const { writeSecretsEnvFile, reconcileSecretsEnvFingerprint, refreshReusedWorktr
   refreshReusedWorktreeBase: vi.fn(),
 }));
 
+/*
+FNXC:TaskPinnedWorktrees 2026-10-11-02:27:
+The pinned reservation must stay held until warm reuse has settled. This probe keeps the real reservation and only records when its release starts and ends, with an optional per-test gate that holds the release open so a test controls the interleaving without real time.
+*/
+const reservationProbe = vi.hoisted(() => ({
+  events: [] as string[],
+  releaseGate: undefined as undefined | (() => Promise<void>),
+}));
+
+vi.mock("@fusion/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@fusion/core")>();
+  return {
+    ...actual,
+    acquireWorktreePathReservation: async (...args: Parameters<typeof actual.acquireWorktreePathReservation>) => {
+      const handle = await actual.acquireWorktreePathReservation(...args);
+      return {
+        canonicalPath: handle.canonicalPath,
+        token: handle.token,
+        previousState: handle.previousState,
+        get state() { return handle.state; },
+        quarantine: (reason: string) => handle.quarantine(reason),
+        release: async () => {
+          reservationProbe.events.push("release:start");
+          await reservationProbe.releaseGate?.();
+          await handle.release();
+          reservationProbe.events.push("release:end");
+        },
+      };
+    },
+  };
+});
+
 vi.mock("../worktree/secrets-env-writer.js", () => ({
   writeSecretsEnvFile,
   reconcileSecretsEnvFingerprint,
@@ -48,6 +80,8 @@ vi.mock("../worktree/worktree-hooks.js", async () => {
 import { acquireTaskWorktree } from "../worktree/worktree-acquisition.js";
 import { classifyTaskWorktree } from "../worktree/worktree-pool.js";
 
+const nextMacrotask = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 function pinnedWorktree(rootDir: string): string {
   execSync("git init -b main", { cwd: rootDir, stdio: "pipe" });
   execSync('git config user.email "test@example.com"', { cwd: rootDir, stdio: "pipe" });
@@ -64,6 +98,8 @@ describe("worktree-acquisition secrets env hook", () => {
   let store: any;
 
   beforeEach(() => {
+    reservationProbe.events.length = 0;
+    reservationProbe.releaseGate = undefined;
     writeSecretsEnvFile.mockReset().mockResolvedValue({ outcome: "skipped", filename: ".env", reason: "disabled" });
     reconcileSecretsEnvFingerprint.mockReset().mockResolvedValue({ executionSafe: true, outcome: "clean" });
     refreshReusedWorktreeBase.mockReset().mockResolvedValue({ kind: "up-to-date", executionSafe: true });
@@ -161,6 +197,70 @@ describe("worktree-acquisition secrets env hook", () => {
     // FNXC:SecretsEnvMaterialization 2026-08-09-03:50: Audit targets identify the affected checkout; only
     // resolver diagnostics and secret-derived values are redacted from the fixed failure outcome.
     expect(JSON.stringify(git.mock.calls)).not.toContain("secret-derived resolver detail");
+  });
+
+  /*
+  FNXC:TaskPinnedWorktrees 2026-10-11-02:27:
+  A refused warm reuse must reach only its caller. If the reservation is released while reuse is still running, the rejection has no handler until the release finishes and the process reports an unhandled rejection although the caller handles it a moment later.
+  The gate makes the release outlast the refusal, so an early release is observable as a wrong event order and as a captured unhandled rejection. Vitest does not report an unhandled rejection while a test owns a listener, so the captured list is the assertion.
+  */
+  it.each([
+    {
+      refusal: "secrets reconciliation rejects",
+      arm: (refuse: () => void) => reconcileSecretsEnvFingerprint.mockImplementationOnce(async () => {
+        refuse();
+        throw new Error("secret-derived resolver detail");
+      }),
+      detail: "git-dir-unavailable",
+    },
+    {
+      refusal: "the base refresh leaves an unproven tree",
+      arm: (refuse: () => void) => refreshReusedWorktreeBase.mockImplementationOnce(async () => {
+        refuse();
+        return { kind: "base-reconciliation-required", executionSafe: false, detail: "restore-failed" };
+      }),
+      detail: "restore-failed",
+    },
+  ])("keeps the pinned reservation held until a warm reuse refused because $refusal has settled", async ({ arm, detail }) => {
+    const projectRoot = tempWorkspace("pinned-reservation-held-");
+    const existingWorktree = pinnedWorktree(projectRoot);
+    let signalRefused!: () => void;
+    const refused = new Promise<void>((resolve) => { signalRefused = resolve; });
+    arm(() => {
+      reservationProbe.events.push("reuse:refused");
+      signalRefused();
+    });
+    reservationProbe.releaseGate = async () => {
+      await refused;
+      await nextMacrotask();
+    };
+    const unhandled: unknown[] = [];
+    const captureUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", captureUnhandled);
+    try {
+      await expect(acquireTaskWorktree({
+        task: { ...task, branch: "fusion/fn-1", worktree: existingWorktree },
+        rootDir: projectRoot,
+        store,
+        settings: { secretsEnv: { enabled: true } } as any,
+        refreshStaleBase: true,
+        createWorktree: vi.fn(),
+      })).rejects.toMatchObject({
+        name: "WorktreeBaseRefreshError",
+        refresh: { kind: "base-reconciliation-required", detail },
+      });
+      await nextMacrotask();
+
+      expect({
+        events: reservationProbe.events,
+        unhandledRejections: unhandled.map((reason) => (reason as Error)?.name ?? String(reason)),
+      }).toEqual({
+        events: ["reuse:refused", "release:start", "release:end"],
+        unhandledRejections: [],
+      });
+    } finally {
+      process.off("unhandledRejection", captureUnhandled);
+    }
   });
 
   it("isolates writer failures", async () => {
