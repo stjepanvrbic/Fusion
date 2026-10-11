@@ -214,6 +214,52 @@ describe("workspace gate repository context", () => {
     expect(harness.executeWorkflowStep.mock.calls.map((call) => call[5]?.dispatchLabel)).toEqual(["repo1", "repo2"]);
   });
 
+  /*
+  FNXC:WorkflowSettings 2026-10-11-07:35:
+  The graph resolves the task's effective workflow settings once per run, and every step session must receive that snapshot.
+  A per-repository workspace review opens one session per repository, so each of them must carry the stored workflow step timeout, as must a single non-review dispatch.
+  */
+  it("hands the graph's resolved workflow settings to every per-repository Code Review session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-fn255-workspace-gate-"));
+    roots.push(root);
+    const { paths } = await createWorkspacePaths(root);
+    const row = workspaceTask(root, paths);
+    const harness = createHarness(root, row);
+    reviewWorkspacePerRepoMock.mockImplementation(async (live: TaskDetail, review: (path: string) => Promise<unknown>) => {
+      await Promise.all(live.repositoryScope!.repositories.map((repo) => review(live.workspaceWorktrees![repo]!.worktreePath!)));
+      return {
+        verdict: "APPROVE",
+        review: "approved",
+        summary: "approved",
+        retryable: false,
+        repositoryScopeRevision: 1,
+        repositoryReviewOutcomes: [],
+        repositoryDiffFingerprints: { repo1: "fp-1", repo2: "fp-2" },
+        repositoryModifiedFiles: ["repo1/src/changed.ts", "repo2/src/changed.ts"],
+      };
+    });
+
+    await runGraphCustomNode(harness as never, CODE_REVIEW_NODE as never, row, { workflowStepTimeoutMs: 2_700_000 } as Settings);
+
+    expect(harness.executeWorkflowStep.mock.calls.map((call) => call[5]?.dispatchLabel)).toEqual(["repo1", "repo2"]);
+    expect(harness.executeWorkflowStep.mock.calls.map((call) => (call[3] as Settings | undefined)?.workflowStepTimeoutMs))
+      .toEqual([2_700_000, 2_700_000]);
+  });
+
+  it("hands the graph's resolved workflow settings to a non-review step session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-fn255-workspace-gate-"));
+    roots.push(root);
+    const { paths } = await createWorkspacePaths(root);
+    const row = workspaceTask(root, paths);
+    const harness = createHarness(root, row);
+
+    const result = await runGraphCustomNode(harness as never, DOCUMENTATION_NODE as never, row, { workflowStepTimeoutMs: 2_700_000 } as Settings);
+
+    expect(result.outcome).toBe("success");
+    expect(harness.executeWorkflowStep).toHaveBeenCalledTimes(1);
+    expect((harness.executeWorkflowStep.mock.calls[0]?.[3] as Settings | undefined)?.workflowStepTimeoutMs).toBe(2_700_000);
+  });
+
   it("fans out Code Review from the authoritative scope after the initial graph snapshot becomes stale", async () => {
     const root = await mkdtemp(join(tmpdir(), "fusion-fn255-workspace-gate-"));
     roots.push(root);

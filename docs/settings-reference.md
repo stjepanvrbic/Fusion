@@ -681,7 +681,7 @@ Default notes:
 | `validatorFallbackProvider` | `string` | `undefined` | Fallback provider for reviewers; also used by reviewer UNAVAILABLE/error recovery retry before returning terminal UNAVAILABLE. |
 | `validatorFallbackModelId` | `string` | `undefined` | Fallback model ID for reviewers; paired with `validatorFallbackProvider` for reviewer recovery retry. |
 | `validatorFallbackThinkingLevel` | `ThinkingLevel` | `undefined` | Optional workflow reviewer-fallback thinking override. Inherits the validator/default thinking level when unset. |
-| `workflowStepTimeoutMs` | `number` | `900000` | Maximum time in milliseconds a single workflow step may run before it is timed out. For review nodes this is a per-reviewer-session attempt limit: an expired primary is disposed before the configured validator fallback starts a distinct fenced session. |
+| `workflowStepTimeoutMs` | `number` | `900000` | Workflow setting (stored per workflow, not in project settings): maximum time in milliseconds a single AI-session workflow step (review, non-review prompt or skill step, pre- or post-merge, and each per-repository workspace review session) may run before it is timed out. Script steps keep their own fixed command bound. For review nodes this is a per-reviewer-session attempt limit: an expired primary is disposed before the configured validator fallback starts a distinct fenced session. |
 | `modelPresets` | `ModelPreset[]` | `[]` | Reusable executor/reviewer model presets. |
 | `autoSelectModelPreset` | `boolean` | `false` | Auto-select presets by task size. |
 | `defaultPresetBySize` | `{ S?: string; M?: string; L?: string }` | `{}` | Mapping for `S`/`M`/`L` → preset ID. |

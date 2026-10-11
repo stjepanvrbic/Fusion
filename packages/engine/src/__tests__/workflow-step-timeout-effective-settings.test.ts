@@ -7,6 +7,10 @@ Original symptom (KB-080): with the stored value at 2700000 ms, Code Review was 
 Surface enumeration (engine only, no UI):
 - Stored value above the default, stored value below the default, and no stored value (the 15-minute default stays).
 - The value is read by the step a real graph run dispatches, not by a step called with hand-built settings.
+
+FNXC:WorkflowSettings 2026-10-11-07:35:
+The stored step timeout bounds every AI-session step kind, not only reviews.
+A non-review prompt step (no review name, kind or group) gets the same stored, lower and default values through the same real graph run.
 */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TaskDetail, WorkflowIr } from "@fusion/core";
@@ -46,6 +50,35 @@ const reviewWorkflow: WorkflowIr = {
   ],
 } as WorkflowIr;
 
+/** A non-review prompt step: no review/verification name, no reviewKind, and not in a review group. */
+const documentationWorkflow: WorkflowIr = {
+  version: "v2",
+  name: "single documentation step",
+  columns: [{ id: "in-review", name: "Review", traits: [] }],
+  settings: [{ id: "workflowStepTimeoutMs", name: "Step timeout (ms)", type: "number", default: 900_000 }],
+  nodes: [
+    { id: "start", kind: "start" },
+    {
+      id: "documentation",
+      kind: "optional-group",
+      config: {
+        name: "Documentation & Delivery",
+        defaultOn: true,
+        phase: "pre-merge",
+        template: {
+          nodes: [{ id: "documentation-step", kind: "prompt", config: { prompt: "Update the documentation.", toolMode: "coding" } }],
+          edges: [],
+        },
+      },
+    },
+    { id: "end", kind: "end" },
+  ],
+  edges: [
+    { from: "start", to: "documentation" },
+    { from: "documentation", to: "end" },
+  ],
+} as WorkflowIr;
+
 function reviewCard(): TaskDetail {
   return {
     id: "KB-080",
@@ -72,16 +105,16 @@ function reviewCard(): TaskDetail {
   } as unknown as TaskDetail;
 }
 
-/** Starts a real graph run whose only step is a review session that never answers. */
-function startHangingReview(storedWorkflowValues: Record<string, unknown>) {
+/** Starts a real graph run whose only step is a session that never answers. */
+function startHangingStep(ir: WorkflowIr, enabledStepId: string, storedWorkflowValues: Record<string, unknown>) {
   const store = createMockStore();
-  const task = reviewCard();
+  const task = { ...reviewCard(), enabledWorkflowSteps: [enabledStepId] } as TaskDetail;
   store.getTask.mockResolvedValue(task);
   store.getSettings.mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4, pollIntervalMs: 15_000, autoMerge: false });
   Object.assign(store, {
     getTaskWorkflowSelection: vi.fn(() => ({ workflowId: WORKFLOW_ID, stepIds: [] })),
     getTaskWorkflowSelectionAsync: vi.fn(async () => ({ workflowId: WORKFLOW_ID, stepIds: [] })),
-    getWorkflowDefinition: vi.fn(async () => ({ id: WORKFLOW_ID, name: "single review step", ir: reviewWorkflow })),
+    getWorkflowDefinition: vi.fn(async () => ({ id: WORKFLOW_ID, name: ir.name, ir })),
     getWorkflowSettingValues: vi.fn(() => storedWorkflowValues),
     getWorkflowSettingsProjectId: vi.fn(() => "proj-1"),
     updateTaskAtomic: vi.fn(async (taskId: string, updater: (current: TaskDetail) => Partial<TaskDetail> | null) => {
@@ -109,6 +142,14 @@ function startHangingReview(storedWorkflowValues: Record<string, unknown>) {
   /** The step reaches its session after real asynchronous work (git, prompt assembly), so wait for it before moving the clock. */
   const sessionOpened = () => vi.waitFor(() => expect(sessions()).toBe(1), { timeout: 10_000 });
   return { timeoutLines, sessions, sessionOpened };
+}
+
+function startHangingReview(storedWorkflowValues: Record<string, unknown>) {
+  return startHangingStep(reviewWorkflow, "code-review", storedWorkflowValues);
+}
+
+function startHangingDocumentationStep(storedWorkflowValues: Record<string, unknown>) {
+  return startHangingStep(documentationWorkflow, "documentation", storedWorkflowValues);
 }
 
 describe("workflow step timeout comes from the task's effective workflow settings", () => {
@@ -146,6 +187,39 @@ describe("workflow step timeout comes from the task's effective workflow setting
 
   it("keeps the 15-minute default when no step timeout is stored", async () => {
     const { timeoutLines, sessionOpened } = startHangingReview({});
+    await sessionOpened();
+
+    await vi.advanceTimersByTimeAsync(14 * MINUTE);
+    expect(timeoutLines()).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(2 * MINUTE);
+    expect(timeoutLines()[0]).toContain("timed out after 900s");
+  });
+
+  it("lets a non-review step run past 15 minutes when the stored step timeout is 45 minutes", async () => {
+    const { timeoutLines, sessions, sessionOpened } = startHangingDocumentationStep({ workflowStepTimeoutMs: 2_700_000 });
+    await sessionOpened();
+
+    await vi.advanceTimersByTimeAsync(44 * MINUTE);
+    expect(sessions()).toBe(1);
+    expect(timeoutLines()).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(2 * MINUTE);
+    expect(timeoutLines()[0]).toContain("'documentation-step'");
+    expect(timeoutLines()[0]).toContain("timed out after 2700s");
+  });
+
+  it("times a non-review step out early when the stored step timeout is 5 minutes", async () => {
+    const { timeoutLines, sessionOpened } = startHangingDocumentationStep({ workflowStepTimeoutMs: 300_000 });
+    await sessionOpened();
+
+    await vi.advanceTimersByTimeAsync(6 * MINUTE);
+
+    expect(timeoutLines()[0]).toContain("timed out after 300s");
+  });
+
+  it("keeps the 15-minute default for a non-review step when no step timeout is stored", async () => {
+    const { timeoutLines, sessionOpened } = startHangingDocumentationStep({});
     await sessionOpened();
 
     await vi.advanceTimersByTimeAsync(14 * MINUTE);
