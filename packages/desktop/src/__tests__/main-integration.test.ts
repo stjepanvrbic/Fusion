@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => {
   const callLog: string[] = [];
@@ -248,6 +248,19 @@ async function flushPromises() {
 describe("main integration", () => {
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
 
+  function mockPlatform(platform: NodeJS.Platform): void {
+    Object.defineProperty(process, "platform", {
+      configurable: true,
+      value: platform,
+    });
+  }
+
+  afterEach(() => {
+    if (platformDescriptor) {
+      Object.defineProperty(process, "platform", platformDescriptor);
+    }
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.resetModules();
@@ -366,7 +379,13 @@ describe("main integration", () => {
     expect(mocks.registerIpcHandlers).toHaveBeenCalledWith(instance, expect.any(Object));
   });
 
+  /*
+  FNXC:DesktopClosePolicy 2026-10-11-16:00:
+  These two cases cover the non-win32 close-to-tray branch; the win32 dialog branch is covered in main.test.ts.
+  The platform is pinned so the result does not depend on the host running the suite.
+  */
   it("window close hides to tray when app is not quitting", async () => {
+    mockPlatform("linux");
     const { initializeApp } = await importMainModule();
     await initializeApp();
 
@@ -381,6 +400,7 @@ describe("main integration", () => {
   });
 
   it("window close saves window state before hiding", async () => {
+    mockPlatform("linux");
     const { initializeApp } = await importMainModule();
     await initializeApp();
 
@@ -408,12 +428,7 @@ describe("main integration", () => {
   });
 
   it("window-all-closed does not quit on macOS", async () => {
-    if (platformDescriptor) {
-      Object.defineProperty(process, "platform", {
-        configurable: true,
-        value: "darwin",
-      });
-    }
+    mockPlatform("darwin");
 
     const { run } = await importMainModule();
     run();
@@ -422,10 +437,6 @@ describe("main integration", () => {
     windowAllClosedHandler?.();
 
     expect(mocks.app.quit).not.toHaveBeenCalled();
-
-    if (platformDescriptor) {
-      Object.defineProperty(process, "platform", platformDescriptor);
-    }
   });
 
   it("loads remote handoff URL when remembered mode is remote", async () => {

@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -28,14 +28,8 @@ describe("Linux AppImage Postgres packaging verifier", () => {
   it("derives the matching platform package and requires executable regular files", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "fusion-pg-verifier-"));
     tempDirs.push(tempDir);
-    const executable = path.join(tempDir, "postgres");
-    const notExecutable = path.join(tempDir, "initdb");
     const x64Elf = path.join(tempDir, "x64-elf");
     const arm64Elf = path.join(tempDir, "arm64-elf");
-    await writeFile(executable, "#!/bin/sh\n");
-    await writeFile(notExecutable, "#!/bin/sh\n");
-    await chmod(executable, 0o755);
-    await chmod(notExecutable, 0o644);
     const elfHeader = (machine: number) => {
       const header = Buffer.alloc(20);
       header.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]);
@@ -47,9 +41,16 @@ describe("Linux AppImage Postgres packaging verifier", () => {
 
     expect(verifier.expectedLinuxPlatform("/tmp/linux-unpacked")).toBe("linux-x64");
     expect(verifier.expectedLinuxPlatform("/tmp/linux-arm64-unpacked")).toBe("linux-arm64");
-    expect(verifier.isRegularExecutable(executable)).toBe(true);
-    expect(verifier.isRegularExecutable(notExecutable)).toBe(false);
+    // FNXC:DesktopEmbeddedPostgres 2026-10-11-16:02:
+    // A win32 host cannot store POSIX execute bits, so the mode rule is asserted on Stats-shaped fixtures.
+    // The real-filesystem checks below hold on every host.
+    const stat = (isFile: boolean, mode: number) => ({ isFile: () => isFile, mode });
+    expect(verifier.isRegularExecutableStat(stat(true, 0o100755))).toBe(true);
+    expect(verifier.isRegularExecutableStat(stat(true, 0o100100))).toBe(true);
+    expect(verifier.isRegularExecutableStat(stat(true, 0o100644))).toBe(false);
+    expect(verifier.isRegularExecutableStat(stat(false, 0o040755))).toBe(false);
     expect(verifier.isRegularExecutable(tempDir)).toBe(false);
+    expect(verifier.isRegularExecutable(path.join(tempDir, "missing"))).toBe(false);
     expect(verifier.hasExpectedElfArchitecture(x64Elf, "linux-x64")).toBe(true);
     expect(verifier.hasExpectedElfArchitecture(x64Elf, "linux-arm64")).toBe(false);
     expect(verifier.hasExpectedElfArchitecture(arm64Elf, "linux-arm64")).toBe(true);

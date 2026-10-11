@@ -222,6 +222,17 @@ test("CLI: --package @fusion/dashboard fails on an unledgered file", () => {
   assert.ok(run.stdout.includes("`src/__tests__/x.test.ts`"));
 });
 
+test("CLI: --package @fusion/desktop fails on an unledgered file", () => {
+  const run = runComparator("@fusion/desktop", "desktop", [["src/__tests__/x.test.ts", "failed"]], path.join(repoRoot, "packages", "desktop"));
+  assert.equal(run.status, 1, run.stderr);
+  assert.ok(run.stdout.includes("`src/__tests__/x.test.ts`"));
+});
+
+test("CLI: --package @fusion/desktop passes a green report with exit code 0", () => {
+  const run = runComparator("@fusion/desktop", "desktop", [["src/__tests__/ok.test.ts", "passed"]], path.join(repoRoot, "packages", "desktop"), "0\n");
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+});
+
 test("CLI: --package @runfusion/fusion passes when only a ledgered CLI file fails", () => {
   const cliDir = path.join(repoRoot, "packages", "cli");
   const known = readKnownFailing().packages["@runfusion/fusion"] ?? [];

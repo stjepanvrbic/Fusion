@@ -15,6 +15,9 @@ PACKAGE_DIRS is exported so the ledger test validates keys against the same map,
 FNXC:CI 2026-10-10-21:33:
 A real Vitest 4.1.10 JSON report never carries the timeout text for a timed-out test. The runner gives the timeout error the stack captured where the test or per-test hook was registered, whose first line is the placeholder "Error: STACK_TRACE_ERROR", and the reporter writes `stack || message` into failureMessages. Only a file-level hook timeout keeps the "Hook timed out in Nms" text, in the file result's `message`.
 The classifier therefore accepts that exact placeholder line as timeout evidence. Without it the motivating case (tests hitting the fifteen-second testTimeout) was still reported under "Unexpected failures". No other Vitest path leaves the placeholder as the first line: expect.poll, vi.waitFor and vi.waitUntil substitute their own message into the copied stack.
+
+FNXC:CI 2026-10-11-16:04:
+KB-130 adds the desktop suite (@fusion/desktop). It has no ledger key, so it compares against an empty known list and any desktop failure is unexpected.
 */
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -27,6 +30,7 @@ export const PACKAGE_DIRS = {
   "@fusion/engine": "packages/engine",
   "@fusion/dashboard": "packages/dashboard",
   "@runfusion/fusion": "packages/cli",
+  "@fusion/desktop": "packages/desktop",
   scripts: "scripts",
 };
 // First line of the stack @vitest/runner assigns to a test or per-test hook timeout error; the JSON reporter emits it in place of the timeout text.

@@ -1083,21 +1083,22 @@ the cache useful across a normal work week.
 
 ## Windows Full Suite lane
 
-The non-blocking `test-windows` job runs the merge gate plus the full core, engine, dashboard-api, CLI and `scripts/__tests__` suites on `windows-latest`. Some files still fail on Windows only; they are listed in `scripts/lib/windows-known-failing-tests.json`. Each lane writes a Vitest JSON report, and `scripts/check-windows-known-failing.mjs` fails the job only when a file outside that list fails, the report is missing, or the lane exits nonzero with no failing file. The job summary lists every result. Because the JSON reporter keeps assertion text out of the job log, every leg uploads its `.windows-lane/*.json` report and `*.exit` code as the `windows-lane-reports-<lane>` artifact (14-day retention); download it to read the failure message of a known or unexpected file. A listed file that now passes produces a warning: remove it and lower the ledger's `ceiling`. The ledger may only shrink; a new Windows-only failure is fixed or quarantined under the normal rules.
+The non-blocking `test-windows` job runs the merge gate plus the full core, engine, dashboard-api, CLI, `scripts/__tests__` and desktop suites on `windows-latest`. Some files still fail on Windows only; they are listed in `scripts/lib/windows-known-failing-tests.json`. Each lane writes a Vitest JSON report, and `scripts/check-windows-known-failing.mjs` fails the job only when a file outside that list fails, the report is missing, or the lane exits nonzero with no failing file. The job summary lists every result. Because the JSON reporter keeps assertion text out of the job log, every leg uploads its `.windows-lane/*.json` report and `*.exit` code as the `windows-lane-reports-<lane>` artifact (14-day retention); download it to read the failure message of a known or unexpected file. A listed file that now passes produces a warning: remove it and lower the ledger's `ceiling`. The ledger may only shrink; a new Windows-only failure is fixed or quarantined under the normal rules.
 
 Core tests must stay Windows-runnable: a fake native client (such as `pg_dump`) is a Node script launched through `packages/core/src/__tests__/_fake-pg-client.ts`, not an extensionless shebang file, and tests must not shell out to `psql` or GNU `tar` (use the harness admin helper and the `tar` npm package).
 
 Every leg starts the runner's preinstalled PostgreSQL service and then runs `node scripts/pg-test-cluster-non-durable.mjs --throwaway`. The script sets `fsync`, `synchronous_commit` and `full_page_writes` to `off` with one `ALTER SYSTEM` statement each, reloads the configuration, waits until all three read `off`, and prints the server version and the effective values. It connects to the `postgres` database at `FUSION_PG_TEST_URL_BASE`. These settings give up crash safety for the whole cluster ([PostgreSQL non-durable settings](https://www.postgresql.org/docs/15/non-durability.html)), so the script exits 2 without `--throwaway` or without `FUSION_PG_TEST_URL_BASE`, and nothing else (harness, Vitest setup or test) changes cluster settings. Use it only on a cluster that is thrown away after the run. The runner's cluster is discarded with the job, and on native Windows PostgreSQL the harness's `DROP DATABASE` calls are flush-bound: three concurrent teardown drops took about 10 s with default durability and about 2.5 s non-durable. A native Windows PostgreSQL used for local test runs should likewise be a throwaway cluster configured with this script; a durable cluster makes the PostgreSQL suites much slower there and can push hooks past their 15 s budget.
 
-The job is a matrix of eight parallel legs: `gate`, `core-1`/`core-2` (core `--shard=1/2` and `2/2`), `engine-1`/`engine-2`, `dashboard`, `cli` and `scripts`. Each core and engine shard runs with `VITEST_MAX_WORKERS=1` and its own 75-minute step budget, under a 120-minute job backstop. One worker per shard gives every test a fixed CPU share that does not depend on the runner's core count, so a slow runner does not turn healthy tests into 15-second timeouts. Running the shards in parallel keeps wall time bounded. Timeouts are never widened. Each shard writes `.windows-lane/<lane>.json` and `.windows-lane/<lane>.exit`. A known file that belongs to the other shard simply does not appear in this shard's report, so it produces neither a failure nor a now-passing warning.
+The job is a matrix of nine parallel legs: `gate`, `core-1`/`core-2` (core `--shard=1/2` and `2/2`), `engine-1`/`engine-2`, `dashboard`, `cli`, `scripts` and `desktop`. Each core and engine shard runs with `VITEST_MAX_WORKERS=1` and its own 75-minute step budget, under a 120-minute job backstop. One worker per shard gives every test a fixed CPU share that does not depend on the runner's core count, so a slow runner does not turn healthy tests into 15-second timeouts. Running the shards in parallel keeps wall time bounded. Timeouts are never widened. Each shard writes `.windows-lane/<lane>.json` and `.windows-lane/<lane>.exit`. A known file that belongs to the other shard simply does not appear in this shard's report, so it produces neither a failure nor a now-passing warning.
 
-The `dashboard`, `cli` and `scripts` legs are not sharded. They are keyed on `matrix.suite` (the comparator package key) and share one compare step:
+The `dashboard`, `cli`, `scripts` and `desktop` legs are not sharded. They are keyed on `matrix.suite` (the comparator package key) and share one compare step:
 
 - `dashboard` runs the `dashboard-api` Vitest project with `FUSION_DASHBOARD_DEEP=1` (without it the project matches nothing). It does not run `dashboard-app` (jsdom) or the curated quality projects.
 - `cli` runs the `@runfusion/fusion` Vitest suite.
 - `scripts` runs `node scripts/run-script-tests.mjs`. node:test has no Vitest JSON reporter, so `scripts/lib/node-test-json-reporter.mjs` writes the comparator's report shape. `run-script-tests.mjs` forwards `--test-reporter` and `--test-reporter-destination` flags (both `--flag=value` and `--flag value` forms) to `node --test` and treats every other argument as a test file, exactly as before. A file fails when any of its tests or its load fails; `skip` and `todo` tests never fail a file.
+- `desktop` runs both `@fusion/desktop` Vitest projects with `pnpm --filter @fusion/desktop exec vitest run`, directly after the job's `pnpm build` (which builds core, dashboard and the plugin dists), not through the package `test` script. It has no ledger key, so any desktop failure is unexpected.
 
-Dashboard and CLI legs pin `VITEST_MAX_WORKERS=1` with a 60-minute step budget; the scripts leg has a 30-minute budget.
+Dashboard and CLI legs pin `VITEST_MAX_WORKERS=1` with a 60-minute step budget. The desktop leg pins `VITEST_MAX_WORKERS=1` with a 30-minute budget, and the scripts leg has a 30-minute budget.
 
 Ledger keys and path spellings (forward slashes, relative to the package directory):
 
@@ -1107,6 +1108,7 @@ Ledger keys and path spellings (forward slashes, relative to the package directo
 | `@fusion/engine` | `packages/engine` | `src/...test.ts(x)` |
 | `@fusion/dashboard` | `packages/dashboard` | `src/...test.ts(x)` |
 | `@runfusion/fusion` | `packages/cli` | `src/...test.ts(x)` |
+| `@fusion/desktop` | `packages/desktop` | `src/...test.ts(x)` |
 | `scripts` | `scripts` | `__tests__/<name>.test.mjs` |
 
 The ledger test validates every key against the comparator's exported `PACKAGE_DIRS`. A package with no ledger key has no known failures.
@@ -1120,7 +1122,7 @@ pnpm --filter @fusion/engine test --reporter=json --outputFile.json=../../.windo
 node scripts/check-windows-known-failing.mjs --package @fusion/engine --report .windows-lane/engine.json --exit-code .windows-lane/engine.exit
 ```
 
-Dashboard, CLI and scripts censuses, also from the repository root in Git Bash after `pnpm build`:
+Dashboard, CLI, scripts and desktop censuses, also from the repository root in Git Bash after `pnpm build`:
 
 ```bash
 FUSION_DASHBOARD_DEEP=1 NODE_OPTIONS=--max-old-space-size=6144 pnpm --filter @fusion/dashboard exec vitest run --project dashboard-api --silent=passed-only --reporter=dot --reporter=json --outputFile.json=../../.windows-lane/dashboard.json; echo $? > .windows-lane/dashboard.exit
@@ -1131,6 +1133,9 @@ node scripts/check-windows-known-failing.mjs --package @runfusion/fusion --repor
 
 node scripts/run-script-tests.mjs --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./scripts/lib/node-test-json-reporter.mjs --test-reporter-destination=.windows-lane/scripts.json; echo $? > .windows-lane/scripts.exit
 node scripts/check-windows-known-failing.mjs --package scripts --report .windows-lane/scripts.json --exit-code .windows-lane/scripts.exit
+
+VITEST_MAX_WORKERS=1 pnpm --filter @fusion/desktop exec vitest run --silent=passed-only --reporter=dot --reporter=json --outputFile.json=../../.windows-lane/desktop.json; echo $? > .windows-lane/desktop.exit
+node scripts/check-windows-known-failing.mjs --package @fusion/desktop --label desktop --report .windows-lane/desktop.json --exit-code .windows-lane/desktop.exit
 ```
 
 To reproduce one CI shard, add `--shard=1/2` to the test command, set `VITEST_MAX_WORKERS=1`, and pass `--label "engine-1 (shard 1/2)"` to the comparator.
@@ -1146,6 +1151,7 @@ Windows-safe test conventions:
 - **Product path guards (8.3 aliases):** a guard that compares an operator- or store-supplied path with git or native output must use `isSamePath`/`isPathInside`/`pathIdentityKey` from `@fusion/core`, never string equality or `path.relative`. Prove it by handing the product a real short spelling from `win32ShortAlias(path)` in the same helper file and asserting that the path is accepted and that the unregistered or foreign case is still refused. When `hasDistinctShortAlias(path)` is false (8dot3 generation disabled, or a non-Windows host) the test still runs with the long spelling and logs one annotation; it is never skipped. Dashboard tests use the `shortAliasForTest` wrapper in `packages/dashboard/src/__tests__/short-alias.ts`.
 - **Drive-less absolute paths:** the runner checks out on `D:` with temp on `C:`. A drive-less absolute setting such as `/var/tmp/x` resolves against the project root's drive, so derive expectations with `resolve(rootDir, "/var/tmp/x")`, not `resolve("/var/tmp/x")`.
 - **Git long paths:** real-git fixtures nested deep under temp can exceed Git for Windows' MAX_PATH (`failed to stat '<sha>...<sha>': Filename too long`). Set `core.longpaths true` on the fixture repo; it is a no-op elsewhere.
+- **Host-independent expectations (desktop, KB-130):** build expected paths with `node:path` from the same inputs the product uses, not POSIX literals (an absolute override such as `FUSION_HOME` must already be absolute on the host). Pin `process.platform` in tests of platform-branching code, such as the desktop window close handler, which asks through a dialog only on win32. Do not assert POSIX mode bits on host files: win32 `statSync` reports `100666` whatever `chmod` set, so test a mode rule through a pure predicate on Stats-shaped fixtures.
 
 The dashboard, CLI and scripts suites joined the Windows lane in KB-062, after KB-036 fixed their named Windows failures. KB-062 seeded the `@runfusion/fusion` key with the CLI files that were still open at that time (KB-036 census class c); the dashboard and scripts keys have no entries.
 

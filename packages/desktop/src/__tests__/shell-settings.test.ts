@@ -1,12 +1,21 @@
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockState = vi.hoisted(() => ({
   content: new Map<string, string>(),
+  userDataDir: "/tmp/fusion",
 }));
+
+/*
+FNXC:DesktopShellSettings 2026-10-11-15:58:
+The product joins the userData directory with node:path, which yields a native path (\tmp\fusion\... on win32).
+Seed the fake file map through the same join so the seeded settings are found on every host.
+*/
+const SETTINGS_PATH = join(mockState.userDataDir, "shell-connections.json");
 
 vi.mock("electron", () => ({
   app: {
-    getPath: vi.fn(() => "/tmp/fusion"),
+    getPath: vi.fn(() => mockState.userDataDir),
   },
 }));
 
@@ -79,7 +88,7 @@ describe("shell-settings", () => {
   });
 
   it("infers completed selection from legacy desktopMode payload", async () => {
-    mockState.content.set("/tmp/fusion/shell-connections.json", JSON.stringify({ desktopMode: "remote" }));
+    mockState.content.set(SETTINGS_PATH, JSON.stringify({ desktopMode: "remote" }));
     const { readShellSettings, getDesktopShellModeState } = await import("../shell-settings.ts");
     const settings = await readShellSettings();
     expect(settings.hasCompletedModeSelection).toBe(true);
@@ -91,11 +100,17 @@ describe("shell-settings", () => {
 
   it("treats invalid persisted mode as first-run", async () => {
     mockState.content.set(
-      "/tmp/fusion/shell-connections.json",
-      JSON.stringify({ desktopMode: "invalid", hasCompletedModeSelection: true }),
+      SETTINGS_PATH,
+      JSON.stringify({
+        desktopMode: "invalid",
+        hasCompletedModeSelection: true,
+        profiles: [{ id: "p1", name: "Remote", serverUrl: "https://fusion.example.com" }],
+      }),
     );
     const { readShellSettings, getDesktopShellModeState } = await import("../shell-settings.ts");
     const settings = await readShellSettings();
+    // The seeded profile proves the persisted payload was read; defaults alone also mean first run.
+    expect(settings.profiles).toHaveLength(1);
     expect(getDesktopShellModeState(settings)).toEqual({
       isFirstRun: true,
       desktopMode: null,
@@ -104,7 +119,7 @@ describe("shell-settings", () => {
 
   it("normalizes invalid profiles, duplicate names, and invalid active id", async () => {
     mockState.content.set(
-      "/tmp/fusion/shell-connections.json",
+      SETTINGS_PATH,
       JSON.stringify({
         activeProfileId: "missing",
         profiles: [

@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { resolveDesktopBundlePluginDirs } from "../bundled-plugin-dirs.js";
 
@@ -13,7 +14,13 @@ import { resolveDesktopBundlePluginDirs } from "../bundled-plugin-dirs.js";
  */
 describe("resolveDesktopBundlePluginDirs", () => {
   it("maps a manifest id to its @fusion-plugin-examples/<short-name> package and walks up to the package root", () => {
-    const fakeEntryPath = "/desktop/deploy/node_modules/@fusion-plugin-examples/hermes-runtime/dist/index.js";
+    // FNXC:DesktopRuntime 2026-10-11-15:58: the product derives a native path, so build the expectation with node:path; a POSIX literal fails on win32.
+    const packageRoot = path.join(
+      path.resolve("/desktop/deploy/node_modules"),
+      "@fusion-plugin-examples",
+      "hermes-runtime",
+    );
+    const fakeEntryPath = path.join(packageRoot, "dist", "index.js");
     let requestedSpecifier: string | undefined;
     const dirs = resolveDesktopBundlePluginDirs("fusion-plugin-hermes-runtime", (specifier) => {
       requestedSpecifier = specifier;
@@ -21,7 +28,7 @@ describe("resolveDesktopBundlePluginDirs", () => {
     });
 
     expect(requestedSpecifier).toBe("@fusion-plugin-examples/hermes-runtime");
-    expect(dirs).toEqual(["/desktop/deploy/node_modules/@fusion-plugin-examples/hermes-runtime"]);
+    expect(dirs).toEqual([packageRoot]);
   });
 
   it("returns an empty candidate list when the package is not resolvable (e.g. desktop does not bundle it)", () => {

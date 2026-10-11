@@ -1,3 +1,4 @@
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
@@ -412,10 +413,12 @@ describe("main process", () => {
   });
 
   it("honors FUSION_HOME override for the local runtime root", async () => {
-    process.env.FUSION_HOME = "/custom/fusion-home";
+    // FNXC:DesktopRuntime 2026-10-11-15:58: the product resolves FUSION_HOME to a native absolute path, so the override is already absolute on the host (a POSIX literal resolves to C:\... on win32).
+    const fusionHome = path.join(path.parse(process.cwd()).root, "custom", "fusion-home");
+    process.env.FUSION_HOME = fusionHome;
     const { resolveLocalRuntimeRoot } = await importMainModule();
 
-    expect(resolveLocalRuntimeRoot()).toBe("/custom/fusion-home");
+    expect(resolveLocalRuntimeRoot()).toBe(fusionHome);
     // FUSION_HOME must satisfy the root without falling back to getPath("home").
     // (Module load calls getPath("userData") for the profile-relocation guard, so
     // assert the specific "home" lookup is skipped rather than getPath overall.)

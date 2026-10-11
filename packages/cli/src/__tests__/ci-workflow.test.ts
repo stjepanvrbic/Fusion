@@ -508,7 +508,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
   Windows is the operator's primary platform, yet every test job ran on ubuntu-latest, so POSIX-only fixtures and separator assumptions landed unseen.
   Every first-class platform needs at least one CI test signal: a non-blocking windows-latest job runs the merge gate plus the core and engine unit lanes against the image's preinstalled PostgreSQL.
   */
-  it("gives Windows a non-blocking test signal: gate, core, engine, dashboard, CLI and scripts lanes", () => {
+  it("gives Windows a non-blocking test signal: gate, core, engine, dashboard, CLI, scripts and desktop lanes", () => {
     const windowsJobs = Object.entries(workflow.jobs ?? {}).filter(([, job]: [string, any]) =>
       String(job?.["runs-on"] ?? "").startsWith("windows"));
     expect(windowsJobs.map(([name]) => name)).toEqual(["test-windows"]);
@@ -561,12 +561,20 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     FNXC:CI 2026-10-08-13:40:
     KB-062 adds unsharded dashboard-api, CLI and scripts legs so KB-036's Windows fixes there cannot regress unseen.
     Each is keyed on matrix.suite (the comparator package key) and matrix.lane (the report/exit file name).
+
+    FNXC:CI 2026-10-11-16:08:
+    KB-130 adds an unsharded desktop leg: the desktop app ships a Windows build with a win32-only close dialog, and seven of its cases failed on win32 unseen.
     */
-    const suites: Array<[string, string]> = [["@fusion/dashboard", "dashboard"], ["@runfusion/fusion", "cli"], ["scripts", "scripts"]];
+    const suites: Array<[string, string]> = [
+      ["@fusion/dashboard", "dashboard"],
+      ["@runfusion/fusion", "cli"],
+      ["scripts", "scripts"],
+      ["@fusion/desktop", "desktop"],
+    ];
     for (const [suite, short] of suites) {
       expect(legs.filter((leg) => leg.suite === suite)).toEqual([{ lane: short, suite }]);
     }
-    expect(legs).toHaveLength(8);
+    expect(legs).toHaveLength(9);
 
     const steps: any[] = job?.steps ?? [];
     const gate = indexOf("pnpm test:gate");
@@ -593,6 +601,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
       dashboard: "pnpm --filter @fusion/dashboard exec vitest run --project dashboard-api",
       cli: "pnpm --filter @runfusion/fusion test",
       scripts: "node scripts/run-script-tests.mjs",
+      desktop: "pnpm --filter @fusion/desktop exec vitest run",
     };
     const suiteLanes = suites.map(([, short]) => indexOf(laneCommands[short]));
     suites.forEach(([, short], i) => {
@@ -610,13 +619,15 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     });
     // The shared compare step sits directly after the last suite lane.
     expect(suiteCompare).toBe(Math.max(...suiteLanes) + 1);
-    const [dashboardLane, cliLane, scriptsLane] = suiteLanes;
+    const [dashboardLane, cliLane, scriptsLane, desktopLane] = suiteLanes;
     expect(runs[dashboardLane]).toContain("FUSION_DASHBOARD_DEEP=1");
     expect(runs[dashboardLane]).toContain("--outputFile.json=../../.windows-lane/dashboard.json");
     expect(steps[dashboardLane]?.env?.VITEST_MAX_WORKERS).toBe("1");
     expect(runs[cliLane]).toContain("--outputFile.json=../../.windows-lane/cli.json");
     expect(steps[cliLane]?.env?.VITEST_MAX_WORKERS).toBe("1");
     expect(runs[scriptsLane]).toContain("--test-reporter=./scripts/lib/node-test-json-reporter.mjs --test-reporter-destination=.windows-lane/scripts.json");
+    expect(runs[desktopLane]).toContain("--outputFile.json=../../.windows-lane/desktop.json");
+    expect(steps[desktopLane]?.env?.VITEST_MAX_WORKERS).toBe("1");
   });
 
   /*

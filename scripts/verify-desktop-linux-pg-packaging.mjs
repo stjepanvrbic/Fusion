@@ -248,10 +248,18 @@ export function expectedLinuxPlatform(unpackedDir) {
   return name.includes("arm64") ? "linux-arm64" : "linux-x64";
 }
 
+/**
+ * FNXC:DesktopEmbeddedPostgres 2026-10-11-16:02:
+ * The AppImage tree is verified on a Linux runner, where any POSIX execute bit is the release requirement.
+ * The predicate is pure so the mode-bit rule can be tested on hosts without POSIX modes (win32 statSync reports 100666 for every file).
+ */
+export function isRegularExecutableStat(stat) {
+  return stat.isFile() && (stat.mode & 0o111) !== 0;
+}
+
 export function isRegularExecutable(path) {
   try {
-    const stat = statSync(path);
-    return stat.isFile() && (stat.mode & 0o111) !== 0;
+    return isRegularExecutableStat(statSync(path));
   } catch {
     return false;
   }

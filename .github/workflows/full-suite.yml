@@ -3,7 +3,7 @@ name: Full Suite (non-blocking)
 # The demoted test tier (docs/plans/2026-06-04-001-refactor-fast-trusted-test-gate-plan.md).
 # Runs the full sharded suite, the engine slow tier, the dashboard inventory
 # guard, the scripts node:test suite, and the Windows gate plus sharded core/engine,
-# dashboard-api, CLI and scripts lanes on every push to main — post-merge signal only. These jobs
+# dashboard-api, CLI, scripts and desktop lanes on every push to main — post-merge signal only. These jobs
 # are NON-BLOCKING by design: they never run on PRs and must never be added
 # to branch-protection required checks. A red run here is information, not a
 # merge stopper; see docs/testing.md for the quarantine ratchet that keeps
@@ -346,6 +346,8 @@ jobs:
     # (scripts/__tests__ node:test) legs so KB-036's Windows fixes there cannot regress unseen.
     # They use matrix.suite rather than matrix.package because they are not sharded; each has its
     # own lane step and shares one compare step against the same known-failing ledger.
+    # FNXC:CI 2026-10-11-16:06:
+    # KB-130 adds a desktop (@fusion/desktop) suite leg with the same shape.
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -370,6 +372,8 @@ jobs:
             suite: "@runfusion/fusion"
           - lane: scripts
             suite: scripts
+          - lane: desktop
+            suite: "@fusion/desktop"
     env:
       FUSION_PG_TEST_URL_BASE: "postgresql://postgres:root@localhost:5432"
       PGPASSWORD: "root"
@@ -484,6 +488,25 @@ jobs:
           set +e
           node scripts/run-script-tests.mjs --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./scripts/lib/node-test-json-reporter.mjs --test-reporter-destination=.windows-lane/scripts.json
           echo $? > .windows-lane/scripts.exit
+
+      # FNXC:CI 2026-10-11-16:06:
+      # The desktop app ships a Windows build and has a win32-only close dialog, so its suite gets a Windows
+      # signal; seven of its cases once failed on win32 unseen because no lane ran them. Same record-then-compare
+      # contract as the other suite legs. @fusion/desktop has no ledger key, so any failure is unexpected.
+      # It calls Vitest directly (both desktop projects): "Build workspace artifacts" already built core,
+      # dashboard and the plugin dists, so the package test script's rebuild would be redundant. The suite
+      # takes about 25 s with one worker on a local win32 host.
+      - name: Desktop lane
+        if: ${{ matrix.lane == 'desktop' && !cancelled() }}
+        timeout-minutes: 30
+        shell: bash
+        env:
+          VITEST_MAX_WORKERS: "1"
+        run: |
+          mkdir -p .windows-lane
+          set +e
+          pnpm --filter @fusion/desktop exec vitest run --silent=passed-only --reporter=dot --reporter=json --outputFile.json=../../.windows-lane/desktop.json
+          echo $? > .windows-lane/desktop.exit
 
       - name: Compare suite with known Windows failures
         if: ${{ matrix.suite && !cancelled() }}
