@@ -56,6 +56,10 @@ import {
   createScopedAffectedMemoryEnvelopeEnv,
   deriveScopedAffectedBudgetMs,
   SCOPED_AFFECTED_BUDGET_CEILING_MS,
+  GUARD_COMPANION_TESTS,
+  GUARD_TRIGGER_CLASSES,
+  selectGuardCompanionTests,
+  planGuardCompanionRuns,
 } from "../test-changed.mjs";
 
 import { deriveBudgetMs } from "../lib/run-vitest-watchdog.mjs";
@@ -2202,6 +2206,269 @@ test("integration: a working-tree edit with HEAD at the base is still selected",
     const { files, affected } = runInRepo(dir, changedFilesSnippet);
     assert.deepEqual(files, ["packages/c/src/index.ts"]);
     assert.deepEqual(affected, ["@x/c"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Guard companions. Drift/inventory guards must run in changed-only
+// `pnpm test` whenever engine merge, heartbeat or route files change.
+// ---------------------------------------------------------------------------
+
+const INVENTORY_GUARD = "packages/engine/src/__tests__/merge-orphan-durable-write-inventory-drift.test.ts";
+const MCP_GUARD = "packages/engine/src/__tests__/mcp-builtin-lane-coverage.test.ts";
+const ACTIVE_COUNT_GUARD = "packages/cli/src/__tests__/cli-active-count-lanes.test.ts";
+
+function writeRepoFile(root, relativePath, content = "") {
+  const absolute = path.join(root, ...relativePath.split("/"));
+  mkdirSync(path.dirname(absolute), { recursive: true });
+  writeFileSync(absolute, content);
+}
+
+function withGuardStubRoot(fn, { omit = [] } = {}) {
+  const root = mkdtempSync(path.join(tmpdir(), "tc-guard-companions-"));
+  try {
+    for (const guard of GUARD_COMPANION_TESTS) {
+      if (!omit.includes(guard.testFile)) writeRepoFile(root, guard.testFile, "// stub guard\n");
+    }
+    return fn(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function selectedByPackage(selection) {
+  return Object.fromEntries(selection.map(({ packageName, testFiles }) => [packageName, testFiles]));
+}
+
+test("guard companions: table covers exactly the three named guards and shared trigger classes", () => {
+  assert.deepEqual(
+    GUARD_COMPANION_TESTS.map(({ testFile }) => testFile).sort(),
+    [ACTIVE_COUNT_GUARD, INVENTORY_GUARD, MCP_GUARD].sort(),
+  );
+  assert.deepEqual(Object.keys(GUARD_TRIGGER_CLASSES).sort(), ["engineMerge", "heartbeat", "routes"]);
+});
+
+test("guard companions: engine merge, heartbeat and route edits select all three guards per package", () => {
+  withGuardStubRoot((projectRoot) => {
+    for (const changed of [
+      "packages/engine/src/merge/merger-ai.ts",
+      "packages/engine/src/merger.ts",
+      "packages/engine/src/agent-heartbeat.ts",
+      "packages/engine/src/agents/heartbeat-monitor.ts",
+      "packages/dashboard/src/routes/register-task-workflow-routes.ts",
+      "packages/dashboard/src/routes.ts",
+    ]) {
+      const selection = selectGuardCompanionTests([changed], { projectRoot });
+      assert.deepEqual(
+        selectedByPackage(selection),
+        {
+          "@fusion/engine": [INVENTORY_GUARD, MCP_GUARD].sort(),
+          "@runfusion/fusion": [ACTIVE_COUNT_GUARD],
+        },
+        `expected all guards for ${changed}`,
+      );
+      assert.ok(selection.every(({ reasons }) => reasons.every(({ file }) => file === changed)));
+    }
+  });
+});
+
+test("guard companions: one diff touching merge, heartbeat and dashboard route sources selects every matching guard", () => {
+  withGuardStubRoot((projectRoot) => {
+    const changed = [
+      "packages/engine/src/merge/merger-ai.ts",
+      "packages/engine/src/agent-heartbeat.ts",
+      "packages/dashboard/src/routes/register-task-workflow-routes.ts",
+    ];
+    const selection = selectGuardCompanionTests(changed, { projectRoot });
+    assert.deepEqual(selectedByPackage(selection), {
+      "@fusion/engine": [INVENTORY_GUARD, MCP_GUARD].sort(),
+      "@runfusion/fusion": [ACTIVE_COUNT_GUARD],
+    });
+    for (const guard of GUARD_COMPANION_TESTS) {
+      const reasonFiles = selection
+        .flatMap(({ reasons }) => reasons)
+        .filter(({ guardId }) => guardId === guard.id)
+        .map(({ file }) => file);
+      assert.deepEqual(reasonFiles, [...changed].sort(), `expected every trigger file for ${guard.id}`);
+    }
+  });
+});
+
+test("guard companions: a multi-file diff with no trigger selects nothing", () => {
+  withGuardStubRoot((projectRoot) => {
+    assert.deepEqual(
+      selectGuardCompanionTests(
+        ["packages/engine/src/executor.ts", "packages/dashboard/app/App.tsx", "packages/core/src/types.ts"],
+        { projectRoot },
+      ),
+      [],
+    );
+  });
+});
+
+test("guard companions: test-only, unrelated source, null and empty diffs select nothing", () => {
+  withGuardStubRoot((projectRoot) => {
+    assert.deepEqual(selectGuardCompanionTests(["packages/engine/src/merge/__tests__/x.test.ts"], { projectRoot }), []);
+    assert.deepEqual(selectGuardCompanionTests(["packages/engine/src/executor.ts"], { projectRoot }), []);
+    assert.deepEqual(selectGuardCompanionTests(null, { projectRoot }), []);
+    assert.deepEqual(selectGuardCompanionTests([], { projectRoot }), []);
+  });
+});
+
+test("guard companions: inventory self-trigger selects only the inventory guard", () => {
+  withGuardStubRoot((projectRoot) => {
+    const selection = selectGuardCompanionTests(
+      ["packages/engine/src/__tests__/fixtures/merge-orphan-durable-write-inventory.json"],
+      { projectRoot },
+    );
+    assert.deepEqual(selectedByPackage(selection), { "@fusion/engine": [INVENTORY_GUARD] });
+  });
+});
+
+test("guard companions: deleted trigger paths still select guards", () => {
+  withGuardStubRoot((projectRoot) => {
+    // Nothing exists on disk for this path; regex triggers do not need it.
+    const selection = selectGuardCompanionTests(["packages/engine/src/merge/removed-module.ts"], { projectRoot });
+    assert.equal(selection.flatMap(({ testFiles }) => testFiles).length, 3);
+  });
+});
+
+test("guard companions: a changed source file containing an MCP resolver needle selects only the MCP guard", () => {
+  withGuardStubRoot((projectRoot) => {
+    const file = "packages/dashboard/src/chat.ts";
+    writeRepoFile(projectRoot, file, "const servers = await resolveMcpServersForStore(store);\n");
+    assert.deepEqual(selectedByPackage(selectGuardCompanionTests([file], { projectRoot })), {
+      "@fusion/engine": [MCP_GUARD],
+    });
+    writeRepoFile(projectRoot, file, "export const chat = 1;\n");
+    assert.deepEqual(selectGuardCompanionTests([file], { projectRoot }), []);
+  });
+});
+
+test("guard companions: a guard whose test file is absent is skipped", () => {
+  withGuardStubRoot(
+    (projectRoot) => {
+      const selection = selectGuardCompanionTests(["packages/engine/src/merge/merger-ai.ts"], { projectRoot });
+      assert.deepEqual(selectedByPackage(selection), { "@fusion/engine": [INVENTORY_GUARD, MCP_GUARD].sort() });
+    },
+    { omit: [ACTIVE_COUNT_GUARD] },
+  );
+});
+
+test("guard companions: duplicate trigger hits dedupe test files", () => {
+  withGuardStubRoot((projectRoot) => {
+    const selection = selectGuardCompanionTests(
+      [
+        "packages/engine/src/merge/merger-ai.ts",
+        "packages/engine/src/merge/merger-ai.ts",
+        "packages/engine/src/agent-heartbeat.ts",
+        "packages\\dashboard\\src\\routes.ts",
+      ],
+      { projectRoot },
+    );
+    assert.deepEqual(selectedByPackage(selection), {
+      "@fusion/engine": [INVENTORY_GUARD, MCP_GUARD].sort(),
+      "@runfusion/fusion": [ACTIVE_COUNT_GUARD],
+    });
+    const engine = selection.find(({ packageName }) => packageName === "@fusion/engine");
+    assert.equal(
+      engine.reasons.filter(({ guardId }) => guardId === "mcp-builtin-lane-coverage").length,
+      3,
+      "each unique trigger file is reported once per guard",
+    );
+  });
+});
+
+test("guard companions: planGuardCompanionRuns drops already-run files and omits emptied packages", () => {
+  const selection = [
+    { packageName: "@fusion/engine", testFiles: [INVENTORY_GUARD, MCP_GUARD], reasons: [] },
+    { packageName: "@runfusion/fusion", testFiles: [ACTIVE_COUNT_GUARD], reasons: [] },
+  ];
+  const packageDirByName = new Map([
+    ["@fusion/engine", "packages/engine"],
+    ["@runfusion/fusion", "packages/cli"],
+  ]);
+  assert.deepEqual(
+    planGuardCompanionRuns(selection, { alreadyRunTestFiles: new Set([MCP_GUARD, ACTIVE_COUNT_GUARD]), packageDirByName }),
+    [{ packageName: "@fusion/engine", relativeTestFiles: ["src/__tests__/merge-orphan-durable-write-inventory-drift.test.ts"] }],
+  );
+  assert.deepEqual(planGuardCompanionRuns(selection, { packageDirByName }), [
+    {
+      packageName: "@fusion/engine",
+      relativeTestFiles: [
+        "src/__tests__/merge-orphan-durable-write-inventory-drift.test.ts",
+        "src/__tests__/mcp-builtin-lane-coverage.test.ts",
+      ],
+    },
+    { packageName: "@runfusion/fusion", relativeTestFiles: ["src/__tests__/cli-active-count-lanes.test.ts"] },
+  ]);
+});
+
+/** Synthetic repo with stub guard tests committed on `main`. */
+function makeGuardRepo(dir) {
+  git(dir, ["init", "-q"]);
+  git(dir, ["config", "user.email", "t@t.t"]);
+  git(dir, ["config", "user.name", "t"]);
+  writeRepoFile(dir, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+  writeRepoFile(dir, "pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+  writeRepoFile(dir, ".changeset/config.json", JSON.stringify({ baseBranch: "main" }));
+  for (const [folder, name] of [
+    ["engine", "@fusion/engine"],
+    ["cli", "@runfusion/fusion"],
+  ]) {
+    writeRepoFile(dir, `packages/${folder}/package.json`, JSON.stringify({ name, version: "1.0.0", scripts: { test: "true" } }));
+    writeRepoFile(dir, `packages/${folder}/src/index.ts`, "export const x = 1;\n");
+  }
+  for (const guard of GUARD_COMPANION_TESTS) writeRepoFile(dir, guard.testFile, "// stub guard\n");
+  git(dir, ["add", "-A"]);
+  git(dir, ["commit", "-q", "-m", "init"]);
+  git(dir, ["branch", "-M", "main"]);
+}
+
+test("integration: --print-mode names guard companions for a merge edit and none otherwise", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tc-guard-print-"));
+  try {
+    makeGuardRepo(dir);
+    writeRepoFile(dir, "packages/engine/src/index.ts", "export const x = 2;\n");
+    const none = runPrintModeInRepo(dir);
+    assert.match(none.stdout, /^\[test-changed\] guard companions: none\r?$/m);
+
+    writeRepoFile(dir, "packages/engine/src/merge/a.ts", "export const a = 1;\n");
+    const triggered = runPrintModeInRepo(dir);
+    const line = triggered.stdout.split(/\r?\n/).find((l) => l.startsWith("[test-changed] guard companions:"));
+    assert.ok(line, triggered.stdout);
+    for (const guard of [INVENTORY_GUARD, MCP_GUARD, ACTIVE_COUNT_GUARD]) {
+      assert.ok(line.includes(guard), `expected ${guard} in: ${line}`);
+    }
+    assert.match(line, /triggered by packages\/engine\/src\/merge\/a\.ts/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("integration: --print-mode names every guard companion for one merge, heartbeat and route diff", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tc-guard-combined-"));
+  try {
+    makeGuardRepo(dir);
+    writeRepoFile(dir, "packages/engine/src/index.ts", "export const x = 2;\n");
+    writeRepoFile(dir, "packages/cli/src/index.ts", "export const x = 2;\n");
+    const none = runPrintModeInRepo(dir);
+    const noneLine = none.stdout.split(/\r?\n/).find((l) => l.startsWith("[test-changed] guard companions:"));
+    assert.equal(noneLine, "[test-changed] guard companions: none", none.stdout);
+
+    writeRepoFile(dir, "packages/engine/src/merge/a.ts", "export const a = 1;\n");
+    writeRepoFile(dir, "packages/engine/src/agent-heartbeat.ts", "export const hb = 1;\n");
+    // Selection runs on raw changed paths, so the route file needs no dashboard package.
+    writeRepoFile(dir, "packages/dashboard/src/routes/x.ts", "export const route = 1;\n");
+    const triggered = runPrintModeInRepo(dir);
+    const line = triggered.stdout.split(/\r?\n/).find((l) => l.startsWith("[test-changed] guard companions:"));
+    assert.ok(line, triggered.stdout);
+    for (const guard of [INVENTORY_GUARD, MCP_GUARD, ACTIVE_COUNT_GUARD]) {
+      assert.ok(line.includes(guard), `expected ${guard} in: ${line}`);
+    }
+    assert.ok(line.includes("+2 more"), `expected three trigger files in: ${line}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

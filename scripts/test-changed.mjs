@@ -1602,6 +1602,172 @@ export function changedSourceFilesAffectingPackage(
   });
 }
 
+/*
+FNXC:TestInfrastructure 2026-10-08-01:57:
+Requirement: run the drift and inventory guards in the changed-only `pnpm test` selection when engine merge, heartbeat or route files change.
+Behaviour changes landed with these guards still red on main because the bounded changed-only lane never selected them: an engine hub-source edit runs only directly-changed test files (wide-fan-out delegation), a dashboard route edit never selects engine or CLI tests, and an all-cache-fresh run short-circuits entirely.
+Guard companions are therefore selected from the raw changed-file list, run in their owning package regardless of the pass-cache or the wide-fan-out delegation, and are never recorded in the pass-cache.
+Each guard is triggered by the shared engine-merge / heartbeat / route classes plus its own direct inputs.
+*/
+/**
+ * Shared trigger classes applied to every guard companion.
+ * Matched against repo-relative `/`-separated changed paths.
+ */
+export const GUARD_TRIGGER_CLASSES = Object.freeze({
+  engineMerge: Object.freeze([/^packages\/engine\/src\/merger\.ts$/, /^packages\/engine\/src\/merge\//]),
+  heartbeat: Object.freeze([
+    /^packages\/engine\/src\/agent-heartbeat\.ts$/,
+    /^packages\/engine\/src\/agents\/(agent-heartbeat|heartbeat-)[^/]*\.ts$/,
+    /^packages\/engine\/src\/executor\/should-defer-for-heartbeat\.ts$/,
+  ]),
+  routes: Object.freeze([
+    /^packages\/dashboard\/src\/routes\//,
+    /^packages\/dashboard\/src\/routes\.ts$/,
+    /^packages\/dashboard\/src\/[^/]+-routes\.ts$/,
+  ]),
+});
+
+const SHARED_GUARD_TRIGGERS = Object.freeze([
+  ...GUARD_TRIGGER_CLASSES.engineMerge,
+  ...GUARD_TRIGGER_CLASSES.heartbeat,
+  ...GUARD_TRIGGER_CLASSES.routes,
+]);
+
+/**
+ * Guard tests that always run when a changed file matches their triggers.
+ * To add a guard: append an entry naming its owning workspace package, its repo-relative test file,
+ * regex `triggers` (shared classes plus the guard's direct source inputs), exact-path `selfTriggers`
+ * for support files the guard reads (fixtures, helpers), and optionally `contentNeedles`/`contentRoots`
+ * when any changed source file containing a needle is itself a guard input.
+ */
+export const GUARD_COMPANION_TESTS = Object.freeze([
+  Object.freeze({
+    id: "merge-orphan-durable-write-inventory",
+    packageName: "@fusion/engine",
+    testFile: "packages/engine/src/__tests__/merge-orphan-durable-write-inventory-drift.test.ts",
+    triggers: Object.freeze([...SHARED_GUARD_TRIGGERS, /^packages\/core\/src\/store\.ts$/]),
+    selfTriggers: Object.freeze([
+      "packages/engine/src/__tests__/_merge-durable-write-callsites.ts",
+      "packages/engine/src/__tests__/fixtures/merge-orphan-durable-write-inventory.json",
+    ]),
+  }),
+  Object.freeze({
+    id: "mcp-builtin-lane-coverage",
+    packageName: "@fusion/engine",
+    testFile: "packages/engine/src/__tests__/mcp-builtin-lane-coverage.test.ts",
+    triggers: Object.freeze([
+      ...SHARED_GUARD_TRIGGERS,
+      /^packages\/engine\/src\/mcp\//,
+      /^packages\/core\/src\/config\/mcp-config\.ts$/,
+      /^packages\/core\/src\/config\/mcp-builtin-servers\.ts$/,
+      /^packages\/cli\/src\/commands\/mcp\.ts$/,
+    ]),
+    selfTriggers: Object.freeze([]),
+    contentNeedles: Object.freeze(["resolveMcpServersForStore(", "resolveMcpServersForRuntime(", "resolveEffectiveMcpServers("]),
+    contentRoots: Object.freeze([
+      "packages/engine/src",
+      "packages/dashboard/src",
+      "packages/dashboard/app",
+      "packages/cli/src",
+      "packages/core/src",
+    ]),
+  }),
+  Object.freeze({
+    id: "cli-active-count-lanes",
+    packageName: "@runfusion/fusion",
+    testFile: "packages/cli/src/__tests__/cli-active-count-lanes.test.ts",
+    triggers: Object.freeze([
+      ...SHARED_GUARD_TRIGGERS,
+      /^packages\/cli\/src\/commands\/dashboard\.ts$/,
+      /^packages\/cli\/src\/commands\/task\.ts$/,
+      /^packages\/cli\/src\/extension\.ts$/,
+    ]),
+    selfTriggers: Object.freeze([]),
+  }),
+]);
+
+function isGuardTestPath(file) {
+  return isTestFilePath(file) || file.includes("/__tests__/");
+}
+
+function changedFileContainsGuardNeedle(guard, file, { projectRoot, readFile }) {
+  if (!guard.contentNeedles?.length || !guard.contentRoots?.length) return false;
+  if (!/\.tsx?$/.test(file) || isGuardTestPath(file) || file.includes("/mocks/")) return false;
+  if (!guard.contentRoots.some((root) => file.startsWith(`${root}/`))) return false;
+  const absolute = path.join(projectRoot, file);
+  if (!existsSync(absolute)) return false;
+  let text;
+  try {
+    text = readFile(absolute);
+  } catch {
+    return false;
+  }
+  return guard.contentNeedles.some((needle) => text.includes(needle));
+}
+
+/**
+ * Select guard companion tests for a changed-file list.
+ * Rules: null/empty input selects nothing; regex triggers ignore test files and `__tests__` paths;
+ * `selfTriggers` match exact paths; deleted trigger paths still trigger regex/self rules (only content
+ * needles need the file on disk); a guard whose test file is absent under `projectRoot` is skipped.
+ * @param {string[]|null|undefined} changedFiles repo-relative diff paths
+ * @param {{ projectRoot?: string, readFile?: (absolutePath: string) => string }} [options]
+ * @returns {Array<{ packageName: string, testFiles: string[], reasons: Array<{ guardId: string, file: string }> }>}
+ */
+export function selectGuardCompanionTests(
+  changedFiles,
+  { projectRoot = rootDir, readFile = (file) => readFileSync(file, "utf8") } = {},
+) {
+  if (!changedFiles || changedFiles.length === 0) return [];
+  const normalized = [...new Set(changedFiles.map((file) => file.replaceAll("\\", "/")))];
+  const byPackage = new Map();
+  for (const guard of GUARD_COMPANION_TESTS) {
+    if (!existsSync(path.join(projectRoot, guard.testFile))) continue;
+    const hits = normalized.filter(
+      (file) =>
+        guard.selfTriggers.includes(file) ||
+        (!isGuardTestPath(file) && guard.triggers.some((pattern) => pattern.test(file))) ||
+        changedFileContainsGuardNeedle(guard, file, { projectRoot, readFile }),
+    );
+    if (hits.length === 0) continue;
+    const entry = byPackage.get(guard.packageName) ?? { packageName: guard.packageName, testFiles: new Set(), reasons: [] };
+    entry.testFiles.add(guard.testFile);
+    for (const file of hits.sort()) entry.reasons.push({ guardId: guard.id, file });
+    byPackage.set(guard.packageName, entry);
+  }
+  return [...byPackage.values()]
+    .map((entry) => ({ ...entry, testFiles: [...entry.testFiles].sort() }))
+    .sort((a, b) => a.packageName.localeCompare(b.packageName));
+}
+
+/**
+ * Turn a companion selection into per-package vitest runs, dropping files the affected loop already
+ * passed positionally (the wide-fan-out lane) so no guard runs twice.
+ * @param {ReturnType<typeof selectGuardCompanionTests>} selection
+ * @param {{ alreadyRunTestFiles?: Set<string>, packageDirByName: Map<string, string> }} options
+ * @returns {Array<{ packageName: string, relativeTestFiles: string[] }>}
+ */
+export function planGuardCompanionRuns(selection, { alreadyRunTestFiles = new Set(), packageDirByName }) {
+  const runs = [];
+  for (const { packageName, testFiles } of selection) {
+    const pkgDir = packageDirByName?.get(packageName) ?? `packages/${packageName.replace(/^@[^/]+\//, "")}`;
+    const relativeTestFiles = testFiles
+      .filter((file) => !alreadyRunTestFiles.has(file))
+      .map((file) => path.posix.relative(pkgDir.replaceAll("\\", "/"), file));
+    if (relativeTestFiles.length > 0) runs.push({ packageName, relativeTestFiles });
+  }
+  return runs;
+}
+
+/** One-line `--print-mode` / run-log description of the selected guard companions. */
+export function describeGuardCompanions(selection) {
+  if (!selection || selection.length === 0) return "[test-changed] guard companions: none";
+  const files = selection.flatMap(({ packageName, testFiles }) => testFiles.map((file) => `${packageName}:${file}`));
+  const triggerFiles = [...new Set(selection.flatMap(({ reasons }) => reasons.map(({ file }) => file)))].sort();
+  const more = triggerFiles.length > 1 ? `, +${triggerFiles.length - 1} more` : "";
+  return `[test-changed] guard companions: ${files.join(",")} (triggered by ${triggerFiles[0]}${more})`;
+}
+
 export function normalizeForwardedArgs(argv) {
   const normalized = [];
 
@@ -1646,6 +1812,8 @@ export async function main(argv = process.argv.slice(2)) {
       reverseDependencyMap,
     });
     emitModeDecision(plan);
+    const printGuardSelection = plan.mode === "full" ? [] : selectGuardCompanionTests(changedFiles);
+    console.log(describeGuardCompanions(printGuardSelection));
     return;
   }
 
@@ -1672,6 +1840,11 @@ export async function main(argv = process.argv.slice(2)) {
   // R5: structured mode-decision telemetry so fast-path hit rate is observable.
   emitModeDecision(plan);
 
+  // FNXC:TestInfrastructure 2026-10-08-01:57: guard companions are selected from the raw diff and
+  // run regardless of the pass-cache and wide-fan-out delegation; a full run already covers them.
+  const guardSelection = plan.mode === "full" ? [] : selectGuardCompanionTests(changedFiles);
+  console.log(describeGuardCompanions(guardSelection));
+
   // For changed plans, resolve the cache now so we know whether any package
   // actually needs running before we spend setup time.
   let cachedPackages = [];
@@ -1697,7 +1870,9 @@ export async function main(argv = process.argv.slice(2)) {
   // Gate mode always has work: the merge-gate suite is not covered by the
   // per-package cache (it spans engine + cli with its own selection), so it
   // must never short-circuit through the cache-fresh fast path.
-  const hasWork = plan.mode === "full" || plan.mode === "gate" || activePackages.length > 0;
+  // Triggered guard companions count as work so a cache-fresh run still runs them.
+  const hasWork =
+    plan.mode === "full" || plan.mode === "gate" || activePackages.length > 0 || guardSelection.length > 0;
 
   // Cache-fresh fast path: nothing to run. Emit a fast-path mode line, run only
   // the (now cheap) isolation guard, and skip skill-sync, artifact-ensure,
@@ -1741,6 +1916,41 @@ export async function main(argv = process.argv.slice(2)) {
     cleanupIsolatedHomePath(isolatedHome);
   };
 
+  // Guard companions run after the gate/affected lanes, never touch the pass-cache, and skip any file the
+  // wide-fan-out lane already passed positionally (FNXC:TestInfrastructure 2026-10-08-01:57).
+  const runGuardCompanions = async (alreadyRunTestFiles = new Set()) => {
+    for (const { packageName, relativeTestFiles } of planGuardCompanionRuns(guardSelection, {
+      alreadyRunTestFiles,
+      packageDirByName,
+    })) {
+      console.log(`[test-changed] guard companions for ${packageName}: ${relativeTestFiles.join(", ")}`);
+      await runMaybeIsolated(
+        "pnpm",
+        [
+          "--filter",
+          packageName,
+          `--workspace-concurrency=${workspaceConcurrency}`,
+          "exec",
+          "vitest",
+          "run",
+          ...relativeTestFiles,
+          "--passWithNoTests",
+          "--silent=passed-only",
+          "--reporter=dot",
+          ...forwardedArgs,
+        ],
+        {
+          env: Object.hasOwn(SCOPED_AFFECTED_MEMORY_ENVELOPES, packageName)
+            ? createScopedAffectedMemoryEnvelopeEnv(packageName, isolatedHomeEnv)
+            : isolatedHomeEnv,
+          onBeforeAfterCheck: cleanupIsolatedHome,
+          budgetMs: deriveScopedAffectedBudgetMs(),
+          label: `guard companions: ${packageName}`,
+        },
+      );
+    }
+  };
+
   try {
 
   if (plan.mode === "full") {
@@ -1774,6 +1984,7 @@ export async function main(argv = process.argv.slice(2)) {
       budgetMs: deriveBudgetMs({ klass: "changed" }),
       label: "test:gate",
     });
+    await runGuardCompanions();
     return;
   }
 
@@ -1821,6 +2032,8 @@ export async function main(argv = process.argv.slice(2)) {
   // from the pass-cache so a later run re-evaluates instead of trusting a
   // partial pass as a full one.
   const notFullyTestedPackages = new Set();
+  // Repo-relative test files passed positionally by the wide-fan-out lane (dedupes guard companions).
+  const alreadyRunTestFiles = new Set();
 
   for (const { packages, mode, memoryEnvelopePackage = null } of [
     ...partitionScopedAffectedPackages(scopable).map((group) => ({ ...group, mode: "scoped" })),
@@ -1875,6 +2088,7 @@ export async function main(argv = process.argv.slice(2)) {
           `[test-changed] ${pkg}: changed non-test source detected; running ONLY the ${explicitChangedTestFiles.length} directly-changed test file(s); ` +
             delegationNote,
         );
+        for (const file of explicitChangedTestFiles) alreadyRunTestFiles.add(file.replaceAll("\\", "/"));
       }
     }
 
@@ -1919,6 +2133,8 @@ export async function main(argv = process.argv.slice(2)) {
       label: `affected (${mode}): ${packages.join(", ")}`,
     });
   }
+
+  await runGuardCompanions(alreadyRunTestFiles);
 
   // Tests passed — record in cache (never cache failures; process.exit on failure above).
   // Skip partially-tested/delegated heavy packages so a partial pass is never
