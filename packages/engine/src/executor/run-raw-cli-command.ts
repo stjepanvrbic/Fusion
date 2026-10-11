@@ -6,7 +6,7 @@
 import type { TaskDetail, TaskStore, RunCommandResult } from "@fusion/core";
 import { executorLog } from "../logger.js";
 import { createRunAuditor, generateSyntheticRunId, type EngineRunContext, type RunAuditor } from "../util/run-audit.js";
-import { configuredCommandErrorMessage } from "./configured-command.js";
+import { configuredCommandErrorMessage, WORKFLOW_COMMAND_STEP_TIMEOUT_MS } from "./configured-command.js";
 import { createConfiguredCommandAbortError } from "./task-predicates.js";
 
 export type RunRawCliCommandDeps = {
@@ -40,7 +40,7 @@ export async function runRawCliCommand(
     const result = await deps.runConfiguredCommand(
       command,
       worktreePath,
-      120_000,
+      WORKFLOW_COMMAND_STEP_TIMEOUT_MS,
       extraEnv,
       createRunAuditor(deps.store, {
         runId: deps.getRunContextFor(task.id)?.runId ?? generateSyntheticRunId("exec-cli", task.id),

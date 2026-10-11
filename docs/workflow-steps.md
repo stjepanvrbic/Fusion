@@ -533,7 +533,7 @@ A post-merge node on a landed card never runs in an unusable checkout. If the re
 ## Execution Modes
 
 - **Prompt mode**: starts an AI agent for the step
-- **Script mode**: runs a named script from project settings (`settings.scripts`)
+- **Script mode**: runs a named script from project settings (`settings.scripts`); the command is stopped after a fixed 120 seconds, independent of the workflow Step timeout, which bounds AI-session steps
 
 Prompt mode can run with readonly or coding-capable tool access depending on step/template configuration.
 

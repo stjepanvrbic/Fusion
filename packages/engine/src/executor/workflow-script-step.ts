@@ -2,6 +2,9 @@
  * FNXC:CodeOrganization 2026-08-03-17:05:
  * executeScriptWorkflowStep peeled from TaskExecutor (U4 Slice B / step-session edge).
  * Resolves settings.scripts[scriptName] and runs via runConfiguredCommand in the task worktree.
+ *
+ * FNXC:WorkflowScriptTimeout 2026-10-11-09:13:
+ * The command is bounded by WORKFLOW_COMMAND_STEP_TIMEOUT_MS, never by `settings.workflowStepTimeoutMs`, which budgets AI-session steps only.
  */
 import type { RunCommandResult, Settings, Task, TaskStore, WorkflowStep } from "@fusion/core";
 import { executorLog } from "../logger.js";
@@ -9,6 +12,7 @@ import { createRunAuditor, generateSyntheticRunId, type EngineRunContext, type R
 import {
   configuredCommandErrorMessage,
   truncateWorkflowScriptOutput,
+  WORKFLOW_COMMAND_STEP_TIMEOUT_MS,
 } from "./configured-command.js";
 import { createConfiguredCommandAbortError } from "./task-predicates.js";
 
@@ -56,7 +60,7 @@ export async function executeScriptWorkflowStep(
     const scriptResult = await deps.runConfiguredCommand(
       scriptCommand,
       worktreePath,
-      120_000,
+      WORKFLOW_COMMAND_STEP_TIMEOUT_MS,
       extraEnv,
       createRunAuditor(deps.store, {
         runId: deps.getRunContextFor(task.id)?.runId ?? generateSyntheticRunId("exec-script", task.id),

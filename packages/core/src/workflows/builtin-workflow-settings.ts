@@ -89,7 +89,12 @@ export const BUILTIN_MOVED_WORKFLOW_SETTINGS: WorkflowSettingDefinition[] = [
      * Code Review steps can exceed the old six-minute default on ordinary dashboard changes. Use a fifteen-minute workflow-step default so every project without an override gets enough reviewer time while keeping runaway sessions bounded.
      */
     default: 900_000,
-    description: "Maximum time a single workflow step may run before it is timed out.",
+    /*
+     * FNXC:WorkflowStepTimeout 2026-10-11-09:21:
+     * The operator-facing description names what the setting bounds: AI-run steps before and after merge. Script steps and raw CLI nodes keep their own fixed command limit, so the text must not claim every workflow step.
+     */
+    description:
+      "Maximum time a single AI-run workflow step (review, prompt or skill step, before or after merge) may run before it is timed out. Script steps use their own fixed limit.",
   },
   {
     id: "workflowStepScopeEnforcement",
@@ -490,7 +495,7 @@ export const BUILTIN_TRIAGE_POLICY_SETTINGS: WorkflowSettingDefinition[] = [
      * FNXC:TriagePlanningTimeout 2026-08-10-18:32:
      * Workflow-native triage policy — it never lived in project/global settings, so it belongs here
      * and must never be added to MOVED_SETTINGS_KEYS. The planning turn previously had NO
-     * Fusion-side ceiling: `workflowStepTimeoutMs` covers pre-merge workflow STEPS only, and the
+     * Fusion-side ceiling: `workflowStepTimeoutMs` covers workflow step sessions only, and the
      * provider SDK's 300s cap is time-to-first-byte (cleared once headers arrive), so a hung stream
      * ran unbounded — observed at 126 minutes, with failed-attempt durations showing a smooth
      * 1-126 min spread and no clustering, the signature of nothing enforcing a bound.

@@ -1762,10 +1762,15 @@ export interface ProjectSettings {
    *  When set, reliability windows are floored at this instant so historical
    *  events before the reset are excluded from aggregates (but not deleted). */
   reliabilityStatsResetAt?: string;
-  /** Wall-clock timeout (ms) for a single pre-merge workflow step's AI call.
+  /** Wall-clock timeout (ms) for a single AI-session workflow step: a review or non-review
+   *  prompt or skill step, before or after merge, and each per-repository workspace review session.
    *  When a step exceeds this, the session is aborted and the executor is
    *  given one shot to retry with the configured fallback model before the
-   *  step is reported as failed. Default: 900_000 (15 minutes). */
+   *  step is reported as failed. Default: 900_000 (15 minutes).
+   *
+   *  FNXC:WorkflowStepTimeout 2026-10-11-09:21:
+   *  The budget covers post-merge prompt gates as well as pre-merge steps.
+   *  Script steps and raw CLI workflow nodes are not AI sessions; the engine bounds their command separately with the fixed `WORKFLOW_COMMAND_STEP_TIMEOUT_MS`. */
   workflowStepTimeoutMs?: number;
   /** How pre-merge prompt workflow steps enforce declared File Scope at step end.
    *  - "block" (default): mark the step failed/revision-requested on off-scope writes
@@ -2567,7 +2572,7 @@ export interface Settings extends GlobalSettings, ProjectSettings {
    *  FNXC:TriagePlanningTimeout 2026-08-10-18:32:
    *  Workflow-native (like `leanPlanning`/`autoApproveSpec` above) — it never lived in project or
    *  global settings, so it is declared HERE rather than on `ProjectSettings`, and must never be
-   *  added to `MOVED_SETTINGS_KEYS`. `workflowStepTimeoutMs` covers pre-merge workflow STEPS only
+   *  added to `MOVED_SETTINGS_KEYS`. `workflowStepTimeoutMs` covers workflow step sessions only
    *  and never applied to the planning session, which had no Fusion-side ceiling at all: the
    *  provider SDK's 300s `APIConnectionTimeoutError` caps time-to-first-byte and is cleared once
    *  headers arrive, so a hung stream ran unbounded (observed: 126 minutes). On timeout the session
