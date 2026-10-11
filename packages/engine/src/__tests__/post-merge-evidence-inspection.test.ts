@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { readPostMergeArtifact } from "../executor/read-post-merge-artifact.js";
-vi.mock("../executor/read-post-merge-artifact.js", () => ({ readPostMergeArtifact: vi.fn(async () => "artifact evidence") }));
+import { InspectionToolMissingError, readPostMergeArtifact } from "../executor/read-post-merge-artifact.js";
+vi.mock("../executor/read-post-merge-artifact.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../executor/read-post-merge-artifact.js")>(),
+  readPostMergeArtifact: vi.fn(async () => "artifact evidence"),
+}));
 import { createPostMergeInspectionTool } from "../executor/post-merge-evidence-inspection.js";
 
 function harness() {
@@ -65,7 +68,29 @@ describe("bounded post-merge evidence inspection", () => {
   it("reports unavailable evidence instead of treating subprocess failure as success", async () => {
     const { run, invoke } = harness();
     run.mockRejectedValue(new Error("output exceeded limit"));
-    expect(await invoke({ operation: "git_status" })).toMatchObject({ isError: true });
+    const result = await invoke({ operation: "git_status" });
+    expect(result).toMatchObject({ isError: true, details: { error: "Evidence unavailable: output exceeded limit" } });
+    expect(result.details).not.toHaveProperty("missingTool");
+  });
+
+  it("reports a missing artifact download tool distinctly from unavailable evidence", async () => {
+    const { invoke } = harness();
+    vi.mocked(readPostMergeArtifact).mockRejectedValueOnce(new InspectionToolMissingError("gh"));
+    const result = await invoke({ operation: "github_artifact_contents", repository: "owner/repo", artifactId: 42 });
+    const text = (result.content[0] as { text: string }).text;
+    expect(result).toMatchObject({ isError: true, details: { missingTool: "gh" } });
+    expect(text).toMatch(/^Inspection tool missing:/);
+    expect(text).not.toContain("Evidence unavailable");
+  });
+
+  it("reports a missing git binary on the generic path as a missing tool", async () => {
+    const { run, invoke } = harness();
+    run.mockRejectedValue(Object.assign(new Error("spawn git ENOENT"), { code: "ENOENT", syscall: "spawn git", path: "git" }));
+    const result = await invoke({ operation: "git_status" });
+    const text = (result.content[0] as { text: string }).text;
+    expect(result).toMatchObject({ isError: true, details: { missingTool: "git" } });
+    expect(text).toMatch(/^Inspection tool missing:/);
+    expect(text).not.toContain("Evidence unavailable");
   });
 
   it("pages large output without silently hiding evidence", async () => {

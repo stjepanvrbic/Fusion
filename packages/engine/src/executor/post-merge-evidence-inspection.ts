@@ -1,4 +1,4 @@
-import { readPostMergeArtifact } from "./read-post-merge-artifact.js";
+import { asInspectionToolMissingError, InspectionToolMissingError, readPostMergeArtifact } from "./read-post-merge-artifact.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Type, type Static } from "@earendil-works/pi-ai";
@@ -86,7 +86,7 @@ export function createPostMergeInspectionTool(
   return {
     name: "fn_post_merge_inspect",
     label: "Inspect Landed Evidence",
-    description: "Read committed Git evidence and GitHub Actions runs, jobs, logs and artifact metadata. No arbitrary commands, code writes or URLs. Artifact contents are read from a bounded temporary download. Use github_repository to discover owner/repository, github_runs to find the first post-landing run, then github_run/jobs/artifacts/job_log; github_artifact_contents reads a selected artifact by artifactId. Git operations use the project root or a recorded workspace repository. Output is paged at 8,000 characters; use outputOffset for remaining evidence.",
+    description: "Read committed Git evidence and GitHub Actions runs, jobs, logs and artifact metadata. No arbitrary commands, code writes or URLs. Artifact contents are read from a bounded in-memory download. Use github_repository to discover owner/repository, github_runs to find the first post-landing run, then github_run/jobs/artifacts/job_log; github_artifact_contents reads a selected artifact by artifactId. Git operations use the project root or a recorded workspace repository. Output is paged at 8,000 characters; use outputOffset for remaining evidence.",
     parameters,
     execute: async (_id, params: InspectionInput, signal) => {
       try {
@@ -111,13 +111,23 @@ export function createPostMergeInspectionTool(
             output = params.operation === "git_ancestor" ? "true" : result.stdout;
           }
         } catch (error) {
-          if (params.operation !== "git_ancestor" || (error as { code?: unknown }).code !== 1) throw error;
+          if (params.operation !== "git_ancestor" || (error as { code?: unknown }).code !== 1) {
+            throw inspection ? asInspectionToolMissingError(error, inspection.binary) : error;
+          }
           output = "false";
         }
         const page = output.slice(offset, offset + 8_000);
         const nextOffset = offset + page.length < output.length ? offset + page.length : undefined;
         return { content: [{ type: "text" as const, text: `${nextOffset !== undefined ? `[More evidence available: repeat with outputOffset=${nextOffset}]\n` : ""}${page || "(empty output)"}` }], details: { output: page, ...(nextOffset !== undefined ? { nextOffset } : {}) } };
       } catch (error) {
+        /*
+        FNXC:PostMergeEvidence 2026-10-11-04:34:
+        A missing git or gh binary must render as "Inspection tool missing" with the tool name, never as "Evidence unavailable", so a host setup gap is not mistaken for absent evidence.
+        */
+        if (error instanceof InspectionToolMissingError) {
+          const message = `Inspection tool missing: ${error.message}`;
+          return { isError: true, content: [{ type: "text" as const, text: message }], details: { error: message, missingTool: error.tool } };
+        }
         const message = `Evidence unavailable: ${error instanceof Error ? error.message : String(error)}`;
         return { isError: true, content: [{ type: "text" as const, text: message }], details: { error: message } };
       }
