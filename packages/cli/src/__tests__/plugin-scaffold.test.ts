@@ -1,6 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from "vitest";
 import { mkdirSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { validatePluginManifest } from "@fusion/plugin-sdk";
 import { resolvePluginEntryFile } from "../commands/plugin.js";
@@ -169,5 +169,98 @@ describe("plugin-scaffold", () => {
 
       await expect(resolvePluginEntryFile(outputDir)).resolves.toBe(entryPath);
     });
+  });
+
+  describe("success message location", () => {
+    const fakeCwd = join(tmpBase, "cwd-root");
+    const insideCwd = (relativePath: string): string => `.${sep}${relativePath}${sep}`;
+    const commands = [
+      { label: "create", run: runPluginCreate, prefix: "  Created plugin at " },
+      { label: "new", run: runPluginNew, prefix: "  Created standalone plugin at " },
+    ];
+    const cases = commands.flatMap(({ label, run, prefix }) => {
+      const outsideTarget = join(tmpBase, "outside", `${label}-abs-plugin`);
+      const escapedTarget = resolve(fakeCwd, "..", `${label}-escape-plugin`);
+      return [
+        {
+          title: "a relative output inside the working directory",
+          name: `${label}-rel-plugin`,
+          output: `${label}-rel-plugin`,
+          location: insideCwd(`${label}-rel-plugin`),
+        },
+        {
+          title: "an omitted output",
+          name: `${label}-default-plugin`,
+          output: undefined,
+          location: insideCwd(`${label}-default-plugin`),
+        },
+        {
+          title: "a dot-prefixed relative output",
+          name: `${label}-dot-plugin`,
+          output: `./${label}-dot-plugin`,
+          location: insideCwd(`${label}-dot-plugin`),
+        },
+        {
+          title: "a nested relative output",
+          name: `${label}-deep-plugin`,
+          output: join("nested", `${label}-deep-plugin`),
+          location: insideCwd(join("nested", `${label}-deep-plugin`)),
+        },
+        {
+          title: "an absolute output inside the working directory",
+          name: `${label}-abs-inside-plugin`,
+          output: join(fakeCwd, `${label}-abs-inside-plugin`),
+          location: insideCwd(`${label}-abs-inside-plugin`),
+        },
+        {
+          title: "an absolute output outside the working directory",
+          name: `${label}-abs-plugin`,
+          output: outsideTarget,
+          location: `${outsideTarget}${sep}`,
+        },
+        {
+          title: "a relative output escaping the working directory",
+          name: `${label}-escape-plugin`,
+          output: join("..", `${label}-escape-plugin`),
+          location: `${escapedTarget}${sep}`,
+        },
+        {
+          title: "an output whose name starts with two dots",
+          name: `${label}-dots-plugin`,
+          output: `..${label}-dots-plugin`,
+          location: insideCwd(`..${label}-dots-plugin`),
+        },
+      ].map((scenario) => ({ ...scenario, label, run, prefix }));
+    });
+
+    beforeEach(() => {
+      mkdirSync(fakeCwd, { recursive: true });
+      vi.spyOn(process, "cwd").mockReturnValue(fakeCwd);
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it.each(cases)(
+      "plugin $label prints the location for $title",
+      async ({ run, prefix, name, output, location }) => {
+        const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+        await run(name, output === undefined ? undefined : { output });
+
+        const target = resolve(fakeCwd, output ?? name);
+        const locationLine = logSpy.mock.calls
+          .map(([line]) => String(line))
+          .find((line) => line.includes("plugin at "));
+
+        expect(locationLine).toBe(`${prefix}${location}`);
+        expect(locationLine).not.toContain(`.${sep}${target}`);
+        expect(locationLine).not.toContain(`./${target}`);
+        expect(locationLine).not.toContain(`.${sep}.${sep}`);
+        expect(locationLine).not.toContain("././");
+        expect(existsSync(join(target, "package.json"))).toBe(true);
+      },
+    );
   });
 });

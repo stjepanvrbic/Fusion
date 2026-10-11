@@ -6,7 +6,7 @@
  */
 
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { readOwnCliVersion } from "../cli-version.js";
 
@@ -41,6 +41,23 @@ function resolveTargetPath(name: string, output?: string): { targetDir: string; 
     targetDir,
     targetPath: resolve(process.cwd(), targetDir),
   };
+}
+
+/**
+ * FNXC:PluginScaffold 2026-10-11-03:22:
+ * The success line of `fn plugin create` and `fn plugin new` must name a location the operator can use as printed.
+ * A target strictly inside the working directory is shown relative to it; any other target is shown as its absolute path, unchanged.
+ * Prefixing the raw `--output` value with `./` printed `./C:\Users\...` for an absolute output, so the location is derived from the resolved path instead.
+ * `path.relative` returns an absolute path when the target is on another Windows drive, which is why an absolute result counts as outside.
+ */
+function formatScaffoldLocation(targetPath: string): string {
+  const relativePath = relative(process.cwd(), targetPath);
+  const insideCwd =
+    relativePath !== "" &&
+    !isAbsolute(relativePath) &&
+    relativePath !== ".." &&
+    !relativePath.startsWith(`..${sep}`);
+  return insideCwd ? `.${sep}${relativePath}${sep}` : `${targetPath}${sep}`;
 }
 
 function ensureTargetPathAvailable(targetDir: string, targetPath: string): void {
@@ -394,7 +411,7 @@ export async function runPluginCreate(
 
   // Print success message
   console.log();
-  console.log(`  Created plugin at ./${targetDir}/`);
+  console.log(`  Created plugin at ${formatScaffoldLocation(targetPath)}`);
   console.log();
   console.log("  Next steps:");
   console.log(`    cd ${targetDir}`);
@@ -434,7 +451,7 @@ export async function runPluginNew(
   }
 
   console.log();
-  console.log(`  Created standalone plugin at ./${targetDir}/`);
+  console.log(`  Created standalone plugin at ${formatScaffoldLocation(targetPath)}`);
   console.log();
   console.log("  Next steps:");
   console.log(`    cd ${targetDir}`);
