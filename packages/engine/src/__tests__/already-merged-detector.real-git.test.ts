@@ -2,13 +2,20 @@
 // anchoring. These tests pin the 2026-05-23 lost-work incident's bug #2:
 // the detector must NOT attribute a task to a commit that merely *mentions*
 // the task ID in prose (the historical `git log --grep` first-hit bug).
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as childProcess from "node:child_process";
 import { execSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import { findAlreadyMergedTaskCommit } from "../merge/already-merged-detector.js";
+
+// Passthrough spies: every detection still runs real git, and the call log shows which launches went through a shell.
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, exec: vi.fn(actual.exec), execFile: vi.fn(actual.execFile) };
+});
 
 const hasGit = spawnSync("git", ["--version"], { stdio: "pipe" }).status === 0;
 const describeIfGit = hasGit ? describe : describe.skip;
@@ -258,6 +265,72 @@ describeIfGit("findAlreadyMergedTaskCommit ownership anchoring (real git)", () =
     });
 
     expect(result).toBeNull();
+  });
+
+  /*
+  FNXC:AlreadyLandedDetection 2026-10-11-08:40:
+  Single git commands run shell-free (`execFile("git", argv)`); only the two `| git patch-id` pipelines may use the shell.
+  One detection computes the branch merge base once: the no-unique-diff proof and the patch-id step share it when no recorded base commit exists.
+  */
+  describe("process launches", () => {
+    /** Canonical task branch whose patch landed on main as an unowned equivalent commit, so detection reaches and returns the patch-id strategy. */
+    function setupPatchEquivalentRepo(): { repo: string; landedSha: string } {
+      const repo = setupRepo();
+      git(repo, "git checkout -b fusion/fn-amd-spawn");
+      mkdirSync(path.join(repo, "src"), { recursive: true });
+      writeFileSync(path.join(repo, "src", "spawn.txt"), "spawn content\n", "utf-8");
+      git(repo, "git add src/spawn.txt && git commit -m 'work on the task branch'");
+      git(repo, "git checkout main");
+      mkdirSync(path.join(repo, "src"), { recursive: true });
+      writeFileSync(path.join(repo, "src", "unrelated.txt"), "unrelated\n", "utf-8");
+      git(repo, "git add src/unrelated.txt && git commit -m 'unrelated main work'");
+      writeFileSync(path.join(repo, "src", "spawn.txt"), "spawn content\n", "utf-8");
+      git(repo, "git add src/spawn.txt && git commit -m 'land the same change'");
+      return { repo, landedSha: git(repo, "git rev-parse HEAD") };
+    }
+
+    async function detectWithLaunchLog(repo: string) {
+      const execFileMock = vi.mocked(childProcess.execFile);
+      const execMock = vi.mocked(childProcess.exec);
+      execFileMock.mockClear();
+      execMock.mockClear();
+      const result = await findAlreadyMergedTaskCommit({
+        taskId: "FN-AMD-SPAWN",
+        repoDir: repo,
+        baseBranch: "main",
+        taskBranch: "fusion/fn-amd-spawn",
+      });
+      return {
+        result,
+        fileCalls: execFileMock.mock.calls.map(([file, args]) => ({ file, args })),
+        shellCommands: execMock.mock.calls.map(([command]) => command),
+      };
+    }
+
+    it("runs single commands without a shell and uses the shell only for the two patch-id pipelines", async () => {
+      const { repo, landedSha } = setupPatchEquivalentRepo();
+
+      const { result, fileCalls, shellCommands } = await detectWithLaunchLog(repo);
+
+      expect(result).toEqual({ sha: landedSha, strategy: "patch-id", ownershipProof: "canonical-branch-patch" });
+      expect(fileCalls.length).toBeGreaterThan(0);
+      for (const call of fileCalls) {
+        expect(call.file).toBe("git");
+        expect(Array.isArray(call.args)).toBe(true);
+      }
+      expect(shellCommands).toHaveLength(2);
+      for (const command of shellCommands) expect(command).toMatch(/ \| git patch-id$/);
+    });
+
+    it("computes the branch merge base once per detection when no base commit is recorded", async () => {
+      const { repo } = setupPatchEquivalentRepo();
+
+      const { result, fileCalls } = await detectWithLaunchLog(repo);
+
+      expect(result?.strategy).toBe("patch-id");
+      const mergeBaseCalls = fileCalls.filter(({ args }) => Array.isArray(args) && args[0] === "merge-base" && args[1] !== "--is-ancestor");
+      expect(mergeBaseCalls).toHaveLength(1);
+    });
   });
 
   it("attributes via ancestry when the landed commit carries a conventional-subject anchor", async () => {

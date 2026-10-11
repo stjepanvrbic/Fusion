@@ -1,10 +1,39 @@
-import { exec, execSync } from "node:child_process";
-import { bindPosixShell, withPosixShell } from "@fusion/core";
-import { promisify } from "node:util";
+import { exec, execFile } from "node:child_process";
+import { bindPosixShell } from "@fusion/core";
 
 import { canonicalFusionBranchName, resolveTaskWorkingBranch } from "../worktree/worktree-names.js";
 
-const execAsync = bindPosixShell(promisify(exec));
+/*
+FNXC:AlreadyLandedDetection 2026-10-11-08:40:
+Single git commands run without a shell, through `execFile("git", argv)`.
+On Windows every Git Bash launch is two extra processes (`Git\bin\bash.exe`, then `usr\bin\bash.exe`), which made shell launches the largest cost of one detection; argv also removes the shell-quoting layer.
+Only the two `… | git patch-id` pipelines need a shell, and they keep the POSIX-shell seam.
+Both runners take node's callback form, so a passthrough mock of `node:child_process` observes the same calls production makes.
+*/
+const execPosixShell = bindPosixShell(exec);
+
+const GIT_TIMEOUT_MS = 30_000;
+const GIT_MAX_BUFFER = 1024 * 1024;
+
+/** Runs one git command without a shell; resolves its stdout and rejects on a non-zero exit, timeout or spawn failure. */
+function runGit(repoDir: string, args: readonly string[], maxBuffer = GIT_MAX_BUFFER): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("git", args, { cwd: repoDir, timeout: GIT_TIMEOUT_MS, maxBuffer, encoding: "utf8" }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+}
+
+/** Runs a `… | git patch-id` pipeline under the POSIX shell. */
+function runPatchIdPipeline(repoDir: string, command: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execPosixShell(command, { cwd: repoDir, timeout: 60_000, maxBuffer: 32 * 1024 * 1024, encoding: "utf8" }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+}
 
 export type AlreadyMergedDetectionStrategy = "trailer" | "ancestry" | "patch-id" | "tree-equal" | "no-diff";
 
@@ -111,33 +140,21 @@ async function commitHasForeignTaskOwnership(
   taskId: string,
   lineageId: string | undefined,
 ): Promise<boolean> {
-  const { stdout } = await execAsync(`git show -s --format=%s%x1f%b ${shellQuote(sha)}`, {
-    cwd: repoDir,
-    timeout: 30_000,
-    maxBuffer: 1024 * 1024,
-  });
+  const stdout = await runGit(repoDir, ["show", "-s", "--format=%s%x1f%b", sha]);
   const [subject = "", body = ""] = stdout.split("\x1f");
   const ownership = getCommitTaskOwnership(taskId, lineageId, subject, body);
   return ownership.rejectionReason === "foreign-task" || ownership.rejectionReason === "foreign-lineage";
 }
 
-async function branchHasNoUniqueDiff(repoDir: string, branchTip: string, baseBranch: string): Promise<boolean> {
-  const { stdout: mergeBaseStdout } = await execAsync(
-    `git merge-base ${shellQuote(branchTip)} ${shellQuote(baseBranch)}`,
-    {
-      cwd: repoDir,
-      timeout: 30_000,
-      maxBuffer: 1024 * 1024,
-    },
-  );
-  const mergeBase = mergeBaseStdout.trim();
+async function branchHasNoUniqueDiff(
+  repoDir: string,
+  branchTip: string,
+  mergeBaseOf: (tip: string) => Promise<string>,
+): Promise<boolean> {
+  const mergeBase = await mergeBaseOf(branchTip);
   if (!mergeBase) return false;
 
-  await execAsync(`git diff --quiet ${shellQuote(mergeBase)}..${shellQuote(branchTip)}`, {
-    cwd: repoDir,
-    timeout: 30_000,
-    maxBuffer: 1024 * 1024,
-  });
+  await runGit(repoDir, ["diff", "--quiet", `${mergeBase}..${branchTip}`]);
   return true;
 }
 
@@ -145,43 +162,29 @@ export async function findAlreadyMergedTaskCommit(
   input: AlreadyMergedLookupInput,
 ): Promise<AlreadyMergedLookupResult | null> {
   const { taskId, lineageId, repoDir, baseBranch, taskBranch, baseCommitSha } = input;
+  // One merge-base computation per tip and detection: the no-unique-diff proof and the patch-id step need the same value.
+  const mergeBases = new Map<string, Promise<string>>();
+  const mergeBaseOf = (tip: string): Promise<string> => {
+    let mergeBase = mergeBases.get(tip);
+    if (!mergeBase) {
+      mergeBase = runGit(repoDir, ["merge-base", tip, baseBranch]).then((stdout) => stdout.trim());
+      mergeBases.set(tip, mergeBase);
+    }
+    return mergeBase;
+  };
 
   try {
     if (lineageId) {
       const lineagePattern = `^Fusion-Task-Lineage: ${escapeRegex(lineageId)}$`;
-      const lineageCommand = [
-        "git log",
-        `--grep=${shellQuote(lineagePattern)}`,
-        "-E",
-        "--max-count=1",
-        "--format=%H",
-        shellQuote(baseBranch),
-      ].join(" ");
-      const lineage = await execAsync(lineageCommand, {
-        cwd: repoDir,
-        timeout: 30_000,
-        maxBuffer: 1024 * 1024,
-      });
-      const lineageSha = lineage.stdout.trim();
+      const lineage = await runGit(repoDir, ["log", `--grep=${lineagePattern}`, "-E", "--max-count=1", "--format=%H", baseBranch]);
+      const lineageSha = lineage.trim();
       if (lineageSha) {
         return { sha: lineageSha, strategy: "trailer", ownershipProof: "lineage-trailer" };
       }
     }
 
     const trailerPattern = `^Fusion-Task-Id: ${escapeRegex(taskId)}$`;
-    const trailerCommand = [
-      "git log",
-      `--grep=${shellQuote(trailerPattern)}`,
-      "-E",
-      "--max-count=1",
-      "--format=%H",
-      shellQuote(baseBranch),
-    ].join(" ");
-    const { stdout } = await execAsync(trailerCommand, {
-      cwd: repoDir,
-      timeout: 30_000,
-      maxBuffer: 1024 * 1024,
-    });
+    const stdout = await runGit(repoDir, ["log", `--grep=${trailerPattern}`, "-E", "--max-count=1", "--format=%H", baseBranch]);
     const sha = stdout.trim();
     if (sha) {
       return { sha, strategy: "trailer", ownershipProof: "task-trailer" };
@@ -202,13 +205,9 @@ export async function findAlreadyMergedTaskCommit(
   let branchTipHasNoUniqueDiff = false;
   let branchTipForeignNoDiff = false;
   try {
-    branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, withPosixShell({
-      cwd: repoDir,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    })).trim();
+    branchTip = (await runGit(repoDir, ["rev-parse", "--verify", branchName])).trim();
     if (hasCanonicalBranchIdentity) {
-      branchTipHasNoUniqueDiff = await branchHasNoUniqueDiff(repoDir, branchTip, baseBranch).catch(() => false);
+      branchTipHasNoUniqueDiff = await branchHasNoUniqueDiff(repoDir, branchTip, mergeBaseOf).catch(() => false);
     }
     /*
     FNXC:WorkflowRecovery 2026-07-03-21:31:
@@ -221,10 +220,7 @@ export async function findAlreadyMergedTaskCommit(
     branchTipForeignNoDiff = branchTipHasNoUniqueDiff && branchTipHasForeignOwnership;
     branchTipOwnershipVerified = true;
 
-    execSync(`git merge-base --is-ancestor ${shellQuote(branchTip)} ${shellQuote(baseBranch)}`, withPosixShell({
-      cwd: repoDir,
-      stdio: ["pipe", "pipe", "pipe"],
-    }));
+    await runGit(repoDir, ["merge-base", "--is-ancestor", branchTip, baseBranch]);
     if (branchTipForeignNoDiff) {
       return { sha: branchTip, strategy: "no-diff", ownershipProof: "canonical-branch-no-diff" };
     }
@@ -233,20 +229,11 @@ export async function findAlreadyMergedTaskCommit(
     // match that also hits commits merely mentioning the task ID in prose.
     // Gather candidates (bounded) and accept only the first whose subject/body
     // is OWNERSHIP-anchored on the task — never the first raw grep hit.
-    const ancestryCommand = [
-      "git log",
-      "--first-parent",
-      "-E",
-      "--format=%H%x1f%s%x1f%b%x1e",
-      `--grep=${shellQuote(escapeRegex(taskId))}`,
-      "--max-count=20",
-      shellQuote(baseBranch),
-    ].join(" ");
-    const { stdout } = await execAsync(ancestryCommand, {
-      cwd: repoDir,
-      timeout: 30_000,
-      maxBuffer: 4 * 1024 * 1024,
-    });
+    const stdout = await runGit(
+      repoDir,
+      ["log", "--first-parent", "-E", "--format=%H%x1f%s%x1f%b%x1e", `--grep=${escapeRegex(taskId)}`, "--max-count=20", baseBranch],
+      4 * 1024 * 1024,
+    );
     const records = stdout
       .split("\x1e")
       .map((record) => record.trim())
@@ -268,13 +255,9 @@ export async function findAlreadyMergedTaskCommit(
       return null;
     }
     if (!branchTip || !branchTipOwnershipVerified) {
-      branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, withPosixShell({
-        cwd: repoDir,
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      })).trim();
+      branchTip = (await runGit(repoDir, ["rev-parse", "--verify", branchName])).trim();
       if (hasCanonicalBranchIdentity) {
-        branchTipHasNoUniqueDiff = await branchHasNoUniqueDiff(repoDir, branchTip, baseBranch).catch(() => false);
+        branchTipHasNoUniqueDiff = await branchHasNoUniqueDiff(repoDir, branchTip, mergeBaseOf).catch(() => false);
       }
       const branchTipHasForeignOwnership = await commitHasForeignTaskOwnership(repoDir, branchTip, taskId, lineageId);
       if (!branchTipHasNoUniqueDiff && branchTipHasForeignOwnership) {
@@ -286,15 +269,7 @@ export async function findAlreadyMergedTaskCommit(
 
     let branchBase = baseCommitSha?.trim();
     if (!branchBase) {
-      const { stdout: mergeBaseStdout } = await execAsync(
-        `git merge-base ${shellQuote(branchTip)} ${shellQuote(baseBranch)}`,
-        {
-          cwd: repoDir,
-          timeout: 30_000,
-          maxBuffer: 1024 * 1024,
-        },
-      );
-      branchBase = mergeBaseStdout.trim();
+      branchBase = await mergeBaseOf(branchTip);
     }
 
     if (!branchBase) {
@@ -302,11 +277,7 @@ export async function findAlreadyMergedTaskCommit(
     }
 
     const branchPatchIdCommand = `git diff ${shellQuote(branchBase)}..${shellQuote(branchTip)} | git patch-id`;
-    const { stdout: branchPatchIdOut } = await execAsync(branchPatchIdCommand, {
-      cwd: repoDir,
-      timeout: 60_000,
-      maxBuffer: 32 * 1024 * 1024,
-    });
+    const branchPatchIdOut = await runPatchIdPipeline(repoDir, branchPatchIdCommand);
     const branchPatchIdLine = branchPatchIdOut
       .trim()
       .split("\n")
@@ -314,11 +285,7 @@ export async function findAlreadyMergedTaskCommit(
     const branchPatchId = branchPatchIdLine?.trim().split(/\s+/)[0];
     if (branchPatchId) {
       const basePatchMapCommand = `git log -n 200 -p --format='%H' ${shellQuote(baseBranch)} | git patch-id`;
-      const { stdout: basePatchIdsOut } = await execAsync(basePatchMapCommand, {
-        cwd: repoDir,
-        timeout: 60_000,
-        maxBuffer: 32 * 1024 * 1024,
-      });
+      const basePatchIdsOut = await runPatchIdPipeline(repoDir, basePatchMapCommand);
 
       const basePatchMap = new Map<string, string>();
       for (const line of basePatchIdsOut.split("\n")) {
@@ -341,31 +308,15 @@ export async function findAlreadyMergedTaskCommit(
     if (treeBranchName !== canonicalBranchName) {
       return null;
     }
-    execSync(`git rev-parse --verify ${shellQuote(treeBranchName)}`, withPosixShell({
-      cwd: repoDir,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    })).trim();
+    await runGit(repoDir, ["rev-parse", "--verify", treeBranchName]);
 
-    const { stdout: baseTreeStdout } = await execAsync(`git rev-parse ${shellQuote(baseBranch)}^{tree}`, {
-      cwd: repoDir,
-      timeout: 30_000,
-      maxBuffer: 1024 * 1024,
-    });
-    const { stdout: branchTreeStdout } = await execAsync(`git rev-parse ${shellQuote(treeBranchName)}^{tree}`, {
-      cwd: repoDir,
-      timeout: 30_000,
-      maxBuffer: 1024 * 1024,
-    });
+    const baseTreeStdout = await runGit(repoDir, ["rev-parse", `${baseBranch}^{tree}`]);
+    const branchTreeStdout = await runGit(repoDir, ["rev-parse", `${treeBranchName}^{tree}`]);
 
     const baseTree = baseTreeStdout.trim();
     const branchTree = branchTreeStdout.trim();
     if (baseTree && branchTree && baseTree === branchTree) {
-      const { stdout: baseHeadStdout } = await execAsync(`git rev-parse ${shellQuote(baseBranch)}`, {
-        cwd: repoDir,
-        timeout: 30_000,
-        maxBuffer: 1024 * 1024,
-      });
+      const baseHeadStdout = await runGit(repoDir, ["rev-parse", baseBranch]);
       const baseHead = baseHeadStdout.trim();
       if (baseHead && (branchTipForeignNoDiff || !await commitHasForeignTaskOwnership(repoDir, baseHead, taskId, lineageId))) {
         return { sha: baseHead, strategy: "tree-equal", ownershipProof: "canonical-branch-tree" };

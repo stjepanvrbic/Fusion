@@ -245,6 +245,26 @@ async function git(args: string[], cwd: string, opts: { timeout?: number } = {})
   return stdout.trim();
 }
 
+/*
+FNXC:AIMergeReviewReconciliation 2026-10-11-08:50:
+A review fence compares the branch and integration tips captured together, so it reads both in one `git rev-parse` process instead of one process per ref.
+Each ref is peeled with `^{commit}` and `--` keeps names from parsing as paths; any ref that does not resolve to a commit rejects the read, as the per-ref `--verify` reads did.
+*/
+async function resolveCommits(refs: readonly string[], cwd: string): Promise<string[]> {
+  const shas = (await git(["rev-parse", ...refs.map((ref) => `${ref}^{commit}`), "--"], cwd))
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && line !== "--");
+  if (shas.length !== refs.length) throw new Error(`git rev-parse resolved ${shas.length} of ${refs.length} refs: ${refs.join(" ")}`);
+  return shas;
+}
+
+/** The message body as `%b` reports it: everything after the subject paragraph, which ends at the first blank line. */
+function commitMessageBody(message: string): string {
+  const separator = /\n[^\S\n]*\n/.exec(message);
+  return separator ? message.slice(separator.index + separator[0].length).trim() : "";
+}
+
 async function gitOk(args: string[], cwd: string): Promise<boolean> {
   try {
     await git(args, cwd);
@@ -383,8 +403,7 @@ async function recoverApprovedPreexistingAiMergeWorktree(
   throwIfAborted(signal, taskId);
   const task = await store.getTask(taskId).catch(() => undefined);
   const state = task?.aiMergeReviewReconciliation;
-  const sourceSha = await git(["rev-parse", "--verify", branch], repoRootDir);
-  const tipSha = await git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], repoRootDir);
+  const [sourceSha, tipSha] = await resolveCommits([branch, `refs/heads/${integrationBranch}`], repoRootDir);
   /*
   FNXC:AIMergeReviewReconciliation 2026-08-20-22:27:
   Recovery may land only the durable, twice-confirmed candidate for the current source and
@@ -496,21 +515,22 @@ function taskTrailers(
 /** Idempotently guarantee the squash commit's task metadata — a safety net so
  *  board association and the task-id prefix hold even if the AI agent omitted
  *  them: the subject starts with `<taskId>:` (when includeTaskId) and the
- *  association trailers are present. */
+ *  association trailers are present. Returns whether an amend ran, so the caller
+ *  re-reads HEAD only when it may have moved. */
 async function ensureCommitTaskMetadata(
   mergeRoot: string,
   taskId: string,
   includeTaskId: boolean,
   trailers: string[],
-): Promise<void> {
+): Promise<boolean> {
   const fullMessage = await git(["log", "-1", "--pretty=%B"], mergeRoot).catch(() => "");
-  if (!fullMessage) return;
+  if (!fullMessage) return false;
   const subject = (fullMessage.split("\n")[0] ?? "").trim();
-  const body = await git(["log", "-1", "--pretty=%b"], mergeRoot).catch(() => "");
+  const body = commitMessageBody(fullMessage);
 
   const needsPrefix = includeTaskId && !subject.toLowerCase().startsWith(taskId.toLowerCase());
   const missingTrailers = trailers.filter((t) => !fullMessage.includes(t));
-  if (!needsPrefix && missingTrailers.length === 0) return;
+  if (!needsPrefix && missingTrailers.length === 0) return false;
 
   /*
   FNXC:GitIdentity 2026-08-18-07:55:
@@ -531,6 +551,7 @@ async function ensureCommitTaskMetadata(
   await git(args, mergeRoot).catch((err: unknown) => {
     aiMergeLog.warn(`failed to amend task metadata onto squash (${err instanceof Error ? err.message : String(err)})`);
   });
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,10 +1757,7 @@ async function reviewNoCommitClaim(input: {
     reviewerStatement = boundAgentStatement(text, "end") ?? "reviewer gave no statement";
     await input.log(`AI merge review (no-commit claim, pass ${pass}/2): confirmed`);
   }
-  const [liveSourceSha, liveTipSha] = await Promise.all([
-    git(["rev-parse", "--verify", branch], mergeRoot),
-    git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], mergeRoot),
-  ]);
+  const [liveSourceSha, liveTipSha] = await resolveCommits([branch, `refs/heads/${integrationBranch}`], mergeRoot);
   if (liveSourceSha !== sourceSha || liveTipSha !== tipSha) throw new AiMergeReviewReconciliationInvalidatedError();
   return { outcome: "confirmed", reviewerStatement, branchTipSha: sourceSha };
 }
@@ -3761,8 +3779,7 @@ async function mergeAndReview(input: {
     if (!expectedState) throw new AiMergeReviewReconciliationInvalidatedError();
     const liveTask = await store.getTask(taskId);
     const liveBranch = liveTask?.branch ?? branch;
-    const liveSourceSha = await git(["rev-parse", "--verify", liveBranch], mergeRoot);
-    const liveTipSha = await git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], mergeRoot);
+    const [liveSourceSha, liveTipSha] = await resolveCommits([liveBranch, `refs/heads/${integrationBranch}`], mergeRoot);
     if (
       liveBranch !== branch
       || liveSourceSha !== expectedState.sourceSha
@@ -3796,7 +3813,7 @@ async function mergeAndReview(input: {
         const noCommitClaim = await reviewNoCommitClaim({ mergeRoot, branch, integrationBranch, tipSha, sourceSha: state.sourceSha, taskId, mergeAgentClaim: mergeAgentExplanation, reviewAgent, log, setStatus });
         return { squashSha: null, sourceSha: state.sourceSha, priorReasons: [], mergeAgentExplanation, noCommitClaim };
       }
-      if (candidateSha !== tipSha) { await ensureCommitTaskMetadata(mergeRoot, taskId, includeTaskId, trailers); candidateSha = await git(["rev-parse", "HEAD"], mergeRoot); }
+      if (candidateSha !== tipSha && await ensureCommitTaskMetadata(mergeRoot, taskId, includeTaskId, trailers)) candidateSha = await git(["rev-parse", "HEAD"], mergeRoot);
       state = { ...state, candidateSha, candidateTreeSha: await git(["rev-parse", `${candidateSha}^{tree}`], mergeRoot), consecutiveCleanApprovals: 0 };
       await persistState(persistedState, state);
       needsMerge = false;

@@ -1402,6 +1402,9 @@ Two merger-ai files each failed once when all eleven merger-ai test files ran in
 <!--
 FNXC:TestFlakeRegister 2026-10-11-02:39:
 The 2026-10-08 record above makes any further Windows timeout of merger-ai.test.ts an immediate same-change file-level quarantine. One was observed locally while verifying an unrelated engine change, so the file is quarantined here rather than recorded as a first sighting, with no widened timeout and no retry.
+
+FNXC:TestFlakeRegister 2026-10-11-09:13:
+KB-114 rescued the file the same day by removing process spawns at their sources, with timeouts and assertions unchanged, and removed the ledger row and the exclude together. The 2026-10-08 escalation rule stays in force for any future Windows timeout of this file.
 -->
 
 - **File:** `packages/engine/src/__tests__/merger-ai.test.ts` (84 cases; one is platform-skipped on win32).
@@ -1411,6 +1414,23 @@ The 2026-10-08 record above makes any further Windows timeout of merger-ai.test.
 - **Alone:** the case passed in 2.5 s and 2.8 s in two single-case runs. The whole file passed alone in six invocations (one at 164.6 s, three in 568.5 s, two in 335.2 s). One further whole-file invocation was killed at a 600 s tool limit with no per-test output captured; its cause is not determined and it did not recur in the six invocations that followed.
 - **Action:** quarantined under the 2026-10-08 escalation rule: entry in `scripts/lib/test-quarantine.json` (`quarantinedAt` 2026-10-11, deletion clock 2026-10-25) with the matching `engine-default` exclude in `packages/engine/vitest.config.ts`. The file is not in the Windows ledger and no timeout, retry or assertion changed.
 - **Rescue:** the mechanism matches the 2026-10-08 record (real-git process spawns under worker fan-out push a two-pass case past 30 s). A rescue needs a measured reduction of that case's git spawn count with assertions and timeouts unchanged, plus evidence that the file catches real regressions; it is the main `runAiMerge` coverage.
+
+**Rescued 2026-10-11 (KB-114):** the ledger row and the `engine-default` exclude were removed together, with every timeout and existing assertion unchanged. Counts are git trace2 process counts per case on the same Windows host (git processes plus the cmd.exe and Git Bash processes that launched them).
+
+| case | processes before | processes after | change |
+|---|---|---|---|
+| `finalizes a superseded branch as landed with no squash when two review passes confirm the merge agent's claim` | 83 (47 git, 36 shell) | 51 (41 git, 10 shell) | 38.6% lower |
+| `lands after two clean approvals of the same candidate without an empty corrective pass` | 60 (50 git, 10 shell) | 51 (43 git, 8 shell) | 15.0% lower |
+| `rebuilds when the source changes between clean confirmation reviews` | 98 (80 git, 18 shell) | 75 (67 git, 8 shell) | 23.5% lower |
+
+- **Changes:**
+  - Test seam: all test-side git calls in the file run through `execFileSync("git", argv)`. A string `execSync` cost one cmd.exe per call, and two Git Bash processes whenever the vitest setup routed POSIX quoting to Git Bash. The fast-forwarded, net-zero and superseded repository states are template variants built once per file, and the source move during review is a prepared commit applied with one `update-ref`.
+  - `already-merged-detector.ts`: every single git command runs through `execFile` with argv. Each one previously launched Git Bash, which is two processes on Windows. Only the two `git patch-id` pipelines still use the shell. One detection computes the branch merge base once instead of twice.
+  - `merger-ai.ts`: each review fence reads the branch tip and the integration tip in one `git rev-parse` process, and the squash metadata check derives the message body from its one `log -1 --pretty=%B` read.
+- **Whole file alone:** summed case time 151.5 s before and 79.9 s after (86 cases after, three of them new), 3939 processes before and 3271 after under trace2.
+- **Load reproduction:** the invocation of the sighting (seventeen paths, default worker fan-out, PostgreSQL 16 container on the same host) passed twice in a row after the change: 1048 passed, 0 failed, 1 skipped in each run, with the slowest `merger-ai.test.ts` case at 4.5 s and 10.0 s. On the unchanged tree the same invocation showed no merger-ai failure either, and its slowest merger-ai case took 15.6 s, so the timeout itself was not reproduced. The combined `src/__tests__/merger-ai` lane (11 files) passed once with its slowest `merger-ai.test.ts` case at 5.9 s.
+- **Regression evidence (temporary probes, each reverted):** requiring one no-commit-claim review pass instead of two fails the superseded case at its two-review assertion. Disabling the review identity fence fails the rebuilds case (`RecordedMergeBranchTipChangedError`) and the new deleted-branch case. Skipping the detector's foreign-trailer rejection fails four `already-merged-detector.real-git.test.ts` cases. Removing only the post-review fence call does not fail the rebuilds case, before or after this change, because the next pre-review fence catches the same source move.
+- **Still in force:** the 2026-10-08 escalation rule. A further Windows timeout of this file is an immediate file-level quarantine, never a Windows ledger entry, a widened timeout or a retry. The remaining shell-launched git calls in each AI merge come from `integration-branch.ts` and `merger.ts` and were not changed here.
 
 ### Record 2026-10-11: `pg-test-harness-template-concurrency.pg.test.ts` Windows 15 s timeout (KB-102, resolved at the cause)
 

@@ -418,12 +418,10 @@ export default defineConfig({
             */
             "src/__tests__/auth-storage-durability.test.ts",
             /*
-            FNXC:MergerAiWindowsTimeoutQuarantine 2026-10-11-02:39:
-            A further Windows 30 s test timeout of merger-ai.test.ts is a file-level quarantine by the register's recorded escalation rule for this file, never a widened timeout, a retry or a Windows ledger entry.
-            The two-review-pass superseded-branch case timed out when the file ran with seventeen other engine files in one invocation on a Windows host; it takes about 2.5 s alone, so the cost is real-git process spawns under worker fan-out.
-            Rescue needs a root-cause reduction of that case's git spawn count, with assertions and timeouts unchanged.
+            FNXC:MergerAiWindowsTimeoutQuarantine 2026-10-11-09:13:
+            KB-114 rescued merger-ai.test.ts into engine-default (not admitted to engine-core). Its Windows 30 s timeouts were process count under worker fan-out: each two-cycle case started 60 to 98 git and shell processes. Test-side git calls and the already-landed detector's single commands now run without a shell, per-case repository states are prebuilt templates, and each review fence reads its two refs in one process. Timeouts and assertions are unchanged. The exclude and ledger row were removed in lockstep.
+            A further Windows timeout of this file is still an immediate file-level quarantine under the register's 2026-10-08 escalation rule.
             */
-            "src/__tests__/merger-ai.test.ts",
             "node_modules/**",
             "dist/**",
             // FNXC:PgMigrationQuarantine 2026-07-18-04:30: FN-8270 rescued the final seven VAL-REMOVAL-005 holdouts by awaiting PG audit reads and modeling async collaborators. Their paired ledger entries and excludes were removed only after targeted green runs.
