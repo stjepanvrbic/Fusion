@@ -1,8 +1,10 @@
 // @vitest-environment node
 
+import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -10,14 +12,15 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { resolveShellFreeLaunch } from "@fusion/core";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const spawnMock = vi.hoisted(() => ({ fn: undefined as unknown as ReturnType<typeof vi.fn> }));
 
@@ -28,13 +31,16 @@ vi.mock("node:child_process", async () => {
 });
 
 import {
+  FnBinaryInUseError,
   fnBinaryFileName,
   installLocalFnBinary,
   isPathInsideOrEqual,
   removeLocalFnShims,
   renderFnCmdShim,
   resolveFnBinaryLocalPaths,
+  runLinkLocalFnBinary,
   runStreamingCommand,
+  type FnBinaryInstallFs,
   type FnBinaryLocalPaths,
 } from "../fn-binary-local-install.js";
 
@@ -47,13 +53,18 @@ shim removal that leaves unrelated binaries alone.
 FNXC:SystemPanelFnBinary 2026-10-08-19:30:
 KB-097: both the Windows (`fn.exe` + `.cmd` shims) and POSIX (`fn` + symlinks) layouts are exercised on every host by passing the platform explicitly.
 Host-native tests derive their expectations from `paths.shimStyle` instead of skipping, so the file runs unskipped on Windows and Linux.
+
+FNXC:SystemPanelFnBinary 2026-10-11-06:32:
+KB-109: re-installing over a really running installed binary (a copy of the Node executable) must succeed, and every injected file-system failure must leave the binary, `client/` and `runtime/` on one build.
+Leftover `.old-`/`.new-` copies are swept by later installs, while unrelated files in the install directory are never deleted.
 */
 
 const tempRoots: string[] = [];
 
 afterEach(() => {
   for (const root of tempRoots.splice(0)) {
-    rmSync(root, { recursive: true, force: true });
+    // Fixture teardown only: Windows releases the lock on an executable slightly after its process exits.
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -65,17 +76,142 @@ function makeTemp(prefix: string): string {
 
 const BINARY_BYTES = "#!/bin/sh\necho ok\n";
 
-/** A dist dir shaped like `packages/cli/dist` after the Bun compile on this host. */
-function makeDist(): string {
-  const dist = makeTemp("fn-bin-dist-");
+interface BuildContents {
+  binary: string;
+  client: string;
+  runtime: string;
+}
+
+/** File contents of the fixture build `label`; no label is the original single-build fixture. */
+function buildContents(label?: string): BuildContents {
+  if (!label) return { binary: BINARY_BYTES, client: "<html></html>", runtime: "native" };
+  return { binary: `${BINARY_BYTES}# ${label}\n`, client: `<html>${label}</html>`, runtime: `native-${label}` };
+}
+
+/**
+ * A dist dir shaped like `packages/cli/dist` after the Bun compile on this host.
+ * `label` makes the binary, `client/index.html` and the runtime file distinguishable between builds.
+ */
+function makeDist(label?: string, dist = makeTemp("fn-bin-dist-")): string {
+  mkdirSync(dist, { recursive: true });
+  const contents = buildContents(label);
   // FNXC:SystemPanelFnBinary 2026-10-08-17:49: KB-087: fixtures use the platform binary name (fn.exe on Windows) the installer reads.
-  writeFileSync(join(dist, fnBinaryFileName()), BINARY_BYTES);
+  writeFileSync(join(dist, fnBinaryFileName()), contents.binary);
   chmodSync(join(dist, fnBinaryFileName()), 0o755);
   mkdirSync(join(dist, "client"), { recursive: true });
-  writeFileSync(join(dist, "client", "index.html"), "<html></html>");
+  writeFileSync(join(dist, "client", "index.html"), contents.client);
   mkdirSync(join(dist, "runtime", "win32-x64"), { recursive: true });
-  writeFileSync(join(dist, "runtime", "win32-x64", "pty.node"), "native");
+  writeFileSync(join(dist, "runtime", "win32-x64", "pty.node"), contents.runtime);
   return dist;
+}
+
+/** What the live install holds: the three entries' contents plus the sorted `installDir` listing. */
+function readInstall(paths: FnBinaryLocalPaths): BuildContents & { entries: string[] } {
+  return {
+    binary: readFileSync(paths.binaryPath, "utf8"),
+    client: readFileSync(join(paths.installDir, "client", "index.html"), "utf8"),
+    runtime: readFileSync(join(paths.installDir, "runtime", "win32-x64", "pty.node"), "utf8"),
+    entries: readdirSync(paths.installDir).sort(),
+  };
+}
+
+/** Sorted names of the three live entries for `paths`. */
+function liveEntries(paths: FnBinaryLocalPaths): string[] {
+  return [fnBinaryFileName(paths.platform), "client", "runtime"].sort();
+}
+
+/**
+ * Start the installed binary (a copy of this Node executable) and resolve once it is running.
+ * The process keeps the executable open, which is what makes Windows refuse to overwrite or delete it.
+ */
+async function startInstalledBinary(binaryPath: string): Promise<ChildProcess> {
+  const env = { ...process.env };
+  delete env.NODE_OPTIONS;
+  const child = spawn(binaryPath, ["-e", "process.stdout.write('ready');setInterval(()=>{},1000)"], {
+    stdio: ["ignore", "pipe", "ignore"],
+    env,
+    windowsHide: true,
+  });
+  await new Promise<void>((resolveReady, rejectReady) => {
+    child.once("error", rejectReady);
+    child.once("exit", (code, signal) => rejectReady(new Error(`installed binary exited early (${code ?? signal})`)));
+    child.stdout?.once("data", () => resolveReady());
+  });
+  return child;
+}
+
+type FsCall = "cpSync" | "renameSync" | "rmSync";
+
+interface InjectedFailure {
+  call: FsCall;
+  /** Matches the call's first path (source, or the path to delete) and, for copies and renames, its destination. */
+  when: (first: string, destination?: string) => boolean;
+  /** Fail every matching call instead of only the first. */
+  always?: boolean;
+}
+
+/** Real file-system calls, except that each injected failure throws an EPERM error at its matching call. */
+function injectFs(failures: InjectedFailure[]): FnBinaryInstallFs {
+  const pending = [...failures];
+  const check = (call: FsCall, first: unknown, destination?: unknown): void => {
+    const index = pending.findIndex(
+      (failure) => failure.call === call && failure.when(String(first), destination === undefined ? undefined : String(destination)),
+    );
+    if (index < 0) return;
+    if (!pending[index].always) pending.splice(index, 1);
+    throw Object.assign(new Error(`EPERM: operation not permitted, ${call} '${String(first)}'`), { code: "EPERM" });
+  };
+  return {
+    cpSync: ((source, destination, options) => {
+      check("cpSync", source, destination);
+      cpSync(source, destination, options);
+    }) as FnBinaryInstallFs["cpSync"],
+    renameSync: ((source, destination) => {
+      check("renameSync", source, destination);
+      renameSync(source, destination);
+    }) as FnBinaryInstallFs["renameSync"],
+    rmSync: ((path, options) => {
+      check("rmSync", path);
+      rmSync(path, options);
+    }) as FnBinaryInstallFs["rmSync"],
+  };
+}
+
+/** A fake spawned child that closes with exit code 0 on the next tick. */
+function exitedChild(): EventEmitter {
+  const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough; pid: number };
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 4242;
+  setImmediate(() => {
+    child.stdout.end();
+    child.stderr.end();
+    child.emit("close", 0, null);
+  });
+  return child;
+}
+
+function captureError(run: () => void): unknown {
+  try {
+    run();
+  } catch (err) {
+    return err;
+  }
+  return undefined;
+}
+
+/** How each PATH shim looks on disk, so a test can assert the shims were not touched. */
+function shimState(paths: FnBinaryLocalPaths): string[] {
+  return [paths.fnShimPath, paths.fusionShimPath].map((shim) =>
+    lstatSync(shim).isSymbolicLink() ? `link:${readlinkSync(shim)}` : `file:${readFileSync(shim, "utf8")}`,
+  );
+}
+
+async function stopProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const closed = new Promise<void>((resolveClosed) => child.once("close", () => resolveClosed()));
+  child.kill();
+  await closed;
 }
 
 function collect(): { logs: string[]; onLog: (stream: string, text: string) => void } {
@@ -155,6 +291,32 @@ describe("installLocalFnBinary", () => {
     expect(launch).toEqual({ command: binaryPath, args: ["--version"], resolvedPath: binaryPath });
   });
 
+  it("re-installs while the installed binary is running", async () => {
+    const home = makeTemp("fn-bin-home-run-");
+    const paths = resolveFnBinaryLocalPaths(home);
+    installLocalFnBinary(makeDist("first"), () => {}, paths);
+    cpSync(process.execPath, paths.binaryPath);
+    chmodSync(paths.binaryPath, 0o755);
+    const child = await startInstalledBinary(paths.binaryPath);
+    try {
+      const { onLog } = collect();
+
+      installLocalFnBinary(makeDist("second"), onLog, paths);
+
+      const installed = readInstall(paths);
+      expect({ binary: installed.binary, client: installed.client, runtime: installed.runtime }).toEqual(
+        buildContents("second"),
+      );
+      expect(child.exitCode).toBeNull();
+      const binaryName = fnBinaryFileName(paths.platform);
+      for (const entry of installed.entries) {
+        expect(liveEntries(paths).includes(entry) || entry.startsWith(`${binaryName}.old-`)).toBe(true);
+      }
+    } finally {
+      await stopProcess(child);
+    }
+  });
+
   it("installs the host-native layout without elevated privileges", () => {
     const home = makeTemp("fn-bin-home-");
     const dist = makeDist();
@@ -173,6 +335,236 @@ describe("installLocalFnBinary", () => {
         expect(readFileSync(shim, "utf8")).toBe(renderFnCmdShim(paths.binDir, paths.binaryPath));
       }
     }
+  });
+});
+
+/*
+FNXC:SystemPanelFnBinary 2026-10-11-06:32:
+KB-109: a re-install either fully replaces the binary, `client/` and `runtime/` with the new build or leaves all three on the previous build.
+Each case injects one failing file-system call through the installer's `fs` seam and runs for the win32 layout and the host-native layout on every host.
+*/
+const LAYOUTS: Array<[string, (home: string) => FnBinaryLocalPaths]> = [
+  ["win32 layout", (home) => resolveFnBinaryLocalPaths(home, "win32")],
+  ["host-native layout", (home) => resolveFnBinaryLocalPaths(home)],
+];
+
+describe.each(LAYOUTS)("installLocalFnBinary staged replacement (%s)", (_name, layout) => {
+  function installFirstBuild(): FnBinaryLocalPaths {
+    const paths = layout(makeTemp("fn-bin-home-swap-"));
+    installLocalFnBinary(makeDist("first"), () => {}, paths);
+    return paths;
+  }
+
+  function expectFirstBuildIntact(paths: FnBinaryLocalPaths): void {
+    expect(readInstall(paths)).toEqual({ ...buildContents("first"), entries: liveEntries(paths) });
+  }
+
+  it("replaces all three entries and leaves nothing else behind on a clean re-install", () => {
+    const paths = installFirstBuild();
+
+    installLocalFnBinary(makeDist("second"), () => {}, paths);
+
+    expect(readInstall(paths)).toEqual({ ...buildContents("second"), entries: liveEntries(paths) });
+  });
+
+  it("removes leftovers of earlier installs and nothing else", () => {
+    const paths = installFirstBuild();
+    const binaryName = fnBinaryFileName(paths.platform);
+    writeFileSync(join(paths.installDir, `${binaryName}.old-stale`), "stale");
+    for (const dir of ["client.old-stale", "runtime.new-stale", "client-old-backup"]) {
+      mkdirSync(join(paths.installDir, dir));
+      writeFileSync(join(paths.installDir, dir, "file.txt"), dir);
+    }
+    writeFileSync(join(paths.installDir, "keep.txt"), "keep");
+
+    installLocalFnBinary(makeDist("second"), () => {}, paths);
+
+    expect(readInstall(paths)).toEqual({
+      ...buildContents("second"),
+      entries: [...liveEntries(paths), "client-old-backup", "keep.txt"].sort(),
+    });
+    expect(readFileSync(join(paths.installDir, "keep.txt"), "utf8")).toBe("keep");
+    expect(readFileSync(join(paths.installDir, "client-old-backup", "file.txt"), "utf8")).toBe("client-old-backup");
+  });
+
+  it("keeps a previous copy that is still in use and removes it on a later install", () => {
+    const paths = installFirstBuild();
+    const binaryName = fnBinaryFileName(paths.platform);
+    const fs = injectFs([
+      { call: "rmSync", when: (path) => path.startsWith(`${paths.binaryPath}.old-`), always: true },
+    ]);
+    const { logs, onLog } = collect();
+
+    installLocalFnBinary(makeDist("second"), onLog, paths, fs);
+
+    const installed = readInstall(paths);
+    expect({ binary: installed.binary, client: installed.client, runtime: installed.runtime }).toEqual(
+      buildContents("second"),
+    );
+    const kept = installed.entries.filter((entry) => entry.startsWith(`${binaryName}.old-`));
+    expect(kept).toHaveLength(1);
+    expect(installed.entries).toEqual([...liveEntries(paths), kept[0]].sort());
+    const keptPath = join(paths.installDir, kept[0]);
+    expect(readFileSync(keptPath, "utf8")).toBe(buildContents("first").binary);
+    expect(logs.some((line) => line.includes(keptPath) && /restart/i.test(line))).toBe(true);
+
+    installLocalFnBinary(makeDist("third"), () => {}, paths);
+
+    expect(readInstall(paths)).toEqual({ ...buildContents("third"), entries: liveEntries(paths) });
+  });
+
+  it("leaves the live install untouched when staging the new build fails", () => {
+    const paths = installFirstBuild();
+    const shimsBefore = shimState(paths);
+    const fs = injectFs([
+      { call: "cpSync", when: (_source, destination) => basename(destination ?? "").startsWith("client.new-") },
+    ]);
+
+    expect(() => installLocalFnBinary(makeDist("second"), () => {}, paths, fs)).toThrow(/Staging/);
+
+    expectFirstBuildIntact(paths);
+    expect(shimState(paths)).toEqual(shimsBefore);
+  });
+
+  it("reports fn as running when the live binary cannot be moved aside", () => {
+    const paths = installFirstBuild();
+    const fs = injectFs([{ call: "renameSync", when: (source) => source === paths.binaryPath }]);
+
+    const thrown = captureError(() => installLocalFnBinary(makeDist("second"), () => {}, paths, fs));
+
+    expect(thrown).toBeInstanceOf(FnBinaryInUseError);
+    const inUse = thrown as FnBinaryInUseError;
+    expect(inUse.path).toBe(paths.binaryPath);
+    expect(inUse.code).toBe("EPERM");
+    expect(inUse.message).toContain(paths.binaryPath);
+    expect(inUse.message).toMatch(/running/i);
+    expectFirstBuildIntact(paths);
+  });
+
+  it("rolls back the swapped binary and client when runtime cannot be moved aside", () => {
+    const paths = installFirstBuild();
+    const runtimeDir = join(paths.installDir, "runtime");
+    const fs = injectFs([{ call: "renameSync", when: (source) => source === runtimeDir }]);
+
+    const thrown = captureError(() => installLocalFnBinary(makeDist("second"), () => {}, paths, fs));
+
+    expect(thrown).toBeInstanceOf(FnBinaryInUseError);
+    expect((thrown as FnBinaryInUseError).path).toBe(runtimeDir);
+    expectFirstBuildIntact(paths);
+  });
+
+  it("rolls back when promoting a staged entry fails", () => {
+    const paths = installFirstBuild();
+    const clientDir = join(paths.installDir, "client");
+    const fs = injectFs([{ call: "renameSync", when: (_source, destination) => destination === clientDir }]);
+
+    expect(() => installLocalFnBinary(makeDist("second"), () => {}, paths, fs)).toThrow(/client/);
+
+    expectFirstBuildIntact(paths);
+  });
+});
+
+describe("installLocalFnBinary leftovers that cannot be deleted", () => {
+  it("installs anyway and logs the leftover that is still in use", () => {
+    const paths = resolveFnBinaryLocalPaths(makeTemp("fn-bin-home-swap-"), "win32");
+    installLocalFnBinary(makeDist("first"), () => {}, paths);
+    const stale = join(paths.installDir, "fn.exe.old-stale");
+    writeFileSync(stale, "stale");
+    const fs = injectFs([{ call: "rmSync", when: (path) => path === stale, always: true }]);
+    const { logs, onLog } = collect();
+
+    installLocalFnBinary(makeDist("second"), onLog, paths, fs);
+
+    expect(readInstall(paths)).toEqual({
+      ...buildContents("second"),
+      entries: [...liveEntries(paths), "fn.exe.old-stale"].sort(),
+    });
+    expect(logs.some((line) => line.includes(stale))).toBe(true);
+  });
+});
+
+describe("installLocalFnBinary rollback failure", () => {
+  it("names the moved-aside copy that still holds the previous binary", () => {
+    const paths = resolveFnBinaryLocalPaths(makeTemp("fn-bin-home-swap-"), "win32");
+    installLocalFnBinary(makeDist("first"), () => {}, paths);
+    const fs = injectFs([
+      { call: "renameSync", when: (source) => source === join(paths.installDir, "client") },
+      {
+        call: "renameSync",
+        when: (source, destination) => source.startsWith(`${paths.binaryPath}.old-`) && destination === paths.binaryPath,
+      },
+    ]);
+
+    const thrown = captureError(() => installLocalFnBinary(makeDist("second"), () => {}, paths, fs));
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    const stranded = readdirSync(paths.installDir).filter((entry) => entry.startsWith("fn.exe.old-"));
+    expect(stranded).toHaveLength(1);
+    const strandedPath = join(paths.installDir, stranded[0]);
+    expect(message).toContain(strandedPath);
+    expect(readFileSync(strandedPath, "utf8")).toBe(buildContents("first").binary);
+  });
+});
+
+/*
+FNXC:SystemPanelFnBinary 2026-10-11-06:32:
+KB-109: the job log shows what `runLinkLocalFnBinary` returns, so an in-use install must come back as `{ success: false, error }` naming the path and saying fn is running.
+The build and Bun compile children are faked and Bun resolves through a stubbed BUN_INSTALL, so the pipeline is hermetic on every host.
+*/
+describe("runLinkLocalFnBinary", () => {
+  beforeEach(() => {
+    spawnMock.fn.mockClear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    spawnMock.fn.mockClear();
+  });
+
+  function prepareSourceRoot(): string {
+    const root = makeTemp("fn-bin-src-");
+    mkdirSync(join(root, "scripts"));
+    writeFileSync(join(root, "scripts", "build-workspace.mjs"), "");
+    mkdirSync(join(root, "packages", "cli"), { recursive: true });
+    writeFileSync(join(root, "packages", "cli", "build.ts"), "");
+    makeDist("second", join(root, "packages", "cli", "dist"));
+    const bunInstall = makeTemp("fn-bin-bun-");
+    mkdirSync(join(bunInstall, "bin"));
+    writeFileSync(join(bunInstall, "bin", process.platform === "win32" ? "bun.exe" : "bun"), "");
+    vi.stubEnv("BUN_INSTALL", bunInstall);
+    spawnMock.fn.mockImplementationOnce(exitedChild).mockImplementationOnce(exitedChild);
+    return root;
+  }
+
+  function installFirstBuild(): FnBinaryLocalPaths {
+    const paths = resolveFnBinaryLocalPaths(makeTemp("fn-bin-home-link-"));
+    installLocalFnBinary(makeDist("first"), () => {}, paths);
+    return paths;
+  }
+
+  it("installs the compiled build at the given paths", async () => {
+    const root = prepareSourceRoot();
+    const paths = installFirstBuild();
+
+    const result = await runLinkLocalFnBinary(root, () => {}, { paths });
+
+    expect(result).toEqual({ success: true });
+    expect(spawnMock.fn).toHaveBeenCalledTimes(2);
+    expect(readInstall(paths)).toEqual({ ...buildContents("second"), entries: liveEntries(paths) });
+  });
+
+  it("returns the in-use message when the installed binary cannot be replaced", async () => {
+    const root = prepareSourceRoot();
+    const paths = installFirstBuild();
+    const fs = injectFs([{ call: "renameSync", when: (source) => source === paths.binaryPath }]);
+
+    const result = await runLinkLocalFnBinary(root, () => {}, { paths, fs });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain(paths.binaryPath);
+    expect(result.error).toMatch(/running/i);
+    expect(readInstall(paths)).toEqual({ ...buildContents("first"), entries: liveEntries(paths) });
   });
 });
 
@@ -299,18 +691,7 @@ describe("runStreamingCommand", () => {
   }
 
   it("unwraps a Windows npm .cmd shim to node <npm-cli.js> with shell:false", async () => {
-    spawnMock.fn.mockImplementationOnce(() => {
-      const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough; pid: number };
-      child.stdout = new PassThrough();
-      child.stderr = new PassThrough();
-      child.pid = 4242;
-      setImmediate(() => {
-        child.stdout.end();
-        child.stderr.end();
-        child.emit("close", 0, null);
-      });
-      return child;
-    });
+    spawnMock.fn.mockImplementationOnce(exitedChild);
     const { onLog } = collect();
 
     const result = await runStreamingCommand("npm", ["install", "-g", "x"], {

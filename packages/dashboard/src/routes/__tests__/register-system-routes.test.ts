@@ -517,6 +517,37 @@ describe("POST /system/fn-binary/link-local", () => {
     const texts = current.body.job.lines.map((line: { text: string }) => line.text);
     expect(texts).toContain("mock-link-local");
   });
+
+  /*
+  FNXC:SystemPanelFnBinary 2026-10-11-06:32:
+  KB-109: when a running fn blocks the install, the operator sees the in-use message in the job log and the job ends failed.
+  */
+  it("fails the job and shows the in-use message when fn is running", async () => {
+    const inUse =
+      'Cannot replace /home/dev/.local/share/fusion/fn: it is in use (EBUSY). A fn started from the local install is probably still running. Stop it and run "Build & link local fn" again. The existing install was left unchanged.';
+    mockRunLinkLocalFnBinary.mockImplementationOnce(async () => ({ success: false, error: inUse }));
+    const { app } = createApp({
+      options: {
+        systemControl: {
+          supervised: true,
+          requestRestart: vi.fn(() => true),
+          sourceWorkspaceRoot: "/Users/dev/fusion",
+        },
+      },
+    });
+
+    const started = await postJson(app, "/api/system/fn-binary/link-local");
+    expect(started.status).toBe(202);
+
+    await vi.waitFor(async () => {
+      const current = await getJson(app, "/api/system/rebuild/current");
+      expect(current.body.job?.status).toBe("failed");
+    }, { timeout: 5_000, interval: 50 });
+
+    const current = await getJson(app, "/api/system/rebuild/current");
+    const texts = current.body.job.lines.map((line: { text: string }) => line.text);
+    expect(texts).toContain(inUse);
+  });
 });
 
 describe("POST /system/fn-binary/use-global", () => {

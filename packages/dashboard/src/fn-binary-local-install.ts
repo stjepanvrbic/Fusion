@@ -6,24 +6,32 @@ the published global npm install. These helpers encode the install layout and
 process steps used by POST /system/fn-binary/link-local and
 POST /system/fn-binary/use-global so the route can stream every step into the
 shared System job log viewer.
+
+FNXC:SystemPanelFnBinary 2026-10-11-06:32:
+KB-109: re-linking must succeed while a previously installed `fn` runs, which on Windows locks the binary and any loaded native module against overwrite and delete.
+The install is staged beside the live entries and swapped in with renames only, so the binary, `client/` and `runtime/` always come from one build; a live entry that cannot be moved aside is reported as `fn` running.
+Moved-aside copies that are still in use are removed by a later install.
 */
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, posix as posixPath, resolve, win32 as win32Path } from "node:path";
+import { basename, dirname, join, posix as posixPath, resolve, win32 as win32Path } from "node:path";
 import {
   FN_INSTALL_NPM,
   FN_NPM_PACKAGE,
@@ -288,6 +296,118 @@ export function fnBinaryFileName(platform: NodeJS.Platform = process.platform): 
   return platform === "win32" ? "fn.exe" : "fn";
 }
 
+/** File-system calls `installLocalFnBinary` uses to copy, move and delete install entries; a test seam. */
+export type FnBinaryInstallFs = Pick<typeof import("node:fs"), "cpSync" | "renameSync" | "rmSync">;
+
+const NODE_INSTALL_FS: FnBinaryInstallFs = { cpSync, renameSync, rmSync };
+
+/** A live install entry could not be moved aside, which means a running `fn` holds it open. */
+export class FnBinaryInUseError extends Error {
+  readonly path: string;
+  readonly code: string | undefined;
+
+  constructor(path: string, code: string | undefined, rollbackFailure: string | undefined, options?: ErrorOptions) {
+    super(
+      `Cannot replace ${path}: it is in use (${code ?? "unknown error"}). ` +
+        `A fn started from the local install is probably still running. Stop it and run "Build & link local fn" again.` +
+        ` ${rollbackFailure ?? "The existing install was left unchanged."}`,
+      options,
+    );
+    this.name = "FnBinaryInUseError";
+    this.path = path;
+    this.code = code;
+  }
+}
+
+/** One of the binary, `client/` or `runtime/` while it is being replaced. */
+interface InstallEntry {
+  label: string;
+  source: string;
+  live: string;
+  /** `<live>.new-<token>`: the new build's copy before it is promoted. */
+  staged: string;
+  /** `<live>.old-<token>`: where the previous live entry is moved aside. */
+  old: string;
+  directory: boolean;
+  movedAside: boolean;
+  promoted: boolean;
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function errorCode(err: unknown): string | undefined {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function removeStagedEntries(entries: InstallEntry[], fs: FnBinaryInstallFs): void {
+  for (const entry of entries) {
+    try {
+      fs.rmSync(entry.staged, { recursive: true, force: true });
+    } catch {
+      // A staged copy nothing runs from is deletable; a leftover is swept by the next install.
+    }
+  }
+}
+
+/**
+ * Undo a partial swap with renames only, newest entry first, then delete the staged copies.
+ * Returns undefined when every live name holds its previous entry again, otherwise a sentence naming each `.old-` path that still holds the previous copy.
+ */
+function rollBackSwap(entries: InstallEntry[], fs: FnBinaryInstallFs): string | undefined {
+  const stranded: string[] = [];
+  for (const entry of [...entries].reverse()) {
+    if (entry.promoted) {
+      try {
+        fs.renameSync(entry.live, entry.staged);
+        entry.promoted = false;
+      } catch {
+        if (entry.movedAside) stranded.push(entry.old);
+        continue;
+      }
+    }
+    if (entry.movedAside) {
+      try {
+        fs.renameSync(entry.old, entry.live);
+        entry.movedAside = false;
+      } catch {
+        stranded.push(entry.old);
+      }
+    }
+  }
+  removeStagedEntries(entries, fs);
+  if (stranded.length === 0) return undefined;
+  return `Rolling back also failed, so the install is in a mixed state; the previous copy is still at ${stranded.join(", ")}.`;
+}
+
+/**
+ * Delete moved-aside and staged copies an earlier install left in `installDir`.
+ * Only names starting with `<binary>.old-`, `<binary>.new-`, `client.old-`, `client.new-`, `runtime.old-` or `runtime.new-` are touched; a copy still in use is logged and kept.
+ */
+function sweepInstallLeftovers(paths: FnBinaryLocalPaths, onLog: FnBinaryLogFn, fs: FnBinaryInstallFs): void {
+  const prefixes = [basename(paths.binaryPath), "client", "runtime"].flatMap((name) => [`${name}.old-`, `${name}.new-`]);
+  for (const name of readdirSync(paths.installDir)) {
+    if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
+    const leftover = join(paths.installDir, name);
+    try {
+      fs.rmSync(leftover, { recursive: true, force: true });
+    } catch {
+      onLog("system", `Leftover ${leftover} is still in use; a later install will remove it.`);
+    }
+  }
+}
+
 /**
  * Copy the built standalone binary + co-located client/runtime assets into
  * `~/.local/share/fusion` and point the `~/.local/bin` PATH shims at it.
@@ -295,11 +415,22 @@ export function fnBinaryFileName(platform: NodeJS.Platform = process.platform): 
  * FNXC:SystemPanelFnBinary 2026-10-08-19:30:
  * KB-097: on the `cmd` layout (Windows) shims are written as batch files and `symlinkSync` is never called, so a non-admin Windows user can install without the symlink privilege.
  * Any prior file or symlink at a shim path is replaced, so re-installing leaves exactly one shim per name.
+ *
+ * FNXC:SystemPanelFnBinary 2026-10-11-06:32:
+ * KB-109: re-linking must work while a previously installed `fn` is running.
+ * Windows refuses to overwrite or delete a running executable or a loaded native module, but allows renaming them and the directories that hold them.
+ * So the new build is first copied next to the live install as `<entry>.new-<token>`, then each live entry is renamed to `<entry>.old-<token>` and its staged copy renamed onto the live name; live entries are never copied over or deleted first.
+ * The binary, `client/` and `runtime/` must always come from the same build: any failure rolls the swap back with renames, and a rollback failure is reported with the `.old-` paths that still hold the previous copy.
+ * A live entry that cannot be moved aside is reported as `fn` running (`FnBinaryInUseError`), never as a raw copy error; the errno of a blocked overwrite is not stable (EIO, EBUSY and EPERM all occur), so nothing matches on it.
+ * Moved-aside copies are deleted after a successful swap when the operating system allows it; one still in use is kept, logged, and removed by the leftover sweep at the start of a later install.
+ * The layout (binary, `client/`, `runtime/` side by side under fixed names) is unchanged because the compiled server resolves its assets next to `process.execPath`.
+ * `fs` is a test seam for every copy, rename and delete of install entries.
  */
 export function installLocalFnBinary(
   distDir: string,
   onLog: FnBinaryLogFn,
   paths: FnBinaryLocalPaths = resolveFnBinaryLocalPaths(),
+  fs: FnBinaryInstallFs = NODE_INSTALL_FS,
 ): void {
   const srcBinary = join(distDir, fnBinaryFileName());
   const srcClient = join(distDir, "client");
@@ -314,23 +445,67 @@ export function installLocalFnBinary(
 
   mkdirSync(paths.installDir, { recursive: true });
   mkdirSync(paths.binDir, { recursive: true });
+  sweepInstallLeftovers(paths, onLog, fs);
 
-  onLog("system", `Installing binary → ${paths.binaryPath}`);
-  cpSync(srcBinary, paths.binaryPath);
+  const token = `${process.pid}-${randomBytes(4).toString("hex")}`;
+  const entry = (label: string, source: string, live: string, directory: boolean): InstallEntry => ({
+    label,
+    source,
+    live,
+    staged: `${live}.new-${token}`,
+    old: `${live}.old-${token}`,
+    directory,
+    movedAside: false,
+    promoted: false,
+  });
+  const entries: InstallEntry[] = [
+    entry("binary", srcBinary, paths.binaryPath, false),
+    entry("client assets", srcClient, join(paths.installDir, "client"), true),
+  ];
+  // A build without runtime/ leaves the live runtime/ as it is.
+  if (existsSync(srcRuntime)) {
+    entries.push(entry("runtime assets", srcRuntime, join(paths.installDir, "runtime"), true));
+  }
+
   try {
-    chmodSync(paths.binaryPath, 0o755);
+    for (const item of entries) {
+      onLog("system", `Installing ${item.label} → ${item.live}`);
+      fs.cpSync(item.source, item.staged, item.directory ? { recursive: true } : undefined);
+    }
+  } catch (err) {
+    removeStagedEntries(entries, fs);
+    throw new Error(
+      `Staging the new fn build in ${paths.installDir} failed: ${errorMessage(err)}. The live install is untouched.`,
+      { cause: err },
+    );
+  }
+  try {
+    chmodSync(entries[0].staged, 0o755);
   } catch {
     // Windows / restricted FS — ignore.
   }
 
-  onLog("system", `Installing client assets → ${join(paths.installDir, "client")}`);
-  rmSync(join(paths.installDir, "client"), { recursive: true, force: true });
-  cpSync(srcClient, join(paths.installDir, "client"), { recursive: true });
-
-  if (existsSync(srcRuntime)) {
-    onLog("system", `Installing runtime assets → ${join(paths.installDir, "runtime")}`);
-    rmSync(join(paths.installDir, "runtime"), { recursive: true, force: true });
-    cpSync(srcRuntime, join(paths.installDir, "runtime"), { recursive: true });
+  for (const item of entries) {
+    if (pathExists(item.live)) {
+      try {
+        fs.renameSync(item.live, item.old);
+        item.movedAside = true;
+      } catch (err) {
+        // Staging just wrote to this directory, so a refused rename of an existing entry means the entry is held open.
+        throw new FnBinaryInUseError(item.live, errorCode(err), rollBackSwap(entries, fs), { cause: err });
+      }
+    }
+    try {
+      fs.renameSync(item.staged, item.live);
+      item.promoted = true;
+    } catch (err) {
+      const rollbackFailure = rollBackSwap(entries, fs);
+      throw new Error(
+        `Could not move the new ${item.label} into ${item.live}: ${errorMessage(err)}. ` +
+          (rollbackFailure ?? "The existing install was left unchanged."),
+        { cause: err },
+      );
+    }
   }
 
   for (const shim of [paths.fnShimPath, paths.fusionShimPath]) {
@@ -347,6 +522,19 @@ export function installLocalFnBinary(
     } else {
       onLog("system", `Link ${shim} → ${paths.binaryPath}`);
       symlinkSync(paths.binaryPath, shim);
+    }
+  }
+
+  for (const item of entries) {
+    if (!item.movedAside) continue;
+    try {
+      fs.rmSync(item.old, { recursive: true, force: true });
+    } catch {
+      onLog(
+        "system",
+        `Kept the previous ${item.label} at ${item.old} because it is still in use; a later install will remove it.` +
+          (item === entries[0] ? " A running fn keeps using the previous build until it is restarted." : ""),
+      );
     }
   }
 
@@ -473,10 +661,15 @@ export function removeLocalFnShims(
 /**
  * Full link-local pipeline: workspace full build → bun compile → install under
  * ~/.local. Requires a Fusion source checkout root.
+ *
+ * FNXC:SystemPanelFnBinary 2026-10-11-06:32:
+ * KB-109: an install failure, including `FnBinaryInUseError` when a running fn holds the install, is returned as `error` verbatim so the route shows it in the job log.
+ * `install` overrides the install layout and file-system seam; the route passes neither.
  */
 export async function runLinkLocalFnBinary(
   sourceRoot: string,
   onLog: FnBinaryLogFn,
+  install: { paths?: FnBinaryLocalPaths; fs?: FnBinaryInstallFs } = {},
 ): Promise<{ success: boolean; error?: string }> {
   const buildScript = join(sourceRoot, "scripts", "build-workspace.mjs");
   const cliBuild = join(sourceRoot, "packages", "cli", "build.ts");
@@ -520,7 +713,7 @@ export async function runLinkLocalFnBinary(
 
   onLog("system", "Step 3/3 — install as default local fn…");
   try {
-    installLocalFnBinary(distDir, onLog);
+    installLocalFnBinary(distDir, onLog, install.paths, install.fs);
   } catch (err) {
     return { success: false, error: err instanceof Error ? err.message : String(err) };
   }
