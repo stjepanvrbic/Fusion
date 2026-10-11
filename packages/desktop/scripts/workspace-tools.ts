@@ -146,6 +146,8 @@ export async function buildDashboard(): Promise<void> {
   await runWorkspaceBin("tsc", [], dashboardRoot);
   // FNXC:DesktopBuild 2026-07-01-11:45:
   // Desktop release and test paths call this helper directly instead of the dashboard package script, so copy the Node-read registry manifest beside server dist here as the shared build invariant.
+  // FNXC:DesktopBuild 2026-10-11-16:42:
+  // Only the release build path (scripts/build.ts) calls this helper now; the desktop test lane resolves the dashboard from source and builds nothing.
   await cp(resolve(dashboardRoot, "src", "registry-manifest.json"), resolve(dashboardRoot, "dist", "registry-manifest.json"));
 }
 
