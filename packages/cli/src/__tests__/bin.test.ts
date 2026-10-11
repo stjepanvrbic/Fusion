@@ -17,6 +17,7 @@ const commandMocks = vi.hoisted(() => ({
   runTaskMove: vi.fn(),
   runTaskMerge: vi.fn(),
   runTaskReconcile: vi.fn(),
+  runTaskCloseLanded: vi.fn(),
   runTaskUpdate: vi.fn(),
   runTaskDeps: vi.fn(),
   runTaskLog: vi.fn(),
@@ -129,7 +130,48 @@ const commandMocks = vi.hoisted(() => ({
   runPluginCreate: vi.fn(),
   runPluginNew: vi.fn(),
   runPluginDev: vi.fn(),
+  runPluginPublish: vi.fn(),
 
+  runMcpList: vi.fn(),
+  runMcpAdd: vi.fn(),
+  runMcpEdit: vi.fn(),
+  runMcpRemove: vi.fn(),
+  runMcpEnable: vi.fn(),
+  runMcpDisable: vi.fn(),
+  runMcpImport: vi.fn(),
+  runMcpExport: vi.fn(),
+  runMcpValidate: vi.fn(),
+  runMcpMemoryServer: vi.fn(),
+
+  runWorkflowValidate: vi.fn(),
+
+  runBranchGroupList: vi.fn(),
+  runBranchGroupShow: vi.fn(),
+  runBranchGroupPromote: vi.fn(),
+  runBranchGroupAbandon: vi.fn(),
+
+  runDbVacuum: vi.fn(),
+  runDbMigrate: vi.fn(),
+
+  runMemoryBackupCreate: vi.fn(),
+  runMemoryBackupList: vi.fn(),
+  runMemoryBackupRestore: vi.fn(),
+
+  runKnowledgeGraphBuild: vi.fn(),
+
+  runAgentExport: vi.fn(),
+
+  runChatInteractive: vi.fn(),
+  parseChatCliArgs: vi.fn(),
+
+  runSkillsSearch: vi.fn(),
+  runSkillsInstall: vi.fn(),
+
+  runComputer: vi.fn(),
+
+  runExperimentFinalize: vi.fn(),
+
+  dispatchUpdateCliArgs: vi.fn(),
 }));
 
 const onboardEnv = vi.hoisted(() => ({
@@ -171,6 +213,7 @@ vi.mock("../commands/task.js", () => ({
   runTaskMove: commandMocks.runTaskMove,
   runTaskMerge: commandMocks.runTaskMerge,
   runTaskReconcile: commandMocks.runTaskReconcile,
+  runTaskCloseLanded: commandMocks.runTaskCloseLanded,
   runTaskUpdate: commandMocks.runTaskUpdate,
   runTaskDeps: commandMocks.runTaskDeps,
   runTaskLog: commandMocks.runTaskLog,
@@ -318,6 +361,84 @@ vi.mock("../commands/plugin-scaffold.js", () => ({
 
 vi.mock("../commands/plugin-dev.js", () => ({
   runPluginDev: commandMocks.runPluginDev,
+}));
+
+/*
+ * FNXC:CliTests 2026-10-11-11:44:
+ * This suite tests routing only, so every command module that loadCommandHandlers imports is mocked here.
+ * A module left unmocked loads the real engine and dashboard graph into the first routing case, which then pays the whole cold import inside its time budget.
+ * A command module added to loadCommandHandlers needs a plain factory here that returns exactly the names bin.ts reads from it.
+ */
+vi.mock("../commands/plugin-publish.js", () => ({
+  runPluginPublish: commandMocks.runPluginPublish,
+}));
+
+vi.mock("../commands/mcp.js", () => ({
+  runMcpList: commandMocks.runMcpList,
+  runMcpAdd: commandMocks.runMcpAdd,
+  runMcpEdit: commandMocks.runMcpEdit,
+  runMcpRemove: commandMocks.runMcpRemove,
+  runMcpEnable: commandMocks.runMcpEnable,
+  runMcpDisable: commandMocks.runMcpDisable,
+  runMcpImport: commandMocks.runMcpImport,
+  runMcpExport: commandMocks.runMcpExport,
+  runMcpValidate: commandMocks.runMcpValidate,
+}));
+
+vi.mock("../commands/mcp-memory-server.js", () => ({
+  runMcpMemoryServer: commandMocks.runMcpMemoryServer,
+}));
+
+vi.mock("../commands/workflow.js", () => ({
+  runWorkflowValidate: commandMocks.runWorkflowValidate,
+}));
+
+vi.mock("../commands/branch-group.js", () => ({
+  runBranchGroupList: commandMocks.runBranchGroupList,
+  runBranchGroupShow: commandMocks.runBranchGroupShow,
+  runBranchGroupPromote: commandMocks.runBranchGroupPromote,
+  runBranchGroupAbandon: commandMocks.runBranchGroupAbandon,
+}));
+
+vi.mock("../commands/db.js", () => ({
+  runDbVacuum: commandMocks.runDbVacuum,
+  runDbMigrate: commandMocks.runDbMigrate,
+}));
+
+vi.mock("../commands/memory-backup.js", () => ({
+  runMemoryBackupCreate: commandMocks.runMemoryBackupCreate,
+  runMemoryBackupList: commandMocks.runMemoryBackupList,
+  runMemoryBackupRestore: commandMocks.runMemoryBackupRestore,
+}));
+
+vi.mock("../commands/knowledge-graph.js", () => ({
+  runKnowledgeGraphBuild: commandMocks.runKnowledgeGraphBuild,
+}));
+
+vi.mock("../commands/agent-export.js", () => ({
+  runAgentExport: commandMocks.runAgentExport,
+}));
+
+vi.mock("../commands/chat.js", () => ({
+  runChatInteractive: commandMocks.runChatInteractive,
+  parseChatCliArgs: commandMocks.parseChatCliArgs,
+}));
+
+vi.mock("../commands/skills.js", () => ({
+  runSkillsSearch: commandMocks.runSkillsSearch,
+  runSkillsInstall: commandMocks.runSkillsInstall,
+}));
+
+vi.mock("../commands/computer.js", () => ({
+  runComputer: commandMocks.runComputer,
+}));
+
+vi.mock("../commands/experiment-finalize.js", () => ({
+  runExperimentFinalize: commandMocks.runExperimentFinalize,
+}));
+
+vi.mock("../commands/update.js", () => ({
+  dispatchUpdateCliArgs: commandMocks.dispatchUpdateCliArgs,
 }));
 
 
@@ -1076,6 +1197,29 @@ describe("bin command routing and fallbacks", () => {
   it("routes task delete default allow-resurrection=false", async () => {
     await runBin(["task", "delete", "FN-1", "--force"]);
     expect(commandMocks.runTaskDelete).toHaveBeenCalledWith("FN-1", true, false, undefined);
+  });
+
+  it("routes task close-landed with its reason and project", async () => {
+    await runBin(["task", "close-landed", "FN-1", "--reason", "already on main", "--project", "ops"]);
+    expect(commandMocks.runTaskCloseLanded).toHaveBeenCalledWith("FN-1", "already on main", "ops");
+  });
+
+  it("routes task close-landed without a project", async () => {
+    await runBin(["task", "close-landed", "FN-1", "--reason", "already on main"]);
+    expect(commandMocks.runTaskCloseLanded).toHaveBeenCalledWith("FN-1", "already on main", undefined);
+  });
+
+  it.each([
+    { label: "no id", argv: ["task", "close-landed"] },
+    { label: "no --reason flag", argv: ["task", "close-landed", "FN-1"] },
+    { label: "--reason without a value", argv: ["task", "close-landed", "FN-1", "--reason"] },
+    { label: "a whitespace-only reason", argv: ["task", "close-landed", "FN-1", "--reason", "   "] },
+  ])("refuses task close-landed with $label", async ({ argv }) => {
+    await expect(runBin(argv)).rejects.toThrow("process.exit:1");
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Usage: fn task close-landed <id> --reason"),
+    );
+    expect(commandMocks.runTaskCloseLanded).not.toHaveBeenCalled();
   });
 
   it("routes desktop flags to runDesktop", async () => {
