@@ -115,7 +115,7 @@ import {
 } from "./planning-handoff-recovery.js";
 import { getPromptPath } from "./execution/spec-staleness.js";
 import { evaluateStrandedHoldContinuation, seedPreReleasePlanReviewContinuation } from "./plan-review-continuation.js";
-import { evaluateStrandedContinuationReclaim, RECLAIM_RETIRED_STATE } from "./workflows/stranded-continuation-reclaim.js";
+import { continuationWaitReason, evaluateStrandedContinuationReclaim, RECLAIM_RETIRED_STATE } from "./workflows/stranded-continuation-reclaim.js";
 /*
 FNXC:Workspace 2026-06-22-14:10 (Phase D review G — cycle dissolved):
 `isRepoLanded` is the CANONICAL per-repo landed predicate (Phase C, exported A6). It now lives in
@@ -8899,6 +8899,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
               || task.column === doneColumn
             ),
             taskPaused: task?.userPaused === true || task?.paused === true,
+            taskWaitReason: task ? continuationWaitReason(task) : null,
             live: live(item.taskId),
             enginePaused,
             stalenessMs: Math.max(0, now - new Date(item.updatedAt).getTime()),

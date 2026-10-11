@@ -183,6 +183,40 @@ describe("reconcileStrandedWorkflowContinuations", () => {
   });
 
   /*
+  FNXC:ContinuationWaitPark 2026-10-11-00:51:
+  A continuation parked `held` behind a file-scope or dependency blocker is a wait with a known end, not a stranded row.
+  While the card still waits on that blocker the sweep leaves it alone, so it is never re-dispatched just to be re-gated.
+  Once the card's blocker marker is gone, the hold has nothing left to wait for and returns to the queue at once, whatever its age.
+  */
+  it("leaves a blocker wait parked while the card still waits on that blocker", async () => {
+    for (const [label, blockedReason, taskOverrides] of [
+      ["file scope", "file-scope:KB-080", { status: "queued", overlapBlockedBy: "KB-080" }],
+      ["dependency", "dependency:KB-012", { status: "queued", blockedBy: "KB-012" }],
+    ] as Array<[string, string, Partial<Task>]>) {
+      const { manager, transitions } = harness([item({ state: "held", leaseOwner: null, blockedReason })], taskOverrides);
+      await expect(manager.reconcileStrandedWorkflowContinuations(), label).resolves.toBe(0);
+      expect(transitions, label).toEqual([]);
+    }
+  });
+
+  it("re-queues a blocker wait as soon as the card no longer waits on that blocker", async () => {
+    for (const [label, blockedReason, taskOverrides] of [
+      ["file scope cleared", "file-scope:KB-080", { status: undefined, overlapBlockedBy: undefined }],
+      ["dependency cleared", "dependency:KB-012", { status: undefined, blockedBy: undefined }],
+      ["now behind another blocker", "file-scope:KB-080", { status: "queued", overlapBlockedBy: "KB-090" }],
+    ] as Array<[string, string, Partial<Task>]>) {
+      recordRunAuditEventMock.mockClear();
+      const fresh = new Date().toISOString();
+      const { manager, transitions } = harness([item({ state: "held", leaseOwner: null, blockedReason, updatedAt: fresh })], taskOverrides);
+      await expect(manager.reconcileStrandedWorkflowContinuations(), label).resolves.toBe(1);
+      expect(transitions[0], label).toMatchObject({ state: "runnable", patch: expect.objectContaining({ blockedReason: null, expectedState: "held" }) });
+      expect(recordRunAuditEventMock, label).toHaveBeenCalledWith(expect.objectContaining({
+        metadata: expect.objectContaining({ priorState: "held", reason: "wait-released" }),
+      }));
+    }
+  });
+
+  /*
   The write is compare-and-set fenced on the state the scan observed. A dispatcher that legitimately
   claimed the row in between must win, and the sweep must not count or log a repair it did not make.
   */

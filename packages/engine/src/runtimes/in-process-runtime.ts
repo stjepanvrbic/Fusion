@@ -34,6 +34,7 @@ import {
   resolveLifecycleColumns,
 } from "@fusion/core";
 import { clearExternalBlockForAdmittedResume, isExternalBlockResumeWorkItem } from "../external-block/external-block-lifecycle.js";
+import { continuationWaitReason, FILE_SCOPE_CONTINUATION_WAIT_PREFIX } from "../workflows/stranded-continuation-reclaim.js";
 import { Scheduler } from "../scheduler.js";
 import { registerDefaultAgentPluginRunner, unregisterDefaultAgentPluginRunner } from "../pi.js";
 import type { PrMonitor, PrComment } from "../merge/pr-monitor.js";
@@ -843,8 +844,12 @@ exact blocker, park the work item `held` with a `file-scope:<blockerId>` reason 
 it re-enter the due window on the next poll (a busy-poll every ~2s until the blocker lands).
 `releaseFileScopeWaitingContinuations` is the matching wake, called once a blocker's overlap-wait
 episodes reach `delivered`/`ready` (see workflows/overlap-plan-revalidation.ts).
+
+FNXC:ContinuationWaitPark 2026-10-11-00:51:
+The wait reasons are derived by `continuationWaitReason` in workflows/stranded-continuation-reclaim.ts, shared with the self-healing reclaim sweep that releases a wait once its marker leaves the task.
+That sweep is the only wake for dependency waits and the backstop for a missed file-scope wake.
 */
-export const FILE_SCOPE_CONTINUATION_WAIT_PREFIX = "file-scope:";
+export { FILE_SCOPE_CONTINUATION_WAIT_PREFIX };
 
 function fileScopeContinuationWaitReason(blockerId: string): string {
   return `${FILE_SCOPE_CONTINUATION_WAIT_PREFIX}${blockerId}`;
@@ -894,35 +899,38 @@ export async function dispatchPlanningContinuationIfCurrent(input: {
  * with this pass (return it to `runnable` so the periodic drain / an immediate kick picks it up).
  * A CAS on `expectedState: "running"` refuses to clobber a state the completion path already moved
  * to underneath this callback (e.g. a concurrent cancel).
+ *
+ * FNXC:ContinuationWaitPark 2026-10-11-00:51:
+ * The dependency and file-scope gates run before the graph claims the item, so a held card's item is still in `dispatchedState`, the state the due poll saw.
+ * Only a wait parks from that state; a card that is not waiting keeps its unclaimed item exactly as the poll left it.
+ * Without this park the unclaimed item stayed `runnable`, was re-offered on every pass as the oldest candidate of its lane, and starved every younger card of that lane.
  */
 export async function settlePlanningContinuationDispatch(input: {
   store: TaskStore;
   taskId: string;
   itemId: string;
+  /** The item's state when it was dispatched; an outer gate leaves it there because the graph never claimed it. */
+  dispatchedState?: WorkflowWorkItemState;
   kick?: () => void;
 }): Promise<"waiting" | "runnable" | "unchanged"> {
   if (typeof input.store.transitionWorkflowWorkItem !== "function") return "unchanged";
   const task = await input.store.getTask(input.taskId).catch(() => null);
   if (!task || task.deletedAt) return "unchanged";
-  const blockerId = task.overlapBlockedBy?.trim();
-  const dependencyId = task.blockedBy?.trim();
-  const waitingReason = task.status === "queued"
-    ? blockerId
-      ? fileScopeContinuationWaitReason(blockerId)
-      : dependencyId
-        ? `dependency:${dependencyId}`
-        : null
-    : null;
+  const waitingReason = continuationWaitReason(task);
   const waiting = waitingReason !== null;
   const targetState: WorkflowWorkItemState = waiting ? "held" : "runnable";
-  const transitioned = await input.store.transitionWorkflowWorkItem(input.itemId, targetState, {
-    expectedState: "running",
+  const settleFrom = (expectedState: WorkflowWorkItemState) => input.store.transitionWorkflowWorkItem(input.itemId, targetState, {
+    expectedState,
     leaseOwner: null,
     leaseExpiresAt: null,
     retryAfter: null,
     lastError: null,
     blockedReason: waitingReason,
   }).catch(() => null);
+  let transitioned = await settleFrom("running");
+  if (waiting && transitioned?.state !== targetState && input.dispatchedState && input.dispatchedState !== "running") {
+    transitioned = await settleFrom(input.dispatchedState);
+  }
   if (!transitioned || transitioned.state !== targetState || (waiting && transitioned.blockedReason !== waitingReason)) {
     return "unchanged";
   }
@@ -991,7 +999,7 @@ export function createPlanningContinuationRun(input: PlanningContinuationRunInpu
     if (isTaskExternallyBlocked(task) && isExternalBlockResumeWorkItem(item)) {
       const cleared = await clearExternalBlockForAdmittedResume({ store: input.store, taskId: task.id, nodeId: item.nodeId });
       if (!cleared) {
-        await settlePlanningContinuationDispatch({ store: input.store, taskId: task.id, itemId: item.id, kick: input.kick });
+        await settlePlanningContinuationDispatch({ store: input.store, taskId: task.id, itemId: item.id, dispatchedState: item.state, kick: input.kick });
         return;
       }
       runTask = cleared;
@@ -999,7 +1007,7 @@ export function createPlanningContinuationRun(input: PlanningContinuationRunInpu
     await input.execute(runTask).catch((error) => {
       input.onError?.(runTask, item, error);
     });
-    await settlePlanningContinuationDispatch({ store: input.store, taskId: task.id, itemId: item.id, kick: input.kick });
+    await settlePlanningContinuationDispatch({ store: input.store, taskId: task.id, itemId: item.id, dispatchedState: item.state, kick: input.kick });
   };
 }
 

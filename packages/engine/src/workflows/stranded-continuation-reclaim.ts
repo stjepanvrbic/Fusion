@@ -1,4 +1,4 @@
-import { ACTIVE_WORKFLOW_WORK_ITEM_STATES, type WorkflowWorkItem } from "@fusion/core";
+import { ACTIVE_WORKFLOW_WORK_ITEM_STATES, type Task, type WorkflowWorkItem } from "@fusion/core";
 
 /*
 FNXC:StrandedContinuationReclaim 2026-08-11-09:12:
@@ -30,6 +30,29 @@ drift from "what the sweep reclaims" — the drift that let the FN-8923 sweep sh
 the problem it was written for.
 */
 
+/*
+FNXC:ContinuationWaitPark 2026-10-11-00:51:
+The outer dispatch gates hold a card in place with `status: "queued"` plus the blocker's id (`overlapBlockedBy` for a file-scope lease, `blockedBy` for a dependency).
+A continuation dispatched into that hold parks `held` with the matching reason below, so the due poll and every admission pass stop offering it.
+The reason is derived from the task in one place because the park (continuation settle) and its release (this sweep) must agree on it exactly.
+*/
+export const FILE_SCOPE_CONTINUATION_WAIT_PREFIX = "file-scope:";
+export const DEPENDENCY_CONTINUATION_WAIT_PREFIX = "dependency:";
+
+/** The wait a queued card is held on, as a continuation `blockedReason`; null when the card waits on no blocker. */
+export function continuationWaitReason(task: Pick<Task, "status" | "overlapBlockedBy" | "blockedBy">): string | null {
+  if (task.status !== "queued") return null;
+  const blockerId = task.overlapBlockedBy?.trim();
+  if (blockerId) return `${FILE_SCOPE_CONTINUATION_WAIT_PREFIX}${blockerId}`;
+  const dependencyId = task.blockedBy?.trim();
+  return dependencyId ? `${DEPENDENCY_CONTINUATION_WAIT_PREFIX}${dependencyId}` : null;
+}
+
+function isContinuationWaitReason(reason: string | null | undefined): boolean {
+  return reason?.startsWith(FILE_SCOPE_CONTINUATION_WAIT_PREFIX) === true
+    || reason?.startsWith(DEPENDENCY_CONTINUATION_WAIT_PREFIX) === true;
+}
+
 /** Terminal disposition for a row whose task can never run it again. */
 export const RECLAIM_RETIRED_STATE = "cancelled" as const;
 
@@ -46,7 +69,9 @@ export type StrandedContinuationReason =
   | "lease-active"
   | "scheduler-owned"
   | "dead-lease"
-  | "unclaimable-hold";
+  | "unclaimable-hold"
+  | "waiting-on-blocker"
+  | "wait-released";
 
 export interface StrandedContinuationVerdict {
   action: StrandedContinuationAction;
@@ -73,6 +98,7 @@ export interface StrandedContinuationVerdict {
  * @param input.item The continuation row under consideration.
  * @param input.taskTerminal The owning task is deleted, archived, or otherwise past running this row.
  * @param input.taskMissing No task row resolved for `item.taskId` at all.
+ * @param input.taskWaitReason The owning task's current blocker wait (`continuationWaitReason`), null when it waits on none.
  * @param input.live Caller-proven live execution for the owning task.
  * @param input.stalenessMs Age of the row's last update.
  * @param input.graceMs Minimum age before a row is considered abandoned.
@@ -82,6 +108,7 @@ export function evaluateStrandedContinuationReclaim(input: {
   taskTerminal: boolean;
   taskMissing: boolean;
   taskPaused: boolean;
+  taskWaitReason: string | null;
   live: boolean;
   enginePaused: boolean;
   stalenessMs: number;
@@ -105,6 +132,16 @@ export function evaluateStrandedContinuationReclaim(input: {
   */
   if (input.item.state === "runnable" || input.item.state === "retrying") {
     return { action: "none", reason: "scheduler-owned" };
+  }
+  /*
+  FNXC:ContinuationWaitPark 2026-10-11-00:51:
+  A blocker wait ends when its marker leaves the task, and nothing claims a `held` row, so a released wait needs no staleness grace.
+  Re-queueing a wait whose blocker is still in place would only re-dispatch the card into the same gate.
+  */
+  if (input.item.state === "held" && isContinuationWaitReason(input.item.blockedReason)) {
+    return input.item.blockedReason === input.taskWaitReason
+      ? { action: "none", reason: "waiting-on-blocker" }
+      : { action: "requeue", reason: "wait-released" };
   }
   if (input.stalenessMs < input.graceMs) return { action: "none", reason: "too-fresh" };
   if (input.item.state === "running") {
