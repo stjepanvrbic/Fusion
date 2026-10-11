@@ -15,9 +15,15 @@ vi.mock("../../hooks/useNavigationHistory", async (importOriginal) => {
   return { ...actual, useNavigationHistoryContext: () => ({ pushNav: vi.fn(), replaceCurrent: vi.fn() }) };
 });
 
+/*
+FNXC:DashboardTests 2026-10-11-04:29:
+react-i18next returns a referentially stable t until the language changes, and Planner Chat's history load depends on it.
+A fresh t per render re-runs that load after every commit, which loops once the transcript anchor runs in the layout phase.
+*/
+const mockT = vi.hoisted(() => (_key: string, fallback?: string) => fallback ?? _key);
 vi.mock("react-i18next", async (importOriginal) => {
   const actual = await importOriginal<typeof import("react-i18next")>();
-  return { ...actual, useTranslation: () => ({ t: (_key: string, fallback?: string) => fallback ?? _key }) };
+  return { ...actual, useTranslation: () => ({ t: mockT }) };
 });
 vi.mock("../../api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../api")>();

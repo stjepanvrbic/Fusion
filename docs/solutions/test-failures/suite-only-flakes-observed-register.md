@@ -19,7 +19,7 @@ tags:
 
 # Observed suite-only flakes register
 
-This register has **8 active observation records** (entries 2, 13, 20, 21, 25, 32, 33, and 37): seven **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, 18, 27, 35, 36, and 38 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **22 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
+This register has **8 active observation records** (entries 2, 13, 20, 21, 25, 32, 33, and 37): seven **active first sightings** and one **reproduced escalation awaiting an owner decision** (entry 13). Entries 1, 15, 18, 27, 35, 36, 38, and 40 closed after structural fixes with recorded verification, and stay in place below for campaign and first-sighting evidence. Entries 7 and 14 below are closed and retained for cross-reference only. It also has **1 merge-gate eviction record** (entry 6) and **22 archived closed records**. Only the active section drives quarantine and escalation decisions; the other sections preserve historical evidence.
 
 <!--
 FNXC:TestFlakeRegister 2026-08-19-11:14:
@@ -54,6 +54,11 @@ The operator's second listed flake, the register-signal-routes teardown timeout,
 
 FNXC:TestFlakeRegister 2026-10-08-13:53:
 The KB-043 record lands as entry 37 because main had already assigned entries 33 through 36 when it merged.
+-->
+
+<!--
+FNXC:TestFlakeRegister 2026-10-11-04:57:
+Entry 40 records the first Planner Chat transcript-anchor sighting and closes it in place: the measured cause was a product ordering defect (the anchor ran in a passive effect after the commit that rendered the history), fixed in the component with the failing case unedited.
 -->
 
 ## Active observation records
@@ -531,6 +536,38 @@ Hypothesis, not measured: the component copies the code from a passive effect ke
 | KB-085 `@fusion/dashboard run test:quality:app:backfill-3`, local Windows, after the fix | passed, 196.8 s wall |
 
 KB-085 measured the window: when the commit that renders the pill lands, the auto-copy passive effect has not run yet and `writeText` has no calls. The case had passed only because RTL's post-`waitFor` drain usually flushed React's scheduled passive effect before the synchronous read. The failure itself was not reproduced locally, so the specific CI race that let the read run first under load remains unmeasured. KB-085 made the case flush effects with `await act(async () => { await Promise.resolve(); })` before the read, mirroring the sibling `SettingsModal.models-auth.test.tsx` case. The exact `toHaveBeenCalledWith("ABCD-1234")`, `toHaveBeenCalledTimes(1)`, and `(2)` assertions are unchanged, and no timeout, retry, or product code changed. The neighboring execCommand-fallback and error-toast cases already wait with `waitFor`. A new sighting re-opens normal escalation.
+
+### 40. Planner Chat transcript anchored after the history commit
+
+- **Status:** Closed 2026-10-11 — structurally resolved on first sighting by KB-098 (product fix); no quarantine.
+- **Root cause:** Planner Chat anchored a newly rendered transcript to its newest message from a passive `useEffect`, so the commit that rendered loaded history left `scrollTop` at `0` until a later effect flush, and the case's synchronous read after `findByText` passed only when that flush happened to run first.
+- **Fix:** KB-098 moved the anchoring effect in `TaskPlannerChatTab.tsx` to `useLayoutEffect`, the phase the sibling `TaskChatTab.tsx` already uses, and added same-commit probe cases for initial history, tab re-activation, and pinned streamed growth.
+- **File:** `packages/dashboard/app/components/__tests__/TaskPlannerChatTab.test.tsx`
+- **Exact test:** `TaskPlannerChatTab > keeps an unsnapped planner transcript in place during streamed growth`.
+- **Observed tree/SHA:** fork Full Suite (non-blocking) run [37822793618](https://github.com/stjepanvrbic/Fusion/actions/runs/37822793618/job/113467856430) at `b797a1a8b0bb890f7f7932b7a0fa7cd83ed18dbd` (KB-087, Linux, `ubuntu-latest`), job `Test shard 3/4` (`113467856430`), command `@fusion/dashboard run test:quality:app:backfill-1`, project `dashboard-app-quality-backfill`. That commit changed only server tests under `packages/dashboard/src`, `devserver-detect.ts`, `fn-binary-local-install.ts`, `register-system-routes.ts`, `docs/testing.md`, and a changeset, and no file under `packages/dashboard/app`.
+- **Observed frequency:** 1 failure, in a command that reported 177 files (1 failed, 176 passed) and 2299 tests (1 failed, 2298 passed).
+
+The failure was `FAIL dashboard-app-quality-backfill app/components/__tests__/TaskPlannerChatTab.test.tsx > TaskPlannerChatTab > keeps an unsnapped planner transcript in place during streamed growth` with `AssertionError: expected +0 to be 1000 // Object.is equality` at `TaskPlannerChatTab.test.tsx:1050`, the `expect(metrics.scrollTop).toBe(metrics.scrollHeight)` read that runs right after `await screen.findByText("Earlier plan")`. The history text was in the DOM and the transcript had not been anchored.
+
+Measured during planning (scratch probes, reverted): a `MutationObserver` reading `scrollTop` at the first DOM mutation that showed "Earlier plan" recorded `0`, and a parent layout-effect probe batched into the history commit recorded `{present: true, scrollTop: 0}`, 3/3 runs each. With only the anchoring effect changed to `useLayoutEffect`, both probes recorded `1000`, 3/3. Measured by KB-098 with the committed probe cases against the unfixed component: the first history-present sample read `scrollTop` `0` against `scrollHeight` `1000`, the tab re-activation sample read `100` against `1000`, and the pinned streamed-growth sample read `1000` against `1400`. All three pass after the fix.
+
+Verdict: a product ordering defect exposed by a synchronous read. Loaded history arrives from an awaited fetch, not an interaction, and React's [`useEffect` caveats](https://react.dev/reference/react/useEffect) state that such an Effect generally runs after the browser paints, recommending `useLayoutEffect` for visual work that would otherwise flicker; [`useLayoutEffect`](https://react.dev/reference/react/useLayoutEffect) runs after the commit and before repaint. A reader could therefore see the top of the history for a frame before it jumped to the newest message. A real browser paint was not measured (jsdom does not paint). Hypothesis, not measured: on run 37822793618 the test's read ran before React's scheduled passive-effect flush because of load-dependent ordering between that flush and React Testing Library's post-`waitFor` drain.
+
+The fix exposed a separate test-harness defect: `StandardChatSurface.nativeStructureEmbed.test.tsx` mocked `useTranslation` with a new `t` per render. Planner Chat's history load depends on `t`, so the load re-ran after every commit, and with the anchor's state update in the layout phase the reload loop hit React's maximum update depth and left the planner in its loading state (3 task-bound cases failed; the file passed 24/24 on the unfixed component). KB-098 gave the mock one stable `t`, as react-i18next does.
+
+| run | result |
+|---|---|
+| Full Suite 37816474788, 37818907020, 37820528898, shard 3/4 | passed |
+| Full Suite 37822793618 (`b797a1a8b`), shard 3/4 | **failed** (this case) |
+| Full Suite 37823843450, 37824921482, 37826361182, 37827485906, 37828982122, 37829637990, 37831541785, 37832714652, shard 3/4 | passed; no failed job log names `TaskPlannerChatTab` |
+| Planning census: failed Linux `Test shard` job logs of 51 earlier runs, 37754942720 through 37820528898, read through the job-log API | no sighting |
+| KB-098: Full Suite runs on main newer than 37832714652 (checked 2026-10-11) | none exist |
+| KB-098 probe cases against the unfixed component, local Windows, `7f51dd69a` | **3/3 failed**: `0` vs `1000`, `100` vs `1000`, `1000` vs `1400` |
+| KB-098 `pnpm exec vitest run app/components/__tests__/TaskPlannerChatTab.test.tsx --project dashboard-app-quality-backfill` in `packages/dashboard`, local Windows, after the fix, 5 consecutive runs | 5/5 passed, 92 tests each |
+| KB-098 other files that mount Planner Chat (TaskDetailModal suites, chat-focus, voice dictation, native-structure embeds), after the fix | passed, 273 tests |
+| KB-098 `@fusion/dashboard run test:quality:app:backfill-1`, local Windows, KB-098 branch with the fix and the embed-suite mock change | passed, 177 files, 2302 tests, 234.6 s wall |
+
+No timeout, retry, or assertion changed, and the failing case's body is unedited. The file is not quarantined. A new sighting re-opens normal escalation: a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`, after checking that the anchoring effect still runs in the layout phase.
 
 ### Common shape and investigated result
 

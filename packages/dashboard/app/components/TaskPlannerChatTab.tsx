@@ -893,7 +893,7 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
     setTranscriptAtBottom(isTranscriptNearBottom(container));
   }, [setTranscriptAtBottom]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const container = transcriptRef.current;
     const wasActive = previousActiveRef.current;
     previousActiveRef.current = active;
@@ -914,6 +914,11 @@ export function TaskPlannerChatTab({ task, columnFlags, projectId, active, expan
      * Planner Chat. Initial history and tab activation intentionally anchor the reader,
      * while streamed snapshots follow only when the reader remains within the 48px tail
      * threshold so manually reading earlier planner output is never overridden.
+     *
+     * FNXC:TaskDetailPlannerChat 2026-10-11-04:29:
+     * The anchor and the empty-transcript reset are written in the commit that renders the
+     * transcript, so a reader never sees an unanchored frame. History loaded from the network
+     * is not an interaction, so a passive effect would run after the browser paints it.
      */
     if (active && (forceScrollToBottomRef.current || becameActive || receivedInitialMessages || (isTranscriptAtBottomRef.current && isTranscriptAtBottom))) {
       anchorTranscriptToBottom(container);

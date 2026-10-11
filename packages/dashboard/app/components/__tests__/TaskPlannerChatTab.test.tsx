@@ -180,6 +180,40 @@ function mockPlannerTranscriptMetrics({ scrollHeight = 1200, clientHeight = 240,
   };
 }
 
+type PlannerTranscriptMetrics = ReturnType<typeof mockPlannerTranscriptMetrics>;
+type TranscriptCommitSample = { markerPresent: boolean; scrollTop: number; scrollHeight: number };
+type TranscriptCommitProbeControls = { bump: () => void };
+
+/*
+FNXC:TaskDetailPlannerChat 2026-10-11-04:29:
+Samples the transcript position in the layout phase of every commit this wrapper takes part in.
+A parent's layout effect runs after its descendants' layout effects and before any passive effect of the same commit, so a sample equals scrollHeight only when Planner Chat writes its anchor in the commit that renders the content, before the browser can paint it.
+*/
+function TranscriptCommitProbe({ marker, metrics, samples, controls, children }: {
+  marker: string;
+  metrics: PlannerTranscriptMetrics;
+  samples: TranscriptCommitSample[];
+  controls: TranscriptCommitProbeControls;
+  children: React.ReactNode;
+}) {
+  const [, bump] = React.useReducer((count: number) => count + 1, 0);
+  React.useLayoutEffect(() => {
+    controls.bump = bump;
+  }, [controls]);
+  React.useLayoutEffect(() => {
+    samples.push({
+      markerPresent: document.body.textContent?.includes(marker) ?? false,
+      scrollTop: metrics.scrollTop,
+      scrollHeight: metrics.scrollHeight,
+    });
+  });
+  return <>{children}</>;
+}
+
+function createTranscriptCommitProbeControls(): TranscriptCommitProbeControls {
+  return { bump: () => { throw new Error("TranscriptCommitProbe is not mounted"); } };
+}
+
 function plannerQuestionMessage(id: string, args: Record<string, unknown>, createdAt = "2026-06-30T00:02:00.000Z") {
   return {
     id,
@@ -1106,6 +1140,88 @@ describe("TaskPlannerChatTab", () => {
     renderPlannerChat({ task: makeTask("FN-empty") });
     await screen.findAllByTestId("task-planner-chat-empty");
     expect(metrics.scrollTop).toBe(0);
+  });
+
+  it("anchors loaded planner history in the same commit that renders it", async () => {
+    const metrics = mockPlannerTranscriptMetrics({ scrollHeight: 1000, clientHeight: 240 });
+    const samples: TranscriptCommitSample[] = [];
+    const controls = createTranscriptCommitProbeControls();
+    mockFetchChatMessages.mockImplementationOnce(async () => {
+      // Batch a probe render into the commit that receives the history.
+      controls.bump();
+      return {
+        messages: [{ id: "history", sessionId: "chat-planner", role: "assistant", content: "Committed plan", thinkingOutput: null, metadata: null, createdAt: "2026-06-30T00:01:00.000Z" }],
+      };
+    });
+
+    render(
+      <TranscriptCommitProbe marker="Committed plan" metrics={metrics} samples={samples} controls={controls}>
+        <TaskPlannerChatTab task={makeTask("FN-7310")} active taskChatModel={{ provider: "anthropic", modelId: "claude-plan" }} addToast={vi.fn()} />
+      </TranscriptCommitProbe>,
+    );
+    await screen.findByText("Committed plan");
+
+    const firstHistorySample = samples.find((sample) => sample.markerPresent);
+    expect(firstHistorySample).toBeDefined();
+    expect(firstHistorySample).toEqual({ markerPresent: true, scrollTop: 1000, scrollHeight: 1000 });
+  });
+
+  it("anchors planner history in the same commit that re-activates the tab", async () => {
+    const metrics = mockPlannerTranscriptMetrics({ scrollHeight: 1000, clientHeight: 240 });
+    const samples: TranscriptCommitSample[] = [];
+    const controls = createTranscriptCommitProbeControls();
+    mockFetchChatMessages.mockResolvedValue({
+      messages: [{ id: "history", sessionId: "chat-planner", role: "assistant", content: "Reactivated plan", thinkingOutput: null, metadata: null, createdAt: "2026-06-30T00:01:00.000Z" }],
+    });
+    const renderProbe = (active: boolean) => (
+      <TranscriptCommitProbe marker="Reactivated plan" metrics={metrics} samples={samples} controls={controls}>
+        <TaskPlannerChatTab task={makeTask("FN-7310")} active={active} taskChatModel={{ provider: "anthropic", modelId: "claude-plan" }} addToast={vi.fn()} />
+      </TranscriptCommitProbe>
+    );
+
+    const { rerender } = render(renderProbe(true));
+    await screen.findByText("Reactivated plan");
+    rerender(renderProbe(false));
+    metrics.scrollTop = 100;
+
+    const activationSampleIndex = samples.length;
+    rerender(renderProbe(true));
+
+    expect(samples[activationSampleIndex]).toEqual({ markerPresent: true, scrollTop: 1000, scrollHeight: 1000 });
+  });
+
+  it("follows pinned streamed planner growth in the same commit that renders it", async () => {
+    const user = userEvent.setup();
+    const metrics = mockPlannerTranscriptMetrics({ scrollHeight: 1000, clientHeight: 240 });
+    const samples: TranscriptCommitSample[] = [];
+    const controls = createTranscriptCommitProbeControls();
+    let streamHandlers: any;
+    mockFetchChatMessages.mockResolvedValueOnce({
+      messages: [{ id: "history", sessionId: "chat-planner", role: "assistant", content: "Earlier plan", thinkingOutput: null, metadata: null, createdAt: "2026-06-30T00:01:00.000Z" }],
+    });
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+      streamHandlers = handlers;
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    render(
+      <TranscriptCommitProbe marker="pinned committed growth" metrics={metrics} samples={samples} controls={controls}>
+        <TaskPlannerChatTab task={makeTask("FN-7310")} active taskChatModel={{ provider: "anthropic", modelId: "claude-plan" }} addToast={vi.fn()} />
+      </TranscriptCommitProbe>,
+    );
+    await screen.findByText("Earlier plan");
+    await user.type(screen.getByLabelText("Message task chat"), "Keep streaming");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(streamHandlers).toBeDefined());
+
+    metrics.scrollHeight = 1400;
+    const growthSampleIndex = samples.length;
+    act(() => {
+      streamHandlers.onText("pinned committed growth");
+      controls.bump();
+    });
+
+    expect(samples[growthSampleIndex]).toEqual({ markerPresent: true, scrollTop: 1400, scrollHeight: 1400 });
   });
 
   it("keeps the mobile media block free of planner transcript scroll-semantic overrides", () => {
