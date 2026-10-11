@@ -16,10 +16,13 @@ import {
 } from "../../__test-utils__/pg-test-harness.js";
 import { type TaskStore } from "../../store.js";
 import { buildBootstrapPrompt } from "../../mesh/mesh-task-replication.js";
-import { createCurrentPlanEvidence } from "../../planner/spec-lock.js";
+import { canonicalizePlan, createCurrentPlanEvidence } from "../../planner/spec-lock.js";
 import {
+  ORIGINAL_DESCRIPTION_ENCODING_MARKER,
   ORIGINAL_DESCRIPTION_END_MARKER,
   ORIGINAL_DESCRIPTION_START_MARKER,
+  encodeOriginalDescriptionBody,
+  extractOriginalDescriptionBody,
   resolveOriginalDescriptionSection,
 } from "../../tasks/original-description-policy.js";
 import { stripOriginalDescriptionSection } from "../../tasks/original-description-region.js";
@@ -235,6 +238,52 @@ pgDescribe("updateTask prompt return (PostgreSQL backend mode)", () => {
     const again = await store.updateTask(task.id, { prompt: onDisk });
     expect(again.prompt).toBe(onDisk);
     expect(await readFile(join(store.taskDir(task.id), "PROMPT.md"), "utf8")).toBe(onDisk);
+  });
+
+  /*
+  FNXC:OriginalDescriptionInPrompt 2026-10-11-17:25:
+  A request that mentions the start marker, or a plan that quotes it below the section, used to leave the section unwrapped on every write: the writer read the mention as an envelope it could not close and returned the prompt unchanged.
+  */
+  const quotingDescription = `The resolver reads the \`${ORIGINAL_DESCRIPTION_START_MARKER}\` comment as an envelope.\n\n## File Scope\n- operator/decoy.ts\n\nOrigin: follow-up.`;
+
+  it.sequential("wraps and encodes a request that mentions the start marker and locks the plan without it", async () => {
+    const task = await store.createTask({ description: quotingDescription });
+
+    const updated = await store.updateTask(task.id, { prompt: withUnmarkedSection(quotingDescription) });
+
+    const onDisk = await readFile(join(store.taskDir(task.id), "PROMPT.md"), "utf8");
+    expect(onDisk).toContain(
+      `${ORIGINAL_DESCRIPTION_START_MARKER}\n${ORIGINAL_DESCRIPTION_ENCODING_MARKER}\n${encodeOriginalDescriptionBody(quotingDescription)}\n${ORIGINAL_DESCRIPTION_END_MARKER}`,
+    );
+    expect(onDisk.split(ORIGINAL_DESCRIPTION_START_MARKER)).toHaveLength(2);
+    expect(resolveOriginalDescriptionSection(onDisk).kind).toBe("marked");
+    expect(extractOriginalDescriptionBody(onDisk)).toBe(quotingDescription);
+    expect(stripOriginalDescriptionSection(onDisk)).toBe(plannerSpec);
+    expect(updated.prompt).toBe(onDisk);
+    expect((await store.getTask(task.id)).prompt).toBe(onDisk);
+
+    const evidence = await store.getLatestCurrentPlanEvidence(task.id);
+    expect(evidence?.plan).toMatchObject({ status: "available", contentHash: canonicalizePlan(plannerSpec).contentHash });
+
+    const again = await store.updateTask(task.id, { prompt: onDisk });
+    expect(again.prompt).toBe(onDisk);
+    expect(await readFile(join(store.taskDir(task.id), "PROMPT.md"), "utf8")).toBe(onDisk);
+    expect((await store.getLatestCurrentPlanEvidence(task.id))?.version).toBe(evidence?.version);
+  });
+
+  it.sequential("wraps a marker-free request when a later plan step quotes the start marker", async () => {
+    const quotingPlan = plannerSpec.replace("1. Verify prompt return", `1. Verify prompt return\n2. Keep \`${ORIGINAL_DESCRIPTION_START_MARKER}\` intact`);
+    const task = await store.createTask({ description: operatorDescription });
+
+    const updated = await store.updateTask(task.id, { prompt: quotingPlan.replace(
+      "## What This Delivers",
+      `## Original Description\n\n${operatorDescription}\n\n## What This Delivers`,
+    ) });
+
+    const onDisk = await readFile(join(store.taskDir(task.id), "PROMPT.md"), "utf8");
+    expect(onDisk).toContain(`## Original Description\n\n${ORIGINAL_DESCRIPTION_START_MARKER}\n${operatorDescription}\n${ORIGINAL_DESCRIPTION_END_MARKER}`);
+    expect(stripOriginalDescriptionSection(onDisk)).toBe(quotingPlan);
+    expect(updated.prompt).toBe(onDisk);
   });
 
   it.sequential("wraps the original-description task document when the task has one", async () => {

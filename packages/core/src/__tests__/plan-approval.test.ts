@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { computePlanApprovalFingerprint, isPlanReviewSatisfied, resolvePlanApprovalRequired, type PlanApprovalMode } from "../planner/plan-approval.js";
 import { applyFrontendUxCriteria } from "../tasks/frontend-ux-policy.js";
-import { applyOriginalDescription } from "../tasks/original-description-policy.js";
+import { applyOriginalDescription, ORIGINAL_DESCRIPTION_END_MARKER, ORIGINAL_DESCRIPTION_START_MARKER } from "../tasks/original-description-policy.js";
 
 const workflowValues = [true, false, undefined] as const;
 
@@ -202,10 +202,29 @@ describe("computePlanApprovalFingerprint", () => {
       "## What This Delivers",
       `## Original Description\n\n${sectionBody}\n\n## What This Delivers`,
     );
-    const shapes: Array<[string, (plan: string, operatorBody: string) => string]> = [
-      ["bare unmarked", (plan, body) => unmarked(plan, body)],
-      ["fenced unmarked", (plan, body) => unmarked(plan, `\`\`\`text\n${body}\n\`\`\``)],
-      ["marked", (plan, body) => applyOriginalDescription(plan, body)],
+    /*
+    FNXC:PlanApproval 2026-10-11-17:15:
+    A section that mentions the start marker outside the positional slot is stripped like any other, before and after hygiene wraps it.
+    The plan-side quote is part of the plan, so that shape compares against the quoting plan without the section.
+    */
+    const start = ORIGINAL_DESCRIPTION_START_MARKER;
+    const end = ORIGINAL_DESCRIPTION_END_MARKER;
+    const identity = (plan: string): string => plan;
+    const quotePlan = (plan: string): string => plan.replace("- Deliver the interface.", `- Deliver the interface; keep \`${start}\` intact.`);
+    const markerMentions: Array<[string, (operatorBody: string) => string, (plan: string) => string]> = [
+      ["start marker inline", (body) => `Mentions \`${start}\` inline.\n\n${body}`, identity],
+      ["start marker alone mid-body", (body) => `Operator lead.\n\n${start}\n\n${body}`, identity],
+      ["both markers inline", (body) => `Quote \`${start}\` and \`${end}\` inline.\n\n${body}`, identity],
+      ["start marker quoted in a later plan section", (body) => body, quotePlan],
+    ];
+    const shapes: Array<[string, (plan: string, operatorBody: string) => string, (plan: string) => string]> = [
+      ["bare unmarked", (plan, body) => unmarked(plan, body), identity],
+      ["fenced unmarked", (plan, body) => unmarked(plan, `\`\`\`text\n${body}\n\`\`\``), identity],
+      ["marked", (plan, body) => applyOriginalDescription(plan, body), identity],
+      ...markerMentions.flatMap(([name, sectionText, planOf]): Array<[string, (plan: string, operatorBody: string) => string, (plan: string) => string]> => [
+        [`bare unmarked with the ${name}`, (plan, body) => unmarked(planOf(plan), sectionText(body)), planOf],
+        [`wrapped with the ${name}`, (plan, body) => applyOriginalDescription(unmarked(planOf(plan), sectionText(body)), sectionText(body)), planOf],
+      ]),
     ];
     const bodies = [
       "Operator request.",
@@ -213,9 +232,9 @@ describe("computePlanApprovalFingerprint", () => {
       "",
     ];
 
-    it.each(shapes)("gives a %s section the fingerprint of the plan without the section, for any body", (_shape, build) => {
+    it.each(shapes)("gives a %s section the fingerprint of the plan without the section, for any body", (_shape, build, planOf) => {
       for (const body of bodies) {
-        expect(computePlanApprovalFingerprint(build(plannerText, body))).toBe(computePlanApprovalFingerprint(plannerText));
+        expect(computePlanApprovalFingerprint(build(plannerText, body))).toBe(computePlanApprovalFingerprint(planOf(plannerText)));
       }
     });
 

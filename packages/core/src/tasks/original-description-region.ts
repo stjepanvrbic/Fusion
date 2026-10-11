@@ -73,7 +73,10 @@ export function stripOriginalDescriptionSection(promptText: string): string {
  *
  * An unresolved marker has two shapes.
  * When an end marker follows the start marker, the region ends just past the first one: hygiene encodes marker literals inside the body, so the first end marker closes every region the store wrote, even when a custom plan heading follows it.
- * When no end marker follows, the start marker is operator prose in an unwrapped section, so the region is bounded like an unmarked section with the body unknown.
+ *
+ * FNXC:FileScopeClassification 2026-10-11-16:55:
+ * An unresolved marker is always a positional opener, because the resolver reads a start marker anywhere else as prose and resolves the section as unmarked.
+ * With no end marker after it, the opener belongs to a truncated envelope; the region is bounded like an unmarked section with the body unknown.
  *
  * Returns `null` when the prompt has no Original Description heading: a seed prompt keeps its operator text as provisional plan content.
  * Never logs, because scope readers run on every scheduler pass.
@@ -85,16 +88,13 @@ export function locateOriginalDescriptionRegion(promptText: string): { start: nu
     return { start: section.sectionStart, end: section.sectionEnd };
   }
 
-  const headingEnd = promptText.indexOf("\n", section.sectionStart);
-  const headerEnd = headingEnd === -1 ? promptText.length : headingEnd;
-  const startMarker = promptText.indexOf(ORIGINAL_DESCRIPTION_START_MARKER, headerEnd);
-  const endMarker = startMarker === -1
-    ? -1
-    : promptText.indexOf(ORIGINAL_DESCRIPTION_END_MARKER, startMarker + ORIGINAL_DESCRIPTION_START_MARKER.length);
+  const endMarker = promptText.indexOf(ORIGINAL_DESCRIPTION_END_MARKER, section.bodyStart);
   if (endMarker !== -1) {
     return { start: section.sectionStart, end: endMarker + ORIGINAL_DESCRIPTION_END_MARKER.length };
   }
 
+  const headingEnd = promptText.indexOf("\n", section.sectionStart);
+  const headerEnd = headingEnd === -1 ? promptText.length : headingEnd;
   const terminatorOffset = findUnmarkedSectionTerminatorOffset(promptText.slice(headerEnd));
   return {
     start: section.sectionStart,

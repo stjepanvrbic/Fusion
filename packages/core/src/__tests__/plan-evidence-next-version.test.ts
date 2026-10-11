@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { expect, it } from "vitest";
 import { appendPlanEvidenceInTransaction, PlanEvidenceAppendError } from "../task-store/plan-evidence.js";
 import { createCurrentPlanEvidence, SPEC_LOCK_PARSER_VERSION, type CurrentPlanEvidence } from "../planner/spec-lock.js";
+import { ORIGINAL_DESCRIPTION_START_MARKER } from "../tasks/original-description-policy.js";
 
 const prompt = "# Task\n\n## Mission\n\nEvidence\n\n## Steps\n\n1. Keep it\n";
 const evidence = (version: number) => createCurrentPlanEvidence({ version, sourceRevision: 1, capturedAt: "2026-08-11T02:04:00.000Z", prompt });
@@ -97,4 +98,39 @@ it("appends current-parser evidence beside a rejection an older parser stored fo
   expect(second.evidence.plan.status).toBe("available");
   expect(rows.map((row) => row.version)).toEqual([1, 2]);
   expect(rows[0]?.snapshot).toBe(legacy);
+});
+
+/*
+FNXC:SpecLock 2026-10-11-17:15:
+Parser version 3 reads a start marker quoted in the request as prose. A rejection that version 2 stored for the same unchanged prompt must not answer for it.
+*/
+it("appends version-3 evidence beside a version-2 rejection of a request that quotes the start marker", async () => {
+  const quotingPrompt = `# Task\n\n## Original Description\n\nMentions \`${ORIGINAL_DESCRIPTION_START_MARKER}\` inline.\n\n## File Scope\n\n- operator/decoy.ts\n\n## What This Delivers\n\n- Value.\n\n## Mission\n\nEvidence\n\n## File Scope\n\n- src/a.ts\n`;
+  const previousParserVersion = SPEC_LOCK_PARSER_VERSION - 1;
+  const staleSourceHash = createHash("sha256")
+    .update(JSON.stringify({ prompt: quotingPrompt, bindings: {}, parserVersion: previousParserVersion }), "utf8")
+    .digest("hex");
+  const build = (version: number) => createCurrentPlanEvidence({ version, sourceRevision: 2, capturedAt: "2026-10-11T17:15:00.000Z", prompt: quotingPrompt });
+  const current = build(2);
+  const stale: CurrentPlanEvidence = {
+    version: 1,
+    sourceRevision: 1,
+    sourceHash: staleSourceHash,
+    capturedAt: "2026-10-11T12:00:00.000Z",
+    plan: {
+      parserVersion: previousParserVersion,
+      status: "unavailable",
+      reason: "section-duplicate",
+      sections: { ...current.plan.sections, "file-scope": { status: "unavailable", reason: "section-duplicate", canonical: "" } },
+    },
+  };
+  const { tx, rows } = durableTx([{ version: 1, sourceHash: staleSourceHash, snapshot: stale }]);
+
+  const first = await appendPlanEvidenceInTransaction(tx as never, { taskId: "KB-1", buildEvidence: build });
+  expect(SPEC_LOCK_PARSER_VERSION).toBe(3);
+  expect(first).toMatchObject({ version: 2, deduped: false });
+  expect(first.evidence.plan).toMatchObject({ status: "available", parserVersion: SPEC_LOCK_PARSER_VERSION });
+  expect(first.evidence.plan.sections["file-scope"].canonical).toBe("src/a.ts");
+  expect(rows.map((row) => row.version)).toEqual([1, 2]);
+  expect(rows[0]?.snapshot).toBe(stale);
 });

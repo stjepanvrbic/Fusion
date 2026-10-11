@@ -473,11 +473,12 @@ describe("File Scope quoted inside the Original Description", () => {
     expect(validateFileScopeInPromptContent(prompt)).toEqual({ valid: planEntries, invalid: [] });
   });
 
-  it("resolves the plan's section in an unwrapped section whose request mentions the start marker with no end marker", () => {
-    const request = description("B").replace(
-      "The requester explains the defect here.",
-      `The requester mentions ${ORIGINAL_DESCRIPTION_START_MARKER} inline.`,
-    );
+  it.each([
+    ["inline", `The requester mentions ${ORIGINAL_DESCRIPTION_START_MARKER} inline.`],
+    ["alone on a mid-body line", `The requester explains the defect here.\n\n${ORIGINAL_DESCRIPTION_START_MARKER}\n`],
+  ])("resolves the plan's section in an unwrapped section whose request mentions the start marker %s with no end marker", (_name, mention) => {
+    const request = description("B").replace("The requester explains the defect here.", mention);
+    expect(request).toContain(ORIGINAL_DESCRIPTION_START_MARKER);
     const prompt = plan().replace("## What This Delivers", `## Original Description\n\n${request}\n\n## What This Delivers`);
     expect(prompt).not.toContain(ORIGINAL_DESCRIPTION_END_MARKER);
     expect(locateFileScopeSection(prompt)?.headingStart).toBe(planHeadingOffset(prompt));

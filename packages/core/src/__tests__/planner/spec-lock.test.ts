@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { evaluateSpecDrift, hasPriorLockDivergence, isCurrentSpecDriftReport } from "../../planner/drift-report.js";
 import { canonicalizePlan, createCurrentPlanEvidence, diffSpecLocks, isSpecLockActive, isUnavailablePlanLockError, UnavailablePlanLockError } from "../../planner/spec-lock.js";
-import { applyOriginalDescription } from "../../tasks/original-description-policy.js";
+import { applyOriginalDescription, ORIGINAL_DESCRIPTION_END_MARKER, ORIGINAL_DESCRIPTION_START_MARKER, resolveOriginalDescriptionSection } from "../../tasks/original-description-policy.js";
 
 const prompt = `# Task\n\n## Mission\n\nBuild a safe widget.\n\n## File Scope\n\n- src/widget.ts\n\n## Steps\n\n1. Build widget\n\n## Completion Criteria\n\n- [ ] Widget works\n\n## Do NOT\n\n- Change API\n\n## Dependencies\n\n- FN-1\n`;
 const plannerPromptWithSummary = `# Task\n\n## What This Delivers\n\n- Deliver a safe widget.\n\n## Mission\n\nBuild a safe widget.\n\n## File Scope\n\n- src/widget.ts\n\n## Steps\n\n1. Build widget\n\n## Completion Criteria\n\n- [ ] Widget works\n\n## Do NOT\n\n- Change API\n\n## Dependencies\n\n- FN-1\n`;
@@ -279,10 +279,32 @@ describe("spec lock across stored Original Description shapes", () => {
     "## What This Delivers",
     `## Original Description\n\n${sectionBody}\n\n## What This Delivers`,
   );
+  /*
+  FNXC:SpecLock 2026-10-11-17:15:
+  A request or plan that mentions the start marker outside the positional slot must lock like any other section, before and after hygiene wraps it.
+  The plan-side quote sits in What This Delivers, which is not a lock section, so the expected content hash is unchanged.
+  */
+  const start = ORIGINAL_DESCRIPTION_START_MARKER;
+  const end = ORIGINAL_DESCRIPTION_END_MARKER;
+  const quotingSpec = plannerSpec.replace("- A safe widget.", `- A safe widget that keeps \`${start}\` intact.`);
+  const unmarkedIn = (spec: string, sectionBody: string): string => spec.replace(
+    "## What This Delivers",
+    `## Original Description\n\n${sectionBody}\n\n## What This Delivers`,
+  );
+  const markerMentions: Array<[string, (operatorBody: string) => string, string]> = [
+    ["start marker inline", (body) => `Mentions \`${start}\` inline.\n\n${body}`, plannerSpec],
+    ["start marker alone mid-body", (body) => `Operator lead.\n\n${start}\n\n${body}`, plannerSpec],
+    ["both markers inline", (body) => `Quote \`${start}\` and \`${end}\` inline.\n\n${body}`, plannerSpec],
+    ["start marker quoted in a later plan section", (body) => body, quotingSpec],
+  ];
   const shapes: Array<[string, (operatorBody: string) => string]> = [
     ["bare unmarked", (body) => unmarked(body)],
     ["fenced unmarked", (body) => unmarked(`\`\`\`text\n${body}\n\`\`\``)],
     ["marked", (body) => applyOriginalDescription(plannerSpec, body)],
+    ...markerMentions.flatMap(([name, sectionText, spec]): Array<[string, (operatorBody: string) => string]> => [
+      [`bare unmarked with the ${name}`, (body) => unmarkedIn(spec, sectionText(body))],
+      [`wrapped with the ${name}`, (body) => applyOriginalDescription(unmarkedIn(spec, sectionText(body)), sectionText(body))],
+    ]),
   ];
   const quotedBodies: Array<[string, string]> = [
     ...lockableAliases.map((alias): [string, string] => [alias, quoting([alias])]),
@@ -298,6 +320,14 @@ describe("spec lock across stored Original Description shapes", () => {
     expect(canonical.status).toBe("available");
     expect(canonical.contentHash).toBe(canonicalizePlan(build("Operator request.")).contentHash);
     expect(canonical.contentHash).toBe(canonicalizePlan(plannerSpec).contentHash);
+  });
+
+  it.each(markerMentions)("wraps a section with the %s into a real envelope", (_name, sectionText, spec) => {
+    const body = quoting(lockableAliases);
+    const unwrapped = unmarkedIn(spec, sectionText(body));
+
+    expect(resolveOriginalDescriptionSection(unwrapped).kind).toBe("unmarked");
+    expect(resolveOriginalDescriptionSection(applyOriginalDescription(unwrapped, sectionText(body))).kind).toBe("marked");
   });
 
   it.each(shapes)("gives the same lock for CRLF and LF text with a %s section", (_shape, build) => {

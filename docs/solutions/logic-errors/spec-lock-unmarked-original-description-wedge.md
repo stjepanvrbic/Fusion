@@ -108,3 +108,50 @@ rewritten.
 - `packages/engine/src/__tests__/plan-review-spec-lock-preflight.test.ts` shows no
   reviewer session for an unlockable plan on a first and a repeated dispatch,
   and exactly one session for lockable plans and for both stuck shapes.
+
+## Follow-up: a request that mentions the start marker
+
+### Symptom
+
+A planned spec whose operator request mentioned the start-marker comment was
+stored with its `## Original Description` section unwrapped, and it stayed that
+way. The resolver took the first start marker after the heading for the start of
+an envelope, even when that marker was prose. With no end marker after it, the
+result was `unresolved-marker`. Hygiene then returned the prompt unchanged, and
+the readers kept the whole section in the spec lock and the approval
+fingerprint. A single quote of the marker anywhere later in the plan had the
+same effect on an otherwise ordinary unmarked section.
+
+### Fix
+
+- **Positional opener.** A start marker opens the envelope only on the first
+  non-blank line under the heading, alone on that line (surrounding spaces, tabs
+  and a trailing `\r` are allowed). Hygiene always writes the opener there and
+  encodes every marker literal inside the body, so a start marker in any other
+  position is prose, and the section resolves as unmarked under the existing
+  rules. A positional opener is handled exactly as before, including the
+  unlisted-successor and truncated-envelope cases, so prompts that hygiene
+  wrapped keep their lock and fingerprint hashes.
+  `original-description-hash-stability.test.ts` pins those hashes with values
+  computed before the change.
+- **Writer idempotence requires a real envelope.** `applyOriginalDescription`
+  returns its input unchanged only when the resolved section is marked, its own
+  body matches the operator text, and the body declares the encoding exactly
+  when the text needs it. The old file-wide marker checks would have left an
+  unmarked section unwrapped whenever the plan below it quoted both markers.
+- **Parser version 3.** `SPEC_LOCK_PARSER_VERSION` is now 3. A stored version-2
+  rejection of an unchanged marker-mentioning prompt no longer answers for it.
+  Content hashes are unchanged for correctly wrapped prompts, so their active
+  locks stay active.
+
+Stored prompts are not backfilled. Such a section is stripped by the readers at
+once and wrapped by its next prompt write. Until that write, a recomputed
+approval fingerprint differs from the stored one. An audit of the stored
+artifacts found one affected prompt (KB-128), and none with the residual shape
+below.
+
+### Residual, accepted
+
+An unwrapped legacy section whose operator text begins with the start marker
+alone on its first line still reads as a truncated envelope. Every new write
+wraps the section, so only a pre-existing stored prompt can have that shape.

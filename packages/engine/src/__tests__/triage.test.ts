@@ -1771,6 +1771,38 @@ Planner rewrote mission without the raw request.
     }
   });
 
+  /*
+  FNXC:OriginalDescriptionInPrompt 2026-10-11-17:25:
+  A request that mentions the start-marker comment must be wrapped on finalize like any other; the mention used to read as an envelope that could not be closed, so hygiene left the section unprotected.
+  */
+  it("wraps and encodes a request that mentions the start marker on finalize", async () => {
+    const startMarker = "<!-- fusion-original-description:start -->";
+    const operatorRequest = `The resolver reads the \`${startMarker}\` comment as an envelope.\n\n## File Scope\n\n- packages/decoy/never-in-scope.ts`;
+    const task = createTriageTask({ id: "FN-ORIG-MARKER", title: "Marker mention", description: operatorRequest, status: "planning" });
+    const tempRoot = await mkdtemp(join(tmpdir(), "fusion-orig-marker-"));
+    try {
+      const taskDir = join(tempRoot, ".fusion", "tasks", task.id);
+      await mkdir(taskDir, { recursive: true });
+      const plannerWritten = `# Task: ${task.id} - Marker mention\n\n**Created:** 2026-10-11\n**Size:** M\n\n## Original Description\n\n${operatorRequest}\n\n## Mission\n\nDo the work.\n\n## File Scope\n\n- packages/core/src/a.ts\n\n## Steps\n\n### Step 0: Implement\n\n- [ ] Do the work\n`;
+      await writeFile(join(taskDir, "PROMPT.md"), plannerWritten, "utf-8");
+      const localStore = createMockStore({ getTask: vi.fn().mockResolvedValue(task) });
+      const localProcessor = new TriageProcessor(localStore, tempRoot);
+
+      await (localProcessor as unknown as {
+        finalizeApprovedTask(task: Task, writtenInput: string, settings: Settings): Promise<void>;
+      }).finalizeApprovedTask(task, plannerWritten, { requirePlanApproval: false } as Settings);
+
+      const onDisk = readFileSync(join(taskDir, "PROMPT.md"), "utf-8");
+      const escapedRequest = operatorRequest.replace(startMarker, "<!-- fusion-original-description:esc:start -->");
+      expect(onDisk).toContain(
+        `## Original Description\n\n${startMarker}\n<!-- fusion-original-description:encoding=escaped-v1 -->\n${escapedRequest}\n<!-- fusion-original-description:end -->\n\n## Mission`,
+      );
+      expect(onDisk.split(startMarker)).toHaveLength(2);
+    } finally {
+      await cleanupTriageFixtureRoot(tempRoot);
+    }
+  });
+
   it("does not release planning to todo when the authoritative PROMPT.md disappears before transition", async () => {
     const task = createTriageTask({ id: "FN-MISSING-RELEASE", status: "planning", recoveryRetryCount: 0 });
     const tempRoot = await mkdtemp(join(tmpdir(), "fusion-missing-release-"));

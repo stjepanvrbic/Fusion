@@ -8,6 +8,7 @@ import {
   ORIGINAL_DESCRIPTION_END_MARKER,
   ORIGINAL_DESCRIPTION_START_MARKER,
   resolveOriginalDescriptionEnd,
+  resolveOriginalDescriptionSection,
 } from "../tasks/original-description-policy.js";
 
 const heading = "## Original Description";
@@ -166,10 +167,19 @@ describe("locateOriginalDescriptionRegion", () => {
     });
   });
 
-  it("bounds a start marker with no end marker like an unmarked section", () => {
+  it("reads an inline start marker as prose and bounds the section like an unmarked one", () => {
     const prompt = `# Task\n\n${heading}\n\nMentions ${ORIGINAL_DESCRIPTION_START_MARKER} inline.\n\n## File Scope\n\n- \`decoy.ts\`\n\n## Mission\n\nGo.\n`;
     const region = locateOriginalDescriptionRegion(prompt)!;
 
+    expect(resolveOriginalDescriptionSection(prompt).kind).toBe("unmarked");
+    expect(region).toEqual({ start: prompt.indexOf(heading), end: prompt.indexOf("## Mission") });
+  });
+
+  it("bounds a truncated envelope (positional opener, no end marker) like an unmarked section", () => {
+    const prompt = `# Task\n\n${heading}\n\n${ORIGINAL_DESCRIPTION_START_MARKER}\nOperator request.\n\n## File Scope\n\n- \`decoy.ts\`\n\n## Mission\n\nGo.\n`;
+    const region = locateOriginalDescriptionRegion(prompt)!;
+
+    expect(resolveOriginalDescriptionSection(prompt).kind).toBe("unresolved-marker");
     expect(region).toEqual({ start: prompt.indexOf(heading), end: prompt.indexOf("## Mission") });
   });
 
@@ -187,5 +197,44 @@ describe("locateOriginalDescriptionRegion", () => {
     }
     expect(warn).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled();
+  });
+});
+
+/*
+FNXC:SpecLock 2026-10-11-16:55:
+Only a positional start marker opens the envelope. A request or plan that mentions the marker anywhere else used to resolve as an unresolved marker, so the section could never be stripped or wrapped.
+*/
+describe("a start marker outside the positional slot", () => {
+  const start = ORIGINAL_DESCRIPTION_START_MARKER;
+  const end = ORIGINAL_DESCRIPTION_END_MARKER;
+  const planTail = (stepExtra = ""): string => [
+    "## What This Delivers", "", "- Value.", "",
+    "## Mission", "", "Build safely.", "",
+    "## File Scope", "", "- src/a.ts", "",
+    "## Steps", "", `1. Build${stepExtra}`, "",
+    "## Completion Criteria", "", "- [ ] Works", "",
+  ].join("\n");
+  const shapes: Array<[string, string, string]> = [
+    ["inline in the first body line", `Mentions \`${start}\` inline.\n\n## File Scope\n\n- decoy.ts`, ""],
+    ["alone on a mid-body line", `Operator request.\n\n${start}\n\nMore operator prose.`, ""],
+    ["quoted inline with the end marker", `Quote \`${start}\` and \`${end}\` inline.`, ""],
+    ["quoted only in a plan step far below", "Operator request.", `\n2. Keep \`${start}\` intact`],
+    ["quoted with the end marker in plan prose before a listed heading", "Operator request.", `\n\n${start}\nquoted\n${end}\n`],
+    ["inside a fenced body", `\`\`\`text\n${start}\nquoted\n\`\`\``, ""],
+  ];
+
+  it.each(shapes)("resolves %s as unmarked and strips it without warning", (_name, body, stepExtra) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const tail = planTail(stepExtra);
+    const prompt = `# Task\n\n${heading}\n\n${body}\n\n${tail}`;
+    const section = resolveOriginalDescriptionSection(prompt);
+
+    expect(section).toMatchObject({ kind: "unmarked", sectionEnd: prompt.indexOf("## What This Delivers") });
+    expect(stripOriginalDescriptionSection(prompt)).toBe(`# Task\n\n${tail}`);
+    expect(locateOriginalDescriptionRegion(prompt)).toEqual({
+      start: prompt.indexOf(heading),
+      end: prompt.indexOf("## What This Delivers"),
+    });
+    expect(warn).not.toHaveBeenCalled();
   });
 });

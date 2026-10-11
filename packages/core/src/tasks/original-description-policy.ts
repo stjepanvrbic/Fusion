@@ -48,6 +48,12 @@ with: (0) an unknown body (`undefined`) skips alignment and uses the allowlist-p
 with the body unknown, operator prose that quotes the top-priority terminator still ends the section
 early, and a custom H2 placed before the first allowlisted heading is read as part of the section.
 The marker envelope is the only exact boundary, so every stored section must carry it.
+
+FNXC:OriginalDescriptionInPrompt 2026-10-11-16:55:
+The envelope opens only at a positional start marker: the first non-blank line under the heading, alone on that line.
+A start marker anywhere else in the section or later in the plan is prose, and the section resolves as unmarked, so a request that mentions the marker is wrapped on its next write (its literal encoded) and readers strip it before and after that write.
+A positional opener keeps the previous rules unchanged, including `unresolved-marker` for an unlisted successor or a missing end marker, so prompts hygiene wrapped keep their persisted lock and approval hashes.
+Residual: an unwrapped legacy section whose operator text starts with the marker alone on its first line still reads as a truncated envelope; every new write wraps, so only a pre-existing stored prompt can have that shape.
 */
 
 import { parsePlanningPlanMd } from "../planner/planning-plan-md.js";
@@ -216,20 +222,26 @@ export function applyOriginalDescription(
   }
 
   const wantedBody = normalizeOriginalDescriptionBody(originalDescription);
-  const existingBody = extractOriginalDescriptionBody(promptMarkdown, originalDescription);
-  const needsEncoding = shouldEncodeOriginalDescriptionBody(wantedBody);
-  // Idempotent only when the stored form also satisfies the declared encoding protocol.
-  if (existingBody !== null && existingBody.trimEnd() === wantedBody) {
-    const hasDeclaration = promptMarkdown.includes(
-      `${ORIGINAL_DESCRIPTION_START_MARKER}\n${ORIGINAL_DESCRIPTION_ENCODING_MARKER}`,
-    );
-    if (hasOriginalDescriptionMarkers(promptMarkdown) && hasDeclaration === needsEncoding) {
+  const existing = resolveOriginalDescriptionSection(promptMarkdown, originalDescription);
+  /*
+  FNXC:OriginalDescriptionInPrompt 2026-10-11-17:05:
+  Idempotent only for a real envelope whose own body matches and declares the encoding exactly when the operator text needs it.
+  File-wide marker checks are wrong here: plan prose may quote both markers below an unmarked section, which would leave that section unwrapped forever.
+  */
+  if (existing.kind === "marked") {
+    const storedBody = stripMarkedBodyEnvelope(existing.body);
+    const declaresEncoding = storedBody === ORIGINAL_DESCRIPTION_ENCODING_MARKER
+      || storedBody.startsWith(`${ORIGINAL_DESCRIPTION_ENCODING_MARKER}\n`);
+    if (
+      decodeDeclaredOriginalDescriptionBody(existing.body).trimEnd() === wantedBody
+      && declaresEncoding === shouldEncodeOriginalDescriptionBody(wantedBody)
+    ) {
       return promptMarkdown;
     }
   }
 
   const section = buildOriginalDescriptionSection(originalDescription);
-  if (existingBody !== null || hasOriginalDescriptionHeading(promptMarkdown)) {
+  if (existing.kind !== "absent") {
     return replaceOriginalDescriptionSection(promptMarkdown, section, originalDescription);
   }
   return insertOriginalDescriptionNearTop(promptMarkdown, section);
@@ -245,17 +257,6 @@ export function extractOriginalDescriptionBody(
     return null;
   }
   return decodeDeclaredOriginalDescriptionBody(range.body).trimEnd();
-}
-
-function hasOriginalDescriptionHeading(content: string): boolean {
-  return /^##\s+Original Description\s*$/m.test(content);
-}
-
-function hasOriginalDescriptionMarkers(content: string): boolean {
-  return (
-    content.includes(ORIGINAL_DESCRIPTION_START_MARKER) &&
-    content.includes(ORIGINAL_DESCRIPTION_END_MARKER)
-  );
 }
 
 /**
@@ -310,7 +311,7 @@ export function resolveOriginalDescriptionEnd(
 export type OriginalDescriptionSection =
   | { kind: "absent" }
   | { kind: "marked"; sectionStart: number; sectionEnd: number; body: string; skippedCandidateCount: number }
-  | { kind: "unresolved-marker"; sectionStart: number; skippedCandidateCount: number; rejectedSuccessorHeading?: string }
+  | { kind: "unresolved-marker"; sectionStart: number; bodyStart: number; skippedCandidateCount: number; rejectedSuccessorHeading?: string }
   | { kind: "unmarked"; sectionStart: number; sectionEnd: number; body: string };
 
 /**
@@ -338,7 +339,7 @@ export function resolveOriginalDescriptionSection(
   const afterHeader = content.slice(headerEnd);
 
   // Marker-bounded body (preferred — safe for any embedded markdown).
-  const startMarkerIdx = afterHeader.indexOf(ORIGINAL_DESCRIPTION_START_MARKER);
+  const startMarkerIdx = findPositionalStartMarker(afterHeader);
   if (startMarkerIdx !== -1) {
     const bodyStart = headerEnd + startMarkerIdx + ORIGINAL_DESCRIPTION_START_MARKER.length;
     /*
@@ -356,6 +357,7 @@ export function resolveOriginalDescriptionSection(
       return {
         kind: "unresolved-marker",
         sectionStart,
+        bodyStart,
         skippedCandidateCount: resolution.skippedCandidateCount,
         rejectedSuccessorHeading: resolution.rejectedSuccessorHeading,
       };
@@ -376,6 +378,31 @@ export function resolveOriginalDescriptionSection(
     .replace(/^\n+/, "")
     .trimEnd();
   return { kind: "unmarked", sectionStart, sectionEnd, body };
+}
+
+/**
+ * FNXC:SpecLock 2026-10-11-16:55:
+ * A start marker opens the envelope only in the slot hygiene writes it: the first non-blank line under the heading, alone on that line.
+ * Hygiene always writes the opener there and encodes every marker literal inside the body, so a start marker anywhere else is operator or planner prose.
+ * Searching the rest of the document for it made a request that merely mentioned the marker unresolvable: the writer could never wrap it and the spec lock could never strip it.
+ * Blank lines before the opener are tolerated because the heading match can stop before them; a trailing `\r` is tolerated so CRLF prompts resolve the same opener.
+ * Returns the marker's offset within `afterHeader`, or -1.
+ */
+function findPositionalStartMarker(afterHeader: string): number {
+  let offset = 0;
+  while (offset < afterHeader.length) {
+    const newline = afterHeader.indexOf("\n", offset);
+    const lineEnd = newline === -1 ? afterHeader.length : newline;
+    const line = afterHeader.slice(offset, lineEnd);
+    if (line.trim()) {
+      const trimmed = line.replace(/\r$/, "").replace(/^[ \t]+|[ \t]+$/g, "");
+      return trimmed === ORIGINAL_DESCRIPTION_START_MARKER
+        ? offset + line.indexOf(ORIGINAL_DESCRIPTION_START_MARKER)
+        : -1;
+    }
+    offset = lineEnd + 1;
+  }
+  return -1;
 }
 
 /** The section range when its boundary is decided; an unresolved marker has none. */

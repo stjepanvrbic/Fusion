@@ -6,8 +6,13 @@ import { stripOriginalDescriptionSection } from "../tasks/original-description-r
  * Version 2 removes the Original Description section in every stored shape. Evidence rows are
  * immutable and deduplicated by source hash, so the version is part of that hash: a snapshot
  * computed by an older parser must never answer for an unchanged prompt under the current one.
+ *
+ * FNXC:SpecLock 2026-10-11-17:15:
+ * Version 3 stops reading a start marker outside the positional slot (the first non-blank line under the heading) as an envelope opener.
+ * Such a prompt used to resolve as an unresolved marker and keep its whole Original Description in the lock; it is now stripped.
+ * The version enters only the evidence source hash, so active locks of correctly wrapped prompts, whose content hashes do not change, stay active.
  */
-export const SPEC_LOCK_PARSER_VERSION = 2;
+export const SPEC_LOCK_PARSER_VERSION = 3;
 
 export type SpecLockSection = "mission" | "file-scope" | "steps" | "acceptance-criteria" | "non-goals" | "dependencies" | "lineage";
 export type SpecParseReason = "mission-missing" | "mission-empty" | "mission-duplicate" | "section-missing" | "section-duplicate";

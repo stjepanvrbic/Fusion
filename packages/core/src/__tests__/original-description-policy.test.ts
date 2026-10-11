@@ -227,6 +227,19 @@ describe("original description policy", () => {
     expect(resolveOriginalDescriptionSection(unmarked, SAMPLE_DESC)).toEqual(section);
   });
 
+  it("opens the envelope only at the positional start marker", () => {
+    const trailing = `# Task\r\n\r\n${ORIGINAL_DESCRIPTION_HEADING}\r\n\r\n\r\n  ${ORIGINAL_DESCRIPTION_START_MARKER}\t\r\n${SAMPLE_DESC}\r\n${ORIGINAL_DESCRIPTION_END_MARKER}\r\n`;
+    const inline = sampleSpec({ withOriginal: true, originalBody: `Quote ${ORIGINAL_DESCRIPTION_START_MARKER} inline.`, marked: false });
+    const truncated = `${ORIGINAL_DESCRIPTION_HEADING}\n\n${ORIGINAL_DESCRIPTION_START_MARKER}\n${SAMPLE_DESC}\n\n## Mission\n\nGo.\n`;
+
+    expect(resolveOriginalDescriptionSection(trailing)).toMatchObject({ kind: "marked", body: `\t\r\n${SAMPLE_DESC}\r\n` });
+    expect(resolveOriginalDescriptionSection(inline)).toMatchObject({ kind: "unmarked", body: `Quote ${ORIGINAL_DESCRIPTION_START_MARKER} inline.` });
+    expect(resolveOriginalDescriptionSection(truncated)).toMatchObject({
+      kind: "unresolved-marker",
+      bodyStart: truncated.indexOf(ORIGINAL_DESCRIPTION_START_MARKER) + ORIGINAL_DESCRIPTION_START_MARKER.length,
+    });
+  });
+
   it("preserves a custom section after an unmarked non-empty description", () => {
     const prompt = `# Task: FN-8659\n\n## Original Description\n\n${SAMPLE_DESC}\n\n## Product Overview\n\nCustom planner context.\n\n## Before → After Transformation\n\n- before\n`;
     const once = applyOriginalDescription(prompt, SAMPLE_DESC);
@@ -463,5 +476,108 @@ describe("original description policy", () => {
 
     expect(computePlanApprovalFingerprint(twice)).toBe(computePlanApprovalFingerprint(once));
     expect(twice).toBe(once);
+  });
+});
+
+/*
+FNXC:OriginalDescriptionInPrompt 2026-10-11-17:05:
+A request that mentions the start marker must be wrapped like any other: the writer used to treat the mention as an envelope it could not resolve and returned the prompt unchanged, so the section stayed unprotected and the spec lock read it as plan structure.
+*/
+describe("a request or plan that mentions the start marker", () => {
+  const plan = [
+    "# Task: KB-1 - Safe widget",
+    "",
+    "**Created:** 2026-10-11",
+    "**Size:** M",
+    "",
+    "## What This Delivers",
+    "",
+    "- A safe widget.",
+    "",
+    "## Mission",
+    "",
+    "Build a safe widget.",
+    "",
+    "## File Scope",
+    "",
+    "- src/widget.ts",
+    "",
+    "## Steps",
+    "",
+    "1. Build widget",
+    "",
+    "## Completion Criteria",
+    "",
+    "- [ ] Widget works",
+    "",
+  ].join("\n");
+  const unwrapped = (body: string, source = plan): string => source.replace(
+    "## What This Delivers",
+    `${ORIGINAL_DESCRIPTION_HEADING}\n\n${body}\n\n## What This Delivers`,
+  );
+  const quotingRequest = [
+    `The resolver treats the \`${ORIGINAL_DESCRIPTION_START_MARKER}\` comment as an envelope.`,
+    "",
+    "## File Scope",
+    "",
+    "- packages/decoy/never-in-scope.ts",
+    "",
+    "Origin: follow-up.",
+  ].join("\n");
+
+  it("wraps and encodes a request that quotes the start marker", () => {
+    const prompt = unwrapped(quotingRequest);
+    const once = applyOriginalDescription(prompt, quotingRequest);
+
+    expect(once).toContain(
+      `${ORIGINAL_DESCRIPTION_HEADING}\n\n${ORIGINAL_DESCRIPTION_START_MARKER}\n${ORIGINAL_DESCRIPTION_ENCODING_MARKER}\n${encodeOriginalDescriptionBody(quotingRequest)}\n${ORIGINAL_DESCRIPTION_END_MARKER}\n`,
+    );
+    expect(once.split(ORIGINAL_DESCRIPTION_START_MARKER)).toHaveLength(2);
+    expect(resolveOriginalDescriptionSection(once).kind).toBe("marked");
+    expect(extractOriginalDescriptionBody(once)).toBe(quotingRequest);
+    expect(extractOriginalDescriptionBody(once, quotingRequest)).toBe(quotingRequest);
+    expect(once.slice(once.indexOf("## What This Delivers"))).toBe(prompt.slice(prompt.indexOf("## What This Delivers")));
+    expect(applyOriginalDescription(once, quotingRequest)).toBe(once);
+  });
+
+  it.each([
+    ["the start marker", `\n2. Keep \`${ORIGINAL_DESCRIPTION_START_MARKER}\` intact`],
+    ["both markers", `\n\n${ORIGINAL_DESCRIPTION_START_MARKER}\nquoted\n${ORIGINAL_DESCRIPTION_END_MARKER}\n`],
+  ])("wraps a marker-free request when later plan prose quotes %s", (_name, stepExtra) => {
+    const source = plan.replace("1. Build widget", `1. Build widget${stepExtra}`);
+    const prompt = unwrapped(SAMPLE_DESC, source);
+    const once = applyOriginalDescription(prompt, SAMPLE_DESC);
+
+    expect(once).toContain(`${ORIGINAL_DESCRIPTION_HEADING}\n\n${ORIGINAL_DESCRIPTION_START_MARKER}\n${SAMPLE_DESC}\n${ORIGINAL_DESCRIPTION_END_MARKER}\n`);
+    expect(once).not.toContain(ORIGINAL_DESCRIPTION_ENCODING_MARKER);
+    expect(once.slice(once.indexOf("## What This Delivers"))).toBe(source.slice(source.indexOf("## What This Delivers")));
+    expect(extractOriginalDescriptionBody(once)).toBe(SAMPLE_DESC);
+    expect(applyOriginalDescription(once, SAMPLE_DESC)).toBe(once);
+  });
+
+  it("round-trips every reserved token when wrapping an unmarked request", () => {
+    const description = [
+      "Operator request.",
+      ORIGINAL_DESCRIPTION_START_MARKER,
+      `Inline ${ORIGINAL_DESCRIPTION_END_MARKER} end.`,
+      ORIGINAL_DESCRIPTION_ENCODING_MARKER,
+      `${ORIGINAL_DESCRIPTION_ESCAPE_PREFIX}start -->`,
+    ].join("\n");
+    const once = applyOriginalDescription(unwrapped(description), description);
+
+    expect(extractOriginalDescriptionBody(once)).toBe(description);
+    expect(once.split(ORIGINAL_DESCRIPTION_START_MARKER)).toHaveLength(2);
+    expect(applyOriginalDescription(once, description)).toBe(once);
+  });
+
+  it("locks and fingerprints the plan without the section before and after wrapping", () => {
+    const prompt = unwrapped(quotingRequest);
+    const once = applyOriginalDescription(prompt, quotingRequest);
+    const planLock = canonicalizePlan(plan);
+
+    for (const candidate of [prompt, once]) {
+      expect(canonicalizePlan(candidate)).toMatchObject({ status: "available", contentHash: planLock.contentHash });
+      expect(computePlanApprovalFingerprint(candidate)).toBe(computePlanApprovalFingerprint(plan));
+    }
   });
 });
