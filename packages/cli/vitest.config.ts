@@ -156,6 +156,13 @@ export default defineConfig({
       and keep it BEFORE the `@fusion/core` root alias so the subpath is not swallowed.
       */
       { find: /^@fusion\/core\/mcp-builtin-servers$/, replacement: resolve(__dirname, "../core/src/config/mcp-builtin-servers.ts") },
+      /*
+      FNXC:CliTests 2026-10-11-12:02:
+      `commands/mcp-memory-server.ts` imports `@fusion/core/memory-mcp`, a package export whose "import" condition points at `dist/`.
+      Without this alias a checkout with no built core fails with "Cannot find package", and a built checkout loads built memory MCP code beside source `@fusion/core`.
+      Keep it BEFORE the `@fusion/core` root alias so the subpath is not swallowed.
+      */
+      { find: /^@fusion\/core\/memory-mcp$/, replacement: resolve(__dirname, "../core/src/memory/mcp/index.ts") },
       { find: /^@fusion\/core$/, replacement: resolve(__dirname, "../core/src/index.ts") },
       { find: /^@fusion\/dashboard\/planning$/, replacement: resolve(__dirname, "../dashboard/src/planning.ts") },
       { find: /^@fusion\/dashboard$/, replacement: resolve(__dirname, "../dashboard/src/index.ts") },
@@ -194,6 +201,18 @@ export default defineConfig({
         replacement: resolve(__dirname, "../../plugins/fusion-plugin-cursor-runtime/src/index.ts"),
       },
       /*
+      FNXC:PluginTests 2026-10-11-13:52:
+      runtime-provider-probes.ts (reached from @fusion/dashboard) imports the Antigravity probe and model discovery from @fusion-plugin-examples/antigravity-runtime, whose export map points at dist/. Without these source aliases a checkout with no built plugin fails with "Failed to resolve entry".
+      */
+      {
+        find: /^@fusion-plugin-examples\/antigravity-runtime\/probe$/,
+        replacement: resolve(__dirname, "../../plugins/fusion-plugin-antigravity-runtime/src/probe.ts"),
+      },
+      {
+        find: /^@fusion-plugin-examples\/antigravity-runtime$/,
+        replacement: resolve(__dirname, "../../plugins/fusion-plugin-antigravity-runtime/src/index.ts"),
+      },
+      /*
       FNXC:GrokCli 2026-07-08-00:00:
       runtime-provider-probes.ts (transitively imported by dashboard) imports probeGrokBinary from @fusion-plugin-examples/grok-runtime (FN-7705, mirroring the Cursor alias above).
       */
@@ -204,14 +223,6 @@ export default defineConfig({
       {
         find: /^@fusion-plugin-examples\/grok-runtime$/,
         replacement: resolve(__dirname, "../../plugins/fusion-plugin-grok-runtime/src/index.ts"),
-      },
-      /*
-      FNXC:PluginTests 2026-07-18-01:58:
-      runtime-provider-probes.ts is reached from @fusion/dashboard through server.ts, routes.ts, and register-runtime-provider-routes.ts, where it imports @fusion-plugin-examples/claude-runtime. Mirror the Cursor, Grok, and OMP source aliases so source checkouts without built plugin dist resolve the Claude runtime (FN-8268).
-      */
-      {
-        find: /^@fusion-plugin-examples\/claude-runtime$/,
-        replacement: resolve(__dirname, "../../plugins/fusion-plugin-claude-runtime/src/index.ts"),
       },
       /*
       FNXC:OmpAcp 2026-07-11-23:35:
@@ -231,6 +242,10 @@ export default defineConfig({
       discovery only. Alias the package root to probes-entry (not full index) so CLI tests do
       not load ACP/runtime-adapter or require @agentclientprotocol/sdk on the CLI resolver path.
       Full-suite shard 4 failed with dist/ entry resolution + missing ACP deps under package lane.
+
+      FNXC:CliTests 2026-10-11-13:52:
+      runtime-provider-probes.ts is reached from @fusion/dashboard through server.ts, routes.ts, and register-runtime-provider-routes.ts, and the plugin export map points at dist/, so the source alias is required in checkouts without built plugin dist.
+      An earlier root entry pointing at the full plugin index matched first, so this probe entry never applied; it was removed and probes-entry.ts is now the target in effect, matching the dashboard config.
       */
       {
         find: /^@fusion-plugin-examples\/claude-runtime\/probe$/,

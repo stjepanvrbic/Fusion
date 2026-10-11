@@ -215,6 +215,12 @@ Mocks that simulate `updateTask` or `moveTask` server responses must return a ta
 
 Public `@fusion/core` exports consumed by runtime tools should include a literal built-dist guard (for example importing `packages/core/dist/index.js`) when package test aliases otherwise resolve `@fusion/core` to source.
 
+<!-- FNXC:CliTests 2026-10-11-12:22: A missing core subpath alias in a package vitest config has surfaced four times as a wall of "Cannot find package" failures in unrelated tests. The CLI config is now guarded by name so the next one fails in one place. -->
+`packages/cli/vitest.config.ts` aliases every `@fusion/core` subpath that CLI-reachable source imports (`gh-cli`, `mcp-builtin-servers`, `memory-mcp`) to its source file, ahead of the `@fusion/core` root alias, so a file-scoped CLI `vitest run` needs no built core and never loads built core code beside source. `packages/cli/src/__tests__/vitest-workspace-resolution.test.ts` fails when CLI source imports a core subpath that has no such alias. A test that spawns the CLI as a child process uses Node resolution, not these aliases, and still needs the bootstrap.
+
+<!-- FNXC:CliTests 2026-10-11-14:06: The antigravity runtime plugin was the fifth entry to fall through to dist in a package vitest config, and a built checkout hid it from the guard. Both guards now derive the plugin entries from the imports, and the CLI guard hides exactly those plugins' dist. -->
+The CLI and dashboard vitest configs also alias every `@fusion-plugin-examples/*` entry that dashboard server source imports to the plugin's `src`, because each plugin's export map points at `dist`. `packages/cli/src/__tests__/vitest-workspace-resolution.test.ts` and `packages/dashboard/src/__tests__/runtime-plugin-alias-regression.test.ts` fail when such an entry has no alias; both derive the entries from the imports. While its dist-absent case runs, the CLI guard moves `packages/{core,engine,dashboard}/dist` and the `dist` of those plugins aside, so a lane running at the same time on the same checkout can see them missing. The desktop lane has no plugin aliases and builds dist before it runs instead.
+
 ## Engine static process guards
 
 <!-- FNXC:EngineProcessRules 2026-06-26-03:58: FN-7056 adds a focused static guard for user-configured command paths. Keep the protected-path registry in the test file, not as a whole-file execSync ban, because engine git plumbing still has legitimate deterministic execSync uses. -->

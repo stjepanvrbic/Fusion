@@ -668,6 +668,18 @@ export default defineConfig({
         "../../plugins/fusion-plugin-grok-runtime/src/index.ts",
       ),
       /*
+      FNXC:DashboardTests 2026-10-11-13:58:
+      runtime-provider-probes.ts imports the Antigravity probe and model discovery from @fusion-plugin-examples/antigravity-runtime, whose export map points at dist/. Without these source aliases every dashboard test that transitively imports the runtime provider fails with "Failed to resolve entry for package" in a checkout with no built plugin. The /probe key must precede the root key because string aliases match by prefix.
+      */
+      "@fusion-plugin-examples/antigravity-runtime/probe": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-antigravity-runtime/src/probe.ts",
+      ),
+      "@fusion-plugin-examples/antigravity-runtime": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-antigravity-runtime/src/index.ts",
+      ),
+      /*
       FNXC:DashboardTests 2026-07-18-09:45:
       Alias Claude runtime to probes-entry (probe + model discovery only), not the full
       ACP index — same class as CLI #2292. Importing index pulls @agentclientprotocol/sdk

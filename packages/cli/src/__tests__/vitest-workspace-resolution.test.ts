@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import vitestConfig from "../../vitest.config";
 
@@ -9,8 +9,55 @@ const hiddenDistRootPrefix = ".tmp-fn-vitest-workspace-resolution-";
 const hiddenDistRoot = join(workspaceRoot, `${hiddenDistRootPrefix}${process.pid}`);
 
 const internalPackages = ["core", "engine", "dashboard"] as const;
-const claudeRuntimeDist = join(workspaceRoot, "plugins", "fusion-plugin-claude-runtime", "dist");
 const movedDistDirs: Array<{ from: string; to: string }> = [];
+
+type AliasEntry = { find: string | RegExp; replacement: string };
+
+function sourceFiles(dir: string, includeTests: boolean): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      return includeTests || entry.name !== "__tests__" ? sourceFiles(path, includeTests) : [];
+    }
+    if (!includeTests && /\.test\.tsx?$/.test(entry.name)) return [];
+    return /\.tsx?$/.test(entry.name) ? [path] : [];
+  });
+}
+
+function aliasMatches(find: string | RegExp, specifier: string) {
+  return typeof find === "string" ? find === specifier : find.test(specifier);
+}
+
+function aliasEntries(): readonly AliasEntry[] {
+  const aliases = vitestConfig.resolve?.alias;
+  return Array.isArray(aliases) ? (aliases as readonly AliasEntry[]) : [];
+}
+
+/** The alias Vite applies to `specifier`: the first anchored pattern that matches it. */
+function effectiveAlias(specifier: string): AliasEntry | undefined {
+  return aliasEntries().find((entry) => entry.find instanceof RegExp && entry.find.test(specifier));
+}
+
+/*
+FNXC:CliTests 2026-10-11-13:45:
+Every plugin entry that dashboard server source or CLI source imports must be aliased to plugin source, because each plugin's export map points its "import" condition at `dist/`.
+The set is derived from the imports themselves, never hardcoded, and the dist-absent case moves the `dist` of exactly these plugin packages aside, so a missing alias fails in a built checkout too instead of being satisfied by a stale build.
+Dashboard tests are skipped because the CLI graph never loads them; CLI tests are included because they import plugin entries directly.
+*/
+const pluginSpecifiers: ReadonlyMap<string, string> = (() => {
+  const specifiers = new Map<string, string>();
+  const files = [
+    ...sourceFiles(join(workspaceRoot, "packages", "dashboard", "src"), false),
+    ...sourceFiles(join(cliRoot, "src"), true),
+  ];
+  for (const path of files) {
+    for (const match of readFileSync(path, "utf8").matchAll(/["'](@fusion-plugin-examples\/([a-z0-9-]+)(?:\/[a-z0-9-]+)*)["']/g)) {
+      specifiers.set(match[1], match[2]);
+    }
+  }
+  return specifiers;
+})();
+const pluginShortNames = [...new Set(pluginSpecifiers.values())];
 
 function rmSyncWithRetry(path: string) {
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -72,7 +119,9 @@ function hideInternalPackageDistDirs() {
     hideDistDir(pkg, join(workspaceRoot, "packages", pkg, "dist"));
   }
 
-  hideDistDir("claude-runtime", claudeRuntimeDist);
+  for (const short of pluginShortNames) {
+    hideDistDir(`plugin-${short}`, join(workspaceRoot, "plugins", `fusion-plugin-${short}`, "dist"));
+  }
 }
 
 function restoreInternalPackageDistDirs() {
@@ -139,6 +188,14 @@ describe("CLI Vitest workspace resolution", () => {
           replacement: join(workspaceRoot, "packages", "core", "src", "gh-cli.ts"),
         },
         {
+          find: String(/^@fusion\/core\/mcp-builtin-servers$/),
+          replacement: join(workspaceRoot, "packages", "core", "src", "config", "mcp-builtin-servers.ts"),
+        },
+        {
+          find: String(/^@fusion\/core\/memory-mcp$/),
+          replacement: join(workspaceRoot, "packages", "core", "src", "memory", "mcp", "index.ts"),
+        },
+        {
           find: String(/^@fusion\/core$/),
           replacement: join(workspaceRoot, "packages", "core", "src", "index.ts"),
         },
@@ -167,7 +224,7 @@ describe("CLI Vitest workspace resolution", () => {
           "openclaw",
           "cursor",
           "grok",
-          "claude",
+          "antigravity",
           "omp",
           "paperclip",
         ].map((runtime) => ({
@@ -219,6 +276,97 @@ describe("CLI Vitest workspace resolution", () => {
     expect(dashboardIndex).toBeGreaterThan(planningIndex);
   });
 
+  /*
+  FNXC:CliTests 2026-10-11-12:01:
+  The `@fusion/core` export map points every subpath's "import" condition at `dist/`. A core subpath that CLI source imports must therefore be aliased to a source file, ahead of the `@fusion/core` root alias.
+  Without the alias, a checkout with no built core fails with "Cannot find package", and a built checkout loads built code beside source `@fusion/core`.
+  The scan covers every CLI source and test file so a new subpath import fails here by name, not as unrelated-looking failures in whichever test loads it first.
+  */
+  it("aliases every core subpath the CLI source imports, ahead of the core root alias", () => {
+    const aliases = vitestConfig.resolve?.alias;
+    const entries = Array.isArray(aliases) ? aliases : [];
+    const coreRootIndex = entries.findIndex((entry) => String(entry.find) === String(/^@fusion\/core$/));
+    expect(coreRootIndex).toBeGreaterThanOrEqual(0);
+
+    const coreSourceRoot = join(workspaceRoot, "packages", "core", "src", "");
+    const coreSubpathAliases = entries.filter((entry) =>
+      String(entry.find).replaceAll("\\", "").includes("@fusion/core/"),
+    );
+    expect(coreSubpathAliases.length).toBeGreaterThan(0);
+    for (const entry of coreSubpathAliases) {
+      const pattern = String(entry.find);
+      expect(entries.indexOf(entry), pattern).toBeLessThan(coreRootIndex);
+      expect(entry.replacement.startsWith(coreSourceRoot), pattern).toBe(true);
+      expect(existsSync(entry.replacement), pattern).toBe(true);
+    }
+
+    const importedSpecifiers = new Set<string>();
+    for (const path of sourceFiles(join(cliRoot, "src"), true)) {
+      for (const match of readFileSync(path, "utf8").matchAll(/["'](@fusion\/core\/[a-z0-9-]+)["']/g)) {
+        importedSpecifiers.add(match[1]);
+      }
+    }
+    expect(importedSpecifiers.size).toBeGreaterThan(0);
+    for (const specifier of importedSpecifiers) {
+      expect(
+        coreSubpathAliases.some((entry) => aliasMatches(entry.find, specifier)),
+        specifier,
+      ).toBe(true);
+    }
+  });
+
+  it("resolves the core subpath aliases from source when core dist is absent", async () => {
+    expect(existsSync(join(workspaceRoot, "packages", "core", "dist"))).toBe(false);
+
+    const { MemoryMcpHandler, createMemoryMcpBackends } = await import("@fusion/core/memory-mcp");
+    const { buildFusionMemoryBuiltIns } = await import("@fusion/core/mcp-builtin-servers");
+    const { isGhAvailable } = await import("@fusion/core/gh-cli");
+
+    expect(typeof MemoryMcpHandler).toBe("function");
+    expect(typeof createMemoryMcpBackends).toBe("function");
+    expect(typeof buildFusionMemoryBuiltIns).toBe("function");
+    expect(typeof isGhAvailable).toBe("function");
+  });
+
+  it("aliases every plugin entry that dashboard and CLI source import to plugin source", () => {
+    expect(pluginSpecifiers.size).toBeGreaterThan(0);
+
+    for (const [specifier, short] of pluginSpecifiers) {
+      const pluginRoot = join(workspaceRoot, "plugins", `fusion-plugin-${short}`);
+      const manifestPath = join(pluginRoot, "package.json");
+      expect(existsSync(manifestPath), specifier).toBe(true);
+      expect((JSON.parse(readFileSync(manifestPath, "utf8")) as { name?: string }).name, specifier).toBe(
+        `@fusion-plugin-examples/${short}`,
+      );
+
+      const alias = effectiveAlias(specifier);
+      expect(alias, `${specifier} has no source alias`).toBeDefined();
+      expect(alias?.replacement.startsWith(join(pluginRoot, "src", "")), specifier).toBe(true);
+      expect(existsSync(alias?.replacement ?? ""), specifier).toBe(true);
+    }
+  });
+
+  it("has no plugin entry alias shadowed by an earlier entry with the same pattern", () => {
+    const patterns = aliasEntries().map((entry) => String(entry.find));
+    const duplicated = patterns.filter((pattern, index) => patterns.indexOf(pattern) !== index);
+    expect(duplicated).toEqual([]);
+  });
+
+  it("pins the plugin entry the Claude and Antigravity runtime aliases resolve to", () => {
+    expect(effectiveAlias("@fusion-plugin-examples/claude-runtime")?.replacement).toBe(
+      join(workspaceRoot, "plugins", "fusion-plugin-claude-runtime", "src", "probes-entry.ts"),
+    );
+    expect(effectiveAlias("@fusion-plugin-examples/claude-runtime/probe")?.replacement).toBe(
+      join(workspaceRoot, "plugins", "fusion-plugin-claude-runtime", "src", "probe.ts"),
+    );
+    expect(effectiveAlias("@fusion-plugin-examples/antigravity-runtime")?.replacement).toBe(
+      join(workspaceRoot, "plugins", "fusion-plugin-antigravity-runtime", "src", "index.ts"),
+    );
+    expect(effectiveAlias("@fusion-plugin-examples/antigravity-runtime/probe")?.replacement).toBe(
+      join(workspaceRoot, "plugins", "fusion-plugin-antigravity-runtime", "src", "probe.ts"),
+    );
+  });
+
   it("resolves non-mocked symbols from internal workspace packages and Claude runtime when dist outputs are absent", async () => {
     const [
       { tempWorkspace },
@@ -226,12 +374,14 @@ describe("CLI Vitest workspace resolution", () => {
       { createRuntimeLogger },
       { parseAgentResponse },
       { probeClaudeBinary, discoverClaudeProviderModels },
+      { probeAntigravityBinary },
     ] = await Promise.all([
       import("@fusion/test-utils"),
       import("@fusion/engine"),
       import("@fusion/dashboard"),
       import("@fusion/dashboard/planning"),
       import("@fusion-plugin-examples/claude-runtime"),
+      import("@fusion-plugin-examples/antigravity-runtime/probe"),
     ]);
 
     expect(typeof tempWorkspace).toBe("function");
@@ -239,6 +389,7 @@ describe("CLI Vitest workspace resolution", () => {
     expect(typeof createRuntimeLogger).toBe("function");
     expect(typeof probeClaudeBinary).toBe("function");
     expect(typeof discoverClaudeProviderModels).toBe("function");
+    expect(typeof probeAntigravityBinary).toBe("function");
     expect(parseAgentResponse('{"type":"question","data":{"id":"q","type":"confirm","question":"Ok?","description":"desc"}}')).toEqual({
       type: "question",
       data: {
