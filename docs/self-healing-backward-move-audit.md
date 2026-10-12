@@ -26,7 +26,7 @@ Stages that cannot satisfy all three must either (a) tighten predicate to requir
 | reconcileSelfDefeatingDependencies | 3499 | dependency self-loop | n/a | graph proof | dependency metadata repair | RECONCILE-ONLY | keep | n/a | n/a |
 | reconcileDependencyCycles | 3557 | persisted dependency cycle | n/a | cycle detector | selective dependency edge repair | RECONCILE-ONLY | keep | n/a | n/a |
 | reconcileStaleMergerStatus | 3702 | stale merger status | `staleMergingStatusMinAgeMs` | age/no active merge | clear status | RECONCILE-ONLY | keep | n/a | n/a |
-| finalizeNoOpReviewTasks | 3750 | in-review already-on-main no-op | git landed proof | landed/no-op proof | mostly in-review→done; one in-review→todo remediation path | FORWARD + BACKWARD edge | tighten (backward edge only) | triple proof for fallback in-review→todo path | gate fallback; emit `task:finalize-no-op-review-no-action` |
+| finalizeNoOpReviewTasks | 3750 | in-review zero-diff branch (owned landed commit or proven no-op) | refusal parks wait `settings.taskStuckTimeoutMs` when positive, else `STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS`, after `columnMovedAt` | landed/no-op proof + no live run + every required pre-merge gate has a result | in-review→done finalize, or a `failed` park in the review lane | FORWARD + in-place park | tightened | liveness and unrun-gate deferral on every branch, triple proof for the unproven-ownership park | unproven park gated, emits `task:finalize-no-op-review-no-action` |
 | reconcileDoneTaskIntegrity | 3870 | done task integrity mismatch | n/a | integrity check | metadata/status hygiene | RECONCILE-ONLY | keep | n/a | n/a |
 | recoverMergeableReviewTasks | 3996 | mergeable in-review task | merge blocker checks | merge readiness | queue/merge status writes | INTERNAL-RETRY | keep | n/a | n/a |
 | recoverReviewTasksWithFailedPreMergeSteps | 4112 | failed pre-merge workflow step | maxFix budget | failed step + budget | revive via executor | INTERNAL-RETRY | keep | n/a | n/a |
@@ -72,9 +72,13 @@ Ghost-review, stale-incomplete-review, in-progress-limbo, generic terminal-failu
 - These can push in-review backward to todo on conflict reclaim paths.
 - Tighten chosen for backward path only; forward/metadata-only branches unchanged.
 
-### finalizeNoOpReviewTasks (fallback backward edge)
-- Method is mostly forward finalize; fallback requeue path can move backward.
-- Tighten only that branch.
+### finalizeNoOpReviewTasks
+- The method never moves a card backward. It finalizes a zero-diff review card into its complete lane, or parks a refused card `failed` in its review lane, where an operator Retry re-runs implementation.
+- Every branch skips a card whose workflow run is live. The signals are an active session path, the executing-task lock, the executor's `isTaskActive` (which covers a graph run between nodes), `getExecutingTaskIds`, a live session surface, the active merge, and a `task` work item in `runnable`, `running`, `held` or `retrying`. An unreadable work-item list counts as live.
+- Every branch also skips a card with an enabled required pre-merge gate that has no result. A gate without a result means the card has not been reviewed yet. When the run is dead, `recoverMergeableReviewTasks` re-seeds the graph at that gate.
+- The no-commits incomplete-work refusal and the lost-work refusal park a card only after it has spent the grace window in its review lane, counted from `columnMovedAt` or, when absent, `updatedAt`. Both re-check liveness after the branch probe and again inside the atomic park. The error, the log entry and the audit row are written only when the park lands.
+- The unproven-ownership park keeps its triple proof.
+- A deferral writes nothing and logs only at debug level.
 
 ### recoverStuckMergeDeadlocks (no-landed branch)
 - Existing no-landed path pauses immediately after failed landed-proof.

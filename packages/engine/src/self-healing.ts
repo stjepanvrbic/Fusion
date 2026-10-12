@@ -769,6 +769,36 @@ async function resolveNoOpFinalizeGateIds(store: TaskStore, task: Task): Promise
   const ir = await resolveWorkflowIrForTask(store, task.id).catch(() => undefined);
   return ir ? resolveRequiredPreMergeStepIds(ir, task.enabledWorkflowSteps) : undefined;
 }
+
+/*
+FNXC:SelfHealingNoOpFinalize 2026-10-12-12:33:
+An enabled required gate with no result at all means "not yet reviewed", not "incomplete work".
+Same definition of missing as the merge doors' pre-merge approval check: no result whose `workflowStepId` matches.
+*/
+function findUnrunNoOpFinalizeGate(
+  task: Pick<Task, "workflowStepResults">,
+  requiredGateIds: ReadonlySet<string> | undefined,
+): string | undefined {
+  return [...(requiredGateIds ?? [])].find((id) => !task.workflowStepResults?.some((result) => result.workflowStepId === id));
+}
+
+/*
+FNXC:SelfHealingNoOpFinalize 2026-10-12-12:33:
+A refusal park (no-commits incomplete-work guard, lost-work guard) waits until the card has sat in its review lane for a grace window, so a card still moving between review steps is never caught.
+Grace is `taskStuckTimeoutMs` when positive, else the 10-minute default: a `0` setting disables stuck detection and must not disable this fence.
+Anchor is `columnMovedAt ?? updatedAt`; an absent or unparseable anchor counts as outside the window, as in the backward-move triple proof.
+*/
+function isOutsideNoOpRefusalGrace(task: Pick<Task, "columnMovedAt" | "updatedAt">, settings: Pick<Settings, "taskStuckTimeoutMs">): boolean {
+  const graceMs = typeof settings.taskStuckTimeoutMs === "number" && settings.taskStuckTimeoutMs > 0
+    ? settings.taskStuckTimeoutMs
+    : STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS;
+  const anchor = task.columnMovedAt ?? task.updatedAt;
+  const anchorMs = anchor ? Date.parse(anchor) : Number.NaN;
+  return !Number.isFinite(anchorMs) || Date.now() - anchorMs >= graceMs;
+}
+
+/** Fixed reason a no-op finalize candidate is deferred because its workflow run is still live. */
+type NoOpFinalizeLiveness = "session" | "executing" | "active-merge" | "workflow-continuation";
 export { classifyTransientMergeError } from "./errors/transient-merge-error-classifier.js";
 const MAX_STARVATION_DROPS = 3;
 type AutoArchiveFailureReason = "lineage-children" | "task-live" | "dependents" | "not-found" | "unknown";
@@ -1611,11 +1641,57 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
   the card a candidate for the next pass. It is now parked failed in its review lane (the finalizer
   skips failed cards), the visible state an operator Retry acts on.
   */
-  private async parkFinalizeBlockedReviewTask(task: Task, error: string): Promise<void> {
+  /*
+  FNXC:SelfHealingNoOpFinalize 2026-10-12-12:33:
+  The park re-checks the synchronous liveness signals inside the atomic update and reports whether it wrote, so callers log and audit only a park that landed.
+  */
+  private async parkFinalizeBlockedReviewTask(task: Task, error: string): Promise<boolean> {
+    let parked = false;
     await this.store.updateTaskAtomic(task.id, (live) => {
+      parked = false;
       if (live.deletedAt || live.paused || live.userPaused || live.column !== task.column || live.status === "failed") return null;
+      if (this.noOpFinalizeLivenessSync(task.id)) return null;
+      parked = true;
       return { status: "failed", error: `${error}. Retry the task to re-run implementation.` };
     });
+    return parked;
+  }
+
+  /*
+  FNXC:SelfHealingNoOpFinalize 2026-10-12-12:33:
+  The no-op finalize sweep never parks, finalizes or mutates a review card whose workflow run is live.
+  Motivating incident: a no-commit card was refused 14 s after entering review, while its graph run was between Completion summary and Code Review; Code Review passed 25 s later, but the failed park blocked every merge until an operator Retry.
+  The synchronous signals are split out so the atomic park can re-check them inside its update.
+  */
+  private noOpFinalizeLivenessSync(taskId: string): NoOpFinalizeLiveness | null {
+    if (activeSessionRegistry.pathsForTask(taskId).some((path) => activeSessionRegistry.isPathActive(path))) return "session";
+    if (this.options.hasLiveSessionSurface?.(taskId) === true) return "session";
+    if (
+      executingTaskLock.has(taskId)
+      || this.options.isTaskActive?.(taskId) === true
+      || this.options.getExecutingTaskIds?.().has(taskId) === true
+    ) return "executing";
+    if (this.options.getActiveMergeTaskId?.() === taskId) return "active-merge";
+    return null;
+  }
+
+  /** Adds an active `task` workflow continuation to the synchronous signals; an unreadable continuation counts as live. */
+  private async noOpFinalizeLiveness(taskId: string): Promise<NoOpFinalizeLiveness | null> {
+    const live = this.noOpFinalizeLivenessSync(taskId);
+    if (live) return live;
+    try {
+      const items = await this.store.listWorkflowWorkItemsForTask?.(taskId, { kinds: ["task"] }) ?? [];
+      return items.some((item) => ACTIVE_WORKFLOW_WORK_ITEM_STATES.includes(item.state)) ? "workflow-continuation" : null;
+    } catch (error) {
+      log.warn(`no-op review finalize: treating ${taskId} as live because its workflow continuations could not be read: ${error instanceof Error ? error.message : String(error)}`);
+      return "workflow-continuation";
+    }
+  }
+
+  private async isNoOpFinalizeDeferredForLiveness(taskId: string): Promise<boolean> {
+    const liveness = await this.noOpFinalizeLiveness(taskId);
+    if (liveness) log.debug(`no-op review finalize: deferring ${taskId} while its workflow run is live (${liveness})`);
+    return liveness !== null;
   }
 
   /*
@@ -9637,6 +9713,21 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       let recovered = 0;
       const mergeTargetBranch = await resolveIntegrationBranch(this.options.rootDir, settings);
       for (const task of candidates) {
+        /*
+        FNXC:SelfHealingNoOpFinalize 2026-10-12-12:33:
+        Every branch below (unproven, owned-commit, proven-no-op) defers a card whose workflow run is live or whose required pre-merge gates have not run yet.
+        `getTaskMergeBlocker` cannot see the unrun gate because this recovery read omits `requiredPreMergeStepIds` on purpose, and the no-commits guard would report it as incomplete work.
+        An idle card with an unrun gate is owned by `recoverMergeableReviewTasks`, which re-seeds the graph at that gate.
+        Deferrals repeat every maintenance cycle, so they write nothing and log at debug level only.
+        */
+        if (await this.isNoOpFinalizeDeferredForLiveness(task.id)) continue;
+        const requiredGateIds = await resolveNoOpFinalizeGateIds(this.store, task);
+        const unrunGateId = findUnrunNoOpFinalizeGate(task, requiredGateIds);
+        if (unrunGateId) {
+          log.debug(`no-op review finalize: deferring ${task.id} until required gate '${unrunGateId}' has run`);
+          continue;
+        }
+
         const ahead = await this.isBranchAheadOfBase(task, task.mergeDetails?.mergeTargetBranch || mergeTargetBranch);
         if (!ahead || ahead.aheadCount !== 0) continue;
 
@@ -9701,6 +9792,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             rootDir: this.options.rootDir,
             settings,
           });
+          // FNXC:SelfHealingNoOpFinalize 2026-10-12-12:33: re-check after the awaited probes, immediately before the first write.
+          if (await this.isNoOpFinalizeDeferredForLiveness(task.id)) continue;
           const mergeDetails: MergeDetails = {
             ...(task.mergeDetails || {}),
             commitSha: classification.commit.sha,
@@ -9724,15 +9817,24 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
           // park the task failed in review (no backward move; see parkFinalizeBlockedReviewTask) so an
           // operator Retry can re-run implementation.
           const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task, {
-            requiredVerificationStepIds: await resolveNoOpFinalizeGateIds(this.store, task),
+            requiredVerificationStepIds: requiredGateIds,
           });
           if (noCommitsFinalize.blocked) {
             const reason = noCommitsFinalize.reason ?? "no-commits task has incomplete work with no net branch changes";
             /*
              * FNXC:Lifecycle 2026-06-14-20:14:
              * FN-6461/FN-6455 requires self-healing no-op finalization to demote no-commits tasks with incomplete/skipped work and set an error so stranded-todo recovery will not immediately re-promote them.
+             *
+             * FNXC:SelfHealingNoOpFinalize 2026-10-12-12:33:
+             * The error is written by the atomic park, together with the failed status, so a park the liveness re-check refuses leaves no error behind.
+             * The refusal waits out the grace window and re-checks liveness first; the log entry and audit row follow only a park that landed.
              */
-            await this.store.updateTask(task.id, { error: reason });
+            if (!isOutsideNoOpRefusalGrace(task, settings)) {
+              log.debug(`no-op review finalize: deferring the incomplete-work refusal of ${task.id} until its review grace window has passed`);
+              continue;
+            }
+            if (await this.isNoOpFinalizeDeferredForLiveness(task.id)) continue;
+            if (!await this.parkFinalizeBlockedReviewTask(task, `Finalize blocked (no-commits incomplete-work guard): ${reason}`)) continue;
             await this.store.logEntry(
               task.id,
               `Finalize blocked (no-commits incomplete-work guard): ${reason}`,
@@ -9752,10 +9854,15 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
               baseRef: classification.baseRef,
               lane: "self-healing-finalize-no-op-review",
             });
-            await this.parkFinalizeBlockedReviewTask(task, `Finalize blocked (no-commits incomplete-work guard): ${reason}`);
             continue;
           }
           if (task.modifiedFiles && task.modifiedFiles.length > 0) {
+            if (!isOutsideNoOpRefusalGrace(task, settings)) {
+              log.debug(`no-op review finalize: deferring the lost-work refusal of ${task.id} until its review grace window has passed`);
+              continue;
+            }
+            if (await this.isNoOpFinalizeDeferredForLiveness(task.id)) continue;
+            if (!await this.parkFinalizeBlockedReviewTask(task, `Finalize blocked (lost-work guard): task claims ${task.modifiedFiles.length} modifiedFiles but the branch has no net changes`)) continue;
             await this.store.logEntry(
               task.id,
               `Finalize blocked (lost-work guard): task claims ${task.modifiedFiles.length} modifiedFiles but classification would finalize as no-op`,
@@ -9770,9 +9877,9 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
               classification: "proven-no-op",
               baseRef: classification.baseRef,
             });
-            await this.parkFinalizeBlockedReviewTask(task, `Finalize blocked (lost-work guard): task claims ${task.modifiedFiles.length} modifiedFiles but the branch has no net changes`);
             continue;
           }
+          if (await this.isNoOpFinalizeDeferredForLiveness(task.id)) continue;
           const noOpReason = `branch has zero commits ahead of ${classification.baseRef}`;
           const mergeDetails: MergeDetails = {
             ...(task.mergeDetails || {}),

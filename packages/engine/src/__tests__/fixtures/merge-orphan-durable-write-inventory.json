@@ -14347,30 +14347,11 @@
     },
     {
       "callSiteId": "packages/engine/src/self-healing.ts::finalizeNoOpReviewTasks::this.store.updateTask::#3",
-      "callSiteFingerprint": "this.store.updateTask(task.id,{error})",
-      "file": "packages/engine/src/self-healing.ts",
-      "enclosingSymbolPath": "finalizeNoOpReviewTasks",
-      "writer": "this.store.updateTask",
-      "ordinal": 3,
-      "owningEntryPoint": "other",
-      "reachableDataStates": [
-        "unobservable:closure-wide production fixture pending"
-      ],
-      "axis1": "out-of-frontier",
-      "axis2Provisional": "out-of-frontier",
-      "axis2Final": "out-of-frontier",
-      "observedInSuite": "out-of-frontier",
-      "executionProof": "none:out-of-frontier",
-      "followUpTaskId": "none:out-of-frontier",
-      "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to finalizeNoOpReviewTasks; SelfHealingManager maintenance and recovery sweeps own this write."
-    },
-    {
-      "callSiteId": "packages/engine/src/self-healing.ts::finalizeNoOpReviewTasks::this.store.updateTask::#4",
       "callSiteFingerprint": "this.store.updateTask(task.id,{?,modifiedFiles,status,error,paused})",
       "file": "packages/engine/src/self-healing.ts",
       "enclosingSymbolPath": "finalizeNoOpReviewTasks",
       "writer": "this.store.updateTask",
-      "ordinal": 4,
+      "ordinal": 3,
       "owningEntryPoint": "other",
       "reachableDataStates": [
         "unobservable:closure-wide production fixture pending"
@@ -14518,7 +14499,7 @@
     },
     {
       "callSiteId": "packages/engine/src/self-healing.ts::parkFinalizeBlockedReviewTask::this.store.updateTaskAtomic::#1",
-      "callSiteFingerprint": "this.store.updateTaskAtomic(task.id,(live) => { if (live.deletedAt || live.paused || live.userPaused || live.column !== task.column || live.status === \"fail)",
+      "callSiteFingerprint": "this.store.updateTaskAtomic(task.id,(live) => { parked = false; if (live.deletedAt || live.paused || live.userPaused || live.column !== task.column || live.)",
       "file": "packages/engine/src/self-healing.ts",
       "enclosingSymbolPath": "parkFinalizeBlockedReviewTask",
       "writer": "this.store.updateTaskAtomic",
