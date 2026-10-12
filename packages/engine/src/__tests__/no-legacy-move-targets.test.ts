@@ -111,19 +111,51 @@ SHARED comment-stripped read cache. countByFile() already memoised its scan, but
 case ("scans a real corpus") re-read the ENTIRE corpus a second time with its own readFileSync loop
 to find moveTask( callers — measured ~270ms of a second full pass over the same unchanging tree. Both
 consumers want the same comment-stripped source, so read+strip each file once and share it.
+
+FNXC:WorkflowResolvedColumns 2026-10-12-09:11:
+The guard never reports a count for a listed file it did not read.
+A listed file that cannot be read fails the scan with an error naming the file, as the script check does, and the failure is not cached, so every consumer that asks for the file fails too.
+The common trigger is a file deleted from the working tree without staging the deletion: the lister still returns it.
+The reader is injected so the cases below can drive a missing path and a failing reader without touching a repository file; production uses one shared instance, so the corpus is still read once per run.
 */
-const strippedSourceCache = new Map<string, string>();
-function strippedSource(file: string): string {
-  const cached = strippedSourceCache.get(file);
-  if (cached !== undefined) return cached;
-  let stripped: string;
-  try {
-    stripped = stripComments(readFileSync(resolve(REPO_ROOT, file), "utf8"));
-  } catch {
-    stripped = "";
+type StrippedSource = (file: string) => string;
+
+function createStrippedSourceReader(readSource: (file: string) => string): StrippedSource {
+  const cache = new Map<string, string>();
+  return (file) => {
+    const cached = cache.get(file);
+    if (cached !== undefined) return cached;
+    let source: string;
+    try {
+      source = readSource(file);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `no-legacy-move-targets: cannot read listed file ${file}: ${reason}\n`
+        + "Refusing to report a move-target count that may be short.\n"
+        + "A file deleted from the working tree stays in the list until the deletion is staged.",
+        { cause: error },
+      );
+    }
+    const stripped = stripComments(source);
+    cache.set(file, stripped);
+    return stripped;
+  };
+}
+
+const strippedSource = createStrippedSourceReader((file) => readFileSync(resolve(REPO_ROOT, file), "utf8"));
+
+function countMoveTargets(files: readonly string[], stripped: StrippedSource): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const file of files) {
+    const hits = stripped(file).match(MOVE_TARGET);
+    if (hits && hits.length > 0) counts[file] = hits.length;
   }
-  strippedSourceCache.set(file, stripped);
-  return stripped;
+  return counts;
+}
+
+function moveTaskCallers(files: readonly string[], stripped: StrippedSource): string[] {
+  return files.filter((file) => /moveTask\s*\(/.test(stripped(file)));
 }
 
 /*
@@ -138,14 +170,8 @@ gratuitously slow is a guard someone eventually moves back out of the gate.
 let countsCache: Record<string, number> | undefined;
 
 function countByFile(): Record<string, number> {
-  if (countsCache) return countsCache;
-  const counts: Record<string, number> = {};
-  for (const file of sourceFiles()) {
-    const hits = strippedSource(file).match(MOVE_TARGET);
-    if (hits && hits.length > 0) counts[file] = hits.length;
-  }
-  countsCache = counts;
-  return counts;
+  countsCache ??= countMoveTargets(sourceFiles(), strippedSource);
+  return countsCache;
 }
 
 describe("moveTask targets resolve the board's own lane", () => {
@@ -163,7 +189,7 @@ describe("moveTask targets resolve the board's own lane", () => {
     const files = sourceFiles();
     expect(files.length).toBeGreaterThan(200);
 
-    const callers = files.filter((file) => /moveTask\s*\(/.test(strippedSource(file)));
+    const callers = moveTaskCallers(files, strippedSource);
     expect(callers.length).toBeGreaterThan(5);
     expect(callers).toContain("packages/engine/src/self-healing.ts");
     /* A plugin calls moveTask too, so the corpus has to reach plugin code. */
@@ -236,5 +262,49 @@ describe("moveTask targets resolve the board's own lane", () => {
       .filter(([file, allowed]) => (counts[file] ?? 0) < allowed)
       .map(([file, allowed]) => `${file}: allows ${allowed}, tree has ${counts[file] ?? 0}`);
     expect(stale, `Lower the allowance to match the tree:\n${stale.join("\n")}`).toEqual([]);
+  });
+});
+
+describe("a listed file the guard cannot read fails the scan", () => {
+  function unreadable(file: string, code: string) {
+    return expect.objectContaining({
+      message: expect.stringContaining(`cannot read listed file ${file}`),
+      cause: expect.objectContaining({ code }),
+    });
+  }
+
+  it("fails on a listed path with no file behind it, for the read point and both consumers", () => {
+    const missing = "packages/engine/src/listed-but-missing.ts";
+    const files = ["packages/engine/src/self-healing.ts", missing];
+
+    expect(() => countMoveTargets(files, strippedSource)).toThrow(unreadable(missing, "ENOENT"));
+    expect(() => moveTaskCallers(files, strippedSource)).toThrow(unreadable(missing, "ENOENT"));
+    expect(() => strippedSource(missing)).toThrow(unreadable(missing, "ENOENT"));
+  });
+
+  it("stops at the unreadable file, reads each readable file once and does not cache the failure", () => {
+    const reads: string[] = [];
+    const stripped = createStrippedSourceReader((file) => {
+      reads.push(file);
+      if (file === "b.ts") throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      return 'await store.moveTask(task.id, "todo");';
+    });
+
+    expect(countMoveTargets(["a.ts"], stripped)).toEqual({ "a.ts": 1 });
+    expect(() => countMoveTargets(["a.ts", "b.ts", "c.ts"], stripped)).toThrow(unreadable("b.ts", "EACCES"));
+    expect(() => moveTaskCallers(["b.ts"], stripped)).toThrow(unreadable("b.ts", "EACCES"));
+    expect(reads).toEqual(["a.ts", "b.ts", "b.ts"]);
+  });
+
+  it("counts an empty file as zero without an error", () => {
+    let reads = 0;
+    const stripped = createStrippedSourceReader(() => {
+      reads += 1;
+      return "";
+    });
+
+    expect(countMoveTargets(["empty.ts"], stripped)).toEqual({});
+    expect(moveTaskCallers(["empty.ts"], stripped)).toEqual([]);
+    expect(reads).toBe(1);
   });
 });

@@ -249,6 +249,10 @@ export default defineConfig({
             The guard takes its file list from the lister and the scope that `scripts/check-move-target-literals.mjs` uses, so both move-target checks scan the same files.
             It now runs two `git ls-files` calls and no other subprocess: the scoped listing, and one unfiltered listing that its completeness case compares the scoped list with.
             Measured on a Windows host: 1.14 to 1.18 s with 12 cases before (two runs), 1.15 to 1.32 s with 13 cases after (three runs). The completeness case took 69 ms.
+
+            FNXC:EngineTests 2026-10-12-09:11:
+            A listed file the guard cannot read now fails the scan with an error naming the file, where it used to count as empty. The three cases that prove it use an injected reader and open at most one missing path; they add no subprocess and no second read of the corpus.
+            Measured on a Windows host (vitest `tests` figure, three runs each): 1.30 to 1.52 s with 13 cases before, 1.25 to 1.57 s with 16 cases after. The new cases took 1 ms together; the run-to-run spread comes from the completeness case's git call (60 to 363 ms).
             */
             "src/__tests__/no-legacy-move-targets.test.ts",
             "src/__tests__/merger-merge-lifecycle.test.ts",
