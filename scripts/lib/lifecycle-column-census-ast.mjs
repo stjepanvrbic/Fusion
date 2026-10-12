@@ -51,6 +51,7 @@ FOREIGN VOCABULARIES (audited 2026-07-30, batch-cli-plugins).
 
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
+import { SourceParseError, parseSourceFileStrict } from "./parse-source-file.mjs";
 
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
@@ -560,45 +561,22 @@ function isTraitFallback(node, sourceFile) {
 }
 
 /**
- * A census file that did not parse cleanly. Thrown instead of returning findings because a partial
- * AST silently omits every site after the first syntax error, and a count taken from it reads as
- * removed guards.
+ * A census file that did not parse cleanly. A count taken from its partial tree would read as
+ * removed guards, so the census reports nothing for it.
  */
-export class CensusParseError extends Error {
-  constructor(file, diagnosticCount, line, detail) {
-    super(
-      `${file}:${line}: ${diagnosticCount} parse error(s), first: "${detail}". `
-        + "The file was not inspected, so no lifecycle-column count can be reported for it.",
-    );
-    this.name = "CensusParseError";
-    this.file = file;
-    this.diagnosticCount = diagnosticCount;
-    this.line = line;
-    this.detail = detail;
-  }
-}
+export { SourceParseError as CensusParseError };
 
 /** Parse one file and classify every comparison against a legacy column id. */
 export function findComparisons(filePath, source) {
   /*
   FNXC:LifecycleColumnCensus 2026-10-12-03:45:
   The census must never report a count for a file it did not fully parse.
-  Every file used to be parsed as TSX. In a `.ts` file a generic arrow `<T>(run) =>` opens a phantom JSX element under TSX; the parser recovered silently, dropped the remaining ~9,500 lines of self-healing.ts, and the census reported three reviewed DELIBERATE-LITERAL sites as removed while recommending a baseline re-record.
-  The parse mode now follows the file extension, and any parse diagnostic fails closed with CensusParseError instead of yielding a partial count.
-  `ts.createSourceFile` never throws on bad syntax, so detection is the `parseDiagnostics` check.
+  A partial parse of self-healing.ts once dropped its remaining ~9,500 lines, and the census reported three reviewed DELIBERATE-LITERAL sites as removed while recommending a baseline re-record.
+
+  FNXC:LifecycleColumnCensus 2026-10-12-04:42:
+  The census parses through the shared strict parser in parse-source-file.mjs, which owns the extension-based parse mode and the fail-closed check for every script AST gate.
   */
-  const scriptKind = /\.[jt]sx$/i.test(filePath) ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
-  const sourceFile = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, scriptKind);
-  const parseErrors = sourceFile.parseDiagnostics ?? [];
-  if (parseErrors.length > 0) {
-    const first = parseErrors[0];
-    throw new CensusParseError(
-      filePath,
-      parseErrors.length,
-      sourceFile.getLineAndCharacterOfPosition(first.start ?? 0).line + 1,
-      ts.flattenDiagnosticMessageText(first.messageText, " "),
-    );
-  }
+  const sourceFile = parseSourceFileStrict(filePath, source);
   const findings = [];
 
   const visit = (node) => {

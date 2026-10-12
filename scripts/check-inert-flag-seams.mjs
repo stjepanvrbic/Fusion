@@ -31,6 +31,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { failClosedOnParseError, parseSourceFileStrict } from "./lib/parse-source-file.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 /*
@@ -136,9 +137,6 @@ function* walk(dir) {
   }
 }
 
-const declared = new Map();
-const callSites = new Map();
-
 /*
 CALL SITES ARE COLLECTED FROM EVERY FILE, DECLARATIONS ONLY FROM CANDIDATES.
 
@@ -151,10 +149,9 @@ missing suppliers in ListView and Column — review did.
 Declarations still use the prefilter: a file DECLARING a flags parameter necessarily contains the
 name, so that half is safe and keeps the scan quick.
 */
-for (const file of SCAN_ROOTS.flatMap((root) => [...walkAll(root)])) {
-  const source = readFileSync(file, "utf8");
-  const fileIsTest = isTestFile(relative(REPO, file).split("\\").join("/"));
-  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+function recordFileSeams({ declared, callSites }, file, source) {
+  const fileIsTest = isTestFile(file);
+  const sf = parseSourceFileStrict(file, source);
   const declares = PREFILTER.test(source);
 
   /*
@@ -196,7 +193,7 @@ for (const file of SCAN_ROOTS.flatMap((root) => [...walkAll(root)])) {
       const exported = node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) === true;
       const last = node.parameters[node.parameters.length - 1];
       if (!fileIsTest && exported && last.questionToken && ts.isIdentifier(last.name) && TRAILING_FLAG_PARAM.test(last.name.text)) {
-        declared.set(node.name.text, { file: relative(REPO, file).split("\\").join("/"), arity: node.parameters.length });
+        declared.set(node.name.text, { file, arity: node.parameters.length });
       }
     }
     if (ts.isCallExpression(node)) {
@@ -213,7 +210,7 @@ for (const file of SCAN_ROOTS.flatMap((root) => [...walkAll(root)])) {
         const target = localAlias.get(callee) ?? callee;
         if (!callSites.has(target)) callSites.set(target, []);
         callSites.get(target).push({
-          file: relative(REPO, file).split("\\").join("/"),
+          file,
           args: effectiveArgCount(node.arguments),
           shadowed: locallyDeclared.has(callee),
           from: importedFrom.get(callee),
@@ -227,13 +224,23 @@ for (const file of SCAN_ROOTS.flatMap((root) => [...walkAll(root)])) {
   visit(sf);
 }
 
-/*
-A call in a file that declares its OWN function of the same name belongs to that local one, unless the
-file is where the seam itself is declared. Resolved here, once the declaring file for each seam is
-known.
-*/
-const callSitesFor = (fn, declaringFile) =>
-  (callSites.get(fn) ?? []).filter((site) => isRelevantCallSite(site, declaringFile));
+/**
+ * Seam declarations and recorded call sites across `files`.
+ *
+ * @param files absolute paths to scan
+ * @param options `repoRoot` is what recorded file names are made relative to; `readFile` is injected for tests
+ * @returns `declared` maps a seam name to `{ file, arity }`; `callSites` maps a callee name to its
+ *   recorded sites `{ file, args, shadowed, from, viaProperty, isTest }`. File names are
+ *   repository-relative with forward slashes.
+ * @throws {SourceParseError} when a file does not parse
+ */
+export function collectSeamData(files, { repoRoot = REPO, readFile = (file) => readFileSync(file, "utf8") } = {}) {
+  const data = { declared: new Map(), callSites: new Map() };
+  for (const file of files) {
+    recordFileSeams(data, relative(repoRoot, file).split("\\").join("/"), readFile(file));
+  }
+  return data;
+}
 
 /*
 FNXC:LifecycleColumnCensus 2026-07-30-23:20 (#2851 review — greptile, "call classification lacks
@@ -338,11 +345,22 @@ GUARDED REPORTING, so importing this module does not run the gate to completion.
 the gate's report and could `process.exit(1)`, so the test file would pass or fail on unrelated repo
 state rather than on what it asserts. Same fix, same reason, as check-sql-column-literals.
 
-The AST WALK above stays unguarded on purpose: `declared` and `callSites` are the module's data, a
-future test may want them, and the walk has no output and no exit. Only the reporting is entry-point
-work.
+FNXC:ScriptAstGates 2026-10-12-04:52:
+THE AST WALK IS ENTRY-POINT WORK TOO. It used to run at import so a test could read the module's data.
+A file that does not parse now stops the scan, so a walk at import would fail every unit test of this module on an unrelated unparseable file anywhere under the scan roots.
+`collectSeamData` takes the file list and a reader instead, and tests drive the same walk with in-memory files.
+A parse failure exits 1 with the file and line before any seam is reported.
 */
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function main() {
+  const { declared, callSites } = collectSeamData(SCAN_ROOTS.flatMap((root) => [...walkAll(root)]));
+  /*
+  A call in a file that declares its OWN function of the same name belongs to that local one, unless the
+  file is where the seam itself is declared. Resolved here, once the declaring file for each seam is
+  known.
+  */
+  const callSitesFor = (fn, declaringFile) =>
+    (callSites.get(fn) ?? []).filter((site) => isRelevantCallSite(site, declaringFile));
+
   const offenders = [];
   const partial = [];
   const stale = [];
@@ -532,4 +550,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   console.log(
     `[check-inert-flag-seams] ${declared.size} lane/flag seams, all supplied at every production call site.`,
   );
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  failClosedOnParseError("check-inert-flag-seams", main);
 }

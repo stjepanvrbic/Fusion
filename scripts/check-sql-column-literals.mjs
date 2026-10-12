@@ -34,6 +34,7 @@ import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { failClosedOnParseError, parseSourceFileStrict } from "./lib/parse-source-file.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PACKAGES = join(REPO, "packages");
@@ -53,12 +54,22 @@ nothing new and reports a reassuring zero — the same trap #2978 hit widening t
 This does NOT contradict the `.sql` note below. That reasoning is about feeding DDL to a TypeScript
 parser; `.mjs` IS JavaScript, so the existing AST walk applies unchanged.
 
-The ScriptKind move is DEFENSIVE, and I could not demonstrate it was necessary — stated plainly
-because the opposite claim would be easy to make and wrong. TSX reads `<` as JSX, so an ordinary
-comparison in a plain script is a plausible misparse; I tried three shapes for it
+JS is used for `.mjs` because it is the correct kind for the file. TSX reads `<` as JSX, so an
+ordinary comparison in a plain script is a plausible misparse; three shapes for it were tried
 (`x <div> y`, `f<b, c>(d)`, a literal between `<` and `>` comparisons) and TSX recovered from all of
-them, returning the same count as JS. So JS is used for `.mjs` because it is the correct kind for the
-file, not because a miss was observed.
+them, returning the same count as JS.
+
+FNXC:ScriptAstGates 2026-10-12-04:48:
+THE PARSE MODE FOLLOWS THE EXTENSION FOR EVERY FILE, AND FOR `.ts` THAT IS A MEASURED FIX.
+
+Every file that was not `.mjs` used to be parsed as TSX. The comparison shapes above recover under
+TSX, which is why the mode once looked harmless. A `.ts` generic arrow (`<T>(run) => ...`) or
+angle-bracket assertion (`<number>value`) does not: TSX opens a phantom JSX element, the parser
+raises nothing, and every literal after that point is missing from the tree. Ten production files
+misparsed that way, one of them from line 8677 of 18,232, and the gate reported each as scanned.
+
+Files are parsed by `parseSourceFileStrict`, which also refuses any file with a parse diagnostic, so
+a count is never taken from a partial tree.
 */
 const SCRIPTS = join(REPO, "scripts");
 const BASELINE = join(REPO, "scripts", "lib", "sql-column-literals-baseline.json");
@@ -142,10 +153,10 @@ function* walk(dir) {
     to `.sql` and `.css` (#2954). That fix does not generalize here, and the two look alike enough
     that it is worth saying so once.
 
-    This gate is AST-based: `ts.createSourceFile(..., ScriptKind.TSX)`, then a walk over string and
-    template nodes. A `.sql` file is not TypeScript, so adding the extension would not widen coverage
-    — it would feed DDL to the TS parser and traverse whatever lenient-mode nodes fell out, which is
-    worse than not looking, because the gate would then REPORT coverage it does not have.
+    This gate is AST-based: each file is parsed as TypeScript or JavaScript according to its
+    extension, then string and template nodes are walked. A `.sql` file is neither, so adding the
+    extension would not widen coverage — it would feed DDL to the TS parser, which refuses any file
+    that does not parse, and the gate would stop at the first migration instead of reading it.
 
     Measured before deciding (2026-07-30): 38 tracked `.sql` files hold exactly one lifecycle-looking
     literal, `CHECK (status IN ('open','converged','archived'))` in 0022_ideation.sql. That is the
@@ -334,7 +345,6 @@ export function literalText(node, consts = new Map()) {
   return null;
 }
 
-/** Per-file counts of SQL literals comparing a task column to a legacy id. */
 /*
 FNXC:LifecycleColumnCensus 2026-07-30-15:10:
 `--list` prints every match, because a baseline number cannot be reviewed.
@@ -345,59 +355,61 @@ reason this check exists, not in the output?". That question is unanswerable aga
 that freezes a population has to be able to show it, or its own number is the only evidence anyone
 has for what it covers.
 */
-const LIST = process.argv.includes("--list");
-const matches = [];
 
+/**
+ * The SQL literals in one file that compare a task column to a legacy id.
+ *
+ * @param file name the parse mode and any parse error are derived from
+ * @returns `hits` is the weighted site count the baseline records; `matches` is one `{ line, text }`
+ *   per matched predicate, for `--list`
+ * @throws {SourceParseError} when the file does not parse
+ */
+export function countSqlColumnLiterals(file, source) {
+  const sf = parseSourceFileStrict(file, source);
+  const consts = collectStringConsts(sf);
+  let hits = 0;
+  const matches = [];
+  const visit = (node) => {
+    const text = literalText(node, consts);
+    if (text !== null) {
+      COMPARISON.lastIndex = 0;                         // a /g regex carries state between calls
+      for (const match of text.match(COMPARISON) ?? []) {
+        hits += comparisonWeight(match);
+        matches.push({
+          line: sf.getLineAndCharacterOfPosition(node.getStart()).line + 1,
+          text: match.replace(/\s+/g, " ").trim(),
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return { hits, matches };
+}
+
+/** Per-file counts of SQL literals comparing a task column to a legacy id, plus every match. */
 function scan() {
   const counts = {};
+  const matches = [];
   for (const file of [...walk(PACKAGES), ...walk(SCRIPTS)]) {
-    const source = readFileSync(file, "utf8");
-    /* The correct kind for the file. Defensive rather than a proven fix — see the header. */
-    const kind = file.endsWith(".mjs") ? ts.ScriptKind.JS : ts.ScriptKind.TSX;
-    const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, kind);
-    const consts = collectStringConsts(sf);
-    let hits = 0;
-    const visit = (node) => {
-      const text = literalText(node, consts);
-      if (text !== null) {
-        COMPARISON.lastIndex = 0;                         // a /g regex carries state between calls
-        for (const match of text.match(COMPARISON) ?? []) {
-          hits += comparisonWeight(match);
-          if (LIST) {
-            const line = sf.getLineAndCharacterOfPosition(node.getStart()).line + 1;
-            const rel = relative(REPO, file).split("\\").join("/");
-            matches.push(`  ${rel}:${line}  ${match.replace(/\s+/g, " ").trim()}`);
-          }
-        }
-      }
-      ts.forEachChild(node, visit);
-    };
-    visit(sf);
-    if (hits > 0) counts[relative(REPO, file).split("\\").join("/")] = hits;
+    const rel = relative(REPO, file).split("\\").join("/");
+    const found = countSqlColumnLiterals(rel, readFileSync(file, "utf8"));
+    if (found.hits > 0) counts[rel] = found.hits;
+    for (const match of found.matches) matches.push(`  ${rel}:${match.line}  ${match.text}`);
   }
-  return counts;
+  return { counts, matches };
 }
 
-/*
-FNXC:LifecycleColumnCensus 2026-07-30-21:00 (#2841 review, second round):
-GUARDED ENTRY POINT, so importing this module does not RUN the gate.
+function main() {
+  const { counts: found, matches } = scan();
 
-`check-sql-column-literals.test.mjs` imports `COMPARISON` and `literalText` to test the matcher
-directly. Without this guard the import executed the whole scan, printed the gate's report, and called
-`process.exit(1)` — so the test file failed for the gate's reasons rather than its own, and while the
-gate happened to be green it passed for reasons unrelated to what it asserts. A test that can be made
-to pass or fail by unrelated repo state is not a test.
-*/
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const found = scan();
+  if (process.argv.includes("--list")) {
+    for (const line of matches.sort()) console.log(line);
+    console.log(`\n[check-sql-column-literals] ${matches.length} match(es) in ${Object.keys(found).length} file(s).`);
+    process.exit(0);
+  }
 
-  if (LIST) {
-  for (const line of matches.sort()) console.log(line);
-  console.log(`\n[check-sql-column-literals] ${matches.length} match(es) in ${Object.keys(found).length} file(s).`);
-  process.exit(0);
-}
-
-if (process.argv.includes("--update-baseline")) {
+  if (process.argv.includes("--update-baseline")) {
     writeFileSync(BASELINE, `${JSON.stringify(found, null, 2)}\n`);
     const total = Object.values(found).reduce((a, b) => a + b, 0);
     console.log(`[check-sql-column-literals] baseline written: ${total} site(s) in ${Object.keys(found).length} file(s)`);
@@ -487,4 +499,22 @@ if (process.argv.includes("--update-baseline")) {
 
   const total = Object.values(found).reduce((a, b) => a + b, 0);
   console.log(`[check-sql-column-literals] ${total} known SQL column literal(s), none added.`);
+}
+
+/*
+FNXC:LifecycleColumnCensus 2026-07-30-21:00 (#2841 review, second round):
+GUARDED ENTRY POINT, so importing this module does not RUN the gate.
+
+`check-sql-column-literals.test.mjs` imports `countSqlColumnLiterals` to test the scanner
+directly. Without this guard the import executed the whole scan, printed the gate's report, and called
+`process.exit(1)` — so the test file failed for the gate's reasons rather than its own, and while the
+gate happened to be green it passed for reasons unrelated to what it asserts. A test that can be made
+to pass or fail by unrelated repo state is not a test.
+
+FNXC:ScriptAstGates 2026-10-12-04:48:
+A file that does not parse fails every mode with exit 1 and a message naming the file and line.
+`main` scans every file before it prints or writes anything, so `--update-baseline` cannot record a count taken from a partly read file.
+*/
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  failClosedOnParseError("check-sql-column-literals", main);
 }

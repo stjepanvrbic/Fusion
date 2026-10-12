@@ -27,6 +27,8 @@ import { globSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { isEntryPoint } from "./lib/is-entry-point.mjs";
+import { failClosedOnParseError, parseSourceFileStrict } from "./lib/parse-source-file.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MODULE_PREFIX = "@fusion/dashboard/";
@@ -56,11 +58,11 @@ but not compared. Reporting them would have been a false positive on the very fi
 whose debut finding is wrong does not get a second reading.
 */
 export function declaredInterfacesForTest(sourceText, fileName) {
-  return declaredInterfaces(sourceText, fileName, ts.ScriptKind.TSX);
+  return declaredInterfaces(sourceText, fileName);
 }
 
 export function exportedFunctions(sourceText, fileName) {
-  const sf = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const sf = parseSourceFileStrict(fileName, sourceText);
   const found = new Map();
   const isExported = (node) => node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
   const visit = (node) => {
@@ -86,7 +88,7 @@ export function exportedFunctions(sourceText, fileName) {
 
 /** Declared functions per `declare module "@fusion/dashboard/..."` block. */
 function mirroredFunctions(file) {
-  const sf = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const sf = parseSourceFileStrict(file, readFileSync(file, "utf8"));
   const out = [];
   const visit = (node) => {
     if (ts.isModuleDeclaration(node) && ts.isStringLiteral(node.name) && node.name.text.startsWith(MODULE_PREFIX)) {
@@ -121,8 +123,8 @@ failure the function-arity case produced — code that looks wired and receives 
 Measured when added: zero across all six mirrors. The rule is here because these files provably
 drift, not because they currently do.
 */
-function declaredInterfaces(sourceText, fileName, kind) {
-  const sf = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.Latest, true, kind);
+function declaredInterfaces(sourceText, fileName) {
+  const sf = parseSourceFileStrict(fileName, sourceText);
   const out = new Map();
   const visit = (node) => {
     if (ts.isInterfaceDeclaration(node)) {
@@ -142,8 +144,7 @@ function declaredInterfaces(sourceText, fileName, kind) {
 
 /** Interfaces a `declare module` block mirrors, keyed by module then interface name. */
 function mirroredInterfaces(file) {
-  const text = readFileSync(file, "utf8");
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const sf = parseSourceFileStrict(file, readFileSync(file, "utf8"));
   const out = [];
   const visit = (node) => {
     if (ts.isModuleDeclaration(node) && ts.isStringLiteral(node.name) && node.name.text.startsWith(MODULE_PREFIX)) {
@@ -168,65 +169,77 @@ function mirroredInterfaces(file) {
   return out;
 }
 
-const mirrors = globSync("plugins/*/src/dashboard-interop.d.ts", { cwd: REPO }).sort();
-const problems = [];
-let compared = 0;
-let comparedInterfaces = 0;
+/*
+FNXC:ScriptAstGates 2026-10-12-04:56:
+The comparison runs only as the entry point, and a file that does not parse ends it with exit 1 and a message naming the file and line.
+It used to run at import, so the unit tests of the helpers above printed the gate's report and depended on the state of every mirror and dashboard module.
+Every file is parsed in the mode its extension implies: a `.ts` dashboard module read as TSX loses everything after a generic arrow or an angle-bracket assertion, and its exports then read as missing.
+*/
+function main() {
+  const mirrors = globSync("plugins/*/src/dashboard-interop.d.ts", { cwd: REPO }).sort();
+  const problems = [];
+  let compared = 0;
+  let comparedInterfaces = 0;
 
-for (const rel of mirrors) {
-  const file = join(REPO, rel);
-  for (const decl of mirroredFunctions(file)) {
-    const realFile = resolveRealFile(decl.moduleName);
-    if (!realFile) {
-      problems.push(`${rel}:${decl.line}  mirrors ${decl.moduleName}, which resolves to no file in packages/dashboard`);
-      continue;
+  for (const rel of mirrors) {
+    const file = join(REPO, rel);
+    for (const decl of mirroredFunctions(file)) {
+      const realFile = resolveRealFile(decl.moduleName);
+      if (!realFile) {
+        problems.push(`${rel}:${decl.line}  mirrors ${decl.moduleName}, which resolves to no file in packages/dashboard`);
+        continue;
+      }
+      const exports = exportedFunctions(readFileSync(realFile, "utf8"), realFile);
+      if (!exports.has(decl.name)) {
+        problems.push(`${rel}:${decl.line}  declares ${decl.name}(), which ${decl.moduleName} does not export`);
+        continue;
+      }
+      const real = exports.get(decl.name);
+      if (real === null) continue;  /* exported, but not as a plain function — arity not comparable */
+      compared += 1;
+      if (real.total !== decl.total || real.required !== decl.required) {
+        problems.push(
+          `${rel}:${decl.line}  ${decl.name}() declares ${decl.total} param(s) (${decl.required} required); `
+          + `the real one takes ${real.total} (${real.required} required)`,
+        );
+      }
     }
-    const exports = exportedFunctions(readFileSync(realFile, "utf8"), realFile);
-    if (!exports.has(decl.name)) {
-      problems.push(`${rel}:${decl.line}  declares ${decl.name}(), which ${decl.moduleName} does not export`);
-      continue;
-    }
-    const real = exports.get(decl.name);
-    if (real === null) continue;  /* exported, but not as a plain function — arity not comparable */
-    compared += 1;
-    if (real.total !== decl.total || real.required !== decl.required) {
-      problems.push(
-        `${rel}:${decl.line}  ${decl.name}() declares ${decl.total} param(s) (${decl.required} required); `
-        + `the real one takes ${real.total} (${real.required} required)`,
-      );
-    }
-  }
 
-  for (const decl of mirroredInterfaces(file)) {
-    const realFile = resolveRealFile(decl.moduleName);
-    if (!realFile) continue;  /* already reported by the function pass */
-    const real = declaredInterfaces(readFileSync(realFile, "utf8"), realFile, ts.ScriptKind.TSX).get(decl.name);
-    if (!real) continue;      /* the mirror may name a local shape the module does not export */
-    comparedInterfaces += 1;
-    for (const [prop, line] of decl.props) {
-      if (!real.has(prop)) {
-        problems.push(`${rel}:${line}  ${decl.name}.${prop} is not a property of the real ${decl.name}`);
+    for (const decl of mirroredInterfaces(file)) {
+      const realFile = resolveRealFile(decl.moduleName);
+      if (!realFile) continue;  /* already reported by the function pass */
+      const real = declaredInterfaces(readFileSync(realFile, "utf8"), realFile).get(decl.name);
+      if (!real) continue;      /* the mirror may name a local shape the module does not export */
+      comparedInterfaces += 1;
+      for (const [prop, line] of decl.props) {
+        if (!real.has(prop)) {
+          problems.push(`${rel}:${line}  ${decl.name}.${prop} is not a property of the real ${decl.name}`);
+        }
       }
     }
   }
+
+  /*
+  ANTI-VACUITY: a resolver change or a rename could leave this walking nothing and reporting success
+  forever, which is the failure mode a ratchet must not have.
+  */
+  if (mirrors.length === 0 || compared === 0 || comparedInterfaces === 0) {
+    console.error(`[check-plugin-interop-drift] scanned ${mirrors.length} mirror(s), compared ${compared} function(s) and ${comparedInterfaces} interface(s) — refusing to report success on an empty comparison.`);
+    process.exit(1);
+  }
+
+  if (problems.length > 0) {
+    console.error(`\n[check-plugin-interop-drift] plugin interop declarations disagree with the real dashboard API:\n`);
+    for (const p of problems) console.error(`  ${p}`);
+    console.error(`\nThese files are hand-maintained copies wired in via tsconfig \`paths\`; nothing else checks them.`);
+    console.error(`Update the declaration to match the real signature — a stale one silently blocks callers`);
+    console.error(`from passing arguments that exist (#3003).\n`);
+    process.exit(1);
+  }
+
+  console.log(`[check-plugin-interop-drift] ${compared} mirrored function(s) and ${comparedInterfaces} interface(s) across ${mirrors.length} plugin(s) match the real dashboard API.`);
 }
 
-/*
-ANTI-VACUITY: a resolver change or a rename could leave this walking nothing and reporting success
-forever, which is the failure mode a ratchet must not have.
-*/
-if (mirrors.length === 0 || compared === 0 || comparedInterfaces === 0) {
-  console.error(`[check-plugin-interop-drift] scanned ${mirrors.length} mirror(s), compared ${compared} function(s) and ${comparedInterfaces} interface(s) — refusing to report success on an empty comparison.`);
-  process.exit(1);
+if (isEntryPoint(import.meta.url)) {
+  failClosedOnParseError("check-plugin-interop-drift", main);
 }
-
-if (problems.length > 0) {
-  console.error(`\n[check-plugin-interop-drift] plugin interop declarations disagree with the real dashboard API:\n`);
-  for (const p of problems) console.error(`  ${p}`);
-  console.error(`\nThese files are hand-maintained copies wired in via tsconfig \`paths\`; nothing else checks them.`);
-  console.error(`Update the declaration to match the real signature — a stale one silently blocks callers`);
-  console.error(`from passing arguments that exist (#3003).\n`);
-  process.exit(1);
-}
-
-console.log(`[check-plugin-interop-drift] ${compared} mirrored function(s) and ${comparedInterfaces} interface(s) across ${mirrors.length} plugin(s) match the real dashboard API.`);

@@ -33,6 +33,7 @@ it teaches people to disable the check.
 
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
+import { parseSourceFileStrict } from "./parse-source-file.mjs";
 
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
@@ -71,7 +72,7 @@ function isExported(node) {
 
 /** Declarations whose parameters are worth checking: exported functions and exported interfaces. */
 function collectLaneParameters(filePath, source) {
-  const sourceFile = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const sourceFile = parseSourceFileStrict(filePath, source);
   const found = [];
 
   const recordParam = (param, ownerName) => {
@@ -143,6 +144,7 @@ function collectLaneParameters(filePath, source) {
  * @param files absolute paths to scan (production sources; callers exclude tests)
  * @param readFile injected for testability
  * @returns declarations whose lane parameter is mentioned in no other file
+ * @throws {SourceParseError} when a file does not parse, so a partly read file is never reported as checked
  */
 export function findUnwiredLaneParameters(files, readFile = (f) => readFileSync(f, "utf8")) {
   const sources = new Map();

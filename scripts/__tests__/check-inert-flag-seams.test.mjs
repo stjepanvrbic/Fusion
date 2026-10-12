@@ -23,10 +23,19 @@ a failure would not say which half broke.
 */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import ts from "typescript";
 
-import { collectImportBindings, isRelevantCallSite, effectiveArgCount } from "../check-inert-flag-seams.mjs";
+import {
+  collectImportBindings,
+  collectSeamData,
+  isRelevantCallSite,
+  effectiveArgCount,
+} from "../check-inert-flag-seams.mjs";
+import { SourceParseError, parseSourceFileStrict } from "../lib/parse-source-file.mjs";
 
 const DECLARING = "packages/core/src/near-duplicate-canonical.ts";
 
@@ -174,7 +183,7 @@ The negatives are the half that keeps this honest: a MIDDLE undefined still posi
 argument after it, so trimming must stop at the first non-undefined from the right.
 */
 function argsOf(source) {
-  const sf = ts.createSourceFile("t.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const sf = parseSourceFileStrict("t.ts", source);
   let found = null;
   const visit = (node) => {
     if (!found && ts.isCallExpression(node)) found = node.arguments;
@@ -206,4 +215,98 @@ test("a MIDDLE undefined positions the argument after it, which is real", () => 
 
 test("a call with no arguments is unchanged", () => {
   assert.equal(effectiveArgCount(argsOf("f();")), 0);
+});
+
+/* Valid TypeScript that opens a phantom JSX element when the file is parsed as TSX. */
+const GENERIC_ARROW = "const underLock = <T>(work: () => Promise<T>): Promise<T> => work();\n";
+const ANGLE_ASSERTION = "declare const raw: unknown;\nconst n = <number>raw;\n";
+
+const THING = "packages/x/src/thing.ts";
+const THING_SOURCE = [
+  GENERIC_ARROW,
+  "export function isThing(task: Task, columnFlags?: Flags): boolean {\n",
+  '  return columnFlags ? columnFlags.wip : task.column === "in-progress";\n',
+  "}\n",
+].join("");
+
+/** Walk in-memory files, keyed by repository-relative name, through the scan the gate runs. */
+function seamData(fileMap) {
+  const absolute = Object.fromEntries(Object.entries(fileMap).map(([file, source]) => [`/repo/${file}`, source]));
+  return collectSeamData(Object.keys(absolute), { repoRoot: "/repo", readFile: (file) => absolute[file] });
+}
+
+/** The recorded calls the gate attributes to the `isThing` seam. */
+function isThingSites(fileMap) {
+  const { callSites } = seamData({ [THING]: THING_SOURCE, ...fileMap });
+  return (callSites.get("isThing") ?? []).filter((site) => isRelevantCallSite(site, THING));
+}
+
+test("a seam and an omitting call that both follow a generic arrow in .ts files are recorded", () => {
+  const caller = "packages/x/src/caller.ts";
+  const fileMap = {
+    [caller]: `import { isThing } from "./thing.js";\n${GENERIC_ARROW}export function check(task: Task): boolean {\n  return isThing(task);\n}\n`,
+  };
+
+  assert.deepEqual(seamData({ [THING]: THING_SOURCE, ...fileMap }).declared.get("isThing"), { file: THING, arity: 2 });
+  assert.deepEqual(isThingSites(fileMap), [
+    { file: caller, args: 1, shadowed: false, from: "./thing.js", viaProperty: false, isTest: false },
+  ]);
+});
+
+test("the same call passing the flags is recorded with both arguments", () => {
+  const sites = isThingSites({
+    "packages/x/src/caller.ts": `import { isThing } from "./thing.js";\n${GENERIC_ARROW}export function check(task: Task, flags: Flags): boolean {\n  return isThing(task, flags);\n}\n`,
+  });
+  assert.deepEqual(sites.map((site) => site.args), [2]);
+});
+
+test("a call after an angle-bracket type assertion in a .ts file is recorded", () => {
+  const sites = isThingSites({
+    "packages/x/src/caller.ts": `import { isThing } from "./thing.js";\n${ANGLE_ASSERTION}export function check(task: Task): boolean {\n  return isThing(task);\n}\n`,
+  });
+  assert.deepEqual(sites.map((site) => [site.file, site.args]), [["packages/x/src/caller.ts", 1]]);
+});
+
+test("a call after real JSX in a .tsx file is recorded", () => {
+  const sites = isThingSites({
+    "packages/x/src/View.tsx": 'import { isThing } from "./thing.js";\nexport const el = <div>{1}</div>;\nexport function check(task: Task): boolean {\n  return isThing(task);\n}\n',
+  });
+  assert.deepEqual(sites.map((site) => [site.file, site.args]), [["packages/x/src/View.tsx", 1]]);
+});
+
+test("a call in a test file is recorded as a test call site", () => {
+  const sites = isThingSites({
+    "packages/x/src/__tests__/caller.test.ts": 'import { isThing } from "../thing.js";\nisThing(task, flags);\n',
+  });
+  assert.deepEqual(sites.map((site) => [site.file, site.args, site.isTest]), [
+    ["packages/x/src/__tests__/caller.test.ts", 2, true],
+  ]);
+});
+
+test("a file that does not parse stops the scan instead of being reported as checked", () => {
+  assert.throws(
+    () => seamData({ [THING]: THING_SOURCE, "packages/x/src/broken.ts": "export function )( {\nisThing(task);\n" }),
+    (error) => {
+      assert.ok(error instanceof SourceParseError);
+      assert.equal(error.file, "packages/x/src/broken.ts");
+      assert.ok(error.message.includes("packages/x/src/broken.ts:1:"), error.message);
+      assert.ok(error.message.includes("not inspected"), error.message);
+      return true;
+    },
+  );
+});
+
+test("importing the gate module does not walk the repository", () => {
+  const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const gateUrl = pathToFileURL(resolve(repo, "scripts/check-inert-flag-seams.mjs")).href;
+  const code = [
+    'import fs from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'fs.readdirSync = () => { throw new Error("directory read while importing the gate"); };',
+    "syncBuiltinESMExports();",
+    `await import(${JSON.stringify(gateUrl)});`,
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd: repo, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "");
 });

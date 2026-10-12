@@ -135,9 +135,20 @@ Run against all five lifecycle gates on one tree, staging a probe file per form.
 |---|---|---|
 | `lifecycle-column-census` | `===` / `!==` comparisons | ~~membership, switch~~ **fixed** — both were invisible while it printed "a new guard cannot land silently" |
 | `check-move-target-literals` | direct + backtick destinations | ~~ternary destination~~ **fixed**; still misses a destination bound to a local first |
-| `check-sql-column-literals` | `"column"` comparisons, including inside plain template literals — not only drizzle `sql` tags | nothing found; the one miss probed was an invented identifier the schema never uses |
+| `check-sql-column-literals` | `"column"` comparisons, including inside plain template literals — not only drizzle `sql` tags | nothing found; the one miss probed was an invented identifier the schema never uses. ~~Everything after a generic arrow or angle-bracket assertion in a `.ts` file~~ **fixed**. The old parse stopped early in 10 of 2,671 scanned files. The unread parts held no SQL column literal |
 | `check-inert-sync-lane-conversions` | lane reads via the `resolvePlannerLanes` helper | a DIRECT `store.resolveTaskWorkflowIrSync(...)` read feeding `resolveLifecycleColumns` — inert by the same mechanism, untracked |
 | `check-fnxc-future-dates` | future stamps | nothing found — it caught the author of this table, twice |
+| `check-inert-flag-seams` | an optional trailing lane or flag parameter that a production call site omits | ~~everything after a generic arrow or angle-bracket assertion in a `.ts` file~~ **fixed**. The old parse stopped early in 24 of 6,807 files (10 production, 14 test or fixture). The unread parts held 3,014 calls. One was a call to a seam, `isNearDuplicateCanonicalInactive` in `self-healing.ts`, and it supplies its flags |
+| `check-plugin-interop-drift` | a mirrored function whose parameter count differs from the real one, and a mirrored interface property the real interface lacks | ~~the same blind spot in a `.ts` dashboard module~~ **fixed**. None of the 12 files it reads was affected when measured |
+| `unwired-lane-parameter` (a library that no command runs) | an exported optional lane parameter that no other file mentions | ~~the same blind spot~~ **fixed**. The old parse stopped early in 9 of 2,817 files. The 19 reported parameters did not change |
+
+<!-- FNXC:ScriptAstGates 2026-10-12-05:10: A script AST gate never reports a result for a file it did not fully parse. -->
+The last three rows and the struck-through generic-arrow entries were measured on 2026-10-12, not in the 2026-07-31 probe.
+Until then these gates parsed every file as TSX. In a `.ts` file, TSX reads a generic arrow `<T>(run) =>` or an angle-bracket assertion `<T>value` as the start of a JSX element. The parser returns a partial tree without raising an error, and the gate reported the file as checked.
+`lifecycle-column-census` had the same defect, described in `docs/testing.md`.
+
+Script AST gates parse through `scripts/lib/parse-source-file.mjs`, which picks the parse mode from the file extension and refuses any file with a parse error.
+A file with a syntax error fails every gate that scans it, with a message naming the file and line. That includes an untracked scratch file and a deliberately broken fixture under a scanned root.
 
 ### The axis this table did not have
 

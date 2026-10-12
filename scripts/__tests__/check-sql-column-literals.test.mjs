@@ -19,29 +19,52 @@ code too, and its baseline would stop meaning anything.
 */
 import test from "node:test";
 import assert from "node:assert/strict";
-import ts from "typescript";
 
-import { COMPARISON, comparisonWeight, literalText, collectStringConsts } from "../check-sql-column-literals.mjs";
+import { countSqlColumnLiterals } from "../check-sql-column-literals.mjs";
+import { SourceParseError } from "../lib/parse-source-file.mjs";
 
-/** Count forbidden comparisons the way the scanner does: over decoded literal text. */
+/** The weighted count the gate records for one `.ts` file, taken from the scanner itself. */
 function hits(source) {
-  const sf = ts.createSourceFile("t.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  /* The scanner resolves same-file constants before matching; the harness must too, or these tests
-     would exercise a scanner that does not exist. */
-  const consts = collectStringConsts(sf);
-  let total = 0;
-  const visit = (node) => {
-    const text = literalText(node, consts);
-    if (text !== null) {
-      COMPARISON.lastIndex = 0;
-      /* Weighted exactly as the scanner counts: an IN list of two legacy ids is two sites. */
-      for (const match of text.match(COMPARISON) ?? []) total += comparisonWeight(match);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
-  return total;
+  return countSqlColumnLiterals("t.ts", source).hits;
 }
+
+/* Valid TypeScript that opens a phantom JSX element when the file is parsed as TSX. */
+const GENERIC_ARROW = "const underLock = <T>(run: () => Promise<T>): Promise<T> => run();\n";
+const ANGLE_ASSERTION = "declare const raw: unknown;\nconst n = <number>raw;\n";
+const STALE_QUERY = "`SELECT id FROM tasks WHERE \"column\" = 'done'`";
+
+test("a literal after a generic arrow function in a .ts file is counted", () => {
+  const found = countSqlColumnLiterals("t.ts", `${GENERIC_ARROW}export const STALE = ${STALE_QUERY};\n`);
+  assert.equal(found.hits, 1);
+  assert.deepEqual(found.matches, [{ line: 2, text: "\"column\" = 'done'" }]);
+});
+
+test("a literal after an angle-bracket type assertion in a .ts file is counted", () => {
+  const source = `${ANGLE_ASSERTION}export function staleQuery() {\n  return ${STALE_QUERY};\n}\n`;
+  assert.equal(countSqlColumnLiterals("t.ts", source).hits, 1);
+});
+
+test("a literal after real JSX in a .tsx file is counted", () => {
+  const source = `export const el = <div>{1}</div>;\nexport const STALE = ${STALE_QUERY};\n`;
+  assert.equal(countSqlColumnLiterals("t.tsx", source).hits, 1);
+});
+
+test("a literal beside a less-than comparison in a .mjs file is counted", () => {
+  assert.equal(countSqlColumnLiterals("t.mjs", "const a = 1 < 2 ? `\"column\" = 'done'` : null;\n").hits, 1);
+});
+
+test("a file that does not parse is refused instead of counted", () => {
+  assert.throws(
+    () => countSqlColumnLiterals("t.ts", `export function )( {\nexport const STALE = ${STALE_QUERY};\n`),
+    (error) => {
+      assert.ok(error instanceof SourceParseError);
+      assert.equal(error.file, "t.ts");
+      assert.ok(error.message.includes("t.ts:1:"), error.message);
+      assert.ok(error.message.includes("not inspected"), error.message);
+      return true;
+    },
+  );
+});
 
 test("a bare clause fragment in a file with NO SQL keyword anywhere is still caught", () => {
   /*

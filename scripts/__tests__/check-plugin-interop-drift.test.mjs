@@ -9,7 +9,11 @@ get a second reading, so the distinction between ABSENT and NOT-COMPARABLE is pi
 */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { exportedFunctions } from "../check-plugin-interop-drift.mjs";
+import { SourceParseError } from "../lib/parse-source-file.mjs";
 
 const parse = (src) => exportedFunctions(src, "t.tsx");
 
@@ -65,4 +69,58 @@ test("a mirror declaring an UNKNOWN property is drift", () => {
   /* The live case: `TaskCardProps.workflowStepNameLookup` outlived its removal from TaskCard. */
   const real = declaredInterfacesForTest("export interface P { a: string }", "t.tsx").get("P");
   assert.equal(real.has("workflowStepNameLookup"), false);
+});
+
+/* Valid TypeScript that opens a phantom JSX element when the file is parsed as TSX. */
+const GENERIC_ARROW = "const underLock = <T>(run: () => Promise<T>): Promise<T> => run();\n";
+const ANGLE_ASSERTION = "declare const raw: unknown;\nconst n = <number>raw;\n";
+const FUNCTION = "export function f(a: string, b?: number) { return a; }\n";
+const INTERFACE = "export interface P { a: string; b?: number }\n";
+const BROKEN = "export function )( {\n";
+
+const propertiesOf = (source, fileName) => [...(declaredInterfacesForTest(source, fileName).get("P") ?? new Map()).keys()];
+
+test("an exported function after a generic arrow in a .ts module is found", () => {
+  assert.deepEqual(exportedFunctions(GENERIC_ARROW + FUNCTION, "t.ts").get("f"), { total: 2, required: 1 });
+});
+
+test("an interface after a generic arrow in a .ts module is found", () => {
+  assert.deepEqual(propertiesOf(GENERIC_ARROW + INTERFACE, "t.ts"), ["a", "b"]);
+});
+
+test("an exported function and an interface after an angle-bracket assertion are found", () => {
+  assert.deepEqual(exportedFunctions(ANGLE_ASSERTION + FUNCTION, "t.ts").get("f"), { total: 2, required: 1 });
+  assert.deepEqual(propertiesOf(ANGLE_ASSERTION + INTERFACE, "t.ts"), ["a", "b"]);
+});
+
+test("an exported function after real JSX in a .tsx module is found", () => {
+  const found = exportedFunctions(`export const el = <div>{1}</div>;\n${FUNCTION}`, "t.tsx");
+  assert.deepEqual(found.get("f"), { total: 2, required: 1 });
+});
+
+test("a module that does not parse is refused instead of read as exporting nothing", () => {
+  const refused = (error) => {
+    assert.ok(error instanceof SourceParseError);
+    assert.equal(error.file, "t.ts");
+    assert.ok(error.message.includes("t.ts:1:"), error.message);
+    assert.ok(error.message.includes("not inspected"), error.message);
+    return true;
+  };
+  assert.throws(() => exportedFunctions(BROKEN + FUNCTION, "t.ts"), refused);
+  assert.throws(() => declaredInterfacesForTest(BROKEN + INTERFACE, "t.ts"), refused);
+});
+
+test("importing the gate module does not run the comparison", () => {
+  const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const gateUrl = pathToFileURL(resolve(repo, "scripts/check-plugin-interop-drift.mjs")).href;
+  const code = [
+    'import fs from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'fs.globSync = () => { throw new Error("mirror lookup while importing the gate"); };',
+    "syncBuiltinESMExports();",
+    `await import(${JSON.stringify(gateUrl)});`,
+  ].join("\n");
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", code], { cwd: repo, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "");
 });
