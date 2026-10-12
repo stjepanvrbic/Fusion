@@ -40,7 +40,7 @@ measured this backlog with three greps and got three answers, so the number is t
 The text classifier stays beside it as an independent second implementation — `--compare` runs both
 and fails if they disagree, which is the only evidence available that either is right.
 */
-import { censusFiles, summarize } from "./lib/lifecycle-column-census-ast.mjs";
+import { CensusParseError, censusFiles, summarize } from "./lib/lifecycle-column-census-ast.mjs";
 
 /** Repo root, for reading a finding's source back when `--triage` classifies it. */
 /*
@@ -162,7 +162,20 @@ if (files.length === 0) {
    sync-resolver probe all resolve through `readCensusFile`, so an injected list cannot end up listed
    against the fixture and read against the repo. That split is the ENOENT #3228 hit. */
 const readCensusFile = (f) => readFileSync(isAbsolute(f) ? f : join(REPO_ROOT, f), "utf8");
-const findings = censusFiles(files, readCensusFile);
+/*
+FNXC:LifecycleColumnCensus 2026-10-12-03:45:
+A file that does not parse fails EVERY mode with exit 1, including `--strict --update-baseline`.
+A partial parse drops every site after the first syntax error, so its count reads as removed guards; re-recording a baseline from it would retire reviewed sites from the ratchet, which is the failure this refusal exists to prevent.
+Only CensusParseError is reported here; any other error propagates unchanged.
+*/
+let findings;
+try {
+  findings = censusFiles(files, readCensusFile);
+} catch (err) {
+  if (!(err instanceof CensusParseError)) throw err;
+  console.error(`lifecycle-column-census: ${err.message}\n  Refusing to report or record any count until the file parses.`);
+  process.exit(1);
+}
 const summary = summarize(findings);
 const json = process.argv.includes("--json");
 const strict = process.argv.includes("--strict");

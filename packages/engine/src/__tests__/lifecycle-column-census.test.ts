@@ -1003,6 +1003,79 @@ describe("the ratchet follows the count down", () => {
 });
 
 /*
+FNXC:LifecycleColumnCensus 2026-10-12-03:45:
+The CLI never reports or records a count for a file it did not fully parse.
+Under the old TSX-everywhere parse, a `.ts` generic arrow hid every later site, and `--strict` advised re-recording the baseline with three reviewed DELIBERATE-LITERAL sites missing.
+*/
+describe("the census refuses to count a file it could not parse", () => {
+  const repoRoot = fileURLToPath(new URL("../../../../", import.meta.url));
+  const cliPath = `${repoRoot}scripts/lifecycle-column-census.mjs`;
+  const FIXTURE_REL = "pkg/src/lock.ts";
+
+  async function runOnFixture(source: string, args: string[]) {
+    const { mkdtemp, mkdir, writeFile, readFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join, dirname } = await import("node:path");
+    const root = await mkdtemp(join(tmpdir(), "fusion-census-parse-"));
+    try {
+      await mkdir(dirname(join(root, FIXTURE_REL)), { recursive: true });
+      await writeFile(join(root, FIXTURE_REL), source);
+      const baselinePath = join(root, "baseline.json");
+      const baselineBefore = `${JSON.stringify({ byFile: {}, deliberateByFile: {}, queryByFile: {} }, null, 2)}\n`;
+      await writeFile(baselinePath, baselineBefore);
+      const result = spawnSync(process.execPath, [cliPath, ...args], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          FUSION_CENSUS_FILE_ROOT: root,
+          FUSION_CENSUS_FILE_LIST: FIXTURE_REL,
+          FUSION_CENSUS_BASELINE_PATH: baselinePath,
+          FUSION_CENSUS_TOUCHED_PATHS: "",
+        },
+        timeout: 30_000,
+      });
+      return {
+        status: result.status,
+        stderr: result.stderr ?? "",
+        baselineBefore,
+        baselineAfter: await readFile(baselinePath, "utf8"),
+      };
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it("exits 1 in every strict mode and leaves the baseline byte-identical", async () => {
+    const unparseable = `function )( {\nif (task.column === "todo") return;\n`;
+    for (const args of [["--strict"], ["--strict", "--update-baseline"]]) {
+      const run = await runOnFixture(unparseable, args);
+
+      expect(run.status, args.join(" ")).toBe(1);
+      expect(run.stderr).toContain(`${FIXTURE_REL}:1:`);
+      expect(run.stderr).toContain("not inspected");
+      expect(run.baselineAfter).toBe(run.baselineBefore);
+    }
+  }, 30_000);
+
+  it("records a deliberate site that follows a generic arrow function in a .ts file", async () => {
+    const source = [
+      "const underLock = <T>(run: () => Promise<T>): Promise<T> => run();",
+      "export function f(task: { column: string }) {",
+      "  /* DELIBERATE-LITERAL: the reviewed legacy half. */",
+      `  if (task.column === "in-review") return 1;`,
+      "  return 0;",
+      "}",
+      "",
+    ].join("\n");
+    const run = await runOnFixture(source, ["--strict", "--update-baseline"]);
+
+    expect(run.status, run.stderr).toBe(0);
+    expect(JSON.parse(run.baselineAfter).deliberateByFile).toEqual({ [`${FIXTURE_REL}\u0000in-review`]: 1 });
+  }, 30_000);
+});
+
+/*
 FNXC:LifecycleColumnCensus 2026-07-31-10:50 (u12 — the rule that decides where the fleet is sent):
 `hasDeferralNote` is what splits the backlog into "debt with a written reason" and "work nobody has
 examined", and the census's default output now states a CONVERSION QUEUE EMPTY verdict from it. A

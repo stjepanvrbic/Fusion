@@ -559,9 +559,46 @@ function isTraitFallback(node, sourceFile) {
   return false;
 }
 
+/**
+ * A census file that did not parse cleanly. Thrown instead of returning findings because a partial
+ * AST silently omits every site after the first syntax error, and a count taken from it reads as
+ * removed guards.
+ */
+export class CensusParseError extends Error {
+  constructor(file, diagnosticCount, line, detail) {
+    super(
+      `${file}:${line}: ${diagnosticCount} parse error(s), first: "${detail}". `
+        + "The file was not inspected, so no lifecycle-column count can be reported for it.",
+    );
+    this.name = "CensusParseError";
+    this.file = file;
+    this.diagnosticCount = diagnosticCount;
+    this.line = line;
+    this.detail = detail;
+  }
+}
+
 /** Parse one file and classify every comparison against a legacy column id. */
 export function findComparisons(filePath, source) {
-  const sourceFile = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  /*
+  FNXC:LifecycleColumnCensus 2026-10-12-03:45:
+  The census must never report a count for a file it did not fully parse.
+  Every file used to be parsed as TSX. In a `.ts` file a generic arrow `<T>(run) =>` opens a phantom JSX element under TSX; the parser recovered silently, dropped the remaining ~9,500 lines of self-healing.ts, and the census reported three reviewed DELIBERATE-LITERAL sites as removed while recommending a baseline re-record.
+  The parse mode now follows the file extension, and any parse diagnostic fails closed with CensusParseError instead of yielding a partial count.
+  `ts.createSourceFile` never throws on bad syntax, so detection is the `parseDiagnostics` check.
+  */
+  const scriptKind = /\.[jt]sx$/i.test(filePath) ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+  const sourceFile = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, scriptKind);
+  const parseErrors = sourceFile.parseDiagnostics ?? [];
+  if (parseErrors.length > 0) {
+    const first = parseErrors[0];
+    throw new CensusParseError(
+      filePath,
+      parseErrors.length,
+      sourceFile.getLineAndCharacterOfPosition(first.start ?? 0).line + 1,
+      ts.flattenDiagnosticMessageText(first.messageText, " "),
+    );
+  }
   const findings = [];
 
   const visit = (node) => {

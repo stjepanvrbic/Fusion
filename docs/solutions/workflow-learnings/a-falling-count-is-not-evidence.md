@@ -35,9 +35,15 @@ Only the first is progress, and from inside the check all three look identical.
 | census 45 → 44 in `triage.ts` (#3114) | converted the exact arm #3108 had flagged hours earlier, blockers named and a test behind it. #3126 reverted it — three PRs for one line |
 | ratchet 20 → 15 | not a conversion: #3065 rewrote `a === x \|\| a === y` as `set.has(a)` and the check counted only comparisons. It printed *"total fell — re-record"*, which would have **permanently retired live guards** |
 | ratchet 22 → 9 | `scheduler.ts` reported **0** while 13 guards still fell back to the default board, laundered through `mergeParkedColumns(sync(...), lanes)` |
+| census deliberate `done` 3 → 2 and `in-review` 3 → 1 in `self-healing.ts` (KB-119) | no exemption was removed: the census parsed the `.ts` file as TSX, a generic arrow `<T>(run) =>` opened a phantom JSX element, and the parser silently dropped the remaining ~9,500 lines, three marked sites among them. `--strict` printed *"baseline CAN BE TIGHTENED"* and named `--update-baseline` as the next step |
 
 Rows three and four are the dangerous shape: **the gate went quiet exactly when someone improved the
 code**, and the remedy it suggested was to lower the allowance.
+
+Row five was added later and is the same shape with a different cause: the scan lost the code
+rather than the code outgrowing the scan. The census now picks the parser mode from the file
+extension and exits 1 on any parse diagnostic, so a file it could not fully read yields an error
+instead of a count.
 
 ### The obligation this creates
 

@@ -288,6 +288,16 @@ cannot prove a receiver is column-typed, so classification remains evidence-base
 the vocabulary its siblings use). That is why the four classes are reported separately and never
 netted — a wrong classification stays visible instead of silently moving the bar.
 
+<!-- FNXC:LifecycleColumnCensus 2026-10-12-03:59: The census must never report a count for a file it did not fully parse. A `.ts` generic arrow read as JSX under a TSX-only parse hid the rest of self-healing.ts, and the drop was reported as removed exemptions. -->
+**A file that does not parse fails the census.** Each file is parsed in the mode its extension
+implies (`.tsx`/`.jsx` as TSX, everything else as TS), because TSX reads a `.ts` generic arrow
+`<T>(run) =>` or an angle-bracket assertion `<T>value` as the start of a JSX element. The TypeScript
+parser never throws on bad syntax; it recovers and returns a partial tree, so every site after the
+first error would be missing from the count and the shortfall would read as removed guards. Any parse
+diagnostic therefore exits 1 in every mode, `--strict --update-baseline` included, with a message
+naming the file, the line and the first diagnostic. Fix the file's syntax; there is no flag to
+continue past it.
+
 `--json` emits the machine-readable form. `--strict` compares per-file counts against
 `scripts/lib/lifecycle-column-census-baseline.json`:
 

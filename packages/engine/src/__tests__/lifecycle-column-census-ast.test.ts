@@ -18,6 +18,7 @@ and its count cannot be the bar.
 import { describe, expect, it } from "vitest";
 
 import {
+  CensusParseError,
   DELIBERATE_MARKER,
   findComparisons,
   summarize,
@@ -69,7 +70,7 @@ describe("the parser catches every reintroduction shape", () => {
     expect(totals(`if (task.column != "triage") return;`).column).toBe(1);
   });
 
-  it("inside JSX, which is why the parser uses ScriptKind.TSX", () => {
+  it("inside JSX, which is why a .tsx file is parsed with ScriptKind.TSX", () => {
     const source = [
       `export const Badge = ({ task }: { task: { column: string } }) => (`,
       `  <span className={task.column === "triage" ? "is-planning" : "is-live"} />`,
@@ -531,5 +532,67 @@ describe("a literal in a trait-fallback branch is flagged as such", () => {
 
     expect(finding.kind).toBe("column");
     expect(finding.traitFallback).toBe(true);
+  });
+});
+
+/*
+FNXC:LifecycleColumnCensus 2026-10-12-03:45:
+The parse mode follows the file extension and a misparse fails closed.
+Under the old TSX-everywhere parse, a `.ts` generic arrow opened a phantom JSX element and every site after it vanished, which the census reported as removed DELIBERATE-LITERAL exemptions.
+*/
+describe("each file is parsed in the mode its extension implies", () => {
+  function kindsIn(file: string, source: string) {
+    return findComparisons(file, source).map((finding: { columnId: string; kind: string }) => [finding.columnId, finding.kind]);
+  }
+
+  it("keeps the sites after a generic arrow function in a .ts file", () => {
+    const source = [
+      "const underLock = <T>(run: () => Promise<T>): Promise<T> => run();",
+      "function f(task: { column: string }) {",
+      `  /* ${DELIBERATE_MARKER} — the reviewed legacy half. */`,
+      `  if (task.column === "in-review") return 1;`,
+      `  if (task.column === "done") return 2;`,
+      "  return 0;",
+      "}",
+    ].join("\n");
+
+    expect(kindsIn("packages/x/src/lock.ts", source)).toEqual([
+      ["in-review", "deliberate"],
+      ["done", "column"],
+    ]);
+  });
+
+  it("keeps the sites after an angle-bracket type assertion in a .ts file", () => {
+    const source = [
+      "const n = <number>value;",
+      `if (task.column === "todo") use(n);`,
+    ].join("\n");
+
+    expect(kindsIn("packages/x/src/assert.ts", source)).toEqual([["todo", "column"]]);
+  });
+
+  it("still parses JSX in a .tsx file", () => {
+    const source = [
+      "const el = <div>{x}</div>;",
+      `if (task.column === "todo") show(el);`,
+    ].join("\n");
+
+    expect(kindsIn("packages/x/app/View.tsx", source)).toEqual([["todo", "column"]]);
+  });
+
+  it("refuses to count a file that does not parse", () => {
+    const source = ["function )( {", `if (task.column === "todo") return;`].join("\n");
+
+    expect(() => findComparisons("packages/x/src/broken.ts", source)).toThrow(CensusParseError);
+    try {
+      findComparisons("packages/x/src/broken.ts", source);
+    } catch (error) {
+      const parseError = error as { file: string; line: number; diagnosticCount: number; message: string };
+      expect(parseError.file).toBe("packages/x/src/broken.ts");
+      expect(parseError.line).toBe(1);
+      expect(parseError.diagnosticCount).toBeGreaterThan(0);
+      expect(parseError.message).toContain("packages/x/src/broken.ts:1:");
+      expect(parseError.message).toContain("not inspected");
+    }
   });
 });
