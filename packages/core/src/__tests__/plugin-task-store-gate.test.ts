@@ -3,7 +3,8 @@ import {
   PLUGIN_DESTRUCTIVE_TASK_STORE_METHODS,
   createPluginGatedTaskStore,
 } from "../plugin-task-store-gate.js";
-import type { TaskStore } from "../store.js";
+import { TaskStore } from "../store.js";
+import { taskColumnHasLaneRole } from "../task-lane-role.js";
 
 /*
 FNXC:PluginTaskStoreGate 2026-07-26-12:20:
@@ -127,5 +128,33 @@ describe("createPluginGatedTaskStore", () => {
     await expect(async () => gated.bypassFailedPreMergeReviewStep("FN-1")).rejects.toThrow(
       "not permitted to call bypassFailedPreMergeReviewStep",
     );
+  });
+
+  /*
+  FNXC:PluginTaskStoreGate 2026-10-12-08:27:
+  A plugin asks which lane role a column carries through `ctx.taskStore`, which is this gated handle. The lookup is a read, so a plugin without `destructiveTaskOps` must reach the real store method and get the board's own answer.
+  */
+  it("answers a lane-role lookup through the gate without a destructiveTaskOps declaration", async () => {
+    const selection = { workflowId: "wf", stepIds: [] as string[] };
+    const ir = {
+      version: "v2", id: "wf", name: "wf", nodes: [], edges: [],
+      columns: [
+        { id: "in-progress", name: "Not a working lane", traits: [] },
+        { id: "building", name: "Building", traits: [{ trait: "wip" }] },
+        { id: "shipped", name: "Shipped", traits: [{ trait: "complete" }] },
+      ],
+    };
+    const raw = {
+      getTaskWorkflowSelection: () => selection,
+      getTaskWorkflowSelectionAsync: async () => selection,
+      getWorkflowDefinition: async () => ({ id: "wf", ir }),
+      taskColumnHasLaneRole: TaskStore.prototype.taskColumnHasLaneRole,
+    };
+    const gated = createPluginGatedTaskStore(raw as unknown as TaskStore, {
+      pluginId: "fusion-plugin-test",
+    });
+
+    await expect(taskColumnHasLaneRole(gated, "FN-1", "building", "wip")).resolves.toBe(true);
+    await expect(taskColumnHasLaneRole(gated, "FN-1", "in-progress", "wip")).resolves.toBe(false);
   });
 });

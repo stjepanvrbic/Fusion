@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { validatePluginManifest as coreBarrelValidate } from "@fusion/core";
-import { definePlugin, validatePluginManifest } from "../index.js";
+import { taskColumnHasLaneRole as coreBarrelLaneRole, validatePluginManifest as coreBarrelValidate } from "@fusion/core";
+import * as sdk from "../index.js";
+import { TASK_LANE_ROLES, definePlugin, taskColumnHasLaneRole, validatePluginManifest } from "../index.js";
+import type { PluginContext, TaskLaneRole } from "../index.js";
 import type { FusionPlugin, PluginUiContributionSurface } from "../../../core/src/plugins/plugin-types.js";
 import type { TaskStore } from "../../../core/src/store.js";
 import { validatePluginManifest as coreValidate } from "../../../core/src/plugins/plugin-types.js";
@@ -357,6 +359,49 @@ describe("Plugin SDK", () => {
 
     it("accepts consecutive hyphens in the id, matching the loader slug rule", () => {
       expect(validatePluginManifest({ ...base, id: "a--b" })).toEqual({ valid: true, errors: [] });
+    });
+  });
+
+  // ── taskColumnHasLaneRole ────────────────────────────────────────────
+
+  /*
+  FNXC:WorkflowLifecycleColumns 2026-10-12-08:27:
+  A plugin asks the Fusion host which lane role a column carries. The SDK export must be core's predicate, return the host's answer, and fall back to the default board only when the host has no lookup. The SDK must not export a workflow or trait resolver, because a plugin's copy would read a private trait registry.
+  */
+  describe("taskColumnHasLaneRole", () => {
+    it("is the predicate from @fusion/core, not a copy", () => {
+      expect(taskColumnHasLaneRole).toBe(coreBarrelLaneRole);
+    });
+
+    it("returns the host's answer", async () => {
+      const host = {
+        taskColumnHasLaneRole: async (_taskId: string, columnId: string, role: TaskLaneRole) =>
+          columnId === "building" && role === "wip",
+      };
+
+      expect(await taskColumnHasLaneRole(host, "FN-1", "building", "wip")).toBe(true);
+      expect(await taskColumnHasLaneRole(host, "FN-1", "in-progress", "wip")).toBe(false);
+    });
+
+    it("returns the default-board answer when the host has no lookup", async () => {
+      expect(await taskColumnHasLaneRole({}, "FN-1", "in-progress", "wip")).toBe(true);
+      expect(await taskColumnHasLaneRole({}, "FN-1", "building", "wip")).toBe(false);
+    });
+
+    it("accepts the task store a plugin context carries", async () => {
+      const ask = (ctx: PluginContext) => taskColumnHasLaneRole(ctx.taskStore, "FN-1", "todo", "hold");
+
+      expect(await ask({ taskStore: {} } as unknown as PluginContext)).toBe(true);
+    });
+
+    it("exports the six lane roles", () => {
+      expect([...TASK_LANE_ROLES]).toEqual(["intake", "hold", "wip", "review", "complete", "archived"]);
+    });
+
+    it("exports no workflow or trait resolver", () => {
+      expect(sdk).not.toHaveProperty("resolveTaskColumnHasLaneRole");
+      expect(sdk).not.toHaveProperty("columnsWithFlag");
+      expect(sdk).not.toHaveProperty("resolveWorkflowIrForTask");
     });
   });
 });

@@ -3122,6 +3122,11 @@
       "reason": "persists or mutates TaskStore state"
     },
     {
+      "method": "taskColumnHasLaneRole",
+      "kind": "non-writer",
+      "reason": "reviewed public TaskStore operation; not a durable writer reached by this merge frontier"
+    },
+    {
       "method": "taskDir",
       "kind": "non-writer",
       "reason": "reviewed public TaskStore operation; not a durable writer reached by this merge frontier"

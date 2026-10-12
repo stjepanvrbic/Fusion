@@ -5,6 +5,8 @@ import type {
   PluginSetupHooks,
   PluginSetupManifest,
   PluginState,
+  TaskLaneRole,
+  TaskLaneRoleHost,
 } from "../index.js";
 
 describe("plugin-sdk re-export contract", () => {
@@ -14,5 +16,11 @@ describe("plugin-sdk re-export contract", () => {
     expectTypeOf<FusionPlugin>().not.toBeAny();
     expectTypeOf<PluginState>().not.toBeAny();
     expectTypeOf<PluginInstallation>().not.toBeAny();
+  });
+
+  it("re-exports the lane-role lookup types from @fusion/core", () => {
+    expectTypeOf<TaskLaneRole>().not.toBeAny();
+    expectTypeOf<TaskLaneRoleHost>().not.toBeAny();
+    expectTypeOf<TaskLaneRole>().toEqualTypeOf<"intake" | "hold" | "wip" | "review" | "complete" | "archived">();
   });
 });

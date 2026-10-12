@@ -156,6 +156,14 @@ export {
 } from "@fusion/core";
 export type { ShellFreeLaunch, ShellFreeLaunchDeps, KillProcessTreeDeps } from "@fusion/core";
 
+/*
+FNXC:WorkflowLifecycleColumns 2026-10-12-08:27:
+A plugin must be able to ask what a column is for, so its lane guards work on a board whose columns were renamed. `taskColumnHasLaneRole(ctx.taskStore, taskId, columnId, role)` asks the Fusion host and returns its answer.
+A plugin must not resolve traits itself: its copy of the SDK has a private trait registry that never holds plugin-contributed traits. That is why the SDK exports no workflow or trait resolver.
+*/
+export { taskColumnHasLaneRole, TASK_LANE_ROLES } from "@fusion/core";
+export type { TaskLaneRole, TaskLaneRoleHost } from "@fusion/core";
+
 // ── Step-inversion IR types (type-only) ──────────────────────────────────────
 // TYPE-ONLY re-exports of the workflow-modelable step constructs (KTD-3/12/13/15)
 // so plugin authors can author/validate workflow IR and step parsers against the

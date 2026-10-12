@@ -851,6 +851,7 @@ const NON_WRITER_REASONS: Record<string, string> = Object.fromEntries([
   "summarizeAgentLog",
   "suppressWatcher",
   "syncAgentTaskLinkOnReassignment",
+  "taskColumnHasLaneRole",
   "taskDir",
   "taskIdExistsAnywhere",
   "taskToArchiveEntry",

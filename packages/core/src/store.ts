@@ -173,6 +173,7 @@ import { __setTaskActivityLogLimitsForTesting } from "./task-store/comments.js";
 import { columnsWithFlag, declaresAnyLifecycleTrait, resolveLifecycleColumns, resolveReviewColumns, type LifecycleColumns } from "./workflows/workflow-lifecycle-traits.js";
 import { isReviewColumnRole, isTerminalColumnRole, isWipColumnRole } from "./column-roles.js";
 import { resolveProjectColumnsForRoles } from "./project-lane-vocabulary.js";
+import { resolveTaskColumnHasLaneRole, type TaskLaneRole } from "./task-lane-role.js";
 import {
   appendPatchnodeEntry,
   appendPatchnodeEntryInTransaction,
@@ -4175,6 +4176,11 @@ Issue #2149 requires read-only type filtering to occur in the file-store before 
   /** FNXC:PostgresCutover 2026-07-04-00:00: authoritative backend-mode read (async Drizzle); SQLite delegates to the sync getter. */
   public async getTaskWorkflowSelectionAsync(taskId: string): Promise<{ workflowId: string; stepIds: string[] } | undefined> {
     return getTaskWorkflowSelectionAsyncImpl(this, taskId);
+  }
+
+  /** FNXC:WorkflowLifecycleColumns 2026-10-12-08:27: plugins reach this through `PluginContext.taskStore` to ask whether a column carries a lane role for a task. The host answers because only its trait registry holds plugin-contributed traits. */
+  public async taskColumnHasLaneRole(taskId: string, columnId: string, role: TaskLaneRole): Promise<boolean> {
+    return resolveTaskColumnHasLaneRole(this, taskId, columnId, role);
   }
 
   public async getTaskWorkflowSelectionsAsync(taskIds: string[]): Promise<Map<string, { workflowId: string; stepIds: string[] }>> {

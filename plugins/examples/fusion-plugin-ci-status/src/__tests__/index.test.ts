@@ -17,6 +17,7 @@ interface MockContext {
   emitEvent: ReturnType<typeof vi.fn>;
   taskStore: {
     getTask: ReturnType<typeof vi.fn>;
+    taskColumnHasLaneRole?: ReturnType<typeof vi.fn>;
   };
 }
 
@@ -40,6 +41,24 @@ function createMockContext(overrides: Partial<MockContext> = {}): MockContext {
     },
     ...overrides,
   };
+}
+
+/**
+ * A context for a board whose lanes were renamed: `building` and `verifying` are working lanes and
+ * `vault` is the archive lane. The store answers the lane-role lookup the way a Fusion host does.
+ */
+function createRenamedBoardContext(overrides: Partial<MockContext> = {}): MockContext {
+  return createMockContext({
+    taskStore: {
+      getTask: vi.fn(),
+      taskColumnHasLaneRole: vi.fn(
+        async (_taskId: string, columnId: string, role: string) =>
+          (role === "wip" && (columnId === "building" || columnId === "verifying")) ||
+          (role === "archived" && columnId === "vault"),
+      ),
+    },
+    ...overrides,
+  });
 }
 
 // ── Mock Request/Response ──────────────────────────────────────────────────────
@@ -299,6 +318,92 @@ describe("ci-status plugin", () => {
       expect(ctx.logger.info).toHaveBeenCalledWith(
         expect.stringContaining("custom/fn-001"),
       );
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "custom/fn-001", status: "pending" }]);
+    });
+  });
+
+  // FNXC:PluginExamples 2026-10-12-08:27:
+  // Tracking must follow the role of a lane and not its id. On a board with renamed lanes the plugin starts when a card enters a working lane and stops when it enters the archive lane, and the default board's ids mean nothing there.
+  describe("hooks.onTaskMoved on a board with renamed lanes", () => {
+    it("should track the branch when the task enters a working lane", async () => {
+      const ctx = createRenamedBoardContext();
+
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "backlog", "building", ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "fusion/fn-001", status: "pending" }]);
+      expect(ctx.taskStore.taskColumnHasLaneRole).toHaveBeenCalledWith("FN-001", "building", "wip");
+      expect(ctx.logger.info).toHaveBeenCalledWith("Tracking branch for task FN-001: fusion/fn-001");
+    });
+
+    it("should not track when the task enters a column that only shares the default working id", async () => {
+      const ctx = createRenamedBoardContext();
+
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "backlog", "in-progress", ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([]);
+    });
+
+    it("should stop tracking when the task enters the archive lane", async () => {
+      // The branch is seeded through a host without the lookup, so this case does not depend on how tracking starts on the renamed board.
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "todo", "in-progress", createMockContext() as any);
+      const ctx = createRenamedBoardContext();
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "fusion/fn-001", status: "pending" }]);
+
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "building", "vault", ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([]);
+      expect(ctx.logger.info).toHaveBeenCalledWith("Stopped tracking branch for task FN-001");
+    });
+
+    it("should keep tracking when the task enters a column that only shares the default archive id", async () => {
+      const ctx = createRenamedBoardContext();
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "backlog", "building", ctx as any);
+
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "building", "archived", ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "fusion/fn-001", status: "pending" }]);
+    });
+
+    it("should keep one entry when the task moves between two working lanes", async () => {
+      const ctx = createRenamedBoardContext();
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "backlog", "building", ctx as any);
+
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "building", "verifying", ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "fusion/fn-001", status: "pending" }]);
+    });
+
+    it("should stop tracking when Fusion reports the task completed", async () => {
+      const ctx = createRenamedBoardContext();
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "backlog", "building", ctx as any);
+
+      await plugin.hooks.onTaskCompleted?.(mockTask as any, ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([]);
+    });
+
+    it("should reject and track nothing when the lane-role lookup fails", async () => {
+      const ctx = createRenamedBoardContext();
+      ctx.taskStore.taskColumnHasLaneRole!.mockRejectedValue(new Error("store offline"));
+
+      await expect(
+        Promise.resolve(plugin.hooks.onTaskMoved?.(mockTask as any, "backlog", "building", ctx as any)),
+      ).rejects.toThrow("store offline");
+
+      expect(await trackedBranches(ctx)).toEqual([]);
+    });
+
+    it("should use configured branch prefix", async () => {
+      const ctx = createRenamedBoardContext({
+        settings: {
+          ciUrl: "https://ci.example.com/api",
+          pollIntervalMs: 60000,
+          branchPrefix: "custom/",
+        },
+      });
+
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "backlog", "building", ctx as any);
+
       expect(await trackedBranches(ctx)).toEqual([{ branch: "custom/fn-001", status: "pending" }]);
     });
   });

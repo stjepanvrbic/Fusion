@@ -4,10 +4,10 @@ Polls CI status for branches and provides a custom API to query results. Useful 
 
 ## Features
 
-- **Branch Tracking**: Automatically tracks branches when tasks move to the default board's `in-progress` column
+- **Branch Tracking**: Tracks a task's branch when the task enters a working lane of its board, whatever that lane is called
 - **Periodic Polling**: Polls CI status at configurable intervals
 - **Custom API**: Provides REST endpoints to query branch status
-- **Automatic Cleanup**: Stops tracking branches when Fusion reports the task completed, or when the task moves to `archived`
+- **Automatic Cleanup**: Stops tracking a branch when Fusion reports the task completed, or when the task enters an archive lane
 
 ## Installation
 
@@ -82,21 +82,29 @@ Triggers an immediate CI status refresh for all tracked branches.
 
 ## How It Works
 
-1. **Branch Creation**: When a task moves to the `in-progress` column, the plugin's `onTaskMoved` hook creates a branch name using the configured prefix (default: `fusion/`) combined with the task ID (lowercased)
+1. **Branch Creation**: When a task enters a working lane, the plugin's `onTaskMoved` hook creates a branch name using the configured prefix (default: `fusion/`) combined with the task ID (lowercased)
 2. **CI Polling**: At the configured interval, the plugin polls the CI API to get status updates for all tracked branches
 3. **CI Integration**: The plugin sends a POST request to `{ciUrl}/status` with the list of branch names
-4. **Branch Cleanup**: When Fusion reports a task completed, the plugin's `onTaskCompleted` hook removes the branch from tracking. Fusion calls that hook when a task reaches the board's complete column, whatever that column is called. A task that moves to the `archived` column is removed from tracking too
+4. **Branch Cleanup**: When Fusion reports a task completed, the plugin's `onTaskCompleted` hook removes the branch from tracking. Fusion calls that hook when a task reaches the board's complete column, whatever that column is called. A task that enters an archive lane is removed from tracking too
 
 ### Boards with renamed columns
 
-A workflow can give its columns other ids than the default board's. Cleanup on completion works on every board, because Fusion decides which column is the complete one before it calls `onTaskCompleted`.
+A workflow can give its columns other ids than the default board's, so the plugin never compares a column id. `onTaskMoved` asks Fusion what the column is for:
 
-The two checks in `onTaskMoved` compare the column id with `in-progress` and `archived`, the default board's ids. The plugin SDK has no call that tells a plugin which role a column has, so on a board that uses other ids:
+```typescript
+if (await taskColumnHasLaneRole(ctx.taskStore, task.id, toColumn, "wip")) {
+  // start tracking
+}
+if (await taskColumnHasLaneRole(ctx.taskStore, task.id, toColumn, "archived")) {
+  // stop tracking
+}
+```
 
-- Tracking does not start if the working column is not called `in-progress`.
-- A task archived before it completes stays tracked until the plugin unloads if the archive column is not called `archived`.
+`taskColumnHasLaneRole` comes from the plugin SDK. Fusion answers from the task's own workflow, so the check works on a board with several working lanes and on a board whose archive lane has another id. On the default board the working lane is `in-progress` and the archive lane is `archived`.
 
-If you copy this plugin for such a board, compare with that board's column ids in `onTaskMoved`.
+Cleanup on completion works on every board too, because Fusion decides which column is the complete one before it calls `onTaskCompleted`.
+
+If you copy this plugin, keep asking for the lane's role. A comparison with a column id such as `in-progress` works on the default board only.
 
 ## CI API Integration
 

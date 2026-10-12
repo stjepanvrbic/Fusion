@@ -2634,6 +2634,7 @@ export { hashWorkflowIr, computeWorkflowIrPin, detectWorkflowDrift, type Workflo
 export { classifyLifecycleRole, classifyLifecycleDirection, evaluateForbiddenLifecyclePath, isSanctionedEngineBackwardMove, ENGINE_BACKWARD_MOVE_REASONS, LIFECYCLE_ROLE_RANK, type LifecycleRole, type LifecycleDirection, type ForbiddenLifecyclePath, type EngineBackwardMoveReason } from "./workflows/workflow-lifecycle-direction.js";
 export { evaluateTransitionInvariants, evaluateMergeBlockerPostcondition, evaluateTerminalReentryPostcondition, evaluateLifecycleDirectionPostcondition, evaluateCapacityRejection, isWipColumn, isTerminalColumn, isCompleteColumn, isHoldColumn, isHoldToWipBoundary, type CapacityFacts } from "./workflows/workflow-transition-policy.js";
 export { resolveProjectColumnsForRoles, resolveArchivedLanes, REVIEW_ROLES, TERMINAL_ROLES, LEGACY_COLUMN_IDS_BY_ROLE, type ProjectLaneVocabularyStore } from "./project-lane-vocabulary.js";
+export { TASK_LANE_ROLES, resolveTaskColumnHasLaneRole, taskColumnHasLaneRole, type TaskLaneRole, type TaskLaneRoleHost } from "./task-lane-role.js";
 // FNXC:GateBarrelSync 2026-07-19-12:20: stale-binary guard exports mirrored per the sync rule above (PR #2341 review).
 export { StaleBinarySchemaError, assertBinaryNotOlderThanDatabase } from "./postgres/schema-applier.js";
 export { promoteResearchFinding } from "./research/research-feature-promotion.js";

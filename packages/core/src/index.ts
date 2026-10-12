@@ -591,6 +591,7 @@ export type { LifecycleColumns, TaskMoveLanes } from "./workflows/workflow-lifec
 export { TaskLaneCache, type TaskLaneCacheOptions } from "./task-lane-cache.js";
 export { resolveReviewLevelSteps, applyReviewLevelPreset } from "./tasks/review-level-preset.js";
 export { resolveProjectColumnsForRoles, resolveArchivedLanes, REVIEW_ROLES, TERMINAL_ROLES, LEGACY_COLUMN_IDS_BY_ROLE, type ProjectLaneVocabularyStore, type ProjectLaneResolutionOptions } from "./project-lane-vocabulary.js";
+export { TASK_LANE_ROLES, resolveTaskColumnHasLaneRole, taskColumnHasLaneRole, type TaskLaneRole, type TaskLaneRoleHost } from "./task-lane-role.js";
 export {
   LEGACY_STATUS_ADOPTION,
   resolveLegacyStatusAdoption,

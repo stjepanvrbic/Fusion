@@ -1,4 +1,4 @@
-import { definePlugin } from "@fusion/plugin-sdk";
+import { definePlugin, taskColumnHasLaneRole } from "@fusion/plugin-sdk";
 import type {
   FusionPlugin,
   PluginContext,
@@ -47,10 +47,10 @@ let pluginLogger: PluginContext["logger"] | null = null;
 
 // ── Branch Tracking ────────────────────────────────────────────────────────────
 
-// FNXC:PluginExamples 2026-10-12-07:05:
-// Plugin authors copy this file, so it compares a column id only where Fusion gives a plugin no other signal.
-// Tracking stops in onTaskCompleted, which Fusion fires for the board's complete column whatever its id is.
-// Fusion has no hook for a card entering the working column or the archive column, and the plugin SDK has no call that returns a column's role. The two column comparisons in onTaskMoved stay for that reason, each with a comment that says what a board with other column ids gets.
+// FNXC:PluginExamples 2026-10-12-08:27:
+// Plugin authors copy this file, so it never compares a column id. A board can rename its columns, and a plugin that compares ids stops working there.
+// Tracking starts when a card enters a working lane and stops when it enters an archive lane. onTaskMoved asks Fusion for the lane's role with taskColumnHasLaneRole.
+// Tracking also stops in onTaskCompleted, which Fusion fires for the board's complete column whatever its id is.
 
 function trackedBranchName(taskId: string, ctx: PluginContext): string {
   const branchPrefix = (ctx.settings.branchPrefix as string) || "fusion/";
@@ -250,12 +250,9 @@ const plugin: FusionPlugin = definePlugin({
       pluginLogger = null;
     },
 
-    onTaskMoved: (task, fromColumn, toColumn, ctx) => {
-      // DELIBERATE-LITERAL: "in-progress" is the id of the working column on Fusion's default board.
-      // The plugin SDK has no call that tells a plugin which role a column has, so this plugin cannot
-      // recognise the working column of a board that gives it another id. On such a board tracking
-      // never starts.
-      if (toColumn === "in-progress") {
+    onTaskMoved: async (task, fromColumn, toColumn, ctx) => {
+      // A board can have several working lanes. A card that moves from one to another is already tracked.
+      if (await taskColumnHasLaneRole(ctx.taskStore, task.id, toColumn, "wip")) {
         const branchName = trackedBranchName(task.id, ctx);
 
         if (!branchStatuses.has(branchName)) {
@@ -268,11 +265,8 @@ const plugin: FusionPlugin = definePlugin({
         }
       }
 
-      // DELIBERATE-LITERAL: "archived" is the id of the archive column on Fusion's default board.
-      // A card can be archived before it completes, and Fusion has no hook for that. The plugin SDK
-      // has no call that tells a plugin which role a column has, so on a board that gives its archive
-      // column another id such a card stays tracked until the plugin unloads.
-      if (toColumn === "archived") {
+      // A card can be archived before it completes, and Fusion has no hook for that.
+      if (await taskColumnHasLaneRole(ctx.taskStore, task.id, toColumn, "archived")) {
         stopTrackingBranch(task.id, ctx);
       }
     },

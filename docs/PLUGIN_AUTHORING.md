@@ -15,6 +15,7 @@ A comprehensive guide to creating Fusion plugins that extend the task board with
    - [Theming & Overlay Layering for Dashboard Views](#theming--overlay-layering-for-dashboard-views)
 9. [Registering Agent Runtimes](#9-registering-agent-runtimes)
 10. [Plugin Context API Reference](#10-plugin-context-api-reference)
+    - [Lane roles](#lane-roles)
 11. [Plugin Lifecycle States](#11-plugin-lifecycle-states)
 12. [Testing Plugins](#12-testing-plugins)
 13. [Publishing Plugins](#13-publishing-plugins)
@@ -356,7 +357,7 @@ const plugin: FusionPlugin = {
 | `onUnload` | `(ctx: PluginContext) => Promise<void> \| void` | Plugin stopped/shutdown |
 | `onTaskCreated` | `(task: Task, ctx: PluginContext) => Promise<void> \| void` | New task created |
 | `onTaskMoved` | `(task: Task, fromColumn: string, toColumn: string, ctx: PluginContext) => Promise<void> \| void` | Task moved between columns |
-| `onTaskCompleted` | `(task: Task, ctx: PluginContext) => Promise<void> \| void` | Task reached "done" |
+| `onTaskCompleted` | `(task: Task, ctx: PluginContext) => Promise<void> \| void` | Task entered a column with the complete role (`done` on the default board) |
 | `onError` | `(error: Error, ctx: PluginContext) => Promise<void> \| void` | Error occurred in plugin execution |
 | `onAgentRunStart` | `(taskId: string, ctx: PluginContext) => Promise<void> \| void` | An agent session begins running for a task |
 | `onAgentRunEnd` | `(taskId: string, ctx: PluginContext) => Promise<void> \| void` | An agent session for a task ends |
@@ -1115,6 +1116,51 @@ interface PluginContext {
 | `emitEvent` | `(event, data) => void` | Emit custom events |
 | `createAiSession` | `CreateAiSessionFactory \| undefined` | Engine-injected AI session factory (undefined when engine isn't loaded) |
 
+### Lane roles
+
+A board can rename its columns, so a plugin must not compare a column id with a fixed name such as `in-progress`. Ask Fusion what the column is for:
+
+```typescript
+import { taskColumnHasLaneRole } from "@fusion/plugin-sdk";
+
+taskColumnHasLaneRole(ctx.taskStore, taskId, columnId, role): Promise<boolean>
+```
+
+The call resolves to `true` when the column carries that role for that task. Pass `ctx.taskStore` from any hook, tool or route context. `role` is a `TaskLaneRole`, and the SDK exports the full list as `TASK_LANE_ROLES`. An unknown role rejects with an error that names it.
+
+| Role | The column is where | Default board |
+|------|---------------------|---------------|
+| `intake` | new cards land | `todo` |
+| `hold` | cards wait before work starts | `todo` |
+| `wip` | work happens | `in-progress` |
+| `review` | review or merging happens | `in-review` |
+| `complete` | finished cards rest | `done` |
+| `archived` | archived cards go | `archived` |
+
+Fusion answers from the workflow the task is on:
+
+- If any column of the workflow carries a [trait](#165-contributing-column-traits), the answer is what the workflow declares and nothing else. A column that keeps the id `in-progress` and is not declared as a working lane does not carry `wip`.
+- If no column carries a trait, or Fusion cannot read the workflow, the answer comes from the default board's ids in the table. `triage` also counts as `intake` in this case.
+- If the Fusion host is older than this lookup, the answer also comes from the default board's ids, with `triage` counted as `intake`.
+
+When you use the answer:
+
+- `review` covers every lane where review happens: merge orchestration, a merge blocker and human review. Use it to observe a card. Do not use it to choose where to move one.
+- Several columns can carry the same role, for example two working lanes. Ask about the column you have and do not look for "the" working column.
+- Fusion does not cache the answer. Ask on each event, and a workflow edit is seen by the next call.
+
+```typescript
+hooks: {
+  onTaskMoved: async (task, fromColumn, toColumn, ctx) => {
+    if (await taskColumnHasLaneRole(ctx.taskStore, task.id, toColumn, "wip")) {
+      ctx.logger.info(`Work started on ${task.id}`);
+    }
+  },
+},
+```
+
+The SDK exports no workflow or trait resolver. A plugin's copy of the SDK cannot see traits that other plugins contribute, so only the host can give the right answer.
+
 ### Durable data access: PostgreSQL / `AsyncDataLayer`
 
 Production Fusion hosts are PostgreSQL-only. **Plugin routes, hooks, and dashboard-backed feature paths must not call `ctx.taskStore.getDatabase()`**: it is the legacy synchronous SQLite accessor and throws in backend mode. Use a project-bound `AsyncDataLayer` and make store methods asynchronous instead.
@@ -1303,6 +1349,19 @@ describe("my plugin", () => {
 });
 ```
 
+A fake `taskStore` without a `taskColumnHasLaneRole` method gets the default-board answer from the [lane-role lookup](#lane-roles), so `taskStore: {}` is enough to test default-board behavior. To test a board with renamed columns, give the fake that method:
+
+```typescript
+const renamedBoardCtx = {
+  ...mockCtx,
+  taskStore: {
+    taskColumnHasLaneRole: vi.fn(
+      async (_taskId: string, columnId: string, role: string) => role === "wip" && columnId === "building",
+    ),
+  },
+};
+```
+
 ### Testing Tools
 
 ```typescript
@@ -1474,8 +1533,8 @@ Automatically labels tasks based on description content using keyword matching.
 
 Polls CI status for branches and provides custom API endpoints.
 
-- Demonstrates: Custom routes, periodic background work, route handlers, UI slot registration
-- Features: `onLoad`/`onUnload` lifecycle, `setInterval` polling, REST API, UI slots for task cards and task detail tabs
+- Demonstrates: Custom routes, periodic background work, route handlers, UI slot registration, lane-role lookup
+- Features: `onLoad`/`onUnload` lifecycle, `setInterval` polling, REST API, UI slots for task cards and task detail tabs, tracking that starts in any working lane and stops in any archive lane
 
 ### [Roadmap Planner Plugin](../../plugins/fusion-plugin-roadmap/)
 
@@ -1845,8 +1904,14 @@ extensions on the plugin object:
 ```typescript
 import {
   WORKFLOW_EXTENSION_SCHEMA_VERSION,
+  definePlugin,
+  taskColumnHasLaneRole,
+  type PluginContext,
   type WorkflowExtensionContribution,
 } from "@fusion/plugin-sdk";
+
+// An extension handler receives no plugin context, so keep the one onLoad received.
+let host: PluginContext | undefined;
 
 const workflowExtensions: WorkflowExtensionContribution[] = [
   {
@@ -1855,12 +1920,16 @@ const workflowExtensions: WorkflowExtensionContribution[] = [
     kind: "move-policy",
     schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION,
     fallback: "failClosed",
-    evaluate: async ({ task, fromColumn, toColumn, actor }) => {
-      if (toColumn === "done" && actor?.kind !== "human") {
+    evaluate: async ({ task, toColumn, actor }) => {
+      // With fallback "failClosed", a throw rejects the move.
+      if (!host) throw new Error("security-move-policy ran before the plugin loaded");
+
+      const entersCompleteLane = await taskColumnHasLaneRole(host.taskStore, task.id, toColumn, "complete");
+      if (entersCompleteLane && actor?.kind !== "human") {
         return {
           allowed: false,
           reason: "human approval required",
-          message: `Cannot move ${task.id} to done without human approval`,
+          message: `Cannot move ${task.id} to '${toColumn}' without human approval`,
         };
       }
       return { allowed: true };
@@ -1871,9 +1940,19 @@ const workflowExtensions: WorkflowExtensionContribution[] = [
 export default definePlugin({
   manifest: { id: "my-plugin", name: "My Plugin", version: "1.0.0" },
   state: "installed",
+  hooks: {
+    onLoad: (ctx) => {
+      host = ctx;
+    },
+    onUnload: () => {
+      host = undefined;
+    },
+  },
   workflowExtensions,
 });
 ```
+
+The policy asks for the `complete` [lane role](#lane-roles) and does not compare `toColumn` with a column id, so it also protects a board whose complete column is not called `done`.
 
 Supported kinds:
 

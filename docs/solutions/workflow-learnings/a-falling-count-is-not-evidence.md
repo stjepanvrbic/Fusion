@@ -174,7 +174,10 @@ Both scopes now have the roots `packages/*/src`, `packages/*/app`, `plugins/*/sr
 
 The wider census reported three unmarked column guards, all in `plugins/examples/fusion-plugin-ci-status/src/index.ts`.
 The `done` guard became an `onTaskCompleted` hook, which the host fires for the complete lane whatever its id is.
-The `in-progress` and `archived` guards carry `DELIBERATE-LITERAL` comments. The plugin SDK has no call that returns a column's role, and no hook reports those two lanes.
+The `in-progress` and `archived` guards were given `DELIBERATE-LITERAL` comments that day, because the plugin SDK had no call that returns a column's role and no hook reports those two lanes.
+
+<!-- FNXC:PluginExamples 2026-10-12-08:27: The example plugin must not compare column ids, so the plugin SDK exports a lane-role lookup and the two marked guards use it. -->
+The SDK now exports `taskColumnHasLaneRole`, which asks the Fusion host whether a column carries a lane role for a task. The example asks for the `wip` and `archived` roles, both markers are gone, and the census baseline no longer holds an entry for that file.
 
 A marked guard has to stay an `===` comparison. The census counts a membership test or a `switch` only when the receiver is named `column`, `columnId` or `col`, so it reports nothing for `["done", "archived"].includes(toColumn)`. Rewriting a guard into that shape removes it from the count without converting it.
 

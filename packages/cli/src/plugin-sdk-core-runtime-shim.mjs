@@ -66,6 +66,15 @@ import { resolveWorkflowIrForTask } from "../../core/src/workflows/workflow-ir-r
 export { columnsWithFlag, resolveReviewColumns, resolveWorkflowIrForTask };
 
 /*
+ * FNXC:WorkflowLifecycleColumns 2026-10-12-08:27:
+ * The plugin SDK re-exports the lane-role lookup, so this shim must carry the binding or the plugin-sdk
+ * and bundled-plugin esbuild builds fail with "No matching export". `taskColumnHasLaneRole` asks the host
+ * through the store handle a plugin already holds and never resolves traits in the bundle.
+ * Re-export from the core source module, never a copy, core dist, or the core barrel.
+ */
+export { taskColumnHasLaneRole, TASK_LANE_ROLES } from "../../core/src/task-lane-role.js";
+
+/*
  * FNXC:PluginManifestValidation 2026-10-08-04:45:
  * The plugin SDK re-exports core's validatePluginManifest so authors get the loader's exact rules (KB-034).
  * Without this binding the plugin-sdk and bundled-plugin esbuild builds fail with "No matching export".

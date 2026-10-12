@@ -12,6 +12,8 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { builtinModules } from "node:module";
 import ts from "typescript";
+import { build as esbuildBuild, stop as stopEsbuild } from "esbuild";
+import { getTraitRegistry, resolveTaskColumnHasLaneRole } from "@fusion/core";
 import { definePlugin, validatePluginManifest } from "@fusion/plugin-sdk";
 import {
   applyPrepackTransform,
@@ -84,6 +86,88 @@ describe("plugin-sdk export surface", () => {
     const shimRaw = readFileSync(join(workspaceRoot, "packages", "cli", "src", "plugin-sdk-core-runtime-shim.mjs"), "utf-8");
     expect(sdkRaw).not.toMatch(/function\s+validatePluginManifest\b/);
     expect(shimRaw).not.toMatch(/function\s+validatePluginManifest\b/);
+  });
+
+  /*
+  FNXC:WorkflowLifecycleColumns 2026-10-12-08:27:
+  A plugin asks the Fusion host which lane role a column carries. The published SDK is a separate bundle with its own trait registry, so the binding must come from the core source module and the bundle must ask the host instead of resolving traits.
+  */
+  it("re-exports the lane-role lookup from the core source module and keeps no copy", () => {
+    const sdkRaw = readFileSync(join(workspaceRoot, "packages", "plugin-sdk", "src", "index.ts"), "utf-8");
+    const shimRaw = readFileSync(join(workspaceRoot, "packages", "cli", "src", "plugin-sdk-core-runtime-shim.mjs"), "utf-8");
+    expect(shimRaw).toMatch(/export\s*\{[^}]*\btaskColumnHasLaneRole\b[^}]*\}\s*from\s*"\.\.\/\.\.\/core\/src\/task-lane-role\.js"/);
+    expect(shimRaw).toMatch(/export\s*\{[^}]*\bTASK_LANE_ROLES\b[^}]*\}\s*from\s*"\.\.\/\.\.\/core\/src\/task-lane-role\.js"/);
+    expect(sdkRaw).not.toMatch(/function\s+taskColumnHasLaneRole\b/);
+    expect(shimRaw).not.toMatch(/function\s+taskColumnHasLaneRole\b/);
+  });
+
+  it("bundles the SDK through the core shim with no @fusion specifier and a lane-role lookup that asks the host", async () => {
+    /* The bundle keeps `drizzle-orm` external, so it must sit below the CLI package for that import to resolve. */
+    const outDir = mkdtempSync(join(workspaceRoot, "packages", "cli", "node_modules", ".plugin-sdk-lane-role-"));
+    const traitId = "plugin-sdk-export-test-build-slot";
+    try {
+      const outfile = join(outDir, "index.js");
+      await esbuildBuild({
+        entryPoints: [join(workspaceRoot, "packages", "plugin-sdk", "src", "index.ts")],
+        outfile,
+        bundle: true,
+        format: "esm",
+        platform: "node",
+        target: "node22",
+        packages: "external",
+        alias: { "@fusion/core": join(workspaceRoot, "packages", "cli", "src", "plugin-sdk-core-runtime-shim.mjs") },
+        logLevel: "silent",
+      });
+
+      const fusionSpecifiers = executableModuleSpecifiers(readFileSync(outfile, "utf-8")).filter((specifier) =>
+        specifier.startsWith("@fusion/"),
+      );
+      expect(fusionSpecifiers).toEqual([]);
+
+      type LaneRoleHost = { taskColumnHasLaneRole?: (taskId: string, columnId: string, role: string) => Promise<boolean> };
+      const built = (await import(pathToFileURL(outfile).href)) as {
+        taskColumnHasLaneRole: (host: LaneRoleHost, taskId: string, columnId: string, role: string) => Promise<boolean>;
+      };
+      expect(built).not.toHaveProperty("resolveTaskColumnHasLaneRole");
+
+      expect(await built.taskColumnHasLaneRole({ taskColumnHasLaneRole: async () => true }, "FN-1", "building", "wip")).toBe(true);
+      expect(await built.taskColumnHasLaneRole({ taskColumnHasLaneRole: async () => false }, "FN-1", "in-progress", "wip")).toBe(false);
+      expect(await built.taskColumnHasLaneRole({}, "FN-1", "in-progress", "wip")).toBe(true);
+      expect(await built.taskColumnHasLaneRole({}, "FN-1", "building", "wip")).toBe(false);
+
+      /* The trait is registered in this process only, which stands in for the host. The bundle's own registry never sees it. */
+      getTraitRegistry().register({ id: traitId, name: "Build slot", flags: { countsTowardWip: true } });
+      const selection = { workflowId: "wf", stepIds: [] as string[] };
+      const hostStore = {
+        getTaskWorkflowSelection: () => selection,
+        getTaskWorkflowSelectionAsync: async () => selection,
+        getWorkflowDefinition: async () => ({
+          ir: {
+            version: "v2" as const,
+            name: "wf",
+            nodes: [
+              { id: "start", kind: "start" as const, column: "assembly" },
+              { id: "end", kind: "end" as const, column: "shipped" },
+            ],
+            edges: [{ from: "start", to: "end", condition: "success" as const }],
+            columns: [
+              { id: "assembly", name: "Assembly", traits: [{ trait: traitId }] },
+              { id: "shipped", name: "Shipped", traits: [{ trait: "complete" }] },
+            ],
+          },
+        }),
+      };
+      const host: LaneRoleHost = {
+        taskColumnHasLaneRole: (taskId, columnId, role) =>
+          resolveTaskColumnHasLaneRole(hostStore, taskId, columnId, role as "wip"),
+      };
+      expect(await built.taskColumnHasLaneRole(host, "FN-1", "assembly", "wip")).toBe(true);
+      expect(await built.taskColumnHasLaneRole(host, "FN-1", "shipped", "wip")).toBe(false);
+    } finally {
+      getTraitRegistry().unregisterTrait(traitId);
+      stopEsbuild();
+      rmSync(outDir, { recursive: true, force: true });
+    }
   });
 
   it("validates manifests with the loader rules in the built plugin-sdk artifact when present", async () => {
