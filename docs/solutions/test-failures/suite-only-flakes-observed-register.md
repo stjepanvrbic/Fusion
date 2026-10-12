@@ -356,6 +356,8 @@ FN-9506 reproduced the pending-to-resolved transition with a deferred discovery 
 
 The failure was `Hook timed out in 15000ms` in the file's top-level `afterEach`, which tears down every PostgreSQL harness the case opened (`harnesses.pop()?.teardown()`). This is the same 15 s PostgreSQL hook mode recorded for entries 2 and 13, here on teardown rather than setup. The case's assertions passed on every rerun. No timeout, retry, or assertion changed. A second sighting requires a same-change file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`.
 
+**Cross-reference (KB-141):** the 2026-10-11 Windows dashboard-leg timeout of `ingestSignal — GitHub CI recovery > feeds a signed GitHub green delivery through the scoped resolver into the merge gate` (run 38182428146) is a different case of this file. Its failure was a test-body timeout caused by a real `gh --version` launch, and the teardown hook was not involved. It is recorded under [the Windows Full Suite lane entry](#record-2026-10-12-register-signal-routestestts-windows-15-s-timeout-kb-141-resolved-at-the-cause) and is not a sighting of this record.
+
 ### 27. ensureCwdProjectRegistered embedded PostgreSQL startup cascade
 
 - **Status:** Closed 2026-10-08 — structurally resolved on first sighting by KB-052 (product fix); no quarantine.
@@ -1509,3 +1511,49 @@ One case of worktree-acquisition.test.ts timed out once on a local Windows host 
   Timeline of the traced run (900 git processes, all exited): the case's repository setup ran `git config user.name` at 23:28:04 UTC, and the next process, `git add README.md`, started 16.0 s later and ran 7.4 s; `git commit -m init` started 8.5 s after that and ran 4.1 s. These are the test's own setup commands, launched through `cmd.exe`. Across the whole run the 250 branch-resolution reads the product made had a median lifetime of 44 ms and a maximum of 798 ms against their 5 s bound, and no process was left without an exit event.
 - **Mechanism:** the case spent its 30 s budget in a host stall during fixture setup. Nothing in the timeline points at the code under test. Not measured: what stalled the host.
 - **Escalation rule:** a second sighting of this case is an on-sight file-level quarantine in `scripts/lib/test-quarantine.json` with its matching vitest exclude. No widened timeout and no retry.
+
+### Record 2026-10-12: `register-signal-routes.test.ts` Windows 15 s timeout (KB-141, resolved at the cause)
+
+<!--
+FNXC:TestFlakeRegister 2026-10-12-00:22:
+KB-141 traced the Windows dashboard-leg timeout of the signal-ingest merge-gate case to a real `gh --version` launch inside the timed test body and removed the launch at the file's stub boundary. It is a first sighting of that case and not a sighting of entry 25, which is a teardown-hook timeout of another case in the same file. Timeouts, assertions, the Windows ledger and the quarantine list are unchanged. A further timeout of this case is an immediate same-commit file-level quarantine.
+-->
+
+- **File:** `packages/dashboard/src/__tests__/register-signal-routes.test.ts` (not in `scripts/lib/windows-known-failing-tests.json` or `scripts/lib/test-quarantine.json`).
+- **Exact test:** `ingestSignal — GitHub CI recovery > feeds a signed GitHub green delivery through the scoped resolver into the merge gate`.
+- **Sighting:** `Test timed out in 15000ms` at line 734, case duration 30,116 ms, [run 38182428146](https://github.com/stjepanvrbic/Fusion/actions/runs/38182428146) (job 114600931652, Windows tests (dashboard), Dashboard API lane) at `9dd3b4177`. The lane reported 1 failed file of 374 and 1 failed test of 5,508, and the comparator classed the file as an unexpected timeout-only failure. The commit changed `docs/testing.md`, two CLI package files and the lockfile, and no dashboard file.
+- **Classification:** a first sighting of this case, because escalation counts sightings of the same test. [Entry 25](#25-signal-ingest-incident-capture-postgresql-teardown-hook) records a different case of this file, `ingestSignal — incident capture > marks resolution events as resolved for every provider`. Its failure was `Hook timed out` in the top-level `afterEach` during PostgreSQL teardown on a local Windows machine. This one is a test-body timeout caused by a process launch, so it is not a second sighting of entry 25.
+- **Reproduction data:**
+
+  Runner, dashboard leg (`windows-lane-reports-dashboard` artifacts, 41 cases of this file per leg, durations include `afterEach`). The three sibling cases are `keeps a green check for a different head SHA out of the merge gate` and its `repository` and `project` variants, which make the same `getPrMergeStatus` call after the merge-gate case.
+
+  | run | SHA | job | merge-gate case | head SHA sibling | repository sibling | project sibling |
+  |---|---|---|---:|---:|---:|---:|
+  | 37831541785 | `0366ead16` | 113497852399 | 5,275 ms | 1,392 ms | 1,272 ms | 1,402 ms |
+  | 37832714652 | `28e7c1244` | 113501865061 | 11,310 ms | 1,249 ms | 1,213 ms | 1,140 ms |
+  | 38171508610 | `18fb7f0f4` | 114564906134 | 4,637 ms | 830 ms | 970 ms | 856 ms |
+  | 38176804785 | `9ad753f77` | 114590368332 | 11,546 ms | 1,196 ms | 1,050 ms | 1,024 ms |
+  | 38182428146 | `9dd3b4177` | 114600931652 | 30,116 ms (timed out) | 866 ms | 960 ms | 860 ms |
+
+  The merge-gate case was the only failing case of this file in the five legs. [Run 38175654275](https://github.com/stjepanvrbic/Fusion/actions/runs/38175654275) (job 114577369836) at `31f1e05b0` has no data for this file: the hosted runner lost communication during the Dashboard API lane, the job log is no longer retrievable and no dashboard report was uploaded. No Full Suite run on `main` was newer than run 38182428146 when this was recorded.
+
+  Local (KB-141): Windows 11 Pro build 26200, Node 24.12.0, `gh` 2.83.2, PostgreSQL 16 container, `VITEST_MAX_WORKERS=1`, project `dashboard-api`, tree `9dd3b4177` with temporary timing code that was removed afterwards. Phases of the merge-gate case in three runs of the file:
+
+  | run | `makeDbStore()` | ingest and check-state reads | `getPrMergeStatus` | of which `gh --version` | teardown |
+  |---|---:|---:|---:|---:|---:|
+  | 1 | 156 ms | 6 ms | 61 ms | 57 ms | 50 ms |
+  | 2 | 141 ms | 7 ms | 213 ms | 209 ms | 55 ms |
+  | 3 | 134 ms | 7 ms | 62 ms | 58 ms | 54 ms |
+
+  In the same runs the three sibling cases spent 145 to 164 ms in `makeDbStore()`, 1 to 2 ms in `getPrMergeStatus` and 41 to 59 ms in teardown. The file started exactly one process per run, `execFileSync("gh", ["--version"])`, in the merge-gate case. In a later whole-file run on the same host with the `isGhAvailable` stub removed and other work running, the merge-gate case took 2,173 ms against 263 to 328 ms for its siblings.
+- **Mechanism:**
+  - `GitHubClient.getPrMergeStatus` calls `hasGhAuth()`, which calls `isGhAvailable()` and then `isGhAuthenticated()`, both from `@fusion/core`. The file stubbed `isGhAuthenticated` and `runGhJsonAsync` but not `isGhAvailable`.
+  - The real `isGhAvailable()` runs `execFileSync("gh", ["--version"])`. The call is synchronous, so the case's 15 s timer cannot fire until it returns.
+  - The result is cached in the module for 60 s. The merge-gate case is the first case of the file to call `getPrMergeStatus`, so it runs the launch and the three sibling cases that follow read the cached result.
+  - The shared test subprocess guard gives a synchronous launch a 30 s default timeout, and the lane does not override it. The failing case lasted 30,116 ms, which is that limit plus about 0.1 s. This fits a launch that never returned and was killed by the guard, after which the case body ended past its 15 s budget.
+  - On a host without `gh` the unfixed case fails outright, because `hasGhAuth()` is false and the client has no token.
+- **Not measured:** which statement was running when the budget ran out in run 38182428146. The lane records no per-statement timing, and the job's stderr lines for the case show only that the store had finished initializing. The 30 s match above is an inference from the duration. Also not measured: why a `gh --version` launch takes 4 to 10 s on the runner in passing legs, against 57 to 209 ms on the local host. That the launch accounts for the runner's excess over the sibling cases is inferred from it being the only measured difference between them.
+- **Resolution (KB-141):** the file stubs `isGhAvailable` to return `true`, and the other process-launching `gh` exports of `@fusion/core` (`runGh`, `runGhAsync`, `runGhJson`, `ensureGhAuth`, `getCurrentRepo`, `getPushRepo`) throw when called. Every case records process launches at `node:child_process`, and the top-level `afterEach` fails a case that started `gh`. A new case that needs no PostgreSQL, `GitHub merge-gate reads — host isolation > answers a gh-mode merge-status read without launching a gh process`, clears the availability cache, runs the same read through the file's mocks and asserts a merge-ready result with no launch. With the `isGhAvailable` stub removed, that case fails alone without PostgreSQL, and it and the merge-gate case fail in the whole file, each with `expected [ 'gh' ] to deeply equal []`. After the change the whole file passes 42 of 42 against PostgreSQL with none skipped, and in two `dashboard-api` runs with one worker the merge-gate case took 222 and 236 ms against 213 to 234 ms for its siblings. `makeDbStore()` stays in the case bodies because it is not the dominant cost. Assertions, `testTimeout`, `hookTimeout`, the Windows ledger and the quarantine list are unchanged.
+- **Other files with a partial stub:** `project-pause-resume-routes.test.ts` and `setup-routes.test.ts` in the same directory stub `isGhAuthenticated` without `isGhAvailable`. A temporary probe at `node:child_process` recorded no process launch in either file (4 and 2 cases), after recording the `gh --version` launch in the unfixed signal-ingest file as a positive control. Both files are unchanged.
+- **Outstanding post-landing check:** in the next `windows-lane-reports-dashboard` artifact after this lands, the merge-gate case's duration should be within the range of its three siblings.
+- **Escalation rule:** a further timeout of this case after the fix lands is a second sighting. It takes a same-commit file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. It is never a Windows ledger entry and never a widened timeout.

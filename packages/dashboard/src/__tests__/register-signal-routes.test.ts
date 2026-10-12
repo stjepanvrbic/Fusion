@@ -1,20 +1,44 @@
 // @vitest-environment node
 
 import { createHmac } from "node:crypto";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { basename } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockIsGhAuthenticated, mockRunGhJsonAsync } = vi.hoisted(() => ({
-  mockIsGhAuthenticated: vi.fn(() => true),
-  mockRunGhJsonAsync: vi.fn(),
-}));
+const { mockIsGhAvailable, mockIsGhAuthenticated, mockRunGhJsonAsync, unstubbedGhCliCalls } = vi.hoisted(() => {
+  const failOnCall = (name: string) => () => {
+    throw new Error(`register-signal-routes.test.ts reached ${name}() from @fusion/core, which starts a real process; stub the read it serves instead.`);
+  };
+  return {
+    mockIsGhAvailable: vi.fn(() => true),
+    mockIsGhAuthenticated: vi.fn(() => true),
+    mockRunGhJsonAsync: vi.fn(),
+    unstubbedGhCliCalls: {
+      runGh: failOnCall("runGh"),
+      runGhAsync: failOnCall("runGhAsync"),
+      runGhJson: failOnCall("runGhJson"),
+      ensureGhAuth: failOnCall("ensureGhAuth"),
+      getCurrentRepo: failOnCall("getCurrentRepo"),
+      getPushRepo: failOnCall("getPushRepo"),
+    },
+  };
+});
 
+/*
+FNXC:SignalRoutesGhIsolation 2026-10-12-00:12:
+This file must not launch the real `gh` CLI. `GitHubClient` consults `isGhAvailable()` before every gh-mode read, and the real probe is a synchronous `gh --version` process launch inside the timed test body: its cost belongs to the host, not to the signal-ingest behavior under test, and on a host without `gh` the merge-gate cases cannot pass at all.
+Every process-launching export of the core gh boundary is therefore replaced. The two probes answer `true`, `runGhJsonAsync` serves the scripted reads, and the remaining exports fail the case on call instead of starting a process.
+*/
 vi.mock("@fusion/core", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@fusion/core")>()),
+  ...unstubbedGhCliCalls,
+  isGhAvailable: mockIsGhAvailable,
   isGhAuthenticated: mockIsGhAuthenticated,
   runGhJsonAsync: mockRunGhJsonAsync,
 }));
 
-import { aggregateSignalsAnalytics, createIngestedCheckResolver, drizzleSql as sql, recordGitHubCheckStateAsync, type AsyncDataLayer, type Task, type TaskStore } from "@fusion/core";
+import { aggregateSignalsAnalytics, createIngestedCheckResolver, drizzleSql as sql, recordGitHubCheckStateAsync, resetGhAvailabilityCache, type AsyncDataLayer, type IngestedCheckState, type Task, type TaskStore } from "@fusion/core";
 import { createTaskStoreForTest, pgDescribe, type PgTestHarness } from "../../../core/src/__test-utils__/pg-test-harness.js";
 import { DeliveryNonceCache, type SignalSource } from "../signal-source.js";
 import {
@@ -110,8 +134,56 @@ const SECRETS: Record<string, string> = {
 const savedEnv: Record<string, string | undefined> = {};
 const harnesses: PgTestHarness[] = [];
 
+/*
+FNXC:SignalRoutesGhIsolation 2026-10-12-00:15:
+The no-real-gh requirement is checked where a launch happens, at `node:child_process`, so it also catches a `gh` launch that reaches the CLI through a path the `@fusion/core` stubs do not cover.
+Every case records its process launches, and the top-level `afterEach` fails any case that started `gh`.
+*/
+const PROCESS_LAUNCHERS = ["exec", "execFile", "execFileSync", "execSync", "spawn", "spawnSync"] as const;
+type ProcessLauncherName = (typeof PROCESS_LAUNCHERS)[number];
+type ProcessLauncher = ((...args: unknown[]) => unknown) & { [promisify.custom]?: (...args: unknown[]) => unknown };
+const nodeChildProcess = createRequire(import.meta.url)("node:child_process") as Record<ProcessLauncherName, ProcessLauncher>;
+const unrecordedLaunchers = new Map<ProcessLauncherName, ProcessLauncher>();
+const launchedPrograms: string[] = [];
+
+function recordProcessLaunches() {
+  launchedPrograms.length = 0;
+  const record = (command: unknown) => {
+    launchedPrograms.push(basename(String(command).trim().split(" ")[0]).toLowerCase());
+  };
+  for (const name of PROCESS_LAUNCHERS) {
+    const launch = nodeChildProcess[name];
+    const recorder: ProcessLauncher = (...args) => {
+      record(args[0]);
+      return launch(...args);
+    };
+    const promisified = launch[promisify.custom];
+    if (promisified) {
+      recorder[promisify.custom] = (...args) => {
+        record(args[0]);
+        return promisified(...args);
+      };
+    }
+    unrecordedLaunchers.set(name, launch);
+    nodeChildProcess[name] = recorder;
+  }
+  syncBuiltinESMExports();
+}
+
+function stopRecordingProcessLaunches() {
+  for (const [name, launch] of unrecordedLaunchers) nodeChildProcess[name] = launch;
+  unrecordedLaunchers.clear();
+  syncBuiltinESMExports();
+}
+
+function realGhLaunches() {
+  return launchedPrograms.filter((program) => program === "gh" || program === "gh.exe");
+}
+
 beforeEach(() => {
+  recordProcessLaunches();
   mockRunGhJsonAsync.mockReset();
+  mockIsGhAvailable.mockClear();
   for (const [k, v] of Object.entries(SECRETS)) {
     savedEnv[k] = process.env[k];
     process.env[k] = v;
@@ -119,11 +191,13 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  stopRecordingProcessLaunches();
   for (const k of Object.keys(SECRETS)) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
   }
   while (harnesses.length > 0) await harnesses.pop()?.teardown();
+  expect(realGhLaunches()).toEqual([]);
 });
 
 function ctxFor(source: SignalSource, payload: object, headers: Record<string, string>) {
@@ -762,6 +836,7 @@ pgDescribe("ingestSignal — GitHub CI recovery", () => {
     ]));
     expect(result.mergeReady).toBe(true);
     expect(result.blockingReasons).not.toContain("required check not reported: checks");
+    expect(realGhLaunches()).toEqual([]);
   });
 
   /*
@@ -796,6 +871,7 @@ pgDescribe("ingestSignal — GitHub CI recovery", () => {
     expect(scopedResolver).toHaveBeenCalledWith({ owner: "org", repo: "repo", headSha: "abc1234" });
     expect(result.mergeReady).toBe(false);
     expect(result.blockingReasons).toContain("required check not reported: checks");
+    expect(realGhLaunches()).toEqual([]);
   }
 
   it("keeps a green check for a different head SHA out of the merge gate", async () => {
@@ -1377,5 +1453,29 @@ describe("ingestSignal — failed ingestion leaves the delivery retryable", () =
     const replay = await ingestSignal({ source: githubSource, store, ...githubContext(green, "check_suite", "github-green-retry"), nonceCache });
     expect(replay.status).toBe(401);
     expect(store._tasks).toHaveLength(0);
+  });
+});
+
+/*
+FNXC:SignalRoutesGhIsolation 2026-10-12-00:15:
+The merge-gate read must be answerable on a host with no `gh` installed and must not spend test time starting one.
+This case needs no PostgreSQL, so the requirement stays checked where the PostgreSQL-backed cases are not collected. It clears the core availability cache first: a cached answer from an earlier case would otherwise hide a missing probe stub.
+*/
+describe("GitHub merge-gate reads — host isolation", () => {
+  it("answers a gh-mode merge-status read without launching a gh process", async () => {
+    resetGhAvailabilityCache();
+    mockGitHubMergeGateReads();
+    const resolveIngestedChecks = vi.fn(async (): Promise<IngestedCheckState[]> => [
+      { repo: "org/repo", headSha: "abc1234", checkName: "checks", state: "success", reportedAt: "2026-08-09T12:00:00.000Z" },
+    ]);
+
+    const result = await new GitHubClient({ forceMode: "gh-cli" }).getPrMergeStatus("org", "repo", 42, {
+      requiredCheckNames: ["checks"],
+      resolveIngestedChecks,
+    });
+
+    expect(resolveIngestedChecks).toHaveBeenCalledWith({ owner: "org", repo: "repo", headSha: "abc1234" });
+    expect(result.mergeReady).toBe(true);
+    expect(realGhLaunches()).toEqual([]);
   });
 });
