@@ -341,6 +341,53 @@ describe("ensureGitRepositoryForProjectPath", () => {
     await expect(git(projectPath, ["rev-list", "--count", "HEAD"])).resolves.toBe("1");
   });
 
+  /*
+  FNXC:ProjectSetup 2026-10-12-03:15:
+  The `fn init` command tests no longer launch git, so the managed `.gitignore` outcomes for an existing repository are owned here.
+  These cases inject a runner that never starts a process and reports an existing repository on branch `main`, so `reconcileManagedGitignore` runs exactly as in production.
+  */
+  function existingRepositoryRunner(commands: string[][]): GitRepositoryCommandRunner {
+    return async (_command, args) => {
+      commands.push(args);
+      return { stdout: args.includes("--is-inside-work-tree") ? "true" : "main", stderr: "" };
+    };
+  }
+
+  it("leaves a .gitignore that already holds every managed rule byte-identical", async () => {
+    const projectPath = tempDir("fusion-git-all-rules-present-");
+    const gitignorePath = join(projectPath, ".gitignore");
+    const managedRules = [".fusion/", ".pi/", ".worktrees/", "fusion.db", "fusion.db-wal", "fusion.db-shm"];
+    const original = `node_modules\n${managedRules.join("\n")}\n`;
+    writeFileSync(gitignorePath, original);
+    const commands: string[][] = [];
+
+    const readiness = await ensureProjectGitReadiness(projectPath, { runner: existingRepositoryRunner(commands) });
+
+    expect(readiness.outcome).toBe("existing");
+    const content = readFileSync(gitignorePath, "utf8");
+    expect(content).toBe(original);
+    const lines = content.split("\n");
+    for (const rule of managedRules) {
+      expect(lines.filter((line) => line === rule)).toHaveLength(1);
+    }
+    expect(commands.some((args) => args.includes("init"))).toBe(false);
+  });
+
+  it("adds only the missing managed rules when a bare .fusion rule is already present", async () => {
+    const projectPath = tempDir("fusion-git-bare-fusion-rule-");
+    const gitignorePath = join(projectPath, ".gitignore");
+    writeFileSync(gitignorePath, "node_modules\n.fusion\n");
+    const commands: string[][] = [];
+
+    const readiness = await ensureProjectGitReadiness(projectPath, { runner: existingRepositoryRunner(commands) });
+
+    expect(readiness.outcome).toBe("existing");
+    expect(readFileSync(gitignorePath, "utf8")).toBe(
+      "node_modules\n.fusion\n.pi/\n.worktrees/\nfusion.db\nfusion.db-wal\nfusion.db-shm\n",
+    );
+    expect(commands.some((args) => args.includes("init"))).toBe(false);
+  });
+
   it.skipIf(process.platform === "win32")("supports special-character paths and refuses an unsafe .gitignore symlink", async () => {
     const projectPath = tempDir("fusion git [special]-");
     await ensureGitRepositoryForProjectPath(projectPath);

@@ -1616,3 +1616,65 @@ A further connection, test or hook timeout of this file is an owner decision rai
 - **Not measured:** backend launch time, event-loop delay and the server log on the runner, because the lane uploads none of them; PostgreSQL 17.11, which the runner uses, against the local 15.18; the effect of the runner's 4 CPUs and any on-access scanning of process starts.
 - **Owner decision pending:** the decision request is the `decision` document of KB-144, carried as that task's completion recommendation `Decide how to handle the Windows core-lane PostgreSQL connection timeout`. Its options are: keep this as a recorded first sighting; make the Windows core legs attributable by uploading a server connection log and the boundary-observer output with the lane reports (recommended, together with the first); raise the harness connection budget to the production default of 10 s, which is a widened timeout that needs explicit approval; or reduce backend launches inside case bodies, which lowers exposure and removes no cause. No option is implemented, and the symptom is not claimed gone.
 - **Escalation rule:** a further connection timeout, test timeout or hook timeout of this file is an owner decision raised as its own task. It is never a Windows ledger entry, a quarantine entry, a widened timeout or a retry.
+
+### Record 2026-10-12: `init.test.ts` Windows 5 s timeouts and `EPERM` cleanup (KB-143, resolved at the cause)
+
+<!--
+FNXC:TestFlakeRegister 2026-10-12-03:23:
+KB-143 found that the `fn init` command tests ran a full real Git readiness pass (17 git processes) inside every 5 s CLI test body, and that the `EPERM` from the following cleanup was a git process still alive in the abandoned body's directory.
+The two sightings make this a second sighting, so the rule was a same-commit quarantine unless the cause was removed in the same change. The cause was removed: the file launches no process and a guard enforces that, so there is no quarantine entry and no Windows ledger row.
+A further timeout of a case of this file is an immediate same-commit file-level quarantine, never a ledger entry, a widened timeout or a retry.
+-->
+
+- **File:** `packages/cli/src/commands/__tests__/init.test.ts` (not in `scripts/lib/windows-known-failing-tests.json`, `scripts/lib/test-quarantine.json` or `quarantinedCliTests`).
+- **Exact tests:** `init command > should create .fusion/ directory when initializing` and `init command > should create project.json without creating fusion.db when initializing`.
+- **Sightings:**
+  - [Run 37807806378](https://github.com/stjepanvrbic/Fusion/actions/runs/37807806378) (run 128, 2026-10-08) at `cd6c6f26f`: case 1 passed in 4,334 ms; case 2 failed with `Test timed out in 5000ms` (5,120 ms), and the `afterEach` threw `EPERM, Permission denied` from `rmSync` on `...\fn-init-test-8M37ul`. No task, record or ledger row followed.
+  - [Run 38189371704](https://github.com/stjepanvrbic/Fusion/actions/runs/38189371704) (run 147, job 114618610078, Windows tests (cli)) at `849590e98`: case 1 timed out (5,118 ms) with the same `EPERM` in `afterEach` on `...\fn-init-test-327UfZ`; case 2 timed out (5,843 ms). The lane reported 4 failed and 2,186 passed tests, and the comparator named this file as the one unexpected failing file. The commit changed only engine files, a changeset and this register.
+- **Classification:** a second sighting of the same cases, resolved at the cause in the same change. The second-sighting rule requires a same-commit quarantine, which applies only if the cause cannot be removed.
+- **Reproduction data:**
+
+  Runner, `windows-lane-reports-cli` artifacts (24 cases per leg; `T` = `Test timed out in 5000ms`). Runs 123 and 124 have no CLI artifact; runs 148 to 150 were cancelled before uploading one.
+
+  | run | id | SHA | case 1 | case 2 | sum of 24 | file |
+  |---|---|---|---:|---:|---:|---|
+  | 151 | 38192958061 | `768e327fd` | 618 | 550 | 11,496 | passed |
+  | 147 | 38189371704 | `849590e98` | 5,118 T | 5,843 T | 22,102 | failed |
+  | 146 | 38182428146 | `9dd3b4177` | 540 | 504 | 11,954 | passed |
+  | 145 | 38176804785 | `9ad753f77` | 1,683 | 1,090 | 14,221 | passed |
+  | 144 | 38175654275 | `31f1e05b0` | 2,546 | 3,026 | 20,973 | passed |
+  | 143 | 38171508610 | `18fb7f0f4` | 3,283 | 3,569 | 17,345 | passed |
+  | 142 | 37832714652 | `28e7c1244` | 1,431 | 1,319 | 20,174 | passed |
+  | 141 | 37831541785 | `0366ead16` | 582 | 526 | 16,299 | passed |
+  | 140 | 37829637990 | `9e5b807a6` | 539 | 497 | 10,674 | passed |
+  | 139 | 37828982122 | `ad3a46e94` | 1,439 | 1,290 | 12,664 | passed |
+  | 138 | 37827485906 | `1bc906a2f` | 529 | 468 | 10,489 | passed |
+  | 137 | 37826361182 | `5e54f21d9` | 572 | 545 | 11,266 | passed |
+  | 136 | 37824921482 | `0049e0ce0` | 453 | 406 | 9,054 | passed |
+  | 135 | 37823843450 | `63014e560` | 627 | 532 | 11,999 | passed |
+  | 134 | 37822793618 | `b797a1a8b` | 3,385 | 1,499 | 13,956 | passed |
+  | 133 | 37820528898 | `d14f4ceb1` | 407 | 344 | 8,514 | passed |
+  | 132 | 37818907020 | `cb9e94545` | 712 | 556 | 22,002 | passed |
+  | 131 | 37816474788 | `9bec4ffa4` | 592 | 542 | 11,552 | passed |
+  | 130 | 37812444425 | `9f120698a` | 503 | 460 | 9,618 | passed |
+  | 129 | 37811439971 | `8ae7ec0a2` | 735 | 670 | 18,531 | passed |
+  | 128 | 37807806378 | `cd6c6f26f` | 4,334 | 5,120 T | 20,985 | failed |
+  | 127 | 37806935522 | `4bac69fee` | 635 | 559 | 11,735 | passed |
+  | 126 | 37806441741 | `f38e89ccc` | 596 | 474 | 9,976 | passed |
+  | 125 | 37805383417 | `a2b62fbf7` | 2,111 | 578 | 14,894 | passed |
+
+  Case 1 or case 2 took 2 s or more in 6 of the 23 legs before run 151. Later cases were slow in other legs (up to 3,690 ms), so the first two cases were the most exposed, not the only ones. The two cases that already stubbed the registration result ran every other part of `runInit` (bundled skill copy, identity write, logging) in 61 to 121 ms.
+
+  Local (KB-143): Windows 11 Pro build 26200, Node 24.12.0, git 2.52.0.windows.1, host busy with other sessions. Three whole-file runs on the unfixed tree: one passed with a 5,001 ms case, one timed out cases 3, 6, 11, 14 and 18 (5,018 to 6,095 ms), one timed out case 1 (5,542 ms). None of the six local timeouts had an `EPERM`. A traced run of case 1 alone on `95e4d618c` took 2,644 ms and wrote 18 product git traces besides the shared setup's `git --exec-path`.
+- **Mechanism:**
+  - The file mocks `CentralCore`, but its default `ensureProjectForPath` mock called the real `ensureProjectGitReadiness`. A fresh `runInit` therefore started 17 git processes (18 for the first case in a worker, which adds `git --version`): 13 sequential (`rev-parse` twice, `init`, `ls-files`, `rev-parse --verify`, `symbolic-ref`, `hash-object`, `read-tree --empty`, `update-index`, `write-tree`, `commit-tree`, `update-ref`, `read-tree HEAD`) and 4 parallel ref probes. A whole-file run started about 360 (361, 333, 361 measured).
+  - git's own lifetime was about 50 ms per process. Under load the interval between consecutive launches was 64 to 77 ms at the median and 315 to 419 ms at the 90th percentile, so the 13 sequential launches alone can exceed 5 s. Module import, `git --version` (once per file) and the skill install were not the cost.
+  - Vitest abandons a timed-out body, but `runInit` keeps running. In a traced timed-out run, four ref probes were alive when `afterEach` removed the directory, and a `git branch main HEAD` started afterwards. On Windows, `rmSync(dir, { recursive: true, force: true })` throws `EPERM` and leaves the directory while a git process has it open (confirmed with a live `git -C <dir> cat-file --batch`), and succeeds after the process exits. Whether the `EPERM` appears depends on a git process being alive at that instant: 2 of 3 runner timeouts, 0 of 6 local ones.
+- **Resolution (KB-143):**
+  - `init.test.ts` launches no process. A hoisted `vi.mock("node:child_process")` replaces `exec`, `execFile`, `execFileSync`, `execSync`, `spawn`, `spawnSync` and `fork` with functions that record the program and throw, and the `afterEach` fails any case that tried to launch. The guard must be a hoisted mock: `init.ts` and core's git modules capture `promisify(exec)` / `promisify(execFile)` at module load, so launchers patched in `beforeEach` are not seen. With the guard and the old mocks, 20 of 24 cases failed on it.
+  - The default `ensureProjectForPath` mock returns a plain registration result. The file keeps what `runInit` owns: directory and identity marker creation, the invalid-database refusal, delegation (`{ path, identity: undefined, name }`, unchanged by `--git`), reporting of the registration result, error propagation and skill installation. A self-check case calls the real `ensureProjectGitReadiness` and asserts it is refused with `git` recorded and no `.git` created.
+  - Seven cases about the Git and `.gitignore` outcomes moved to their owner, `packages/core/src/__tests__/git-repository.test.ts` (15 s budget, real git): an empty directory gets a verifiable baseline and exact ignore content, populated and existing repositories keep their content and commit count. Two input states core did not cover were added there without launching git, through an injected runner: all six managed rules already present (file byte-identical) and a bare `.fusion` rule (only the five missing rules appended).
+  - After the change: 18 cases, three local whole-file runs passed with case sums of 1,181, 1,183 and 1,049 ms and a slowest case of 93, 111 and 83 ms; a traced whole-file run left one trace file, the setup's `git --exec-path`, and none naming an `fn-init-test-` directory. Timeouts, retries and the Windows ledger are unchanged.
+- **Sibling check:** `packages/dashboard/src/routes/__tests__/register-project-git-readiness.test.ts` uses the same construction (mocked registration calling real readiness) under a 15 s budget. Its slowest case in the `windows-lane-reports-dashboard` artifacts of runs 151, 147 and 146 took 691, 701 and 1,058 ms, far below half its budget, so it is unchanged.
+- **Outstanding post-landing check:** the Windows CLI leg of the next Full Suite run after this lands should show every case of this file well under 1 s.
+- **Escalation rule:** a further timeout of a case of this file is an immediate same-commit file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedCliTests`. It is never a Windows ledger entry, a widened timeout or a retry.

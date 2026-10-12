@@ -5,10 +5,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, existsSync, rmSync, writeFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { runInit } from "../init.js";
 import { installShippedSkillsIntoProject, SHIPPED_SKILL_NAMES, type ShippedSkillName } from "../claude-skills.js";
-import { gitFixture } from "../../../../core/src/__test-utils__/git-fixture";
 import { ensureProjectGitReadiness, GitRepositoryInitializationError } from "@fusion/core";
 
 function makeConstructibleMock<T extends (...args: any[]) => unknown>(impl?: T) {
@@ -37,6 +36,34 @@ const { mockIsValidSqliteDatabaseFile, mockInstallSkillsForProject } = vi.hoiste
   mockIsValidSqliteDatabaseFile: vi.fn(),
   mockInstallSkillsForProject: vi.fn(() => []),
 }));
+
+/*
+FNXC:InitCommandTests 2026-10-12-03:15:
+This file launches no process. Real Git readiness inside a 5 s CLI test body started 17 git processes per `runInit` and timed out on busy Windows runners; a timed-out body kept launching git into its directory, so the following cleanup failed with `EPERM`.
+The guard sits at `node:child_process` and is hoisted, because `init.ts` and core's git modules capture `promisify(exec)` / `promisify(execFile)` at module load. Every launcher records the program and throws, and `afterEach` fails any case that tried to start a process.
+Git and `.gitignore` outcomes of registration are asserted with real git in core's `git-repository.test.ts`.
+*/
+const { launchedPrograms } = vi.hoisted(() => ({ launchedPrograms: [] as string[] }));
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const forbidden = (launcher: string) => (command: unknown) => {
+    const commandText = String(command).trim();
+    const program = launcher === "exec" || launcher === "execSync" ? commandText.split(/\s+/)[0] ?? "" : commandText;
+    launchedPrograms.push(program.split(/[\\/]/).pop()?.toLowerCase().replace(/\.exe$/, "") ?? "");
+    throw new Error(`init.test.ts must not launch a process: ${launcher}(${program})`);
+  };
+  return {
+    ...actual,
+    exec: forbidden("exec"),
+    execFile: forbidden("execFile"),
+    execFileSync: forbidden("execFileSync"),
+    execSync: forbidden("execSync"),
+    spawn: forbidden("spawn"),
+    spawnSync: forbidden("spawnSync"),
+    fork: forbidden("fork"),
+  };
+});
 
 vi.mock("../claude-skills-runner.js", () => ({
   maybeInstallClaudeSkillForNewProject: mockInstallSkillsForProject,
@@ -68,19 +95,6 @@ function tempDir(prefix: string): string {
 }
 
 
-const localStorageGitignoreEntries = [
-  ".fusion/",
-  ".pi/",
-  ".worktrees/",
-  "fusion.db",
-  "fusion.db-wal",
-  "fusion.db-shm",
-] as const;
-
-function toLines(content: string): string[] {
-  return content.split(/\r?\n/).filter((line) => line.length > 0);
-}
-
 describe("init command", () => {
   let tempProjectDir: string;
   let tempHomeDir: string;
@@ -90,6 +104,8 @@ describe("init command", () => {
   beforeEach(() => {
     tempProjectDir = tempDir("fn-init-test-");
     tempHomeDir = tempDir("fn-init-home-");
+    launchedPrograms.length = 0;
+    mockEnsureProjectForPath.mockClear();
     process.env.HOME = tempHomeDir;
     process.env.USERPROFILE = tempHomeDir;
     mockInstallSkillsForProject.mockClear();
@@ -105,12 +121,15 @@ describe("init command", () => {
       createdAt: "2026-07-14T00:00:00.000Z",
       updatedAt: "",
     });
+    /*
+    FNXC:InitCommandTests 2026-10-12-03:15:
+    The registration seam is a plain stub: `runInit` owns delegation and reporting of the registration result, while `ensureProjectGitReadiness` owns the Git and `.gitignore` outcomes and is tested in core.
+    */
     mockEnsureProjectForPath.mockImplementation(async ({ path }: { path: string }) => {
-      const gitReadiness = await ensureProjectGitReadiness(path);
       return {
         outcome: "registered" as const,
-        gitRepository: gitReadiness.outcome,
-        integrationBranches: gitReadiness.integrationBranches,
+        gitRepository: "initialized" as const,
+        integrationBranches: [{ repoRelPath: ".", branch: "main", source: "well-known-local", action: "existing" }],
         project: {
           id: "proj_1234567890abcdef",
           name: "test-project",
@@ -150,6 +169,7 @@ describe("init command", () => {
     if (existsSync(tempHomeDir)) {
       rmSync(tempHomeDir, { recursive: true, force: true });
     }
+    expect(launchedPrograms).toEqual([]);
   });
 
   it("should create .fusion/ directory when initializing", async () => {
@@ -271,48 +291,6 @@ describe("init command", () => {
     expect(existsSync(join(fusionDir, "fusion.db"))).toBe(false);
   });
 
-  it("should add local storage directories to .gitignore when it doesn't exist", async () => {
-    const gitignorePath = join(tempProjectDir, ".gitignore");
-    expect(existsSync(gitignorePath)).toBe(false);
-
-    await runInit({ path: tempProjectDir });
-
-    expect(existsSync(gitignorePath)).toBe(true);
-    const lines = toLines(readFileSync(gitignorePath, "utf-8"));
-    for (const entry of localStorageGitignoreEntries) {
-      expect(lines).toContain(entry);
-    }
-  });
-
-  it("should append local storage directories to existing .gitignore", async () => {
-    const gitignorePath = join(tempProjectDir, ".gitignore");
-    writeFileSync(gitignorePath, "node_modules\ndist\n");
-
-    await runInit({ path: tempProjectDir });
-
-    const lines = toLines(readFileSync(gitignorePath, "utf-8"));
-    expect(lines).toContain("node_modules");
-    expect(lines).toContain("dist");
-    for (const entry of localStorageGitignoreEntries) {
-      expect(lines).toContain(entry);
-    }
-  });
-
-  it("should not duplicate local storage directories in .gitignore (idempotent)", async () => {
-    const gitignorePath = join(tempProjectDir, ".gitignore");
-    writeFileSync(
-      gitignorePath,
-      `node_modules\n${localStorageGitignoreEntries.join("\n")}\n`,
-    );
-
-    await runInit({ path: tempProjectDir });
-
-    const lines = toLines(readFileSync(gitignorePath, "utf-8"));
-    for (const entry of localStorageGitignoreEntries) {
-      expect(lines.filter((line) => line === entry)).toHaveLength(1);
-    }
-  });
-
   it("C1: fn init reconciles every shipped skill for its new project", async () => {
     /* FNXC:ComputerUseSkill 2026-08-11-14:30: The init call-site contract is
      * outcomes, not just delegation: both shipped skills must reconcile. */
@@ -381,67 +359,28 @@ describe("init command", () => {
     expect(existsSync(join(tempHomeDir, ".gemini", "skills", "fusion", "SKILL.md"))).toBe(true);
   });
 
-  it("should add .pi and fusion.db entries when .fusion is already ignored", async () => {
-    const gitignorePath = join(tempProjectDir, ".gitignore");
-    writeFileSync(gitignorePath, "node_modules\n.fusion\n");
+  it.each([false, true])("delegates Git readiness to registration and reports its result with --git=%s", async (compatibilityFlag) => {
+    const originalLog = console.log;
+    const logs: string[] = [];
+    console.log = (...args: unknown[]) => {
+      logs.push(args.join(" "));
+    };
 
-    await runInit({ path: tempProjectDir });
-
-    const lines = toLines(readFileSync(gitignorePath, "utf-8"));
-    expect(lines.filter((line) => line === ".fusion")).toHaveLength(1);
-    for (const entry of [".pi/", ".worktrees/", "fusion.db", "fusion.db-wal", "fusion.db-shm"]) {
-      expect(lines.filter((line) => line === entry)).toHaveLength(1);
+    try {
+      await runInit({ path: tempProjectDir, ...(compatibilityFlag ? { git: true } : {}) });
+    } finally {
+      console.log = originalLog;
     }
-  });
 
-  it("does not modify .gitignore when all local storage entries are already present", async () => {
-    const gitignorePath = join(tempProjectDir, ".gitignore");
-    const existingContent = `node_modules\n${localStorageGitignoreEntries.join("\n")}\n`;
-    writeFileSync(gitignorePath, existingContent);
-
-    await runInit({ path: tempProjectDir });
-
-    const contentAfterInit = readFileSync(gitignorePath, "utf-8");
-    expect(contentAfterInit).toBe(existingContent);
-  });
-
-  it.each([false, true])("creates execution-ready Git state by default and with --git=%s", async (compatibilityFlag) => {
+    expect(mockEnsureProjectForPath).toHaveBeenCalledTimes(1);
+    expect(mockEnsureProjectForPath).toHaveBeenCalledWith({
+      path: tempProjectDir,
+      identity: undefined,
+      name: basename(tempProjectDir),
+    });
+    expect(logs.join("\n")).toContain("Initialized git repository");
+    expect(logs.join("\n")).toContain("Integration branch: main (existing)");
     expect(existsSync(join(tempProjectDir, ".git"))).toBe(false);
-
-    await runInit({ path: tempProjectDir, ...(compatibilityFlag ? { git: true } : {}) });
-
-    expect(existsSync(join(tempProjectDir, ".git"))).toBe(true);
-    await expect(gitFixture(tempProjectDir, ["rev-parse", "--verify", "HEAD^{commit}"])).resolves.toMatch(/^[0-9a-f]+$/);
-    const tree = await gitFixture(tempProjectDir, ["ls-tree", "-r", "--name-only", "HEAD"]);
-    expect(tree).toBe(".gitignore");
-    const worktree = join(tempProjectDir, "task-worktree");
-    await gitFixture(tempProjectDir, ["worktree", "add", "-b", `fusion/init-${compatibilityFlag ? "git" : "default"}`, worktree, "HEAD"]);
-    await gitFixture(tempProjectDir, ["worktree", "remove", "--force", worktree]);
-    for (const entry of localStorageGitignoreEntries) {
-      expect(toLines(readFileSync(join(tempProjectDir, ".gitignore"), "utf8"))).toContain(entry);
-    }
-  });
-
-  it("creates an initial commit when --git initializes a repository", async () => {
-    await runInit({ path: tempProjectDir, git: true });
-
-    const commitCount = await gitFixture(tempProjectDir, ["rev-list", "--count", "HEAD"]);
-    expect(Number(commitCount)).toBeGreaterThanOrEqual(1);
-  });
-
-  it("does not reinitialize git when repository already exists", async () => {
-    await gitFixture(tempProjectDir, ["init"]);
-    await gitFixture(tempProjectDir, ["checkout", "-b", "main"]);
-    await gitFixture(tempProjectDir, ["config", "user.name", "Existing User"]);
-    await gitFixture(tempProjectDir, ["config", "user.email", "existing@example.com"]);
-    writeFileSync(join(tempProjectDir, "README.md"), "# Existing Repo\n");
-    await gitFixture(tempProjectDir, ["add", "README.md"]);
-    await gitFixture(tempProjectDir, ["commit", "-m", "existing commit"]);
-
-    await runInit({ path: tempProjectDir, git: true });
-
-    const commitCount = await gitFixture(tempProjectDir, ["rev-list", "--count", "HEAD"]);
-    expect(Number(commitCount)).toBe(1);
   });
 
   it("delegates registration without --git and does not log a manual git hint", async () => {
@@ -457,7 +396,6 @@ describe("init command", () => {
       console.log = originalLog;
     }
 
-    expect(existsSync(join(tempProjectDir, ".git"))).toBe(true);
     expect(mockEnsureProjectForPath).toHaveBeenCalledWith(
       expect.objectContaining({
         path: tempProjectDir,
@@ -532,5 +470,13 @@ describe("init command", () => {
     }
 
     expect(logs.join("\n")).toContain("Integration branch: release/9.9 (unavailable)");
+  });
+
+  it("blocks the real Git readiness path from launching git", async () => {
+    await expect(ensureProjectGitReadiness(tempProjectDir)).rejects.toBeInstanceOf(GitRepositoryInitializationError);
+
+    expect(launchedPrograms).toContain("git");
+    expect(existsSync(join(tempProjectDir, ".git"))).toBe(false);
+    launchedPrograms.length = 0;
   });
 });
