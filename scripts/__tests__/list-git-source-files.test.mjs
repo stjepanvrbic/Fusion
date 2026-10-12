@@ -22,6 +22,10 @@ These run the real git, without a shell, so they fail on any platform where the 
 FNXC:SourceFileListing 2026-10-12-06:14:
 A gate's list must hold every file under its roots with one of its extensions, files directly in a root included. The lifecycle-column census once listed 2,654 of 2,865 files and reported a zero backlog while five column guards sat in the 211 files it never opened.
 The repository cases compare each gate's list with a set computed from the unfiltered `git ls-files` output by path segments, so a root or extension added to a scope is checked without a new test.
+
+FNXC:SourceFileListing 2026-10-12-07:05:
+Plugin code is in two places, `plugins/<plugin>/src` and `plugins/examples/<plugin>/src`, and both gates must list both. The example plugins are the code plugin authors copy, and a literal move destination is rejected on a renamed board wherever the call is written.
+The example root is one level deeper than the plugin root, so the fixture holds a path one level deeper again that must stay unlisted.
 */
 
 const repoRoot = path.dirname(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
@@ -33,13 +37,19 @@ const GATE_SCOPES = [
     mustList: [
       "packages/dashboard/app/App.tsx",
       "plugins/fusion-plugin-dependency-graph/src/index.ts",
+      "plugins/examples/fusion-plugin-ci-status/src/index.ts",
       "packages/core/src/index.ts",
     ],
   },
   {
     name: "move-target check",
     scope: MOVE_TARGET_SOURCE_SCOPE,
-    mustList: ["packages/dashboard/app/App.tsx", "packages/core/src/index.ts"],
+    mustList: [
+      "packages/dashboard/app/App.tsx",
+      "packages/core/src/index.ts",
+      "plugins/fusion-plugin-even-realities-glasses/src/agent-actions.ts",
+      "plugins/examples/fusion-plugin-ci-status/src/index.ts",
+    ],
   },
 ];
 
@@ -83,6 +93,7 @@ const TRACKED_FILES = {
   "plugins/p1/src/View.tsx": SOURCE,
   "plugins/p1/src/sub/n.ts": SOURCE,
   "plugins/examples/ex/src/index.ts": SOURCE,
+  "plugins/examples/ex/deeper/src/y.ts": SOURCE,
   "packages/a/b/src/x.ts": SOURCE,
 };
 const UNTRACKED_FILES = {
@@ -105,37 +116,32 @@ after(() => {
   rmSync(fixture, { recursive: true, force: true });
 });
 
+const FIXTURE_SOURCE_FILES = [
+  "packages/dash/app/App.tsx",
+  "packages/dash/app/api.ts",
+  "packages/dash/app/components/C.tsx",
+  "packages/dash/app/untracked.ts",
+  "packages/eng/src/deep/er/x.ts",
+  "packages/eng/src/deep/tracked.tsx",
+  "packages/eng/src/top.ts",
+  "packages/eng/src/types.d.ts",
+  "plugins/examples/ex/src/index.ts",
+  "plugins/p1/src/View.tsx",
+  "plugins/p1/src/index.ts",
+  "plugins/p1/src/sub/n.ts",
+  "plugins/p1/src/untrackedTop.tsx",
+];
+
 test("lists direct children and nested files of every census root, tracked and untracked, and nothing else", () => {
   const files = listGitSourceFiles(CENSUS_SOURCE_SCOPE, { cwd: fixture });
-  assert.deepEqual([...files].sort(), [
-    "packages/dash/app/App.tsx",
-    "packages/dash/app/api.ts",
-    "packages/dash/app/components/C.tsx",
-    "packages/dash/app/untracked.ts",
-    "packages/eng/src/deep/er/x.ts",
-    "packages/eng/src/deep/tracked.tsx",
-    "packages/eng/src/top.ts",
-    "packages/eng/src/types.d.ts",
-    "plugins/p1/src/View.tsx",
-    "plugins/p1/src/index.ts",
-    "plugins/p1/src/sub/n.ts",
-    "plugins/p1/src/untrackedTop.tsx",
-  ]);
+  assert.deepEqual([...files].sort(), FIXTURE_SOURCE_FILES);
   assert.equal(new Set(files).size, files.length);
 });
 
-test("lists the package roots only under the move-target scope", () => {
+test("lists the same package, plugin and example-plugin files under the move-target scope", () => {
   const files = listGitSourceFiles(MOVE_TARGET_SOURCE_SCOPE, { cwd: fixture });
-  assert.deepEqual([...files].sort(), [
-    "packages/dash/app/App.tsx",
-    "packages/dash/app/api.ts",
-    "packages/dash/app/components/C.tsx",
-    "packages/dash/app/untracked.ts",
-    "packages/eng/src/deep/er/x.ts",
-    "packages/eng/src/deep/tracked.tsx",
-    "packages/eng/src/top.ts",
-    "packages/eng/src/types.d.ts",
-  ]);
+  assert.deepEqual([...files].sort(), FIXTURE_SOURCE_FILES);
+  assert.equal(new Set(files).size, files.length);
 });
 
 test("the production list drops test files that the full list contains", () => {
@@ -174,6 +180,26 @@ test("a column guard and a literal move target in a file directly under a root a
     const moveTargetFiles = listProductionSourceFiles(MOVE_TARGET_SOURCE_SCOPE, { cwd: dir });
     assert.ok(moveTargetFiles.includes("packages/dash/app/main.tsx"));
     assert.equal(countLegacyMoveTargetLiterals(read("packages/dash/app/main.tsx"), "packages/dash/app/main.tsx"), 1);
+  });
+});
+
+test("a column guard and a literal move target in plugin and example-plugin files are counted", () => {
+  withRepository((dir) => {
+    const guard = 'export const f = (toColumn: string) => toColumn === "in-progress";\n';
+    const move = 'declare const store: any;\ndeclare const id: string;\nstore.moveTask(id, "done");\n';
+    writeFiles(dir, {
+      "plugins/examples/ex/src/index.ts": guard + move,
+      "plugins/p1/src/move.ts": move,
+    });
+    const read = (file) => readFileSync(path.join(dir, file), "utf8");
+
+    const summary = summarize(censusFiles(listProductionSourceFiles(CENSUS_SOURCE_SCOPE, { cwd: dir }), read));
+    assert.equal(summary.totals.column, 1);
+    assert.deepEqual(summary.byFile.map(([file]) => file), ["plugins/examples/ex/src/index.ts"]);
+
+    const moveTargetFiles = [...listProductionSourceFiles(MOVE_TARGET_SOURCE_SCOPE, { cwd: dir })].sort();
+    assert.deepEqual(moveTargetFiles, ["plugins/examples/ex/src/index.ts", "plugins/p1/src/move.ts"]);
+    for (const file of moveTargetFiles) assert.equal(countLegacyMoveTargetLiterals(read(file), file), 1, file);
   });
 });
 

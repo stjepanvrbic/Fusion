@@ -33,6 +33,9 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { MOVE_TARGET_SOURCE_SCOPE } from "../../../../scripts/check-move-target-literals.mjs";
+import { listProductionSourceFiles } from "../../../../scripts/lib/list-git-source-files.mjs";
+
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "../../../../..");
 
 /** Legacy lifecycle column ids, as move TARGETS. */
@@ -55,14 +58,44 @@ appears" — it is `TransitionRejectionError: unknown-column` thrown at runtime 
 */
 const ALLOWED: Record<string, number> = {};
 
+// FNXC:WorkflowResolvedColumns 2026-10-12-07:05:
+// This guard and the script check `scripts/check-move-target-literals.mjs` must scan the same files: every non-test `.ts` and `.tsx` file under each root of the move-target scope, files directly in a root included.
+// A pathspec list written in this file once had no entry for `.tsx` under `packages/*/src` and required a directory between `app/` and the file, so the guard passed while it never opened 22 files, `packages/dashboard/app/App.tsx` among them.
+// The scope and the lister are imported from the script check, so a root added there is scanned here without an edit to this file.
+// The lister resolves its pathspecs against `cwd`, which must be the repository root. The list is computed once per run because the tree cannot change during it.
+// (Line comments, because the globs quoted here contain the block-comment terminator.)
+let sourceFilesCache: string[] | undefined;
 function sourceFiles(): string[] {
-  return execFileSync(
-    "git",
-    ["ls-files", "packages/*/src/**/*.ts", "packages/*/src/*.ts", "packages/*/app/**/*.ts", "packages/*/app/**/*.tsx"],
-    { cwd: REPO_ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
-  )
-    .split("\n")
-    .filter((f) => f && !f.includes("__tests__") && !/\.(test|spec)\.tsx?$/.test(f));
+  sourceFilesCache ??= listProductionSourceFiles(MOVE_TARGET_SOURCE_SCOPE, { cwd: REPO_ROOT }) as string[];
+  return sourceFilesCache;
+}
+
+/*
+FNXC:WorkflowResolvedColumns 2026-10-12-07:05:
+The files the guard must list, computed without git pathspec matching and without the lister or its test-file predicate, so a wrong pathspec or a wrong filter in either cannot make both sides of the comparison agree.
+A file counts when its leading path segments match a scope root (`*` stands for exactly one segment and at least one segment follows the root), its name ends with a scope extension, and it is not a test file.
+*/
+function isUnderRoot(file: string, root: string): boolean {
+  const rootSegments = root.split("/");
+  const fileSegments = file.split("/");
+  return fileSegments.length > rootSegments.length
+    && rootSegments.every((segment, index) => segment === "*" || segment === fileSegments[index]);
+}
+
+const TEST_FILE_SUFFIXES = [".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"];
+
+function repositoryFilesInScope(): string[] {
+  const { roots, extensions } = MOVE_TARGET_SOURCE_SCOPE as { roots: readonly string[]; extensions: readonly string[] };
+  return execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  })
+    .split("\0")
+    .filter((file) => file.length > 0)
+    .filter((file) => roots.some((root) => isUnderRoot(file, root)))
+    .filter((file) => extensions.some((extension) => file.endsWith(extension)))
+    .filter((file) => !file.includes("__tests__") && !TEST_FILE_SUFFIXES.some((suffix) => file.endsWith(suffix)));
 }
 
 /** Blank comments in place so prose describing a past call is not counted as one. */
@@ -133,6 +166,29 @@ describe("moveTask targets resolve the board's own lane", () => {
     const callers = files.filter((file) => /moveTask\s*\(/.test(strippedSource(file)));
     expect(callers.length).toBeGreaterThan(5);
     expect(callers).toContain("packages/engine/src/self-healing.ts");
+    /* A plugin calls moveTask too, so the corpus has to reach plugin code. */
+    expect(callers).toContain("plugins/fusion-plugin-even-realities-glasses/src/agent-actions.ts");
+  });
+
+  it("lists every source file its roots contain", () => {
+    const expected = repositoryFilesInScope().sort();
+    const listed = [...sourceFiles()].sort();
+
+    /* Two files the earlier pathspecs skipped: a direct child of an `app` root and a `.tsx` file under a `src` root. They also prove the expected set is the real population. */
+    expect(expected).toContain("packages/dashboard/app/App.tsx");
+    expect(expected).toContain("packages/cli/src/commands/dashboard-tui/app.tsx");
+
+    const listedSet = new Set(listed);
+    const expectedSet = new Set(expected);
+    const omitted = expected.filter((file) => !listedSet.has(file));
+    const unexpected = listed.filter((file) => !expectedSet.has(file));
+    expect(
+      { omitted, unexpected },
+      `The guard scans ${listed.length} file(s) and its roots contain ${expected.length}.\n`
+      + `Under the roots but not scanned (${omitted.length}):\n${omitted.join("\n")}\n`
+      + `Scanned but outside the roots (${unexpected.length}):\n${unexpected.join("\n")}`,
+    ).toEqual({ omitted: [], unexpected: [] });
+    expect(listed.length).toBe(expected.length);
   });
 
   /* The matcher is covered, because the scan is only as good as it: each case is a real shape. */

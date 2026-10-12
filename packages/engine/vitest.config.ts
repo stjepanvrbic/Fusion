@@ -244,6 +244,11 @@ export default defineConfig({
             one call. Deterministic by construction — same tree, same counts. Measured 509ms / 508ms
             across runs, 12 tests, after memoising the corpus scan (it was 800ms when each case
             re-read every file).
+
+            FNXC:EngineTests 2026-10-12-07:05:
+            The guard takes its file list from the lister and the scope that `scripts/check-move-target-literals.mjs` uses, so both move-target checks scan the same files.
+            It now runs two `git ls-files` calls and no other subprocess: the scoped listing, and one unfiltered listing that its completeness case compares the scoped list with.
+            Measured on a Windows host: 1.14 to 1.18 s with 12 cases before (two runs), 1.15 to 1.32 s with 13 cases after (three runs). The completeness case took 69 ms.
             */
             "src/__tests__/no-legacy-move-targets.test.ts",
             "src/__tests__/merger-merge-lifecycle.test.ts",

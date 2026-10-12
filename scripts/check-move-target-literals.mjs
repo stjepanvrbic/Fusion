@@ -133,8 +133,12 @@ FNXC:MoveTargetRatchet 2026-10-12-06:14:
 The sources this check covers: every `.ts` and `.tsx` file under these roots, files directly in a root included.
 The lister builds the git pathspecs from the scope, so this file names directories and extensions only.
 */
+// FNXC:MoveTargetRatchet 2026-10-12-07:05:
+// The scope covers plugin code too: `plugins/<plugin>/src` and the example plugins under `plugins/examples/<plugin>/src`, which plugin authors copy. `*` matches one path segment, so each needs its own root.
+// `moveTaskInternal` rejects a destination the workflow does not declare wherever the call is written, and plugins call `moveTask` (the glasses plugin does in two files).
+// The Vitest guard `packages/engine/src/__tests__/no-legacy-move-targets.test.ts` imports this scope, so both checks scan the same files.
 export const MOVE_TARGET_SOURCE_SCOPE = Object.freeze({
-  roots: Object.freeze(["packages/*/src", "packages/*/app"]),
+  roots: Object.freeze(["packages/*/src", "packages/*/app", "plugins/*/src", "plugins/examples/*/src"]),
   extensions: Object.freeze([".ts", ".tsx"]),
 });
 

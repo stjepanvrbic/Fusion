@@ -86,6 +86,15 @@ async function drainDetachedPoll(): Promise<void> {
   await Promise.resolve();
 }
 
+/** The tracked branches as the plugin's own GET /status route reports them. */
+async function trackedBranches(ctx: MockContext): Promise<Array<{ branch: string; status: string }>> {
+  const route = plugin.routes!.find((r) => r.method === "GET" && r.path === "/status")!;
+  const result = await route.handler(createMockRequest() as any, ctx as any) as {
+    branches: Array<{ branch: string; status: string }>;
+  };
+  return result.branches.map(({ branch, status }) => ({ branch, status }));
+}
+
 // ── Test Suite ─────────────────────────────────────────────────────────────────
 
 describe("ci-status plugin", () => {
@@ -146,10 +155,11 @@ describe("ci-status plugin", () => {
       expect(route!.description).toBe("Trigger an immediate CI status refresh");
     });
 
-    it("should have onLoad, onUnload, and onTaskMoved hooks", () => {
+    it("should have onLoad, onUnload, onTaskMoved, and onTaskCompleted hooks", () => {
       expect(plugin.hooks.onLoad).toBeDefined();
       expect(plugin.hooks.onUnload).toBeDefined();
       expect(plugin.hooks.onTaskMoved).toBeDefined();
+      expect(plugin.hooks.onTaskCompleted).toBeDefined();
     });
 
     it("should have settings schema defined", () => {
@@ -236,30 +246,38 @@ describe("ci-status plugin", () => {
       expect(ctx.logger.info).toHaveBeenCalledWith(
         expect.stringContaining("Tracking branch for task FN-001"),
       );
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "fusion/fn-001", status: "pending" }]);
     });
 
-    it("should stop tracking branch when task moves to done", async () => {
+    it("should keep one entry when the task moves to in-progress twice", async () => {
       const ctx = createMockContext();
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "todo", "in-progress", ctx as any);
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "in-review", "in-progress", ctx as any);
 
-      // First move to in-progress
-      await plugin.hooks.onTaskMoved?.(
-        mockTask as any,
-        "todo",
-        "in-progress",
-        ctx as any,
-      );
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "fusion/fn-001", status: "pending" }]);
+    });
+
+    it("should keep tracking when the task moves to done without a completion report", async () => {
+      // Fusion reports completion through onTaskCompleted, so a move to a column named "done" is not the signal.
+      const ctx = createMockContext();
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "todo", "in-progress", ctx as any);
       vi.clearAllMocks();
 
-      // Then move to done
-      await plugin.hooks.onTaskMoved?.(
-        mockTask as any,
-        "in-progress",
-        "done",
-        ctx as any,
-      );
-      expect(ctx.logger.info).toHaveBeenCalledWith(
-        expect.stringContaining("Stopped tracking branch for task FN-001"),
-      );
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "in-progress", "done", ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "fusion/fn-001", status: "pending" }]);
+      expect(ctx.logger.info).not.toHaveBeenCalledWith(expect.stringContaining("Stopped tracking"));
+    });
+
+    it("should stop tracking branch when task moves to archived", async () => {
+      const ctx = createMockContext();
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "todo", "in-progress", ctx as any);
+      vi.clearAllMocks();
+
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "in-progress", "archived", ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([]);
+      expect(ctx.logger.info).toHaveBeenCalledWith("Stopped tracking branch for task FN-001");
     });
 
     it("should use configured branch prefix", async () => {
@@ -281,6 +299,59 @@ describe("ci-status plugin", () => {
       expect(ctx.logger.info).toHaveBeenCalledWith(
         expect.stringContaining("custom/fn-001"),
       );
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "custom/fn-001", status: "pending" }]);
+    });
+  });
+
+  describe("hooks.onTaskCompleted", () => {
+    it("should stop tracking branch when the task is completed", async () => {
+      const ctx = createMockContext();
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "todo", "in-progress", ctx as any);
+      vi.clearAllMocks();
+
+      await plugin.hooks.onTaskCompleted?.(mockTask as any, ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([]);
+      expect(ctx.logger.info).toHaveBeenCalledWith("Stopped tracking branch for task FN-001");
+    });
+
+    it("should stop tracking when the board's complete column has another id", async () => {
+      const ctx = createMockContext();
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "todo", "in-progress", ctx as any);
+
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "qa", "shipped", ctx as any);
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "fusion/fn-001", status: "pending" }]);
+
+      await plugin.hooks.onTaskCompleted?.(mockTask as any, ctx as any);
+      expect(await trackedBranches(ctx)).toEqual([]);
+    });
+
+    it("should do nothing for a task that was never tracked", async () => {
+      const ctx = createMockContext();
+      const other = { ...mockTask, id: "FN-002" };
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "todo", "in-progress", ctx as any);
+      vi.clearAllMocks();
+
+      await plugin.hooks.onTaskCompleted?.(other as any, ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "fusion/fn-001", status: "pending" }]);
+      expect(ctx.logger.info).not.toHaveBeenCalledWith(expect.stringContaining("Stopped tracking"));
+    });
+
+    it("should use configured branch prefix", async () => {
+      const ctx = createMockContext({
+        settings: {
+          ciUrl: "https://ci.example.com/api",
+          pollIntervalMs: 60000,
+          branchPrefix: "custom/",
+        },
+      });
+      await plugin.hooks.onTaskMoved?.(mockTask as any, "todo", "in-progress", ctx as any);
+      expect(await trackedBranches(ctx)).toEqual([{ branch: "custom/fn-001", status: "pending" }]);
+
+      await plugin.hooks.onTaskCompleted?.(mockTask as any, ctx as any);
+
+      expect(await trackedBranches(ctx)).toEqual([]);
     });
   });
 

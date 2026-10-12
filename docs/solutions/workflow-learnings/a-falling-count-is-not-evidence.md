@@ -133,8 +133,9 @@ Run against all five lifecycle gates on one tree, staging a probe file per form.
 
 | gate | catches | does NOT catch |
 |---|---|---|
-| `lifecycle-column-census` | `===` / `!==` comparisons | ~~membership, switch~~ **fixed** — both were invisible while it printed "a new guard cannot land silently". ~~Files directly in a root~~ **fixed**. The file list held 2,654 of 2,865 production files. It skipped the 16 files directly under `packages/dashboard/app/` and the 195 directly under a `plugins/*/src/` directory, and those 211 files held five unmarked column guards while the census printed "BACKLOG ZERO" |
-| `check-move-target-literals` | direct + backtick destinations | ~~ternary destination~~ **fixed**; still misses a destination bound to a local first. ~~Files directly under `packages/*/app`~~ **fixed**. The file list held 2,502 of 2,518 production files and skipped the 16 files directly under `packages/dashboard/app/`, which held no literal move target |
+| `lifecycle-column-census` | `===` / `!==` comparisons | ~~membership, switch~~ **fixed** — both were invisible while it printed "a new guard cannot land silently". ~~Files directly in a root~~ **fixed**. The file list held 2,654 of 2,865 production files. It skipped the 16 files directly under `packages/dashboard/app/` and the 195 directly under a `plugins/*/src/` directory, and those 211 files held five unmarked column guards while the census printed "BACKLOG ZERO". ~~The example plugins~~ **fixed**. No root covered `plugins/examples/*/src`. Its four source files held three unmarked column guards, all in the CI status example |
+| `check-move-target-literals` | direct + backtick destinations | ~~ternary destination~~ **fixed**; still misses a destination bound to a local first. ~~Files directly under `packages/*/app`~~ **fixed**. The file list held 2,502 of 2,518 production files and skipped the 16 files directly under `packages/dashboard/app/`, which held no literal move target. ~~Plugin code~~ **fixed**. The scope had no `plugins` root, so the check opened none of the 351 plugin and example-plugin source files. Two of them call `moveTask`, and neither passes a literal destination |
+| `no-legacy-move-targets.test.ts` (Vitest, in the merge gate) | a quoted legacy id as the second argument of `moveTask(...)`, matched by a regular expression over comment-stripped source | ~~22 files under its own roots~~ **fixed**. It built its list from its own pathspecs and listed 2,496 of 2,518 production files. It skipped the 16 files directly under `packages/dashboard/app/` and the 6 `.tsx` files under `packages/*/src/`, which held no literal move target. ~~Plugin code~~ **fixed**, as in the row above |
 | `check-sql-column-literals` | `"column"` comparisons, including inside plain template literals — not only drizzle `sql` tags | nothing found; the one miss probed was an invented identifier the schema never uses. ~~Everything after a generic arrow or angle-bracket assertion in a `.ts` file~~ **fixed**. The old parse stopped early in 10 of 2,671 scanned files. The unread parts held no SQL column literal |
 | `check-inert-sync-lane-conversions` | lane reads via the `resolvePlannerLanes` helper | a DIRECT `store.resolveTaskWorkflowIrSync(...)` read feeding `resolveLifecycleColumns` — inert by the same mechanism, untracked |
 | `check-fnxc-future-dates` | future stamps | nothing found — it caught the author of this table, twice |
@@ -160,6 +161,22 @@ Before trusting a zero, compare the gate's file list with the repository: take e
 
 Both gates now declare a scope, `{ roots, extensions }`. `listProductionSourceFiles` in `scripts/lib/list-git-source-files.mjs` builds one `:(glob)<root>/**/*<extension>` pathspec per root and extension, which lists direct children and keeps `*` inside one path segment.
 `scripts/__tests__/list-git-source-files.test.mjs` makes the comparison above for each gate's scope on every run, so a new root or extension is checked without a new test.
+
+<!-- FNXC:SourceFileListing 2026-10-12-07:05: The two move-target checks read one file list, and both lifecycle scopes cover the two directories that hold plugin code. -->
+A second comparison on 2026-10-12 found two more lists that missed files.
+
+The Vitest guard `packages/engine/src/__tests__/no-legacy-move-targets.test.ts` is in the merge gate. It built its own pathspec list, so the lister fix did not reach it, and it listed 2,496 of 2,518 files.
+It now calls `listProductionSourceFiles(MOVE_TARGET_SOURCE_SCOPE)`, the list the script check scans. Its case `lists every source file its roots contain` makes the repository comparison on every gate run.
+
+The example plugins are in `plugins/examples/<plugin>/src`, one level deeper than `plugins/*/src`. The earlier pathspecs listed only their test files, because a plain `*` matched `examples/<plugin>` and `**/` needed the `__tests__` directory. Once `*` stayed inside one path segment, no root listed them at all.
+The move-target scope had no plugin root.
+Both scopes now have the roots `packages/*/src`, `packages/*/app`, `plugins/*/src` and `plugins/examples/*/src`, which held 2,869 production files on that day.
+
+The wider census reported three unmarked column guards, all in `plugins/examples/fusion-plugin-ci-status/src/index.ts`.
+The `done` guard became an `onTaskCompleted` hook, which the host fires for the complete lane whatever its id is.
+The `in-progress` and `archived` guards carry `DELIBERATE-LITERAL` comments. The plugin SDK has no call that returns a column's role, and no hook reports those two lanes.
+
+A marked guard has to stay an `===` comparison. The census counts a membership test or a `switch` only when the receiver is named `column`, `columnId` or `col`, so it reports nothing for `["done", "archived"].includes(toColumn)`. Rewriting a guard into that shape removes it from the count without converting it.
 
 ### The axis this table did not have
 

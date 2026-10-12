@@ -61,8 +61,11 @@ FNXC:LifecycleColumnCensus 2026-10-12-06:14:
 The sources the census covers: every `.ts` and `.tsx` file under these roots, files directly in a root included.
 Declared here so a test can import it without running the command-line script.
 */
+// FNXC:LifecycleColumnCensus 2026-10-12-07:05:
+// Plugin code is in two places, `plugins/<plugin>/src` and `plugins/examples/<plugin>/src`, and `*` matches one path segment, so each needs its own root.
+// The example plugins are the code plugin authors copy. A literal column comparison there spreads the pattern the census exists to remove, so the census counts it like any other.
 export const CENSUS_SOURCE_SCOPE = Object.freeze({
-  roots: Object.freeze(["packages/*/src", "packages/*/app", "plugins/*/src"]),
+  roots: Object.freeze(["packages/*/src", "packages/*/app", "plugins/*/src", "plugins/examples/*/src"]),
   extensions: Object.freeze([".ts", ".tsx"]),
 });
 
