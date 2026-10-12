@@ -479,6 +479,15 @@ export interface WorkflowStepResult {
   resumeReason?: string;
   /** The `status` this result carried immediately before the resume rewrote it (always `"pending"`). */
   resumedFromStatus?: WorkflowStepResult["status"];
+  /**
+   * FNXC:ReviewRecovery 2026-10-12-03:50:
+   * ISO-8601 time an operator retry re-armed the no-verdict review retry budget for this failed, verdict-less attempt.
+   * Only an operator retry writes it; no automatic sweep, recorder or resume does, so the budget cannot reset itself.
+   * No-verdict budget counting starts after the newest attempt that carries it, so the earlier attempts stay as history without spending the fresh budget.
+   * It travels into `priorAttempts` with the attempt's snapshot when the next attempt is recorded.
+   * It is audit and counting-boundary data only: it never participates in merge blocking, approval evaluation, result reuse or recovery selection.
+   */
+  noVerdictBudgetRearmedAt?: string;
   /*
    * FNXC:WorkflowStepResults 2026-07-09-00:10:
    * FN-7727: self-healing recovery re-runs a failed pre-merge review node

@@ -1057,6 +1057,8 @@ export {
   MANUAL_RETRY_RESET_COUNTER_KEYS,
   buildAutoPauseClearPatch,
   buildManualRetryResetPatch,
+  buildManualRetryResetPatchIfCurrent,
+  buildNoVerdictBudgetRearmPatch,
 } from "./tasks/manual-retry-reset.js";
 export {
   RESTART_STAGE_FENCE_REASON,
@@ -2588,6 +2590,7 @@ export {
   applySupersededFindingIds,
   applySupersededPriorAttemptFindingIds,
   archiveTerminalWorkflowStepFailures,
+  rearmNoVerdictRecoveryBudget,
   archiveArbitratedWorkflowStepFailure,
   isArchivedRemediationCarrier,
   collectDisputedFindings,

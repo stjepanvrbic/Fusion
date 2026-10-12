@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { isWorkflowStepNotRun as isWorkflowStepNotRunFromGateBarrel } from "../index.gate.js";
 import { isWorkflowStepNotRun as isWorkflowStepNotRunFromMainBarrel } from "../index.js";
-import { applySupersededFindingIds, archiveArbitratedWorkflowStepFailure, archiveTerminalWorkflowStepFailures, classifyRemediationAttemptClaim, closeUnrebuttedDisputedFindings, isArchivedRemediationCarrier, isWorkflowStepNotRun, MAX_WORKFLOW_REVIEW_FINDINGS, MAX_WORKFLOW_STEP_PRIOR_ATTEMPTS, normalizeSupersededFindingIds, normalizeWorkflowReviewFindings, upsertWorkflowStepResult, WORKFLOW_STEP_NOT_RUN_REASONS } from "../workflows/workflow-step-results.js";
+import { applySupersededFindingIds, archiveArbitratedWorkflowStepFailure, archiveTerminalWorkflowStepFailures, classifyRemediationAttemptClaim, closeUnrebuttedDisputedFindings, isArchivedRemediationCarrier, isWorkflowStepNotRun, MAX_WORKFLOW_REVIEW_FINDINGS, MAX_WORKFLOW_STEP_PRIOR_ATTEMPTS, normalizeSupersededFindingIds, normalizeWorkflowReviewFindings, rearmNoVerdictRecoveryBudget, upsertWorkflowStepResult, WORKFLOW_STEP_NOT_RUN_REASONS } from "../workflows/workflow-step-results.js";
 import type { WorkflowStepResult } from "../types.js";
 
 function makeResult(overrides: Partial<WorkflowStepResult> = {}): WorkflowStepResult {
@@ -311,5 +311,88 @@ describe("upsertWorkflowStepResult", () => {
     expect(existing[0].status).toBe("passed");
     expect(existing[0].priorAttempts).toHaveLength(2);
     expect(existing[0].priorAttempts?.map((r) => r.output)).toEqual(["attempt-2", "attempt-1"]);
+  });
+});
+
+describe("rearmNoVerdictRecoveryBudget", () => {
+  const REARMED_AT = "2026-10-12T04:00:00.000Z";
+
+  it("stamps every current failed verdict-less pre-merge review row in one call", () => {
+    const planReview = makeResult({ workflowStepId: "plan-review", workflowStepName: "Plan Review", output: "lost dispatch" });
+    const codeReview = makeResult({ phase: "pre-merge", output: "lost dispatch" });
+
+    const rearmed = rearmNoVerdictRecoveryBudget([planReview, codeReview], REARMED_AT);
+
+    expect(rearmed).toEqual([
+      { ...planReview, noVerdictBudgetRearmedAt: REARMED_AT },
+      { ...codeReview, noVerdictBudgetRearmedAt: REARMED_AT },
+    ]);
+    expect(planReview.noVerdictBudgetRearmedAt).toBeUndefined();
+    expect(codeReview.noVerdictBudgetRearmedAt).toBeUndefined();
+  });
+
+  it("stamps only the failed verdict-less row among rows that carry a verdict or another status", () => {
+    const rows = [
+      makeResult({ workflowStepId: "passed", status: "passed", verdict: "APPROVE" }),
+      makeResult({ workflowStepId: "revise", verdict: "REVISE" }),
+      makeResult({ workflowStepId: "pending", status: "pending" }),
+      makeResult({ workflowStepId: "skipped", status: "skipped" }),
+      makeResult({ workflowStepId: "superseded", supersededAt: "2026-10-11T00:00:00.000Z", supersededReason: "respecify" }),
+      makeResult({ workflowStepId: "post-merge", phase: "post-merge" }),
+      makeResult({ workflowStepId: "lost" }),
+    ];
+
+    const rearmed = rearmNoVerdictRecoveryBudget(rows, REARMED_AT)!;
+
+    expect(rearmed.filter((row) => row.noVerdictBudgetRearmedAt !== undefined).map((row) => row.workflowStepId)).toEqual(["lost"]);
+    for (const [index, row] of rows.entries()) {
+      if (row.workflowStepId !== "lost") expect(rearmed[index]).toBe(row);
+    }
+  });
+
+  it.each([
+    ["passed", makeResult({ status: "passed", verdict: "APPROVE" })],
+    ["REVISE", makeResult({ verdict: "REVISE" })],
+    ["pending", makeResult({ status: "pending" })],
+    ["skipped", makeResult({ status: "skipped" })],
+    ["superseded", makeResult({ supersededAt: "2026-10-11T00:00:00.000Z" })],
+    ["post-merge", makeResult({ phase: "post-merge" })],
+  ])("returns the same reference when the only row is %s", (_label, row) => {
+    const rows = [row];
+    expect(rearmNoVerdictRecoveryBudget(rows, REARMED_AT)).toBe(rows);
+  });
+
+  it("returns undefined and empty input unchanged", () => {
+    const empty: WorkflowStepResult[] = [];
+    expect(rearmNoVerdictRecoveryBudget(undefined, REARMED_AT)).toBeUndefined();
+    expect(rearmNoVerdictRecoveryBudget(empty, REARMED_AT)).toBe(empty);
+  });
+
+  it("leaves prior attempts untouched", () => {
+    const priorAttempts = [
+      makeResult({ startedAt: "T2", output: "attempt-2" }),
+      makeResult({ startedAt: "T1", output: "attempt-1", noVerdictBudgetRearmedAt: "2026-10-01T00:00:00.000Z" }),
+    ];
+    const rows = [makeResult({ startedAt: "T3", output: "attempt-3", priorAttempts })];
+
+    const rearmed = rearmNoVerdictRecoveryBudget(rows, REARMED_AT)!;
+
+    expect(rearmed[0].noVerdictBudgetRearmedAt).toBe(REARMED_AT);
+    expect(rearmed[0].priorAttempts).toBe(priorAttempts);
+    expect(rearmed[0].priorAttempts?.map((attempt) => attempt.noVerdictBudgetRearmedAt)).toEqual([undefined, "2026-10-01T00:00:00.000Z"]);
+  });
+
+  it("overwrites an older marker with the new time", () => {
+    const rearmed = rearmNoVerdictRecoveryBudget([makeResult({ noVerdictBudgetRearmedAt: "2026-10-01T00:00:00.000Z" })], REARMED_AT)!;
+    expect(rearmed[0].noVerdictBudgetRearmedAt).toBe(REARMED_AT);
+  });
+
+  it("travels into history when the next attempt replaces the stamped row", () => {
+    const stamped = rearmNoVerdictRecoveryBudget([makeResult({ startedAt: "T1" })], REARMED_AT)!;
+
+    const [next] = upsertWorkflowStepResult(stamped, makeResult({ startedAt: "T2" }));
+
+    expect(next.noVerdictBudgetRearmedAt).toBeUndefined();
+    expect(next.priorAttempts?.map((attempt) => attempt.noVerdictBudgetRearmedAt)).toEqual([REARMED_AT]);
   });
 });

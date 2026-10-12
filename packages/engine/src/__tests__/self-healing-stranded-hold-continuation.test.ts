@@ -17,7 +17,9 @@ vi.mock("../util/run-audit.js", async (importOriginal) => ({
   createRunAuditor: vi.fn(() => ({ database: recordRunAuditEventMock })),
 }));
 
+import { buildManualRetryResetPatch, buildManualRetryResetPatchIfCurrent } from "@fusion/core";
 import { SelfHealingManager } from "../self-healing.js";
+import { isRateLimitedNoVerdictResult } from "../external-block/provider-rate-limit-deferral.js";
 import { InProcessRuntime } from "../runtimes/in-process-runtime.js";
 import { WorkflowGraphExecutor } from "../workflows/workflow-graph-executor.js";
 import { evaluateStrandedHoldContinuation, planReviewInputFingerprint } from "../plan-review-continuation.js";
@@ -83,6 +85,7 @@ const CHANGED_PLAN = `${PLAN}\n\n### Step 1: More work`;
 const planIdentity = planReviewInputFingerprint(PLAN)!;
 const RATE_LIMIT = { origin: "model-provider", code: "RATE_LIMIT" } as const;
 const LOCK_UNAVAILABLE = "Plan approved but spec lock unavailable: mission-missing (mission).";
+const RETRY_REMEDY = "Retry the task to start a fresh review budget: dashboard Retry re-plans the card, while `fn task retry` and the `fn_task_retry` tool keep the plan and its review history.";
 
 /** One Plan Review attempt that ended without a verdict on the unchanged plan. */
 function noVerdictFailure(sequence: number, overrides: Partial<WorkflowStepResult> = {}): WorkflowStepResult {
@@ -310,8 +313,8 @@ describe("FN-8592 stranded hold continuation recovery", () => {
       expect(task.error).toContain(failureText);
       expect(task.error).toContain("no verdict after 3 automatic retries on the unchanged plan");
       expect(task.error).toContain("'holding-area'");
-      expect(task.error).toContain("Retry the task from the dashboard to re-plan it with a fresh review budget");
-      expect(task.error).toContain("a changed plan also starts a fresh budget");
+      expect(task.error).toContain(RETRY_REMEDY);
+      expect(task.error).toContain("A changed plan also starts a fresh budget.");
       expect(task.column).toBe("holding-area");
       expect(store.moveTask).not.toHaveBeenCalled();
       expect(store.logEntry).toHaveBeenCalledOnce();
@@ -551,7 +554,169 @@ describe("FN-8592 stranded hold continuation recovery", () => {
       expect(store.moveTask).not.toHaveBeenCalled();
       expect(task.status).toBe("failed");
       expect(task.error).toContain("reviewer session ended (retry 3)");
-      expect(task.error).toContain("Retry the task from the dashboard to re-plan it with a fresh review budget");
+      expect(task.error).toContain(RETRY_REMEDY);
+    });
+
+    describe("operator retry", () => {
+      /** Sweeps the card; every seeded review dies without a verdict, written through the graph recorder as a lease and then the failure. */
+      function reviewLoop(task: Task, store: any) {
+        const graphWriter = {
+          store,
+          getRunContextFor: () => undefined,
+          readTaskArtifact: (taskId: string, key: string) => readTaskArtifact({ store }, taskId, key),
+        } as never;
+        let attempt = 0;
+        const failSeededReview = async (overrides: Partial<WorkflowStepResult> = {}) => {
+          attempt += 1;
+          for (const item of store._items as WorkflowWorkItem[]) item.state = "failed";
+          const startedAt = new Date(Date.UTC(2026, 9, 11, 12, attempt * 5)).toISOString();
+          const lease = { workflowStepId: "plan-review", workflowStepName: "Plan Review", phase: "pre-merge", status: "pending", startedAt } as WorkflowStepResult;
+          await persistWorkflowStepResultWithOutcome(graphWriter, task.id, lease);
+          await persistWorkflowStepResultWithOutcome(graphWriter, task.id, {
+            ...lease,
+            status: "failed",
+            completedAt: new Date(Date.parse(startedAt) + 16_000).toISOString(),
+            output: `Plan Review failed before producing a verdict: reviewer session ended (retry ${attempt})`,
+            ...overrides,
+          }, { requireAttemptStartedAt: startedAt });
+        };
+        const sweep = async (manager: SelfHealingManager, failures: Array<Partial<WorkflowStepResult>>) => {
+          const seededPerPass: number[] = [];
+          for (const failure of failures) {
+            const seeded = await manager.reconcileStrandedHoldContinuations();
+            seededPerPass.push(seeded);
+            if (seeded > 0) await failSeededReview(failure);
+          }
+          return seededPerPass;
+        };
+        return { sweep };
+      }
+      const genuine = (passes: number): Array<Partial<WorkflowStepResult>> => Array.from({ length: passes }, () => ({}));
+      /** The write `fn task retry` and the extension `fn_task_retry` tool apply to a failed card. */
+      const operatorRetry = (task: Task, store: any) => {
+        const snapshot = { ...task };
+        return store.updateTaskAtomic(task.id, (live: Task) => buildManualRetryResetPatchIfCurrent(live, snapshot, {
+          status: null, error: null, ...buildManualRetryResetPatch({ resetMergeRetries: true }),
+        }));
+      };
+      const exhaustedAudits = () => recordRunAuditEventMock.mock.calls.filter(([event]: any[]) =>
+        event.type === "task:reconcile-stranded-hold-continuation-no-action" && event.metadata.reason === "no-verdict-recovery-exhausted");
+      const markers = (row: WorkflowStepResult) => [row, ...(row.priorAttempts ?? [])].map((attempt) => attempt.noVerdictBudgetRearmedAt !== undefined);
+
+      it("gives the card one fresh attempt plus three retries, keeps its history, and a restart does not reset the count", async () => {
+        const { task, store } = await holdCard({ workflowStepResults: [planReviewRow(0)] });
+        const loop = reviewLoop(task, store);
+        let manager = new SelfHealingManager(store, { rootDir: root });
+
+        expect(await loop.sweep(manager, genuine(5))).toEqual([1, 1, 1, 0, 0]);
+        expect(task.status).toBe("failed");
+        const parkedRow = task.workflowStepResults![0]!;
+        expect(parkedRow.priorAttempts).toHaveLength(3);
+
+        await operatorRetry(task, store);
+
+        expect(task.status).toBeNull();
+        expect(task.error).toBeNull();
+        expect(task.workflowStepResults).toEqual([{ ...parkedRow, noVerdictBudgetRearmedAt: expect.any(String) }]);
+
+        const seededAfterRetry = await loop.sweep(manager, genuine(2));
+        manager = new SelfHealingManager(store, { rootDir: root });
+        seededAfterRetry.push(...await loop.sweep(manager, genuine(4)));
+
+        expect(seededAfterRetry).toEqual([1, 1, 1, 1, 0, 0]);
+        expect(store.seedStrandedPlanReviewContinuation).toHaveBeenCalledTimes(7);
+        expect(task.status).toBe("failed");
+        expect(task.error).toContain("reviewer session ended (retry 7)");
+        expect(task.error).toContain("no verdict after 3 automatic retries on the unchanged plan");
+        expect(task.error).toContain(RETRY_REMEDY);
+        expect(task.column).toBe("holding-area");
+        expect(store.moveTask).not.toHaveBeenCalled();
+        // History holds the three attempts recorded after the retry, then the re-armed attempt, then every attempt from before the retry, unchanged.
+        const [latest] = task.workflowStepResults!;
+        const { priorAttempts: historyBeforeRetry, ...parkedAttempt } = parkedRow;
+        expect(markers(latest!)).toEqual([false, false, false, false, true, false, false, false]);
+        expect(latest!.priorAttempts!.slice(0, 3).map((attempt) => attempt.output)).toEqual([
+          expect.stringContaining("(retry 6)"), expect.stringContaining("(retry 5)"), expect.stringContaining("(retry 4)"),
+        ]);
+        expect(latest!.priorAttempts!.slice(3)).toEqual([
+          { ...parkedAttempt, noVerdictBudgetRearmedAt: expect.any(String) },
+          ...historyBeforeRetry!,
+        ]);
+      });
+
+      it("audits the second stop in the same engine process", async () => {
+        const { task, store, manager } = await holdCard({ workflowStepResults: [planReviewRow(0)] });
+        const loop = reviewLoop(task, store);
+
+        await loop.sweep(manager, genuine(5));
+        expect(exhaustedAudits()).toHaveLength(1);
+        await operatorRetry(task, store);
+        expect(await loop.sweep(manager, genuine(6))).toEqual([1, 1, 1, 1, 0, 0]);
+
+        expect(exhaustedAudits()).toHaveLength(2);
+        expect(store.recordRunAuditEvent.mock.calls.filter(([event]: any[]) => event.mutationType === "auto-recovery:retry-budget-escalated")).toHaveLength(2);
+        expect(task.status).toBe("failed");
+      });
+
+      it("is the only thing that re-arms: sweeps and restarts never mark a row or seed a parked card", async () => {
+        const { task, store, manager } = await holdCard({ workflowStepResults: [planReviewRow(0)] });
+        const loop = reviewLoop(task, store);
+
+        expect(await loop.sweep(manager, genuine(4))).toEqual([1, 1, 1, 0]);
+        expect(await loop.sweep(manager, genuine(3))).toEqual([0, 0, 0]);
+        expect(await loop.sweep(new SelfHealingManager(store, { rootDir: root }), genuine(2))).toEqual([0, 0]);
+
+        expect(markers(task.workflowStepResults![0]!)).toEqual([false, false, false, false]);
+        expect(store.seedStrandedPlanReviewContinuation).toHaveBeenCalledTimes(3);
+        expect(task.status).toBe("failed");
+      });
+
+      it("re-arms once per retry, so a second retry after the second stop works the same way", async () => {
+        const { task, store, manager } = await holdCard({ workflowStepResults: [planReviewRow(0)] });
+        const loop = reviewLoop(task, store);
+        await loop.sweep(manager, genuine(4));
+        await operatorRetry(task, store);
+        await loop.sweep(manager, genuine(5));
+        expect(task.status).toBe("failed");
+
+        await operatorRetry(task, store);
+
+        expect(await loop.sweep(manager, genuine(6))).toEqual([1, 1, 1, 1, 0, 0]);
+        expect(task.status).toBe("failed");
+        // Both re-armed attempts are still in history; counting stops at the newer one.
+        expect(markers(task.workflowStepResults![0]!)).toEqual([false, false, false, false, true, false, false, false, true, false, false, false]);
+      });
+
+      it("leaves a rate-limited failure outside the budget before and after the retry", async () => {
+        const { task, store, manager } = await holdCard({
+          status: "failed", error: "Plan Review recovery stopped",
+          workflowStepResults: [planReviewRow(3, { providerFailure: RATE_LIMIT })],
+        } as Partial<Task>);
+        const loop = reviewLoop(task, store);
+
+        await operatorRetry(task, store);
+
+        const [marked] = task.workflowStepResults!;
+        expect(marked!.noVerdictBudgetRearmedAt).toEqual(expect.any(String));
+        expect(isRateLimitedNoVerdictResult(marked)).toBe(true);
+        // A rate-limited attempt after the retry spends nothing: the card still gets one fresh attempt plus three retries of genuine failures.
+        expect(await loop.sweep(manager, [{}, { providerFailure: RATE_LIMIT }, {}, {}, {}, {}])).toEqual([1, 1, 1, 1, 1, 0]);
+        expect(isRateLimitedNoVerdictResult(task.workflowStepResults![0])).toBe(false);
+        expect(task.status).toBe("failed");
+      });
+
+      it("handles a retried card whose latest failure is a spec-lock rejection exactly like an untouched one", async () => {
+        const lockRow = () => planReviewRow(3, { output: LOCK_UNAVAILABLE, notes: LOCK_UNAVAILABLE });
+        const untouched = await holdCard({ workflowStepResults: [lockRow()] });
+        const retried = await holdCard({ status: "failed", error: "stopped", workflowStepResults: [lockRow()] } as Partial<Task>);
+
+        await operatorRetry(retried.task, retried.store);
+
+        expect(retried.task.workflowStepResults![0]!.noVerdictBudgetRearmedAt).toEqual(expect.any(String));
+        await expect(untouched.manager.reconcileStrandedHoldContinuations()).resolves.toBe(1);
+        await expect(retried.manager.reconcileStrandedHoldContinuations()).resolves.toBe(1);
+        expect(retried.task.status).toBeNull();
+      });
     });
 
     it("reports the spent budget from the evaluator only for the current plan identity, after every other guard", () => {

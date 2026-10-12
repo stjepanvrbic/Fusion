@@ -8,9 +8,13 @@ const core = vi.hoisted(() => ({
 }));
 vi.mock("@fusion/core", () => core);
 
+// The core module is mocked above, so the operator retry write and the result recorder are taken from their source files.
+import { buildManualRetryResetPatch, buildManualRetryResetPatchIfCurrent } from "../../../core/src/tasks/manual-retry-reset.js";
+import { upsertWorkflowStepResult } from "../../../core/src/workflows/workflow-step-results.js";
 import {
   hasExhaustedNoVerdictRecovery,
   hasExhaustedPlanReviewNoVerdictRecovery,
+  isFailedNoVerdictPreMergeReviewResult,
   NO_VERDICT_RECOVERY_RETRY_LIMIT,
   rerouteFailedNoVerdictPreMergeGateToReview,
   rerouteUnrunPreMergeGateToReview,
@@ -289,5 +293,145 @@ describe("hold-lane Plan Review no-verdict budget", () => {
       ...reviewFailure, priorAttempts: [reviewFailure, reviewFailure, { ...reviewFailure, providerFailure: rateLimit }],
     })).toBe(false);
     expect(hasExhaustedNoVerdictRecovery({ ...reviewFailure, verdict: "REVISE", priorAttempts: [reviewFailure, reviewFailure, reviewFailure] })).toBe(false);
+  });
+});
+
+describe("operator re-arm of the no-verdict budget", () => {
+  const REARMED_AT = "2026-10-12T04:00:00.000Z";
+  const lockText = "Plan approved but spec lock unavailable: mission-missing (mission).";
+  const rateLimit = { origin: "model-provider", code: "RATE_LIMIT" };
+  const lanes = [
+    ["review lane", { workflowStepId: "code-review", status: "failed", reviewInputFingerprint: "diff", reviewedCommitSha: "sha" },
+      (result: any) => hasExhaustedNoVerdictRecovery(result)],
+    ["hold lane", { workflowStepId: "plan-review", status: "failed", reviewInputFingerprint: "plan" },
+      (result: any) => hasExhaustedPlanReviewNoVerdictRecovery(result, "plan")],
+  ] as const;
+
+  describe.each(lanes)("%s", (_lane, failure, exhausted) => {
+    const failures = (count: number) => Array.from({ length: count }, () => ({ ...failure }));
+    const marked = { ...failure, noVerdictBudgetRearmedAt: REARMED_AT };
+
+    it("reports exhaustion for unmarked history exactly as before", () => {
+      expect(exhausted({ ...failure, priorAttempts: failures(3) })).toBe(true);
+      expect(exhausted({ ...failure, priorAttempts: failures(2) })).toBe(false);
+    });
+
+    it("does not report exhaustion when the latest row is marked", () => {
+      expect(exhausted({ ...marked, priorAttempts: failures(3) })).toBe(false);
+      expect(exhausted({ ...marked, priorAttempts: failures(5) })).toBe(false);
+    });
+
+    it.each([
+      [0, false],
+      [2, false],
+      [3, true],
+      [4, true],
+    ])("counts %i failures recorded after the marked attempt (exhausted: %s)", (newer, expected) => {
+      expect(exhausted({ ...failure, priorAttempts: [...failures(newer), marked] })).toBe(expected);
+    });
+
+    it("ignores unmarked failures older than the marked attempt", () => {
+      expect(exhausted({ ...failure, priorAttempts: [...failures(1), marked, ...failures(3)] })).toBe(false);
+      expect(exhausted({ ...failure, priorAttempts: [marked, ...failures(4)] })).toBe(false);
+    });
+
+    it("stops at the newest of several marked attempts", () => {
+      const older = { ...failure, noVerdictBudgetRearmedAt: "2026-10-11T00:00:00.000Z" };
+      expect(exhausted({ ...failure, priorAttempts: [...failures(2), marked, ...failures(1), older] })).toBe(false);
+      expect(exhausted({ ...failure, priorAttempts: [...failures(3), marked, older] })).toBe(true);
+    });
+
+    it("counts the retained attempts when the marked attempt has left the history window", () => {
+      expect(exhausted({ ...failure, priorAttempts: failures(5) })).toBe(true);
+    });
+  });
+
+  it("keeps a marked rate-limited Plan Review out of the budget", () => {
+    const failure = { workflowStepId: "plan-review", status: "failed", reviewInputFingerprint: "plan" } as any;
+    const latest = { ...failure, providerFailure: rateLimit, noVerdictBudgetRearmedAt: REARMED_AT, priorAttempts: [failure, failure, failure] };
+    expect(hasExhaustedPlanReviewNoVerdictRecovery(latest, "plan")).toBe(false);
+    // A rate-limited attempt recorded after the marked one still spends nothing.
+    expect(hasExhaustedPlanReviewNoVerdictRecovery({
+      ...failure,
+      priorAttempts: [failure, failure, { ...failure, providerFailure: rateLimit }, { ...failure, noVerdictBudgetRearmedAt: REARMED_AT }],
+    }, "plan")).toBe(false);
+  });
+
+  it.each(["output", "notes"])("keeps a marked spec-lock failure (%s) out of the no-verdict reroute", async (field) => {
+    const lockFailure = {
+      workflowStepId: "security-review", reviewKind: "plan", status: "failed", noVerdictBudgetRearmedAt: REARMED_AT,
+      [field]: lockText,
+    } as any;
+    expect(isFailedNoVerdictPreMergeReviewResult(lockFailure, required)).toBe(false);
+    expect(hasExhaustedPlanReviewNoVerdictRecovery({ ...lockFailure, reviewInputFingerprint: "plan" }, "plan")).toBe(false);
+
+    const fake = store();
+    await expect(rerouteFailedNoVerdictPreMergeGateToReview(fake, subject({ workflowStepResults: [lockFailure] }), {
+      requiredPreMergeStepIds: required, mergeContent: singular,
+    })).resolves.toMatchObject({ rerouted: false, reason: "no-failed-no-verdict-gate" });
+    expect(fake.seedWorkspaceCodeReviewContinuationIfIdle).not.toHaveBeenCalled();
+  });
+
+  it("lets an operator retry re-seed a review-lane card stopped by the limit, then stops it again after three more failures", async () => {
+    const attempt = (sequence: number) => ({
+      workflowStepId: "code-review", workflowStepName: "Code Review", phase: "pre-merge", status: "failed",
+      startedAt: `2026-10-12T0${sequence}:00:00.000Z`, output: `reviewer session ended (attempt ${sequence})`,
+      reviewInputFingerprint: "diff", reviewedCommitSha: "sha",
+      findings: [{ id: "finding-1", title: "Missing guard", body: "Validate the input." }],
+    }) as any;
+    const parked = subject({
+      status: "failed",
+      error: "Review recovery stopped at 'code-review': reviewer session ended (attempt 4) Correct the review input or provider failure before retrying.",
+      steps: [{ name: "Implement", status: "done" }],
+      workflowStepResults: [{ ...attempt(4), priorAttempts: [attempt(3), attempt(2), attempt(1)] }],
+    });
+    const options = { requiredPreMergeStepIds: required, mergeContent: singular };
+    const beforeRetry = store();
+    await expect(rerouteFailedNoVerdictPreMergeGateToReview(beforeRetry, parked, options))
+      .resolves.toMatchObject({ rerouted: false, reason: "no-failed-no-verdict-gate" });
+    expect(beforeRetry.seedWorkspaceCodeReviewContinuationIfIdle).not.toHaveBeenCalled();
+
+    // The write every operator retry surface applies to the live row.
+    const exhaustedRow = parked.workflowStepResults[0];
+    Object.assign(parked, buildManualRetryResetPatchIfCurrent(parked, { ...parked }, {
+      status: null, error: null, ...buildManualRetryResetPatch({ resetMergeRetries: true }),
+    }));
+
+    expect(parked.workflowStepResults).toEqual([{ ...exhaustedRow, noVerdictBudgetRearmedAt: expect.any(String) }]);
+    const afterRetry = store();
+    await expect(rerouteFailedNoVerdictPreMergeGateToReview(afterRetry, parked, options))
+      .resolves.toMatchObject({ rerouted: true, reason: "seeded", nodeId: "code-review", workflowStepId: "code-review" });
+    expect(afterRetry.seedWorkspaceCodeReviewContinuationIfIdle).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: parked.id, nodeId: "code-review", runId: expect.stringContaining("failed-no-verdict-pre-merge-gate-reseed"),
+    }));
+    expect(afterRetry.moveTask).not.toHaveBeenCalled();
+    expect(parked.workflowStepResults[0].findings).toEqual(exhaustedRow.findings);
+    expect(parked.workflowStepResults[0].priorAttempts).toEqual(exhaustedRow.priorAttempts);
+
+    // The re-seeded review and each automatic retry die without a verdict on the same input.
+    const candidateAfterFailure: boolean[] = [];
+    for (const sequence of [5, 6, 7, 8]) {
+      parked.workflowStepResults = upsertWorkflowStepResult(parked.workflowStepResults, attempt(sequence));
+      candidateAfterFailure.push(isFailedNoVerdictPreMergeReviewResult(parked.workflowStepResults[0], required));
+    }
+    expect(candidateAfterFailure).toEqual([true, true, true, false]);
+    expect(hasExhaustedNoVerdictRecovery(parked.workflowStepResults[0])).toBe(true);
+    const afterSecondExhaustion = store();
+    await expect(rerouteFailedNoVerdictPreMergeGateToReview(afterSecondExhaustion, parked, options))
+      .resolves.toMatchObject({ rerouted: false, reason: "no-failed-no-verdict-gate" });
+    // The re-armed attempt and the attempts before it are still on the card (history holds five).
+    expect(parked.workflowStepResults[0].priorAttempts.map((entry: any) => entry.output)).toEqual([
+      "reviewer session ended (attempt 7)", "reviewer session ended (attempt 6)", "reviewer session ended (attempt 5)",
+      "reviewer session ended (attempt 4)", "reviewer session ended (attempt 3)",
+    ]);
+    expect(parked.workflowStepResults[0].priorAttempts[3].noVerdictBudgetRearmedAt).toEqual(expect.any(String));
+  });
+
+  it("makes a marked exhausted review failure a reroute candidate again", () => {
+    const failure = { workflowStepId: "code-review", status: "failed" } as any;
+    expect(isFailedNoVerdictPreMergeReviewResult({ ...failure, priorAttempts: [failure, failure, failure] }, required)).toBe(false);
+    expect(isFailedNoVerdictPreMergeReviewResult({
+      ...failure, noVerdictBudgetRearmedAt: REARMED_AT, priorAttempts: [failure, failure, failure],
+    }, required)).toBe(true);
   });
 });

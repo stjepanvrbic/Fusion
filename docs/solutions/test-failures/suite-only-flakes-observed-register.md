@@ -1678,3 +1678,26 @@ A further timeout of a case of this file is an immediate same-commit file-level 
 - **Sibling check:** `packages/dashboard/src/routes/__tests__/register-project-git-readiness.test.ts` uses the same construction (mocked registration calling real readiness) under a 15 s budget. Its slowest case in the `windows-lane-reports-dashboard` artifacts of runs 151, 147 and 146 took 691, 701 and 1,058 ms, far below half its budget, so it is unchanged.
 - **Outstanding post-landing check:** the Windows CLI leg of the next Full Suite run after this lands should show every case of this file well under 1 s.
 - **Escalation rule:** a further timeout of a case of this file is an immediate same-commit file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedCliTests`. It is never a Windows ledger entry, a widened timeout or a retry.
+
+### Record 2026-10-12: `extension.test.ts` local Windows 5 s timeout (first sighting)
+
+<!--
+FNXC:TestFlakeRegister 2026-10-12-04:30:
+One case of the CLI extension suite exceeded the default 5 s test timeout once on a local Windows host while the whole file ran against PostgreSQL in Docker. The case covers feature unlinking, which the change under verification does not touch, and it passed in the whole-file run just before. The file keeps 94 other running cases, so this is recorded as a first sighting instead of quarantined. A second sighting of the case is an on-sight file-level quarantine.
+-->
+
+- **File:** `packages/cli/src/__tests__/extension.test.ts` (not in `scripts/lib/test-quarantine.json`, and not in the merge gate).
+- **Exact test:** `fn pi extension (runnable structured-output regression slice) > fn_feature_repoint_task / fn_feature_unlink_task > unlinks a linked feature (clearing taskId and demoting to defined) and errors on an already-unlinked feature`. It hit the default 5 s test timeout with a case duration of 5,052 ms.
+- **Sighting:** one run of the whole file together with `task-retry.test.ts` at `43d7c22b3` on a local Windows 11 host (Node 24.12, PostgreSQL 16.15 in a Docker container reached through a published port, `FUSION_PG_TEST_REQUIRED=1`). The other 94 running cases of the file passed. Its 93 legacy-suite cases are gated off by default and did not run.
+- **Reproduction data** (same host, 2026-10-12 UTC):
+
+  | start | files | tree | this file | wall |
+  |---|---|---|---|---:|
+  | 04:09 | `task-retry.test.ts`, `extension.test.ts` | `263222122` plus the CLI test additions later committed as `24018e7e5` | 2 failed, 93 passed; the failing names were not captured | 192 s |
+  | 04:14 | `extension.test.ts`, filtered to the `fn_task_retry` group | same | 22 of 22 passed | 56 s |
+  | 04:23 | the two files plus `commands/__tests__/task.test.ts` | `43d7c22b3` | 95 of 95 passed | 109 s |
+  | 04:25 | `task-retry.test.ts`, `extension.test.ts` | `43d7c22b3` | this case failed, 94 passed | 122 s |
+
+  In the failing run the eight slowest passing cases of the file took 2,420 to 3,945 ms. The sibling case of the same group, `re-points a linked feature to a second delivery task atomically`, took 2,799 ms.
+- **Mechanism:** not measured. The trees under test changed the operator retry path and the review retry counting; the feature link and unlink tools call neither. Cases of this file ran at 2.4 to 3.9 s against the 5 s limit in the same run, so the margin on this host is small. Not measured: host load during the run, and where the case spent its time. The two failures of the 04:09 run cannot be attributed to a case, so they count as no sighting of any named test.
+- **Escalation rule:** a second sighting of this case is an on-sight file-level quarantine in `scripts/lib/test-quarantine.json` with its matching vitest exclude. No widened timeout and no retry.

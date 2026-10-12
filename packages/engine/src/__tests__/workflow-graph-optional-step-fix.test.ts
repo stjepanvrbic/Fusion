@@ -869,6 +869,76 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
     });
   });
 
+  it("still parks a deterministic spec-lock failure whose row an operator retry re-armed", async () => {
+    const store = createMockStore();
+    const lockText = "Plan approved but spec lock unavailable: mission-missing (mission).";
+    const liveTask = task({ column: "in-review", workflowStepResults: [{
+      workflowStepId: "plan-review", status: "failed", notes: lockText, noVerdictBudgetRearmedAt: "2026-10-12T04:00:00.000Z",
+    }] });
+    store.getTask.mockResolvedValue(liveTask);
+    store.updateTaskAtomic = vi.fn(async (_id, update) => { const patch = update(liveTask); return patch ? Object.assign(liveTask, patch) : null; });
+    store.getSettings.mockResolvedValue({ maxPostReviewFixes: 3 });
+    const executor = new TaskExecutor(store, "/tmp/test");
+    await expect((executor as any).requestPreMergeOptionalStepFix(liveTask.id, liveTask, {
+      nodeId: "plan-review", stepName: "Plan Review", phase: "pre-merge", status: "failed", feedback: lockText,
+    })).resolves.toBe(false);
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(liveTask).toMatchObject({ status: "failed", error: expect.stringContaining("Review recovery stopped at 'plan-review'") });
+  });
+
+  describe("exhausted no-verdict Code Review park", () => {
+    const lostReview = { workflowStepId: "code-review", workflowStepName: "Code Review", phase: "pre-merge" as const, status: "failed" as const, output: "reviewer session ended" };
+    async function requestFix(latest: Record<string, unknown>) {
+      const store = createMockStore();
+      const liveTask = task({
+        column: "in-review",
+        steps: [{ name: "Implement", status: "done" }],
+        workflowStepResults: [{ ...lostReview, ...latest }],
+      } as Partial<Task>);
+      store.getTask.mockResolvedValue(liveTask);
+      store.updateTaskAtomic = vi.fn(async (_id, update) => { const patch = await update(liveTask); return patch ? Object.assign(liveTask, patch) : null; });
+      store.getSettings.mockResolvedValue({ maxPostReviewFixes: 3 });
+      const executor = new TaskExecutor(store, "/tmp/test");
+      const outcome = await (executor as any).requestPreMergeOptionalStepFix(liveTask.id, liveTask, {
+        nodeId: "code-review", stepName: "Code Review", phase: "pre-merge", status: "failed", feedback: lostReview.output,
+      }).then((value: unknown) => ({ value }), (error: Error) => ({ error: error.constructor.name }));
+      return { store, liveTask, outcome };
+    }
+    const parkLogged = (store: ReturnType<typeof createMockStore>) => store.logEntry.mock.calls
+      .some(([, message]: [string, string]) => String(message).startsWith("Review recovery stopped"));
+
+    it("parks a row whose budget is spent", async () => {
+      const { store, liveTask, outcome } = await requestFix({ priorAttempts: [lostReview, lostReview, lostReview] });
+
+      expect(outcome).toEqual({ value: false });
+      expect(liveTask).toMatchObject({ status: "failed", error: expect.stringContaining("Review recovery stopped at 'code-review'") });
+      expect(parkLogged(store)).toBe(true);
+      expect(store.moveTask).not.toHaveBeenCalled();
+    });
+
+    it("does not park a spent row that an operator retry re-armed, and treats it like a row with budget left", async () => {
+      const rearmed = await requestFix({ priorAttempts: [lostReview, lostReview, lostReview], noVerdictBudgetRearmedAt: "2026-10-12T04:00:00.000Z" });
+      const withBudget = await requestFix({ priorAttempts: [lostReview, lostReview] });
+
+      for (const { store, liveTask } of [rearmed, withBudget]) {
+        expect(String(liveTask.error ?? "")).not.toContain("Review recovery stopped");
+        expect(parkLogged(store)).toBe(false);
+      }
+      expect(rearmed.outcome).toEqual(withBudget.outcome);
+      expect(rearmed.liveTask.status).toBe(withBudget.liveTask.status);
+      expect(rearmed.liveTask.column).toBe(withBudget.liveTask.column);
+      expect(rearmed.store.moveTask.mock.calls).toEqual(withBudget.store.moveTask.mock.calls);
+    });
+
+    it("parks again once three more attempts fail after the re-armed one", async () => {
+      const marked = { ...lostReview, noVerdictBudgetRearmedAt: "2026-10-12T04:00:00.000Z" };
+      const { liveTask, outcome } = await requestFix({ priorAttempts: [lostReview, lostReview, lostReview, marked, lostReview] });
+
+      expect(outcome).toEqual({ value: false });
+      expect(liveTask).toMatchObject({ status: "failed", error: expect.stringContaining("Review recovery stopped at 'code-review'") });
+    });
+  });
+
   it("self-healing never sends deterministic plan-lock failures back to implementation", async () => {
     const store = createMockStore();
     const liveTask = task({ column: "in-review", workflowStepResults: [{ workflowStepId: "plan-review", status: "failed", output: "Plan approved but spec lock unavailable: mission-missing (mission)." }] });

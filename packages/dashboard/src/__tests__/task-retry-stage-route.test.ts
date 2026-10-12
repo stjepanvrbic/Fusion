@@ -607,6 +607,70 @@ describe("POST /tasks/:id/retry", () => {
     expect(staleResponse.status).toBe(200);
   });
 
+  /*
+  FNXC:ReviewRecovery 2026-10-12-04:20:
+  Dashboard Retry of a card stopped by a no-verdict review limit must give it a fresh review retry budget on both of its paths.
+  The in-place stage restart does so by discarding the stage's review rows; the legacy fallback keeps the history and re-arms the failed row.
+  */
+  describe("card stopped by a no-verdict review limit", () => {
+    /** A review row that failed without a verdict four times on one input: the first attempt plus three automatic retries. */
+    const exhaustedReviewRow = (workflowStepId: string, input: Record<string, string>) => {
+      const attempt = (sequence: number) => ({
+        workflowStepId, phase: "pre-merge" as const, status: "failed" as const,
+        startedAt: `2026-10-12T0${sequence}:00:00.000Z`, output: `Review failed before producing a verdict (attempt ${sequence})`, ...input,
+      });
+      return { ...attempt(4), priorAttempts: [attempt(3), attempt(2), attempt(1)] };
+    };
+
+    it("re-plans a hold-lane card through the stage restart, which discards its Plan Review history", async () => {
+      const root = await mkdtemp(join(tmpdir(), "fusion-retry-no-verdict-plan-"));
+      const prompt = await createPrompt(root);
+      const ir = structuredClone(RESTART_IR) as unknown as { nodes: Array<Record<string, unknown>>; edges: Array<Record<string, unknown>> };
+      ir.nodes.push({ id: "plan-review", kind: "prompt", column: "planning" });
+      ir.edges = [
+        { from: "start", to: "plan" }, { from: "plan", to: "plan-review" }, { from: "plan-review", to: "implement" },
+        { from: "implement", to: "code-review" }, { from: "code-review", to: "post-review" },
+      ];
+      const row = taskFixture({
+        status: "failed",
+        error: "Plan Review recovery stopped in 'planning': no verdict after 3 automatic retries on the unchanged plan.",
+        workflowStepResults: [exhaustedReviewRow("plan-review", { reviewInputFingerprint: "plan" })],
+      });
+      const { store, calls } = createRestartStore(root, row, { ir });
+
+      const response = await postRetry(createApp(store));
+
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(row).toMatchObject({ column: "planning", status: "needs-replan", error: null });
+      expect(row.workflowStepResults).toEqual([]);
+      await expect(readFile(prompt, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(calls).toEqual(["fence", "retire", "patch", "arm", "unfence"]);
+    });
+
+    it("re-arms a review-lane card through the legacy fallback and keeps its review history", async () => {
+      const root = await mkdtemp(join(tmpdir(), "fusion-retry-no-verdict-review-"));
+      const exhausted = exhaustedReviewRow("code-review", { reviewInputFingerprint: "diff", reviewedCommitSha: "abc123" });
+      const row = taskFixture({
+        column: "in-review",
+        status: "failed",
+        error: "Review recovery stopped at 'code-review': Review failed before producing a verdict (attempt 4) Correct the review input or provider failure before retrying.",
+        steps: [{ name: "Implement", status: "done" }],
+        mergeRetries: 2,
+        workflowStepResults: [exhausted],
+      });
+      const { store, calls } = createRestartStore(root, row, { ir: LEGACY_V1_IR });
+
+      const response = await postRetry(createApp(store));
+
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(calls).toEqual([]);
+      expect(store.pauseTask).not.toHaveBeenCalled();
+      expect(row).toMatchObject({ column: "in-review", status: null, error: null, mergeRetries: 0 });
+      expect(row.workflowStepResults).toEqual([{ ...exhausted, noVerdictBudgetRearmedAt: expect.any(String) }]);
+      expect(row.workflowStepResults![0]!.priorAttempts).toEqual(exhausted.priorAttempts);
+    });
+  });
+
   it("does not route the removed restart-stage endpoint", async () => {
     const root = await mkdtemp(join(tmpdir(), "fusion-retry-route-removed-"));
     const { store } = createRestartStore(root, taskFixture());

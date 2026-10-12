@@ -285,6 +285,24 @@ export function archiveTerminalWorkflowStepFailures(
   });
 }
 
+/**
+ * FNXC:ReviewRecovery 2026-10-12-03:50:
+ * An operator retry of a card stopped by a no-verdict review limit must get a fresh retry budget while the earlier attempts stay on the card as history.
+ * Stamp every current pre-merge review result that failed without a verdict and is not superseded; budget counting starts after the newest stamped attempt.
+ * Rate-limited and plan-lock failures are stamped like any other, because their handling never reads the count.
+ * `priorAttempts` entries are left as they are, and the input is returned by reference when nothing qualifies.
+ * Callers must be operator retry writes only: an automatic path that stamped would reopen the unbounded retry loop.
+ */
+export function rearmNoVerdictRecoveryBudget(
+  results: WorkflowStepResult[] | undefined,
+  rearmedAt: string,
+): WorkflowStepResult[] | undefined {
+  const qualifies = (result: WorkflowStepResult) => (result.phase ?? "pre-merge") === "pre-merge"
+    && result.status === "failed" && result.verdict === undefined && result.supersededAt == null;
+  if (!results?.some(qualifies)) return results;
+  return results.map((result) => (qualifies(result) ? { ...result, noVerdictBudgetRearmedAt: rearmedAt } : result));
+}
+
 export function isArchivedRemediationCarrier(result: WorkflowStepResult): boolean {
   return result.remediationArchivedAt != null;
 }

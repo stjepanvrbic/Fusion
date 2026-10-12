@@ -120,6 +120,10 @@ FNXC:ReviewRecovery 2026-10-04-02:24:
 A deterministic spec-lock rejection is not a lost dispatch. Never spend another reviewer call on
 unchanged parser input. Bound genuine lost-dispatch recovery to three retries per recorded review
 input using durable history, so restarting the engine cannot reset the budget.
+
+FNXC:ReviewRecovery 2026-10-12-03:55:
+An operator retry is the only thing that re-arms the budget. It stamps `noVerdictBudgetRearmedAt` on the failed attempt, and counting starts after the newest stamped attempt, so the card gets one fresh attempt plus the automatic retries while every earlier attempt stays as history.
+No automatic path writes the marker. History is bounded (five attempts, fifteen for Plan Review), so a marker pushed out of that window falls back to counting the retained attempts, as for a row that was never re-armed.
 */
 export function isUnavailablePlanLockResult(result: Pick<WorkflowStepResult, "output" | "notes">): boolean {
   return [result.output, result.notes].some((text) => text?.startsWith(PLAN_LOCK_UNAVAILABLE_DIAGNOSTIC));
@@ -128,12 +132,15 @@ export function isUnavailablePlanLockResult(result: Pick<WorkflowStepResult, "ou
 /** Automatic retries a verdict-less review failure gets per unchanged review input, after its first attempt. */
 export const NO_VERDICT_RECOVERY_RETRY_LIMIT = 3;
 
-/** Prior attempts that spent the no-verdict budget on the review input the caller identifies. */
+/** Prior attempts, recorded after the newest operator re-arm, that spent the no-verdict budget on the review input the caller identifies. */
 function countSpentNoVerdictAttempts(
   result: WorkflowStepResult,
   isSameReviewInput: (entry: WorkflowStepResult) => boolean,
 ): number {
-  return (result.priorAttempts ?? []).filter((entry) => !entry.supersededAt && !entry.remediationArchivedAt
+  if (result.noVerdictBudgetRearmedAt) return 0;
+  const priorAttempts = result.priorAttempts ?? [];
+  const rearmedIndex = priorAttempts.findIndex((entry) => entry.noVerdictBudgetRearmedAt);
+  return (rearmedIndex < 0 ? priorAttempts : priorAttempts.slice(0, rearmedIndex)).filter((entry) => !entry.supersededAt && !entry.remediationArchivedAt
     && entry.status === "failed" && entry.verdict === undefined
     // FNXC:ProviderRateLimitDeferral 2026-10-08-16:05: a provider rate limit is not a lost dispatch; KB-077 defers it on the external-block schedule, so it never spends this budget.
     && entry.providerFailure?.code !== "RATE_LIMIT"
@@ -152,6 +159,10 @@ export function hasExhaustedNoVerdictRecovery(result: WorkflowStepResult): boole
  * The review input is the plan text alone. The reviewed commit is ignored because a hold-lane worktree tip can move between attempts while the plan stays the same.
  * A provider rate limit and a spec-lock rejection have their own owners, so neither spends this budget, and a latest row of either kind never reports exhaustion.
  * A row without a recorded plan identity matches no plan, so history written before the identity existed never counts.
+ *
+ * FNXC:ReviewRecovery 2026-10-12-03:55:
+ * An operator retry re-arms this budget without changing the plan: only attempts recorded after the newest `noVerdictBudgetRearmedAt` marker count, and only an operator retry writes that marker.
+ * A marker older than the retained Plan Review history (fifteen attempts) no longer bounds the count, which then covers the retained attempts.
  */
 export function hasExhaustedPlanReviewNoVerdictRecovery(
   result: WorkflowStepResult | undefined,

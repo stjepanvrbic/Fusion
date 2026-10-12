@@ -6,7 +6,9 @@ import {
   buildAutoPauseClearPatch,
   buildManualRetryResetPatch,
   buildManualRetryResetPatchIfCurrent,
+  buildNoVerdictBudgetRearmPatch,
 } from "../tasks/manual-retry-reset.js";
+import type { Task, WorkflowStepResult } from "../types.js";
 
 const RETRY_SUMMARY_COUNTER_REGEX = /toCount\(task\.(\w+)\)/g;
 
@@ -80,6 +82,73 @@ describe("buildManualRetryResetPatchIfCurrent", () => {
       status: null,
       paused: false,
       pausedReason: null,
+    });
+  });
+
+  describe("no-verdict review budget re-arm", () => {
+    const priorAttempts: WorkflowStepResult[] = [3, 2, 1].map((attempt) => ({
+      workflowStepId: "plan-review",
+      workflowStepName: "Plan Review",
+      status: "failed",
+      startedAt: `T${attempt}`,
+      reviewInputFingerprint: "plan",
+    }));
+    const lostReview: WorkflowStepResult = {
+      workflowStepId: "plan-review",
+      workflowStepName: "Plan Review",
+      status: "failed",
+      startedAt: "T4",
+      reviewInputFingerprint: "plan",
+      priorAttempts,
+    };
+    const approved: WorkflowStepResult = {
+      workflowStepId: "code-review",
+      workflowStepName: "Code Review",
+      status: "passed",
+      verdict: "APPROVE",
+    };
+    const parked = { ...(expected as Task), paused: undefined, pausedReason: undefined } as Task;
+
+    it("marks a failed verdict-less review row on the live task and keeps every row and prior attempt", () => {
+      const live = { ...parked, workflowStepResults: [lostReview, approved] } as Task;
+
+      const patch = buildManualRetryResetPatchIfCurrent(live, parked, { status: null, error: null });
+
+      expect(patch).toMatchObject({ status: null, error: null });
+      const [rearmed, untouched] = patch!.workflowStepResults!;
+      expect(typeof rearmed.noVerdictBudgetRearmedAt).toBe("string");
+      expect(Number.isNaN(Date.parse(rearmed.noVerdictBudgetRearmedAt!))).toBe(false);
+      expect(rearmed).toEqual({ ...lostReview, noVerdictBudgetRearmedAt: rearmed.noVerdictBudgetRearmedAt });
+      expect(rearmed.priorAttempts).toBe(priorAttempts);
+      expect(untouched).toBe(approved);
+      expect(patch!.workflowStepResults).toHaveLength(2);
+    });
+
+    it.each([
+      ["no step results", undefined],
+      ["an empty result list", []],
+      ["only an approved review", [approved]],
+    ])("writes no step results for a live task with %s", (_label, workflowStepResults) => {
+      const live = { ...parked, workflowStepResults } as Task;
+      expect(buildManualRetryResetPatchIfCurrent(live, parked, { status: null })).not.toHaveProperty("workflowStepResults");
+      expect(buildNoVerdictBudgetRearmPatch(live)).toEqual({});
+    });
+
+    it("still refuses a newer lifecycle before re-arming", () => {
+      const live = { ...parked, workflowStepResults: [lostReview] } as Task;
+      expect(buildManualRetryResetPatchIfCurrent({ ...live, branch: "fusion/replacement" }, parked, { status: null })).toBeNull();
+      expect(buildManualRetryResetPatchIfCurrent({ ...live, userPaused: true }, parked, { status: null })).toBeNull();
+    });
+
+    it("lets an explicit caller step-result patch win over the re-arm", () => {
+      const live = { ...parked, workflowStepResults: [lostReview] } as Task;
+      const explicit: WorkflowStepResult[] = [];
+      expect(buildManualRetryResetPatchIfCurrent(live, parked, { workflowStepResults: explicit })!.workflowStepResults).toBe(explicit);
+    });
+
+    it("uses the supplied re-arm time", () => {
+      const patch = buildNoVerdictBudgetRearmPatch({ workflowStepResults: [lostReview] }, "2026-10-12T04:00:00.000Z");
+      expect(patch.workflowStepResults?.[0].noVerdictBudgetRearmedAt).toBe("2026-10-12T04:00:00.000Z");
     });
   });
 });

@@ -4079,11 +4079,11 @@
       "axis1Evidence": "No call edge from runAiMerge, landWorkspaceTask, or landOneRepo to createTaskRetryTool; this imported module belongs to the legacy/independent subsystem closure."
     },
     {
-      "callSiteId": "packages/engine/src/agent-tools.ts::createTaskRetryTool::store.updateTask::#1",
-      "callSiteFingerprint": "store.updateTask(params.id,{status,error})",
+      "callSiteId": "packages/engine/src/agent-tools.ts::createTaskRetryTool::store.updateTaskAtomic::#1",
+      "callSiteFingerprint": "store.updateTaskAtomic(params.id,(live) => ({ ...fusionCore.buildNoVerdictBudgetRearmPatch(live), status: null, error: null, }))",
       "file": "packages/engine/src/agent-tools.ts",
       "enclosingSymbolPath": "createTaskRetryTool",
-      "writer": "store.updateTask",
+      "writer": "store.updateTaskAtomic",
       "ordinal": 1,
       "owningEntryPoint": "other",
       "reachableDataStates": [

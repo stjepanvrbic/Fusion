@@ -1,5 +1,6 @@
 import type { Task } from "../types.js";
 import type { TaskStore } from "../store.js";
+import { rearmNoVerdictRecoveryBudget } from "../workflows/workflow-step-results.js";
 
 export const IN_REVIEW_STALL_DEADLOCK_PAUSE_REASON = "in-review-stall-deadlock";
 export const BRANCH_CONFLICT_UNRECOVERABLE_PAUSE_REASON = "branch-conflict-unrecoverable";
@@ -49,11 +50,29 @@ export function buildAutoPauseClearPatch(
   return {};
 }
 
+/**
+ * FNXC:ReviewRecovery 2026-10-12-03:50:
+ * Patch that gives a retried card a fresh no-verdict review retry budget and keeps its review history.
+ * Empty when the card has no failed, verdict-less pre-merge review result, so a retry of any other card writes no step results.
+ * For operator retry writes only, computed from the live row inside the task lock.
+ */
+export function buildNoVerdictBudgetRearmPatch(
+  task: Pick<Task, "workflowStepResults">,
+  rearmedAt: string = new Date().toISOString(),
+): Pick<Partial<Task>, "workflowStepResults"> {
+  const workflowStepResults = rearmNoVerdictRecoveryBudget(task.workflowStepResults, rearmedAt);
+  return workflowStepResults === task.workflowStepResults ? {} : { workflowStepResults };
+}
+
 /*
 FNXC:BranchConflictRecoveryFence 2026-10-01-08:15:
 A manual retry may race a scheduler that inspected the prior branch-conflict failure. The retry
 writer must revalidate that generation while holding the task lock, so neither an explicit pause
 nor a replacement checkout is cleared by a stale operator snapshot.
+
+FNXC:ReviewRecovery 2026-10-12-03:50:
+Every operator retry surface writes through this helper, so it is where a retry re-arms the no-verdict review budget.
+The re-arm is computed from the locked live row, and an explicit `workflowStepResults` in the caller's patch wins over it.
 */
 export function buildManualRetryResetPatchIfCurrent(
   live: Task,
@@ -66,6 +85,7 @@ export function buildManualRetryResetPatchIfCurrent(
   if (hasNewerLifecycle) return null;
 
   return {
+    ...buildNoVerdictBudgetRearmPatch(live),
     ...patch,
     ...buildAutoPauseClearPatch(live),
   };

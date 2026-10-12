@@ -35,7 +35,12 @@ vi.mock("../commands/task.js", () => ({
 import { __setCachedStoreForTesting, closeCachedStores, resolveTaskListFormatter } from "../extension.js";
 import { isGhAvailable as coreIsGhAvailable, isGhAuthenticated as coreIsGhAuthenticated } from "@fusion/core";
 import { TaskStore, AgentStore, MANUAL_RETRY_RESET_COUNTER_KEYS, MAX_TASK_LIST_TEXT_CHARS, MAX_TASK_MESSAGE_LENGTH, MissionBlockedClearConflictError, formatTaskListText, COLUMN_LABELS, drizzleSql } from "@fusion/core";
-import type { WorkflowIr } from "@fusion/core";
+import type { WorkflowIr, WorkflowStepResult } from "@fusion/core";
+import {
+  hasExhaustedNoVerdictRecovery,
+  hasExhaustedPlanReviewNoVerdictRecovery,
+  isFailedNoVerdictPreMergeReviewResult,
+} from "../../../engine/src/merge/pre-merge-gate-reseed.js";
 import { isGhAvailable, isGhAuthenticated, runGhJsonAsync } from "@fusion/core/gh-cli";
 import { runTaskPlan } from "../commands/task.js";
 import { pgDescribe } from "../../../core/src/__test-utils__/pg-test-harness.js";
@@ -4463,6 +4468,78 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       expect(updated?.error).toBeFalsy();
       expectRetryCountersReset(updated);
       expect(updated?.mergeRetries).toBe(0);
+    });
+
+    /*
+    FNXC:ReviewRecovery 2026-10-12-04:10:
+    A card stopped by a no-verdict review limit must get a fresh retry budget from the `fn_task_retry` tool, with its review history kept.
+    The stored row is read back from PostgreSQL and checked with the predicates the engine sweeps use.
+    */
+    /** A review row that failed without a verdict four times on one input: the first attempt plus three automatic retries. */
+    const exhaustedReviewRow = (workflowStepId: string, workflowStepName: string, input: Partial<WorkflowStepResult>): WorkflowStepResult => {
+      const attempt = (sequence: number): WorkflowStepResult => ({
+        workflowStepId, workflowStepName, phase: "pre-merge", status: "failed",
+        startedAt: `2026-10-12T0${sequence}:00:00.000Z`, completedAt: `2026-10-12T0${sequence}:00:16.000Z`,
+        output: `Review failed before producing a verdict (attempt ${sequence})`, ...input,
+      });
+      return { ...attempt(4), priorAttempts: [attempt(3), attempt(2), attempt(1)] };
+    };
+
+    it("re-arms the Plan Review no-verdict budget of a parked hold-lane card and keeps its review history", async () => {
+      const store = createStore();
+      const task = await store.createTask({ title: "parked plan review", description: "test", column: "todo" });
+      const row = exhaustedReviewRow("plan-review", "Plan Review", { reviewInputFingerprint: "plan" });
+      await store.updateTask(task.id, {
+        status: "failed",
+        error: "Plan Review recovery stopped in 'todo': no verdict after 3 automatic retries on the unchanged plan.",
+        workflowStepResults: [row],
+      });
+      expect(hasExhaustedPlanReviewNoVerdictRecovery(row, "plan")).toBe(true);
+
+      const retryTool = api.tools.get("fn_task_retry")!;
+      const result = await retryTool.execute("retry-parked-plan-review", { id: task.id }, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.isError).toBeFalsy();
+      expect(result.details.newColumn).toBe("todo");
+      const updated = await store.getTask(task.id);
+      expect(updated?.column).toBe("todo");
+      expect(updated?.status).toBeFalsy();
+      expect(updated?.error).toBeFalsy();
+      expect(updated?.workflowStepResults).toHaveLength(1);
+      const [stored] = updated!.workflowStepResults!;
+      expect(stored).toEqual({ ...row, noVerdictBudgetRearmedAt: expect.any(String) });
+      expect(hasExhaustedPlanReviewNoVerdictRecovery(stored, "plan")).toBe(false);
+    });
+
+    it("re-arms the review no-verdict budget of a parked review-lane card and keeps it in review", async () => {
+      const store = createStore();
+      const task = await store.createTask({ title: "parked code review", description: "test", column: "todo" });
+      await store.moveTask(task.id, "in-progress");
+      await store.moveTask(task.id, "in-review");
+      const row = exhaustedReviewRow("code-review", "Code Review", { reviewInputFingerprint: "diff", reviewedCommitSha: "abc123" });
+      await store.updateTask(task.id, {
+        status: "failed",
+        error: "Review recovery stopped at 'code-review': Review failed before producing a verdict (attempt 4) Correct the review input or provider failure before retrying.",
+        steps: [{ name: "Step 0", status: "done" }],
+        mergeRetries: 2,
+        workflowStepResults: [row],
+      });
+      expect(hasExhaustedNoVerdictRecovery(row)).toBe(true);
+      expect(isFailedNoVerdictPreMergeReviewResult(row, new Set(["code-review"]))).toBe(false);
+
+      const retryTool = api.tools.get("fn_task_retry")!;
+      const result = await retryTool.execute("retry-parked-code-review", { id: task.id }, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.isError).toBeFalsy();
+      const updated = await store.getTask(task.id);
+      expect(updated?.column).toBe("in-review");
+      expect(updated?.status).toBeFalsy();
+      expect(updated?.error).toBeFalsy();
+      expect(updated?.mergeRetries).toBe(0);
+      const [stored] = updated!.workflowStepResults!;
+      expect(stored).toEqual({ ...row, noVerdictBudgetRearmedAt: expect.any(String) });
+      expect(hasExhaustedNoVerdictRecovery(stored)).toBe(false);
+      expect(isFailedNoVerdictPreMergeReviewResult(stored, new Set(["code-review"]))).toBe(true);
     });
   });
 

@@ -3622,7 +3622,16 @@ export function createTaskRetryTool(store: TaskStore, options: TaskRetryToolOpti
         if (task.status !== "failed" && task.status !== "stuck-killed") {
           return { content: [{ type: "text" as const, text: `Task ${params.id} is not in a retryable state (status: ${task.status || "none"})` }], details: { taskId: params.id, currentStatus: task.status }, isError: true };
         }
-        await store.updateTask(params.id, { status: null, error: null });
+        /*
+        FNXC:ReviewRecovery 2026-10-12-03:58:
+        A chat retry of a card stopped by a no-verdict review limit must give it a fresh review retry budget, as the CLI, extension and dashboard retries do.
+        The re-arm is computed from the live row under the task lock and keeps the card's review history.
+        */
+        await store.updateTaskAtomic(params.id, (live) => ({
+          ...fusionCore.buildNoVerdictBudgetRearmPatch(live),
+          status: null,
+          error: null,
+        }));
         /*
         FNXC:TaskRetry 2026-07-31-23:59 (review finding on #3152 — the move resolved, the REPORT did not):
         The rebound target is resolved once and reused for the move, the log line, the response text

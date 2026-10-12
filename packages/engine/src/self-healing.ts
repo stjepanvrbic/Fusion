@@ -8730,6 +8730,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
                 await audit("task:reconcile-stranded-hold-continuation-no-action", seeded.reason, fresh);
                 return false;
               }
+              // FNXC:ReviewRecovery 2026-10-12-03:58: a seed after an exhausted stop means an operator retry or a changed plan re-armed the budget, so a later exhaustion of the same card is a new stop and is audited again.
+              this.strandedHoldContinuationNoActionAudited.delete(`${fresh.task.id}:no-verdict-recovery-exhausted`);
               await audit("task:reconcile-stranded-hold-continuation", undefined, fresh);
               return true;
             };

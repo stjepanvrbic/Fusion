@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Task, TaskStore } from "@fusion/core";
+import type { Task, TaskStore, WorkflowStepResult } from "@fusion/core";
 import { createTaskRetryTool } from "../agent-tools.js";
+import { hasExhaustedNoVerdictRecovery, hasExhaustedPlanReviewNoVerdictRecovery } from "../merge/pre-merge-gate-reseed.js";
 
 function task(overrides: Partial<Task> = {}): Task {
   return {
@@ -212,5 +213,101 @@ describe("createTaskRetryTool", () => {
     expect((result.content[0] as { text: string }).text).toContain("merge is queued or active");
     expect(resetInReviewMergeRetry).toHaveBeenCalledWith(completedReviewTask);
     expect(logEntry).not.toHaveBeenCalled();
+  });
+
+  describe("no-verdict review budget re-arm", () => {
+    /** A review row that failed without a verdict four times on the same input: one attempt plus three retries. */
+    function exhaustedRow(workflowStepId: string, input: Partial<WorkflowStepResult>): WorkflowStepResult {
+      const attempt = (sequence: number): WorkflowStepResult => ({
+        workflowStepId, workflowStepName: workflowStepId, phase: "pre-merge", status: "failed",
+        startedAt: `2026-10-12T0${sequence}:00:00.000Z`, output: `no verdict (attempt ${sequence})`, ...input,
+      });
+      return { ...attempt(4), priorAttempts: [attempt(3), attempt(2), attempt(1)] };
+    }
+
+    /** A store whose writes land on the fixture, so the stored rows can be read back after the retry. */
+    function parkedStore(parked: Task) {
+      const updateTask = vi.fn();
+      const updateTaskAtomic = vi.fn(async (_id: string, mutate: (current: Task) => Partial<Task> | null) => {
+        const patch = mutate(parked);
+        if (patch) Object.assign(parked, patch);
+        return parked;
+      });
+      const moveTask = vi.fn(async (_id: string, column: string) => Object.assign(parked, { column }));
+      const store = {
+        getTask: vi.fn(async () => parked),
+        getTaskWorkflowSelection: vi.fn().mockReturnValue(undefined),
+        getSettings: vi.fn().mockResolvedValue({ autoMerge: true }),
+        updateTask,
+        updateTaskAtomic,
+        moveTask,
+        logEntry: vi.fn().mockResolvedValue(undefined),
+      } as unknown as TaskStore;
+      return { store, updateTask, updateTaskAtomic, moveTask };
+    }
+
+    const retry = (store: TaskStore, id: string) => createTaskRetryTool(store).execute(
+      "run", { id }, undefined as never, undefined as never, undefined as never,
+    );
+
+    it("re-arms a hold-lane card parked by the Plan Review no-verdict limit and keeps its history", async () => {
+      const row = exhaustedRow("plan-review", { reviewInputFingerprint: "plan" });
+      const parked = task({
+        column: "todo", status: "failed", error: "Plan Review recovery stopped in 'todo'", steps: [], workflowStepResults: [row],
+      });
+      expect(hasExhaustedPlanReviewNoVerdictRecovery(row, "plan")).toBe(true);
+      const { store, updateTask } = parkedStore(parked);
+
+      const result = await retry(store, parked.id);
+
+      expect((result as { isError?: boolean }).isError).not.toBe(true);
+      expect(updateTask).not.toHaveBeenCalled();
+      expect(parked.status).toBeNull();
+      expect(parked.error).toBeNull();
+      const [stored] = parked.workflowStepResults!;
+      expect(typeof stored.noVerdictBudgetRearmedAt).toBe("string");
+      expect(stored.priorAttempts).toEqual(row.priorAttempts);
+      expect(stored).toEqual({ ...row, noVerdictBudgetRearmedAt: stored.noVerdictBudgetRearmedAt });
+      expect(hasExhaustedPlanReviewNoVerdictRecovery(stored, "plan")).toBe(false);
+    });
+
+    it("re-arms a review-lane card parked by the review no-verdict limit and keeps its history", async () => {
+      const row = exhaustedRow("code-review", { reviewInputFingerprint: "diff", reviewedCommitSha: "sha" });
+      const parked = task({
+        status: "failed", error: "Review recovery stopped at 'code-review': no verdict", workflowStepResults: [row],
+      });
+      expect(hasExhaustedNoVerdictRecovery(row)).toBe(true);
+      const { store } = parkedStore(parked);
+
+      const result = await retry(store, parked.id);
+
+      expect((result as { isError?: boolean }).isError).not.toBe(true);
+      expect(parked.status).toBeNull();
+      expect(parked.error).toBeNull();
+      const [stored] = parked.workflowStepResults!;
+      expect(typeof stored.noVerdictBudgetRearmedAt).toBe("string");
+      expect(stored.priorAttempts).toEqual(row.priorAttempts);
+      expect(hasExhaustedNoVerdictRecovery(stored)).toBe(false);
+    });
+
+    it.each([
+      ["no review results", undefined],
+      ["an approved review", [{ workflowStepId: "code-review", workflowStepName: "Code Review", status: "passed", verdict: "APPROVE" }]],
+      ["a rejected review", [{ workflowStepId: "code-review", workflowStepName: "Code Review", status: "failed", verdict: "REVISE" }]],
+    ] as const)("writes no step results when retrying a failed card with %s", async (_label, workflowStepResults) => {
+      const parked = task({
+        column: "in-progress", status: "failed", error: "executor failed",
+        workflowStepResults: workflowStepResults as WorkflowStepResult[] | undefined,
+      });
+      const { store, updateTaskAtomic } = parkedStore(parked);
+
+      const result = await retry(store, parked.id);
+
+      expect((result as { isError?: boolean }).isError).not.toBe(true);
+      expect(updateTaskAtomic).toHaveBeenCalledOnce();
+      await expect(updateTaskAtomic.mock.results[0]!.value).resolves.toBe(parked);
+      const patch = (updateTaskAtomic.mock.calls[0]![1] as (current: Task) => Partial<Task>)(parked);
+      expect(patch).toEqual({ status: null, error: null });
+    });
   });
 });

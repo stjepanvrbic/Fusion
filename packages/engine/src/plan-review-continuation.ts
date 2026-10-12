@@ -73,7 +73,11 @@ export async function readCurrentPlanReviewInputFingerprint(
  * FNXC:ReviewRecovery 2026-10-12-02:02:
  * Operator-facing error for a hold-lane card whose Plan Review retry budget is spent.
  * It names the column the card stays in, the bound, the last failure and the remedy.
- * The remedy is the pair of actions that really start a fresh budget: dashboard Retry re-plans the card and discards its review history, and a changed plan has a new identity.
+ * The remedy lists only actions that really start a fresh budget.
+ *
+ * FNXC:ReviewRecovery 2026-10-12-03:58:
+ * Every operator retry starts a fresh budget, and so does a changed plan, which has a new identity. The remedy names each and says what it keeps.
+ * Dashboard Retry re-plans the card and discards its review history. `fn task retry` and the `fn_task_retry` tool keep the plan and its review history.
  */
 export function formatExhaustedPlanReviewNoVerdictError(
   column: string,
@@ -82,7 +86,8 @@ export function formatExhaustedPlanReviewNoVerdictError(
   const detail = lastFailure.notes?.trim() || lastFailure.output?.trim() || "no failure detail was recorded";
   return `Plan Review recovery stopped in '${column}': no verdict after ${NO_VERDICT_RECOVERY_RETRY_LIMIT} automatic retries on the unchanged plan. `
     + `Last failure: ${detail}${/[.!?]$/.test(detail) ? "" : "."} `
-    + "Retry the task from the dashboard to re-plan it with a fresh review budget; a changed plan also starts a fresh budget.";
+    + "Retry the task to start a fresh review budget: dashboard Retry re-plans the card, while `fn task retry` and the `fn_task_retry` tool keep the plan and its review history. "
+    + "A changed plan also starts a fresh budget.";
 }
 
 /** The durable outcome of resuming a manually approved pre-release Plan Review. */
