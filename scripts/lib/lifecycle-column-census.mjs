@@ -291,7 +291,11 @@ FNXC:LifecycleColumnCensus 2026-07-31-12:55 (u12 — the report went SILENT at t
 The backlog-state verdict was two inline branches in the CLI, and neither fired at a count of ZERO —
 `CONVERSION QUEUE EMPTY` required `totals.column > 0`. So the one state the whole fleet phase was
 working toward printed nothing at all, which reads as a broken scan rather than the protected end
-state. Reached zero on 2026-07-31 (722 at the start of the phase).
+state. The census first printed zero on 2026-07-31 (722 at the start of the phase).
+
+FNXC:LifecycleColumnCensus 2026-10-12-06:14:
+The 2026-07-31 zero was measured over a file list that skipped the files directly in the dashboard `app` directory and directly in each plugin's `src` directory. On 2026-10-12 those were 211 files holding five unmarked column guards.
+The census reached zero over the full list on 2026-10-12, and `scripts/__tests__/list-git-source-files.test.mjs` compares the list with the repository on every run.
 
 Pure and exported so all three states are unit-testable. Against the real tree only the CURRENT state
 is observable, so an inline branch for zero could not be tested until the tree was already zero — and

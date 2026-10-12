@@ -41,6 +41,44 @@ describe("notification routes", () => {
     expect(notifier.drainPending).toHaveBeenCalled();
   });
 
+  describe("review lane in the card title", () => {
+    const renamedBoardIr = {
+      version: "v2", id: "wf-custom", name: "custom", nodes: [], edges: [],
+      columns: [
+        { id: "backlog", name: "Backlog", traits: [{ trait: "intake" }] },
+        { id: "qa", name: "QA", traits: [{ trait: "merge-blocker" }] },
+      ],
+    };
+
+    async function cardTitleFor(column: string, taskStoreExtras: Record<string, unknown>) {
+      const event = { taskId: "FN-1", reason: "entered-column", column, previousColumn: "backlog", updatedAt: "2026-01-01T00:00:00.000Z" };
+      const context = ctx({ peekPending: vi.fn(() => [event]), lastPolledAt: vi.fn(() => null) });
+      context.taskStore = {
+        getTask: vi.fn(async (id: string) => ({ id, description: id, column, updatedAt: "2026-01-01T00:00:00.000Z", dependencies: [], steps: [], currentStep: 1, log: [] })),
+        ...taskStoreExtras,
+      };
+      const res: any = await route("GET", "/notifications").handler({ headers: { authorization: "Bearer secret" } }, context);
+      expect(res.status).toBe(200);
+      expect(res.body.cards).toHaveLength(1);
+      return res.body.cards[0].title as string;
+    }
+
+    it("titles entry into a declared review lane as in review", async () => {
+      const title = await cardTitleFor("qa", { listWorkflowDefinitions: async () => [{ id: "wf-custom", ir: renamedBoardIr }] });
+      expect(title.startsWith("In review ·")).toBe(true);
+    });
+
+    it("titles entry into a lane no workflow declares as a review lane as moved in", async () => {
+      const title = await cardTitleFor("backlog", { listWorkflowDefinitions: async () => [{ id: "wf-custom", ir: renamedBoardIr }] });
+      expect(title.startsWith("Moved in ·")).toBe(true);
+    });
+
+    it("keeps the in-review title on a store that lists no workflow definitions", async () => {
+      expect((await cardTitleFor("in-review", {})).startsWith("In review ·")).toBe(true);
+      expect((await cardTitleFor("qa", {})).startsWith("Moved in ·")).toBe(true);
+    });
+  });
+
   it("acks matching task ids", async () => {
     const notifier = { ack: vi.fn(() => 2) };
     const res: any = await route("POST", "/notifications/ack").handler({ headers: { authorization: "Bearer secret" }, body: { taskIds: ["FN-1", "FN-2"] } }, ctx(notifier));

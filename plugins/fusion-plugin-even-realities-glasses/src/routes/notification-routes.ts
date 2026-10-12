@@ -1,7 +1,7 @@
 import type { PluginContext, PluginRouteDefinition } from "@fusion/plugin-sdk";
 import { notificationCard } from "../cards.js";
 import { GlassesInputError } from "../quick-capture.js";
-import type { Notifier } from "../notifier.js";
+import { resolveReviewLanes, type Notifier } from "../notifier.js";
 import { requireApiKey } from "./quick-capture-routes.js";
 
 function parseLimit(raw: unknown): number {
@@ -34,10 +34,11 @@ export function createNotificationRoutes(
           const drain = parseDrain(query.drain);
           const events = drain ? notifier.drainPending(limit) : notifier.peekPending(limit);
 
+          const reviewColumns = events.length > 0 ? await resolveReviewLanes(ctx.taskStore) : undefined;
           const cards = [];
           for (const event of events) {
             const task = await ctx.taskStore.getTask(event.taskId);
-            if (task) cards.push(notificationCard(task as never, event.reason));
+            if (task) cards.push(notificationCard(task as never, event.reason, { reviewColumns }));
           }
 
           return { status: 200, body: { events, cards, lastPolledAt: notifier.lastPolledAt() } };

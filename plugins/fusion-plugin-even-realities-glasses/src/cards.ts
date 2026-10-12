@@ -256,15 +256,22 @@ export function boardSummaryCard(tasksByColumn: Record<string, number>): Glasses
   };
 }
 
+/*
+FNXC:WorkflowLifecycleColumns 2026-10-12-06:14:
+`reviewColumns` are the lanes whose entry is announced as "In review". The caller supplies them because this function takes plain `Task` rows and cannot resolve a workflow.
+With the set supplied, a board that names its review lane anything other than `in-review` gets the "In review" title, and a column outside the set gets the neutral "Moved in".
+*/
 export function notificationCard(
   task: Task,
   reason: NotificationReason,
-  opts: { now?: () => Date; maxCharsPerLine?: number; maxLines?: number } = {},
+  opts: { now?: () => Date; maxCharsPerLine?: number; maxLines?: number; reviewColumns?: ReadonlySet<string> } = {},
 ): GlassesCard {
   const baseTitle = typeof task.title === "string" && task.title.trim() ? task.title : task.description;
+  /* DELIBERATE-LITERAL: the title's answer when the caller resolved no lanes. */
+  const isReviewLane = opts.reviewColumns ? opts.reviewColumns.has(task.column) : task.column === "in-review";
   const reasonTitle =
     reason === "entered-column"
-      ? task.column === "in-review"
+      ? isReviewLane
         ? "In review"
         : "Moved in"
       : reason === "new-task"

@@ -11,6 +11,26 @@ import {
 } from "@fusion/core";
 import { getScopedItem, removeScopedItem, setScopedItem } from "../utils/projectStorage";
 import { CAPACITY_RISK_DISMISSED_KEY } from "../utils/appLifecycle";
+import { isReviewColumnRole, isWipColumnRole, type ColumnRoleFlags } from "../utils/columnRoles";
+
+/*
+FNXC:CapacityRisk 2026-10-12-06:14:
+The banner's in-progress and in-review counts follow each task's column traits, so a board whose lanes are renamed is counted like the default board.
+A task with no traits (remote node, first paint, a column its workflow no longer declares) is counted by its legacy column id through the shared role helpers.
+*/
+export function countCapacityRiskLanes(
+  tasks: ReadonlyArray<{ readonly id: string; readonly column: string }>,
+  columnFlagsByTaskId: ReadonlyMap<string, ColumnRoleFlags>,
+): { inProgressCount: number; inReviewCount: number } {
+  let inProgressCount = 0;
+  let inReviewCount = 0;
+  for (const task of tasks) {
+    const flags = columnFlagsByTaskId.get(task.id);
+    if (isWipColumnRole(flags, task.column)) inProgressCount += 1;
+    if (isReviewColumnRole(flags, task.column)) inReviewCount += 1;
+  }
+  return { inProgressCount, inReviewCount };
+}
 
 export interface UseCapacityRiskBannerOptions {
   agentStats: { todoTaskCount?: number; idleNonEphemeralCount?: number } | null | undefined;

@@ -133,8 +133,8 @@ Run against all five lifecycle gates on one tree, staging a probe file per form.
 
 | gate | catches | does NOT catch |
 |---|---|---|
-| `lifecycle-column-census` | `===` / `!==` comparisons | ~~membership, switch~~ **fixed** — both were invisible while it printed "a new guard cannot land silently" |
-| `check-move-target-literals` | direct + backtick destinations | ~~ternary destination~~ **fixed**; still misses a destination bound to a local first |
+| `lifecycle-column-census` | `===` / `!==` comparisons | ~~membership, switch~~ **fixed** — both were invisible while it printed "a new guard cannot land silently". ~~Files directly in a root~~ **fixed**. The file list held 2,654 of 2,865 production files. It skipped the 16 files directly under `packages/dashboard/app/` and the 195 directly under a `plugins/*/src/` directory, and those 211 files held five unmarked column guards while the census printed "BACKLOG ZERO" |
+| `check-move-target-literals` | direct + backtick destinations | ~~ternary destination~~ **fixed**; still misses a destination bound to a local first. ~~Files directly under `packages/*/app`~~ **fixed**. The file list held 2,502 of 2,518 production files and skipped the 16 files directly under `packages/dashboard/app/`, which held no literal move target |
 | `check-sql-column-literals` | `"column"` comparisons, including inside plain template literals — not only drizzle `sql` tags | nothing found; the one miss probed was an invented identifier the schema never uses. ~~Everything after a generic arrow or angle-bracket assertion in a `.ts` file~~ **fixed**. The old parse stopped early in 10 of 2,671 scanned files. The unread parts held no SQL column literal |
 | `check-inert-sync-lane-conversions` | lane reads via the `resolvePlannerLanes` helper | a DIRECT `store.resolveTaskWorkflowIrSync(...)` read feeding `resolveLifecycleColumns` — inert by the same mechanism, untracked |
 | `check-fnxc-future-dates` | future stamps | nothing found — it caught the author of this table, twice |
@@ -149,6 +149,17 @@ Until then these gates parsed every file as TSX. In a `.ts` file, TSX reads a ge
 
 Script AST gates parse through `scripts/lib/parse-source-file.mjs`, which picks the parse mode from the file extension and refuses any file with a parse error.
 A file with a syntax error fails every gate that scans it, with a message naming the file and line. That includes an untracked scratch file and a deliberately broken fixture under a scanned root.
+
+<!-- FNXC:SourceFileListing 2026-10-12-06:14: A gate's file list holds every file under its roots that has one of its extensions, files directly in a root included, on every platform. -->
+The two struck-through "files directly" entries were also measured on 2026-10-12.
+Both gates listed their sources with git pathspecs such as `packages/*/app/**/*.tsx`. Git matches a pathspec without glob magic unless told otherwise, so `**/` needs a directory between `app/` and the file, and `app/App.tsx` was never listed. A plain `*` also matches `/`, so `packages/a/b/src` counted as a root.
+The pathspecs date from 2026-07-29, so every zero the census printed from 2026-07-31 on was measured over a list without those files. On 2026-10-12 the list omitted 211 files with five column guards in them.
+
+A detection probe cannot find this. A probe checks what the parser does with a file, and the gate never opened these files.
+Before trusting a zero, compare the gate's file list with the repository: take every path from an unfiltered `git ls-files`, keep the ones under the gate's roots that have one of its extensions, and check that the gate lists the same set.
+
+Both gates now declare a scope, `{ roots, extensions }`. `listProductionSourceFiles` in `scripts/lib/list-git-source-files.mjs` builds one `:(glob)<root>/**/*<extension>` pathspec per root and extension, which lists direct children and keeps `*` inside one path segment.
+`scripts/__tests__/list-git-source-files.test.mjs` makes the comparison above for each gate's scope on every run, so a new root or extension is checked without a new test.
 
 ### The axis this table did not have
 
@@ -172,11 +183,12 @@ What it cost: every worker who ran a gate received a byte-identical uncommitted 
 authored, and reasonably committed it. #3283 and #3285 are the same `+0/-1` five minutes apart, by
 two authors, neither of whom wrote that line.
 
-**So audit a tool on at least three axes, not one:**
+**So audit a tool on at least four axes, not one:**
 
 1. **What can it see?** — probe each spelling of the thing it claims to catch.
 2. **Can it fail at all?** — invoke it as `package.json` does; a report-only run exits 0 forever.
 3. **Does it write?** — `git status --porcelain` before and after, on a clean tree.
+4. **Which files does it open?** Compare its file list with the repository, as the 2026-10-12 note above describes.
 
 A trap for the third: these gates write only when a tightening is *available*, so a clean tree after
 a run proves the trigger is absent, not that the tool is read-only. Inflate a baseline entry first,
@@ -205,6 +217,7 @@ the person who had just written it down.
 - Before trusting a ratchet: mutate the shape it claims to catch and confirm it exits non-zero.
 - Before trusting a `check:*` script: confirm something runs it, and that it can fail.
 - Before comparing two numbers: confirm they came from one tree.
+- Before trusting a zero: confirm the gate's file list holds every file under its roots.
 - Before converting a flagged site: read the flag. It is a claim, and it decays — but re-deriving it
   costs minutes and overriding it wrongly has cost three PRs.
 

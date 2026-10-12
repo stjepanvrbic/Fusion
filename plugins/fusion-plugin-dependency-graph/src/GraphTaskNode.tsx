@@ -108,11 +108,19 @@ export function GraphTaskNode({
   execution activity, it is active and the stale approval status is residue; if it does not, the approval
   state is the truth. That ordering needs no IR lookup, which matters here — this is a synchronous React
   render.
-
-  The `in-progress` literal is pre-existing and NOT on the triage bar; converting it needs the board's
-  column traits, which this component is not given. Left with this note rather than half-converted.
   */
-  const hasExecutionSignal = task.column === "in-progress" || ACTIVE_STATUSES.has(task.status as string);
+  /*
+  FNXC:PluginLifecycleColumns 2026-10-12-06:14:
+  The execution lane and the review lane are read from this card's own column traits (`taskColumnFlags`), so a board with renamed lanes gets the active and in-review styling.
+  The definitions match the dashboard role helpers, which a plugin cannot import: in progress is `countsTowardWip`, in review is `mergeBlocker` or `humanReview`.
+  */
+  /* DELIBERATE-LITERAL: the answer when the host supplied no traits for this card (remote rows, off-board columns). */
+  const isInWipLane = taskColumnFlags ? taskColumnFlags.countsTowardWip === true : task.column === "in-progress";
+  /* DELIBERATE-LITERAL: the answer when the host supplied no traits for this card (remote rows, off-board columns). */
+  const isInReview = taskColumnFlags
+    ? taskColumnFlags.mergeBlocker === true || taskColumnFlags.humanReview === true
+    : task.column === "in-review";
+  const hasExecutionSignal = isInWipLane || ACTIVE_STATUSES.has(task.status as string);
   const isAwaitingApproval = task.status === "awaiting-approval" && !hasExecutionSignal;
   const isActive =
     !globalPaused &&
@@ -126,7 +134,6 @@ export function GraphTaskNode({
     task.currentStep >= 0 &&
     Array.isArray(task.steps) &&
     task.currentStep < task.steps.length;
-  const isInReview = task.column === "in-review";
 
   const drag = useNodeDrag({
     taskId: task.id,

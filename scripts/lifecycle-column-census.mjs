@@ -29,7 +29,7 @@ re-recording the baseline in the same PR (`--strict --update-baseline`). That is
 the new number in the diff, where a reviewer sees it, instead of in a hand-written claim.
 */
 import { execFileSync } from "node:child_process";
-import { listGitSourceFiles } from "./lib/list-git-source-files.mjs";
+import { isProductionSourceFile, listProductionSourceFiles } from "./lib/list-git-source-files.mjs";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,7 +40,7 @@ measured this backlog with three greps and got three answers, so the number is t
 The text classifier stays beside it as an independent second implementation — `--compare` runs both
 and fails if they disagree, which is the only evidence available that either is right.
 */
-import { CensusParseError, censusFiles, summarize } from "./lib/lifecycle-column-census-ast.mjs";
+import { CENSUS_SOURCE_SCOPE, CensusParseError, censusFiles, summarize } from "./lib/lifecycle-column-census-ast.mjs";
 
 /** Repo root, for reading a finding's source back when `--triage` classifies it. */
 /*
@@ -131,19 +131,13 @@ try {
   disagreeing on WHICH FILES EXIST is how one probe can be caught by one and missed by the other
   (#3252) — that discrepancy cost a full investigation to attribute, so the scopes are aligned here.
 
-  FNXC:WindowsShell 2026-10-07-18:03: listGitSourceFiles passes the pathspecs as argv; the old execSync shell string ran cmd.exe on Windows, which kept the single quotes, so the census listed no files and failed closed on every Windows run.
+  FNXC:WindowsShell 2026-10-07-18:03: the lister passes the pathspecs as argv; the old execSync shell string ran cmd.exe on Windows, which kept the single quotes, so the census listed no files and failed closed on every Windows run.
+
+  FNXC:LifecycleColumnCensus 2026-10-12-06:14: the census declares its roots and extensions as CENSUS_SOURCE_SCOPE and the lister builds one recursive pathspec per root and extension, so a file directly in a root is listed like a nested one.
   */
-  const PATHSPECS = Object.freeze([
-    "packages/*/src/**/*.ts",
-    "packages/*/src/*.ts",
-    "packages/*/src/**/*.tsx",
-    "packages/*/app/**/*.ts",
-    "packages/*/app/**/*.tsx",
-    "plugins/*/src/**/*.ts",
-    "plugins/*/src/**/*.tsx",
-  ]);
-  files = (injectedList !== undefined ? injectedList : listGitSourceFiles(PATHSPECS, { cwd: REPO_ROOT }))
-    .filter((f) => !f.includes("__tests__") && !/\.(test|spec)\.tsx?$/.test(f));
+  files = injectedList !== undefined
+    ? injectedList.filter(isProductionSourceFile)
+    : listProductionSourceFiles(CENSUS_SOURCE_SCOPE, { cwd: REPO_ROOT });
   /* A path can be listed by both --cached and --others in some index states; counting it twice would
      double every guard in it. */
   files = [...new Set(files)];
@@ -313,10 +307,13 @@ if (json) {
   every inert conversion is.
 
   Why this needs saying where the numbers PRINT rather than only in the classifier: the two counts sit
-  directly under the backlog with larger values (12 and 185 against a backlog of 0). A worker told to
+  directly under the backlog with larger values (12 and 185 against a printed backlog of 0). A worker told to
   drive a census down, finding the column line at zero, has two bigger numbers in front of them and
   "(not guards)" alone does not explain why they are off-limits. The label states the verdict; this
   states the reason.
+
+  FNXC:LifecycleColumnCensus 2026-10-12-06:14:
+  The backlog of 0 quoted above was the printed figure. The file list skipped files directly in a root, which on 2026-10-12 were 211 files holding five unmarked column guards. The census reached zero over the full list that day.
   */
   console.log(`  ROLE comparisons (NOT backlog — agent/chat/telemetry receivers, not columns): ${summary.totals.role}`);
   console.log(`  STATUS comparisons (NOT backlog — goal/mission/step status, not columns): ${summary.totals.status}`);

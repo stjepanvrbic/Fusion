@@ -118,6 +118,53 @@ describe("GraphTaskNode", () => {
     expect(screen.getByTestId("graph-task-node-FN-TEST").className).not.toContain("graph-task-node--in-review");
   });
 
+  describe("lanes resolved from the card's column traits", () => {
+    const renamed = (column: string) => column as Task["column"];
+
+    it("is active in a renamed lane that counts toward WIP", () => {
+      const props = createProps(createTask({ column: renamed("building"), status: undefined }));
+      const { container } = render(<GraphTaskNode {...props} taskColumnFlags={{ countsTowardWip: true }} />);
+
+      expect(screen.getByTestId("graph-task-node-FN-TEST").className).toContain("graph-task-node--active");
+      expect(container.querySelector(".graph-task-active-indicator")).toBeTruthy();
+    });
+
+    it("is not active in a column with the legacy in-progress id whose traits lack the WIP role", () => {
+      const props = createProps(createTask({ column: "in-progress", status: undefined }));
+      const { container } = render(<GraphTaskNode {...props} taskColumnFlags={{}} />);
+
+      expect(screen.getByTestId("graph-task-node-FN-TEST").className).not.toContain("graph-task-node--active");
+      expect(container.querySelector(".graph-task-active-indicator")).toBeFalsy();
+    });
+
+    it("stays active in a renamed WIP lane when a stale awaiting-approval status remains", () => {
+      const props = createProps(createTask({ column: renamed("building"), status: "awaiting-approval" }));
+      const { container } = render(<GraphTaskNode {...props} taskColumnFlags={{ countsTowardWip: true }} />);
+
+      expect(screen.getByTestId("graph-task-node-FN-TEST").className).toContain("graph-task-node--active");
+      expect(container.querySelector(".graph-task-active-indicator")).toBeTruthy();
+    });
+
+    it.each([
+      ["mergeBlocker", { mergeBlocker: true }],
+      ["humanReview", { humanReview: true }],
+    ] as const)("applies the in-review class in a renamed lane carrying %s", (_trait, flags) => {
+      const props = createProps(createTask({ column: renamed("qa"), status: "idle" }));
+      render(<GraphTaskNode {...props} taskColumnFlags={flags} />);
+
+      const node = screen.getByTestId("graph-task-node-FN-TEST");
+      expect(node.className).toContain("graph-task-node--in-review");
+      expect(node.className).not.toContain("graph-task-node--active");
+    });
+
+    it("does not apply the in-review class to the legacy in-review id whose traits lack a review role", () => {
+      const props = createProps(createTask({ column: "in-review", status: "idle" }));
+      render(<GraphTaskNode {...props} taskColumnFlags={{}} />);
+
+      expect(screen.getByTestId("graph-task-node-FN-TEST").className).not.toContain("graph-task-node--in-review");
+    });
+  });
+
   it("does not render active indicator for paused in-progress tasks", () => {
     const props = createProps(createTask({ column: "in-progress", status: "executing", paused: true }));
     const { container } = render(<GraphTaskNode {...props} />);

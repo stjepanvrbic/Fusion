@@ -25,6 +25,25 @@ describe("notificationCard", () => {
     expect(card.badge).toBe("in-review");
   });
 
+  it("titles entry into a renamed review lane the caller supplied as in review", () => {
+    const card = notificationCard({ ...baseTask, column: "qa" } as never, "entered-column", {
+      reviewColumns: new Set(["qa"]),
+    });
+    expect(card.title.startsWith("In review ·")).toBe(true);
+  });
+
+  it("titles entry into a column outside the supplied review lanes as moved in", () => {
+    const card = notificationCard(baseTask as never, "entered-column", { reviewColumns: new Set(["qa"]) });
+    expect(card.title.startsWith("Moved in ·")).toBe(true);
+  });
+
+  it("decides the entry title by the legacy id when the caller supplies no review lanes", () => {
+    expect(notificationCard(baseTask as never, "entered-column").title.startsWith("In review ·")).toBe(true);
+    expect(
+      notificationCard({ ...baseTask, column: "qa" } as never, "entered-column").title.startsWith("Moved in ·"),
+    ).toBe(true);
+  });
+
   it("truncates title boundary", () => {
     const card = notificationCard(baseTask as never, "new-task", { maxCharsPerLine: 16 });
     expect(card.title).toContain("…");

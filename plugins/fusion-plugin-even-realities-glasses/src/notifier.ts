@@ -1,4 +1,4 @@
-import { resolveTaskLifecycleColumns } from "@fusion/core";
+import { resolveProjectColumnsForRoles, resolveTaskLifecycleColumns } from "@fusion/core";
 import type { AsyncDataLayer, Task, WorkflowIr } from "@fusion/core";
 import type { PluginContext } from "@fusion/plugin-sdk";
 import { notificationCard } from "./cards.js";
@@ -41,6 +41,27 @@ export interface Notifier {
 }
 
 const PENDING_CAP = 200;
+
+const REVIEW_TITLE_ROLES = ["mergeBlocker", "humanReview"] as const;
+
+/*
+FNXC:WorkflowLifecycleColumns 2026-10-12-06:14:
+The lanes a notification card announces as "In review": every column a workflow in this project gives the merge-blocker or human-review trait, plus the legacy `in-review` id the core helper always includes.
+The set spans the project, so it can hold a lane from a workflow the notified card does not use. That is accepted here because the value only selects the card's title text.
+A failed resolution returns undefined, and the card then decides by the legacy id.
+*/
+export async function resolveReviewLanes(
+  taskStore: PluginContext["taskStore"],
+): Promise<ReadonlySet<string> | undefined> {
+  try {
+    return await resolveProjectColumnsForRoles(
+      taskStore as Parameters<typeof resolveProjectColumnsForRoles>[0],
+      REVIEW_TITLE_ROLES,
+    );
+  } catch {
+    return undefined;
+  }
+}
 
 export function createNotifier(deps: NotifierDeps): Notifier {
   const setIntervalImpl = deps.setIntervalImpl ?? setInterval;
@@ -150,12 +171,13 @@ export function createNotifier(deps: NotifierDeps): Notifier {
       }
       const events = diffSnapshots(snapshot, tasks, { notifyOnColumns, alsoNotifyOnDone, completeColumnsByTaskId });
       const taskMap = new Map(tasks.map((task) => [task.id, task] as const));
+      const reviewColumns = events.length > 0 ? await resolveReviewLanes(deps.taskStore) : undefined;
 
       for (const event of events) {
         const task = taskMap.get(event.taskId);
         if (!task) continue;
         try {
-          await deps.transport.pushCard(notificationCard(task, event.reason));
+          await deps.transport.pushCard(notificationCard(task, event.reason, { reviewColumns }));
         } catch (err) {
           deps.logger?.error?.("failed to push notification card", { err, pluginId: deps.pluginId, taskId: task.id });
         }

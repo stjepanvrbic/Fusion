@@ -137,6 +137,7 @@ a question other than the one being asked.
 | --- | --- |
 | `node scripts/check-*.mjs` exits 0 | report-only mode — the failure path needs `--strict` |
 | a census reports 0 for a new file | the file is untracked, so it was never scanned |
+| a census reports 0 for a file that holds a guard | the file is not in the gate's list, so the gate never opened it. Compare the list with every file under the gate's roots: `pnpm test:scripts -- scripts/__tests__/list-git-source-files.test.mjs` |
 | a backgrounded `cmd > log; grep …` reports exit 0 | that is `grep`'s status; the suite inside had 8 failures |
 | a rebased branch's tests pass | the rebase never started, so it ran on the **old** base |
 

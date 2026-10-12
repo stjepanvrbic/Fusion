@@ -84,7 +84,7 @@ import { useBranchTaskFilters } from "./hooks/useBranchTaskFilters";
 import { useDashboardHealth } from "./hooks/useDashboardHealth";
 import { useAuthTokenRecovery } from "./hooks/useAuthTokenRecovery";
 import { useScopedDismissFlag } from "./hooks/useScopedDismissFlag";
-import { useCapacityRiskBanner } from "./hooks/useCapacityRiskBanner";
+import { countCapacityRiskLanes, useCapacityRiskBanner } from "./hooks/useCapacityRiskBanner";
 import { useMainPanelTaskDetail } from "./hooks/useMainPanelTaskDetail";
 import { useBoardScrollRestore } from "./hooks/useBoardScrollRestore";
 import { usePoppedOutTasks, type PoppedOutTaskEntry } from "./hooks/usePoppedOutTasks";
@@ -990,13 +990,9 @@ function AppInner() {
 
   const { stats: agentStats } = useAgents(currentProject?.id);
 
-  const inProgressCount = useMemo(
-    () => boardSourceTasks.filter((task) => task.column === "in-progress").length,
-    [boardSourceTasks],
-  );
-  const inReviewCount = useMemo(
-    () => boardSourceTasks.filter((task) => task.column === "in-review").length,
-    [boardSourceTasks],
+  const { inProgressCount, inReviewCount } = useMemo(
+    () => countCapacityRiskLanes(boardSourceTasks, footerColumnFlagsByTaskId),
+    [boardSourceTasks, footerColumnFlagsByTaskId],
   );
   const { signal: capacityRiskSignal, dismissed: capacityRiskDismissed, dismiss: handleDismissCapacityRisk } = useCapacityRiskBanner({
     agentStats,

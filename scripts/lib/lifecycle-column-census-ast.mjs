@@ -56,6 +56,16 @@ import { SourceParseError, parseSourceFileStrict } from "./parse-source-file.mjs
 const require = createRequire(import.meta.url);
 const ts = require("typescript");
 
+/*
+FNXC:LifecycleColumnCensus 2026-10-12-06:14:
+The sources the census covers: every `.ts` and `.tsx` file under these roots, files directly in a root included.
+Declared here so a test can import it without running the command-line script.
+*/
+export const CENSUS_SOURCE_SCOPE = Object.freeze({
+  roots: Object.freeze(["packages/*/src", "packages/*/app", "plugins/*/src"]),
+  extensions: Object.freeze([".ts", ".tsx"]),
+});
+
 /** The legacy lifecycle column vocabulary — the ids that shipped as the builtin board. */
 export const LEGACY_COLUMN_IDS = ["triage", "todo", "in-progress", "in-review", "done", "archived"];
 

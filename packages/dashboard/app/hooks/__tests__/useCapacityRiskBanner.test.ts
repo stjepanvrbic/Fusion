@@ -8,7 +8,8 @@ vi.mock("../../utils/projectStorage", () => ({
 }));
 
 import { getScopedItem, removeScopedItem, setScopedItem } from "../../utils/projectStorage";
-import { useCapacityRiskBanner } from "../useCapacityRiskBanner";
+import { countCapacityRiskLanes, useCapacityRiskBanner } from "../useCapacityRiskBanner";
+import type { ColumnRoleFlags } from "../../utils/columnRoles";
 
 const base = {
   agentStats: { todoTaskCount: 5, idleNonEphemeralCount: 0 },
@@ -19,6 +20,61 @@ const base = {
   settingsLoaded: true,
   currentProjectId: "p1",
 };
+
+describe("countCapacityRiskLanes", () => {
+  const flagsFor = (entries: Record<string, ColumnRoleFlags>) => new Map(Object.entries(entries));
+
+  it("counts renamed lanes by their column traits", () => {
+    const tasks = [
+      { id: "T-1", column: "building" },
+      { id: "T-2", column: "qa" },
+      { id: "T-3", column: "backlog" },
+    ];
+    const flags = flagsFor({
+      "T-1": { countsTowardWip: true },
+      "T-2": { mergeBlocker: true },
+      "T-3": { hold: true },
+    });
+
+    expect(countCapacityRiskLanes(tasks, flags)).toEqual({ inProgressCount: 1, inReviewCount: 1 });
+  });
+
+  it("counts a human-review lane as in review", () => {
+    const tasks = [{ id: "T-1", column: "qa" }];
+
+    expect(countCapacityRiskLanes(tasks, flagsFor({ "T-1": { humanReview: true } }))).toEqual({
+      inProgressCount: 0,
+      inReviewCount: 1,
+    });
+  });
+
+  it("does not count a legacy column id whose traits lack the role", () => {
+    const tasks = [
+      { id: "T-1", column: "in-progress" },
+      { id: "T-2", column: "in-review" },
+    ];
+    const flags = flagsFor({ "T-1": { hold: true }, "T-2": {} });
+
+    expect(countCapacityRiskLanes(tasks, flags)).toEqual({ inProgressCount: 0, inReviewCount: 0 });
+  });
+
+  it("counts by legacy column id when a task has no traits", () => {
+    const tasks = [
+      { id: "T-1", column: "in-progress" },
+      { id: "T-2", column: "in-review" },
+      { id: "T-3", column: "todo" },
+    ];
+
+    expect(countCapacityRiskLanes(tasks, new Map())).toEqual({ inProgressCount: 1, inReviewCount: 1 });
+  });
+
+  it("counts nothing for an empty task list", () => {
+    expect(countCapacityRiskLanes([], flagsFor({ "T-1": { countsTowardWip: true } }))).toEqual({
+      inProgressCount: 0,
+      inReviewCount: 0,
+    });
+  });
+});
 
 describe("useCapacityRiskBanner", () => {
   beforeEach(() => {

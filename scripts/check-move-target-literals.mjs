@@ -28,7 +28,7 @@ Report-only by default; `--strict` fails on any change from the baseline, in EIT
 drop is re-recorded in the same PR that earns it rather than leaving a stale allowance open.
 */
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { listGitSourceFiles } from "./lib/list-git-source-files.mjs";
+import { listProductionSourceFiles } from "./lib/list-git-source-files.mjs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -128,14 +128,15 @@ because there was nowhere to put a regression.
 Behaviour-preserving: the CLI body is unchanged, only wrapped so it runs when this file is the entry point
 and not when imported. The two pure helpers are hoisted above it and `destinationLiterals` is exported.
 */
-/** Git pathspecs for the scanned production sources; passed as argv so no shell reinterprets the globs. */
-export const MOVE_TARGET_PATHSPECS = Object.freeze([
-  "packages/*/src/**/*.ts",
-  "packages/*/src/*.ts",
-  "packages/*/src/**/*.tsx",
-  "packages/*/app/**/*.ts",
-  "packages/*/app/**/*.tsx",
-]);
+/*
+FNXC:MoveTargetRatchet 2026-10-12-06:14:
+The sources this check covers: every `.ts` and `.tsx` file under these roots, files directly in a root included.
+The lister builds the git pathspecs from the scope, so this file names directories and extensions only.
+*/
+export const MOVE_TARGET_SOURCE_SCOPE = Object.freeze({
+  roots: Object.freeze(["packages/*/src", "packages/*/app"]),
+  extensions: Object.freeze([".ts", ".tsx"]),
+});
 
 const isEntryPoint = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isEntryPoint) {
@@ -150,10 +151,9 @@ if (isEntryPoint) {
     population; it only makes the local reading honest. #3254 made the same change to the census.
     A path listed by both --cached and --others is scanned once, so the baseline never double-counts.
 
-    FNXC:WindowsShell 2026-10-07-18:03: listGitSourceFiles passes the pathspecs as argv; the old execSync shell string ran cmd.exe on Windows, which kept the single quotes, so the list came back empty and the ratchet failed closed on every Windows run.
+    FNXC:WindowsShell 2026-10-07-18:03: the lister passes the pathspecs as argv; the old execSync shell string ran cmd.exe on Windows, which kept the single quotes, so the list came back empty and the ratchet failed closed on every Windows run.
     */
-    files = listGitSourceFiles(MOVE_TARGET_PATHSPECS, { cwd: REPO })
-      .filter((f) => !f.includes("__tests__") && !/\.(test|spec)\.tsx?$/.test(f));
+    files = listProductionSourceFiles(MOVE_TARGET_SOURCE_SCOPE, { cwd: REPO });
   } catch (err) {
     /* FAIL CLOSED: an unreadable file list means nothing was checked, which must not read as clean. */
     console.error(`check-move-target-literals: could not list files — ${err?.message ?? err}`);
