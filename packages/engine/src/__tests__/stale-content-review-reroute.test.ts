@@ -4,7 +4,7 @@ const core = vi.hoisted(() => ({
   resolveWorkflowIrForTask: vi.fn(),
   computeWorkflowIrPin: vi.fn(() => ({ irHash: "ir-hash" })),
 }));
-vi.mock("@fusion/core", () => core);
+vi.mock("@fusion/core", async (importOriginal) => ({ ...(await importOriginal<typeof import("@fusion/core")>()), ...core }));
 
 import { rerouteSingularStaleContentToReview } from "../merge/stale-content-review-reroute.js";
 
@@ -63,5 +63,28 @@ describe("singular stale-content review reroute", () => {
     expect(result).toMatchObject({ rerouted: false, reason });
     expect(subject.workflowStepResults).toEqual(before);
     if (reason !== "active-continuation") expect(fake.seedWorkspaceCodeReviewContinuationIfIdle).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:MergeLandingCommitPoint 2026-10-12-12:10:
+  KB-146 was seeded back to Code Review from a snapshot taken before its landing was confirmed.
+  The reroute reads the live row and refuses a landing-settled card, while an unlanded stale card is still seeded and an active continuation still wins.
+  */
+  it("refuses a card whose live row is landing-settled even when the snapshot predates the landing", async () => {
+    const fake = { ...store(), getTask: vi.fn(async () => task({ mergeDetails: { mergeConfirmed: true, noOpMerge: true } })), getRootDir: vi.fn(() => "/repo") };
+
+    await expect(rerouteSingularStaleContentToReview(fake, task(), {
+      requiredPreMergeStepIds: new Set(["security-review", "code-review"]), mergeContent: singular,
+    })).resolves.toEqual({ rerouted: false, reason: "landed" });
+    expect(fake.seedWorkspaceCodeReviewContinuationIfIdle).not.toHaveBeenCalled();
+  });
+
+  it.each([[true, "seeded"], [false, "active-continuation"]] as const)("keeps rerouting an unlanded live card (idle=%s -> %s)", async (idle, reason) => {
+    const fake = { ...store(idle), getTask: vi.fn(async () => task()), getRootDir: vi.fn(() => "/repo") };
+
+    await expect(rerouteSingularStaleContentToReview(fake, task(), {
+      requiredPreMergeStepIds: new Set(["security-review", "code-review"]), mergeContent: singular,
+    })).resolves.toMatchObject({ rerouted: idle, reason });
+    expect(fake.seedWorkspaceCodeReviewContinuationIfIdle).toHaveBeenCalledTimes(1);
   });
 });

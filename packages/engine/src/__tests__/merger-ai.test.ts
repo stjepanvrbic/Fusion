@@ -12,6 +12,18 @@ vi.mock("../agents/agent-session-helpers.js", async (importOriginal) => {
     createResolvedAgentSession: createResolvedAgentSessionMock,
   };
 });
+/* FNXC:MergeLandingCommitPoint 2026-10-12-10:25: lets one landing test force the un-stashable dirty-checkout advance; every other call runs the real stash. */
+const pushTaggedStashSpy = vi.hoisted(() => ({ fail: false }));
+vi.mock("../merge/tagged-stash.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../merge/tagged-stash.js")>();
+  return {
+    ...actual,
+    pushTaggedStash: async (...args: Parameters<typeof actual.pushTaggedStash>) => {
+      if (pushTaggedStashSpy.fail) throw new Error("stash push failed");
+      return actual.pushTaggedStash(...args);
+    },
+  };
+});
 vi.mock("../pi.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../pi.js")>();
   return {
@@ -1949,6 +1961,8 @@ describe("runAiMerge", () => {
     );
     expect(auditDb.some((e: any) => e.mutationType === "overseer:no-op-finalize-vetoed-failed-executor")).toBe(true);
     expect(git(dir, ["rev-parse", "main"])).toBe(mainBefore);
+    // FNXC:MergeLandingCommitPoint 2026-10-12-11:35: the early no-op confirmation runs only after every empty-lane guard.
+    expect(task.mergeDetails?.mergeConfirmed).not.toBe(true);
   });
 
   /*
@@ -2355,5 +2369,404 @@ describe("landSquash (advance + local-checkout sync)", () => {
     expect(git(dir, ["rev-parse", "main"])).toBe(squashSha);
     // The original pre-merge edits are retained as a backup entry.
     expect(stashEntries(dir).some((e) => e.subject.includes("fusion-merger-autostash:FN-1:ai-local-sync:"))).toBe(true);
+  });
+
+  /*
+  FNXC:MergeLandingCommitPoint 2026-10-12-10:25:
+  Every ref-advance shape reports the landing commit point exactly once, before the ref moves, so a requester's hung-merge bound stops before the merge commits (KB-146).
+  */
+  describe("landing commit point", () => {
+    function recordLanding(dir: string): { callback: () => void; tipsAtCallback: string[] } {
+      const tipsAtCallback: string[] = [];
+      return { callback: () => { tipsAtCallback.push(git(dir, ["rev-parse", "main"])); }, tipsAtCallback };
+    }
+
+    it("reports the fast-forward of a clean checkout once, before main moves", async () => {
+      const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+      const { tipSha, squashSha } = makeDescendantSquash(dir, () => writeFileSync(join(dir, "landed.txt"), "landed\n"));
+      const landing = recordLanding(dir);
+
+      const res = await landSquash({ projectRootDir: dir, mergeRoot: dir, integrationBranch: "main", tipSha, squashSha, taskId: "FN-1", audit: auditStub(), onLandingStarted: landing.callback });
+
+      expect(res).toEqual({ outcome: "advanced", localSync: "ff" });
+      expect(landing.tipsAtCallback).toEqual([tipSha]);
+      expect(git(dir, ["rev-parse", "main"])).toBe(squashSha);
+    });
+
+    it("reports the bare ref advance when the target is not checked out", async () => {
+      const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+      const { tipSha, squashSha } = makeDescendantSquash(dir, () => writeFileSync(join(dir, "landed.txt"), "landed\n"));
+      git(dir, ["checkout", "-q", "-b", "somewhere-else", "main"]);
+      const landing = recordLanding(dir);
+
+      const res = await landSquash({ projectRootDir: dir, mergeRoot: dir, integrationBranch: "main", tipSha, squashSha, taskId: "FN-1", audit: auditStub(), onLandingStarted: landing.callback });
+
+      expect(res).toEqual({ outcome: "advanced", localSync: "skipped-other-branch" });
+      expect(landing.tipsAtCallback).toEqual([tipSha]);
+      expect(git(dir, ["rev-parse", "main"])).toBe(squashSha);
+    });
+
+    it("reports the bare ref advance of an un-stashable dirty checkout", async () => {
+      const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+      const { tipSha, squashSha } = makeDescendantSquash(dir, () => writeFileSync(join(dir, "landed.txt"), "landed\n"));
+      writeFileSync(join(dir, "mydraft.txt"), "local draft\n");
+      const landing = recordLanding(dir);
+      pushTaggedStashSpy.fail = true;
+      try {
+        const res = await landSquash({ projectRootDir: dir, mergeRoot: dir, integrationBranch: "main", tipSha, squashSha, taskId: "FN-1", audit: auditStub(), allowDirtyLocalCheckoutSync: true, onLandingStarted: landing.callback });
+        expect(res).toEqual({ outcome: "advanced", localSync: "skipped-dirty-unstashable" });
+      } finally {
+        pushTaggedStashSpy.fail = false;
+      }
+      expect(landing.tipsAtCallback).toEqual([tipSha]);
+      expect(git(dir, ["rev-parse", "main"])).toBe(squashSha);
+    });
+
+    it("does not advance the ref when the merge is aborted during the pre-landing gate re-check", async () => {
+      const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+      const { tipSha, squashSha } = makeDescendantSquash(dir, () => writeFileSync(join(dir, "landed.txt"), "landed\n"));
+      const controller = new AbortController();
+
+      await expect(landSquash({
+        projectRootDir: dir, mergeRoot: dir, integrationBranch: "main", tipSha, squashSha, taskId: "FN-1", audit: auditStub(),
+        signal: controller.signal,
+        assertMergeGateStillOpen: async () => { controller.abort(); },
+      })).rejects.toMatchObject({ name: "MergeAbortedError" });
+      expect(git(dir, ["rev-parse", "main"])).toBe(tipSha);
+      expect(existsSync(join(dir, "landed.txt"))).toBe(false);
+    });
+  });
+});
+
+/*
+FNXC:MergeLandingCommitPoint 2026-10-12-10:50:
+KB-146: a merge aborted three seconds after main fast-forwarded recorded no landing, had its `landing` stamp cleared as stale, published nothing, and paid a second full merge session.
+The ref advance is the commit point: whatever aborts the body afterwards, the card already holds the landing proof, keeps its stamp for the confirmed-landing owners, and the next pass finishes with no merge or review agent.
+Surfaces: clean fast-forward, dirty checkout whose stash restore conflicts (abort during stash resolution), pre-existing clean-room recovery, the second pass, a failing proof write, and the merge door for settled, poisoned and moved-past-pin rows.
+*/
+describe("runAiMerge landing commit point", () => {
+  type Fixture = ReturnType<typeof makeStore>;
+
+  /** Aborts the merge right after its landing proof is written, which happens immediately after the ref advance. */
+  function abortAfterLandingProof(fixture: Fixture, controller: AbortController): void {
+    const base = fixture.store.updateTaskAtomic.getMockImplementation();
+    fixture.store.updateTaskAtomic.mockImplementation(async (id: string, updater: never) => {
+      const result = await base(id, updater);
+      if (fixture.task.mergeDetails?.mergeConfirmed === true) controller.abort();
+      return result;
+    });
+  }
+
+  function expectLandingProof(dir: string, fixture: Fixture, branchTipSha: string, mainBefore: string): void {
+    const mainAfter = git(dir, ["rev-parse", "main"]);
+    expect(mainAfter).not.toBe(mainBefore);
+    expect(fixture.task.mergeDetails).toMatchObject({
+      mergeConfirmed: true,
+      commitSha: mainAfter,
+      landedBranchTipSha: branchTipSha,
+      mergeTargetBranch: "main",
+    });
+    // The body leaves its merge-active stamp for the confirmed-landing owners instead of clearing it as stale.
+    expect(["merging", "landing"]).toContain(fixture.task.status);
+    expect(fixture.logs.some((line) => line.includes("cleared stale"))).toBe(false);
+  }
+
+  async function abortedLanding(): Promise<{ dir: string; fixture: Fixture; branchTipSha: string; mainBefore: string; worktree: string }> {
+    const { dir } = initRepoWithBranch();
+    const worktree = mkdtempSync(join(tmpdir(), "fusion-kb-159-worktree-"));
+    rmSync(worktree, RM);
+    tracked.add(worktree);
+    git(dir, ["worktree", "add", "-q", worktree, "fusion/fn-1"]);
+    const fixture = makeStore(dir, { worktree });
+    const [mainBefore, branchTipSha] = revParse(dir, ["main", "fusion/fn-1"]);
+    const controller = new AbortController();
+    abortAfterLandingProof(fixture, controller);
+
+    await expect(runAiMerge(fixture.store, dir, "FN-1", { manual: true, signal: controller.signal }, {
+      mergeAgent: realMergeAgent("fusion/fn-1"),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    })).rejects.toMatchObject({ name: "MergeAbortedError" });
+    return { dir, fixture, branchTipSha, mainBefore, worktree };
+  }
+
+  it("records the landing when the merge is aborted right after a clean fast-forward", async () => {
+    const { dir, fixture, branchTipSha, mainBefore } = await abortedLanding();
+
+    expectLandingProof(dir, fixture, branchTipSha, mainBefore);
+  });
+
+  it("records the landing when the abort arrives while the conflicting stash restore is being resolved", async () => {
+    const { dir } = initRepoWithBranch();
+    const fixture = makeStore(dir);
+    const [mainBefore, branchTipSha] = revParse(dir, ["main", "fusion/fn-1"]);
+    writeFileSync(join(dir, "feature.txt"), "local untracked draft\n");
+    const controller = new AbortController();
+    const stashResolveAgent = vi.fn(async () => { controller.abort(); });
+
+    await expect(runAiMerge(fixture.store, dir, "FN-1", { manual: true, signal: controller.signal, allowDirtyLocalCheckoutSync: true }, {
+      mergeAgent: realMergeAgent("fusion/fn-1"),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+      stashResolveAgent,
+    })).rejects.toMatchObject({ name: "MergeAbortedError" });
+
+    expect(stashResolveAgent).toHaveBeenCalledOnce();
+    expectLandingProof(dir, fixture, branchTipSha, mainBefore);
+  });
+
+  it("records the landing when a recovered pre-existing clean-room commit is aborted after it lands", async () => {
+    const { dir } = initRepoWithBranch();
+    const [mainBefore, branchTipSha] = revParse(dir, ["main", "fusion/fn-1"]);
+    const aiMergeRoot = resolveAiMergeRootPath(dir, undefined);
+    mkdirSync(aiMergeRoot, { recursive: true });
+    const strandedRoot = mkdtempSync(join(aiMergeRoot, "fusion-ai-merge-fn-1-"));
+    tracked.add(strandedRoot);
+    git(dir, ["worktree", "add", "--detach", strandedRoot, mainBefore]);
+    git(strandedRoot, ["merge", "--squash", "fusion/fn-1"]);
+    git(strandedRoot, ["commit", "-q", "-m", "FN-1: recovered clean-room", "-m", "Fusion-Task-Id: FN-1"]);
+    const fixture = makeStore(dir, {
+      aiMergeReviewReconciliation: {
+        sourceSha: branchTipSha,
+        integrationTipSha: mainBefore,
+        candidateSha: git(strandedRoot, ["rev-parse", "HEAD"]),
+        candidateTreeSha: git(strandedRoot, ["rev-parse", "HEAD^{tree}"]),
+        findings: [],
+        consecutiveCleanApprovals: 2,
+        correctivePasses: 0,
+      },
+    });
+    const controller = new AbortController();
+    abortAfterLandingProof(fixture, controller);
+    const mergeAgent = vi.fn(async () => { throw new Error("should not re-merge"); });
+
+    await expect(runAiMerge(fixture.store, dir, "FN-1", { manual: true, signal: controller.signal }, {
+      mergeAgent,
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    })).rejects.toMatchObject({ name: "MergeAbortedError" });
+
+    expect(mergeAgent).not.toHaveBeenCalled();
+    expectLandingProof(dir, fixture, branchTipSha, mainBefore);
+  });
+
+  it("finishes an aborted landing on the next pass with no merge or review agent", async () => {
+    const { dir, fixture, worktree } = await abortedLanding();
+    const landedSha = git(dir, ["rev-parse", "main"]);
+    const mergeAgent = vi.fn(async () => { throw new Error("should not re-merge"); });
+    const reviewAgent = vi.fn(async () => "REVIEW_VERDICT: approve");
+
+    const result = await runAiMerge(fixture.store, dir, "FN-1", { manual: true, signal: new AbortController().signal }, { mergeAgent, reviewAgent });
+
+    expect(result).toMatchObject({ merged: true, commitSha: landedSha });
+    expect(mergeAgent).not.toHaveBeenCalled();
+    expect(reviewAgent).not.toHaveBeenCalled();
+    expect(git(dir, ["rev-parse", "main"])).toBe(landedSha);
+    expect(fixture.logs.some((line) => line.includes("skipped a second clean-room merge"))).toBe(true);
+    expect(existsSync(worktree)).toBe(false);
+    expect(branchExists(dir, "fusion/fn-1")).toBe(false);
+  });
+
+  it("completes the landing when the landing-proof write fails", async () => {
+    const { dir } = initRepoWithBranch();
+    const fixture = makeStore(dir);
+    const [mainBefore, branchTipSha] = revParse(dir, ["main", "fusion/fn-1"]);
+    const base = fixture.store.updateTaskAtomic.getMockImplementation();
+    let failed = false;
+    fixture.store.updateTaskAtomic.mockImplementation(async (id: string, updater: never) => {
+      if (!failed && git(dir, ["rev-parse", "main"]) !== mainBefore) {
+        failed = true;
+        throw new Error("database unavailable");
+      }
+      return base(id, updater);
+    });
+
+    const result = await runAiMerge(fixture.store, dir, "FN-1", { manual: true }, {
+      mergeAgent: realMergeAgent("fusion/fn-1"),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    });
+
+    expect(failed).toBe(true);
+    expect(result.merged).toBe(true);
+    expect(fixture.task.mergeDetails).toMatchObject({ mergeConfirmed: true, commitSha: git(dir, ["rev-parse", "main"]), landedBranchTipSha: branchTipSha });
+  });
+
+  describe("merge door for a card with a stale content approval", () => {
+    const STALE_FINGERPRINT = `sha256:${"0".repeat(64)}`;
+
+    function staleApprovalCard(dir: string, mergeDetails: Record<string, unknown>): Fixture {
+      const worktree = mkdtempSync(join(tmpdir(), "fusion-kb-159-door-"));
+      rmSync(worktree, RM);
+      tracked.add(worktree);
+      git(dir, ["worktree", "add", "-q", worktree, "fusion/fn-1"]);
+      const fixture = makeStore(dir, {
+        worktree,
+        baseCommitSha: git(dir, ["rev-parse", "main"]),
+        enabledWorkflowSteps: ["code-review"],
+        workflowStepResults: [{
+          workflowStepId: "code-review",
+          workflowStepName: "Code Review",
+          phase: "pre-merge",
+          source: "optional-group",
+          status: "passed",
+          verdict: "APPROVE",
+          reviewInputFingerprint: STALE_FINGERPRINT,
+          completedAt: new Date().toISOString(),
+        }],
+        mergeDetails,
+      });
+      const selection = { workflowId: "builtin:coding", stepIds: ["code-review"] };
+      Object.assign(fixture.store, {
+        getTaskWorkflowSelection: vi.fn(() => selection),
+        getTaskWorkflowSelectionAsync: vi.fn(async () => selection),
+      });
+      return fixture;
+    }
+
+    function landSquashOnMain(dir: string): string {
+      git(dir, ["merge", "--squash", "fusion/fn-1"]);
+      git(dir, ["commit", "-q", "-m", "FN-1: squash", "-m", "Fusion-Task-Id: FN-1"]);
+      return git(dir, ["rev-parse", "main"]);
+    }
+
+    it("lets a landing-settled card reach the recorded-landing finalizer", async () => {
+      const { dir } = initRepoWithBranch();
+      const branchTipSha = git(dir, ["rev-parse", "fusion/fn-1"]);
+      const fixture = staleApprovalCard(dir, {});
+      const landedSha = landSquashOnMain(dir);
+      fixture.task.mergeDetails = { mergeConfirmed: true, commitSha: landedSha, landedBranchTipSha: branchTipSha, mergeTargetBranch: "main" };
+      const mergeAgent = vi.fn(async () => { throw new Error("should not re-merge"); });
+
+      const result = await runAiMerge(fixture.store, dir, "FN-1", { manual: true }, { mergeAgent, reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve") });
+
+      expect(result).toMatchObject({ merged: true, commitSha: landedSha });
+      expect(mergeAgent).not.toHaveBeenCalled();
+    });
+
+    it("still refuses a confirmed row whose commit never reached the target", async () => {
+      const { dir } = initRepoWithBranch();
+      const branchTipSha = git(dir, ["rev-parse", "fusion/fn-1"]);
+      const fixture = staleApprovalCard(dir, { mergeConfirmed: true, commitSha: sourceAdvanceSha, landedBranchTipSha: branchTipSha, mergeTargetBranch: "main" });
+      const mergeAgent = vi.fn(async () => { throw new Error("should not merge"); });
+
+      await expect(runAiMerge(fixture.store, dir, "FN-1", { manual: true }, { mergeAgent, reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve") }))
+        .rejects.toThrow(/Cannot merge FN-1: .*approval recorded against different content/);
+      expect(mergeAgent).not.toHaveBeenCalled();
+    });
+
+    it("still refuses a confirmed row whose branch moved past its pin", async () => {
+      const { dir } = initRepoWithBranch();
+      const mainBefore = git(dir, ["rev-parse", "main"]);
+      const fixture = staleApprovalCard(dir, {});
+      const landedSha = landSquashOnMain(dir);
+      fixture.task.mergeDetails = { mergeConfirmed: true, commitSha: landedSha, landedBranchTipSha: mainBefore, mergeTargetBranch: "main" };
+      const mergeAgent = vi.fn(async () => { throw new Error("should not merge"); });
+
+      await expect(runAiMerge(fixture.store, dir, "FN-1", { manual: true }, { mergeAgent, reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve") }))
+        .rejects.toThrow(/Cannot merge FN-1: .*approval recorded against different content/);
+      expect(mergeAgent).not.toHaveBeenCalled();
+    });
+  });
+});
+
+/*
+FNXC:MergeLandingCommitPoint 2026-10-12-11:35:
+KB-146's no-op finalize removed the task worktree for 33 seconds before it confirmed the landing, and a stale-content reroute seeded Code Review on the landed card in that window.
+The no-op lane now confirms before post-landing cleanup, pins the branch tip it proved, and an interrupted finalize finishes on the next pass without a merge agent.
+Surfaces: trailer proof, reviewer-confirmed no-commit claim, an abort during cleanup, and the guards that must still park before any confirmation.
+*/
+describe("runAiMerge no-op confirmation before cleanup", () => {
+  function landTrailerSquashOnMain(dir: string): void {
+    git(dir, ["merge", "--squash", "fusion/fn-1"]);
+    git(dir, ["commit", "-q", "-m", "FN-1: squash", "-m", "Fusion-Task-Id: FN-1"]);
+  }
+
+  function withTaskWorktree(dir: string): string {
+    const worktree = mkdtempSync(join(tmpdir(), "fusion-kb-159-noop-"));
+    rmSync(worktree, RM);
+    tracked.add(worktree);
+    git(dir, ["worktree", "add", "-q", worktree, "fusion/fn-1"]);
+    return worktree;
+  }
+
+  /** Records the merge details visible at the moment post-landing cleanup clears the worktree pointer. */
+  function observeCleanup(fixture: ReturnType<typeof makeStore>, onCleanup?: () => void): { seen: () => Record<string, unknown> | undefined } {
+    let seen: Record<string, unknown> | undefined;
+    const base = fixture.store.updateTask.getMockImplementation();
+    fixture.store.updateTask.mockImplementation(async (id: string, patch: Record<string, unknown>) => {
+      if ("worktree" in patch && patch.worktree === null && !seen) {
+        seen = { ...(fixture.task.mergeDetails ?? {}) };
+        onCleanup?.();
+      }
+      return base(id, patch);
+    });
+    return { seen: () => seen };
+  }
+
+  it("confirms a trailer-proven no-op landing before post-landing cleanup runs", async () => {
+    const { dir } = initRepoWithBranch();
+    const branchTipSha = git(dir, ["rev-parse", "fusion/fn-1"]);
+    landTrailerSquashOnMain(dir);
+    const fixture = makeStore(dir, { worktree: withTaskWorktree(dir) });
+    const cleanup = observeCleanup(fixture);
+
+    const result = await runAiMerge(fixture.store, dir, "FN-1", { manual: true }, {
+      mergeAgent: vi.fn(async () => undefined),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    });
+
+    expect(result).toMatchObject({ noOp: true, mergeConfirmed: true });
+    expect(fixture.logs.some((line) => line.includes("work already landed (proof=trailer"))).toBe(true);
+    expect(cleanup.seen()).toMatchObject({ mergeConfirmed: true, noOpMerge: true, landedBranchTipSha: branchTipSha, mergeTargetBranch: "main" });
+    expect(fixture.task.mergeDetails).toMatchObject({ mergeConfirmed: true, noOpMerge: true, noOpReason: "no-net-changes" });
+  });
+
+  it("confirms a reviewer-confirmed no-commit claim before post-landing cleanup runs", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1", variant: "main-superset-of-branch" });
+    const fixture = makeStore(dir, { worktree: withTaskWorktree(dir) });
+    const cleanup = observeCleanup(fixture);
+
+    const result = await runAiMerge(fixture.store, dir, "FN-1", {}, {
+      mergeAgent: vi.fn(async () => "I didn't make a commit, because main already contains everything on fusion/fn-1."),
+      reviewAgent: vi.fn(async () => "main's feature.txt carries the branch line.\nREVIEW_VERDICT: approve"),
+    });
+
+    expect(result).toMatchObject({ noOp: true });
+    expect(cleanup.seen()).toMatchObject({ mergeConfirmed: true, noOpMerge: true });
+  });
+
+  it("finishes a no-op finalize interrupted during cleanup on the next pass without a merge agent", async () => {
+    const { dir } = initRepoWithBranch();
+    landTrailerSquashOnMain(dir);
+    const fixture = makeStore(dir, { worktree: withTaskWorktree(dir) });
+    const controller = new AbortController();
+    observeCleanup(fixture, () => controller.abort());
+
+    await expect(runAiMerge(fixture.store, dir, "FN-1", { manual: true, signal: controller.signal }, {
+      mergeAgent: vi.fn(async () => undefined),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    })).rejects.toMatchObject({ name: "MergeAbortedError" });
+    expect(fixture.task.mergeDetails).toMatchObject({ mergeConfirmed: true, noOpMerge: true });
+    expect(branchExists(dir, "fusion/fn-1")).toBe(true);
+
+    const mergeAgent = vi.fn(async () => { throw new Error("should not re-merge"); });
+    const result = await runAiMerge(fixture.store, dir, "FN-1", { manual: true, signal: new AbortController().signal }, {
+      mergeAgent,
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    });
+
+    expect(result).toMatchObject({ noOp: true, mergeConfirmed: true });
+    expect(mergeAgent).not.toHaveBeenCalled();
+    expect(branchExists(dir, "fusion/fn-1")).toBe(false);
+  });
+
+  it("parks an empty branch without landed proof before writing any confirmation", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1", variant: "branch-reverted-to-net-zero" });
+    const fixture = makeStore(dir);
+
+    await runAiMerge(fixture.store, dir, "FN-1", { manual: true }, {
+      mergeAgent: vi.fn(async () => undefined),
+      reviewAgent: vi.fn(async () => "REVIEW_VERDICT: approve"),
+    });
+
+    expect(fixture.task.status).toBe("failed");
+    expect(fixture.task.mergeDetails?.mergeConfirmed).not.toBe(true);
   });
 });

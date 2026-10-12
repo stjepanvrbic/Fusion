@@ -133,3 +133,62 @@ describe("hidden stale-content park recovery", () => {
     manager.stop();
   });
 });
+
+/*
+FNXC:MergeLandingCommitPoint 2026-10-12-12:15:
+KB-146 was seeded back to Code Review while its own merge was finishing its landing.
+Mergeable-review recovery leaves a card whose merge lane is owned to that merge, still reroutes an unowned unlanded stale card, and a landed refusal from the reroute neither clears a hidden park nor writes an audit row.
+*/
+describe("stale-content recovery around an owned or landed merge", () => {
+  beforeEach(() => recovery.reroute.mockClear());
+
+  function mergeableTask(): Task {
+    return { id: "FN-1", column: "in-review", status: null, error: null, autoMerge: true, worktree: "/tmp/fn-1", workflowStepResults: [], steps: [] } as unknown as Task;
+  }
+
+  it("does not reroute a mergeable card whose merge is active", async () => {
+    const store = Object.assign(createRecoveryStore(mergeableTask()), { peekMergeQueue: vi.fn(async () => []) });
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project", getActiveMergeTaskId: () => "FN-1" });
+
+    await manager.recoverMergeableReviewTasks();
+
+    expect(recovery.reroute).not.toHaveBeenCalled();
+    manager.stop();
+  });
+
+  it("does not reroute a mergeable card queued in the merge lane", async () => {
+    const store = Object.assign(createRecoveryStore(mergeableTask()), { peekMergeQueue: vi.fn(async () => [{ taskId: "FN-1" }]) });
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+
+    await manager.recoverMergeableReviewTasks();
+
+    expect(recovery.reroute).not.toHaveBeenCalled();
+    manager.stop();
+  });
+
+  it("still reroutes an unowned unlanded mergeable card", async () => {
+    const store = Object.assign(createRecoveryStore(mergeableTask()), { peekMergeQueue: vi.fn(async () => []) });
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+
+    await manager.recoverMergeableReviewTasks();
+
+    expect(recovery.reroute).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ id: "FN-1" }), expect.objectContaining({ projectRootDir: "/tmp/test-project" }));
+    manager.stop();
+  });
+
+  it("neither seeds nor clears a hidden park whose card has landed", async () => {
+    recovery.reroute.mockResolvedValue({ rerouted: false, reason: "landed" });
+    const task = hiddenTask();
+    const store = createRecoveryStore(task);
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+
+    await manager.recoverMergeableReviewTasks();
+
+    expect(recovery.reroute).toHaveBeenCalled();
+    expect(task).toMatchObject({ status: "failed", error: blocker });
+    expect(store.updateTaskAtomic).not.toHaveBeenCalled();
+    expect(store.recordRunAuditEvent).not.toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:merge-stale-content-review-rerouted" }));
+    expect(store.logEntry).not.toHaveBeenCalledWith("FN-1", expect.stringContaining("approved older content"));
+    manager.stop();
+  });
+});

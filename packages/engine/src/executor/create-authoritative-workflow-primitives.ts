@@ -448,7 +448,7 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
         try {
           let result: Awaited<ReturnType<NonNullable<typeof deps.mergeRequester>>> | "timeout" | "cancelled";
           try {
-            result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal: mergeSignal, graphOwnedPostMergeTraversal: true, onMergeRunStarted: runTimeout.restart }), runTimeout.expired, cancelled]);
+            result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal: mergeSignal, graphOwnedPostMergeTraversal: true, onMergeRunStarted: runTimeout.restart, onMergeLandingStarted: runTimeout.clear }), runTimeout.expired, cancelled]);
           } catch (error) {
             const terminalRefusal = classifyMergeRequesterRejection(error, ctx.node.node.id);
             if (terminalRefusal) return terminalRefusal;

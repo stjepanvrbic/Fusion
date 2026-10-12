@@ -172,6 +172,7 @@
     "packages/engine/src/merge/integration-branch.ts",
     "packages/engine/src/merge/landed-commit-provenance.ts",
     "packages/engine/src/merge/landed-commit-publication.ts",
+    "packages/engine/src/merge/landing-settled.ts",
     "packages/engine/src/merge/merge-active-status.ts",
     "packages/engine/src/merge/merge-content-capture.ts",
     "packages/engine/src/merge/merge-dependency-sync.ts",
@@ -7037,6 +7038,29 @@
       "axis1Evidence": "FN-8958 applies a fresh per-boundary fence or ownership checkpoint at this call site."
     },
     {
+      "callSiteId": "packages/engine/src/merge/merger-ai.ts::finalizeMerged::store.updateTask::#3",
+      "callSiteFingerprint": "store.updateTask(taskId,{?})",
+      "file": "packages/engine/src/merge/merger-ai.ts",
+      "enclosingSymbolPath": "finalizeMerged",
+      "writer": "store.updateTask",
+      "ordinal": 3,
+      "owningEntryPoint": "runAiMerge",
+      "reachableDataStates": [
+        "pre-land",
+        "mid-review",
+        "post-ref-advance",
+        "post-mergeDetails",
+        "workspace-partial-land"
+      ],
+      "axis1": "checkpoint-covered",
+      "axis1Evidence": "FN-8958 applies a fresh per-boundary fence or ownership checkpoint at this call site.",
+      "axis2Provisional": "unresolved",
+      "axis2Final": "already-fenced",
+      "observedInSuite": "layerB-observed",
+      "executionProof": "static:per-call-site merge write fence or ownership checkpoint",
+      "followUpTaskId": "none:no-follow-up-required"
+    },
+    {
       "callSiteId": "packages/engine/src/merge/merger-ai.ts::finalizeMerged::store.upsertTaskCommitAssociation::#1",
       "callSiteFingerprint": "store.upsertTaskCommitAssociation({taskLineageId,taskIdSnapshot,commitSha,commitSubject,authoredAt,matchedBy,confidence,additions,?})",
       "file": "packages/engine/src/merge/merger-ai.ts",
@@ -7893,6 +7917,25 @@
       "executionProof": "static:per-call-site merge write fence or ownership checkpoint",
       "followUpTaskId": "none:no-follow-up-required",
       "axis1Evidence": "FN-8958 applies a fresh per-boundary fence or ownership checkpoint at this call site."
+    },
+    {
+      "callSiteId": "packages/engine/src/merge/merger-ai.ts::runAiMerge>recordLanding>persisted::store.updateTaskAtomic::#1",
+      "callSiteFingerprint": "store.updateTaskAtomic(taskId,(live) => { const existing = live.mergeDetails; if (existing?.mergeConfirmed === true && existing.commitSha && existing.)",
+      "file": "packages/engine/src/merge/merger-ai.ts",
+      "enclosingSymbolPath": "runAiMerge>recordLanding>persisted",
+      "writer": "store.updateTaskAtomic",
+      "ordinal": 1,
+      "owningEntryPoint": "runAiMerge",
+      "reachableDataStates": [
+        "post-ref-advance"
+      ],
+      "axis1": "checkpoint-gap",
+      "axis1Evidence": "KB-159: landSquash calls recordLanding immediately after its own integration-ref advance succeeds and before any awaited tail work; the write is deliberately outside the merge write fence because the body that moved the ref owns that fact even if its signal aborts a moment later.",
+      "axis2Provisional": "benign-unfenced",
+      "axis2Final": "benign-unfenced",
+      "observedInSuite": "static-only:merger-ai.test.ts runAiMerge landing commit point cases abort the body right after this write and assert the stored landing proof; no Layer B production-body observation",
+      "executionProof": "static:atomic write records this body's own ref advance and never replaces a confirmed record naming a different commit",
+      "followUpTaskId": "none:no-follow-up-required"
     },
     {
       "callSiteId": "packages/engine/src/merge/merger-ai.ts::runPushAfterMergeStep::store.logEntry::#1",

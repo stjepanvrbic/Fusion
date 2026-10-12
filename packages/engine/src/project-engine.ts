@@ -503,6 +503,7 @@ type MergeResolver = {
   reject: (err: Error) => void;
   graphOwnedPostMergeTraversal?: boolean;
   onMergeRunStarted?: () => void;
+  onMergeLandingStarted?: () => void;
 };
 
 const EXTERNAL_MERGE_REGION_KINDS = new Set([
@@ -701,6 +702,8 @@ export class ProjectEngine {
   private activeMergeTaskId: string | null = null;
   /** Wall-clock when `activeMergeTaskId` was claimed; self-healing uses this when agent logs are silent. */
   private activeMergeStartedAtMs: number | null = null;
+  /** The active merge whose current attempt has started advancing its integration ref; reset on each attempt start. */
+  private activeMergeLandingTaskId: string | null = null;
   /*
   FNXC:MergeQueue 2026-07-15-10:05:
   Tracks the underlying merge body promise (not the abort race). After force-abort the race rejects so drain can continue, but the orphan body may still be mid-tool. The next claim waits for this latch so two runAiMerge/land paths cannot advance main concurrently.
@@ -1233,7 +1236,20 @@ export class ProjectEngine {
   */
   private noteMergeRunStarted(taskId: string): void {
     this.mergeRunningSince = Date.now();
+    this.activeMergeLandingTaskId = null;
     for (const resolver of this.manualMergeResolvers.get(taskId) ?? []) resolver.onMergeRunStarted?.();
+  }
+
+  /*
+  FNXC:MergeLandingCommitPoint 2026-10-12-09:55:
+  The active merge is about to advance its integration ref. Every requester waiting on it stops its hung-merge bound, and a requester that joins during this landing tail is told at once.
+  The pump watchdog measures the tail from here; a hung tail stays owned by that watchdog and the self-healing wedged-merge reclaim, whose abort can no longer lose the landing because the body records it when the ref moves.
+  */
+  private noteMergeLandingStarted(taskId: string): void {
+    if (this.activeMergeTaskId !== taskId) return;
+    this.mergeRunningSince = Date.now();
+    this.activeMergeLandingTaskId = taskId;
+    for (const resolver of this.manualMergeResolvers.get(taskId) ?? []) resolver.onMergeLandingStarted?.();
   }
 
   /*
@@ -3067,6 +3083,7 @@ export class ProjectEngine {
       const resolver: MergeResolver = {
         graphOwnedPostMergeTraversal: options.graphOwnedPostMergeTraversal === true,
         onMergeRunStarted: options.onMergeRunStarted,
+        onMergeLandingStarted: options.onMergeLandingStarted,
         resolve: (result) => {
           if (settled) return;
           settled = true;
@@ -3106,7 +3123,10 @@ export class ProjectEngine {
 
       signal?.addEventListener("abort", abort, { once: true });
       this.addMergeResolver(taskId, resolver);
-      if (this.activeMergeTaskId === taskId) resolver.onMergeRunStarted?.();
+      if (this.activeMergeTaskId === taskId) {
+        resolver.onMergeRunStarted?.();
+        if (this.activeMergeLandingTaskId === taskId) resolver.onMergeLandingStarted?.();
+      }
 
       // If this task is already queued or actively merging, wait for the
       // existing merge to finish rather than starting a second one.
@@ -3415,16 +3435,24 @@ export class ProjectEngine {
         metadata: { taskId: task.id, nodeId: reroute.nodeId, workflowStepId: reroute.workflowStepId, reason: reroute.reason, source: "merge-gate", missingGateCount: mergeGate.requiredPreMergeStepIds.size },
       });
     }
-    if (isStaleContentApprovalBlocker(blocker) && mergeContent.kind === "singular") {
+    /*
+    FNXC:MergeLandingCommitPoint 2026-10-12-11:55:
+    This probe runs on every merge sweep for every unpaused review card, including the card whose own merge body is running.
+    KB-146's stale-content branch seeded Code Review while its own no-op landing was finishing, so the probe never reroutes the active merge's card; the blocker it returns is unchanged.
+    A queued card is still rerouted (the pump's pre-dispatch probe relies on that), and a `landed` refusal writes no log line and no audit row.
+    */
+    if (isStaleContentApprovalBlocker(blocker) && mergeContent.kind === "singular" && this.activeMergeTaskId !== task.id) {
       const reroute = await rerouteSingularStaleContentToReview(store, task, {
         requiredPreMergeStepIds: mergeGate.requiredPreMergeStepIds,
         mergeContent,
+        projectRootDir: store.getRootDir?.() ?? this.config.workingDirectory,
       }).catch(() => ({
         rerouted: false,
         reason: "no-progress" as const,
         nodeId: undefined,
         workflowStepId: undefined,
       }));
+      if (reroute.reason === "landed") return blocker;
       await store.logEntry(
         task.id,
         `[pre-merge] Review lane '${reroute.nodeId ?? "unknown"}' approved older content; re-review is owned by the workflow graph (${reroute.reason}).`,
@@ -5189,6 +5217,7 @@ export class ProjectEngine {
                 pluginRunner: this.getPluginRunner(),
                 signal: abortSignal,
                 onMergeAttemptStarted: () => this.noteMergeRunStarted(taskId),
+                onMergeLandingStarted: () => this.noteMergeLandingStarted(taskId),
                 graphOwnedPostMergeTraversal,
                 syncGroupPr: this.options.syncGroupPr,
                 onSession: (session: { dispose: () => void }) => {

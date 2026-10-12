@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import type { Settings, Task, TaskStore } from "@fusion/core";
 import { SelfHealingManager } from "../self-healing.js";
+import { isLandingSettled } from "../merge/landing-settled.js";
+import { rerouteSingularStaleContentToReview } from "../merge/stale-content-review-reroute.js";
 import * as publication from "../merge/landed-commit-publication.js";
 
 /*
@@ -104,6 +106,24 @@ describe("SelfHealingManager.reconcileLandedReviewTask", () => {
 
     expect(result).toMatchObject({ outcome: "reconciled", sha: "abc123", strategy: "trailer", baseBranch: "main" });
     expect(tasks.get("FN-9304")).toMatchObject({ mergeDetails: { mergeConfirmed: true, commitSha: "abc123" }, branch: null });
+  });
+
+  /*
+  FNXC:MergeLandingCommitPoint 2026-10-12-12:35:
+  An absent-branch reconcile leaves a card whose landing is settled, so a stale Code Review approval on it is never rerouted back to review (KB-146).
+  */
+  it("leaves a card whose landing is settled, so a stale-content reroute refuses it as landed", async () => {
+    const { store, tasks } = storeWithTask(baseTask({ workflowStepResults: [{ workflowStepId: "code-review", status: "passed", verdict: "APPROVE", reviewInputFingerprint: "older" }] } as Partial<Task>));
+    const manager = managerWithStubs(store);
+    await manager.reconcileLandedReviewTask("FN-9304", { source: "manual" });
+    const reconciled = tasks.get("FN-9304")!;
+
+    expect(await isLandingSettled(reconciled, "/repo")).toBe(true);
+    await expect(rerouteSingularStaleContentToReview(store, baseTask(), {
+      requiredPreMergeStepIds: new Set(["code-review"]),
+      mergeContent: { kind: "singular", diff: { state: "fingerprint", fingerprint: "current" } } as never,
+      projectRootDir: "/repo",
+    })).resolves.toEqual({ rerouted: false, reason: "landed" });
   });
 
   it("reports confirmed review work as awaiting finalization, not already complete", async () => {

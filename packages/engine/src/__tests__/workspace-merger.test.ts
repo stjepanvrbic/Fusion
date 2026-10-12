@@ -299,12 +299,15 @@ describeIfGit("landWorkspaceTask — per-repo merge loop (Phase C U1)", () => {
       "repo-b": { worktreePath: fx.repoPath("repo-b"), branch: BRANCH },
     });
 
-    const result = await landWorkspaceTask(store, task, fx.rootDir, {}, {
+    // FNXC:MergeLandingCommitPoint 2026-10-12-10:20: each repository's ref advance reports the landing commit point once.
+    const landingStarted = vi.fn();
+    const result = await landWorkspaceTask(store, task, fx.rootDir, { onMergeLandingStarted: landingStarted }, {
       mergeAgent: squashMergeAgent(BRANCH),
       reviewAgent: approveReviewAgent,
     });
 
     expect(result.allLanded).toBe(true);
+    expect(landingStarted).toHaveBeenCalledTimes(2);
     expect(result.repos.map((r) => r.repo).sort()).toEqual(["repo-a", "repo-b"]);
     for (const r of result.repos) expect(r.status).toBe("landed");
 

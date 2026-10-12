@@ -267,4 +267,31 @@ describe("self-healing agrees on confirmed-landing residue", () => {
     expect(landed.status).toBeNull();
     manager.stop();
   });
+
+  it.each([
+    ["is the active merge", { activeMergeTaskId: "KB-LANE", queued: [] as string[] }],
+    ["is queued for merge", { activeMergeTaskId: null, queued: ["KB-LANE"] }],
+  ])("leaves a confirmed card to its merge lane while it %s", async (_label, lane) => {
+    const landed = landedCard({ id: "KB-LANE" });
+    const store = makeStore(landed);
+    Object.assign(store, {
+      listTasks: vi.fn(async (options?: { column?: string }) => (!options?.column || options.column === landed.column ? [landed] : [])),
+      peekMergeQueue: vi.fn(async () => lane.queued.map((taskId) => ({ taskId }))),
+    });
+    const manager = new SelfHealingManager(store, { rootDir: "/repo", getActiveMergeTaskId: () => lane.activeMergeTaskId });
+    Object.assign(manager, {
+      resolveSelfHealingMergeTarget: vi.fn(async () => ({ branch: "main", source: "settings" })),
+      isCommitReachableFromBranch: vi.fn(async () => true),
+      recordSelfHealingBranchGroupMemberLanding: vi.fn(async () => undefined),
+    });
+
+    await expect(manager.recoverMergedReviewTasks()).resolves.toBe(0);
+
+    expect(landed.status).toBe("landing");
+    expect(landed.column).toBe("in-review");
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.updateTaskAtomic).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalled();
+    manager.stop();
+  });
 });

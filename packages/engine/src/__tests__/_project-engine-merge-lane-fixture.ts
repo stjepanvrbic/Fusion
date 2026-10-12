@@ -16,6 +16,7 @@ type MergeLaneState = {
   activeMergeSession: { dispose(): void } | null;
   activeMergeTaskId: string | null;
   activeMergeStartedAtMs: number | null;
+  activeMergeLandingTaskId: string | null;
   mergeBodyInFlight: Promise<unknown> | null;
   mergeAbortController: AbortController | null;
   requesterAbandonedMergeSignals: WeakSet<AbortSignal>;
@@ -63,6 +64,8 @@ export function seedMergeLaneState<T extends object>(
     activeMergeSession: null,
     activeMergeTaskId: null,
     activeMergeStartedAtMs: null,
+    /* FNXC:MergeLandingCommitPoint 2026-10-12-10:10: a fresh engine has no merge in its landing tail. */
+    activeMergeLandingTaskId: null,
     mergeBodyInFlight: null,
     mergeAbortController: null,
     /* FNXC:MergeRetryReliability 2026-10-10-23:03: a fresh engine has no merge abandoned by its requester. */

@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { EMPTY_MERGE_NO_LANDED_PROOF_REASON, type Settings, type Task, type TaskStore } from "@fusion/core";
 import { SelfHealingManager } from "../self-healing.js";
+import { isLandingSettled } from "../merge/landing-settled.js";
+import { rerouteSingularStaleContentToReview } from "../merge/stale-content-review-reroute.js";
 
 /*
 Surface enumeration: this covers the engine seam shared by `fn task close-landed` (CLI) and
@@ -158,6 +160,24 @@ describe("SelfHealingManager.closeEmptyMergeParkAsLanded", () => {
     expect(await instance.closeEmptyMergeParkAsLanded("KB-057", { reason: "superseded", actor: "cli-operator", source: "cli" }))
       .toEqual({ outcome: "raced", reason: "task-state-changed" });
     expect(seams.moveToCompleteLaneAfterLandedCleanup).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:MergeLandingCommitPoint 2026-10-12-12:35:
+  A card closed as landed counts as landing-settled, so a stale Code Review approval on it is never rerouted back to review (KB-146).
+  */
+  it("leaves a card whose landing is settled, so a stale-content reroute refuses it as landed", async () => {
+    const { store, tasks } = storeWithTask(parkedTask({ workflowStepResults: [{ workflowStepId: "code-review", status: "passed", verdict: "APPROVE", reviewInputFingerprint: "older" }] } as Partial<Task>));
+    const { instance } = manager(store);
+    await instance.closeEmptyMergeParkAsLanded("KB-057", { reason: "superseded", actor: "cli-operator", source: "cli" });
+    const closed = tasks.get("KB-057")!;
+
+    expect(await isLandingSettled(closed, "/repo")).toBe(true);
+    await expect(rerouteSingularStaleContentToReview(store, parkedTask(), {
+      requiredPreMergeStepIds: new Set(["code-review"]),
+      mergeContent: { kind: "singular", diff: { state: "fingerprint", fingerprint: "current" } } as never,
+      projectRootDir: "/repo",
+    })).resolves.toEqual({ rerouted: false, reason: "landed" });
   });
 
   it("still closes when the audit sink throws", async () => {

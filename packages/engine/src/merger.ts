@@ -5086,6 +5086,12 @@ export interface MergerOptions {
    */
   onMergeAttemptStarted?: () => void;
   /**
+   * FNXC:MergeLandingCommitPoint 2026-10-12-09:55:
+   * Called once per integration-ref advance, after the pre-landing gate re-check and immediately before the first ref-moving git command.
+   * The merge pump forwards it to every requester, which stops its hung-merge bound: from here on the landing must finish or be recorded, never be abandoned by a timeout.
+   */
+  onMergeLandingStarted?: () => void;
+  /**
    * True only when the workflow graph caller will immediately traverse its authored post-merge
    * nodes after this merge resolves. Direct/manual callers must not defer required evidence.
    */

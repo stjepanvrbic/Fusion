@@ -1394,3 +1394,91 @@ describe("WorkflowGraphExecutor optional-group", () => {
     expect(calls).not.toContain("review");
   });
 });
+
+/*
+FNXC:MergeLandingCommitPoint 2026-10-12-12:05:
+KB-146 re-ran Code Review on a landed card: the seeded gate wrote a pending lease over the stored approval and started a reviewer session.
+An enabled pre-merge group on a landing-settled card is skipped before any lease, result write, preparation or template node, and the walk continues like a disabled group.
+Post-merge groups, unlanded cards and cards whose branch moved past their pin still run the group; a failed settled read runs it too.
+*/
+describe("WorkflowGraphExecutor optional-group on a landed card", () => {
+  function landedTask(): TaskDetail {
+    return { id: "FN-OG", enabledWorkflowSteps: ["group"], mergeDetails: { mergeConfirmed: true, commitSha: "a".repeat(40) } } as TaskDetail;
+  }
+
+  function harness(isTaskLandingSettled?: (taskId: string) => Promise<boolean>) {
+    const calls: string[] = [];
+    const records: WorkflowStepResult[] = [];
+    const logs: string[] = [];
+    const prepareNodeExecution = vi.fn();
+    const executor = new WorkflowGraphExecutor({
+      handlers: {
+        prompt: async (node) => {
+          calls.push(node.id);
+          return { outcome: "success" };
+        },
+      },
+      recordWorkflowStepResult: async (_taskId, result) => { records.push(result); return true; },
+      logTaskEntry: (summary: string) => { logs.push(summary); },
+      prepareNodeExecution,
+      ...(isTaskLandingSettled ? { isTaskLandingSettled } : {}),
+    });
+    return { executor, calls, records, logs, prepareNodeExecution };
+  }
+
+  it("skips an enabled pre-merge group without writing a result or running its template", async () => {
+    const run = harness(async () => true);
+
+    const result = await run.executor.run(landedTask(), settingsOn(), optionalGroupIr());
+
+    expect(result.outcome).toBe("success");
+    expect(run.records).toEqual([]);
+    expect(run.calls).not.toContain("optstep");
+    expect(result.visitedNodeIds).not.toContain("group::optstep");
+    expect(run.prepareNodeExecution).not.toHaveBeenCalledWith(expect.objectContaining({ id: "group::optstep" }), expect.anything(), expect.anything());
+    expect(run.logs.filter((line) => line.includes("Skipped workflow step: Browser verification"))).toHaveLength(1);
+    expect(run.calls).toContain("after");
+  });
+
+  it("keeps a disabled group on a landed card a plain bypass", async () => {
+    const run = harness(async () => true);
+
+    const result = await run.executor.run({ ...landedTask(), enabledWorkflowSteps: [] } as TaskDetail, settingsOn(), optionalGroupIr());
+
+    expect(result.outcome).toBe("success");
+    expect(run.logs.some((line) => line.includes("Skipped workflow step"))).toBe(false);
+    expect(run.calls).toContain("after");
+  });
+
+  it("still runs a post-merge group on a landed card", async () => {
+    const run = harness(async () => true);
+
+    await run.executor.run({ ...landedTask(), enabledWorkflowSteps: ["group"] } as TaskDetail, settingsOn(), reviseGroupIr({ phase: "post-merge" }));
+
+    expect(run.calls).toContain("review");
+    expect(run.records.some((record) => record.workflowStepId === "group")).toBe(true);
+  });
+
+  it.each([
+    ["the branch moved past its landing pin", async () => false],
+    ["the card has not landed", async () => false],
+    ["the settled read fails", async () => { throw new Error("store unavailable"); }],
+  ])("runs the group when %s", async (_label, isTaskLandingSettled) => {
+    const run = harness(isTaskLandingSettled);
+
+    await run.executor.run(landedTask(), settingsOn(), optionalGroupIr());
+
+    expect(run.calls).toContain("optstep");
+    expect(run.records.some((record) => record.workflowStepId === "group" && record.status === "pending")).toBe(true);
+  });
+
+  it("falls back to the run snapshot's merge confirmation without the live dependency", async () => {
+    const landed = harness();
+    await landed.executor.run(landedTask(), settingsOn(), optionalGroupIr());
+    expect(landed.calls).not.toContain("optstep");
+
+    const unlanded = harness();
+    await unlanded.executor.run(taskWith(["group"]), settingsOn(), optionalGroupIr());
+    expect(unlanded.calls).toContain("optstep");
+  });
+});

@@ -312,7 +312,7 @@ export function createAuthoritativeWorkflowSeams(
         try {
           let result: Awaited<ReturnType<NonNullable<typeof deps.mergeRequester>>> | "timeout" | "cancelled";
           try {
-            result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal, graphOwnedPostMergeTraversal: true, onMergeRunStarted: runTimeout.restart }), runTimeout.expired, cancelled]);
+            result = await Promise.race([deps.mergeRequester(mergeTask.id, { signal, graphOwnedPostMergeTraversal: true, onMergeRunStarted: runTimeout.restart, onMergeLandingStarted: runTimeout.clear }), runTimeout.expired, cancelled]);
           } catch (error) {
             // The legacy seam has no node context; it always runs as the `merge` seam node.
             const terminalRefusal = classifyMergeRequesterRejection(error, "merge");

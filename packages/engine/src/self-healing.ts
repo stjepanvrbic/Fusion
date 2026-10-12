@@ -10082,16 +10082,28 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
     if (!isStaleContentApprovalBlocker(blocker) || mergeContent.kind !== "singular") {
       return { handled: false, seeded: false, parkCleared: false, mergeRetriesReset: false };
     }
+    /*
+    FNXC:MergeLandingCommitPoint 2026-10-12-12:00:
+    Mergeable-review recovery never reroutes a card whose merge lane is owned (queued or merging): its merge body owns the outcome, and KB-146 was seeded back to Code Review while its own landing finished.
+    The card stays out of admission exactly as a stale card does. The hidden stale-content park loop relies on the reroute's own `landed` refusal instead.
+    */
+    if (!parkShape && await this.isMergeLaneOwned(task.id)) {
+      return { handled: true, seeded: false, parkCleared: false, mergeRetriesReset: false };
+    }
 
     const reroute = await rerouteSingularStaleContentToReview(this.store, task, {
       requiredPreMergeStepIds: mergeGate.requiredPreMergeStepIds,
       mergeContent,
+      projectRootDir: this.options.rootDir,
     }).catch(() => ({
       rerouted: false,
       reason: "no-progress" as const,
       nodeId: undefined,
       workflowStepId: undefined,
     }));
+    if (reroute.reason === "landed") {
+      return { handled: true, seeded: false, parkShape, parkCleared: false, mergeRetriesReset: false };
+    }
     /*
     FNXC:PreMergeApproval 2026-09-06-00:28:
     A hidden stale-content park may race a new operator hold or successor owner after the idle
@@ -13058,6 +13070,12 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       let recovered = 0;
       for (const task of mergedButNotDone) {
         try {
+          /*
+          FNXC:MergeLandingCommitPoint 2026-10-12-10:22:
+          A merge body records `mergeConfirmed` the moment its integration ref advances, then still restores the stash, removes its clean room and runs its own finalizer.
+          While that card's merge lane is owned (active or queued), the body or the merge pump's confirmed fast path finalizes it; this sweep must not clear its stamp, move it to done or emit `task:merged` underneath it.
+          */
+          if (await this.isMergeLaneOwned(task.id)) continue;
           const mergeTarget = await this.resolveSelfHealingMergeTarget(task, settings, "recover-merged-review");
           if (!(await this.isCommitReachableFromBranch(task.mergeDetails?.commitSha, mergeTarget.branch))) {
             await this.recordSharedGroupDefaultTargetGuard(task, "recover-merged-review", {

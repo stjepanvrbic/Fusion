@@ -17,6 +17,7 @@ import {
   WorkspaceReviewRequiredError,
 } from "../merge/merger-ai.js";
 import { runtimeLog } from "../logger.js";
+import { createMergeRunTimeout, GRAPH_MERGE_RUN_TIMEOUT_MS } from "../executor/merge-run-timeout.js";
 import { TunnelProcessManager } from "../remote-access/tunnel-process-manager.js";
 import { __resetRemoteTunnelServicesForTests } from "../remote-access/remote-tunnel-service.js";
 import { setLocalDashboardPort, resetLocalDashboardPortForTests } from "../local-dashboard-port.js";
@@ -1809,17 +1810,18 @@ Surface enumeration (engine only, no UI):
 */
 describe("ProjectEngine merge run ownership", () => {
   const WATCHDOG_MS = 30 * 60_000;
-  type Body = { taskId: string; signal: AbortSignal; restart: () => void; finish: (result?: unknown) => void; fail: (err: Error) => void };
+  type Body = { taskId: string; signal: AbortSignal; restart: () => void; land: () => void; finish: (result?: unknown) => void; fail: (err: Error) => void };
   let bodies: Body[];
 
   function holdEveryMerge(): void {
     mocks.runAiMerge.mockImplementation((...args: unknown[]) => new Promise((resolve, reject) => {
       const taskId = args[2] as string;
-      const options = args[3] as { signal: AbortSignal; onMergeAttemptStarted?: () => void };
+      const options = args[3] as { signal: AbortSignal; onMergeAttemptStarted?: () => void; onMergeLandingStarted?: () => void };
       bodies.push({
         taskId,
         signal: options.signal,
         restart: () => options.onMergeAttemptStarted?.(),
+        land: () => options.onMergeLandingStarted?.(),
         finish: (result = { merged: true, task: { id: taskId } }) => resolve(result),
         fail: reject,
       });
@@ -1881,6 +1883,60 @@ describe("ProjectEngine merge run ownership", () => {
     bodies[0].restart();
 
     expect(started).toHaveBeenCalledTimes(before + 1);
+    await engine.stop();
+  });
+
+  /*
+  FNXC:MergeLandingCommitPoint 2026-10-12-10:15:
+  KB-146: the graph bound expired three seconds after main fast-forwarded and aborted the landed merge before it was recorded.
+  A requester built exactly like the graph's requestMerge primitive must stop its bound when the merge reports its landing started, so the landing tail runs to completion in one merge session.
+  */
+  it("never lets a requester's bound abort a merge in its landing tail", async () => {
+    vi.useFakeTimers();
+    const engine = createEngine();
+    await engine.start();
+    const controller = new AbortController();
+    const runTimeout = createMergeRunTimeout(() => controller.abort());
+    const request = settle(engine.onMerge("FN-first", {
+      signal: controller.signal,
+      onMergeRunStarted: runTimeout.restart,
+      onMergeLandingStarted: runTimeout.clear,
+    }));
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+
+    bodies[0].restart();
+    await vi.advanceTimersByTimeAsync(29 * 60_000);
+    bodies[0].land();
+    await vi.advanceTimersByTimeAsync(GRAPH_MERGE_RUN_TIMEOUT_MS);
+
+    expect(controller.signal.aborted).toBe(false);
+    expect(bodies[0].signal.aborted).toBe(false);
+    bodies[0].finish();
+    expect(await request).toEqual({ value: expect.objectContaining({ merged: true }) });
+    expect(mocks.runAiMerge).toHaveBeenCalledTimes(1);
+    await engine.stop();
+  });
+
+  it("tells a requester that joins during the landing tail at once, and resets on the next attempt", async () => {
+    const engine = createEngine();
+    await engine.start();
+    void settle(engine.onMerge("FN-first"));
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    bodies[0].land();
+
+    const landing = vi.fn();
+    void settle(engine.onMerge("FN-first", { onMergeLandingStarted: landing }));
+    await vi.waitFor(() => expect(landing).toHaveBeenCalledTimes(1));
+
+    bodies[0].restart();
+    const lateLanding = vi.fn();
+    void settle(engine.onMerge("FN-first", { onMergeLandingStarted: lateLanding }));
+    const resolvers = (engine as unknown as { manualMergeResolvers: Map<string, unknown[]> }).manualMergeResolvers;
+    await vi.waitFor(() => expect(resolvers.get("FN-first")).toHaveLength(3));
+    expect(lateLanding).not.toHaveBeenCalled();
+    bodies[0].land();
+    expect(lateLanding).toHaveBeenCalledTimes(1);
+    expect(landing).toHaveBeenCalledTimes(2);
     await engine.stop();
   });
 

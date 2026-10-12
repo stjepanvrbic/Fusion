@@ -18,6 +18,7 @@ import {
   type TaskStore,
   type WorkflowIrNode,
 } from "@fusion/core";
+import { isLandingSettled } from "./landing-settled.js";
 
 export type SingularStaleContentRerouteReason =
   | "seeded"
@@ -25,7 +26,8 @@ export type SingularStaleContentRerouteReason =
   | "no-review-route"
   | "no-progress"
   | "not-singular"
-  | "operator-held";
+  | "operator-held"
+  | "landed";
 
 function isContentReviewNode(node: WorkflowIrNode): boolean {
   if (node.kind !== "optional-group" && node.kind !== "step-review") return false;
@@ -36,7 +38,7 @@ function isContentReviewNode(node: WorkflowIrNode): boolean {
 export async function rerouteSingularStaleContentToReview(
   store: TaskStore,
   task: Task,
-  options: { requiredPreMergeStepIds: ReadonlySet<string>; mergeContent: MergeContentDescriptor },
+  options: { requiredPreMergeStepIds: ReadonlySet<string>; mergeContent: MergeContentDescriptor; projectRootDir?: string },
 ): Promise<{ rerouted: boolean; reason: SingularStaleContentRerouteReason; nodeId?: string; workflowStepId?: string }> {
   const mergeContent = options.mergeContent;
   if (mergeContent.kind !== "singular" || task.workspaceWorktrees !== undefined) {
@@ -45,6 +47,15 @@ export async function rerouteSingularStaleContentToReview(
   if (task.paused || task.userPaused || task.deletedAt || task.autoMerge === false) {
     return { rerouted: false, reason: "operator-held" };
   }
+  /*
+  FNXC:MergeLandingCommitPoint 2026-10-12-11:50:
+  A stale approval on a card whose landing is settled is not stale review work: the diff differs only because the work is on the target.
+  KB-146 was seeded back to Code Review this way while its own no-op landing was finishing. Callers write no log line and no audit row for this refusal.
+  The decision reads the live row, because the caller's snapshot can predate the landing.
+  */
+  const live = await Promise.resolve().then(() => store.getTask(task.id)).catch(() => undefined) ?? task;
+  const projectRootDir = options.projectRootDir ?? (typeof store.getRootDir === "function" ? store.getRootDir() : undefined);
+  if (projectRootDir && await isLandingSettled(live, projectRootDir)) return { rerouted: false, reason: "landed" };
   if (mergeContent.diff.state !== "fingerprint") return { rerouted: false, reason: "no-progress" };
   const currentFingerprint = mergeContent.diff.fingerprint;
 

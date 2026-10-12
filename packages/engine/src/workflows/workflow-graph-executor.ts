@@ -308,6 +308,12 @@ export interface WorkflowGraphExecutorDeps {
     requirement: WorkflowNodePreparationRequirement,
   ) => void | Promise<void>;
   /**
+   * FNXC:MergeLandingCommitPoint 2026-10-12-11:45:
+   * Reads the live task row and answers whether its landing is settled (`isLandingSettled`), so an enabled pre-merge group is skipped on a landed card.
+   * Absent, the graph falls back to the run's task snapshot and `mergeConfirmed`; a failed read counts as not settled, so the gate runs.
+   */
+  isTaskLandingSettled?: (taskId: string) => Promise<boolean>;
+  /**
    * Invoked immediately before an agent-executed node handler. Implementations
    * may fence a durable workflow principal or fail closed before any session is
    * constructed; control nodes remain untouched when the callback is absent.
@@ -1115,6 +1121,18 @@ export class WorkflowGraphExecutor {
           const groupName = typeof node.config?.name === "string" && node.config.name.trim()
             ? node.config.name.trim()
             : node.id;
+          /*
+          FNXC:MergeLandingCommitPoint 2026-10-12-11:45:
+          A pre-merge gate exists to decide whether work may land, so it has nothing to decide once the card's landing is settled.
+          KB-146 re-ran Code Review on a landed card: a stale-content reroute seeded the gate, its pending lease replaced the stored approval, and a REVISE there could have named remediation for work already on main.
+          This is the one fence every seeder passes through (stale-content, unrun-gate and no-verdict reroutes, failed-step recovery, operator retry), so the group is skipped before any lease, result write, worktree preparation or template node, and the walk continues as if the group were disabled.
+          Post-merge groups still run, and a card whose branch moved past its landing pin is not settled, so its gates run as before.
+          */
+          if (node.config?.phase !== "post-merge" && await this.isPreMergeGateLandingSettled(task)) {
+            this.deps.logTaskEntry?.(`[pre-merge] Skipped workflow step: ${groupName} — this card's work has already landed; pre-merge gates do not run after landing.`);
+            context[`node:${node.id}:outcome`] = "success";
+            return await traverseChildren(node, { outcome: "success" });
+          }
           /*
           FNXC:PlanReview 2026-08-04-06:35:
           Triage runs Plan Review before releasing a task to execution so the task stays in the triage column during review. When the execution graph later reaches the same optional group, only an unsuperseded projection may satisfy, repair, or hold the gate; old-episode evidence must never suppress the current reviewer session.
@@ -2748,6 +2766,16 @@ export class WorkflowGraphExecutor {
         [`node:${node.id}:value`]: value,
       },
     };
+  }
+
+  /** Pre-merge gate entry decision; see `WorkflowGraphExecutorDeps.isTaskLandingSettled`. */
+  private async isPreMergeGateLandingSettled(task: TaskDetail): Promise<boolean> {
+    if (!this.deps.isTaskLandingSettled) return task.mergeDetails?.mergeConfirmed === true;
+    try {
+      return await this.deps.isTaskLandingSettled(task.id);
+    } catch {
+      return false;
+    }
   }
 
   private async prepareNodeExecution(

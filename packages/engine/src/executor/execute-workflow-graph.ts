@@ -76,6 +76,7 @@ import {
 } from "./workflow-principal-before-node.js";
 import { resolvePendingOverlapWaits } from "../workflows/overlap-plan-revalidation.js";
 import { mergeEffectiveSettings } from "../project/effective-settings.js";
+import { isLandingSettled } from "../merge/landing-settled.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mirror TaskExecutor method/map surface
 type AnyFn = (...args: any[]) => any;
@@ -1132,6 +1133,8 @@ export async function executeWorkflowGraph(
         }),
         discardWorkflowStepLease: (taskId: string, workflowStepId: string, startedAt: string) =>
           discardWorkflowStepLease(deps, taskId, workflowStepId, startedAt),
+        // FNXC:MergeLandingCommitPoint 2026-10-12-11:45: the pre-merge gate entry reads the live row, not the run snapshot, so a landing confirmed after the walk started still skips the gate.
+        isTaskLandingSettled: async (taskId: string) => isLandingSettled(await deps.store.getTask(taskId), deps.store.getRootDir()),
         /*
         FNXC:PostMergeEvidenceWait 2026-10-08-19:12:
         KB-080: the 8-hour evidence-wait ceiling is surfaced through the FN-9175 bounded seam. Metadata is

@@ -40,6 +40,7 @@ vi.mock("../pi.js", async (importOriginal) => {
 });
 
 import { runAiMerge } from "../merge/merger-ai.js";
+import { recoverConfirmedMergePush } from "../merge/recover-confirmed-merge-push.js";
 
 const RM = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as const;
 const tracked = new Set<string>();
@@ -392,5 +393,52 @@ exit 1
     expect(result.pushedToRemote).toBe(false);
     expect(result.pushError).toBeTruthy();
     expect(logs.some((l) => l.action === "PushToRemoteFailed")).toBe(true);
+  });
+});
+
+/*
+FNXC:MergeLandingCommitPoint 2026-10-12-11:05:
+KB-146's landed commit reached origin only with the next card's push, because the aborted merge recorded no landing.
+A merge aborted right after its ref advance now holds the landing proof, so both the next merge pass and the confirmed-merge push recovery publish it under the normal push policy, and neither publishes when push after merge is off.
+*/
+describe("push after a landing aborted right after its ref advance", () => {
+  async function abortedLanding(pushAfterMerge: boolean) {
+    const { dir, originDir } = initRepoWithRemote();
+    const fixture = makeStore({ pushAfterMerge });
+    const remoteBefore = git(originDir, "rev-parse main");
+    const controller = new AbortController();
+    const base = fixture.storeMocks.updateTaskAtomic.getMockImplementation()!;
+    fixture.storeMocks.updateTaskAtomic.mockImplementation(async (id: string, updater: (current: Record<string, unknown>) => Record<string, unknown> | undefined) => {
+      const result = await base(id, updater);
+      if ((fixture.task.mergeDetails as { mergeConfirmed?: boolean } | undefined)?.mergeConfirmed === true) controller.abort();
+      return result;
+    });
+    await expect(runAiMerge(fixture.store, dir, "FN-1", { manual: true, signal: controller.signal }, {
+      mergeAgent: realMergeAgent("fusion/fn-1"),
+      reviewAgent: approveReviewer(),
+    })).rejects.toMatchObject({ name: "MergeAbortedError" });
+    expect(git(originDir, "rev-parse main")).toBe(remoteBefore);
+    return { dir, originDir, remoteBefore, ...fixture, landedSha: git(dir, "rev-parse main") };
+  }
+
+  it.each([true, false])("the next merge pass publishes the recorded landing only when push after merge is on (%s)", async (pushAfterMerge) => {
+    const { dir, originDir, remoteBefore, store, landedSha } = await abortedLanding(pushAfterMerge);
+    const mergeAgent = vi.fn(async () => { throw new Error("should not re-merge"); });
+
+    const result = await runAiMerge(store, dir, "FN-1", { manual: true }, { mergeAgent, reviewAgent: approveReviewer() });
+
+    expect(result).toMatchObject({ merged: true, commitSha: landedSha });
+    expect(mergeAgent).not.toHaveBeenCalled();
+    expect(git(originDir, "rev-parse main")).toBe(pushAfterMerge ? landedSha : remoteBefore);
+  });
+
+  it.each([true, false])("confirmed-merge push recovery publishes the aborted row only when push after merge is on (%s)", async (pushAfterMerge) => {
+    const { dir, originDir, remoteBefore, store, storeMocks, task, landedSha } = await abortedLanding(pushAfterMerge);
+    Object.assign(storeMocks, { rootDir: dir });
+
+    const outcome = await recoverConfirmedMergePush(store, task as never, await storeMocks.getSettings() as never);
+
+    expect(outcome).toBe(pushAfterMerge ? "delivered" : "skipped");
+    expect(git(originDir, "rev-parse main")).toBe(pushAfterMerge ? landedSha : remoteBefore);
   });
 });
