@@ -28,7 +28,21 @@ vi.mock("node:child_process", async () => {
       }
     });
   });
-  return { execSync: execSyncFn, exec: execFn, execFile: vi.fn() };
+  /*
+  FNXC:AlreadyLandedDetection 2026-10-12-00:58:
+  The landed-commit detector launches single git commands with `execFile` and an argument list.
+  A mock that never calls back leaves the recovery waiting instead of failing, so argv launches are joined into the command string the `exec` mock already answers.
+  */
+  const execFileFn: any = vi.fn((file: string, args: any, opts: any, cb: any) => {
+    const argv = Array.isArray(args) ? args : [];
+    const cmd = [file, ...argv].join(" ");
+    const optsArg = Array.isArray(args) ? opts : args;
+    const cbArg = Array.isArray(args) ? cb : opts;
+    return execFn(cmd, optsArg, cbArg);
+  });
+  execFileFn[utilPromisify.custom] = (file: string, args?: any, opts?: any) =>
+    (execFn[utilPromisify.custom] as any)([file, ...(Array.isArray(args) ? args : [])].join(" "), opts);
+  return { execSync: execSyncFn, exec: execFn, execFile: execFileFn };
 });
 
 import { EventEmitter } from "node:events";

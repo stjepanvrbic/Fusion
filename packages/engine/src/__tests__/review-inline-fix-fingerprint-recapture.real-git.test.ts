@@ -155,7 +155,7 @@ async function reviewFixture(workspace = false) {
   } as any;
   const deps = {
     store, rootDir: repo.directory, options: {}, activePlanningWorkflowSessions: new Set(),
-    activeWorkflowStepSessions: new Map(), getRunContextFor: () => undefined,
+    activeWorkflowStepSessions: new Map(), activeWorkflowGraphAbortControllers: new Map(), getRunContextFor: () => undefined,
     captureModifiedFiles: async () => [], createSpawnAgentTool: () => undefined, sharedWorkerTools: {},
     deleteActiveWorkflowStepSession: () => undefined, getAssignedAgentRuntimeConfig: () => undefined,
     getAuthoritativeAssignedAgent: async () => undefined, readTaskArtifact: async () => "# Approved task\n",
@@ -263,6 +263,7 @@ describe("inline review fingerprint recapture", () => {
       options: {},
       activePlanningWorkflowSessions: new Set(),
       activeWorkflowStepSessions: new Map(),
+      activeWorkflowGraphAbortControllers: new Map(),
       getRunContextFor: () => ({ agentId: "test-reviewer", runId: "review-run" }),
       captureModifiedFiles: async () => [],
       createSpawnAgentTool: () => undefined,

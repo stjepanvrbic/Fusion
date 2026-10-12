@@ -121,6 +121,7 @@ function executeDeps(row: TaskDetail): ExecuteWorkflowStepDeps {
     options: {},
     activePlanningWorkflowSessions: new Set(),
     activeWorkflowStepSessions: new Map(),
+    activeWorkflowGraphAbortControllers: new Map(),
     getRunContextFor: () => undefined,
     captureModifiedFiles: vi.fn(async () => []),
     createSpawnAgentTool: vi.fn(),

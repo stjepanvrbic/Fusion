@@ -130,6 +130,7 @@ describe("FN-9234 review-recapture audit sink health", () => {
     } as any;
     const outcome = await throughBoundedAudit(mode, sink, () => executeWorkflowStep({
       store, rootDir: repo.directory, options: {}, activePlanningWorkflowSessions: new Set(), activeWorkflowStepSessions: new Map(),
+      activeWorkflowGraphAbortControllers: new Map(),
       getRunContextFor: () => ({ agentId: "reviewer", runId: "audit-run" }), captureModifiedFiles: async () => [],
       createSpawnAgentTool: () => undefined, sharedWorkerTools: {}, deleteActiveWorkflowStepSession: () => undefined,
       getAssignedAgentRuntimeConfig: () => undefined, getAuthoritativeAssignedAgent: async () => undefined,

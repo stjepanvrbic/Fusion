@@ -1043,12 +1043,19 @@ describe("aiMergeTask — merge details collection", () => {
     expect(commitCommand).toContain("Files changed:\n1 file changed");
   });
 
-  it("recovers owned landed commit when branch is not found", async () => {
+  /*
+  FNXC:LandedCommitProvenance 2026-10-12-00:56:
+  The merger reads a stored landed commit together with its committer time.
+  A task-trailer commit outside the task's bounded range counts as the task's landing only when that time does not predate the task.
+  */
+  function storedLandedCommitFixture(committedAt: string) {
+    const committerTimeSeconds = Math.floor(Date.parse(committedAt) / 1000);
     const store = createMockStore(
       {
         id: "FN-3469",
         worktree: "/tmp/root/.worktrees/FN-3469",
         baseCommitSha: "base3469",
+        createdAt: "2026-05-01T00:00:00.000Z",
         mergeDetails: { commitSha: "a47b1e5d78d626f8b480f1e90d3d64be2625ff6a" } as any,
       },
       [{ id: "FN-3469", worktree: "/tmp/root/.worktrees/FN-3469", column: "in-review" } as Task],
@@ -1058,14 +1065,19 @@ describe("aiMergeTask — merge details collection", () => {
       const cmdStr = String(cmd);
       if (cmdStr.includes("rev-parse --verify")) throw new Error("not found");
       if (cmdStr.includes("merge-base --is-ancestor a47b1e5d78d626f8b480f1e90d3d64be2625ff6a HEAD")) return Buffer.from("");
-      if (cmdStr.includes("log -1 --format=%H%x1f%s%x1f%b a47b1e5d78d626f8b480f1e90d3d64be2625ff6a")) {
-        return "a47b1e5d78d626f8b480f1e90d3d64be2625ff6a\u001ffix(FN-3469): title\u001fFusion-Task-Id: FN-3469" as any;
+      if (cmdStr.includes("log -1 --format=%H%x1f%s%x1f%ct%x1f%b a47b1e5d78d626f8b480f1e90d3d64be2625ff6a")) {
+        return `a47b1e5d78d626f8b480f1e90d3d64be2625ff6a\u001ffix(FN-3469): title\u001f${committerTimeSeconds}\u001fFusion-Task-Id: FN-3469` as any;
       }
       if (cmdStr.includes("show --shortstat --format= a47b1e5d78d626f8b480f1e90d3d64be2625ff6a")) {
         return "2 files changed, 84 insertions(+), 2 deletions(-)" as any;
       }
       return Buffer.from("");
     });
+    return store;
+  }
+
+  it("recovers owned landed commit when branch is not found", async () => {
+    const store = storedLandedCommitFixture("2026-05-01T01:00:00.000Z");
 
     const result = await aiMergeTask(store, "/tmp/root", "FN-3469");
     expect(result.merged).toBe(true);
@@ -1086,6 +1098,19 @@ describe("aiMergeTask — merge details collection", () => {
       mergeCommitMessage: "fix(FN-3469): title",
       mergeConfirmed: true,
     }));
+  });
+
+  it("does not recover a stored commit whose committer time predates the task when branch is not found", async () => {
+    const store = storedLandedCommitFixture("2026-04-29T00:00:00.000Z");
+
+    const result = await aiMergeTask(store, "/tmp/root", "FN-3469");
+    expect(result.merged).toBe(false);
+    expect((store.emit as ReturnType<typeof vi.fn>).mock.calls.map((call: any[]) => call[0])).not.toContain("task:merged");
+    const mergeDetailsCall = (store.updateTask as ReturnType<typeof vi.fn>).mock.calls.find(
+      (call: any[]) => call[1]?.mergeDetails !== undefined,
+    );
+    expect(mergeDetailsCall).toBeUndefined();
+    expect(store.moveTask).not.toHaveBeenCalled();
   });
 
   it("does not persist misleading mergeDetails when branch is not found and no owned commit exists", async () => {
