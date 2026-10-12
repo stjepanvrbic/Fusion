@@ -1474,8 +1474,15 @@ KB-102 reproduced the Windows core-1 timeout on native Windows PostgreSQL and re
   | 37829637990 | `9e5b807a6` | 1,271 s | 29,292 ms (timed out) | 11,515 ms | 16,008 ms | 13,506 ms |
   | 37831541785 | `0366ead16` | 952 s | 8,960 ms | 4,373 ms | 5,714 ms | 5,135 ms |
   | 37832714652 | `28e7c1244` | 1,126 s | 14,141 ms | 8,356 ms | 10,830 ms | 8,532 ms |
+  | 38171508610 | `18fb7f0f4` | 912 s | 5,170 ms | 2,603 ms | 3,572 ms | 2,979 ms |
+  | 38175654275 | `31f1e05b0` | 800 s | 3,181 ms | 2,423 ms | 3,623 ms | 2,552 ms |
+  | 38176804785 | `9ad753f77` | 670 s | 4,477 ms | 2,413 ms | 2,629 ms | 2,266 ms |
+  | 38182428146 | `9dd3b4177` | 654 s | 9,360 ms | 2,713 ms | 5,629 ms | 4,088 ms |
+  | 38189371704 | `849590e98` | 882 s | 5,080 ms | 3,282 ms | 11,604 ms (failed, CONNECT_TIMEOUT) | 4,222 ms |
 
-  Case 1 was the slowest PostgreSQL case of the leg in all four runs. In the red run the leg wall time grew 1.39x, while the cases containing a module's first harness use grew 2.3x to 3.3x and plain clone-and-drop cases did not grow.
+  The rows from run 38171508610 on were added on 2026-10-12 and are the legs that contain the KB-102 change. `case 1` to `case 4` are the concurrent, missing-template, reuse and half-built cases in every row. The warm-up case that the change added runs first, has no column, and took 28 to 50 ms in those five legs.
+
+  Case 1 was the slowest PostgreSQL case of the leg in the four runs before the change. In the red run the leg wall time grew 1.39x, while the cases containing a module's first harness use grew 2.3x to 3.3x and plain clone-and-drop cases did not grow.
 
   Local (KB-102): Windows 11, Node 24.12, throwaway native PostgreSQL 15.18 cluster, default durability, `VITEST_MAX_WORKERS=1`, boundary observer at threshold 0. At base `c5d43057a`, run 1 on a fresh cluster passed (case 1 10,807 ms, `template.ensure-schema` 3.4 s). Run 2 immediately after, with run 1's seven dead-owner template databases present, failed case 1 with `Test timed out in 15000ms`: its three `template.ensure-schema` boundaries completed at 15.2 s. After the change, a two-run sequence from an empty cluster passed both runs and every hook (`beforeAll` 4.2 / 8.2 s, case 1 body 4-5 s, `afterAll` 6.4 / 3.8 s), and ten runs on the same cluster made non-durable passed with case 1's `template.ensure-schema` at 1.1 to 2.9 s in nine runs and 4.5 to 6.3 s in the first run after switching the live cluster. No per-module template remained after any run.
 - **Mechanism:**
@@ -1488,6 +1495,7 @@ KB-102 reproduced the Windows core-1 timeout on native Windows PostgreSQL and re
 - **Resolution (KB-102):** the file runs dead-owner reclamation and golden readiness in `beforeAll` (seeding one dead-owner template that a new first case asserts is gone), and drops every template it creates: single-module cases in `afterEach`, the concurrent case's three in `afterAll`, which then asserts none of the six remain. The harness gained two additive test hooks (`ensureGoldenTemplate`, `databaseExists`). The Windows job runs `scripts/pg-test-cluster-non-durable.mjs --throwaway` after starting the runner's PostgreSQL. Assertions, `testTimeout`, `hookTimeout`, the Windows ledger and the quarantine list are unchanged.
 - **Known residual risk:** on a default-durability Windows cluster the new `beforeAll` timed out when about eight 16 MB dead-owner databases were waiting to be reclaimed, and case 1's unchanged store-teardown `afterEach` reached 13.9 s once. The lane cluster is non-durable, and the file no longer leaves a backlog.
 - **Escalation rule:** a further Windows timeout of this case or of one of this file's hooks is an owner decision raised as its own task (core PostgreSQL files cannot be quarantined inline), investigated with the boundary observer enabled for attribution. It is never a Windows ledger entry and never a widened timeout.
+- **Follow-up 2026-10-12:** the file failed again in run 38189371704, with a different failure shape and in a different case. A connection attempt inside the reuse case (case 3 in the table) exceeded the harness's 5 s connection budget, and the read bound to it was rejected with `CONNECT_TIMEOUT`. No test or hook reached its 15 s timeout, and the concurrent case this record covers passed at 5,080 ms. It is recorded separately in [Record 2026-10-12: Windows connection timeout](#record-2026-10-12-pg-test-harness-template-concurrencypgtestts-windows-connection-timeout-kb-144-owner-decision-pending).
 
 ### Record 2026-10-11: `worktree-acquisition.test.ts` local Windows 30 s timeout (first sighting)
 
@@ -1557,3 +1565,54 @@ KB-141 traced the Windows dashboard-leg timeout of the signal-ingest merge-gate 
 - **Other files with a partial stub:** `project-pause-resume-routes.test.ts` and `setup-routes.test.ts` in the same directory stub `isGhAuthenticated` without `isGhAvailable`. A temporary probe at `node:child_process` recorded no process launch in either file (4 and 2 cases), after recording the `gh --version` launch in the unfixed signal-ingest file as a positive control. Both files are unchanged.
 - **Outstanding post-landing check:** in the next `windows-lane-reports-dashboard` artifact after this lands, the merge-gate case's duration should be within the range of its three siblings.
 - **Escalation rule:** a further timeout of this case after the fix lands is a second sighting. It takes a same-commit file-level quarantine in `scripts/lib/test-quarantine.json` and `quarantinedDashboardTests`. It is never a Windows ledger entry and never a widened timeout.
+
+### Record 2026-10-12: `pg-test-harness-template-concurrency.pg.test.ts` Windows connection timeout (KB-144, owner decision pending)
+
+<!--
+FNXC:TestFlakeRegister 2026-10-12-01:48:
+KB-144 records a Windows core-1 failure of the template-lifecycle harness file that is not a test or hook timeout: one PostgreSQL connection attempt inside the reuse case exceeded the harness's 5 s connection budget, and the read bound to it was rejected. It is kept apart from the KB-102 record because the failing case, the error and the exhausted budget all differ. Timeouts, retries, assertions, the Windows ledger and the quarantine list are unchanged.
+
+FNXC:TestFlakeRegister 2026-10-12-02:52:
+The reproduction on native Windows PostgreSQL did not reproduce the timeout and could not attribute it between a slow backend process start and a held test-process thread, so the record carries an owner decision instead of a fix.
+A further connection, test or hook timeout of this file is an owner decision raised as its own task, never a ledger entry, quarantine, widened timeout or retry.
+-->
+
+- **File:** `packages/core/src/__tests__/postgres/pg-test-harness-template-concurrency.pg.test.ts` (not an entry of `scripts/lib/windows-known-failing-tests.json` or `scripts/lib/test-quarantine.json`).
+- **Exact test:** `PG template database lifecycle across isolated harness modules > reuses the valid template memo within one module instance`.
+- **Sighting:** one, in [run 38189371704](https://github.com/stjepanvrbic/Fusion/actions/runs/38189371704) (job 114618610065, Windows tests (core-1)) at `849590e98`. Case duration 11,604 ms.
+  - The case creates two stores from one harness module and round-trips a task through both at once. The read of the second store (database `template_reuse_second_5428_2_hx5dfn`), `store.getTask("KB-001")`, was rejected. The first store completed its round trip.
+  - Error chain: `promise rejected ... instead of resolving` at the round-trip assertion, caused by `Failed query: select "id", "project_id", ... params: KB-001` from `readTaskRow`, caused by `write CONNECT_TIMEOUT localhost:5432` from `connectTimedOut` in `postgres@3.4.9`.
+  - The case's stderr shows that both stores had finished `store.init()` before the failure.
+  - The leg reported 2 failed files of 356 and 2 failed tests of 4,004. The other file, `postgres/sqlite-migrator.test.ts`, is on the Windows ledger, so the comparator named this file as the one unexpected failure. The report contains no `too many clients` text.
+  - The commit changed engine files, a changeset and this register, and nothing in `packages/core`.
+- **Runner facts:** image `windows-2025-vs2026` 20260925.250.1, Node 24.21.0, 4 CPUs, `VITEST_MAX_WORKERS=1`, PostgreSQL 17.11 for Windows with `fsync = off`. The file was the 117th of 356 in start order and started 474.6 s after the shard. The file before it, `pg-teardown-diagnostics.test.ts`, ended 3.0 s earlier.
+
+  The five core-1 legs that contain the KB-102 change (`windows-lane-reports-core-1` artifacts; durations include `afterEach`):
+
+  | run | SHA | leg wall | warm-up | concurrent | missing template | reuse | half-built | file |
+  |---|---|---:|---:|---:|---:|---:|---:|---|
+  | 38171508610 | `18fb7f0f4` | 912 s | 39 ms | 5,170 ms | 2,603 ms | 3,572 ms | 2,979 ms | passed |
+  | 38175654275 | `31f1e05b0` | 800 s | 35 ms | 3,181 ms | 2,423 ms | 3,623 ms | 2,552 ms | passed |
+  | 38176804785 | `9ad753f77` | 670 s | 40 ms | 4,477 ms | 2,413 ms | 2,629 ms | 2,266 ms | passed |
+  | 38182428146 | `9dd3b4177` | 654 s | 28 ms | 9,360 ms | 2,713 ms | 5,629 ms | 4,088 ms | passed |
+  | 38189371704 | `849590e98` | 882 s | 50 ms | 5,080 ms | 3,282 ms | 11,604 ms (failed) | 4,222 ms | failed |
+
+  The reuse case passed at 2.6 to 5.6 s. Its failing duration is that range plus 6.0 to 9.0 s, and the harness opens every store pool with a 5 s connection budget. The other four cases of the failing leg are inside their passing ranges.
+- **Reproduction data (KB-144, local):** Windows 11 Pro build 26200, 32 CPUs, Node 24, PostgreSQL 15.18 for Windows (`pnpm pg:test:up`, private cluster) made non-durable with `pg-test-cluster-non-durable.mjs --throwaway`, `max_connections` 100, host `localhost`, `VITEST_MAX_WORKERS=1`, tree `001354be5`. A temporary setup file timed every connection attempt of the test process at the socket, and the server logged connections with millisecond timestamps; both were removed afterwards and no file under `node_modules` was edited.
+
+  | run | result | reuse case | attempts | slowest attempt | longest event-loop stall in the file |
+  |---|---|---:|---:|---:|---:|
+  | the file alone, 20 times | 20 of 20 green | 4,400 to 7,501 ms | 1,060 | 1,695 ms | 254 ms |
+  | core `--shard=1/2`, file 116th of 356 | 3,994 passed, comparator `pass`, 881.5 s | 4,450 ms | 62 in the file, 1,103 in the shard | 311 ms in the file | 188 ms |
+
+  Per attempt over the 20-run series, the only phase with a tail is launch, from TCP connected to the server's `connection received` line: median 21 ms, p95 315 ms, maximum 1,691 ms. DNS lookup stayed under 10 ms, TCP connect under 2.4 ms and authentication under 2 ms. Local case durations are longer than the runner's because the server logged every statement.
+
+  Controls on the private cluster, with the harness's 5 s `connect_timeout`: a missing database answered `3D000` in 32 ms; the 101st connection answered `53300 sorry, too many clients already` in 298 ms; a client thread held for 6 s right after a new socket's `connect()` produced `write CONNECT_TIMEOUT localhost:55444` twice from a healthy server, and a 4 s hold did not. Fresh connections for 30 s per condition took at most 542 ms idle, 587 ms during a `DROP DATABASE … WITH (FORCE)` / `CREATE DATABASE … TEMPLATE` loop, 724 ms under 32 CPU-burning threads plus a process-launch loop, and 1,397 ms under both, with no error.
+- **Mechanism, as far as measured:**
+  - The failing read always needed a new PostgreSQL backend. After `createTask` resolves, the store's unawaited best-effort `activity_log` insert runs on the store's only open runtime connection, so the next read, the task-row `SELECT` of `getTask`, finds no idle connection and postgres.js opens a second one with that `SELECT` as its initial query. This held for every store of every case in all 20 runs (140 of 280 store-database connections). In the run inspected the insert ran for 3.5 to 5.1 ms on the server; it makes the launch necessary and does not slow it.
+  - postgres.js starts the 5 s timer just before the socket connects and clears it at the first `ReadyForQuery`, so a new connection fails when backend start, or a hold of the test process's thread, exceeds 5 s.
+  - Excluded: the connection limit (a full server answers `53300` promptly; the file peaked at 15 of 100 backends; the runner report has no `too many clients`) and a pool pointing at a dropped database (`3D000` promptly; the second store's database is dropped only in `afterEach`, after the failure).
+  - Not reproduced and not attributed (class D). The explanation consistent with every measurement is runner load slowing backend process start: on Windows every backend is a new process, launch is the only phase with a tail and it grows under load, the runner has 4 CPUs, and the KB-141 record above found single process launches there at an inferred 4 to 10 s. A held test-process thread produces the same error chain, but no such hold exists in this file's path locally; stalls of 1.0 to 3.2 s occurred only in other files of the shard.
+- **Not measured:** backend launch time, event-loop delay and the server log on the runner, because the lane uploads none of them; PostgreSQL 17.11, which the runner uses, against the local 15.18; the effect of the runner's 4 CPUs and any on-access scanning of process starts.
+- **Owner decision pending:** the decision request is the `decision` document of KB-144, carried as that task's completion recommendation `Decide how to handle the Windows core-lane PostgreSQL connection timeout`. Its options are: keep this as a recorded first sighting; make the Windows core legs attributable by uploading a server connection log and the boundary-observer output with the lane reports (recommended, together with the first); raise the harness connection budget to the production default of 10 s, which is a widened timeout that needs explicit approval; or reduce backend launches inside case bodies, which lowers exposure and removes no cause. No option is implemented, and the symptom is not claimed gone.
+- **Escalation rule:** a further connection timeout, test timeout or hook timeout of this file is an owner decision raised as its own task. It is never a Windows ledger entry, a quarantine entry, a widened timeout or a retry.
