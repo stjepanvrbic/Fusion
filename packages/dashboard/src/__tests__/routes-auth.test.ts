@@ -43,17 +43,19 @@ import { __setLoginInitiationTimeoutMsForTests, parseGitHubCopilotDeviceCode } f
 import { createFusionAuthStorage } from "../../../engine/src/auth/auth-storage.js";
 import { createAuthMiddleware } from "../auth-middleware.js";
 import { __resetModelRegistryRefreshCacheForTests } from "../model-registry-refresh-cache.js";
+import { __resetHermesPickerModelsCacheForTests } from "../hermes-model-cache.js";
 
 // Mock @fusion/core for gh CLI auth checks
 const mockCentralListProjects = vi.fn().mockResolvedValue([]);
 const mockCentralInit = vi.fn().mockResolvedValue(undefined);
 const mockCentralClose = vi.fn().mockResolvedValue(undefined);
 const mockCentralReconcileProjectStatuses = vi.fn().mockResolvedValue(undefined);
-const { mockPerformUpdateCheck, mockClearUpdateCheckCache, mockExecSync, mockExecFile } = vi.hoisted(() => ({
+const { mockPerformUpdateCheck, mockClearUpdateCheckCache, mockExecSync, mockExecFile, mockSpawn } = vi.hoisted(() => ({
   mockPerformUpdateCheck: vi.fn(),
   mockClearUpdateCheckCache: vi.fn(),
   mockExecSync: vi.fn(),
   mockExecFile: vi.fn(),
+  mockSpawn: vi.fn(),
 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -86,6 +88,8 @@ vi.mock("../update-check.js", async () => {
 vi.mock("node:child_process", async () => {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
   mockExecSync.mockImplementation(((...args: Parameters<typeof actual.execSync>) => actual.execSync(...args)) as typeof actual.execSync);
+  // Pass-through recorder: lets the model catalog tests prove no runtime discovery process is launched.
+  mockSpawn.mockImplementation(((...args: Parameters<typeof actual.spawn>) => (actual.spawn as (...inner: unknown[]) => unknown)(...args)) as typeof actual.spawn);
   // Default execFile mock blocks host-process pgrep calls used by /kill-vitest
   // but passes through all other commands (including git) to preserve route
   // behavior for integration-style API tests in this file.
@@ -112,6 +116,7 @@ vi.mock("node:child_process", async () => {
     ...actual,
     execSync: mockExecSync,
     execFile: mockExecFile,
+    spawn: mockSpawn,
   };
 });
 
@@ -333,6 +338,18 @@ afterEach(() => {
   resetDiagnosticsSink();
 });
 
+/*
+FNXC:ModelCatalog 2026-10-12-10:56:
+Route tests must not run the host's Hermes binary lookup: every cold /api/models request awaits Hermes discovery, and on Windows that is a real `where hermes` whose latency under runner load timed out the first catalog case.
+Fake discovery at the runtime-provider-probes boundary with an empty profile list (what a host without Hermes returns) and reset the picker cache so each test sees the fake.
+File-level so it survives the per-describe vi.restoreAllMocks() calls.
+*/
+beforeEach(() => {
+  // spyOn reuses a live spy, so clear its call history per test.
+  vi.spyOn(runtimeProviderProbesModule, "listHermesProviderProfiles").mockResolvedValue([]).mockClear();
+  __resetHermesPickerModelsCacheForTests();
+});
+
 
 // --- Models route tests ---
 
@@ -393,6 +410,21 @@ describe("GET /models", () => {
       { provider: "openai", id: "gpt-4o", name: "GPT-4o", reasoning: false, contextWindow: 128000, supportedThinkingLevels: ["off"] },
     ]);
     expect(modelRegistry.refresh).toHaveBeenCalled();
+  });
+
+  it("does not launch Hermes discovery processes while building the catalog", async () => {
+    __resetHermesPickerModelsCacheForTests();
+    mockSpawn.mockClear();
+
+    const res = await GET(buildApp(createMockModelRegistry()), "/api/models");
+
+    expect(res.status).toBe(200);
+    const discoverySpawns = mockSpawn.mock.calls.filter(([command, args]) => {
+      const argv = Array.isArray(args) ? args.map(String) : [];
+      return String(command).toLowerCase() === "where" || [String(command), ...argv].some((part) => /hermes/i.test(part));
+    });
+    expect(discoverySpawns).toEqual([]);
+    expect(runtimeProviderProbesModule.listHermesProviderProfiles).toHaveBeenCalledTimes(1);
   });
 
   it("returns empty array when no model registry is provided", async () => {

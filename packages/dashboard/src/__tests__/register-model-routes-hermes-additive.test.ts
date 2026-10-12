@@ -16,6 +16,16 @@ import { registerModelRoutes } from "../routes/register-model-routes.js";
 import { customProviderRegistryKey } from "@fusion/core";
 import type { CustomProvider } from "@fusion/core";
 
+/*
+FNXC:ModelCatalog 2026-10-12-10:56:
+GET /api/models awaits Hermes discovery, so fake it at the runtime-provider-probes boundary: no host `where hermes` lookup or Hermes CLI may run in route tests.
+An empty profile list is what a host without Hermes returns, so no assertion here changes meaning.
+*/
+vi.mock("../runtime-provider-probes.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../runtime-provider-probes.js")>()),
+  listHermesProviderProfiles: vi.fn(async () => []),
+}));
+
 interface SetupOptions {
   customProviders: CustomProvider[];
   /** When true, simulate a connected/active Hermes runtime contributing its own models to the registry. */

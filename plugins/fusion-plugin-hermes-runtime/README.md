@@ -31,7 +31,7 @@ Verify with `hermes --version`.
 
 ## Windows binary resolution
 
-On Windows, `binaryPath` / `HERMES_BIN` can point to an absolute `.cmd` or `.bat` shim. Fusion launches these shims through `cmd.exe /d /s /c` with escaped arguments, rather than relying on an unsafe blanket shell. PATH lookup chooses the first matching directory and then its PATHEXT-preferred executable; results are cached per PATH/PATHEXT, while misses are retried after a short TTL. Probe results continue to report the selected Hermes executable path (not `cmd.exe`) on every platform.
+On Windows, `binaryPath` / `HERMES_BIN` can point to an absolute `.cmd` or `.bat` shim. Fusion launches these shims through `cmd.exe /d /s /c` with escaped arguments, rather than relying on an unsafe blanket shell. PATH lookup chooses the first matching directory and then its PATHEXT-preferred executable; results are cached per PATH/PATHEXT, while misses are retried after a short TTL. The PATH lookup is bounded at 2 seconds: a lookup that has not finished by then is stopped, that call falls back to the bare `hermes` command, and the next call looks again instead of treating Hermes as not installed. Probe results continue to report the selected Hermes executable path (not `cmd.exe`) on every platform.
 
 ## Fusion skill auto-install
 

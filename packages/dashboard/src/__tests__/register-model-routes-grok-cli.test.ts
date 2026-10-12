@@ -22,6 +22,16 @@ import type { Router } from "express";
 import { getGrokPickerModels } from "../grok-model-cache.js";
 import { registerModelRoutes } from "../routes/register-model-routes.js";
 
+/*
+FNXC:ModelCatalog 2026-10-12-10:56:
+GET /api/models awaits Hermes discovery, so fake it at the runtime-provider-probes boundary: no host `where hermes` lookup or Hermes CLI may run in route tests.
+An empty profile list is what a host without Hermes returns, so no assertion here changes meaning.
+*/
+vi.mock("../runtime-provider-probes.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../runtime-provider-probes.js")>()),
+  listHermesProviderProfiles: vi.fn(async () => []),
+}));
+
 const mockedGetGrokPickerModels = vi.mocked(getGrokPickerModels);
 
 function setup(

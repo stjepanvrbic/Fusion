@@ -4,6 +4,16 @@ import { createKimiModelCatalogRegistry } from "./_kimi-model-catalog-fixture.js
 import { registerModelRoutes } from "../routes/register-model-routes.js";
 
 /*
+FNXC:ModelCatalog 2026-10-12-10:56:
+GET /api/models awaits Hermes discovery, so fake it at the runtime-provider-probes boundary: no host `where hermes` lookup or Hermes CLI may run in route tests.
+An empty profile list is what a host without Hermes returns, so no assertion here changes meaning.
+*/
+vi.mock("../runtime-provider-probes.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../runtime-provider-probes.js")>()),
+  listHermesProviderProfiles: vi.fn(async () => []),
+}));
+
+/*
 FNXC:ModelCatalog 2026-08-09-10:27:
 FN-8900 keeps dashboard-level K3 coverage on pi-ai's real bundled catalog instead of the live
 ModelRegistry.refresh() path, which reproduced a roughly 300-second stall. The route still runs its

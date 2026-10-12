@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { win32 } from "node:path";
 
 export interface HermesLaunchSpec {
@@ -18,9 +18,22 @@ export interface HermesLaunchDependencies {
 const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
 export const NEGATIVE_RESULT_TTL_MS = 30_000;
 export const MAX_CACHE_ENTRIES = 32;
+/** Upper bound for the default Windows `where` lookup; matches the binary probe timeout. */
+export const WHERE_LOOKUP_TIMEOUT_MS = 2_000;
+
+interface WhereLookupOutcome {
+  stdout?: string;
+  /** The lookup was killed at the bound: "could not determine", not "not installed". */
+  timedOut?: true;
+}
+
+interface ResolutionOutcome {
+  path: string | undefined;
+  timedOut: boolean;
+}
 
 interface CachedResolution {
-  promise: Promise<string | undefined>;
+  promise: Promise<ResolutionOutcome>;
   createdAt: number;
 }
 
@@ -60,9 +73,15 @@ function evictOldestIfNeeded(): void {
   }
 }
 
-async function defaultRunWhere(binary: string, env: NodeJS.ProcessEnv): Promise<string | undefined> {
+/*
+FNXC:HermesCli 2026-10-12-10:58:
+The Windows binary lookup sits on the /api/models request path (Hermes picker discovery) and on every Hermes launch, so it is bounded by WHERE_LOOKUP_TIMEOUT_MS and the `where` child is killed at the bound.
+An unbounded lookup stalled requests behind a slow host `where`; on a loaded CI runner it outlived a 15 s test timeout.
+A timeout means "could not determine": the caller falls back to the bare binary for that call, and the result is never cached as "not installed", so the next call looks again.
+*/
+function defaultRunWhere(binary: string, env: NodeJS.ProcessEnv): Promise<WhereLookupOutcome> {
   return new Promise((resolve) => {
-    let child;
+    let child: ChildProcess;
     try {
       child = spawn("where", [binary], {
         env,
@@ -70,13 +89,26 @@ async function defaultRunWhere(binary: string, env: NodeJS.ProcessEnv): Promise<
         stdio: ["ignore", "pipe", "ignore"],
       });
     } catch {
-      resolve(undefined);
+      resolve({});
       return;
     }
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (outcome: WhereLookupOutcome): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(outcome);
+    };
+    timer = setTimeout(() => {
+      settle({ timedOut: true });
+      child.kill();
+    }, WHERE_LOOKUP_TIMEOUT_MS);
+    timer.unref?.();
     let stdout = "";
     child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
-    child.once("error", () => resolve(undefined));
-    child.once("close", (code) => resolve(code === 0 && stdout.trim() ? stdout : undefined));
+    child.once("error", () => settle({}));
+    child.once("close", (code) => settle(code === 0 && stdout.trim() ? { stdout } : {}));
   });
 }
 
@@ -113,29 +145,35 @@ export async function resolveHermesBinaryPath(
   const env = deps.env ?? process.env;
   if (platform !== "win32" || isWindowsPath(binary)) return platform === "win32" && isWindowsPath(binary) ? binary : undefined;
 
-  const lookup = async (): Promise<string | undefined> => {
-    const output = await (deps.runWhere ?? defaultRunWhere)(binary, env);
-    return output ? chooseWhereCandidate(output, env) : undefined;
-  };
   // Injected runners are deterministic test seams and must not share process cache state.
-  if (deps.runWhere) return lookup();
+  if (deps.runWhere) {
+    const output = await deps.runWhere(binary, env);
+    return output ? chooseWhereCandidate(output, env) : undefined;
+  }
 
   const key = cacheKey(binary, platform, env);
   const cached = resolutionCache.get(key);
   if (cached) {
     const result = await cached.promise;
     // Positive resolutions remain stable, while misses are retried after the bounded install-discovery window.
-    if (result !== undefined || Date.now() - cached.createdAt < NEGATIVE_RESULT_TTL_MS) return result;
-    resolutionCache.delete(key);
+    if (result.path !== undefined || result.timedOut || Date.now() - cached.createdAt < NEGATIVE_RESULT_TTL_MS) return result.path;
+    if (resolutionCache.get(key) === cached) resolutionCache.delete(key);
   }
 
   evictOldestIfNeeded();
-  const entry: CachedResolution = { promise: lookup(), createdAt: Date.now() };
+  const entry: CachedResolution = {
+    promise: defaultRunWhere(binary, env).then((outcome) => ({
+      path: outcome.stdout ? chooseWhereCandidate(outcome.stdout, env) : undefined,
+      timedOut: outcome.timedOut === true,
+    })),
+    createdAt: Date.now(),
+  };
   resolutionCache.set(key, entry);
-  entry.promise.catch(() => {
+  const evict = (): void => {
     if (resolutionCache.get(key) === entry) resolutionCache.delete(key);
-  });
-  return entry.promise;
+  };
+  entry.promise.then((outcome) => { if (outcome.timedOut) evict(); }, evict);
+  return (await entry.promise).path;
 }
 
 /** Escape cmd.exe metacharacters in a command path without adding outer quotes. */
