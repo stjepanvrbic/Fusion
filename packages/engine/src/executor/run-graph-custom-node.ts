@@ -395,6 +395,10 @@ export function preserveOutcomeFindingsFromReviewOutput(outcome: WorkflowStepOut
  * executor's taxonomy (`classifyExternalObstacle`). Only the session error is classified, never reviewer prose (`outcome.output`), so a
  * review that discusses rate limiting is never mistaken for a 429. Script-mode steps have no provider and never carry the marker.
  * An outcome that parsed a verdict is genuine reviewer evidence and records nothing here.
+ *
+ * FNXC:ReviewFailureReason 2026-10-12-03:04:
+ * Session-failure producers guarantee a non-blank `error` (`describeFailure`), so the blank guard means "no session error to record".
+ * The classifier runs on the composed reason, so an empty-message error whose cause or code is a provider or network signal is still classified.
  */
 export function buildStepFailureContextPatch(
   nodeId: string,

@@ -67,6 +67,7 @@ import {
 } from "../environment/environment-capabilities.js";
 import { checkSessionError } from "../errors/usage-limit-detector.js";
 import { isClaudeCliRateLimitError, withRateLimitRetry } from "../errors/rate-limit-retry.js";
+import { describeFailure } from "../errors/describe-failure.js";
 import {
   requiredArtifactMissingValue,
   requiredArtifactReadFailedValue,
@@ -1565,7 +1566,12 @@ CRITICAL SCOPING RULES — read before doing anything else:
           }
           return { success: false, error: `[readonly-violation] ${violation.message}` };
         }
-        const errorMessage = err instanceof Error ? err.message : String(err);
+        /*
+        FNXC:ReviewFailureReason 2026-10-12-03:04:
+        An empty-message Error or a non-Error rejection used to yield a blank or junk step error, so the step result read "failed before producing a verdict: failed" and could not be classified.
+        Every runtime's session rejection funnels through here; describeFailure keeps non-blank messages byte-identical and otherwise names the error type, code, exit code, signal, stderr tail and cause.
+        */
+        const errorMessage = describeFailure(err, "Agent session");
         if (workflowStep.requiresBrowser === true) {
           await logBrowserVerificationActivity(`[browser-verification] finished browser verification for task ${task.id}: failed — ${errorMessage}`);
         }

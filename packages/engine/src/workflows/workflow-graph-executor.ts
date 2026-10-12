@@ -18,6 +18,7 @@ import {
   isNonPlanDefectPlanReviewFailure,
 } from "../errors/transient-error-detector.js";
 import { isSessionContentionError } from "../errors/transient-error-patterns.js";
+import { describeFailure } from "../errors/describe-failure.js";
 import { isRequiredArtifactReadFailedValue, parseRequiredArtifactMissingValue } from "../execution/required-workflow-artifacts.js";
 
 import {
@@ -2106,6 +2107,9 @@ export class WorkflowGraphExecutor {
    * verdict extraction, edge routing, and `self-healing.ts`'s
    * `latestFailedPreMergeStep` (which filters on `status === "failed"`) are
    * untouched — this only adds `output` to an already-failed record.
+   *
+   * FNXC:ReviewFailureReason 2026-10-12-03:04:
+   * Producers now always supply a non-blank `:error` value for thrown failures and session rejections (`describeFailure`), so the failure-value fallback is reached only when no error was thrown at all.
    */
   private synthesizeNonVerdictFailureOutput(params: {
     stepLabel: string;
@@ -2271,7 +2275,7 @@ export class WorkflowGraphExecutor {
           outcome: "failure",
           value: "plugin-node-handler-error",
           contextPatch: {
-            [`node:${node.id}:error`]: error instanceof Error ? error.message : String(error),
+            [`node:${node.id}:error`]: describeFailure(error, "Workflow node"),
             [`node:${node.id}:extensionId`]: extensionId,
           },
         };
@@ -2520,7 +2524,7 @@ export class WorkflowGraphExecutor {
         outcome: "success",
         value: "summary-unavailable",
         contextPatch: {
-          [`node:${node.id}:error`]: lastError instanceof Error ? lastError.message : String(lastError),
+          [`node:${node.id}:error`]: describeFailure(lastError, "Workflow node"),
         },
       };
       if (recordProgress && this.shouldRecordNodeProgress(node)) {
@@ -2528,7 +2532,12 @@ export class WorkflowGraphExecutor {
       }
       return degraded;
     }
-    const lastErrorText = lastError instanceof Error ? lastError.message : String(lastError);
+    /*
+    FNXC:ReviewFailureReason 2026-10-12-03:04:
+    A review node whose handler throws before its session catch (session creation, browser environment, worktree) lands here.
+    An empty-message or non-Error throw must still record a specific `:error` reason; message-bearing errors stay byte-identical so contention detection is unchanged.
+    */
+    const lastErrorText = describeFailure(lastError, "Workflow node");
     const failureResult: WorkflowNodeResult = {
       outcome: "failure",
       // FNXC:SessionContention 2026-07-25-21:30: contention is a retryable hold, not an exception.

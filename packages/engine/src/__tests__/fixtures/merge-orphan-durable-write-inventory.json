@@ -61,6 +61,7 @@
     "packages/engine/src/duplicate-marker-clear.ts",
     "packages/engine/src/environment/environment-capabilities.ts",
     "packages/engine/src/errors/context-limit-detector.ts",
+    "packages/engine/src/errors/describe-failure.ts",
     "packages/engine/src/errors/engine-errors.ts",
     "packages/engine/src/errors/error-classifier.ts",
     "packages/engine/src/errors/rate-limit-retry.ts",

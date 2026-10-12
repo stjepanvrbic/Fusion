@@ -18,6 +18,7 @@ import { resumeDueExternalBlocks } from "../external-block/external-block-lifecy
 import { projectAdmissionCoordinator } from "../concurrency/concurrency.js";
 import { buildStepFailureContextPatch } from "../executor/run-graph-custom-node.js";
 import { deferReviewStepOnProviderRateLimit } from "../external-block/provider-rate-limit-deferral.js";
+import { describeFailure } from "../errors/describe-failure.js";
 import { ANTHROPIC_RATE_LIMIT_429, MINUTE, RAW_429, T0, createRateLimitStore, graphFailureDeps, rateLimitedResult, reviewCard } from "./fixtures/rate-limit-deferral-store.js";
 
 const settingsOn = () => ({ experimentalFeatures: { workflowGraphExecutor: true } });
@@ -160,6 +161,21 @@ describe("KB-077 step result records the provider error and a structured provide
     expect(result?.status).toBe("failed");
     expect(result?.output).toContain("429 Too Many Requests");
     expect(result?.providerFailure).toBeUndefined();
+  });
+
+  it("(e) an empty-message session error whose cause is a 429 records the RATE_LIMIT marker", async () => {
+    const recorder = makeRecorder();
+    const error = describeFailure(new Error("", { cause: new Error("429 Too Many Requests") }), "Agent session");
+    const executor = new WorkflowGraphExecutor({
+      handlers: { prompt: failingStep({ success: false, error }) },
+      recordWorkflowStepResult: recorder.record,
+    });
+    await executor.run(task, settingsOn(), codeReviewGroupIr());
+
+    const result = recorder.results.find((entry) => entry.workflowStepId === "code-review");
+    expect(result?.status).toBe("failed");
+    expect(result?.output).toBe(`Code Review failed before producing a verdict: ${error}`);
+    expect(result?.providerFailure).toEqual({ origin: "model-provider", code: "RATE_LIMIT" });
   });
 
   it("a parsed verdict is reviewer evidence: the helper records neither error nor marker", () => {
