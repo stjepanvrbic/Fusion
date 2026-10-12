@@ -9,6 +9,9 @@ const core = vi.hoisted(() => ({
 vi.mock("@fusion/core", () => core);
 
 import {
+  hasExhaustedNoVerdictRecovery,
+  hasExhaustedPlanReviewNoVerdictRecovery,
+  NO_VERDICT_RECOVERY_RETRY_LIMIT,
   rerouteFailedNoVerdictPreMergeGateToReview,
   rerouteUnrunPreMergeGateToReview,
 } from "../merge/pre-merge-gate-reseed.js";
@@ -213,5 +216,78 @@ describe("unrun pre-merge gate reseed", () => {
       mergeContent: singular,
       expectedWorkflowSelection: { workflowId: "builtin:coding", stepIds: ["code-review"] },
     })).resolves.toMatchObject({ rerouted: false, reason: "workflow-selection-changed" });
+  });
+});
+
+describe("hold-lane Plan Review no-verdict budget", () => {
+  const lockText = "Plan approved but spec lock unavailable: mission-missing (mission).";
+  const rateLimit = { origin: "model-provider", code: "RATE_LIMIT" };
+  const failure = (overrides: Record<string, unknown> = {}) => ({
+    workflowStepId: "plan-review", workflowStepName: "Plan Review", status: "failed", reviewInputFingerprint: "A", ...overrides,
+  }) as any;
+  const latest = (priors: unknown[], overrides: Record<string, unknown> = {}) => failure({ priorAttempts: priors, ...overrides });
+  const priors = (count: number, overrides: Record<string, unknown> = {}) =>
+    Array.from({ length: count }, (_unused, index) => failure({ startedAt: `2026-10-10T10:0${index}:00.000Z`, ...overrides }));
+
+  it("allows three retries per unchanged plan", () => {
+    expect(NO_VERDICT_RECOVERY_RETRY_LIMIT).toBe(3);
+  });
+
+  it.each([
+    ["three matching priors", latest(priors(3)), "A", true],
+    ["two matching priors", latest(priors(2)), "A", false],
+    ["four matching priors", latest(priors(4)), "A", true],
+    ["no prior attempts", failure(), "A", false],
+    ["a plan changed after the last failure", latest(priors(3)), "B", false],
+    ["priors recorded for another plan", latest(priors(3, { reviewInputFingerprint: "B" })), "A", false],
+    ["priors without a recorded plan", latest(priors(3, { reviewInputFingerprint: undefined })), "A", false],
+    ["a latest row without a recorded plan", latest(priors(3), { reviewInputFingerprint: undefined }), "A", false],
+    ["an undefined current plan", latest(priors(3)), undefined, false],
+    ["an empty current plan", latest(priors(3)), "", false],
+    ["an undefined result", undefined, "A", false],
+    ["one rate-limited prior among three", latest([...priors(2), failure({ providerFailure: rateLimit })]), "A", false],
+    ["a rate-limited latest row with three genuine priors", latest(priors(3), { providerFailure: rateLimit }), "A", false],
+    ["one lock-unavailable prior among three (output)", latest([...priors(2), failure({ output: lockText })]), "A", false],
+    ["one lock-unavailable prior among three (notes)", latest([...priors(2), failure({ notes: lockText })]), "A", false],
+    ["a lock-unavailable latest row", latest(priors(3), { output: lockText, notes: lockText }), "A", false],
+    ["one superseded prior among three", latest([...priors(2), failure({ supersededAt: "2026-10-10T11:00:00.000Z" })]), "A", false],
+    ["one remediation-archived prior among three", latest([...priors(2), failure({ remediationArchivedAt: "2026-10-10T11:00:00.000Z" })]), "A", false],
+    ["one REVISE prior among three", latest([...priors(2), failure({ verdict: "REVISE" })]), "A", false],
+    ["three genuine priors mixed with excluded ones", latest([
+      failure({ providerFailure: rateLimit }), ...priors(2), failure({ output: lockText }), failure({ verdict: "REVISE" }), ...priors(1),
+    ]), "A", true],
+    ["a superseded latest row", latest(priors(3), { supersededAt: "2026-10-10T11:00:00.000Z" }), "A", false],
+    ["a latest REVISE", latest(priors(3), { verdict: "REVISE" }), "A", false],
+    ["a latest pending lease", latest(priors(3), { status: "pending" }), "A", false],
+    ["a latest passed row", latest(priors(3), { status: "passed", verdict: "APPROVE" }), "A", false],
+  ])("%s", (_label, result, currentPlanFingerprint, expected) => {
+    expect(hasExhaustedPlanReviewNoVerdictRecovery(result, currentPlanFingerprint)).toBe(expected);
+  });
+
+  it("ignores the reviewed commit, which can move while the plan is unchanged", () => {
+    const moved = priors(3).map((entry, index) => ({ ...entry, reviewedCommitSha: `sha-${index}` }));
+    expect(hasExhaustedPlanReviewNoVerdictRecovery(latest(moved, { reviewedCommitSha: "sha-latest" }), "A")).toBe(true);
+  });
+
+  it("leaves the review-lane budget keyed on the recorded input and the reviewed commit", () => {
+    const reviewFailure = { workflowStepId: "code-review", status: "failed" } as any;
+    expect(hasExhaustedNoVerdictRecovery({ ...reviewFailure, priorAttempts: [reviewFailure, reviewFailure, reviewFailure] })).toBe(true);
+    expect(hasExhaustedNoVerdictRecovery({ ...reviewFailure, priorAttempts: [reviewFailure, reviewFailure] })).toBe(false);
+    expect(hasExhaustedNoVerdictRecovery({
+      ...reviewFailure, reviewInputFingerprint: "new",
+      priorAttempts: [1, 2, 3].map(() => ({ ...reviewFailure, reviewInputFingerprint: "old" })),
+    })).toBe(false);
+    expect(hasExhaustedNoVerdictRecovery({
+      ...reviewFailure, reviewedCommitSha: "new",
+      priorAttempts: [1, 2, 3].map(() => ({ ...reviewFailure, reviewedCommitSha: "old" })),
+    })).toBe(false);
+    // The review lane counts a lock-unavailable prior and a verdict-less row with no recorded input.
+    expect(hasExhaustedNoVerdictRecovery({
+      ...reviewFailure, priorAttempts: [reviewFailure, reviewFailure, { ...reviewFailure, output: lockText }],
+    })).toBe(true);
+    expect(hasExhaustedNoVerdictRecovery({
+      ...reviewFailure, priorAttempts: [reviewFailure, reviewFailure, { ...reviewFailure, providerFailure: rateLimit }],
+    })).toBe(false);
+    expect(hasExhaustedNoVerdictRecovery({ ...reviewFailure, verdict: "REVISE", priorAttempts: [reviewFailure, reviewFailure, reviewFailure] })).toBe(false);
   });
 });

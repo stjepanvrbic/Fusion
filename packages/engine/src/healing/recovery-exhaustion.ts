@@ -23,6 +23,7 @@ export type RecoveryOwner =
   | "scheduler-filesystem-validation"
   | "self-healing-pr-conflict"
   | "self-healing-planning-handoff"
+  | "self-healing-plan-review-no-verdict"
   | "graph-worktree-base-refresh"
   | "graph-artifact-read"
   | "graph-plan-review-provider"

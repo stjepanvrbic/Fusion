@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { getTaskMergeBlocker, UnavailablePlanLockError, type Task, type WorkflowStepResult } from "@fusion/core";
+import { computePlanApprovalFingerprint, getTaskMergeBlocker, UnavailablePlanLockError, type Task, type WorkflowStepResult } from "@fusion/core";
 import {
   attemptStillPresent,
   discardWorkflowStepLease,
@@ -7,7 +7,7 @@ import {
   persistWorkflowStepResultWithOutcome,
 } from "../executor/execute-workflow-graph.js";
 import { __setResetPublicationFailureForTesting } from "../../../core/src/task-store/reset-lifecycle.js";
-import { rerouteFailedNoVerdictPreMergeGateToReview } from "../merge/pre-merge-gate-reseed.js";
+import { hasExhaustedPlanReviewNoVerdictRecovery, rerouteFailedNoVerdictPreMergeGateToReview } from "../merge/pre-merge-gate-reseed.js";
 import {
   createSharedPgTaskStoreTestHarness,
   pgDescribe,
@@ -230,6 +230,8 @@ describe("persistWorkflowStepResult abort and reset fence", () => {
       workflowStepId: "plan-review", status: "failed", verdict: undefined,
       output: expect.stringContaining("section-duplicate (non-goals)"),
     })]);
+    // A spec-lock rejection is deterministic, not a lost dispatch, so it records no plan identity for the retry budget.
+    expect(task.workflowStepResults?.[0]).not.toHaveProperty("reviewInputFingerprint");
     expect(logEntry).toHaveBeenCalledWith(task.id, expect.stringContaining("section-duplicate (non-goals)"), undefined, undefined);
     const seed = vi.fn();
     Object.assign(store, { seedWorkspaceCodeReviewContinuationIfIdle: seed });
@@ -326,6 +328,155 @@ describe("persistWorkflowStepResult abort and reset fence", () => {
       expect.objectContaining({ status: "failed", startedAt: "terminal-a" }),
       expect.objectContaining({ status: "pending", startedAt: "attempt-b" }),
     ]);
+  });
+});
+
+/*
+FNXC:ReviewRecovery 2026-10-12-01:58:
+The hold-lane retry budget counts verdict-less Plan Review failures per unchanged plan, so each such failure must be stored with the identity of the plan it failed on, on every writer tier.
+Verdicts, pending leases, other review steps and the spec-lock rejection carry no such identity.
+*/
+describe.each(["core", "atomic", "direct"] as const)("Plan Review failure identity on the %s writer tier", (tier) => {
+  const planText = "# Plan\n\n## Mission\n\nDo the work.\n\n## Steps\n\n### Step 0: Real work\n";
+  const planFingerprint = computePlanApprovalFingerprint(planText);
+  const planFailure = (startedAt: string, overrides: Partial<WorkflowStepResult> = {}): WorkflowStepResult => ({
+    ...terminal("plan-review", startedAt),
+    workflowStepName: "Plan Review",
+    ...overrides,
+  });
+  const depsWith = (store: unknown, readTaskArtifact?: (...args: unknown[]) => unknown) => ({
+    store,
+    getRunContextFor: () => undefined,
+    ...(readTaskArtifact ? { readTaskArtifact } : {}),
+  }) as never;
+  const storedRow = (task: Task, workflowStepId = "plan-review") =>
+    task.workflowStepResults?.find((entry) => entry.workflowStepId === workflowStepId);
+  const emptyTask = () => ({ id: "FN-249", workflowStepResults: [] } as unknown as Task);
+  /** One graph attempt as the recorders write it: a pending lease, then the terminal row for the same startedAt. */
+  const runAttempt = async (
+    task: Task,
+    store: unknown,
+    startedAt: string,
+    readTaskArtifact: ((...args: unknown[]) => unknown) | undefined,
+    overrides: Partial<WorkflowStepResult> = {},
+  ) => {
+    await persistWorkflowStepResultWithOutcome(
+      depsWith(store, readTaskArtifact), task.id, { ...pending("plan-review", startedAt), workflowStepName: "Plan Review" },
+    );
+    return persistWorkflowStepResultWithOutcome(
+      depsWith(store, readTaskArtifact), task.id, planFailure(startedAt, overrides), { requireAttemptStartedAt: startedAt },
+    );
+  };
+
+  it("records the plan fingerprint on a verdict-less failure", async () => {
+    const task = emptyTask();
+    const { store } = createStore(task, tier);
+    const reader = vi.fn(async () => planText);
+
+    const outcome = await runAttempt(task, store, "attempt-a", reader);
+
+    expect(outcome).toMatchObject({ persisted: true, disposition: "applied" });
+    expect(outcome.persistedResult?.reviewInputFingerprint).toBe(planFingerprint);
+    expect(storedRow(task)).toMatchObject({ status: "failed", startedAt: "attempt-a", reviewInputFingerprint: planFingerprint });
+    expect(storedRow(task)?.verdict).toBeUndefined();
+    // The pending lease is written without reading the plan.
+    expect(reader).toHaveBeenCalledOnce();
+    expect(reader).toHaveBeenCalledWith(task.id, "PROMPT.md");
+  });
+
+  it("keeps each attempt's identity in history and stamps the next attempt with the plan read at that time", async () => {
+    const task = emptyTask();
+    const { store } = createStore(task, tier);
+    const changedText = `${planText}\n### Step 1: More work\n`;
+
+    await runAttempt(task, store, "attempt-a", async () => planText);
+    await runAttempt(task, store, "attempt-b", async () => changedText);
+
+    const row = storedRow(task);
+    expect(row).toMatchObject({ startedAt: "attempt-b", reviewInputFingerprint: computePlanApprovalFingerprint(changedText) });
+    expect(row?.reviewInputFingerprint).not.toBe(planFingerprint);
+    expect(row?.priorAttempts).toHaveLength(1);
+    expect(row?.priorAttempts?.[0]).toMatchObject({ status: "failed", startedAt: "attempt-a", reviewInputFingerprint: planFingerprint });
+  });
+
+  it("gives CRLF text with trailing spaces the identity of its LF form", async () => {
+    const task = emptyTask();
+    const { store } = createStore(task, tier);
+    const windowsText = planText.split("\n").map((line) => (line ? `${line}  ` : line)).join("\r\n");
+
+    await runAttempt(task, store, "attempt-a", async () => windowsText);
+
+    expect(storedRow(task)?.reviewInputFingerprint).toBe(planFingerprint);
+  });
+
+  it.each([
+    ["a rejecting reader", async () => { throw new Error("documents unavailable"); }],
+    ["an undefined plan", async () => undefined],
+    ["a blank plan", async () => " \n\t\n"],
+    ["no reader", undefined],
+  ] as const)("stores the failure without an identity for %s", async (_label, reader) => {
+    const task = emptyTask();
+    const { store } = createStore(task, tier);
+
+    const outcome = await runAttempt(task, store, "attempt-a", reader);
+
+    expect(outcome).toMatchObject({ persisted: true, disposition: "applied" });
+    expect(storedRow(task)).toMatchObject({ status: "failed", startedAt: "attempt-a" });
+    expect(storedRow(task)).not.toHaveProperty("reviewInputFingerprint");
+  });
+
+  it.each([
+    ["a REVISE", planFailure("attempt-a", { verdict: "REVISE" })],
+    ["an approval", planFailure("attempt-a", { status: "passed", verdict: "APPROVE" })],
+    ["a pending lease", { ...pending("plan-review", "attempt-a"), workflowStepName: "Plan Review" }],
+    ["a verdict-less failure of another review step", terminal("code-review", "attempt-a")],
+  ] as const)("does not read the plan or stamp %s", async (_label, incoming) => {
+    const task = emptyTask();
+    const { store } = createStore(task, tier);
+    const reader = vi.fn(async () => planText);
+
+    await expect(persistWorkflowStepResultWithOutcome(depsWith(store, reader), task.id, incoming))
+      .resolves.toMatchObject({ persisted: true, disposition: "applied" });
+
+    expect(reader).not.toHaveBeenCalled();
+    expect(storedRow(task, incoming.workflowStepId)).toMatchObject({ status: incoming.status });
+    expect(storedRow(task, incoming.workflowStepId)).not.toHaveProperty("reviewInputFingerprint");
+  });
+
+  it("keeps the review input a failure already carries", async () => {
+    const task = emptyTask();
+    const { store } = createStore(task, tier);
+    const reader = vi.fn(async () => planText);
+
+    await persistWorkflowStepResultWithOutcome(
+      depsWith(store, reader), task.id, { ...terminal("code-review", "attempt-a"), reviewInputFingerprint: "diff-fingerprint" },
+    );
+    await persistWorkflowStepResultWithOutcome(
+      depsWith(store, reader), task.id, planFailure("attempt-a", { reviewInputFingerprint: "caller-supplied" }),
+    );
+
+    expect(reader).not.toHaveBeenCalled();
+    expect(storedRow(task, "code-review")?.reviewInputFingerprint).toBe("diff-fingerprint");
+    expect(storedRow(task)?.reviewInputFingerprint).toBe("caller-supplied");
+  });
+
+  it("spends the retry budget on stored genuine failures and never on a rate-limited one", async () => {
+    const task = emptyTask();
+    const { store } = createStore(task, tier);
+    const reader = async () => planText;
+
+    for (const startedAt of ["attempt-a", "attempt-b", "attempt-c"]) await runAttempt(task, store, startedAt, reader);
+    expect(hasExhaustedPlanReviewNoVerdictRecovery(storedRow(task), planFingerprint)).toBe(false);
+
+    await runAttempt(task, store, "attempt-d", reader, { providerFailure: { origin: "model-provider", code: "RATE_LIMIT" } });
+    expect(storedRow(task)).toMatchObject({ startedAt: "attempt-d", reviewInputFingerprint: planFingerprint });
+    expect(storedRow(task)?.priorAttempts).toHaveLength(3);
+    expect(hasExhaustedPlanReviewNoVerdictRecovery(storedRow(task), planFingerprint)).toBe(false);
+
+    await runAttempt(task, store, "attempt-e", reader);
+    expect(storedRow(task)?.priorAttempts).toHaveLength(4);
+    expect(hasExhaustedPlanReviewNoVerdictRecovery(storedRow(task), planFingerprint)).toBe(true);
+    expect(hasExhaustedPlanReviewNoVerdictRecovery(storedRow(task), computePlanApprovalFingerprint(`${planText}\nchanged\n`))).toBe(false);
   });
 });
 

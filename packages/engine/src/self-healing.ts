@@ -100,6 +100,7 @@ import { rerouteSingularStaleContentToReview } from "./merge/stale-content-revie
 import {
   isFailedNoVerdictPreMergeReviewResult,
   isRecoverableUnrunGatePark,
+  NO_VERDICT_RECOVERY_RETRY_LIMIT,
   rerouteFailedNoVerdictPreMergeGateToReview,
   rerouteUnrunPreMergeGateToReview,
 } from "./merge/pre-merge-gate-reseed.js";
@@ -114,7 +115,13 @@ import {
   LEGACY_NULL_PLAN_HANDOFF_STALE_MS,
 } from "./planning-handoff-recovery.js";
 import { getPromptPath } from "./execution/spec-staleness.js";
-import { evaluateStrandedHoldContinuation, seedPreReleasePlanReviewContinuation } from "./plan-review-continuation.js";
+import {
+  evaluateStrandedHoldContinuation,
+  findPreReleasePlanReviewResult,
+  formatExhaustedPlanReviewNoVerdictError,
+  readCurrentPlanReviewInputFingerprint,
+  seedPreReleasePlanReviewContinuation,
+} from "./plan-review-continuation.js";
 import { continuationWaitReason, evaluateStrandedContinuationReclaim, RECLAIM_RETIRED_STATE } from "./workflows/stranded-continuation-reclaim.js";
 /*
 FNXC:Workspace 2026-06-22-14:10 (Phase D review G — cycle dissolved):
@@ -163,7 +170,7 @@ import { SelfHealingGitEvidence, execAsync, shellQuote } from "./self-healing-gi
 import { evaluateParkedAgentTaskLink, PARKED_AGENT_LINK_FRESH_RUN_MS } from "./agents/task-agent-sync.js";
 import { describeSelfHealingNoActionWedge } from "./notification/task-wedge-notification.js";
 import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES } from "./healing/recovery-policy.js";
-import { formatRecoveryExhaustedError, recordRecoveryEscalation } from "./healing/recovery-exhaustion.js";
+import { formatRecoveryExhaustedError, parkExhaustedRecovery, recordRecoveryEscalation } from "./healing/recovery-exhaustion.js";
 
 type FileScopeLeaseTaskRoles = {
   isWipColumn: boolean;
@@ -8650,6 +8657,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
             enginePaused: freshEnginePaused, promptContent, live: live(task.id),
             stalenessMs: Date.now() - new Date(task.columnMovedAt ?? task.updatedAt).getTime(), graceMs,
             now: Date.now(),
+            planFingerprint: await readCurrentPlanReviewInputFingerprint(this.store, task, ir),
           }),
         };
       };
@@ -8666,6 +8674,45 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
               // FNXC:StrandedHoldContinuation 2026-07-26-23:59: Mark only a successfully persisted no-action event so a transient audit failure remains visible on the next maintenance pass.
               if (type.endsWith("no-action")) this.strandedHoldContinuationNoActionAudited.add(key);
             };
+            const underLifecycleLock = <T>(run: () => Promise<T>): Promise<T> =>
+              typeof (this.store as Partial<TaskStore>).withPlanningLifecycleLock === "function"
+                ? this.store.withPlanningLifecycleLock(snapshot.id, run)
+                : run();
+            if (initial.result.reason === "no-verdict-recovery-exhausted") {
+              /*
+              FNXC:ReviewRecovery 2026-10-12-02:02:
+              A hold-lane Plan Review that failed without a verdict on its first attempt and on three automatic retries of the same plan is not seeded again.
+              The card becomes a visible failed row in the column it is in, with the last failure and the remedy; it is never moved backward.
+              The park runs before the no-action audit so a failing audit sink cannot leave the stop invisible.
+              A card that is already failed keeps its error; it stays unseeded because the stop is read from review history, not from status.
+              The live row must still be the same failed attempt, so a newer review attempt or an operator action wins.
+              */
+              const parkUnderLifecycleLock = async () => {
+                const fresh = await evaluate(snapshot.id);
+                if (!fresh || fresh.result.reason !== "no-verdict-recovery-exhausted") return undefined;
+                const exhausted = findPreReleasePlanReviewResult(fresh.ir, fresh.task.workflowStepResults);
+                if (exhausted && fresh.task.status !== "failed") {
+                  await parkExhaustedRecovery(this.store, fresh.task, {
+                    owner: "self-healing-plan-review-no-verdict",
+                    attempts: NO_VERDICT_RECOVERY_RETRY_LIMIT,
+                    detail: "Plan Review produced no verdict",
+                    agentId: "self-healing",
+                    reseeded: false,
+                    preserveRecoveryCounter: true,
+                    errorOverride: formatExhaustedPlanReviewNoVerdictError(fresh.task.column, exhausted),
+                    isSameEpisode: (live) => {
+                      const current = findPreReleasePlanReviewResult(fresh.ir, live.workflowStepResults);
+                      return current?.status === "failed" && current.verdict === undefined
+                        && current.startedAt === exhausted.startedAt && current.completedAt === exhausted.completedAt;
+                    },
+                  });
+                }
+                return fresh;
+              };
+              const stopped = await underLifecycleLock(parkUnderLifecycleLock);
+              if (stopped) await audit("task:reconcile-stranded-hold-continuation-no-action", stopped.result.reason, stopped);
+              continue;
+            }
             if (!initial.result.stranded) { await audit("task:reconcile-stranded-hold-continuation-no-action", initial.result.reason); continue; }
             // FNXC:PlanningDependencyReseed 2026-08-04-04:10:
             // Re-read and seed under the same cross-process lifecycle lock used
@@ -8686,10 +8733,7 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
               await audit("task:reconcile-stranded-hold-continuation", undefined, fresh);
               return true;
             };
-            const lifecycleLock = (this.store as Partial<TaskStore>).withPlanningLifecycleLock;
-            const seeded = lifecycleLock
-              ? await lifecycleLock.call(this.store, snapshot.id, reconcileUnderLifecycleLock)
-              : await reconcileUnderLifecycleLock();
+            const seeded = await underLifecycleLock(reconcileUnderLifecycleLock);
             if (seeded) repaired += 1;
           } catch (error) { log.warn(`reconcileStrandedHoldContinuations: failed for ${snapshot.id}: ${error instanceof Error ? error.message : String(error)}`); }
         }

@@ -72,7 +72,7 @@ import { schedulerLog } from "../logger.js";
 import { emitBoundedRunAudit } from "../util/emit-bounded-run-audit.js";
 import { getPromptPath } from "./spec-staleness.js";
 import { activeSessionRegistry, executingTaskLock } from "../agents/active-session-registry.js";
-import { evaluateStrandedHoldContinuation } from "../plan-review-continuation.js";
+import { evaluateStrandedHoldContinuation, readCurrentPlanReviewInputFingerprint } from "../plan-review-continuation.js";
 
 // FNXC:StrandedHoldContinuation 2026-07-26-14:15:
 // A genuine stranded-plan fault is warned once per held location; ordinary
@@ -357,6 +357,8 @@ export async function evaluateCapacityHoldReadiness(
         stalenessMs: deps.now() - new Date(task.columnMovedAt ?? task.updatedAt).getTime(),
         graceMs: 60_000,
         now: deps.now(),
+        // FNXC:ReviewRecovery 2026-10-12-02:02: the same plan identity the recovery sweep uses, so a card whose Plan Review retry budget is spent is not announced as about to be re-seeded.
+        planFingerprint: await readCurrentPlanReviewInputFingerprint(store, task, ir),
       });
       const key = `${task.id}:${task.column}`;
       if (stranded.stranded && !strandedHoldWarningMemo.has(key)) {

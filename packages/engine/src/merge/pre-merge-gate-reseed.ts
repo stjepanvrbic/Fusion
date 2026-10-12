@@ -125,15 +125,44 @@ export function isUnavailablePlanLockResult(result: Pick<WorkflowStepResult, "ou
   return [result.output, result.notes].some((text) => text?.startsWith(PLAN_LOCK_UNAVAILABLE_DIAGNOSTIC));
 }
 
-export function hasExhaustedNoVerdictRecovery(result: WorkflowStepResult): boolean {
-  if (result.status !== "failed" || result.verdict !== undefined) return false;
-  const previous = (result.priorAttempts ?? []).filter((entry) => !entry.supersededAt && !entry.remediationArchivedAt
-    && entry.reviewInputFingerprint === result.reviewInputFingerprint
-    && entry.reviewedCommitSha === result.reviewedCommitSha
+/** Automatic retries a verdict-less review failure gets per unchanged review input, after its first attempt. */
+export const NO_VERDICT_RECOVERY_RETRY_LIMIT = 3;
+
+/** Prior attempts that spent the no-verdict budget on the review input the caller identifies. */
+function countSpentNoVerdictAttempts(
+  result: WorkflowStepResult,
+  isSameReviewInput: (entry: WorkflowStepResult) => boolean,
+): number {
+  return (result.priorAttempts ?? []).filter((entry) => !entry.supersededAt && !entry.remediationArchivedAt
     && entry.status === "failed" && entry.verdict === undefined
     // FNXC:ProviderRateLimitDeferral 2026-10-08-16:05: a provider rate limit is not a lost dispatch; KB-077 defers it on the external-block schedule, so it never spends this budget.
-    && entry.providerFailure?.code !== "RATE_LIMIT");
-  return previous.length >= 3;
+    && entry.providerFailure?.code !== "RATE_LIMIT"
+    && isSameReviewInput(entry)).length;
+}
+
+export function hasExhaustedNoVerdictRecovery(result: WorkflowStepResult): boolean {
+  if (result.status !== "failed" || result.verdict !== undefined) return false;
+  return countSpentNoVerdictAttempts(result, (entry) => entry.reviewInputFingerprint === result.reviewInputFingerprint
+    && entry.reviewedCommitSha === result.reviewedCommitSha) >= NO_VERDICT_RECOVERY_RETRY_LIMIT;
+}
+
+/**
+ * FNXC:ReviewRecovery 2026-10-12-01:53:
+ * A Plan Review resting in a hold lane gets the review lane's budget: one attempt plus three automatic retries per unchanged plan, counted from stored history so an engine restart cannot reset it.
+ * The review input is the plan text alone. The reviewed commit is ignored because a hold-lane worktree tip can move between attempts while the plan stays the same.
+ * A provider rate limit and a spec-lock rejection have their own owners, so neither spends this budget, and a latest row of either kind never reports exhaustion.
+ * A row without a recorded plan identity matches no plan, so history written before the identity existed never counts.
+ */
+export function hasExhaustedPlanReviewNoVerdictRecovery(
+  result: WorkflowStepResult | undefined,
+  currentPlanFingerprint: string | undefined,
+): boolean {
+  if (!result || !currentPlanFingerprint) return false;
+  if (result.status !== "failed" || result.verdict !== undefined || result.supersededAt) return false;
+  if (result.reviewInputFingerprint !== currentPlanFingerprint) return false;
+  if (result.providerFailure?.code === "RATE_LIMIT" || isUnavailablePlanLockResult(result)) return false;
+  return countSpentNoVerdictAttempts(result, (entry) => entry.reviewInputFingerprint === currentPlanFingerprint
+    && !isUnavailablePlanLockResult(entry)) >= NO_VERDICT_RECOVERY_RETRY_LIMIT;
 }
 
 export async function rerouteUnrunPreMergeGateToReview(

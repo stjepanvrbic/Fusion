@@ -118,6 +118,7 @@
     "packages/engine/src/executor/merge-run-timeout.ts",
     "packages/engine/src/executor/no-commit-eligibility.ts",
     "packages/engine/src/executor/prompt-derived-eligibility.ts",
+    "packages/engine/src/executor/read-task-artifact.ts",
     "packages/engine/src/executor/resolve-remediation-checkout.ts",
     "packages/engine/src/executor/review-checkout-routing.ts",
     "packages/engine/src/executor/review-empty-content-close.ts",

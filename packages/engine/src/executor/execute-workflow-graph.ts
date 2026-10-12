@@ -48,6 +48,7 @@ import {
 } from "../execution/required-workflow-artifacts.js";
 import { getActiveNotificationService } from "../util/notifier.js";
 import { holdWorkflowAdmission, workflowAdmissionHoldReason } from "./workflow-admission-hold.js";
+import { planReviewInputFingerprint } from "../plan-review-continuation.js";
 
 export function buildWorkflowGateActivityMetadata(
   result: CoreWorkflowStepResult,
@@ -406,6 +407,20 @@ export async function persistWorkflowStepResult(
   return (await persistWorkflowStepResultWithOutcome(deps, taskId, result, fence)).scopeCurrent;
 }
 
+async function readPlanReviewInputFingerprint(
+  deps: Partial<Pick<PersistWorkflowStepResultDeps, "readTaskArtifact">>,
+  taskId: string,
+): Promise<string | undefined> {
+  if (typeof deps.readTaskArtifact !== "function") return undefined;
+  try {
+    const planText: unknown = await deps.readTaskArtifact(taskId, "PROMPT.md");
+    return planReviewInputFingerprint(typeof planText === "string" ? planText : undefined);
+  } catch (error) {
+    executorLog.warn(`[workflow-graph] ${taskId}: Plan Review failure recorded without a plan identity; PROMPT.md could not be read: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
 /**
  * Production adapter receipt for graph persistence. `persistWorkflowStepResult` retains its legacy
  * boolean contract while optional-group lease establishment uses `persisted` to decide whether a
@@ -427,9 +442,20 @@ export async function persistWorkflowStepResultWithOutcome(
       : undefined;
     const isPlanReviewResult = result.workflowStepId === PLAN_REVIEW_GROUP_ID
       || result.workflowStepName === "Plan Review";
+    /*
+    FNXC:ReviewRecovery 2026-10-12-01:53:
+    A Plan Review that fails without a verdict records which plan it failed on, so the bounded hold-lane recovery can count retries per unchanged plan from stored history.
+    The read is best effort: an unreadable or blank plan leaves the row without an identity, and such a row spends no budget.
+    Verdicts, pending leases and the spec-lock rejection below are never stamped.
+    */
+    let identifiedResult = result;
+    if (isPlanReviewResult && result.status === "failed" && result.verdict === undefined && result.reviewInputFingerprint === undefined) {
+      const reviewInputFingerprint = await readPlanReviewInputFingerprint(deps, taskId);
+      if (reviewInputFingerprint) identifiedResult = { ...result, reviewInputFingerprint };
+    }
     let scopeSuperseded = false;
     let fenceRefused = false;
-    let activityResult = result;
+    let activityResult = identifiedResult;
     let activityResults: CoreWorkflowStepResult[] | undefined;
     let unavailablePlanLockDiagnostic: string | undefined;
 
@@ -449,7 +475,7 @@ export async function persistWorkflowStepResultWithOutcome(
         scopeSuperseded = true;
         return null;
       }
-      const resultForPersistence = unavailablePlanLockDiagnostic ? activityResult : result;
+      const resultForPersistence = unavailablePlanLockDiagnostic ? activityResult : identifiedResult;
       const unprovenApproval = resolveUnprovenReviewApproval(resultForPersistence, {
         workspace: current.workspaceWorktrees !== undefined,
       });

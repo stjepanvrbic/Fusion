@@ -1,5 +1,6 @@
 import {
   ACTIVE_WORKFLOW_WORK_ITEM_STATES,
+  computePlanApprovalFingerprint,
   computeWorkflowIrPin,
   isTaskBlockedOnApproval,
   isPlanReviewSatisfied,
@@ -8,9 +9,12 @@ import {
   type Task,
   type TaskStore,
   type WorkflowIr,
+  type WorkflowStepResult,
   type WorkflowWorkItem,
 } from "@fusion/core";
 import { resolvePreReleasePlanReviewNode } from "./execution/hold-release.js";
+import { readTaskArtifact } from "./executor/read-task-artifact.js";
+import { hasExhaustedPlanReviewNoVerdictRecovery, NO_VERDICT_RECOVERY_RETRY_LIMIT } from "./merge/pre-merge-gate-reseed.js";
 import {
   classifyPersistedPlanHandoff,
   LEGACY_NULL_PLAN_HANDOFF_STALE_MS,
@@ -21,7 +25,65 @@ export type StrandedHoldContinuationReason =
   | "plan-review-passed" | "seed-prompt" | "prompt-missing" | "triage-owned"
   | "planning-recovery-owned"
   | "awaiting-approval"
-  | "paused" | "engine-paused" | "live" | "too-fresh" | "auto-merge-off" | "ready";
+  | "paused" | "engine-paused" | "live" | "too-fresh" | "auto-merge-off"
+  | "no-verdict-recovery-exhausted" | "ready";
+
+/**
+ * FNXC:ReviewRecovery 2026-10-12-01:53:
+ * The single definition of a Plan Review's input identity: the fingerprint of the plan text the reviewer reads.
+ * The writer of a verdict-less failure and every reader of the retry budget use it, so they cannot disagree on what "the same plan" means.
+ * Missing or blank text has no identity.
+ * Line endings are not part of the plan: the approval fingerprint keeps a carriage return, so CRLF text is folded to LF first and the same plan saved either way keeps one budget.
+ */
+export function planReviewInputFingerprint(planText: string | null | undefined): string | undefined {
+  return planText?.trim() ? computePlanApprovalFingerprint(planText.split("\r\n").join("\n")) : undefined;
+}
+
+/** The stored result of the workflow's pre-release Plan Review node, when the workflow has one. */
+export function findPreReleasePlanReviewResult(
+  ir: WorkflowIr,
+  stepResults: Task["workflowStepResults"],
+): WorkflowStepResult | undefined {
+  const review = resolvePreReleasePlanReviewNode(ir);
+  return review ? stepResults?.find((entry) => entry.workflowStepId === review.id) : undefined;
+}
+
+/**
+ * FNXC:ReviewRecovery 2026-10-12-02:02:
+ * The identity of the plan a hold-lane card would be reviewed on now, read through the task artifact reader the reviewer uses.
+ * The stranded-hold sweep and the hold-release warning both call this, so they cannot disagree on whether the retry budget is spent.
+ * The plan is read only when the stored Plan Review row is a verdict-less failure that recorded an identity, the only shape the bound can stop.
+ * Best effort: an unreadable plan has no identity, and then the bound does not apply.
+ */
+export async function readCurrentPlanReviewInputFingerprint(
+  store: TaskStore,
+  task: Pick<Task, "id" | "workflowStepResults">,
+  ir: WorkflowIr,
+): Promise<string | undefined> {
+  const latest = findPreReleasePlanReviewResult(ir, task.workflowStepResults);
+  if (!latest?.reviewInputFingerprint || latest.status !== "failed" || latest.verdict !== undefined) return undefined;
+  try {
+    return planReviewInputFingerprint(await readTaskArtifact({ store }, task.id, "PROMPT.md"));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * FNXC:ReviewRecovery 2026-10-12-02:02:
+ * Operator-facing error for a hold-lane card whose Plan Review retry budget is spent.
+ * It names the column the card stays in, the bound, the last failure and the remedy.
+ * The remedy is the pair of actions that really start a fresh budget: dashboard Retry re-plans the card and discards its review history, and a changed plan has a new identity.
+ */
+export function formatExhaustedPlanReviewNoVerdictError(
+  column: string,
+  lastFailure: Pick<WorkflowStepResult, "notes" | "output">,
+): string {
+  const detail = lastFailure.notes?.trim() || lastFailure.output?.trim() || "no failure detail was recorded";
+  return `Plan Review recovery stopped in '${column}': no verdict after ${NO_VERDICT_RECOVERY_RETRY_LIMIT} automatic retries on the unchanged plan. `
+    + `Last failure: ${detail}${/[.!?]$/.test(detail) ? "" : "."} `
+    + "Retry the task from the dashboard to re-plan it with a fresh review budget; a changed plan also starts a fresh budget.";
+}
 
 /** The durable outcome of resuming a manually approved pre-release Plan Review. */
 export type ApprovedPlanReviewHandoffResult = {
@@ -191,6 +253,8 @@ export function evaluateStrandedHoldContinuation(input: {
   stalenessMs: number;
   graceMs: number;
   now?: number;
+  /** Identity of the plan a review would read now, from `readCurrentPlanReviewInputFingerprint`. Without it the retry bound does not apply. */
+  planFingerprint?: string;
 }): { stranded: boolean; candidate: boolean; reason: StrandedHoldContinuationReason } {
   if (!input.columnFlags.hold) return { stranded: false, candidate: false, reason: "not-hold-column" };
   /*
@@ -239,5 +303,15 @@ export function evaluateStrandedHoldContinuation(input: {
   if (input.live) return { stranded: false, candidate: true, reason: "live" };
   if (input.stalenessMs < input.graceMs) return { stranded: false, candidate: true, reason: "too-fresh" };
   if (input.effectiveSettings.autoMerge === false) return { stranded: false, candidate: true, reason: "auto-merge-off" };
+  /*
+  FNXC:ReviewRecovery 2026-10-12-02:02:
+  A Plan Review that keeps failing without a verdict is retried at most three times per unchanged plan, then the card stops being re-seeded.
+  The stop is read from the stored review history, never from task status, so clearing a failed status cannot reopen the loop and an engine restart cannot reset the count.
+  It sits last so every operator park and liveness guard above keeps its precedence, and it is a candidate so the sweep audits it and makes the stop visible.
+  A provider rate limit or a spec-lock rejection as the latest failure never stops here; each has its own owner.
+  */
+  if (hasExhaustedPlanReviewNoVerdictRecovery(input.stepResults?.find((entry) => entry.workflowStepId === review.id), input.planFingerprint)) {
+    return { stranded: false, candidate: true, reason: "no-verdict-recovery-exhausted" };
+  }
   return { stranded: true, candidate: true, reason: "ready" };
 }
