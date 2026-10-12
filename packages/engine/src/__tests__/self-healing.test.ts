@@ -5095,9 +5095,11 @@ describe("SelfHealingManager", () => {
       (store as any).getTaskWorkflowSelection = vi.fn(() => null);
       (store as any).listWorkflowWorkItemsForTask = vi.fn(async () => []);
       (store as any).seedWorkspaceCodeReviewContinuationIfIdle = vi.fn(async () => ({ seeded: true }));
-      mockedExecSync.mockImplementation((command) => {
+      mockedExecSync.mockImplementation((command, options) => {
         const cmd = String(command);
         if (cmd === "git diff --binary base-sha..HEAD") return "current diff" as any;
+        // FNXC:EngineTests 2026-10-12-11:12: the task worktree is its own checkout, as the review probes' own-checkout guard requires.
+        if (cmd === "git rev-parse --show-toplevel") return `${options?.cwd}\n` as any;
         return "" as any;
       });
 

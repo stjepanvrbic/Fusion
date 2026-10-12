@@ -382,8 +382,12 @@ vi.mock("node:child_process", async () => {
         }
       });
     });
-  execFileFn[promisify.custom] = (_file: string, _args?: string[], _opts?: any) =>
-    Promise.resolve({ stdout: "", stderr: "" });
+  // FNXC:EngineTests 2026-10-12-11:08: the fake checkout is its own git top level, as the review probes' own-checkout guard requires; every other read answers empty.
+  execFileFn[promisify.custom] = (_file: string, args?: string[], opts?: any) =>
+    Promise.resolve({
+      stdout: args?.[0] === "rev-parse" && args[1] === "--show-toplevel" && typeof opts?.cwd === "string" ? `${opts.cwd}\n` : "",
+      stderr: "",
+    });
 
   return { execSync: execSyncFn, exec: execFn, execFile: execFileFn, spawn: spawnFn };
 });

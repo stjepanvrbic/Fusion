@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolveDiffBaseRef } from "../executor/worktree-git-refs.js";
+import { isOwnGitTopLevel } from "./own-checkout-top-level.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,6 +40,8 @@ export type ReviewDiffFingerprintProbe =
   | { state: "fingerprint"; fingerprint: string }
   | { state: "empty" }
   | { state: "unavailable"; reason: string };
+
+const NOT_OWN_CHECKOUT: ReviewDiffFingerprintProbe = { state: "unavailable", reason: "checkout-not-own-top-level" };
 
 export type ReviewChangesSinceCommitProbe =
   | { state: "frozen"; commitCount: 0 }
@@ -94,8 +97,15 @@ while preventing a clean checkout from being mistaken for an empty reviewed bran
 */
 export async function probeReviewDiffFingerprint(worktreePath: string | undefined, baseRef: string | undefined, targetRef = "HEAD"): Promise<ReviewDiffFingerprintProbe> {
   if (!worktreePath || !baseRef) return { state: "unavailable", reason: "missing-worktree-or-base" };
+  if (!await isOwnGitTopLevel(worktreePath)) return NOT_OWN_CHECKOUT;
   try {
     const { stdout } = await execFileAsync("git", ["diff", "--binary", `${baseRef}..${targetRef}`], gitCaptureOptions(worktreePath));
+    /*
+    FNXC:ReviewInputProof 2026-10-12-10:55:
+    Cleanup can remove the worktree's `.git` link while the diff runs, letting git answer for the enclosing primary checkout.
+    Removal is one-way, so a passing check after the command proves the whole diff came from this checkout.
+    */
+    if (!await isOwnGitTopLevel(worktreePath)) return NOT_OWN_CHECKOUT;
     return stdout
       ? { state: "fingerprint", fingerprint: createHash("sha256").update(stdout).digest("hex") }
       : { state: "empty" };

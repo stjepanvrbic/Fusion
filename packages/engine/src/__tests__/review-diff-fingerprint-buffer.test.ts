@@ -3,16 +3,23 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const childProcess = vi.hoisted(() => {
   type Response = { stdout: string; stderr?: string } | { error: Error & { code?: string } };
-  const state: { respond: (args: string[]) => Response } = {
+  const state: {
+    respond: (args: string[]) => Response;
+    topLevel: (cwd: string | undefined) => string | undefined;
+  } = {
     respond: () => ({ stdout: "" }),
+    topLevel: (cwd) => cwd,
   };
   const execFile = vi.fn((
     _file: string,
     args: string[],
-    options: { maxBuffer?: number },
+    options: { maxBuffer?: number; cwd?: string },
     callback: (error: Error | null, stdout: string, stderr: string) => void,
   ) => {
-    const response = state.respond(args);
+    // FNXC:EngineTests 2026-10-12-11:02: by default the fake checkout is its own git top level, as the probes' own-checkout guard requires.
+    const response = args[0] === "rev-parse" && args[1] === "--show-toplevel"
+      ? { stdout: `${state.topLevel(options.cwd) ?? ""}\n` }
+      : state.respond(args);
     if ("error" in response) {
       callback(response.error, "", "");
       return;
@@ -53,11 +60,17 @@ import {
   REVIEW_DIFF_GIT_MAX_BUFFER_BYTES,
   REVIEW_DIFF_GIT_TIMEOUT_MS,
 } from "../worktree/review-diff-fingerprint.js";
+import { probeReviewCheckout } from "../worktree/review-checkout-clean.js";
+
+function isDiffOrChangesCall(call: unknown[]): boolean {
+  return (call[1] as string[])[0] !== "rev-parse";
+}
 
 describe("review diff fingerprint bounded capture", () => {
   beforeEach(() => {
     childProcess.execFile.mockClear();
     childProcess.state.respond = () => ({ stdout: "" });
+    childProcess.state.topLevel = (cwd) => cwd;
   });
 
   it("captures a two-megabyte binary diff and reuses its stable fingerprint", async () => {
@@ -126,9 +139,38 @@ describe("review diff fingerprint bounded capture", () => {
       totalChangedFileCount: 2,
       shortstat: "2 files changed, 3 insertions(+)",
     });
-    expect(childProcess.execFile.mock.calls.every((call) => (
+    expect(childProcess.execFile.mock.calls.filter(isDiffOrChangesCall).every((call) => (
       (call[2] as { maxBuffer?: number }).maxBuffer === REVIEW_DIFF_GIT_MAX_BUFFER_BYTES
       && (call[2] as { timeout?: number }).timeout === REVIEW_DIFF_GIT_TIMEOUT_MS
     ))).toBe(true);
+  });
+
+  it("refuses a diff when the checkout stops being its own git top level during the command", async () => {
+    let topLevelCalls = 0;
+    childProcess.state.topLevel = (cwd) => (++topLevelCalls === 1 ? cwd : "/primary");
+    childProcess.state.respond = () => ({ stdout: "diff --git a/task.txt b/task.txt\n+change\n" });
+
+    await expect(probeReviewDiffFingerprint("/primary/.fusion/worktrees/kb-170", "base")).resolves.toEqual({
+      state: "unavailable",
+      reason: "checkout-not-own-top-level",
+    });
+    expect(topLevelCalls).toBe(2);
+    expect(childProcess.execFile).toHaveBeenCalledWith("git", ["diff", "--binary", "base..HEAD"], expect.anything(), expect.any(Function));
+  });
+
+  it("refuses a checkout status when the checkout stops being its own git top level during the command", async () => {
+    let topLevelCalls = 0;
+    childProcess.state.topLevel = (cwd) => (++topLevelCalls === 1 ? cwd : "/primary");
+    childProcess.state.respond = () => ({ stdout: "?? untracked.txt\0" });
+
+    await expect(probeReviewCheckout("/primary/.fusion/worktrees/kb-170")).resolves.toEqual({ state: "unavailable" });
+    expect(topLevelCalls).toBe(2);
+
+    topLevelCalls = 0;
+    childProcess.state.topLevel = (cwd) => cwd;
+    await expect(probeReviewCheckout("/primary/.fusion/worktrees/kb-170")).resolves.toEqual({
+      state: "dirty",
+      paths: ["untracked.txt"],
+    });
   });
 });

@@ -9,10 +9,15 @@ const childProcess = vi.hoisted(() => {
   const diff = `diff --git a/large.bin b/large.bin\n${"x".repeat(2 * 1024 * 1024)}`;
   const execFile = vi.fn((
     _file: string,
-    _args: string[],
-    options: { maxBuffer?: number },
+    args: string[],
+    options: { maxBuffer?: number; cwd?: string },
     callback: (error: Error | null, stdout: string, stderr: string) => void,
   ) => {
+    // FNXC:EngineTests 2026-10-12-11:02: the fake worktree is its own checkout, so the probes' own-checkout guard sees its cwd as the git top level.
+    if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+      callback(null, `${options.cwd}\n`, "");
+      return;
+    }
     if (typeof options.maxBuffer === "number" && Buffer.byteLength(diff) > options.maxBuffer) {
       callback(Object.assign(new Error("stdout maxBuffer length exceeded"), {
         code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",

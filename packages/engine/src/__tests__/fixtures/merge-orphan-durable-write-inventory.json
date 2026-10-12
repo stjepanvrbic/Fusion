@@ -322,6 +322,7 @@
     "packages/engine/src/workflows/workflow-step-tool-policy.ts",
     "packages/engine/src/worktree-base-refresh.ts",
     "packages/engine/src/worktree/dependency-bootstrap-inference.ts",
+    "packages/engine/src/worktree/own-checkout-top-level.ts",
     "packages/engine/src/worktree/prove-task-worktree-rebind.ts",
     "packages/engine/src/worktree/python-uv-inference.ts",
     "packages/engine/src/worktree/remove-checkout.ts",

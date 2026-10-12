@@ -71,6 +71,8 @@ A pre-merge review binds source content when its step id is `code-review` **or**
 
 Every singular content-binding approval must record a `reviewInputFingerprint`. Fusion refuses to dispatch the review when it cannot prove that input, records a recoverable failed step instead, and prevents any proofless approval from being persisted or honored. An audited human bypass—identified by a non-empty operator actor plus a recorded timestamp and reason—waives content binding for the specific skipped step. The automated `fast-mode` bypass never does; it retains the existing fail-closed merge refusal.
 
+Content proof is read only from the checkout itself. Before and after reading the checkout status or the review diff, Fusion confirms that git names that directory as its own checkout root. A directory that is no longer its own checkout, such as a task worktree whose `.git` link cleanup removed while leaving the folder inside the primary checkout, yields an unavailable proof (reason `checkout-not-own-top-level`) instead of the primary checkout's status and diff. An unavailable proof defers; it never approves and never starts another review on its own.
+
 Workspace Code Review is excluded from both the singular pre-dispatch proof requirement and the human-waiver shortcut. Workspace approval is bound through confirmed per-repository review evidence instead of one scalar fingerprint, and merge admission continues to validate that evidence repository by repository.
 
 ### Current workflow behavior inventory
