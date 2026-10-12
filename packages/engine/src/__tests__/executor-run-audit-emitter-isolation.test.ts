@@ -197,6 +197,49 @@ describe("FN-9172 executor run-audit emitter isolation", () => {
     expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:execution-blocked-parked" }));
   });
 
+  /*
+  FNXC:DecisionWait 2026-10-12-06:16:
+  The decision-wait park reuses the external-block parked row, so its telemetry must stay optional: a rejecting, throwing or hanging sink leaves the tool result and the frozen task exactly as a healthy sink does.
+  */
+  it.each(Object.entries(sinkStates))("keeps the fn_task_done decision-wait park identical after a %s sink", async (state, makeSink) => {
+    const park = async (recordRunAuditEvent: ReturnType<typeof vi.fn>, hanging: boolean) => {
+      let task: any = {
+        id: "FN-DECIDE", column: "in-progress", dependencies: [], log: [], currentStep: 1, effectiveNodeId: "steps#1:step-execute",
+        worktree: "/repo/.worktrees/fn-decide", branch: "fusion/fn-decide",
+        steps: [{ name: "Preflight", status: "done" }, { name: "Choose", status: "in-progress", decisionGate: true }],
+      };
+      const persistTokenUsage = vi.fn().mockResolvedValue(undefined);
+      const logEntry = vi.fn().mockResolvedValue(undefined);
+      const store = {
+        getTask: vi.fn(async () => structuredClone(task)),
+        updateTask: vi.fn(async (_id: string, patch: any) => { task = { ...task, ...patch }; return task; }),
+        moveTask: vi.fn().mockResolvedValue(undefined), logEntry, recordRunAuditEvent,
+      } as any;
+      const tool = createTaskDoneTool({
+        store, getRunContextFor: () => undefined, persistTokenUsage, workflowLifecycleMovesInFlight: new Set(),
+      } as any, task.id, "/repo", "", new Map(), vi.fn());
+
+      const result = await settleBounded(() => tool.execute("call", {
+        outcome: "blocked", obstacle: "decision-required", reason: "Awaiting the owner's choice.",
+        decision: { question: "Which option?", unblockCondition: "Record the option in a comment, then retry." },
+      } as never), hanging);
+      const { blockedAt: _blockedAt, ...externalBlock } = task.externalBlock;
+      return { result, task: { ...task, externalBlock }, logged: logEntry.mock.calls.map((call) => call[1]), persistTokenUsage, store };
+    };
+
+    const healthy = await park(vi.fn().mockResolvedValue(undefined), false);
+    const hostile = await park(makeSink(), state === "hanging");
+
+    expect(hostile.result).toEqual(healthy.result);
+    expect(hostile.result.content[0]?.text).toContain("Task parked waiting for a decision.");
+    expect(hostile.task).toEqual(healthy.task);
+    expect(hostile.task).toMatchObject({ status: "blocked", paused: true, externalBlock: { origin: "human-decision", code: "DECISION_REQUIRED" } });
+    expect(hostile.logged).toEqual(healthy.logged);
+    expect(hostile.persistTokenUsage).toHaveBeenCalledWith("FN-DECIDE");
+    expect(hostile.store.recordRunAuditEvent).toHaveBeenCalledTimes(1);
+    expect(hostile.store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({ mutationType: "task:external-block-parked" }));
+  });
+
   it.each(Object.entries(sinkStates))("keeps Shape-B stale-plan replay returning true after a %s sink", async (state, makeSink) => {
     const recordRunAuditEvent = makeSink();
     const persistTokenUsage = vi.fn().mockResolvedValue(undefined);

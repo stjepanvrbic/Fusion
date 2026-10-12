@@ -54,6 +54,13 @@ export interface TaskStep {
    * Absence and emptiness are different planner contracts. Absent means unannotated and therefore implicitly depends on the previous step; an explicit empty array means this step has no dependencies and may run as a parallel root.
    */
   dependsOn?: number[];
+  /**
+   * FNXC:DecisionGate 2026-10-12-06:16:
+   * Set when the plan heading carries `(decision-gate)`: this step needs a human choice the executor must not make.
+   * It is the only authorization for the executor's decision-required blocked exit. The planner writes it and Plan Review approves it, so an executor cannot authorize its own park.
+   * Task steps are JSONB, so the attribute needs no migration. Absent means an ordinary step.
+   */
+  decisionGate?: true;
 }
 
 /** Correlation metadata linking a task mutation to the agent run that caused it. */

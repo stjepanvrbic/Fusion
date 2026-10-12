@@ -12,6 +12,15 @@ import {
   createSharedPgTaskStoreTestHarness,
   type SharedPgTaskStoreHarness,
 } from "../../__test-utils__/pg-test-harness.js";
+import { findOpenDecisionGateStep } from "../../tasks/decision-gate.js";
+import {
+  DECISION_WAIT_CODE,
+  DECISION_WAIT_ORIGIN,
+  buildTaskExternalBlockPatch,
+  buildTaskExternalBlockReport,
+  isTaskAwaitingDecision,
+  type TaskExternalBlock,
+} from "../../tasks/task-external-block.js";
 
 const pgTest = pgDescribe;
 
@@ -95,6 +104,44 @@ pgTest("TaskStore.updateStep step-order guard (PostgreSQL)", () => {
       disposition: "resumed",
     });
     expect(result.task.steps[1].status).toBe("in-progress");
+  });
+
+  /*
+   * FNXC:DecisionGate 2026-10-12-06:16:
+   * The decision-gate attribute and the decision-wait freeze live in JSONB columns with no migration.
+   * The store must return both unchanged after step updates and a re-read, because the executor authorizes a decision wait from the stored steps and every operator view reads the stored freeze.
+   */
+  it("keeps the decision-gate attribute and a decision-wait freeze through store writes and reads", async () => {
+    const store = h.store();
+    const task = await h.createTaskWithSteps();
+    await store.updateTask(task.id, {
+      steps: task.steps.map((step, index) => (index === 1 ? { ...step, decisionGate: true as const } : step)),
+    });
+    expect(findOpenDecisionGateStep((await store.getTask(task.id)).steps)).toBeUndefined();
+
+    await store.updateStep(task.id, 0, "done");
+    expect(findOpenDecisionGateStep((await store.getTask(task.id)).steps)).toBe(1);
+    const started = await store.updateStep(task.id, 1, "in-progress");
+    expect(started.steps[1]).toMatchObject({ status: "in-progress", decisionGate: true });
+    expect(started.steps[0]).not.toHaveProperty("decisionGate");
+
+    const cause = { origin: DECISION_WAIT_ORIGIN, code: DECISION_WAIT_CODE };
+    const externalBlock: TaskExternalBlock = {
+      ...cause,
+      message: "Awaiting the owner's choice among options 1-4.",
+      source: "agent-declaration",
+      blockedAt: "2026-10-12T06:16:00.000Z",
+      resume: { column: started.column, currentStep: 1 },
+      report: buildTaskExternalBlockReport(cause, { question: "Which option should this task implement?", unblockCondition: "Record the option in a comment, then retry." }),
+    };
+    await store.updateTask(task.id, buildTaskExternalBlockPatch(externalBlock) as never);
+
+    const frozen = await store.getTask(task.id);
+    expect(isTaskAwaitingDecision(frozen)).toBe(true);
+    expect(frozen).toMatchObject({ status: "blocked", paused: true, pausedReason: "external-block", column: started.column });
+    expect(frozen.externalBlock).toEqual(externalBlock);
+    expect(frozen.steps[1]).toMatchObject({ status: "in-progress", decisionGate: true });
+    expect(findOpenDecisionGateStep(frozen.steps)).toBe(1);
   });
 
   it("allows an explicitly independent step to finish out of index order", async () => {

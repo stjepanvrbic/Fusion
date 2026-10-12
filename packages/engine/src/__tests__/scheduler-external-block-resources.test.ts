@@ -66,4 +66,22 @@ describe("external-block resource ownership", () => {
     // Once resumed (marker cleared, unpaused) it is a running WIP holder again.
     expect(persistedTopLevelAgentSlots([{ ...blocked, status: null, paused: false, externalBlock: undefined }])).toBe(1);
   });
+
+  it("holds a card waiting for an owner decision exactly like any other freeze", async () => {
+    const waiting = blockedTask({
+      id: "FN-210",
+      pausedReason: "external-block",
+      externalBlock: {
+        ...blockedTask().externalBlock!,
+        origin: "human-decision",
+        code: "DECISION_REQUIRED",
+        message: "Awaiting the owner's choice among options 1-4.",
+      },
+    });
+
+    expect(persistedTopLevelAgentSlots([waiting])).toBe(0);
+    expect(await projectCapacityHoldersFromStore(resolverStore, [waiting])).toEqual({ runningTaskIds: [], checkoutOnlyHolderTaskIds: ["FN-210"] });
+    expect(shouldHoldActiveFileScopeLease(waiting, [waiting], { isWipColumn: true })).toBe(true);
+    expect(persistedTopLevelAgentSlots([{ ...waiting, status: null, paused: false, externalBlock: undefined }])).toBe(1);
+  });
 });

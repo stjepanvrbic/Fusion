@@ -191,7 +191,8 @@ export function describeTaskWedge(task: Task): TaskWedgeDescriptor | null {
     const report = buildTaskExternalBlockReport(task.externalBlock, task.externalBlock.report);
     return {
       reasonKey: `external-block:${task.externalBlock.origin}:${task.externalBlock.code}`,
-      reason: report.stopReason,
+      // FNXC:DecisionWait 2026-10-12-06:16: a decision wait tells the operator the question to answer. Only that origin's report carries one.
+      reason: report.question ?? report.stopReason,
       action: report.unblockCondition,
       externalBlockReport: report,
     };

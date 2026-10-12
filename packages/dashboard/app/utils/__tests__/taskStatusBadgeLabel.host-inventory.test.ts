@@ -16,4 +16,15 @@ describe("task status badge host inventory", () => {
       expect(source).toContain("sessionContentionWaitReason");
     }
   });
+
+  it("passes the decision-wait flag wherever a host passes externalBlocked", () => {
+    for (const host of hosts) {
+      const source = readFileSync(resolve(__dirname, host), "utf8");
+      const externalBlockedContexts = source.match(/externalBlocked: \w+\.status === "blocked"/g) ?? [];
+      const awaitingDecisionContexts = source.match(/awaitingDecision: isTaskAwaitingDecision\(\w+\)/g) ?? [];
+
+      expect(externalBlockedContexts.length, host).toBeGreaterThan(0);
+      expect(awaitingDecisionContexts, host).toHaveLength(externalBlockedContexts.length);
+    }
+  });
 });

@@ -49,6 +49,7 @@ import type {
 import {
   ApprovalRequestStore,
   buildTaskExternalBlockReport,
+  isTaskExternallyBlocked,
   DEFAULT_PROVIDER_INSTANCE_ID,
   RetryStormError,
   columnsWithFlag,
@@ -380,6 +381,24 @@ export async function parkExternalSessionObstacle(
     runContext: deps.getRunContextFor(taskId),
     logMessage: `External session obstacle frozen (${externalBlock.origin}/${externalBlock.code}); worktree and execution progress retained for Retry`,
   });
+  return true;
+}
+
+/*
+FNXC:ExternalBlock 2026-10-12-08:06:
+An accepted blocked exit freezes the card from inside its own session: a declared fault, or a decision wait at a plan-marked gate.
+The freeze raises the task pause, the pause listener aborts that session, and execution then leaves through a paused exit.
+Those exits serve an operator or engine pause: they arm an in-place resume, and the exit taken when the aborted prompt throws removes the worktree.
+A frozen card keeps its worktree on disk, its branch and its step progress, and starts no further session until Retry, so each paused exit asks this first and ends execution when the card is frozen.
+*/
+async function endExecutionOnInSessionFreeze(
+  deps: Pick<RunImplementationDeps, "store" | "clearPausedAborted" | "persistTokenUsage">,
+  taskId: string,
+): Promise<boolean> {
+  if (!isTaskExternallyBlocked(await deps.store.getTask(taskId))) return false;
+  deps.clearPausedAborted(taskId);
+  executorLog.log(`${taskId}: external-block freeze raised in the session, so execution ends with worktree and progress retained`);
+  await deps.persistTokenUsage(taskId);
   return true;
 }
 
@@ -2696,6 +2715,10 @@ export async function runImplementation(
               await deps.store.logEntry(task.id, "Execution canceled by user — leaving task in todo");
               return;
             }
+            if (await endExecutionOnInSessionFreeze(deps, task.id)) {
+              wasPaused = true;
+              return;
+            }
             if (await deps.parkApprovalSuspension(task.id, "agent session")) {
               wasPaused = true;
               return;
@@ -2806,6 +2829,20 @@ export async function runImplementation(
               This deliberately does NOT reuse the FN-4806 reclaim branch below: that silently requeues to `todo`, which would clear the park and — with the refusal budget already exhausted — re-park on the next pickup, looping todo→execute→park. A terminal park is the agent's own failure and must stay parked for a human.
               Note the reclaim probes below cannot cover this: they test `liveTask.worktree === null`, but the store maps a cleared column to `undefined`, never `null` (`task-store/serialization.ts` — `row.worktree || undefined`). Tightening that probe is a separate change with real blast radius, so the park is detected by status here instead.
               */
+              /*
+              FNXC:ExternalBlock 2026-10-12-06:16:
+              An accepted blocked exit freezes the card from inside the session: a declared fault, or a decision wait at a plan-marked gate.
+              The freeze raises the pause, which the reclaim check below would read as a lost worktree contract and answer by clearing worktree and branch and scheduling a retry.
+              A frozen card keeps its worktree, branch and step progress and starts no further session, so the freeze is honored here before any other check.
+              */
+              if (isTaskExternallyBlocked(liveTask)) {
+                executorLog.log(`${task.id}: external-block freeze raised in the session, so execution ends with worktree and progress retained`);
+                deps.deleteActiveSession(task.id);
+                deps.tokenUsageBaselines.delete(task.id);
+                session.dispose();
+                terminallyParked = true;
+                break;
+              }
               if (liveTask.status === "failed" || liveTask.status === "needs-replan") {
                 const parkMessage = liveTask.status === "needs-replan"
                   ? `${task.id}: task parked for automatic replan during no-fn_task_done retry — honoring park, not retrying`
@@ -3373,6 +3410,7 @@ export async function runImplementation(
           await deps.store.logEntry(task.id, "Execution canceled by user — leaving task in todo");
           return;
         }
+        if (await endExecutionOnInSessionFreeze(deps, task.id)) return;
         if (await deps.parkApprovalSuspension(task.id, "executor session")) return;
         deps.clearPausedAborted(task.id);
         const latestTask = await deps.store.getTask(task.id);

@@ -270,6 +270,19 @@ describe("buildExecutionPrompt", () => {
     expect(result).not.toContain("fn_review_step");
   });
 
+  it("describes the three blocked-exit causes and what each one must declare", () => {
+    const result = buildExecutionPrompt(createMockTaskDetail(), "/home/user/project");
+
+    expect(result).toContain("declare one of three causes in `obstacle`");
+    expect(result).toContain('`obstacle:"outside-worktree"` for host-resource, network, model-provider, and credential failures');
+    expect(result).toContain("`externalFailure` with the failure class in `cause` and the verbatim error output in `observedError`");
+    expect(result).toContain("classifies only that error output, never your explanation");
+    expect(result).toContain('`obstacle:"decision-required"` only at a step the plan marks `(decision-gate)`');
+    expect(result).toContain("`decision.question` and `decision.unblockCondition`");
+    expect(result).toContain("do not retry or choose for the owner");
+    expect(result).toContain('`obstacle:"inside-worktree"` for everything else');
+  });
+
   it("routes missing capabilities through the non-blocking repair ladder", () => {
     const result = buildExecutionPrompt(createMockTaskDetail(), "/home/user/project");
 

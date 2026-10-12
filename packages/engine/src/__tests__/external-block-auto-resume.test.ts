@@ -115,12 +115,12 @@ function createStore(initial: Task[]) {
   return { store, rows, items, audits, logs };
 }
 
-async function park(env: ReturnType<typeof createStore>, taskId: string, code: string) {
+async function park(env: ReturnType<typeof createStore>, taskId: string, code: string, overrides: Partial<TaskExternalBlock> = {}) {
   const live = await env.store.getTask(taskId);
   await parkTaskOnExternalObstacle({
     store: env.store as never,
     task: live,
-    externalBlock: block(code),
+    externalBlock: block(code, overrides),
     logMessage: `External session obstacle frozen (model-provider/${code}); worktree and execution progress retained for Retry`,
   });
 }
@@ -265,6 +265,82 @@ KB-092 audit verdict: the synchronous operator-Retry resume is an audited admiss
 projectCapacityAdmissionLimits, so worktrees-off constructs no worktree ceiling there and other frozen checkouts can never hold the Retry;
 worktrees-on (explicit or omitted) still counts them, with the resuming card's own checkout discounted.
 */
+/*
+FNXC:DecisionWait 2026-10-12-06:16:
+A card waiting for an owner decision is resumed by a person and by nothing else: no schedule, no sweep, no automatic request, whatever automatic budget the task has left.
+Operator Retry publishes the continuation at the node the freeze recorded, as for any other freeze.
+*/
+describe("decision-wait freeze", () => {
+  const decisionWait: Partial<TaskExternalBlock> = {
+    origin: "human-decision",
+    source: "agent-declaration",
+    message: "Awaiting the owner's choice among options 1-4.",
+  };
+
+  it.each([0, 3])("never resumes automatically (automatic resumes already spent: %s)", async (spent) => {
+    const env = createStore([card("KB-050", { externalBlockAutoResumeCount: spent })]);
+    await park(env, "KB-050", "DECISION_REQUIRED", decisionWait);
+    const frozen = env.rows.get("KB-050")!;
+    expect(frozen.externalBlock).toMatchObject({ origin: "human-decision", code: "DECISION_REQUIRED" });
+    expect(frozen.externalBlock?.autoResume).toBeUndefined();
+
+    vi.setSystemTime(T0 + 30 * 24 * 60 * MINUTE);
+    expect(await resumeDueExternalBlocks({ store: env.store as never, tasks: [frozen] })).toEqual([]);
+    expect(await requestExternalBlockResume({ store: env.store as never, taskId: "KB-050", trigger: "automatic" })).toEqual({ kind: "not-due" });
+
+    expect(env.items).toEqual([]);
+    expect(env.rows.get("KB-050")).toEqual(frozen);
+    expect(isRunningAgentTask({ ...frozen, columnCountsTowardWip: true })).toBe(false);
+    expect(env.audits.map((event) => event.mutationType)).toEqual(["task:external-block-parked"]);
+    expect(env.logs.some((entry) => /Automatic resume|automatic resume/.test(entry.message))).toBe(false);
+  });
+
+  it("is never dispatched: no continuation of the waiting card is actionable until Retry requests one", async () => {
+    const running = ["KB-001", "KB-002", "KB-003", "KB-004", "KB-005", "KB-006"].map((id) => card(id));
+    const env = createStore([...running, card("KB-053")]);
+    await park(env, "KB-053", "DECISION_REQUIRED", decisionWait);
+    const stray = { id: "stray", kind: "task", runId: "KB-053:plain", nodeId: "implement", state: "runnable" } as WorkflowWorkItem;
+
+    expect(resolvePlanningContinuationCandidate(stray, env.rows.get("KB-053")!)).toMatchObject({ kind: "skip", reason: "paused" });
+
+    // The running-agent cap is full, so Retry stays queued and the freeze stays raised: only its own continuation is offered.
+    await requestExternalBlockResume({ store: env.store as never, taskId: "KB-053", trigger: "operator" });
+    expect(resolvePlanningContinuationCandidate(stray, env.rows.get("KB-053")!)).toMatchObject({ kind: "skip", reason: "paused" });
+    expect(resolvePlanningContinuationCandidate(env.items.at(-1)!, env.rows.get("KB-053")!)).toMatchObject({ kind: "actionable" });
+  });
+
+  it("resumes at the recorded node through operator Retry", async () => {
+    const env = createStore([card("KB-051")]);
+    await park(env, "KB-051", "DECISION_REQUIRED", decisionWait);
+
+    const result = await requestExternalBlockResume({ store: env.store as never, taskId: "KB-051", trigger: "operator" });
+
+    expect(result).toMatchObject({ kind: "requested", nodeId: "implement" });
+    expect(env.items).toHaveLength(1);
+    expect(env.items[0]).toMatchObject({ taskId: "KB-051", nodeId: "implement", kind: "task" });
+    expect(isExternalBlockResumeWorkItem(env.items[0]!)).toBe(true);
+    const resumed = env.rows.get("KB-051")!;
+    expect(resumed.externalBlock).toBeUndefined();
+    expect(resumed.paused).toBe(false);
+    expect(resumed.worktree).toBe("/worktrees/kb-051");
+    expect(env.audits.find((event) => event.mutationType === "task:external-block-cleared")!.metadata)
+      .toMatchObject({ trigger: "operator", origin: "human-decision", code: "DECISION_REQUIRED" });
+  });
+
+  it("keeps operator Retry queued behind the freeze at a full running-agent cap", async () => {
+    const running = ["KB-001", "KB-002", "KB-003", "KB-004", "KB-005", "KB-006"].map((id) => card(id));
+    const env = createStore([...running, card("KB-052")]);
+    await park(env, "KB-052", "DECISION_REQUIRED", decisionWait);
+
+    const result = await requestExternalBlockResume({ store: env.store as never, taskId: "KB-052", trigger: "operator" });
+
+    expect(result).toMatchObject({ kind: "requested", nodeId: "implement" });
+    const queued = env.rows.get("KB-052")!;
+    expect(queued.status).toBe("blocked");
+    expect(queued.externalBlock).toMatchObject({ origin: "human-decision", resumeRequest: { trigger: "operator" } });
+  });
+});
+
 describe("synchronous operator Retry honors the worktree capacity mode", () => {
   const OTHER_FROZEN = ["KB-010", "KB-011", "KB-012"];
 

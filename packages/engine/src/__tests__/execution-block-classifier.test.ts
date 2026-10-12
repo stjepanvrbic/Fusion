@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   BLOCKED_THRASH_LIMIT,
+  DECLARED_EXTERNAL_FAILURE_CAUSES,
   classifyBlockedExit,
+  classifyDeclaredExternalObstacle,
   classifyExternalObstacle,
   countBlockedThrashHits,
   isDurableBlockedTask,
@@ -49,6 +51,70 @@ describe("classifyExternalObstacle", () => {
 
   it("continues to classify genuine credential failures", () => {
     expect(classifyExternalObstacle("Invalid API key: authentication failed")).toEqual({ origin: "credentials", code: "CREDENTIALS" });
+  });
+});
+
+describe("classifyDeclaredExternalObstacle", () => {
+  /** The reason stored on KB-147's freeze, verbatim. */
+  const KB147_SESSION_14_REASON = "Awaiting the owner's choice among KB-147 options 1-4 (KB-144 recommends 1 with 2). No owner-authored choice is recorded on this card: the task record has no comments or steering messages, the description is the unchanged original, and the only task documents are the planner's plan and the executor's owner-decision-request. The specification forbids choosing for the owner or defaulting to the recommendation, so Steps 2-8 cannot start. This is not a host, network, provider or credential failure and no tool or check is missing. Unblock: an owner comment on KB-147 naming the option numbers (option 3 only with explicit approval of the wider connection budget, option 4 only with sub-variant 4a or 4b).";
+
+  it.each([
+    ["host-environment", "ENOSPC: no space left on device, write", "ENOSPC"],
+    ["host-environment", "Error: EMFILE: too many open files, open 'a.ts'", "EMFILE"],
+    ["network", "read ECONNRESET", "ECONNRESET"],
+    ["network", "request failed: socket hang up", "SOCKET_HANG_UP"],
+    ["model-provider", ANTHROPIC_RATE_LIMIT_429, "RATE_LIMIT"],
+    ["model-provider", "429 You exceeded your current quota, please check your plan and billing details", "USAGE_LIMIT"],
+    ["credentials", "Invalid API key: authentication failed", "CREDENTIALS"],
+  ] as const)("classifies %s evidence: %s", (cause, observedError, code) => {
+    expect(classifyDeclaredExternalObstacle({ cause, observedError })).toEqual({ origin: cause, code });
+  });
+
+  it("accepts exactly the origins the session-failure classifier can return", () => {
+    expect([...DECLARED_EXTERNAL_FAILURE_CAUSES].sort()).toEqual(["credentials", "host-environment", "model-provider", "network"]);
+  });
+
+  it.each([
+    ["credentials", "ENOSPC: no space left on device, write"],
+    ["host-environment", "read ECONNRESET"],
+    ["network", "Invalid API key: authentication failed"],
+    ["model-provider", "Invalid API key: authentication failed"],
+    ["credentials", ANTHROPIC_RATE_LIMIT_429],
+    ["third-party-service", "ENOSPC: no space left on device, write"],
+    ["human-decision", "Invalid API key: authentication failed"],
+    [undefined, "ENOSPC: no space left on device, write"],
+  ])("returns nothing when the declared class %s disagrees with the evidence", (cause, observedError) => {
+    expect(classifyDeclaredExternalObstacle({ cause, observedError })).toBeUndefined();
+  });
+
+  it.each(["", "   ", "\n\t", undefined, null, 429, { message: "ENOSPC" }])("returns nothing for evidence that is not error text: %j", (observedError) => {
+    for (const cause of DECLARED_EXTERNAL_FAILURE_CAUSES) {
+      expect(classifyDeclaredExternalObstacle({ cause, observedError })).toBeUndefined();
+    }
+    expect(classifyDeclaredExternalObstacle(undefined)).toBeUndefined();
+  });
+
+  it("does not freeze transient credential rotation or a lifecycle rejection", () => {
+    for (const observedError of [
+      '401 {"type":"authentication_error","message":"Invalid authentication credentials"}',
+      "Cannot move CLOU-058 to 'todo': Forbidden lifecycle path F5: 'in-progress' (wip) → 'todo' (hold); reason=self-healing-session-recovery",
+      "Step 5 start was rejected by the task lifecycle projection",
+      "TransitionRejectionError: Cannot move task",
+    ]) {
+      expect(classifyDeclaredExternalObstacle({ cause: "credentials", observedError })).toBeUndefined();
+    }
+  });
+
+  it("gives an explanation no path into classification", () => {
+    // The explanation that froze a card as credentials/CREDENTIALS still matches the prose-reading classifier.
+    expect(classifyExternalObstacle(KB147_SESSION_14_REASON)).toEqual({ origin: "credentials", code: "CREDENTIALS" });
+
+    for (const cause of DECLARED_EXTERNAL_FAILURE_CAUSES) {
+      const declaration = { cause, reason: KB147_SESSION_14_REASON, message: KB147_SESSION_14_REASON };
+      expect(classifyDeclaredExternalObstacle(declaration)).toBeUndefined();
+      expect(classifyDeclaredExternalObstacle({ ...declaration, observedError: "" })).toBeUndefined();
+    }
+    expect(classifyDeclaredExternalObstacle.length).toBe(1);
   });
 });
 

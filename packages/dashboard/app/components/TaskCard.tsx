@@ -4,7 +4,7 @@ import type { TFunction } from "i18next";
 import { memo, useCallback, useState, useRef, useEffect, useLayoutEffect, useMemo, type CSSProperties, type ReactElement } from "react";
 import { createPortal } from "react-dom";
 import { Link, Clock, Layers, Pencil, ChevronDown, Folder, Target, Bot, Trash2, RotateCw, Zap, GitBranch, GitPullRequest, AlertTriangle, Eye, MoreHorizontal, Sparkles, X } from "lucide-react";
-import { isTaskExternallyBlocked } from "@fusion/core";
+import { isTaskAwaitingDecision, isTaskExternallyBlocked } from "@fusion/core";
 import type { Task, TaskDetail, Column, ColumnId, PrInfo, IssueInfo, TaskPriority, GithubIssueAction, MergeResult, PlannerOversightLevel } from "@fusion/core";
 import {
   DEFAULT_PLANNER_OVERSIGHT_LEVEL,
@@ -615,6 +615,10 @@ Every task surface uses one external-obstacle notice so Blocked always wins over
 dependency, and file-overlap vocabulary. Action buttons exist only when their real handlers exist;
 the explanation prompt carries the durable raw code/message and Retry resumes without the normal
 destructive stage-restart confirmation.
+
+FNXC:DecisionWait 2026-10-12-06:16:
+A card that waits for an owner decision is not a fault. The same notice titles it "Waiting for a decision", shows the question and what the owner must do to resume, and omits the fault code and the "Explain this error" button, because there is no error to explain.
+Retry is unchanged: it is how the owner resumes the card after answering.
 */
 export function ExternalBlockNotice({ task, variant, onOpenChatWithPrefill, onRetryTask, addToast }: ExternalBlockNoticeProps) {
   const { t } = useTranslation("app");
@@ -624,6 +628,9 @@ export function ExternalBlockNotice({ task, variant, onOpenChatWithPrefill, onRe
   const code = block.code.trim() || t("tasks.externalBlock.unknownCode", "UNCLASSIFIED");
   const message = block.message.trim() || t("tasks.externalBlock.genericMessage", "External obstacle requires operator action");
   const error = `${code}: ${message}`;
+  const awaitingDecision = isTaskAwaitingDecision(task);
+  const decisionUnblock = awaitingDecision ? block.report?.unblockCondition?.trim() : undefined;
+  const canExplain = Boolean(onOpenChatWithPrefill) && !awaitingDecision;
   /*
   FNXC:ExternalBlockUx 2026-10-08-08:29:
   A requested resume waits for a running-agent slot while the card stays frozen, so Retry turns into a disabled waiting state rather than a
@@ -651,8 +658,15 @@ export function ExternalBlockNotice({ task, variant, onOpenChatWithPrefill, onRe
   };
   return (
     <div className={`external-block-notice external-block-notice--${variant}`} role="alert" data-testid={`external-block-${variant}-${task.id}`}>
-      <strong className="external-block-notice__title">{t("tasks.externalBlock.title", "Blocked")}</strong>
-      <span className="external-block-notice__reason">{error}</span>
+      <strong className="external-block-notice__title">
+        {awaitingDecision ? t("tasks.externalBlock.decisionTitle", "Waiting for a decision") : t("tasks.externalBlock.title", "Blocked")}
+      </strong>
+      <span className="external-block-notice__reason">{awaitingDecision ? block.report?.question?.trim() || message : error}</span>
+      {decisionUnblock && (
+        <span className="external-block-notice__reason">
+          {t("tasks.externalBlock.decisionUnblock", "To resume: {{condition}}", { condition: decisionUnblock })}
+        </span>
+      )}
       {autoResume && (
         <span className="external-block-notice__reason">
           {t("tasks.externalBlock.autoResumeScheduled", "Automatic retry {{attempt}}/{{budget}} at {{time}}", {
@@ -662,9 +676,9 @@ export function ExternalBlockNotice({ task, variant, onOpenChatWithPrefill, onRe
           })}
         </span>
       )}
-      {(onOpenChatWithPrefill || onRetryTask) && (
+      {(canExplain || onRetryTask) && (
         <span className="external-block-notice__actions">
-          {onOpenChatWithPrefill && (
+          {canExplain && (
             <button type="button" className="btn btn-icon" onClick={explain} aria-label={t("tasks.externalBlock.explain", "Explain this error")} title={t("tasks.externalBlock.explain", "Explain this error")}>
               <Bot aria-hidden="true" />
             </button>
@@ -1054,6 +1068,9 @@ function areTaskCardPropsEqual(previous: TaskCardProps, next: TaskCardProps): bo
     previousTask.externalBlock?.blockedAt === nextTask.externalBlock?.blockedAt &&
     previousTask.externalBlock?.code === nextTask.externalBlock?.code &&
     previousTask.externalBlock?.message === nextTask.externalBlock?.message &&
+    previousTask.externalBlock?.origin === nextTask.externalBlock?.origin &&
+    previousTask.externalBlock?.report?.question === nextTask.externalBlock?.report?.question &&
+    previousTask.externalBlock?.report?.unblockCondition === nextTask.externalBlock?.report?.unblockCondition &&
     previousTask.externalBlock?.resumeRequest?.requestedAt === nextTask.externalBlock?.resumeRequest?.requestedAt &&
     previousTask.externalBlock?.autoResume?.resumeAt === nextTask.externalBlock?.autoResume?.resumeAt &&
     previousTask.size === nextTask.size &&
@@ -3494,7 +3511,7 @@ function TaskCardComponent({
               : showQueuedBadge
                 ? t("tasks.statusQueued", "Queued")
                 : wipLifecycleBadgeLabel
-                  ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null, recoveryRetryCount: task.recoveryRetryCount, recoveryDisposition: task.recoveryDisposition, nextRecoveryAt: task.nextRecoveryAt, userPaused: task.userPaused, paused: task.paused, awaitingApproval: task.status === "awaiting-approval", externalBlocked: task.status === "blocked" });
+                  ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null, recoveryRetryCount: task.recoveryRetryCount, recoveryDisposition: task.recoveryDisposition, nextRecoveryAt: task.nextRecoveryAt, userPaused: task.userPaused, paused: task.paused, awaitingApproval: task.status === "awaiting-approval", externalBlocked: task.status === "blocked", awaitingDecision: isTaskAwaitingDecision(task) });
   const hasCardMetaBadges = showPriorityBadge
     || task.executionMode === "fast"
     // FNXC:PlannerOversight 2026-07-04-00:00: the oversight badge is opt-in

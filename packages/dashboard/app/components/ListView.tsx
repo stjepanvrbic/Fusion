@@ -5,7 +5,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { ArrowUpDown, ArrowUp, ArrowDown, Link, Columns3, EyeOff, Eye, ChevronRight, Zap, Trash2, Pause, Play, Archive } from "lucide-react";
-import { DEFAULT_COLUMN, THINKING_LEVELS, getErrorMessage, isColumn, sortTasksForDisplayColumn, type Task, type TaskDetail, type Column, type ColumnId, type TaskCreateInput, type MergeResult, type GithubIssueAction, type PrInfo, type ThinkingLevel } from "@fusion/core";
+import { DEFAULT_COLUMN, THINKING_LEVELS, getErrorMessage, isColumn, isTaskAwaitingDecision, sortTasksForDisplayColumn, type Task, type TaskDetail, type Column, type ColumnId, type TaskCreateInput, type MergeResult, type GithubIssueAction, type PrInfo, type ThinkingLevel } from "@fusion/core";
 import { resolveEffectiveAutoMerge } from "../../../core/src/merge/task-merge";
 import { useColumnLabel } from "../i18n/labels";
 import { isArchivedColumnRole, isCompleteColumnRole, isIntakeColumnRole, isPreImplementationColumnRole, isReviewColumnRole, isWipColumnRole } from "../utils/columnRoles";
@@ -3046,7 +3046,7 @@ export function ListView({
                             : isLivePlanning || isTransientPlannerActive
                               ? t("tasks.statusPlanning", "Planning")
                               : wipLifecycleBadgeLabel
-                                ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null, recoveryRetryCount: task.recoveryRetryCount, recoveryDisposition: task.recoveryDisposition, nextRecoveryAt: task.nextRecoveryAt, userPaused: task.userPaused, paused: task.paused, awaitingApproval: task.status === "awaiting-approval", externalBlocked: task.status === "blocked" }));
+                                ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null, recoveryRetryCount: task.recoveryRetryCount, recoveryDisposition: task.recoveryDisposition, nextRecoveryAt: task.nextRecoveryAt, userPaused: task.userPaused, paused: task.paused, awaitingApproval: task.status === "awaiting-approval", externalBlocked: task.status === "blocked", awaitingDecision: isTaskAwaitingDecision(task) }));
                           const hasDependencies = Boolean(task.dependencies && task.dependencies.length > 0);
                           const taskProgress = getTaskProgress(task, getTaskColumnFlags(task));
                           const hasProgress = taskProgress.hasProgress;
@@ -3333,7 +3333,7 @@ export function ListView({
                               : isLivePlanning || isTransientPlannerActive
                                 ? t("tasks.statusPlanning", "Planning")
                                 : wipLifecycleBadgeLabel
-                                  ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null, recoveryRetryCount: task.recoveryRetryCount, recoveryDisposition: task.recoveryDisposition, nextRecoveryAt: task.nextRecoveryAt, userPaused: task.userPaused, paused: task.paused, awaitingApproval: task.status === "awaiting-approval", externalBlocked: task.status === "blocked" }));
+                                  ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null, recoveryRetryCount: task.recoveryRetryCount, recoveryDisposition: task.recoveryDisposition, nextRecoveryAt: task.nextRecoveryAt, userPaused: task.userPaused, paused: task.paused, awaitingApproval: task.status === "awaiting-approval", externalBlocked: task.status === "blocked", awaitingDecision: isTaskAwaitingDecision(task) }));
 
                             return (
                               <tr

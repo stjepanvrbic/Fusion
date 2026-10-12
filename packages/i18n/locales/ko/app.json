@@ -8671,7 +8671,10 @@
       "resuming": "재개 중…",
       "retry": "다시 시도",
       "autoResumeScheduled": "자동 재시도 {{attempt}}/{{budget}} · {{time}}",
-      "waitingForSlot": "사용 가능한 에이전트 슬롯 대기 중…"
+      "waitingForSlot": "사용 가능한 에이전트 슬롯 대기 중…",
+      "decisionTitle": "결정 대기 중",
+      "decisionUnblock": "재개하려면: {{condition}}",
+      "decisionBadge": "결정 대기"
     },
     "branch": "브랜치",
     "branchMetadata": "브랜치 메타데이터",

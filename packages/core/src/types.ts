@@ -567,10 +567,14 @@ export type {
   GoalCitationFilter,
 };
 
+export { findOpenDecisionGateStep } from "./tasks/decision-gate.js";
 export {
   EXTERNAL_BLOCK_STATUS,
   EXTERNAL_BLOCK_PAUSE_REASON,
+  DECISION_WAIT_ORIGIN,
+  DECISION_WAIT_CODE,
   isTaskExternallyBlocked,
+  isTaskAwaitingDecision,
   buildTaskExternalBlockPatch,
   buildTaskExternalBlockClearPatch,
   buildTaskExternalBlockReport,

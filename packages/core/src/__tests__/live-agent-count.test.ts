@@ -69,6 +69,34 @@ describe("live agent count predicates", () => {
     expect(holdsWorktreeCapacitySlot(frozenWithoutCheckout)).toBe(false);
   });
 
+  it("treats a card waiting for an owner decision as frozen: no running agent, retained checkout counted", () => {
+    const externalBlock = {
+      origin: "human-decision" as const,
+      code: "DECISION_REQUIRED",
+      message: "Awaiting the owner's choice among options 1-4.",
+      source: "agent-declaration" as const,
+      blockedAt: "2026-10-12T06:16:00.000Z",
+      resume: { column: "in-progress", currentStep: 1, worktree: "/worktrees/kb-147", branch: "fusion/kb-147" },
+    };
+    const waiting = task({ column: "in-progress", columnCountsTowardWip: true, status: "blocked", paused: true, externalBlock, worktree: "/worktrees/kb-147" });
+    const waitingWithoutCheckout = task({
+      column: "in-progress",
+      columnCountsTowardWip: true,
+      status: "blocked",
+      paused: true,
+      externalBlock: { ...externalBlock, resume: { column: "in-progress", currentStep: 1 } },
+    });
+
+    for (const frozen of [waiting, waitingWithoutCheckout]) {
+      expect(isRunningAgentTask(frozen)).toBe(false);
+      expect(isWaitingAgentTask(frozen)).toBe(false);
+    }
+    expect(countRunningAgentTasks([waiting, waitingWithoutCheckout])).toBe(0);
+    expect(isExternallyFrozenCheckoutHolder(waiting)).toBe(true);
+    expect(holdsWorktreeCapacitySlot(waiting)).toBe(true);
+    expect(holdsWorktreeCapacitySlot(waitingWithoutCheckout)).toBe(false);
+  });
+
   it("keeps today's counting for running cards and ordinary pauses", () => {
     const running = task({ column: "in-progress", columnCountsTowardWip: true, worktree: "/worktrees/kb-008" });
     const userPaused = task({ column: "in-progress", columnCountsTowardWip: true, paused: true, userPaused: true, worktree: "/worktrees/kb-009" });

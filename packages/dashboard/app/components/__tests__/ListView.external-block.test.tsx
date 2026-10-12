@@ -28,6 +28,37 @@ describe("ListView external-block surfaces", () => {
     expect(explain).toHaveBeenCalledWith(expect.stringContaining("ETIMEDOUT: connection timed out"));
   });
 
+  it("renders a decision wait in the list notice with its question, no fault code and no explanation button", () => {
+    const retry = vi.fn().mockResolvedValue(blocked);
+    const waiting = {
+      ...blocked,
+      externalBlock: {
+        ...blocked.externalBlock!, origin: "human-decision", code: "DECISION_REQUIRED", source: "agent-declaration", message: "Awaiting the owner's choice.",
+        report: { verifiedCondition: "No choice is recorded.", stopReason: "Paused.", unimplementedWork: "Steps 2-8.", unblockCondition: "Record the option in a comment, then retry.", question: "Which option should this task implement?" },
+      },
+    } as Task;
+    render(<ExternalBlockNotice task={waiting} variant="list" onOpenChatWithPrefill={vi.fn()} onRetryTask={retry} />);
+    const notice = screen.getByTestId("external-block-list-FN-209");
+
+    expect(notice).toHaveTextContent("Waiting for a decision");
+    expect(notice).toHaveTextContent("Which option should this task implement?");
+    expect(notice).toHaveTextContent("To resume: Record the option in a comment, then retry.");
+    expect(notice).not.toHaveTextContent("DECISION_REQUIRED");
+    expect(notice).not.toHaveTextContent("Blocked");
+    expect(screen.queryByRole("button", { name: "Explain this error" })).toBeNull();
+    expect(notice.querySelectorAll("button")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledWith("FN-209");
+  });
+
+  it("passes the decision-wait flag to the status badge in both list layouts", () => {
+    const source = readAppFile("components/ListView.tsx");
+    const badgeContexts = source.match(/externalBlocked: task\.status === "blocked"[^}]*\}/g) ?? [];
+
+    expect(badgeContexts).toHaveLength(2);
+    for (const context of badgeContexts) expect(context).toContain("awaitingDecision: isTaskAwaitingDecision(task)");
+  });
+
   it("keeps both grouped-card and table-row render branches wired to the shared notice", () => {
     const source = readAppFile("components/ListView.tsx");
     const notices = source.match(/<ExternalBlockNotice task=\{task\} variant="list"[^>]*\/>/g) ?? [];

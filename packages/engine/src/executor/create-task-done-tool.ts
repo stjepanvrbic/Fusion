@@ -14,9 +14,13 @@
  * Completed-task watchdog arms on resolved WIP column, not literal in-progress.
  */
 import { Type } from "@earendil-works/pi-ai";
-import type { Settings, Task, TaskDetail, TaskRecommendation, TaskStore } from "@fusion/core";
+import type { Settings, Task, TaskDetail, TaskExternalBlock, TaskExternalBlockReport, TaskRecommendation, TaskStore } from "@fusion/core";
 import {
+  DECISION_WAIT_CODE,
+  DECISION_WAIT_ORIGIN,
   buildTaskExternalBlockReport,
+  findOpenDecisionGateStep,
+  isTaskAwaitingDecision,
   isTaskNotFoundError,
   parseNoOpCompletionMarker,
   resolveWipTargetForTask,
@@ -27,10 +31,11 @@ import {
   BLOCKED_THRASH_LIMIT,
   buildExternalBlockMetadataPatch,
   classifyBlockedExit,
-  classifyExternalObstacle,
+  classifyDeclaredExternalObstacle,
   countBlockedThrashHits,
   detectRepairableObstacleHint,
   partitionBlockedByRefs,
+  type DeclaredExternalFailureCause,
 } from "../execution-block-classifier.js";
 import { mergeEffectiveSettings } from "../project/effective-settings.js";
 import { generateSyntheticRunId, type EngineRunContext, type RunAuditor } from "../util/run-audit.js";
@@ -44,6 +49,12 @@ import { MAX_TASK_DONE_REQUEUE_RETRIES } from "./task-done-refusal-handler.js";
 import { validateCompletionRecommendations } from "./validate-completion-recommendations.js";
 import { dispatchAcceptedCompletionRecommendationNotice } from "./completion-recommendation-notice.js";
 import type { FinalizeAcceptedNoOpCompletionParams } from "./plan-review-no-op.js";
+
+/*
+FNXC:HonestBlockedExit 2026-10-12-06:16:
+Every refused blocked exit hands the session the same repair ladder, whichever obstacle value it declared, so no declaration is a way around repairable work.
+*/
+const REPAIR_LADDER = ` Continue repairing in place; fn_task_done(outcome="blocked") did not change the task. Repair ladder: (1) Resolve it — use an equivalent already available in this environment or install it with the project's own tooling. (2) Substitute — write the verification as an automated check in a runtime that is present and note the substitution in the completion summary. (3) Degrade and record — when the missing capability does not prevent the task objective, finish the achievable work, run checks that actually work, and record the deferred verification as a plain-prose recommendations entry at accepted fn_task_done(outcome="completed"); when recommendation capture is disabled, record it in the completion summary and fn_task_log. Only host-resource, network, model-provider, and credential failures, and a decision wait at a step the approved plan marks as a decision gate, freeze a card.`;
 
 export type CreateTaskDoneToolDeps = {
   store: TaskStore;
@@ -105,7 +116,7 @@ export function createTaskDoneTool(
         "the project cap of genuine, task-ready out-of-scope recommendations with stable unique ids, or explicitly send " +
         "recommendations: [] when none qualify; when required by project policy, an explicit array is mandatory, but a shorter list or [] is valid when relevance does not support more; at cap 0, omit recommendations. " +
         "Do not use recommendations for required fixes, blockers, secrets, commands, or reasoning. " +
-        "With outcome=\"blocked\": obstacle=\"outside-worktree\" freezes only when the cause is classified as a host-resource, network, model-provider, or credential failure. Missing tooling, missing optional services, and unrunnable commands are AI-repairable and are refused back to the session to resolve, substitute, or complete-and-recommend. Use obstacle=\"inside-worktree\" for code, test, plan, lint, type, merge, or review failures; Fusion also refuses that exit so the agent continues repairing in place. Blocked is NOT a completion claim — it does not " +
+        "With outcome=\"blocked\": obstacle=\"outside-worktree\" freezes only a host-resource, network, model-provider, or credential failure that is declared in externalFailure with its failure class and the verbatim error output. The reason text is never classified. obstacle=\"decision-required\" parks the task to wait for a human decision and exists only at a step the approved plan marks (decision-gate): declare it once with decision.question and decision.unblockCondition when the required answer is not recorded. It is not an exit for missing tooling, failing checks, or plan defects, and it is refused when the plan has no open decision-gate step. Missing tooling, missing optional services, and unrunnable commands are AI-repairable and are refused back to the session to resolve, substitute, or complete-and-recommend. Use obstacle=\"inside-worktree\" for code, test, plan, lint, type, merge, or review failures; Fusion also refuses that exit so the agent continues repairing in place. Blocked is NOT a completion claim — it does not " +
         "trip the review/completion gates, auto-complete steps, or move implementation back into planning. Task-dependency blocks preserve worktree/" +
         "branch/step progress and park behind real dependency edges.",
       parameters: Type.Object({
@@ -138,9 +149,31 @@ export function createTaskDoneTool(
           description: "When outcome=\"blocked\": Fusion task IDs (e.g. [\"FN-8145\"]) that must complete before this task can proceed. Task IDs become real dependency edges. Open GitHub PRs are not valid blockers.",
         })),
         obstacle: Type.Optional(Type.Union(
-          [Type.Literal("outside-worktree"), Type.Literal("inside-worktree")],
-          { description: "Required when outcome=\"blocked\": outside-worktree freezes only classified host-resource, network, model-provider, or credential failures. Missing tooling, optional services, and unrunnable commands are repairable and refused back to the session; use inside-worktree for code/tests/plan/review." },
+          [Type.Literal("outside-worktree"), Type.Literal("inside-worktree"), Type.Literal("decision-required")],
+          { description: "Required when outcome=\"blocked\". One of three causes. outside-worktree freezes only host-resource, network, model-provider, or credential failures declared in externalFailure. decision-required waits for a human decision and is accepted only while a step the plan marks (decision-gate) is open. inside-worktree is every code/tests/plan/review failure. Missing tooling, optional services, unrunnable commands, failing checks, and plan defects are repairable under every value and are refused back to the session." },
         )),
+        /*
+        FNXC:DecisionWait 2026-10-12-06:16:
+        A decision wait is declared structurally and authorized by the plan, never detected from prose.
+        The agent states the question and what the owner must do, and the engine accepts the declaration only while a plan-marked decision-gate step is open.
+        */
+        decision: Type.Optional(Type.Object({
+          question: Type.String({ description: "The question the owner must answer, with the options when the plan lists them." }),
+          unblockCondition: Type.String({ description: "What the owner must do before Retry, for example where to record the answer." }),
+        }, { description: "Required when obstacle=\"decision-required\": the question the plan's decision-gate step needs answered and the condition that unblocks the task. Shown to the operator on the parked card." })),
+        /*
+        FNXC:ExternalBlock 2026-10-12-06:16:
+        A fault freeze takes evidence, not explanation. The agent names the failure class and quotes the error it observed. Only that quoted text is classified, and the freeze happens only when the classification agrees with the named class.
+        */
+        externalFailure: Type.Optional(Type.Object({
+          cause: Type.Union(
+            [Type.Literal("host-environment"), Type.Literal("network"), Type.Literal("model-provider"), Type.Literal("credentials")],
+            { description: "The failure class: host-environment (disk, memory, file handles), network, model-provider (rate limit, quota, billing), or credentials." },
+          ),
+          observedError: Type.String({
+            description: "The verbatim error output that shows the failure, copied from the failing command or API response. Do not paraphrase it.",
+          }),
+        }, { description: "Required when obstacle=\"outside-worktree\" has no blockedBy task: the declared failure class and the verbatim error output. Fusion classifies observedError only and freezes only when it matches cause." })),
 
         reason: Type.Optional(Type.String({
           description: "Required when outcome=\"blocked\": concrete explanation of what is blocking the work and what is needed to unblock it.",
@@ -150,9 +183,9 @@ export function createTaskDoneTool(
           stopReason: Type.Optional(Type.String()),
           unimplementedWork: Type.Optional(Type.String()),
           unblockCondition: Type.Optional(Type.String()),
-        }, { description: "Optional safe operator report for an accepted outside-worktree block. State what was verified, why work stopped, what remains undone, and the precise unblock condition. Never include prompts, logs, stack traces, or credentials." })),
+        }, { description: "Optional safe operator report for an accepted outside-worktree block or decision wait. State what was verified, why work stopped, what remains undone, and the precise unblock condition. Never include prompts, logs, stack traces, or credentials." })),
       }),
-      execute: async (_id: string, params: { summary?: string; recommendations?: TaskRecommendation[]; outcome?: "completed" | "blocked"; blockedBy?: string[]; obstacle?: "outside-worktree" | "inside-worktree"; reason?: string; blockedReport?: { verifiedCondition?: string; stopReason?: string; unimplementedWork?: string; unblockCondition?: string } }) => {
+      execute: async (_id: string, params: { summary?: string; recommendations?: TaskRecommendation[]; outcome?: "completed" | "blocked"; blockedBy?: string[]; obstacle?: "outside-worktree" | "inside-worktree" | "decision-required"; externalFailure?: { cause?: DeclaredExternalFailureCause; observedError?: string }; decision?: { question?: string; unblockCondition?: string }; reason?: string; blockedReport?: { verifiedCondition?: string; stopReason?: string; unimplementedWork?: string; unblockCondition?: string } }) => {
         /*
         FNXC:Lifecycle 2026-07-16-10:20:
         FN-8141 — the blocked exit runs BEFORE every completion gate (completion blocker, verdict providers, worktree
@@ -170,7 +203,7 @@ export function createTaskDoneTool(
             };
           }
           if (params.obstacle === undefined) {
-            const message = "fn_task_done(outcome=\"blocked\") requires `obstacle` to be either \"outside-worktree\" or \"inside-worktree\". Re-issue the call with the origin declared explicitly.";
+            const message = "fn_task_done(outcome=\"blocked\") requires `obstacle` to be \"outside-worktree\", \"inside-worktree\", or \"decision-required\". Re-issue the call with the cause declared explicitly.";
             return {
               content: [{ type: "text" as const, text: message }],
               details: { error: message },
@@ -181,6 +214,79 @@ export function createTaskDoneTool(
           const rawBlockedBy = Array.from(
             new Set((params.blockedBy ?? []).map((id) => id.trim()).filter((id) => id.length > 0)),
           );
+          const refuse = (message: string) => ({
+            content: [{ type: "text" as const, text: message }],
+            details: { error: message },
+          });
+          /*
+          FNXC:ExternalBlock 2026-10-08-08:29:
+          A frozen card releases its running-agent slot; its worktree, branch, and file-scope lease stay retained for the resume.
+
+          FNXC:DecisionWait 2026-10-12-06:16:
+          Fault freezes and decision waits are written by the same freeze owner with the same resume coordinates, so both resume through operator Retry at the interrupted workflow node.
+          */
+          const freezeInPlace = async (
+            cause: Pick<TaskExternalBlock, "origin" | "code">,
+            report: Partial<TaskExternalBlockReport> | undefined,
+            logMessage: string,
+          ): Promise<void> => {
+            await parkTaskOnExternalObstacle({
+              store,
+              task: blockedTask,
+              externalBlock: {
+                ...cause,
+                message: reason,
+                report: buildTaskExternalBlockReport(cause, report),
+                source: "agent-declaration",
+                blockedAt: new Date().toISOString(),
+                resume: {
+                  column: blockedTask.column,
+                  nodeId: blockedTask.effectiveNodeId,
+                  currentStep: blockedTask.currentStep,
+                  worktree: blockedTask.worktree,
+                  branch: blockedTask.branch,
+                },
+              },
+              runContext: deps.getRunContextFor(taskId),
+              writeRunContext: deps.getRunContextFor(taskId),
+              logMessage,
+            });
+            await deps.persistTokenUsage(taskId);
+          };
+
+          /*
+          FNXC:DecisionWait 2026-10-12-06:16:
+          A plan that says "stop until the owner chooses" had no accepted exit: the declaration was refused, a new session started, and the cycle repeated.
+          decision-required parks the card in one call as an external-block freeze with its own origin, so it holds no running-agent slot, keeps worktree, branch and steps, never resumes automatically, and resumes through operator Retry.
+          The approved plan is the only authorization. The checks run in a fixed order and read no prose: no blockedBy, a stated question and unblock condition, and an open plan-marked decision-gate step.
+          Without an open gate the declaration gets the same refusal and repair ladder as any repairable obstacle, so it is not an exit from missing tooling, failing checks or plan defects.
+          */
+          if (params.obstacle === "decision-required") {
+            const parkedText = "Task parked waiting for a decision. Column, completed steps, worktree, branch, and file-scope lease are retained, and the running-agent slot is released. Retry resumes the interrupted workflow node once the decision is recorded and a slot is free.";
+            if (isTaskAwaitingDecision(blockedTask)) {
+              return { content: [{ type: "text" as const, text: parkedText }], details: {} };
+            }
+            if (rawBlockedBy.length > 0) {
+              return refuse("fn_task_done(outcome=\"blocked\", obstacle=\"decision-required\") does not take `blockedBy`. Declare either the task dependency (blockedBy with another obstacle value) or the decision wait, not both. The task was not changed.");
+            }
+            const question = params.decision?.question?.trim();
+            const unblockCondition = params.decision?.unblockCondition?.trim();
+            if (!question || !unblockCondition) {
+              return refuse("fn_task_done(outcome=\"blocked\", obstacle=\"decision-required\") requires a non-empty `decision.question` and `decision.unblockCondition`. State the question the owner must answer and what they must do before Retry, then call again. The task was not changed.");
+            }
+            const gateIndex = findOpenDecisionGateStep(blockedTask.steps);
+            if (gateIndex === undefined) {
+              const hint = detectRepairableObstacleHint(reason);
+              const hintText = hint ? ` Detected AI-repairable obstacle hint: ${hint}.` : "";
+              return refuse(`This decision wait is not authorized: the approved plan has no open decision-gate step.${hintText} A decision wait exists only at a step the plan marks (decision-gate) while that step is the work in front of you.${REPAIR_LADDER}`);
+            }
+            await freezeInPlace(
+              { origin: DECISION_WAIT_ORIGIN, code: DECISION_WAIT_CODE },
+              { ...params.blockedReport, question, unblockCondition },
+              `Decision wait parked at decision-gate Step ${gateIndex} (${blockedTask.steps[gateIndex]!.name}) (${DECISION_WAIT_ORIGIN}/${DECISION_WAIT_CODE}); worktree and execution progress retained for Retry`,
+            );
+            return { content: [{ type: "text" as const, text: parkedText }], details: {} };
+          }
           /*
           FNXC:HonestBlockedExit 2026-08-02-23:59 (operator decision — FN-8728 vs PR #2398):
           Blocked exits classify on Fusion task dependencies ONLY. The FN-8700 file-claim/open-PR
@@ -235,38 +341,19 @@ export function createTaskDoneTool(
           FNXC:ExternalBlock 2026-08-28-22:39:
           A discarded stale or self-spawned dependency proves the blocked declaration itself is invalid.
           Refuse it into self-repair even when its reason separately matches a freezable host failure.
+
+          FNXC:ExternalBlock 2026-10-12-06:16:
+          The reason is stored and shown to the operator but never classified. An outside-worktree declaration freezes only on its declared evidence: the failure class it names plus error output that classifies as that class.
           */
           const classifiedObstacle = params.obstacle === "outside-worktree"
-            ? classifyExternalObstacle(reason)
+            ? classifyDeclaredExternalObstacle(params.externalFailure)
             : undefined;
           if (blockedByIds.length === 0 && !hasDiscardedTaskBlocker && classifiedObstacle) {
-            const externalBlock = {
-              ...classifiedObstacle,
-              message: reason,
-              report: buildTaskExternalBlockReport(classifiedObstacle, params.blockedReport),
-              source: "agent-declaration" as const,
-              blockedAt: new Date().toISOString(),
-              resume: {
-                column: blockedTask.column,
-                nodeId: blockedTask.effectiveNodeId,
-                currentStep: blockedTask.currentStep,
-                worktree: blockedTask.worktree,
-                branch: blockedTask.branch,
-              },
-            };
-            await parkTaskOnExternalObstacle({
-              store,
-              task: blockedTask,
-              externalBlock,
-              runContext: deps.getRunContextFor(taskId),
-              writeRunContext: deps.getRunContextFor(taskId),
-              logMessage: `External obstacle frozen (${externalBlock.origin}/${externalBlock.code}); worktree and execution progress retained for Retry`,
-            });
-            await deps.persistTokenUsage(taskId);
-            /*
-            FNXC:ExternalBlock 2026-10-08-08:29:
-            A frozen card releases its running-agent slot; its worktree, branch, and file-scope lease stay retained for the resume.
-            */
+            await freezeInPlace(
+              classifiedObstacle,
+              params.blockedReport,
+              `External obstacle frozen (${classifiedObstacle.origin}/${classifiedObstacle.code}); worktree and execution progress retained for Retry`,
+            );
             return {
               content: [{ type: "text" as const, text: "Task frozen as Blocked for human action. Column, completed steps, worktree, branch, and file-scope lease are retained; the running-agent slot is released. Retry will resume the interrupted workflow node once a slot is free." }],
               details: {},
@@ -274,13 +361,12 @@ export function createTaskDoneTool(
           }
 
           if (blockedByIds.length === 0) {
-            const hint = detectRepairableObstacleHint(reason);
+            const hint = detectRepairableObstacleHint(reason) ?? detectRepairableObstacleHint(params.externalFailure?.observedError ?? "");
             const hintText = hint ? ` Detected AI-repairable obstacle hint: ${hint}.` : "";
-            const message = `This obstacle is not authorized to freeze the card.${hintText} Continue repairing in place; fn_task_done(outcome="blocked") did not change the task. Repair ladder: (1) Resolve it — use an equivalent already available in this environment or install it with the project's own tooling. (2) Substitute — write the verification as an automated check in a runtime that is present and note the substitution in the completion summary. (3) Degrade and record — when the missing capability does not prevent the task objective, finish the achievable work, run checks that actually work, and record the deferred verification as a plain-prose recommendations entry at accepted fn_task_done(outcome="completed"); when recommendation capture is disabled, record it in the completion summary and fn_task_log. Only host-resource, network, model-provider, and credential failures freeze a card.`;
-            return {
-              content: [{ type: "text" as const, text: message }],
-              details: { error: message },
-            };
+            const evidenceText = params.obstacle === "outside-worktree"
+              ? " An outside-worktree block must declare `externalFailure` with the failure class (`cause`) and the verbatim error output (`observedError`) that shows that class, because the explanation in `reason` is never classified."
+              : "";
+            return refuse(`This obstacle is not authorized to freeze the card.${hintText}${evidenceText}${REPAIR_LADDER}`);
           }
 
           const classification = classifyBlockedExit(reason, blockedByIds);

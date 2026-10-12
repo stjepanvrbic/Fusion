@@ -24,6 +24,21 @@ type PendingWedgeCompletionOutcome = "delivered" | "suppressed" | "cleared" | "r
 function formatWedgeMailboxContent(task: Task, descriptor: TaskWedgeDescriptor, link: string | undefined): string {
   if (descriptor.externalBlockReport) {
     const report = descriptor.externalBlockReport;
+    /*
+    FNXC:DecisionWait 2026-10-12-06:16:
+    A card waiting for an owner decision is not a fault, so its message is headed as a wait for a decision and leads with the question and what the owner must do.
+    Like the fault message, it is built from the sanitized report only.
+    */
+    if (report.question !== undefined) {
+      return [
+        `**${formatTaskIdentifier(task)} is waiting for a decision**`, "",
+        `**Question:** ${report.question}`,
+        `**Unblock:** ${report.unblockCondition}`,
+        `**Verified:** ${report.verifiedCondition}`,
+        `**Not implemented:** ${report.unimplementedWork}`,
+        ...(link ? ["", `[Open ${task.id}](${link})`] : []),
+      ].join("\n");
+    }
     return [
       `**${formatTaskIdentifier(task)} is blocked and needs operator action**`, "",
       `**Verified:** ${report.verifiedCondition}`,

@@ -17,6 +17,7 @@ import { withRateLimitRetry } from "../errors/rate-limit-retry.js";
 import { MAX_RECOVERY_RETRIES } from "../healing/recovery-policy.js";
 import { executingTaskLock } from "../agents/active-session-registry.js";
 import { runVerificationCommand as mockedRunVerificationCommand } from "../execution/verification-utils.js";
+import { removeWorktree } from "../worktree/worktree-pool.js";
 import {
   createMockStore,
   createWorkflowRoutingAgentStore,
@@ -371,6 +372,216 @@ describe("Workflow Steps Execution", () => {
       expect.objectContaining({ message: "Agent finished without calling fn_task_done (after 3 retries)" }),
     );
     expect(onComplete).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:DecisionWait 2026-10-12-06:16:
+  A card at a planned owner decision once ran 14 implementation sessions because the blocked exit had no accepted form for it.
+  One decision-required declaration at a plan-marked gate must end execution in the same session. Without a gate the declaration is still refused and the existing retry path runs.
+  The gate attribute reaches the task only through the plan: the graph's parse node reads the heading marker from PROMPT.md, so these cases prove the authorization end to end.
+  */
+  function decisionWaitTask(plan: { decisionGate: boolean }) {
+    const marker = plan.decisionGate ? " (decision-gate)" : "";
+    return {
+      id: "FN-001",
+      title: "Decide",
+      description: "Decision gate task",
+      column: "in-progress",
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      log: [],
+      prompt: `# test\n## Steps\n### Step 0: Preflight\n- [ ] check\n### Step 1${marker}: Owner decision\n- [ ] read the recorded choice`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  const DECISION_DECLARATION = {
+    outcome: "blocked",
+    obstacle: "decision-required",
+    reason: "Awaiting the owner's choice among options 1-4; no choice is recorded on this card.",
+    decision: {
+      question: "Which of options 1-4 should this task implement?",
+      unblockCondition: "Record the chosen option numbers in a task comment, then retry.",
+    },
+  };
+
+  /**
+   * Runs the task. Its first implementation session finishes Preflight, starts the second step, and makes the blocked declaration once.
+   * With `pauseAbort`, the store publishes the pause write as the production store does, so the executor's pause listener aborts the live session, and the aborted prompt then ends in the named way.
+   */
+  async function runDecisionWaitTask(
+    plan: { decisionGate: boolean },
+    declaration: Record<string, unknown> = DECISION_DECLARATION,
+    pauseAbort?: "prompt-resolves" | "prompt-throws",
+  ) {
+    const store = createMockStore();
+    const task = decisionWaitTask(plan);
+    store.getTask.mockResolvedValue(task);
+    store.getTaskDocument.mockImplementation(async (_taskId: string, key: string) =>
+      key === "PROMPT.md" ? { content: task.prompt } : undefined);
+    if (pauseAbort) {
+      const applyUpdate = store.updateTask.getMockImplementation()!;
+      store.updateTask.mockImplementation(async (id: string, patch: Record<string, unknown>) => {
+        const updated = await applyUpdate(id, patch);
+        if (patch.paused === true) await store._triggerAsync("task:updated", await store.getTask(id));
+        return updated;
+      });
+    }
+    const results: string[] = [];
+    const stepsAtDeclaration: any[] = [];
+    mockedCreateFnAgent.mockImplementation((async (opts: any) => {
+      const taskDoneTool = (opts.customTools || []).find((tool: any) => tool.name === "fn_task_done");
+      return {
+        session: {
+          prompt: vi.fn().mockImplementation(async () => {
+            if (!taskDoneTool || results.length > 0) return;
+            await store.updateStep(task.id, 0, "done");
+            await store.updateStep(task.id, 1, "in-progress");
+            stepsAtDeclaration.push(...(await store.getTask(task.id)).steps);
+            const result = await taskDoneTool.execute("tool-1", declaration);
+            results.push(result.content[0].text);
+            if (pauseAbort) mockedExistsSync.mockReturnValue(true);
+            if (pauseAbort === "prompt-throws") throw new Error("Request was aborted");
+          }),
+          dispose: vi.fn(),
+          on: vi.fn(),
+          sessionManager: { getLeafId: vi.fn().mockReturnValue("leaf-1") },
+          state: {},
+        },
+      };
+    }) as any);
+
+    const onError = vi.fn();
+    const onComplete = vi.fn();
+    const executor = createRoutingExecutor(store, "/tmp/test", { onError, onComplete });
+    await executor.execute(task as any);
+    const logged = store.logEntry.mock.calls.map(([, message]: [string, string]) => String(message));
+    return { store, executor, results, stepsAtDeclaration, logged, onError, onComplete, live: await store.getTask(task.id) };
+  }
+
+  it("parks a plan-marked decision wait in one implementation session without retrying", async () => {
+    const { store, executor, results, stepsAtDeclaration, logged, onError, onComplete, live } = await runDecisionWaitTask({ decisionGate: true });
+
+    expect(stepsAtDeclaration).toEqual([
+      { name: "Preflight", status: "done" },
+      { name: "Owner decision", status: "in-progress", decisionGate: true },
+    ]);
+    expect(results).toEqual([expect.stringContaining("Task parked waiting for a decision.")]);
+    expect(implementationSessionCount()).toBe(1);
+    expect(live).toMatchObject({
+      status: "blocked",
+      paused: true,
+      pausedReason: "external-block",
+      column: "in-progress",
+      externalBlock: {
+        origin: "human-decision",
+        code: "DECISION_REQUIRED",
+        source: "agent-declaration",
+        report: { question: "Which of options 1-4 should this task implement?" },
+      },
+    });
+    expect(live.externalBlock.autoResume).toBeUndefined();
+    expect(live.steps).toEqual(stepsAtDeclaration);
+    expect(live.worktree).toBe(live.externalBlock.resume.worktree);
+    expect(live.worktree).toEqual(expect.any(String));
+    expect(live.branch).toBe("fusion/fn-001");
+    expect(logged.filter((message: string) => /retrying|requeue/i.test(message))).toEqual([]);
+    expect((executor as any).scheduleInPlaceResume).not.toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+    expect(onComplete).not.toHaveBeenCalled();
+  });
+
+  it("ends execution in one session for a declared fault freeze and keeps its worktree", async () => {
+    const { store, executor, results, logged, live } = await runDecisionWaitTask({ decisionGate: false }, {
+      outcome: "blocked",
+      obstacle: "outside-worktree",
+      reason: "The disk is full, so the test runner cannot start.",
+      externalFailure: { cause: "host-environment", observedError: "ENOSPC: no space left on device, write" },
+    });
+
+    expect(results).toEqual([expect.stringContaining("Task frozen as Blocked")]);
+    expect(implementationSessionCount()).toBe(1);
+    expect(live).toMatchObject({
+      status: "blocked",
+      paused: true,
+      branch: "fusion/fn-001",
+      externalBlock: { origin: "host-environment", code: "ENOSPC" },
+    });
+    expect(live.worktree).toEqual(expect.any(String));
+    expect(live.worktree).toBe(live.externalBlock.resume.worktree);
+    expect(logged.filter((message: string) => /retrying|requeue/i.test(message))).toEqual([]);
+    expect((executor as any).scheduleInPlaceResume).not.toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:ExternalBlock 2026-10-12-08:06:
+  The freeze raises the task pause from inside the session that declared it. The production store publishes that write, and the executor's pause listener aborts the live session.
+  The aborted prompt either returns or throws, and both exits used to run the ordinary pause teardown: one armed an in-place resume, the other removed the worktree.
+  A card frozen by its own session must leave both exits untouched: worktree on disk, binding, branch and steps retained, no resume armed, no further session.
+  */
+  describe.each(["prompt-resolves", "prompt-throws"] as const)("freeze raised in a live session whose aborted %s", (pauseAbort) => {
+    const mockedRemoveWorktree = vi.mocked(removeWorktree);
+    let actualRemoveWorktree: typeof removeWorktree | undefined;
+
+    beforeEach(() => {
+      actualRemoveWorktree = mockedRemoveWorktree.getMockImplementation();
+      mockedRemoveWorktree.mockClear();
+      mockedRemoveWorktree.mockResolvedValue(undefined as never);
+    });
+
+    afterEach(() => {
+      mockedRemoveWorktree.mockImplementation(actualRemoveWorktree!);
+    });
+
+    it.each([
+      ["decision wait", { decisionGate: true }, DECISION_DECLARATION, "human-decision"],
+      ["declared fault", { decisionGate: false }, {
+        outcome: "blocked",
+        obstacle: "outside-worktree",
+        reason: "The disk is full, so the test runner cannot start.",
+        externalFailure: { cause: "host-environment", observedError: "ENOSPC: no space left on device, write" },
+      }, "host-environment"],
+    ] as const)("keeps the %s frozen with its worktree, branch and steps", async (_name, plan, declaration, origin) => {
+      const { store, executor, results, stepsAtDeclaration, logged, onError, onComplete, live } = await runDecisionWaitTask(plan, declaration, pauseAbort);
+
+      expect(results).toHaveLength(1);
+      expect(implementationSessionCount()).toBe(1);
+      expect(live).toMatchObject({ status: "blocked", paused: true, pausedReason: "external-block", column: "in-progress", externalBlock: { origin } });
+      expect(mockedRemoveWorktree).not.toHaveBeenCalled();
+      expect(live.worktree).toEqual(expect.any(String));
+      expect(live.worktree).toBe(live.externalBlock.resume.worktree);
+      expect(live.branch).toBe("fusion/fn-001");
+      expect(live.steps).toEqual(stepsAtDeclaration);
+      expect(logged.filter((message: string) => /Execution paused|retrying|requeue/i.test(message))).toEqual([]);
+      expect((executor as any).scheduleInPlaceResume).not.toHaveBeenCalled();
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(onError).not.toHaveBeenCalled();
+      expect(onComplete).not.toHaveBeenCalled();
+    });
+  });
+
+  it("still refuses a decision wait and retries when the plan has no decision gate", async () => {
+    const { store, results, stepsAtDeclaration, live } = await runDecisionWaitTask({ decisionGate: false });
+
+    expect(stepsAtDeclaration).toEqual([
+      { name: "Preflight", status: "done" },
+      { name: "Owner decision", status: "in-progress" },
+    ]);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toContain("This decision wait is not authorized: the approved plan has no open decision-gate step.");
+    expect(implementationSessionCount()).toBe(4);
+    expect(live.externalBlock).toBeUndefined();
+    expect(live.status).not.toBe("blocked");
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "FN-001",
+      "Agent finished without calling fn_task_done (after 3 retries) — retrying in place with progress preserved (1/3)",
+      undefined,
+      expect.objectContaining({ agentId: "executor" }),
+    );
   });
 
   it("marks task failed in-place once fn_task_done requeue budget is exhausted (FN-7229)", async () => {

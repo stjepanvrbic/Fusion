@@ -59,6 +59,15 @@ describe("getTaskStatusBadgeLabel", () => {
     expect(getTaskStatusBadgeLabel("needs-replan", t, undefined, { externalBlocked: true, recoveryRetryCount: 2 })).toBe("Blocked");
   });
 
+  it("labels a decision wait ahead of Blocked and every other stationary state", () => {
+    expect(getTaskStatusBadgeLabel("blocked", t, undefined, { externalBlocked: true, awaitingDecision: true })).toBe("Awaiting decision");
+    expect(getTaskStatusBadgeLabel("blocked", t, undefined, { externalBlocked: true, awaitingDecision: true, paused: true, recoveryRetryCount: 2 })).toBe("Awaiting decision");
+    expect(getTaskStatusBadgeLabel("blocked", t, "Plan Review", { externalBlocked: true, awaitingDecision: true })).toBe("Awaiting decision");
+    expect(getTaskStatusBadgeLabel("blocked", t, undefined, { externalBlocked: true, awaitingDecision: false })).toBe("Blocked");
+    expect(getTaskStatusBadgeLabel("blocked", t, undefined, { externalBlocked: true })).toBe("Blocked");
+    expect(getTaskStatusBadgeLabel("blocked", t, undefined, { externalBlocked: true, paused: true })).toBe("Blocked");
+  });
+
   it("maps external Blocked to operator copy while waiting states remain distinct", () => {
     expect(getTaskStatusBadgeLabel("blocked", t)).toBe("Blocked");
     expect(getTaskStatusBadgeLabel("contention-hold", t)).toBe("Waiting");

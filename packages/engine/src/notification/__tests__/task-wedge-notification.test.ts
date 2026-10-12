@@ -867,6 +867,115 @@ describe("task wedge notifications", () => {
     await service.stop();
   });
 
+  /*
+  FNXC:DecisionWait 2026-10-12-06:16:
+  A card waiting for an owner decision opens the same mailbox episode as any freeze, but the operator must read a question to answer, not a fault to repair.
+  */
+  describe("decision wait", () => {
+    const QUESTION = "Which of options 1-4 should this task implement?";
+    const UNBLOCK = "Record the chosen option numbers in a task comment, then retry.";
+    const decisionWait = (overrides: Partial<Task> = {}, report: Record<string, unknown> | null = { question: QUESTION, unblockCondition: UNBLOCK }): Partial<Task> => ({
+      status: "blocked", paused: true, pausedReason: "external-block",
+      error: "BLOCKED: human-decision/DECISION_REQUIRED: raw explanation that names a credential failure",
+      externalBlock: {
+        origin: "human-decision", code: "DECISION_REQUIRED", message: "raw explanation that names a credential failure",
+        source: "agent-declaration", blockedAt: "2026-10-12T06:16:00.000Z",
+        resume: { column: "in-progress", currentStep: 1 },
+        ...(report ? { report } : {}),
+      } as Task["externalBlock"],
+      ...overrides,
+    });
+    const fault = (overrides: Partial<Task> = {}): Partial<Task> => ({
+      status: "blocked", paused: true, pausedReason: "external-block", error: "BLOCKED: credentials/CREDENTIALS: Invalid API key",
+      externalBlock: {
+        origin: "credentials", code: "CREDENTIALS", message: "Invalid API key", source: "agent-declaration", blockedAt: "2026-10-12T06:16:00.000Z",
+        resume: { column: "in-progress", currentStep: 1 },
+        report: { verifiedCondition: "The provider rejected the key.", stopReason: "No request can be sent.", unimplementedWork: "Steps 2-4.", unblockCondition: "Replace the key.", question: "Ignored for a fault?" },
+      } as Task["externalBlock"],
+      ...overrides,
+    });
+
+    it("describes the wait by its question and unblock condition", () => {
+      const { task } = fixture();
+
+      expect(describeTaskWedge(task(decisionWait()))).toEqual({
+        reasonKey: "external-block:human-decision:DECISION_REQUIRED",
+        reason: QUESTION,
+        action: UNBLOCK,
+        externalBlockReport: {
+          verifiedCondition: "The plan requires an owner decision that is not recorded on this task.",
+          stopReason: "The task is paused at its decision step with the work done so far preserved.",
+          unimplementedWork: "The steps that depend on the decision were not started.",
+          unblockCondition: UNBLOCK,
+          question: QUESTION,
+        },
+      });
+    });
+
+    it("falls back to decision wording when a stored wait has no report", () => {
+      const { task } = fixture();
+
+      expect(describeTaskWedge(task(decisionWait({}, null)))).toMatchObject({
+        reasonKey: "external-block:human-decision:DECISION_REQUIRED",
+        reason: "The plan requires an owner decision before this task can continue.",
+        action: "Record the decision on the task, then retry.",
+      });
+    });
+
+    it("leaves a fault descriptor on its stop reason, without a question", () => {
+      const { task } = fixture();
+      const descriptor = describeTaskWedge(task(fault()))!;
+
+      expect(descriptor).toMatchObject({ reasonKey: "external-block:credentials:CREDENTIALS", reason: "No request can be sent.", action: "Replace the key." });
+      expect(descriptor.externalBlockReport).not.toHaveProperty("question");
+    });
+
+    it.each([
+      ["user-paused", { userPaused: true }],
+      ["auto-merge off", { autoMerge: false }],
+    ])("opens no decision-wait episode for a %s card, as for a fault", (_label, overrides) => {
+      const { task } = fixture();
+      const waiting = describeTaskWedge(task(decisionWait(overrides)));
+      const faulted = describeTaskWedge(task(fault(overrides)));
+
+      expect(waiting?.reasonKey?.startsWith("external-block:") ?? false).toBe(false);
+      expect(waiting?.externalBlockReport).toBeUndefined();
+      expect(waiting?.reasonKey).toBe(faulted?.reasonKey);
+    });
+
+    it("delivers one message headed as a wait for a decision, built from the sanitized report", async () => {
+      const { store, service, sendMessageOnce, task } = fixture();
+      await service.start();
+      const waiting = task(decisionWait({}, {
+        question: QUESTION,
+        unblockCondition: UNBLOCK,
+        verifiedCondition: "No owner comment is recorded; token=super-secret",
+        unimplementedWork: "Steps 2-8 were not started.",
+      }));
+      store.setLiveTask(waiting);
+      store.emit(waiting);
+      store.emit(waiting);
+      await vi.waitFor(() => expect(sendMessageOnce).toHaveBeenCalledTimes(1));
+      const payload = sendMessageOnce.mock.calls[0]?.[0] as { content: string; metadata: Record<string, unknown> };
+      const lines = payload.content.split("\n");
+
+      expect(lines[0]).toMatch(/^\*\*.+ is waiting for a decision\*\*$/);
+      expect(lines.slice(2, 6)).toEqual([
+        `**Question:** ${QUESTION}`,
+        `**Unblock:** ${UNBLOCK}`,
+        "**Verified:** No owner comment is recorded; token=[REDACTED]",
+        "**Not implemented:** Steps 2-8 were not started.",
+      ]);
+      expect(payload.content).not.toContain("is blocked and needs operator action");
+      expect(payload.content).not.toContain("Why work stopped");
+      expect(payload.content).not.toContain("raw explanation");
+      expect(payload.content).not.toContain("credential");
+      expect(payload.content).not.toContain("super-secret");
+      expect(payload.metadata).toEqual(expect.objectContaining({ taskId: "FN-8501", wedgeReason: "external-block:human-decision:DECISION_REQUIRED" }));
+      await service.stop();
+    });
+  });
+
   it("does NOT resolve on a status-less update while the card sits in the renamed REVIEW lane", async () => {
     const { store, service, sendMessageOnce, task } = fixture(RENAMED_IR);
     await service.start();

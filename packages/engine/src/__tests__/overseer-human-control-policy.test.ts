@@ -47,6 +47,24 @@ describe("evaluateOverseerHumanControl", () => {
     expect(evaluateOverseerHumanControl(task({ status: "blocked" }), settings())).toEqual({ withhold: false });
   });
 
+  it("withholds with reason external-block for a card waiting for an owner decision", () => {
+    const waiting = task({
+      status: "blocked",
+      paused: true,
+      pausedReason: "external-block",
+      externalBlock: {
+        origin: "human-decision",
+        code: "DECISION_REQUIRED",
+        message: "Awaiting the owner's choice among options 1-4.",
+        source: "agent-declaration",
+        blockedAt: "2026-10-12T06:16:00.000Z",
+        resume: { column: "in-progress", currentStep: 1 },
+      },
+    });
+    expect(evaluateOverseerHumanControl(waiting, settings())).toEqual({ withhold: true, reason: "external-block" });
+    expect(evaluateOverseerHumanControl(waiting, settings({ autoMerge: false }))).toEqual({ withhold: true, reason: "external-block" });
+  });
+
   it("withholds with reason user-paused when task.userPaused is true", () => {
     const decision = evaluateOverseerHumanControl(task({ userPaused: true }), settings());
     expect(decision).toEqual({ withhold: true, reason: "user-paused" });

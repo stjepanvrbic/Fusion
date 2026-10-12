@@ -20,6 +20,9 @@ FN-8141 — regression coverage for the honest blocked exit. Asserts the INVARIA
 (4) the ordinary completed outcome is unchanged.
 */
 
+/** The reason stored on KB-147's freeze, verbatim. */
+const KB147_SESSION_14_REASON = "Awaiting the owner's choice among KB-147 options 1-4 (KB-144 recommends 1 with 2). No owner-authored choice is recorded on this card: the task record has no comments or steering messages, the description is the unchanged original, and the only task documents are the planner's plan and the executor's owner-decision-request. The specification forbids choosing for the owner or defaulting to the recommendation, so Steps 2-8 cannot start. This is not a host, network, provider or credential failure and no tool or check is missing. Unblock: an owner comment on KB-147 naming the option numbers (option 3 only with explicit approval of the wider connection budget, option 4 only with sub-variant 4a or 4b).";
+
 function baseTask(overrides: Record<string, unknown> = {}) {
   return {
     id: "FN-8141",
@@ -99,7 +102,13 @@ describe("FN-8141 fn_task_done honest blocked exit", () => {
     const reason = "Les contrôles obligatoires de typecheck (`npm run check`) et de build (`npm run build`) réussissent, mais Vitest ne peut pas démarrer : la commande ciblée complète et une unique spec avec TMPDIR local échouent avant tout test avec `ENOSPC: no space left on device, write`.";
     const { store, tool, getTask } = await setup({ currentStep: 1, effectiveNodeId: "steps#0:step-execute" });
 
-    const result = await tool.execute("id", { outcome: "blocked", obstacle: "outside-worktree", reason, blockedBy: [] });
+    const result = await tool.execute("id", {
+      outcome: "blocked",
+      obstacle: "outside-worktree",
+      reason,
+      externalFailure: { cause: "host-environment", observedError: "ENOSPC: no space left on device, write" },
+      blockedBy: [],
+    });
     const persisted = getTask();
 
     expect(persisted).toMatchObject({
@@ -126,7 +135,8 @@ describe("FN-8141 fn_task_done honest blocked exit", () => {
   it("persists a sanitized four-part report only with an accepted external block", async () => {
     const { tool, getTask } = await setup();
     await tool.execute("id", {
-      outcome: "blocked", obstacle: "outside-worktree", reason: "ENOSPC: no space left on device",
+      outcome: "blocked", obstacle: "outside-worktree", reason: "The disk is full, so the test runner cannot start.",
+      externalFailure: { cause: "host-environment", observedError: "ENOSPC: no space left on device" },
       blockedReport: {
         verifiedCondition: "Session-isolated MCP support was verified unavailable.",
         stopReason: "Persistent configuration was not changed.",
@@ -141,6 +151,118 @@ describe("FN-8141 fn_task_done honest blocked exit", () => {
       unimplementedWork: "Remaining implementation was not performed.",
       unblockCondition: "Provide a supported session-scoped interface.",
     });
+  });
+
+  /*
+  FNXC:ExternalBlock 2026-10-12-06:16:
+  KB-147 session 14 froze as credentials/CREDENTIALS because its explanation denied a credential failure in words.
+  An outside-worktree declaration is classified from its declared evidence only, so this replay must be refused with the task untouched.
+  */
+  it("refuses the KB-147 session-14 replay instead of freezing it as a credentials failure", async () => {
+    const { store, tool, getTask } = await setup();
+    const before = structuredClone(getTask());
+
+    const result = await tool.execute("id", { outcome: "blocked", obstacle: "outside-worktree", reason: KB147_SESSION_14_REASON });
+
+    expect(result.details.error).toContain("This obstacle is not authorized to freeze the card.");
+    expect(result.details.error).toContain("must declare `externalFailure`");
+    expect(result.details.error).toContain("the explanation in `reason` is never classified");
+    expect(result.details.error).toContain("Repair ladder: (1) Resolve it");
+    expect(getTask()).toEqual(before);
+    expect(getTask().externalBlock).toBeUndefined();
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.recordRunAuditEvent).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["credentials", "The work stopped for a reason unrelated to any credential problem."],
+    ["billing", "This is a planning question about billing code, not a billing failure."],
+    ["forbidden", "The specification says choosing for the owner is forbidden."],
+    ["unauthorized", "An unauthorized change to the plan would be needed to continue."],
+    ["a rate limit", "The task is to document the 429 rate limit behavior, and the plan contradicts itself."],
+    ["a host code", "The fixture expects ENOSPC and ECONNRESET strings, and the assertion is wrong."],
+  ])("refuses an outside-worktree declaration whose explanation only mentions %s", async (_label, reason) => {
+    const { store, tool, getTask } = await setup();
+    const before = structuredClone(getTask());
+
+    const result = await tool.execute("id", { outcome: "blocked", obstacle: "outside-worktree", reason });
+
+    expect(result.details.error).toContain("This obstacle is not authorized to freeze the card.");
+    expect(getTask()).toEqual(before);
+    expect(store.updateTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["is blank", { cause: "credentials", observedError: "   " }],
+    ["has no error output", { cause: "credentials" }],
+    ["names a class its error output does not show", { cause: "credentials", observedError: "ENOSPC: no space left on device, write" }],
+    ["names no class", { observedError: "ENOSPC: no space left on device, write" }],
+    ["quotes output that shows no external failure", { cause: "host-environment", observedError: "AssertionError: expected 4 to be 1" }],
+  ])("refuses an outside-worktree declaration whose evidence %s", async (_label, externalFailure) => {
+    const { store, tool, getTask } = await setup();
+    const before = structuredClone(getTask());
+
+    const result = await tool.execute("id", {
+      outcome: "blocked",
+      obstacle: "outside-worktree",
+      reason: "Invalid API key: authentication failed, so the provider rejects every request.",
+      externalFailure,
+    });
+
+    expect(result.details.error).toContain("This obstacle is not authorized to freeze the card.");
+    expect(result.details.error).toContain("must declare `externalFailure`");
+    expect(getTask()).toEqual(before);
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.recordRunAuditEvent).not.toHaveBeenCalled();
+  });
+
+  it("freezes on the quoted error when the explanation is a paraphrase", async () => {
+    const reason = "The GitHub CLI is not signed in, so the release notes cannot be fetched.";
+    const { tool, getTask } = await setup();
+
+    const result = await tool.execute("id", {
+      outcome: "blocked",
+      obstacle: "outside-worktree",
+      reason,
+      externalFailure: { cause: "credentials", observedError: "HTTP 401: Bad credentials (https://api.github.com/graphql)" },
+    });
+
+    expect(result.content[0].text).toContain("frozen as Blocked");
+    expect(getTask()).toMatchObject({
+      status: "blocked",
+      paused: true,
+      pausedReason: "external-block",
+      externalBlock: { origin: "credentials", code: "CREDENTIALS", message: reason, source: "agent-declaration" },
+    });
+  });
+
+  it.each([
+    ["a failing test suite", "Three unit tests fail after my change and I cannot find the cause.", { cause: "host-environment", observedError: "FAIL src/run.test.ts > parks the task\nAssertionError: expected 'failed' to be 'blocked'" }],
+    ["a plan defect", "Step 3 and Step 5 of the plan contradict each other.", undefined],
+    ["a missing interpreter", "The Python regression command cannot run on this host.", { cause: "host-environment", observedError: "bash: python3: command not found" }],
+  ])("still refuses %s declared as an outside-worktree block", async (_label, reason, externalFailure) => {
+    const { store, tool, getTask } = await setup();
+    const before = structuredClone(getTask());
+
+    const result = await tool.execute("id", { outcome: "blocked", obstacle: "outside-worktree", reason, externalFailure });
+
+    expect(result.details.error).toContain("This obstacle is not authorized to freeze the card.");
+    expect(result.details.error).toContain("Repair ladder: (1) Resolve it");
+    expect(getTask()).toEqual(before);
+    expect(store.updateTask).not.toHaveBeenCalled();
+  });
+
+  it("takes the repairable-obstacle hint from the quoted error as well as the explanation", async () => {
+    const { tool } = await setup();
+
+    const result = await tool.execute("id", {
+      outcome: "blocked",
+      obstacle: "outside-worktree",
+      reason: "The Python regression command cannot run on this host.",
+      externalFailure: { cause: "host-environment", observedError: "bash: python3: command not found" },
+    });
+
+    expect(result.details.error).toContain("Detected AI-repairable obstacle hint: missing-tooling.");
   });
 
   it("refuses the FN-243 missing-interpreter declaration without mutating lifecycle state", async () => {
@@ -187,18 +309,27 @@ describe("FN-8141 fn_task_done honest blocked exit", () => {
   });
 
   it.each([
+    ["ENOSPC: no space left on device, write", "host-environment", "ENOSPC"],
     ["ECONNRESET from provider", "network", "ECONNRESET"],
     ["quota exceeded for this billing period", "model-provider", "USAGE_LIMIT"],
+    ["429 Too Many Requests", "model-provider", "RATE_LIMIT"],
     ["invalid api key for provider", "credentials", "CREDENTIALS"],
-  ])("keeps classified %s failures freezable", async (reason, origin, code) => {
+  ])("keeps declared %s failures freezable", async (observedError, origin, code) => {
+    const reason = "The dependency install cannot finish on this host.";
     const { tool, getTask } = await setup();
 
-    await tool.execute("id", { outcome: "blocked", obstacle: "outside-worktree", reason, blockedBy: [] });
+    await tool.execute("id", {
+      outcome: "blocked",
+      obstacle: "outside-worktree",
+      reason,
+      externalFailure: { cause: origin, observedError },
+      blockedBy: [],
+    });
 
     expect(getTask()).toMatchObject({
       status: "blocked",
       paused: true,
-      externalBlock: { origin, code, source: "agent-declaration" },
+      externalBlock: { origin, code, message: reason, source: "agent-declaration" },
     });
   });
 
@@ -209,7 +340,8 @@ describe("FN-8141 fn_task_done honest blocked exit", () => {
     const result = await tool.execute("id", {
       outcome: "blocked",
       obstacle: "outside-worktree",
-      reason: '401 {"type":"authentication_error","message":"Invalid authentication credentials"}',
+      reason: "The provider rejected the request while its credentials were rotating.",
+      externalFailure: { cause: "credentials", observedError: '401 {"type":"authentication_error","message":"Invalid authentication credentials"}' },
       blockedBy: [],
     });
 
@@ -244,7 +376,8 @@ describe("FN-8141 fn_task_done honest blocked exit", () => {
     const result = await tool.execute("id", {
       outcome: "blocked",
       obstacle: "outside-worktree",
-      reason: "ENOSPC: no space left on device, write",
+      reason: "The disk is full, so the test runner cannot start.",
+      externalFailure: { cause: "host-environment", observedError: "ENOSPC: no space left on device, write" },
       blockedBy: ["FN-8145"],
     });
 
@@ -264,7 +397,8 @@ describe("FN-8141 fn_task_done honest blocked exit", () => {
     const result = await tool.execute("id", {
       outcome: "blocked",
       obstacle: "outside-worktree",
-      reason: "ENOSPC: no space left on device, write",
+      reason: "The disk is full, so the test runner cannot start.",
+      externalFailure: { cause: "host-environment", observedError: "ENOSPC: no space left on device, write" },
       blockedBy: ["FN-8145"],
     });
 
@@ -425,7 +559,7 @@ describe("FN-8141 fn_task_done honest blocked exit", () => {
 
     const result = await tool.execute("id", { outcome: "blocked", reason: "requirements contradict each other" });
 
-    expect(result.content[0].text).toContain('"outside-worktree" or "inside-worktree"');
+    expect(result.content[0].text).toContain('"outside-worktree", "inside-worktree", or "decision-required"');
     expect(store.getTask).not.toHaveBeenCalled();
     expect(store.updateTask).not.toHaveBeenCalled();
     expect(store.moveTask).not.toHaveBeenCalled();

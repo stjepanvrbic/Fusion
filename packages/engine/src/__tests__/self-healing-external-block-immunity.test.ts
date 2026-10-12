@@ -10,7 +10,11 @@ import { SelfHealingManager } from "../self-healing.js";
 
 const roots: string[] = [];
 
-function blockedTask(rootDir: string, id: string, column: string): Task {
+type FreezeCause = { origin: "host-environment" | "human-decision"; code: string; message: string };
+const DISK_FULL: FreezeCause = { origin: "host-environment", code: "ENOSPC", message: "no space left on device, write" };
+const DECISION_WAIT: FreezeCause = { origin: "human-decision", code: "DECISION_REQUIRED", message: "Awaiting the owner's choice among options 1-4." };
+
+function blockedTask(rootDir: string, id: string, column: string, cause: FreezeCause = DISK_FULL): Task {
   const worktree = join(rootDir, ".fusion", "worktrees", id.toLowerCase());
   mkdirSync(worktree, { recursive: true });
   const blockedAt = "2026-08-28T00:00:00.000Z";
@@ -20,7 +24,7 @@ function blockedTask(rootDir: string, id: string, column: string): Task {
     description: "Production-shaped external-block recovery fixture",
     column,
     status: "blocked",
-    error: "BLOCKED: host-environment/ENOSPC: no space left on device, write",
+    error: `BLOCKED: ${cause.origin}/${cause.code}: ${cause.message}`,
     paused: true,
     pausedReason: "external-block",
     worktree,
@@ -38,9 +42,7 @@ function blockedTask(rootDir: string, id: string, column: string): Task {
     updatedAt: blockedAt,
     columnMovedAt: blockedAt,
     externalBlock: {
-      origin: "host-environment",
-      code: "ENOSPC",
-      message: "no space left on device, write",
+      ...cause,
       source: "agent-declaration",
       blockedAt,
       resume: {
@@ -163,6 +165,10 @@ describe("external-block self-healing immunity", () => {
       blockedTask(rootDir, "FN-209-HOLD", "todo"),
       blockedTask(rootDir, "FN-209-WIP", "in-progress"),
       blockedTask(rootDir, "FN-209-REVIEW", "in-review"),
+      // A card waiting for an owner decision is human-held in the same way as a fault freeze.
+      blockedTask(rootDir, "FN-209-DECISION-HOLD", "todo", DECISION_WAIT),
+      blockedTask(rootDir, "FN-209-DECISION-WIP", "in-progress", DECISION_WAIT),
+      blockedTask(rootDir, "FN-209-DECISION-REVIEW", "in-review", DECISION_WAIT),
     ];
     const expected = new Map(tasks.map((task) => [task.id, structuredClone(freezeProjection(task))]));
     const store = createStatefulStore(tasks, rootDir);

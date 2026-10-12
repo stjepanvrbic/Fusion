@@ -9,7 +9,17 @@ export type TaskExternalBlockOrigin =
   | "model-provider"
   | "credentials"
   | "network"
-  | "third-party-service";
+  | "third-party-service"
+  | "human-decision";
+
+/*
+FNXC:DecisionWait 2026-10-12-06:16:
+A task whose plan requires a human choice waits as an external-block freeze with its own origin and code, not as a fault.
+It reuses the freeze so every guarantee keyed on `isTaskExternallyBlocked` holds without a second proof: no running-agent slot, retained worktree, branch and steps, overseer and self-healing immunity, the dispatch fence, and operator Retry.
+The code is not transient, so a decision wait never resumes automatically.
+*/
+export const DECISION_WAIT_ORIGIN = "human-decision" as const satisfies TaskExternalBlockOrigin;
+export const DECISION_WAIT_CODE = "DECISION_REQUIRED" as const;
 
 /*
 FNXC:ExternalBlock 2026-08-28-03:48:
@@ -22,6 +32,8 @@ export interface TaskExternalBlockReport {
   stopReason: string;
   unimplementedWork: string;
   unblockCondition: string;
+  /** The question the owner must answer. Present only on a decision wait. */
+  question?: string;
 }
 
 export interface TaskExternalBlock {
@@ -97,7 +109,16 @@ export function externalBlockRetainedCheckout(task: Pick<Task, "worktree" | "ext
 const REPORT_FIELD_MAX_LENGTH = 320;
 const UNSAFE_REPORT_CONTENT = /\b(?:system prompt|tool (?:output|log)|stack trace|\bat \S+ \([^)]*:\d+:\d+\))/i;
 
+const DECISION_WAIT_FALLBACK_REPORT = {
+  verifiedCondition: "The plan requires an owner decision that is not recorded on this task.",
+  stopReason: "The task is paused at its decision step with the work done so far preserved.",
+  unimplementedWork: "The steps that depend on the decision were not started.",
+  unblockCondition: "Record the decision on the task, then retry.",
+  question: "The plan requires an owner decision before this task can continue.",
+} as const satisfies Required<TaskExternalBlockReport>;
+
 function fallbackReport(block: Pick<TaskExternalBlock, "origin" | "code">): TaskExternalBlockReport {
+  if (block.origin === DECISION_WAIT_ORIGIN) return DECISION_WAIT_FALLBACK_REPORT;
   const condition = `${block.origin} limitation (${block.code || "UNCLASSIFIED"})`;
   return {
     verifiedCondition: `Fusion verified an external ${condition}.`,
@@ -118,6 +139,10 @@ function sanitizeReportField(value: unknown, fallback: string): string {
  * External-block reports are the only operator-facing evidence persisted with a freeze. Bound and
  * redact every field here so legacy and new delivery paths cannot serialize prompts, logs, stacks,
  * or credentials while lifecycle writers retain their existing freeze-only authority.
+ *
+ * FNXC:DecisionWait 2026-10-12-06:16:
+ * A decision wait also reports the question the owner must answer, under the same bound and redaction.
+ * Its fallback texts describe a wait for a decision, never an external limitation, and no other origin carries a question.
  */
 export function buildTaskExternalBlockReport(
   block: Pick<TaskExternalBlock, "origin" | "code">,
@@ -129,11 +154,17 @@ export function buildTaskExternalBlockReport(
     stopReason: sanitizeReportField(report?.stopReason, fallback.stopReason),
     unimplementedWork: sanitizeReportField(report?.unimplementedWork, fallback.unimplementedWork),
     unblockCondition: sanitizeReportField(report?.unblockCondition, fallback.unblockCondition),
+    ...(fallback.question === undefined ? {} : { question: sanitizeReportField(report?.question, fallback.question) }),
   };
 }
 
 export function isTaskExternallyBlocked(task: Pick<Task, "status" | "externalBlock">): boolean {
   return task.status === EXTERNAL_BLOCK_STATUS && task.externalBlock !== undefined;
+}
+
+/** True for a freeze that waits for an owner decision rather than for a fault to be repaired. */
+export function isTaskAwaitingDecision(task: Pick<Task, "status" | "externalBlock">): boolean {
+  return isTaskExternallyBlocked(task) && task.externalBlock?.origin === DECISION_WAIT_ORIGIN;
 }
 
 export function formatTaskExternalBlockReason(block: Pick<TaskExternalBlock, "origin" | "code" | "message">): string {

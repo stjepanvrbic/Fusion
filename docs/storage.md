@@ -866,4 +866,8 @@ Recommendation proposal claims use the indexed `findTaskByProposalClaimId` read 
 
 Project task rows persist `external_block` as nullable JSONB. A non-null value records the obstacle origin, code, raw message, source, timestamp, and exact resume coordinates. Legacy/null rows hydrate as `externalBlock: undefined`; lifecycle reset clears the column.
 
+The origin is `host-environment`, `network`, `model-provider`, or `credentials` for a fault, and `human-decision` with code `DECISION_REQUIRED` for a card that waits for an owner decision. The optional `report` object holds four sanitized operator fields (`verifiedCondition`, `stopReason`, `unimplementedWork`, `unblockCondition`) and, for a decision wait only, a `question`. Rows written before `report` or `question` existed hydrate without them, and readers derive conservative text.
+
+Task steps are stored as JSONB on the task row. A step carries `decisionGate: true` when its plan heading has the `(decision-gate)` marker. The attribute needs no migration, and a step without it is an ordinary step.
+
 Project task rows also persist `planning_failure` as nullable JSONB engine-owned planning retry evidence. It is never validated against workflow `fields`; legacy/null rows hydrate as `planningFailure: undefined`, and lifecycle reset clears the column.

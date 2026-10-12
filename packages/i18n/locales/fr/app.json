@@ -8672,7 +8672,10 @@
       "resuming": "Reprise…",
       "retry": "Réessayer",
       "autoResumeScheduled": "Nouvel essai automatique {{attempt}}/{{budget}} à {{time}}",
-      "waitingForSlot": "En attente d'un emplacement d'agent libre…"
+      "waitingForSlot": "En attente d'un emplacement d'agent libre…",
+      "decisionTitle": "En attente d'une décision",
+      "decisionUnblock": "Pour reprendre : {{condition}}",
+      "decisionBadge": "Décision en attente"
     },
     "branch": "Branche",
     "branchMetadata": "Métadonnées de branche",

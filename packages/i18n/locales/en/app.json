@@ -8763,7 +8763,10 @@
       "resuming": "Resuming…",
       "retry": "Retry",
       "autoResumeScheduled": "Automatic retry {{attempt}}/{{budget}} at {{time}}",
-      "waitingForSlot": "Waiting for a free agent slot…"
+      "waitingForSlot": "Waiting for a free agent slot…",
+      "decisionTitle": "Waiting for a decision",
+      "decisionUnblock": "To resume: {{condition}}",
+      "decisionBadge": "Awaiting decision"
     },
     "planApproval": {
       "approve": "Approve",

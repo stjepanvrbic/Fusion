@@ -8671,7 +8671,10 @@
       "resuming": "正在恢复…",
       "retry": "重试",
       "autoResumeScheduled": "自动重试 {{attempt}}/{{budget}}，时间 {{time}}",
-      "waitingForSlot": "正在等待空闲的智能体槽位…"
+      "waitingForSlot": "正在等待空闲的智能体槽位…",
+      "decisionTitle": "等待决定",
+      "decisionUnblock": "恢复条件：{{condition}}",
+      "decisionBadge": "待决定"
     },
     "branch": "分支",
     "branchMetadata": "分支元数据",

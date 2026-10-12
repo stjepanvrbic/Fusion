@@ -173,16 +173,17 @@ export async function parseStepsFromPromptImpl(store: TaskStore, id: string): Pr
     // Step-inversion U12 (KTD-12): delegate to the registry's `step-headings`
     // parser (resolved by id, not a direct import) so the registry path is
     // proven and stays byte-identical to the extracted function. The parser
-    // yields `{ name, dependsOn? }`; re-apply the `pending` status here.
+    // yields `{ name, dependsOn?, decisionGate? }`; re-apply the `pending` status here.
     const parser = getStepParser("step-headings");
     if (!parser) {
       throw new Error("Step parser 'step-headings' is not registered");
     }
-    return parser.parse(content).steps.map((s) =>
-      s.dependsOn
-        ? { name: s.name, status: "pending" as const, dependsOn: s.dependsOn }
-        : { name: s.name, status: "pending" as const },
-    );
+    return parser.parse(content).steps.map((s) => ({
+      name: s.name,
+      status: "pending" as const,
+      ...(s.dependsOn ? { dependsOn: s.dependsOn } : {}),
+      ...(s.decisionGate === true ? { decisionGate: true as const } : {}),
+    }));
 }
 
 export async function parseDependenciesFromPromptImpl(store: TaskStore, id: string): Promise<string[]> {

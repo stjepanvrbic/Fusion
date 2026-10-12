@@ -521,6 +521,7 @@ export {
   parseJsonSteps,
   validateStepDependencies,
   StepDependencyValidationError,
+  StepDecisionGateAnnotationError,
   resolveAuthoredStepHeadingOffset,
   __resetStepParserRegistryForTests,
 } from "./tasks/step-parsers.js";
@@ -1292,10 +1293,14 @@ export {
   RESTART_STAGE_FENCE_REASON,
   planTaskColumnRestart,
 } from "./tasks/task-column-restart.js";
+export { findOpenDecisionGateStep } from "./tasks/decision-gate.js";
 export {
   EXTERNAL_BLOCK_STATUS,
   EXTERNAL_BLOCK_PAUSE_REASON,
+  DECISION_WAIT_ORIGIN,
+  DECISION_WAIT_CODE,
   isTaskExternallyBlocked,
+  isTaskAwaitingDecision,
   buildTaskExternalBlockPatch,
   buildTaskExternalBlockClearPatch,
   buildTaskExternalBlockReport,

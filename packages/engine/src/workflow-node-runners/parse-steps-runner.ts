@@ -147,6 +147,7 @@ export class ParseStepsNodeRunner implements WorkflowNodeRunner {
     const steps: TaskStep[] = parsedSteps.map((s) => {
       const step: TaskStep = { name: s.name, status: "pending" };
       if (Array.isArray(s.dependsOn)) step.dependsOn = s.dependsOn;
+      if (s.decisionGate === true) step.decisionGate = true;
       return step;
     });
     try {

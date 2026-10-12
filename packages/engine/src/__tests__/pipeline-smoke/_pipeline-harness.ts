@@ -91,7 +91,11 @@ class PipelineGraphExecutor extends TaskExecutor {
     await this.executeWorkflowGraph(task);
   }
 
-  async declareExternalObstacle(task: Task, reason: string): Promise<void> {
+  async declareExternalObstacle(
+    task: Task,
+    reason: string,
+    externalFailure: { cause: "host-environment" | "network" | "model-provider" | "credentials"; observedError: string },
+  ): Promise<void> {
     if (!task.worktree) throw new Error(`Pipeline smoke task ${task.id} has no worktree for fn_task_done.`);
     const tool = this.createTaskDoneTool(
       task.id,
@@ -105,6 +109,7 @@ class PipelineGraphExecutor extends TaskExecutor {
       obstacle: "outside-worktree",
       blockedBy: [],
       reason,
+      externalFailure,
     } as never);
     const text = result.content.map((entry) => entry.type === "text" ? entry.text : "").join("\n");
     if (!text.includes("frozen as Blocked")) {
@@ -643,7 +648,8 @@ export class PipelineSmokeHarness {
     });
     await this.wireExecutor().declareExternalObstacle(
       live,
-      "Vitest cannot start: ENOSPC: no space left on device, write",
+      "Vitest cannot start because the disk is full.",
+      { cause: "host-environment", observedError: "ENOSPC: no space left on device, write" },
     );
     await this.requireExternalBlockBinding(task.id, "external obstacle declaration");
     const recordedBase = this.externalBlockBindings.get(task.id)?.baseCommitSha;

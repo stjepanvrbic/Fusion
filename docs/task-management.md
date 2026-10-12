@@ -1002,6 +1002,12 @@ Read that mailbox explanation before acting. After the stated unblock condition 
 
 A Blocked card does not use one of the project's running-agent slots, so other work keeps running while it waits; it still counts toward **Max Worktrees** because it keeps its worktree. Retry resumes the card at once when a running-agent slot is free. When every slot is busy, the card shows **Waiting for a free agent slot…** until one opens, then resumes. A provider rate limit retries automatically after 5, 15, 30, 60, 120, and 120 minutes, at most six times, and the card shows when the next automatic retry runs. Retry still works at any time and resets that automatic budget. Billing, quota, credential, disk, and network blocks wait for you.
 
+### Waiting for a decision
+
+A card can also stop because its plan needs a choice that only you can make. The card is labelled **Waiting for a decision**, with the badge **Awaiting decision**, instead of **Blocked**. The notice on the card and the mailbox message show the question and what you must do to resume, for example recording the chosen option in a task comment. The card keeps its worktree, branch, and completed steps and uses no running-agent slot. Fusion never resumes it automatically.
+
+Answer the question the way the notice asks, then use **Retry**. The task continues from the same step. An agent can stop this way only at a step the approved plan marks as a decision point, so it cannot use the wait to leave work it could repair itself.
+
 ## Reconciling review tasks with a cleaned-up branch
 
 `absent-branch-landed-reconciliation` — an in-review task whose branch was cleaned up can be completed only when an ownership-anchored commit exists on its base branch and the task is not paused, executing, or holding a fresh checkout lease. `fn task reconcile <id>` uses the same liveness and compare-and-set fence as the automatic self-healing sweep; it never fabricates review approval.

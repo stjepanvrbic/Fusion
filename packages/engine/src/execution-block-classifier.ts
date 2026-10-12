@@ -77,6 +77,24 @@ export function classifyExternalObstacle(message: string): ExternalObstacleClass
   return undefined;
 }
 
+/** The failure classes an agent may declare for an outside-worktree block: the origins {@link classifyExternalObstacle} can return. */
+export const DECLARED_EXTERNAL_FAILURE_CAUSES = ["host-environment", "network", "model-provider", "credentials"] as const;
+export type DeclaredExternalFailureCause = (typeof DECLARED_EXTERNAL_FAILURE_CAUSES)[number];
+
+/*
+FNXC:ExternalBlock 2026-10-12-06:16:
+An agent's explanation is prose about the situation, not the failure itself. Classifying it froze a card as credentials/CREDENTIALS because the explanation said "this is not a ... credential failure".
+An agent-declared fault freeze is therefore classified from the declared evidence only: the verbatim error output must classify, and its class must equal the class the agent named. The explanation has no path into this function.
+Session-failure callers keep classifyExternalObstacle, because their input is real error text.
+*/
+export function classifyDeclaredExternalObstacle(
+  declared: { cause?: unknown; observedError?: unknown } | undefined,
+): ExternalObstacleClassification | undefined {
+  if (typeof declared?.observedError !== "string") return undefined;
+  const classified = classifyExternalObstacle(declared.observedError);
+  return classified && classified.origin === declared.cause ? classified : undefined;
+}
+
 export type RepairableObstacleHint = "missing-tooling" | "missing-service";
 
 /**

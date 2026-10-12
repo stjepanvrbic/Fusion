@@ -18,6 +18,8 @@ An obstacle outside a task worktree becomes durable `blocked` state only when th
 
 FN-243 corrected the broader agent-declaration route: `outside-worktree` alone no longer authorizes a freeze. An unclassified cause is returned to the executor without lifecycle mutation to resolve it, substitute a runnable check, or complete achievable work and record the deferred check as non-blocking. Internal defects—code, tests, type errors, merge conflicts, planning gaps, and review revisions—remain owned by the existing AI remediation paths. Dependencies and file overlap remain waiting states.
 
+A later change (2026-10-12) made that route evidence-based and added a second freeze cause. Until then the classifier read the agent's explanation, and an explanation that said "this is not a host, network, provider or credential failure" froze a card as `credentials/CREDENTIALS`. An `outside-worktree` declaration now passes `externalFailure` with the failure class and the verbatim error output, and only that error output is classified. A wait for an owner decision is declared with `obstacle: "decision-required"` at a step the plan marks `(decision-gate)`. It freezes with origin `human-decision`, has no automatic resume, and resumes through operator Retry.
+
 ## Remaining drifts documented, not fixed by FN-209
 
 1. **Multi-repository review stops at the first failing repository.** Location: workspace per-repository review aggregation in the engine workflow review path. Root cause: evaluation short-circuits on the first blocking verdict. Desired behavior: retain a verdict for every modified repository before selecting remediation.

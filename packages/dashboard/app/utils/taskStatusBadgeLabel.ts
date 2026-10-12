@@ -100,6 +100,11 @@ export interface TaskStatusBadgeContext {
   paused?: boolean;
   awaitingApproval?: boolean;
   externalBlocked?: boolean;
+  /**
+   * FNXC:DecisionWait 2026-10-12-06:16:
+   * True for a freeze that waits for an owner decision. Every badge host passes it beside `externalBlocked`, so such a card reads "Awaiting decision" and never the fault label "Blocked".
+   */
+  awaitingDecision?: boolean;
 }
 
 export function getTaskStatusBadgeLabel(
@@ -134,6 +139,7 @@ export function getTaskStatusBadgeLabel(
   wait without exposing an internal error. Explicit stationary controls remain more specific
   than a stale retry counter and are never presented as an automatic recovery.
   */
+  if (context?.awaitingDecision) return t("tasks.externalBlock.decisionBadge", "Awaiting decision");
   if (context?.externalBlocked) return t("tasks.externalBlock.title", "Blocked");
   // Terminal and failure badges retain their explicit lifecycle truth over stale pause/retry metadata.
   const canOverrideLifecycleStatus = status !== "done" && status !== "failed";

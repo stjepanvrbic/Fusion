@@ -91,6 +91,37 @@ describe("parse-steps node handler (U12, KTD-12)", () => {
     ]);
   });
 
+  it("writes the decision-gate attribute from a marked heading and from json-steps", async () => {
+    const headings = makeDeps({
+      readArtifact: async () => "### Step 1: a\n### Step 2 (depends: 1) (decision-gate): choose\n### Step 3: c",
+    });
+    expect((await runParse(parseIr("step-headings"), headings.deps)).outcome).toBe("success");
+    expect(headings.written[0]).toEqual([
+      { name: "a", status: "pending" },
+      { name: "choose", status: "pending", dependsOn: [0], decisionGate: true },
+      { name: "c", status: "pending" },
+    ]);
+
+    const json = makeDeps({
+      readArtifact: async () => JSON.stringify([{ name: "a" }, { name: "choose", decisionGate: true }]),
+    });
+    expect((await runParse(parseIr("json-steps"), json.deps)).outcome).toBe("success");
+    expect(json.written[0]).toEqual([
+      { name: "a", status: "pending" },
+      { name: "choose", status: "pending", decisionGate: true },
+    ]);
+  });
+
+  it("routes a malformed decision-gate marker to parse-error without writing steps", async () => {
+    const { deps, written, audits } = makeDeps({
+      readArtifact: async () => "### Step 1: a\n### Step 2: choose (decision-gate)",
+    });
+    const result = await runParse(parseIr("step-headings", undefined, [{ from: "parse", to: "end", condition: "outcome:parse-error" }]), deps);
+    expect(written).toHaveLength(0);
+    expect(audits.some((entry) => entry.reason === "parse-error" && entry.detail.includes("decision-gate marker"))).toBe(true);
+    expect(result.context["node:parse:value"]).toBe("parse-error");
+  });
+
   it("executes parsing for a legacy zero-based plan with trailing dependency annotations", async () => {
     const { deps, written } = makeDeps({ readArtifact: async () => [
       "### Step 0: Preflight",

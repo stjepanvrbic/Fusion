@@ -86,7 +86,7 @@ If you have just finished a step's work, immediately call \`fn_task_update\` to 
 
 The user is not watching this conversation in real-time. They will read the final result. Asking permission wastes a full retry cycle and may orphan committed work.
 
-If the work genuinely cannot proceed because of a host-resource, network, model-provider, or credential failure, or because a prerequisite Fusion task is incomplete, call \`fn_task_done(outcome="blocked", reason="<concrete blocker + what would unblock it>", blockedBy=["FN-XXXX"])\`. Missing tooling, optional services, and unrunnable commands must be resolved, replaced with a runnable check, or recorded as deferred verification after achievable work completes; they are not blocked exits. A classified external block freezes in place, while task dependencies park failed with no completion claim, preserve worktree/branch/steps, and requeue after the dependency completes. Do NOT mark the remaining steps \`skipped\` and call \`fn_task_done\` to fake completion — that launders a failure into \`done\`. Never write the blocker as plain prose.
+If the work genuinely cannot proceed because of a host-resource, network, model-provider, or credential failure, or because a prerequisite Fusion task is incomplete, call \`fn_task_done(outcome="blocked", reason="<concrete blocker + what would unblock it>", blockedBy=["FN-XXXX"])\`. Missing tooling, optional services, and unrunnable commands must be resolved, replaced with a runnable check, or recorded as deferred verification after achievable work completes; they are not blocked exits. A classified external block freezes in place, while task dependencies park failed with no completion claim, preserve worktree/branch/steps, and requeue after the dependency completes. When the plan marks the current step \`(decision-gate)\` and the human answer it needs is not recorded, call \`fn_task_done(outcome="blocked", obstacle="decision-required", reason="...", decision={ question, unblockCondition })\` once and edit nothing. That exit exists only at such a step. Do NOT mark the remaining steps \`skipped\` and call \`fn_task_done\` to fake completion — that launders a failure into \`done\`. Never write the blocker as plain prose.
 
 ## How to work
 1. Read the PROMPT.md carefully — it contains your mission, steps, file scope, and acceptance criteria
@@ -335,10 +335,11 @@ For bug-class/bug-fix tasks only; feature/docs/non-bug tasks do not need this se
 Keep the project default workflow (usually \`builtin:coding\`) unless the user explicitly requested a specific workflow for this task, or you created that task yourself. When you create a task via \`fn_task_create\`, you may pass \`workflow_id\` after calling \`fn_workflow_list\`; otherwise do not move a task you did not create unless the user asked. Do NOT call \`fn_workflow_select\` or pass \`workflow_id\` for the task being specified just because it seems lightweight. If the user explicitly asks for a workflow change, use \`fn_workflow_list\` then \`fn_workflow_select\` or \`workflow_id\` deliberately and document it.
 
 ## Task Artifact Location
-For forensic, reconciliation, or recovery tasks targeting another task ID, tell agents to inspect the real project root artifacts: \`<rootDir>/.fusion/tasks/{TARGET_ID}/\` for PROMPT.md/task.json/logs/attachments and use \`TaskStore\` APIs for the authoritative PostgreSQL task store. A legacy \`<rootDir>/.fusion/fusion.db\` is migration evidence only. Do not cite non-existent task-local paths under the new task; project root matters.
+For forensic, reconciliation, or recovery tasks targeting another task ID, tell agents to inspect the real project root artifacts: \`<rootDir>/.fusion/tasks/{TARGET_ID}/\` for PROMPT.md/task.json/logs/attachments and use \`TaskStore\` APIs for the authoritative PostgreSQL task store. A legacy \`<rootDir>/.fusion/fusion.db\` is migration evidence only.
 
 ## Decision-only specs
 If the requested outcome is only to decide, route, or coordinate work, include \`**No commits expected:** true\` and make the steps operational routing/coordination only. Examples: \`Decide whether FN-XYZ needs a fix\`; \`Assign ready implementation task to active owner, or record no-route state\`. Do not mark no-commit when wording says \`Investigate FN-XYZ and fix if needed\` or \`Investigate and fix routing if needed\`.
+Head a step needing a human-only choice \`### Step N (decision-gate): Title\`. Never use it to defer repairable work.
 
 ## Safety rules
 - Never kill port 4040; use a random/free port for test servers.
@@ -438,6 +439,12 @@ Follow this structure exactly:
 > independent root; an unannotated step depends on the preceding parsed step. JSON \`depends\` remains
 > a separate 0-based API. Be conservative — only mark a step independent when it truly does not read
 > or modify the prior step's output.
+>
+> Optional: when the request requires a human choice the executor must not make, mark that step
+> \`### Step N (decision-gate): Title\`, after \`(depends: …)\` when both apply. In the step body, state the
+> question, the options, and where the answer is recorded, and say that without a recorded answer the
+> executor declares a decision wait and edits nothing. Never mark a step as a decision gate to defer
+> repairable work such as missing tooling, a failing check, or a plan defect.
 
 ### Step 0: Preflight
 

@@ -8672,7 +8672,10 @@
       "resuming": "Reanudando…",
       "retry": "Reintentar",
       "autoResumeScheduled": "Reintento automático {{attempt}}/{{budget}} a las {{time}}",
-      "waitingForSlot": "Esperando un espacio de agente libre…"
+      "waitingForSlot": "Esperando un espacio de agente libre…",
+      "decisionTitle": "Esperando una decisión",
+      "decisionUnblock": "Para reanudar: {{condition}}",
+      "decisionBadge": "Pendiente de decisión"
     },
     "branch": "Rama",
     "branchMetadata": "Metadatos de rama",

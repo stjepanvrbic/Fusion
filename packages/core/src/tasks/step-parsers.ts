@@ -36,6 +36,8 @@ import { extractPlanSection, locateOriginalDescriptionRegion } from "./original-
 export interface ParsedStep {
   name: string;
   dependsOn?: number[];
+  /** Present only on a step the plan marks as a decision gate. See {@link TaskStep.decisionGate}. */
+  decisionGate?: true;
 }
 
 /** The result of running a step parser over an artifact's content. */
@@ -278,6 +280,51 @@ export function validateStepDependencies(steps: readonly Pick<ParsedStep, "depen
   for (let index = 0; index < steps.length; index++) visit(index, new Set(), visited);
 }
 
+/** A step heading whose `(decision-gate)` marker is misplaced or malformed. */
+export class StepDecisionGateAnnotationError extends Error {
+  readonly heading: string;
+
+  constructor(heading: string) {
+    super(
+      `step heading "${heading}" has a misplaced or malformed decision-gate marker. `
+      + "Write \"### Step N (decision-gate): Title\" or \"### Step N (depends: …) (decision-gate): Title\"",
+    );
+    this.name = "StepDecisionGateAnnotationError";
+    this.heading = heading;
+  }
+}
+
+const DECISION_GATE_MARKER = "(decision-gate)";
+
+/*
+FNXC:DecisionGate 2026-10-12-06:16:
+A plan authorizes an executor's decision wait by marking the step `### Step N (decision-gate): Title`, optionally after a `(depends: …)` prefix.
+The marker is the only authorization the engine accepts, so a misplaced or malformed one fails closed here instead of parsing as an ordinary step: repeated, before `(depends:`, carrying content, or trailing the title.
+The words "decision-gate" elsewhere in a title are plain text.
+Returns the heading with a valid marker removed, so the dependency parsing below sees exactly the heading it always handled.
+*/
+function extractDecisionGateMarker(heading: string): { heading: string; decisionGate: boolean } {
+  const prefix = /^(###\s+Step\s+\d+\s*)((?:\([^)]*\)\s*)*)/.exec(heading);
+  if (!prefix) return { heading, decisionGate: false };
+  const groups = prefix[2].match(/\([^)]*\)/g) ?? [];
+  const mentionsMarker = (group: string): boolean => /^\(\s*decision-gate\b/i.test(group);
+  const title = heading.slice(prefix[0].length);
+  if (!groups.some(mentionsMarker)) {
+    if (/\(decision-gate\)\s*$/i.test(title.replace(/\s+\(depends:[^)]*\)\s*$/, ""))) {
+      throw new StepDecisionGateAnnotationError(heading);
+    }
+    return { heading, decisionGate: false };
+  }
+  const wellFormed = groups[groups.length - 1] === DECISION_GATE_MARKER
+    && groups.filter(mentionsMarker).length === 1
+    && (groups.length === 1 || (groups.length === 2 && /^\(depends:/.test(groups[0])))
+    && title.startsWith(":")
+    && !/\(decision-gate\)\s*$/i.test(title);
+  if (!wellFormed) throw new StepDecisionGateAnnotationError(heading);
+  const leading = groups.length === 2 ? `${groups[0]} ` : "";
+  return { heading: `${prefix[1]}${leading}${title}`, decisionGate: true };
+}
+
 export function parseStepHeadings(content: string): TaskStep[] {
   const annotatedRegex = /^###\s+Step\s+\d+\s*\(depends:\s*([^)]*)\)\s*:\s*([^\n]+)$/;
   const suffixRegex = /^###\s+Step\s+\d+\s*:\s*(.+?)\s+\(depends:\s*([^)]*)\)\s*$/;
@@ -289,15 +336,19 @@ export function parseStepHeadings(content: string): TaskStep[] {
   const pendingDependencies: Array<{ position: number; raw: string; offset: number } | undefined> = [];
 
   for (const entry of matches) {
-    const annotated = annotatedRegex.exec(entry.match);
-    const suffix = suffixRegex.exec(entry.match);
-    const annotations = entry.match.split("(depends:").length - 1;
+    const gate = extractDecisionGateMarker(entry.match);
+    const heading = gate.heading;
+    const annotated = annotatedRegex.exec(heading);
+    const suffix = suffixRegex.exec(heading);
+    const annotations = heading.split("(depends:").length - 1;
     if (annotations > 1 || (annotations > 0 && !annotated && !suffix)
       || (suffix && !unambiguousLegacyLabels)) {
       throw new StepDependencyValidationError({ coordinate: "markdown-position", dependentPosition: steps.length + 1, token: entry.match, reason: "malformed", stepCount: matches.length });
     }
-    const name = annotated?.[2] ?? suffix?.[1] ?? /^###\s+Step\s+\d+[^:]*:\s*(.+)$/m.exec(entry.match)?.[1] ?? "";
-    steps.push({ name: name.trim(), status: "pending" });
+    const name = annotated?.[2] ?? suffix?.[1] ?? /^###\s+Step\s+\d+[^:]*:\s*(.+)$/m.exec(heading)?.[1] ?? "";
+    steps.push(gate.decisionGate
+      ? { name: name.trim(), status: "pending", decisionGate: true }
+      : { name: name.trim(), status: "pending" });
     pendingDependencies.push(annotated
       ? { position: steps.length, raw: annotated[1], offset: 1 }
       : suffix ? { position: steps.length, raw: suffix[2], offset: legacyOffset! } : undefined);
@@ -367,7 +418,7 @@ export function resolveAuthoredStepHeadingOffset(headingNumbers: readonly number
 // ── Built-in: json-steps ──────────────────────────────────────────────────────
 
 /**
- * Parse a JSON document: an array of `{ name: string, depends?: number[] }`.
+ * Parse a JSON document: an array of `{ name: string, depends?: number[], decisionGate?: boolean }`.
  * `depends` values are 0-indexed document indices (deduped, sorted). Omitted
  * `depends` means implicit previous-step dependency; explicit
  * `depends: []` is preserved as no dependencies. Throws a descriptive error on
@@ -418,6 +469,15 @@ export function parseJsonSteps(content: string): StepParseResult {
       step.dependsOn = [...obj.depends] as number[];
     }
 
+    if (obj.decisionGate !== undefined) {
+      if (typeof obj.decisionGate !== "boolean") {
+        throw new Error(
+          `json-steps: step at index ${i} 'decisionGate' must be a boolean; got ${JSON.stringify(obj.decisionGate)}`,
+        );
+      }
+      if (obj.decisionGate) step.decisionGate = true;
+    }
+
     steps.push(step);
   });
 
@@ -436,6 +496,7 @@ const BUILTIN_STEP_PARSERS: StepParser[] = [
       const steps = parseStepHeadings(content).map((s) => {
         const out: ParsedStep = { name: s.name };
         if (Array.isArray(s.dependsOn)) out.dependsOn = s.dependsOn;
+        if (s.decisionGate === true) out.decisionGate = true;
         return out;
       });
       return { steps };

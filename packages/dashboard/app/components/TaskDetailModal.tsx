@@ -26,6 +26,7 @@ import {
   TASK_PRIORITIES,
   PLANNER_OVERSIGHT_LEVELS,
   getErrorMessage,
+  isTaskAwaitingDecision,
 } from "@fusion/core";
 import { resolveEffectivePlannerOversightLevel } from "../../../core/src/workflows/workflow-settings-resolver";
 import { resolveTaskSessionAdvisorEnabled } from "../../../core/src/agents/session-advisor";
@@ -1130,6 +1131,7 @@ export function TaskDetailContent({
       paused: workingTask.paused,
       awaitingApproval: workingTask.status === "awaiting-approval",
       externalBlocked: workingTask.status === "blocked",
+      awaitingDecision: isTaskAwaitingDecision(workingTask),
     });
   const originalTaskPrompt = workingTask.description ?? "";
   const hasOriginalTaskPrompt = originalTaskPrompt.trim().length > 0;

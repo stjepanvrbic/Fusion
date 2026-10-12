@@ -114,6 +114,7 @@ export default interface Resources {
       "hideToolOutput": "Hide tool output",
       "live": "Live",
       "loadMore": "Load More",
+      "loadMoreFailed": "Could not load more messages",
       "loading": "Loading agent logs…",
       "loadingMore": "Loading…",
       "markdown": "Markdown",
@@ -3599,7 +3600,9 @@ export default interface Resources {
       "labelSystem": "System",
       "labelUser": "User: {{id}}",
       "labelYou": "You",
+      "loadMore": "Load more",
       "loadingApproval": "Loading approval…",
+      "loadingMore": "Loading more…",
       "markAllRead": "Mark all read",
       "markAllReadButton": "Mark all read",
       "markAllReadTitle": "Mark all as read",
@@ -3626,6 +3629,7 @@ export default interface Resources {
       "outbox": "Outbox",
       "outboxTab": "Outbox",
       "pending": "Pending",
+      "recommendationNotYetActionable": "These recommendations can be filed as tasks after the source task lands or completes.",
       "recommendationsUnavailable": "Recommendations are no longer available.",
       "recommendationsUnavailableIdsReason": "The source task no longer contains the recommendation IDs from this message. A later completion retry may have replaced them.",
       "recommendationsUnavailableTaskReason": "The source task can no longer be loaded. It may have been deleted or moved out of this project.",
@@ -8141,6 +8145,11 @@ export default interface Resources {
       "cacheRead": "Cache read",
       "cacheWrite": "Cache write",
       "checkoutLink": "checkout {{id}}",
+      "closeAsLanded": {
+        "btn": "Close as landed",
+        "promptMessage": "This card's branch merged to nothing. If you have checked that its work is already on main, give the reason to close it as landed (required, audit-logged):",
+        "success": "Closed {{id}} as already landed"
+      },
       "costTab": {
         "cacheWriteTokens": "Cache write",
         "cachedTokens": "Cached",
@@ -8991,6 +9000,9 @@ export default interface Resources {
       "expand": "Expand",
       "externalBlock": {
         "autoResumeScheduled": "Automatic retry {{attempt}}/{{budget}} at {{time}}",
+        "decisionBadge": "Awaiting decision",
+        "decisionTitle": "Waiting for a decision",
+        "decisionUnblock": "To resume: {{condition}}",
         "explain": "Explain this error",
         "explainPrompt": "Explain this error {{error}} and how to resolve it.",
         "genericMessage": "External obstacle requires operator action",

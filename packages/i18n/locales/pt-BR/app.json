@@ -8691,7 +8691,10 @@
       "resuming": "Retomando…",
       "retry": "Tentar novamente",
       "autoResumeScheduled": "Nova tentativa automática {{attempt}}/{{budget}} às {{time}}",
-      "waitingForSlot": "Aguardando um slot de agente livre…"
+      "waitingForSlot": "Aguardando um slot de agente livre…",
+      "decisionTitle": "Aguardando uma decisão",
+      "decisionUnblock": "Para retomar: {{condition}}",
+      "decisionBadge": "Aguardando decisão"
     },
     "branch": "Branch",
     "branchMetadata": "Metadados do branch",

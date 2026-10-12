@@ -117,7 +117,8 @@ describe("fn_task_done recommendation validation", () => {
     const blocked = await tool.execute("call-required-blocked", {
       outcome: "blocked",
       obstacle: "outside-worktree",
-      reason: "ECONNRESET while waiting for the upstream API contract.",
+      reason: "The upstream API contract cannot be fetched from this host.",
+      externalFailure: { cause: "network", observedError: "read ECONNRESET" },
     });
 
     expect(blocked.content[0].text).toContain("Task frozen as Blocked");
@@ -238,7 +239,8 @@ describe("fn_task_done recommendation validation", () => {
     const blocked = await tool.execute("call-blocked", {
       outcome: "blocked",
       obstacle: "outside-worktree",
-      reason: "ECONNRESET while waiting for the upstream API contract.",
+      reason: "The upstream API contract cannot be fetched from this host.",
+      externalFailure: { cause: "network", observedError: "read ECONNRESET" },
       recommendations: [recommendation],
     });
     expect(blocked.content[0].text).toContain("Task frozen as Blocked");

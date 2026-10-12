@@ -1701,3 +1701,28 @@ One case of the CLI extension suite exceeded the default 5 s test timeout once o
   In the failing run the eight slowest passing cases of the file took 2,420 to 3,945 ms. The sibling case of the same group, `re-points a linked feature to a second delivery task atomically`, took 2,799 ms.
 - **Mechanism:** not measured. The trees under test changed the operator retry path and the review retry counting; the feature link and unlink tools call neither. Cases of this file ran at 2.4 to 3.9 s against the 5 s limit in the same run, so the margin on this host is small. Not measured: host load during the run, and where the case spent its time. The two failures of the 04:09 run cannot be attributed to a case, so they count as no sighting of any named test.
 - **Escalation rule:** a second sighting of this case is an on-sight file-level quarantine in `scripts/lib/test-quarantine.json` with its matching vitest exclude. No widened timeout and no retry.
+
+### Record 2026-10-12: `pipeline-resilience.pipeline.test.ts` scenario S17 on a local Windows host (KB-155, fails on the base tree, owner decision pending)
+
+<!--
+FNXC:TestFlakeRegister 2026-10-12-07:44:
+The pipeline-smoke restart scenario S17 failed in every run on one local Windows host, on the base tree as well as on the branch under verification. The branch did not cause it, and the other five scenarios of the file passed. Quarantine is file-level and would also remove the Linux coverage of S18 to S21, so the failure is recorded here with its data and left for an owner decision.
+-->
+
+- **File:** `packages/engine/src/__tests__/pipeline-smoke/pipeline-resilience.pipeline.test.ts` (not in `scripts/lib/test-quarantine.json` or `scripts/lib/windows-known-failing-tests.json`, and not in the merge gate). CI runs this project in the non-blocking Linux `Pipeline smoke tier` job.
+- **Exact test:** `pipeline smoke: resilience scenarios > S17 runs every Coding Ideas restart stage through one fixture lifecycle`.
+- **Sighting:** five runs on a local Windows 11 host (Node 24.12.0, PostgreSQL 16 in a Docker container reached through a published port, `FUSION_PG_TEST_REQUIRED=1`), with Git long paths enabled for the run as `docs/testing.md` requires on Windows.
+- **Reproduction data** (same host, 2026-10-12 UTC):
+
+  | core and engine sources | selection | result for S17 | wall |
+  |---|---|---|---:|
+  | `bc796fc85` (KB-155 branch) | whole file | failed: `EPERM, Permission denied` from `rmSync` on the `fusion-pipeline-smoke-*` fixture directory during harness dispose. The other five scenarios passed. | 149 s |
+  | `bc796fc85` | S17 only | failed: same `EPERM` | 88 s |
+  | `bc796fc85` | S17 only | failed: same `EPERM` | 91 s |
+  | `a8f710c68` (base) | S17 only | failed: same `EPERM` | 79 s |
+  | `a8f710c68` (base) | S17 only | failed: `W5 quiescence violation: FN-182-S17-execution-2 did not converge` (column `todo`, status `needs-replan`, `parse` node running) | 41 s |
+
+  Without the long-paths setting, S17 and both S19 cases fail with `Filename too long` on both trees. That is the documented Windows prerequisite and counts as no sighting.
+- **Mechanism:** not measured. The `EPERM` is raised when the harness removes the fixture directory, which on Windows means a process still had the directory open. One base-tree run stopped earlier, at the quiescence check. Not measured: which process held the directory, and whether the failure occurs on Linux. No Linux run was made here.
+- **Why it is not quarantined:** the failure reproduces on the base tree, so it is a property of this scenario on this host and not of the change. A quarantine entry excludes the whole file on every platform, and S18 to S21 in the same file passed here and are the pipeline coverage of the external-block freeze.
+- **Escalation rule:** an owner decides between a root-cause fix of the fixture cleanup on Windows and a Windows-only record for this file. No widened timeout and no retry.

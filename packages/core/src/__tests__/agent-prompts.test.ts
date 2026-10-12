@@ -437,6 +437,29 @@ describe("resolveAgentPrompt", () => {
     expect(fastPrompt.split("\n").length).toBeLessThan(120);
   });
 
+  it("tells both planning prompts how to mark a step that needs a human choice", () => {
+    const standard = builtinSeamPrompt("planning");
+    const fast = builtinSeamPrompt("planning-fast");
+
+    for (const prompt of [standard, fast, resolveAgentPrompt("triage")]) {
+      expect(prompt).toContain("`### Step N (decision-gate): Title`");
+      expect(prompt).toMatch(/Never (?:mark a step as a decision gate|use it) to defer\s+(?:> )?repairable work/);
+    }
+    expect(standard).toContain("when the request requires a human choice the executor must not make");
+    expect(standard).toContain("after `(depends: …)` when both apply");
+    expect(standard).toContain("where the answer is recorded");
+    expect(standard).toContain("the\n> executor declares a decision wait and edits nothing");
+    expect(fast).toContain("Head a step needing a human-only choice");
+  });
+
+  it("tells the executor that the decision wait exists only at a plan-marked step", () => {
+    const prompt = resolveAgentPrompt("executor");
+
+    expect(prompt).toContain('obstacle="decision-required"');
+    expect(prompt).toContain("When the plan marks the current step `(decision-gate)`");
+    expect(prompt).toContain("That exit exists only at such a step.");
+  });
+
   it("requires before-to-after transformation summaries across planning prompts", () => {
     const prompts = [
       resolveAgentPrompt("triage"),
