@@ -9,7 +9,6 @@ import {
   __resetIntegrationBranchCacheForTests,
   INTEGRATION_BRANCH_FALLBACK,
   resolveIntegrationBranch,
-  resolveIntegrationBranchSync,
 } from "../../merge/integration-branch.js";
 
 const hasGit = spawnSync("git", ["--version"], { stdio: "pipe" }).status === 0;
@@ -43,19 +42,10 @@ describeIfGit("integration branch resolution (real git, master)", () => {
     return repo;
   }
 
-  /** Resolves through both ladders with no settings branch and returns the two results. */
-  async function resolveBoth(rootDir: string): Promise<{ asyncResolved: string; syncResolved: string }> {
-    const asyncResolved = await resolveIntegrationBranch(rootDir, undefined, { logger: { warn: vi.fn() } });
-    __resetIntegrationBranchCacheForTests();
-    const syncResolved = resolveIntegrationBranchSync(rootDir, undefined, { logger: { warn: vi.fn() } });
-    return { asyncResolved, syncResolved };
+  /** Resolves with no settings branch, so the result comes from git alone. */
+  function resolveWithoutSettings(rootDir: string): Promise<string> {
+    return resolveIntegrationBranch(rootDir, undefined, { logger: { warn: vi.fn() } });
   }
-
-  it("reads origin/HEAD the same through the async and sync ladders", async () => {
-    const repo = setupRepo();
-
-    await expect(resolveBoth(repo)).resolves.toEqual({ asyncResolved: "master", syncResolved: "master" });
-  });
 
   /*
   FNXC:IntegrationBranchReadiness 2026-10-11-22:50:
@@ -68,7 +58,7 @@ describeIfGit("integration branch resolution (real git, master)", () => {
     const expected = selectIntegrationBranch({ localBranches: ["production"], currentBranch: "", remoteBranches: [] });
 
     expect(expected).toEqual({ branch: "production", source: "sole-local" });
-    await expect(resolveBoth(repo)).resolves.toEqual({ asyncResolved: expected?.branch, syncResolved: expected?.branch });
+    await expect(resolveWithoutSettings(repo)).resolves.toBe(expected?.branch);
   });
 
   it("infers the checked-out local branch among several when origin/HEAD is unset", async () => {
@@ -77,7 +67,7 @@ describeIfGit("integration branch resolution (real git, master)", () => {
     const expected = selectIntegrationBranch({ localBranches: ["production", "staging"], currentBranch: "production", remoteBranches: [] });
 
     expect(expected).toEqual({ branch: "production", source: "current-head" });
-    await expect(resolveBoth(repo)).resolves.toEqual({ asyncResolved: expected?.branch, syncResolved: expected?.branch });
+    await expect(resolveWithoutSettings(repo)).resolves.toBe(expected?.branch);
   });
 
   it("infers the only origin remote-tracking branch when no local branch exists", async () => {
@@ -88,26 +78,20 @@ describeIfGit("integration branch resolution (real git, master)", () => {
     const expected = selectIntegrationBranch({ localBranches: [], currentBranch: "", remoteBranches: ["staging"] });
 
     expect(expected).toEqual({ branch: "staging", source: "remote-tracking" });
-    await expect(resolveBoth(repo)).resolves.toEqual({ asyncResolved: expected?.branch, syncResolved: expected?.branch });
+    await expect(resolveWithoutSettings(repo)).resolves.toBe(expected?.branch);
   });
 
   it("falls back to main without throwing outside a repository", async () => {
     const notARepo = mkdtempSync(path.join(os.tmpdir(), "fn-5349-plain-"));
     repos.push(notARepo);
 
-    await expect(resolveBoth(notARepo)).resolves.toEqual({
-      asyncResolved: INTEGRATION_BRANCH_FALLBACK,
-      syncResolved: INTEGRATION_BRANCH_FALLBACK,
-    });
+    await expect(resolveWithoutSettings(notARepo)).resolves.toBe(INTEGRATION_BRANCH_FALLBACK);
   });
 
   it("falls back to main without throwing when the directory does not exist", async () => {
     const missing = path.join(os.tmpdir(), `fn-5349-missing-${process.pid}-${Date.now()}`);
 
-    await expect(resolveBoth(missing)).resolves.toEqual({
-      asyncResolved: INTEGRATION_BRANCH_FALLBACK,
-      syncResolved: INTEGRATION_BRANCH_FALLBACK,
-    });
+    await expect(resolveWithoutSettings(missing)).resolves.toBe(INTEGRATION_BRANCH_FALLBACK);
   });
 
   it("resolves origin/HEAD and respects explicit override", async () => {

@@ -457,7 +457,6 @@ export {
 } from "./merge/merge-trait.js";
 export {
   resolveIntegrationBranch,
-  resolveIntegrationBranchSync,
   __resetIntegrationBranchCacheForTests,
 } from "./merge/integration-branch.js";
 export {

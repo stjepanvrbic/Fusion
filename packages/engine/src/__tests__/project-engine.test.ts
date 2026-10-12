@@ -198,7 +198,6 @@ states remain owned by integration-branch.test.ts; this seam supplies only a sta
 vi.mock("../merge/integration-branch.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../merge/integration-branch.js")>()),
   resolveIntegrationBranch: vi.fn().mockResolvedValue("main"),
-  resolveIntegrationBranchSync: vi.fn().mockReturnValue("main"),
   __resetIntegrationBranchCacheForTests: vi.fn(),
 }));
 

@@ -67,7 +67,6 @@ vi.mock("../merge/merger-ai.js", () => {
 vi.mock("../merge/integration-branch.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../merge/integration-branch.js")>()),
   resolveIntegrationBranch: vi.fn().mockResolvedValue("main"),
-  resolveIntegrationBranchSync: vi.fn().mockReturnValue("main"),
   __resetIntegrationBranchCacheForTests: vi.fn(),
 }));
 

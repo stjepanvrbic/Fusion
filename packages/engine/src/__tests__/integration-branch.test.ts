@@ -1,25 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { selectIntegrationBranch } from "@fusion/core";
 
-const { execMock, execSyncMock, execFileMock, execFileSyncMock } = vi.hoisted(() => ({
+const { execMock, execFileMock } = vi.hoisted(() => ({
   execMock: vi.fn(),
-  execSyncMock: vi.fn(),
   execFileMock: vi.fn(),
-  execFileSyncMock: vi.fn(),
 }));
 
 vi.mock("node:child_process", () => ({
   exec: execMock,
-  execSync: execSyncMock,
   execFile: execFileMock,
-  execFileSync: execFileSyncMock,
 }));
 
 import {
   __resetIntegrationBranchCacheForTests,
   INTEGRATION_BRANCH_FALLBACK,
   resolveIntegrationBranch,
-  resolveIntegrationBranchSync,
 } from "../merge/integration-branch.js";
 
 const ORIGIN_HEAD = ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"];
@@ -52,45 +47,26 @@ function answerAsync(respond: GitResponder): void {
   });
 }
 
-function answerSync(respond: GitResponder): void {
-  execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
-    const answer = respond(args);
-    if (answer instanceof Error) throw answer;
-    return answer;
-  });
-}
-
-function answerBoth(respond: GitResponder): void {
-  answerAsync(respond);
-  answerSync(respond);
-}
-
 const launchedArgs = (mock: typeof execFileMock): string[][] => mock.mock.calls.map((call) => call[1] as string[]);
 
 describe("integration-branch resolver", () => {
   beforeEach(() => {
     __resetIntegrationBranchCacheForTests();
     execMock.mockReset();
-    execSyncMock.mockReset();
     execFileMock.mockReset();
-    execFileSyncMock.mockReset();
     /*
-    FNXC:IntegrationBranchReadiness 2026-10-11-22:48:
-    Branch resolution launches git without a shell, so the shell launchers answer with a failure instead of staying silent.
-    A resolver that reached one would then return its fallback and fail the case's assertion, instead of waiting on a callback that never comes.
+    FNXC:IntegrationBranchReadiness 2026-10-12-02:45:
+    Branch resolution launches git without a shell, so the shell launcher answers with a failure instead of staying silent.
+    A resolver that reached it would then return its fallback and fail the case's assertion, instead of waiting on a callback that never comes.
     */
     execMock.mockImplementation((_command: string, _opts: object, callback: ShellCallback) => {
       callback(new Error("exec must not be reached"), "", "");
       return {};
     });
-    execSyncMock.mockImplementation(() => {
-      throw new Error("execSync must not be reached");
-    });
   });
 
   afterEach(() => {
     expect(execMock).not.toHaveBeenCalled();
-    expect(execSyncMock).not.toHaveBeenCalled();
     __resetIntegrationBranchCacheForTests();
     vi.restoreAllMocks();
   });
@@ -99,20 +75,16 @@ describe("integration-branch resolver", () => {
     const settings = { integrationBranch: " trunk ", baseBranch: "develop" } as any;
 
     expect(await resolveIntegrationBranch("/repo", settings)).toBe("trunk");
-    expect(resolveIntegrationBranchSync("/repo", settings)).toBe("trunk");
 
     expect(execFileMock).not.toHaveBeenCalled();
-    expect(execFileSyncMock).not.toHaveBeenCalled();
   });
 
   it("baseBranch wins over origin/HEAD", async () => {
     const settings = { baseBranch: " develop " } as any;
 
     expect(await resolveIntegrationBranch("/repo", settings)).toBe("develop");
-    expect(resolveIntegrationBranchSync("/repo", settings)).toBe("develop");
 
     expect(execFileMock).not.toHaveBeenCalled();
-    expect(execFileSyncMock).not.toHaveBeenCalled();
   });
 
   it("strips refs/remotes/origin and origin prefixes", async () => {
@@ -141,16 +113,12 @@ describe("integration-branch resolver", () => {
   });
 
   it("reads origin/HEAD with one shell-free git launch and stops there when it is set", async () => {
-    answerBoth(byArgs({ [key(ORIGIN_HEAD)]: "origin/release\n" }));
+    answerAsync(byArgs({ [key(ORIGIN_HEAD)]: "origin/release\n" }));
 
     await expect(resolveIntegrationBranch("/repo", undefined)).resolves.toBe("release");
-    expect(resolveIntegrationBranchSync("/repo-sync", undefined)).toBe("release");
 
     expect(execFileMock.mock.calls).toEqual([
       ["git", ORIGIN_HEAD, { cwd: "/repo", encoding: "utf8", timeout: TIMEOUT_MS, maxBuffer: MAX_BUFFER }, expect.any(Function)],
-    ]);
-    expect(execFileSyncMock.mock.calls).toEqual([
-      ["git", ORIGIN_HEAD, { cwd: "/repo-sync", encoding: "utf8", timeout: TIMEOUT_MS, maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "ignore"] }],
     ]);
   });
 
@@ -181,37 +149,18 @@ describe("integration-branch resolver", () => {
     expect(launched.slice(1)).toEqual(expect.arrayContaining([LOCAL_BRANCHES, CURRENT_HEAD, ORIGIN_BRANCHES]));
   });
 
-  it("launches the synchronous ladder with the same argument lists and bounds", () => {
-    answerSync(byArgs({ [key(LOCAL_BRANCHES)]: "", [key(ORIGIN_BRANCHES)]: "", [key(REMOTES)]: "" }));
-
-    expect(resolveIntegrationBranchSync("/repo", undefined, { logger: { warn: vi.fn() } })).toBe(INTEGRATION_BRANCH_FALLBACK);
-
-    const launched = launchedArgs(execFileSyncMock);
-    expect(launched).toHaveLength(5);
-    expect(launched[0]).toEqual(ORIGIN_HEAD);
-    expect(launched.slice(1, 4)).toEqual(expect.arrayContaining([LOCAL_BRANCHES, CURRENT_HEAD, ORIGIN_BRANCHES]));
-    expect(launched[4]).toEqual(REMOTES);
-    for (const call of execFileSyncMock.mock.calls) {
-      expect(call[0]).toBe("git");
-      expect(call[2]).toEqual({ cwd: "/repo", encoding: "utf8", timeout: TIMEOUT_MS, maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "ignore"] });
-    }
-  });
-
   it("passes each ref prefix as one argument beside an unquoted format argument", async () => {
-    answerBoth(byArgs({ [key(LOCAL_BRANCHES)]: "", [key(ORIGIN_BRANCHES)]: "" }));
+    answerAsync(byArgs({ [key(LOCAL_BRANCHES)]: "", [key(ORIGIN_BRANCHES)]: "" }));
 
     await resolveIntegrationBranch("/repo", undefined, { logger: { warn: vi.fn() } });
-    resolveIntegrationBranchSync("/repo-sync", undefined, { logger: { warn: vi.fn() } });
 
-    for (const launched of [launchedArgs(execFileMock), launchedArgs(execFileSyncMock)]) {
-      const listings = launched.filter((args) => args[0] === "for-each-ref");
-      expect(listings).toHaveLength(2);
-      for (const args of listings) {
-        expect(args).toHaveLength(3);
-        expect(args[1]).toBe("--format=%(refname:short)");
-      }
-      expect(listings.map((args) => args[2]).sort()).toEqual(["refs/heads/", "refs/remotes/origin/"]);
+    const listings = launchedArgs(execFileMock).filter((args) => args[0] === "for-each-ref");
+    expect(listings).toHaveLength(2);
+    for (const args of listings) {
+      expect(args).toHaveLength(3);
+      expect(args[1]).toBe("--format=%(refname:short)");
     }
+    expect(listings.map((args) => args[2]).sort()).toEqual(["refs/heads/", "refs/remotes/origin/"]);
   });
 
   it("falls back to main and warns once per rootDir", async () => {
@@ -299,14 +248,13 @@ describe("integration-branch resolver", () => {
   });
 
   it("drops origin's HEAD entry from the remote-tracking list", async () => {
-    answerBoth(byArgs({
+    answerAsync(byArgs({
       [key(LOCAL_BRANCHES)]: "",
       [key(ORIGIN_BRANCHES)]: "origin/HEAD\norigin/develop\n",
       [key(REMOTES)]: "",
     }));
 
     await expect(resolveIntegrationBranch("/remote-head", undefined, { logger: { warn: vi.fn() } })).resolves.toBe("develop");
-    expect(resolveIntegrationBranchSync("/remote-head-sync", undefined, { logger: { warn: vi.fn() } })).toBe("develop");
   });
 
   it("falls back when every inferred branch is a Fusion sibling", async () => {
@@ -319,8 +267,8 @@ describe("integration-branch resolver", () => {
     await expect(resolveIntegrationBranch("/fusion-only", undefined, { logger: { warn: vi.fn() } })).resolves.toBe(INTEGRATION_BRANCH_FALLBACK);
   });
 
-  it("keeps sync and async inference aligned with the shared selector", async () => {
-    answerBoth(byArgs({
+  it("resolves inference to the branch the shared selector picks", async () => {
+    answerAsync(byArgs({
       [key(LOCAL_BRANCHES)]: "",
       [key(ORIGIN_BRANCHES)]: "origin/develop\n",
       [key(REMOTES)]: "",
@@ -331,33 +279,18 @@ describe("integration-branch resolver", () => {
       remoteBranches: ["develop"],
     });
 
-    const asyncResolved = await resolveIntegrationBranch("/parity", undefined, { logger: { warn: vi.fn() } });
-    const syncResolved = resolveIntegrationBranchSync("/parity-sync", undefined, { logger: { warn: vi.fn() } });
+    const resolved = await resolveIntegrationBranch("/parity", undefined, { logger: { warn: vi.fn() } });
 
     expect(expected).toEqual({ branch: "develop", source: "remote-tracking" });
-    expect(asyncResolved).toBe(expected?.branch);
-    expect(syncResolved).toBe(expected?.branch);
-  });
-
-  it("sync and async variants match", async () => {
-    answerAsync(() => "refs/remotes/origin/master\n");
-    answerSync(() => "origin/master\n");
-
-    const asyncResolved = await resolveIntegrationBranch("/repo", undefined);
-    const syncResolved = resolveIntegrationBranchSync("/repo", undefined);
-
-    expect(syncResolved).toEqual(asyncResolved);
-    expect(syncResolved).toBe("master");
+    expect(resolved).toBe(expected?.branch);
   });
 
   it("swallows git failures and does not throw", async () => {
-    answerBoth(() => new Error("git failed"));
+    answerAsync(() => new Error("git failed"));
     const warn = vi.fn();
 
     await expect(resolveIntegrationBranch("/repo", undefined, { logger: { warn } })).resolves.toBe(INTEGRATION_BRANCH_FALLBACK);
-    expect(resolveIntegrationBranchSync("/repo-sync", undefined, { logger: { warn } })).toBe(INTEGRATION_BRANCH_FALLBACK);
 
     expect(launchedArgs(execFileMock)).toHaveLength(5);
-    expect(launchedArgs(execFileSyncMock)).toHaveLength(5);
   });
 });

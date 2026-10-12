@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { selectIntegrationBranch, type ProjectSettings } from "@fusion/core";
 
 /*
@@ -18,21 +18,6 @@ function runGit(rootDir: string, args: readonly string[]): Promise<string> {
       if (error) reject(error);
       else resolve(stdout);
     });
-  });
-}
-
-/*
-FNXC:EngineProcessRules 2026-10-11-22:50:
-The synchronous branch-inference ladder reaches git through this one call: short fixed plumbing, launched without a shell, bounded by the same timeout and maxBuffer as the async ladder.
-Its argument lists are literals of this module (the ref prefixes included), never caller input. Keep the single call-site allowlist entry in step with this line.
-*/
-function runGitSync(rootDir: string, args: readonly string[]): string {
-  return execFileSync("git", args, {
-    cwd: rootDir,
-    encoding: "utf8",
-    timeout: GIT_TIMEOUT_MS,
-    maxBuffer: GIT_MAX_BUFFER,
-    stdio: ["ignore", "pipe", "ignore"],
   });
 }
 
@@ -103,14 +88,6 @@ async function resolveFromOriginHead(rootDir: string): Promise<string> {
   }
 }
 
-function resolveFromOriginHeadSync(rootDir: string): string {
-  try {
-    return normalize(runGitSync(rootDir, ORIGIN_HEAD_ARGS));
-  } catch {
-    return "";
-  }
-}
-
 function parseRemotes(stdout: string): string[] {
   return [...new Set(stdout
     .split(/\r?\n/)
@@ -126,14 +103,6 @@ async function listGitRemotes(rootDir: string): Promise<string[]> {
   }
 }
 
-function listGitRemotesSync(rootDir: string): string[] {
-  try {
-    return parseRemotes(runGitSync(rootDir, REMOTE_LIST_ARGS));
-  } catch {
-    return [];
-  }
-}
-
 function parseBranchRefs(stdout: string, dropRemoteHead = false): string[] {
   return [...new Set(stdout
     .split(/\r?\n/)
@@ -144,14 +113,6 @@ function parseBranchRefs(stdout: string, dropRemoteHead = false): string[] {
 async function listBranchRefs(rootDir: string, refPrefix: string, dropRemoteHead = false): Promise<string[]> {
   try {
     return parseBranchRefs(await runGit(rootDir, branchRefsArgs(refPrefix)), dropRemoteHead);
-  } catch {
-    return [];
-  }
-}
-
-function listBranchRefsSync(rootDir: string, refPrefix: string, dropRemoteHead = false): string[] {
-  try {
-    return parseBranchRefs(runGitSync(rootDir, branchRefsArgs(refPrefix)), dropRemoteHead);
   } catch {
     return [];
   }
@@ -177,25 +138,9 @@ async function resolveInferredBranch(rootDir: string): Promise<ReturnType<typeof
   });
 }
 
-function resolveInferredBranchSync(rootDir: string): ReturnType<typeof selectIntegrationBranch> {
-  return selectIntegrationBranch({
-    localBranches: listBranchRefsSync(rootDir, "refs/heads/"),
-    currentBranch: resolveCurrentHeadSync(rootDir),
-    remoteBranches: listBranchRefsSync(rootDir, "refs/remotes/origin/", true),
-  });
-}
-
 async function resolveCurrentHead(rootDir: string): Promise<string> {
   try {
     return normalize(await runGit(rootDir, CURRENT_HEAD_ARGS));
-  } catch {
-    return "";
-  }
-}
-
-function resolveCurrentHeadSync(rootDir: string): string {
-  try {
-    return normalize(runGitSync(rootDir, CURRENT_HEAD_ARGS));
   } catch {
     return "";
   }
@@ -214,6 +159,12 @@ function warnInferredBranch(
   logger.warn(`[integration-branch] adopted '${branch}' from ${source} inference instead of falling back to 'main'.`);
 }
 
+/*
+FNXC:IntegrationBranchReadiness 2026-10-12-02:45:
+Branch resolution is asynchronous only, because the engine shares one event loop with every task it runs.
+A synchronous copy of this ladder had no caller and forced every ladder change to be made twice.
+A caller that cannot await must be handed the resolved branch by its own caller instead of resolving it again.
+*/
 export async function resolveIntegrationBranch(
   rootDir: string,
   settings: IntegrationBranchSettings,
@@ -238,34 +189,6 @@ export async function resolveIntegrationBranch(
   }
 
   const remotes = await listGitRemotes(rootDir);
-  warnFallback(rootDir, logger, remotes);
-  return INTEGRATION_BRANCH_FALLBACK;
-}
-
-export function resolveIntegrationBranchSync(
-  rootDir: string,
-  settings: IntegrationBranchSettings,
-  opts: { logger?: Pick<Console, "warn"> } = {},
-): string {
-  const logger = opts.logger ?? console;
-
-  const fromSettings = resolveFromSettings(settings);
-  if (fromSettings.length > 0) {
-    return fromSettings;
-  }
-
-  const fromOrigin = resolveFromOriginHeadSync(rootDir);
-  if (fromOrigin.length > 0) {
-    return fromOrigin;
-  }
-
-  const inferred = resolveInferredBranchSync(rootDir);
-  if (inferred) {
-    warnInferredBranch(rootDir, logger, inferred.branch, inferred.source);
-    return inferred.branch;
-  }
-
-  const remotes = listGitRemotesSync(rootDir);
   warnFallback(rootDir, logger, remotes);
   return INTEGRATION_BRANCH_FALLBACK;
 }
