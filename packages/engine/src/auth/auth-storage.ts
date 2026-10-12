@@ -64,10 +64,16 @@ modify() and queue per resolved auth path before taking the cross-process file l
 prevents same-engine sessions from self-contending while preserving fresh read-modify-merge
 under the lock for independent Fusion processes. The vendored pi-coding-agent synchronous
 lock defect from Runfusion/Fusion#2167 remains a separately tracked upstream follow-up.
+
+FNXC:ProviderAuth 2026-10-12-01:04:
+`update` is the interval of the renewal check that keeps a held lock fresh. proper-lockfile silently clamps it to at least 1 000 ms and at most `stale / 2`, and defaults it to `stale / 2`.
+OAUTH_REFRESH_REQUEST_TIMEOUT_MS must not be a whole multiple of it. At the 15 s default a hung token endpoint released the refresh lock at the instant a renewal check was due, and a check that starts as its lock is released finds the lock directory gone and reports a lock that was released cleanly as lost.
+`stale` equals the value the vendored pi auth backend uses for the same auth.json: holders that disagree on it can both acquire the lock.
 */
 const AUTH_LOCK_OPTIONS = {
   realpath: false,
   stale: 30_000,
+  update: 10_000,
   retries: {
     retries: 10,
     factor: 2,
@@ -91,6 +97,44 @@ function enqueueAuthWrite<T>(authPath: string, write: () => Promise<T>): Promise
   return operation;
 }
 
+/*
+FNXC:ProviderAuth 2026-10-12-01:04:
+Every auth file lock (credential write, OAuth refresh, instance login) is taken here, so a lost lock is handled one way.
+proper-lockfile reports a lost lock from its renewal check, a file-system callback, and its default handler throws there: an uncaught exception that stops the engine instead of a failure the holder can handle. The handler therefore only records the loss.
+A lock lost while held rejects its holder with ECOMPROMISED once the operation resolves; an operation that fails on its own keeps its own error.
+`assertLockHeld` lets a holder refuse a write it has not committed yet: a credential snapshot computed under a lost lock could overwrite a login another process saved in the meantime.
+A lost lock is never released. The library has already dropped it, so release would only answer ERELEASED and mask the outcome, and the lock directory may now belong to another holder.
+A report that arrives after release began is ignored: a renewal check already in flight sees the removed lock directory, but the operation finished under a lock it held.
+*/
+async function withAuthFileLock<T>(
+  lockTarget: string,
+  operation: (assertLockHeld: () => void) => Promise<T>,
+): Promise<T> {
+  let compromise: Error | undefined;
+  let releasing = false;
+  const assertLockHeld = (): void => {
+    if (!compromise) return;
+    throw Object.assign(
+      new Error(`Auth file lock on ${lockTarget} was lost while it was held`, { cause: compromise }),
+      { code: "ECOMPROMISED" },
+    );
+  };
+  const release = await lockfile.lock(lockTarget, {
+    ...AUTH_LOCK_OPTIONS,
+    onCompromised: (error) => {
+      if (!releasing) compromise = error;
+    },
+  });
+  try {
+    const result = await operation(assertLockHeld);
+    assertLockHeld();
+    return result;
+  } finally {
+    releasing = true;
+    if (!compromise) await release();
+  }
+}
+
 async function withOAuthRefreshLock<T>(
   authPath: string,
   providerId: string,
@@ -100,12 +144,7 @@ async function withOAuthRefreshLock<T>(
   // Use a distinct lock target, not authPath with a custom lockfilePath. proper-lockfile
   // tracks held locks by target path internally, so two lock domains sharing authPath
   // would corrupt each other's renewal/release bookkeeping.
-  const release = await lockfile.lock(`${authPath}.${safeProviderId}.refresh`, AUTH_LOCK_OPTIONS);
-  try {
-    return await refresh();
-  } finally {
-    await release();
-  }
+  return withAuthFileLock(`${authPath}.${safeProviderId}.refresh`, refresh);
 }
 
 /*
@@ -120,12 +159,7 @@ async function withOAuthInstanceLoginLock<T>(
   operation: () => Promise<T>,
 ): Promise<T> {
   const safeProviderId = providerId.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const release = await lockfile.lock(`${authPath}.${safeProviderId}.instance-login`, AUTH_LOCK_OPTIONS);
-  try {
-    return await operation();
-  } finally {
-    await release();
-  }
+  return withAuthFileLock(`${authPath}.${safeProviderId}.instance-login`, operation);
 }
 
 type AuthFileData = Record<string, unknown>;
@@ -286,12 +320,12 @@ class FusionFileAuthStorage implements FusionAuthStorage {
   }
   private async withLock<T>(fn: (current: AuthFileData) => Promise<{ result: T; changed: boolean }>): Promise<T> {
     return enqueueAuthWrite(this.authPath, async () => {
-      this.ensureFile(); const release = await lockfile.lock(this.authPath, AUTH_LOCK_OPTIONS);
-      try {
+      this.ensureFile();
+      return withAuthFileLock(this.authPath, async (assertLockHeld) => {
         const current = this.readCurrentForWrite(); const { result, changed } = await fn(current);
-        if (changed) { await writeAuthFileAtomic(this.authPath, JSON.stringify(current, null, 2)); this.data = current; this.fileStamp = this.readFileStamp(); }
+        if (changed) { assertLockHeld(); await writeAuthFileAtomic(this.authPath, JSON.stringify(current, null, 2)); this.data = current; this.fileStamp = this.readFileStamp(); }
         return result;
-      } finally { await release(); }
+      });
     });
   }
   reload(): void {
