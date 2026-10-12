@@ -2531,6 +2531,10 @@ export class ProjectEngine {
    * un-exhausts — e.g. cleared via `clear(taskId)` on terminal transition —
    * clears the dedup entry and may escalate again in a future exhaustion).
    * Best-effort; never throws out of the poll.
+   *
+   * FNXC:PlannerOversight 2026-10-12-00:50:
+   * The poll also releases the entry as soon as the stage reports a decision that is not exhausted (see `pollPlannerOverseer`).
+   * A card that exhausts its budget, recovers, and later stalls again gets a fresh budget from the recovery controller, so its second exhaustion must raise a second escalation instead of being swallowed by the first one's dedup entry.
    */
   private async emitOverseerEscalationDeduped(
     store: TaskStore,
@@ -4093,6 +4097,9 @@ export class ProjectEngine {
             // while the stage remains exhausted across subsequent polls.
             if (decision?.exhausted && decision.watchedStage) {
               await this.emitOverseerEscalationDeduped(store, task.id, decision);
+            } else if (decision?.watchedStage) {
+              // FNXC:PlannerOversight 2026-10-12-00:50: the stage is no longer exhausted, so a later exhaustion is a new event and may escalate again. A null decision (oversight withheld, no snapshot) says nothing about the stage and releases nothing.
+              this.plannerEscalationEmitDedup.delete(`${task.id}::${decision.watchedStage}`);
             }
           }
 

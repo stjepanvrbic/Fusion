@@ -21,6 +21,7 @@ import {acquireMergeQueueLease as acquireMergeQueueLeaseAsync} from "../task-sto
 import {appendTaskStepReport} from "../workflows/task-step-reports.js";
 import {buildStepLedgerReopenLog, evaluateStepLedgerSeal, STEP_LEDGER_REFUSAL_MARKER_PREFIX} from "./step-ledger-seal.js";
 import {validateStepDependencies} from "../tasks/step-parsers.js";
+import {formatStepTransitionLogAction} from "../tasks/step-transition-log.js";
 
 export type StepStartDisposition = "started" | "resumed" | "blocked" | "terminal";
 
@@ -400,7 +401,7 @@ async function mutateStepImpl(store: TaskStore, id: string, stepIndex: number, s
       if (isTransition) {
         task.log.push({
           timestamp: task.updatedAt,
-          action: `Step ${stepIndex} (${task.steps[stepIndex].name}) → ${status}`,
+          action: formatStepTransitionLogAction(stepIndex, task.steps[stepIndex].name, status),
         });
       }
 

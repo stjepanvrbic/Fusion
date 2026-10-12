@@ -533,6 +533,8 @@ export type {
   StepDependencyCoordinate,
   StepDependencyValidationReason,
 } from "./tasks/step-parsers.js";
+export { formatStepTransitionLogAction, parseStepTransitionLogAction } from "./tasks/step-transition-log.js";
+export type { StepTransitionLogAction } from "./tasks/step-transition-log.js";
 export {
   registerDefaultWorkflowHooks,
   __resetDefaultWorkflowHooksForTests,

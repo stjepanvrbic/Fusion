@@ -1593,18 +1593,65 @@ task always reported `signal: "progressing"` regardless of how long it had been 
 `decidePlannerRecovery` always returned `action: "none"`.
 */
 
-The executor stage now detects a stalled/idle non-paused `in-progress` task and reports `signal: "stuck"`
-instead of always `"progressing"`. `PlannerOverseerMonitor#observeTask` accepts an optional
+The executor stage detects a non-paused `in-progress` task that has gone silent and reports `signal: "stuck"`
+instead of `"progressing"`. `PlannerOverseerMonitor#observeTask` accepts an optional
 `{ now?: () => number; executorStuckAfterMs?: number }` (both default: `Date.now` and the declared
 `plannerOverseerExecutorStuckAfterMs` workflow-setting default) and threads them into the still-pure,
-still-never-reads-settings `deriveSignalAndSources`. The staleness input is `task.columnMovedAt ??
-task.updatedAt` (mirroring the existing "age is measured from columnMovedAt when present, otherwise
-updatedAt" convention already used by `stalePausedReviewThresholdMs`/`stalePausedTodoThresholdMs`) — the
-best available store-backed proxy for "last execution activity" at this poll seam, since the live
-in-session `StuckTaskDetector` heartbeat state (`packages/engine/src/stuck-task-detector.ts`) is
-in-memory-only and unavailable here. A missing or unparseable timestamp degrades to `"progressing"`
-(fail-safe — never fabricate a stall). The `stuck` reason buckets inactivity to whole hours so the FN-7577
+still-never-reads-settings `deriveSignalAndSources`.
+
+/*
+FNXC:PlannerOversight 2026-10-12-00:50:
+The stall check measures silence since the last execution activity, not time spent in the lane.
+An execution that outlives the threshold while its agent keeps working is healthy and must never be reported stuck or nudged.
+*/
+
+**What counts as execution activity.** The live in-session `StuckTaskDetector` heartbeat state
+(`packages/engine/src/stuck-task-detector.ts`) is in-memory-only and unavailable at this poll seam, so the
+check reads two durable sources, cheapest first:
+
+1. **Row evidence (no I/O).** The newest valid timestamp among `task.columnMovedAt` and every `task.log`
+   entry that records a step status transition (recognized with `parseStepTransitionLogAction` from
+   `@fusion/core`, the counterpart of the formatter the only writer uses). The lane entry is a floor: a
+   card that just entered the lane is not stale, and evidence from an earlier tenure cannot make it stale.
+2. **Agent-log evidence (one lazy read).** The timestamp of the newest entry in the task's agent log, read
+   through `store.getAgentLogs(taskId, { limit: 1 })`. The working session's tool calls land there,
+   including commit notes and step updates. Any entry counts whatever its `agent` role, because several
+   session writers omit the role.
+
+The agent log is a whole-file synchronous read, so the monitor consults it only for an executor-stage card
+that is neither paused nor failed and whose row evidence is already silent for the threshold. A card with a
+recent step transition costs no extra I/O.
+
+**Why `task.updatedAt` is not an input.** The overseer bumps it with every intervention: its feed line
+(`store.logEntry`), its steering comment (`store.addSteeringComment`), and the executor's relay of that
+comment. Reading it would let the overseer restart its own stall clock. The task log as a whole is excluded
+for the same reason, since those three writes are task-log entries; only the engine-formatted
+step-transition line is accepted. No overseer path writes to the agent log, which is what makes that log safe
+to read back.
+
+**Outcomes.** With threshold `T`:
+
+| Row evidence | Agent log | Signal |
+| --- | --- | --- |
+| No valid timestamp at all | not read | `progressing` (tenure and activity unknown) |
+| Newest timestamp younger than `T` | not read | `progressing` |
+| Silent for at least `T`, monitor has no agent-log seam | not available | `stuck` |
+| Silent for at least `T` | newest entry younger than `T` | `progressing` |
+| Silent for at least `T` | empty, or newest entry also at least `T` old | `stuck` |
+| Silent for at least `T` | read fails, or newest timestamp is unparseable | `progressing`, with a warning |
+
+Unknown is never a stall. A failed agent-log read is logged once per task and not again until a read for
+that task yields usable evidence. The clock is sampled once per observation so the decision that gates the
+agent-log read and the derivation that consumes its result agree. A `paused` card stays `blocked` and a
+`status: "failed"` card stays `failed`; neither triggers an agent-log read. A threshold that is zero,
+negative, or not finite disables the check.
+
+The `stuck` reason buckets inactivity to whole hours, measured from the newest evidence, so the FN-7577
 `stage|signal|reason` feed dedup stays effective (it must never embed an ever-changing millisecond value).
+
+**Limit of the proxy.** A tool call writes an agent-log entry when it starts and another when it ends. A
+single command that runs longer than the threshold therefore reads as silence, so the threshold must exceed
+the longest command the executor is expected to run.
 
 `ProjectEngine.pollPlannerOverseer` resolves `plannerOverseerExecutorStuckAfterMs` from the task's
 already-fetched effective workflow settings (`resolveExecutorStuckAfterMs`, fail-safe default 2 hours) once
@@ -1613,6 +1660,12 @@ passes it into `observeTask`. `decidePlannerRecovery` already mapped executor `s
 (no change needed there); the human-control withhold guard in `evaluateOverseerHumanControl` still runs
 BEFORE any recovery decision, so a stuck-but-user-paused/approval-blocked/autoMerge-off task is still fully
 withheld.
+
+**Recovery after a stall.** `PlannerRecoveryController.tick` drops the `(taskId, stage)` attempt count
+whenever the stage reports `progressing`, `complete`, or `awaiting-human`, so real forward progress
+restores the full recovery budget. The poll releases the stage's escalation-dedup entry at the same moment
+(any decision for the stage that is not exhausted), so a card that exhausts its budget, recovers, and later
+stalls again is nudged again and raises a second escalation.
 
 ### Planner overseer bounded autonomous recovery (FN-7512)
 

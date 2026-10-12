@@ -14,7 +14,10 @@
  * the seam every later planner-oversight subtask reads from.
  */
 
-import { DEFAULT_PLANNER_OVERSEER_EXECUTOR_STUCK_AFTER_MS, type PlannerOversightLevel, type PrInfo, type Task, type TraitFlags } from "@fusion/core";
+import { DEFAULT_PLANNER_OVERSEER_EXECUTOR_STUCK_AFTER_MS, parseStepTransitionLogAction, type AgentLogEntry, type PlannerOversightLevel, type PrInfo, type Task, type TraitFlags } from "@fusion/core";
+import { createLogger, type Logger } from "../logger.js";
+
+const overseerLog = createLogger("planner-overseer");
 
 /*
 FNXC:WorkflowResolvedColumns 2026-07-31-13:40 (fleet — inline fallback arms):
@@ -88,8 +91,9 @@ export type OverseerTaskRef = Pick<
   | "paused"
   | "pausedReason"
   | "workflowTransitionNotification"
-  | "updatedAt"
   | "columnMovedAt"
+  // FNXC:PlannerOversight 2026-10-12-00:50: the executor stall check reads step status transitions from the task log. `updatedAt` is deliberately not picked: see `ExecutorAgentLogActivity`.
+  | "log"
   // FNXC:WorkflowReviewGates 2026-07-26-16:35: the in-review stages (reviewer AND merger) need the
   // pre-merge gate's pending lease to anchor their stall check on when the GATE started, not when
   // the card entered the column. See `reviewGateStallReason`.
@@ -272,11 +276,54 @@ function reviewGateStallReason(
   return `Review gate running for over ${inactiveHours}h with no verdict`;
 }
 
+/*
+FNXC:PlannerOversight 2026-10-12-00:50:
+The executor stall check measures silence since the last execution activity, not time spent in the lane. An execution that outlives the threshold while its agent keeps working is healthy and must never be reported stuck or nudged.
+
+Activity has two durable sources, cheapest first.
+Row evidence (no I/O) is the newest valid timestamp among the lane entry (`columnMovedAt`) and every task-log entry that records a step status transition. The lane entry is a floor: a card that just entered the lane is not stale, and evidence from an earlier tenure cannot make it stale.
+Agent-log evidence is the newest entry of the task's agent log, where the working session's tool calls land, including commit notes and step updates. Any entry counts whatever its agent role, because several session writers omit the role.
+
+`task.updatedAt` and the task log as a whole are deliberately not evidence. The overseer's own feed line, its steering comment, and the executor's relay of that comment each bump the first or land in the second, so reading them would let the overseer restart its own stall clock. No overseer path writes to the agent log, which is what makes that log safe to read back.
+
+Unknown is never a stall: no valid row timestamp, a failed agent-log read, and an unparseable newest agent-log timestamp all report `progressing`.
+
+A single tool call that runs longer than the threshold reads as silence, because its start and its result are the only entries it writes. The threshold must therefore exceed the longest command the executor is expected to run.
+*/
+type ExecutorAgentLogActivity = { kind: "none" } | { kind: "latest"; atMs: number } | { kind: "unknown" };
+
+function newestExecutorRowActivityMs(task: Partial<OverseerTaskRef>): number | undefined {
+  const laneEntryMs = Date.parse(task.columnMovedAt ?? "");
+  let newestMs = Number.isFinite(laneEntryMs) ? laneEntryMs : undefined;
+  for (const entry of task.log ?? []) {
+    const entryMs = Date.parse(entry.timestamp);
+    if (!Number.isFinite(entryMs) || (newestMs !== undefined && entryMs <= newestMs)) continue;
+    if (parseStepTransitionLogAction(entry.action)) newestMs = entryMs;
+  }
+  return newestMs;
+}
+
+/**
+ * The newest row-evidence timestamp when the executor stall check applies and row evidence alone is silent for the threshold.
+ * `undefined` means the row already settles the signal without the agent log: the card is paused or failed, the threshold disables the check, tenure is unknown, or the row shows recent activity.
+ */
+function silentExecutorRowActivityMs(
+  task: Partial<OverseerTaskRef>,
+  stallInput: ExecutorStallSignalInput,
+): number | undefined {
+  if (task.paused === true || task.status === "failed") return undefined;
+  if (!(stallInput.executorStuckAfterMs > 0)) return undefined;
+  const rowActivityAtMs = newestExecutorRowActivityMs(task);
+  if (rowActivityAtMs === undefined) return undefined;
+  return stallInput.now() - rowActivityAtMs >= stallInput.executorStuckAfterMs ? rowActivityAtMs : undefined;
+}
+
 function deriveSignalAndSources(
   taskId: string,
   stage: OverseerWatchedStage,
   task: Partial<OverseerTaskRef>,
   stallInput: ExecutorStallSignalInput,
+  agentLogActivity?: ExecutorAgentLogActivity,
 ): { signal: OverseerObservationSignal; reason: string; sources: OverseerSourceLink[] } {
   switch (stage) {
     case "executor": {
@@ -303,21 +350,15 @@ function deriveSignalAndSources(
         };
       }
 
-      // FNXC:PlannerOversight 2026-07-09-00:00:
-      // FN-7743: a non-paused in-progress task whose executor session has gone
-      // silent (dead/hung agent, no commits/heartbeat) was previously ALWAYS
-      // reported "progressing" forever (FN-7732 symptom) since nothing here
-      // checked staleness. Use `columnMovedAt ?? updatedAt` as the best
-      // available store-backed "last execution activity" proxy at this poll
-      // seam (the live in-session `StuckTaskDetector` heartbeat state is
-      // in-memory-only and not available here). A missing/malformed timestamp
-      // degrades to "progressing" — never fabricate a stall. The reason is
-      // bucketed to whole hours so the FN-7577 `stage|signal|reason` feed dedup
-      // stays effective (it must not embed an ever-changing millisecond value).
-      const activityTimestamp = task.columnMovedAt ?? task.updatedAt;
-      const activityAtMs = activityTimestamp ? Date.parse(activityTimestamp) : NaN;
-      if (Number.isFinite(activityAtMs) && stallInput.executorStuckAfterMs > 0) {
-        const inactiveMs = stallInput.now() - activityAtMs;
+      // FNXC:PlannerOversight 2026-10-12-00:50:
+      // A non-paused card whose executor session has gone silent (dead or hung agent) must not be reported "progressing" forever, so silence for the threshold is "stuck".
+      // `agentLogActivity` is absent when the caller has no agent-log seam; row silence alone then decides.
+      // The reason is bucketed to whole hours, measured from the newest evidence, so the `stage|signal|reason` feed dedup stays effective.
+      const silentRowActivityAtMs = silentExecutorRowActivityMs(task, stallInput);
+      if (silentRowActivityAtMs !== undefined && agentLogActivity?.kind !== "unknown") {
+        const lastActivityAtMs =
+          agentLogActivity?.kind === "latest" ? Math.max(silentRowActivityAtMs, agentLogActivity.atMs) : silentRowActivityAtMs;
+        const inactiveMs = stallInput.now() - lastActivityAtMs;
         if (inactiveMs >= stallInput.executorStuckAfterMs) {
           const inactiveHours = Math.max(1, Math.floor(inactiveMs / 3_600_000));
           return {
@@ -428,13 +469,8 @@ function deriveSignalAndSources(
  *  mirrors `fallback-model-observer.ts`'s `FallbackLogStore` seam. */
 export interface OverseerLogStore {
   logEntry?(taskId: string, action: string): Promise<unknown>;
-  appendAgentLog?(
-    taskId: string,
-    text: string,
-    type: "text" | "thinking" | "tool" | "tool_result" | "tool_error",
-    detail?: string,
-    agent?: string,
-  ): Promise<unknown>;
+  /** Read-only: the newest agent-log entry is execution-activity evidence for the executor stall check. The monitor never writes to the agent log. */
+  getAgentLogs?(taskId: string, options?: { limit?: number }): Promise<ReadonlyArray<Pick<AgentLogEntry, "timestamp">>>;
 }
 
 export interface PlannerOverseerMonitorOptions {
@@ -442,6 +478,7 @@ export interface PlannerOverseerMonitorOptions {
   onObservation?: (observation: OverseerStageObservation) => void | Promise<void>;
   /** Max observations retained per task in the in-memory ring buffer. Default: 20. */
   maxObservationsPerTask?: number;
+  logger?: Logger;
 }
 
 const DEFAULT_MAX_OBSERVATIONS_PER_TASK = 20;
@@ -476,7 +513,17 @@ export class PlannerOverseerMonitor {
   */
   private readonly lastLoggedKey = new Map<string, string>();
 
+  private readonly logger: Logger;
+
+  /*
+  FNXC:PlannerOversight 2026-10-12-00:50:
+  A failed agent-log read must look neither like "no activity" nor like success, so it is warned about.
+  The poll repeats every 45 seconds, so the warning is raised once per task and re-armed only after a read for that task yields usable evidence again.
+  */
+  private readonly agentLogReadWarned = new Set<string>();
+
   constructor(options: PlannerOverseerMonitorOptions = {}) {
+    this.logger = options.logger ?? overseerLog;
     this.store = options.store;
     this.onObservation = options.onObservation;
     this.maxObservationsPerTask = options.maxObservationsPerTask ?? DEFAULT_MAX_OBSERVATIONS_PER_TASK;
@@ -494,6 +541,10 @@ export class PlannerOverseerMonitor {
    * so existing callers keep working unchanged; the poll seam
    * (`project-engine.ts#pollPlannerOverseer`) resolves the real workflow-setting
    * value once per cycle and passes it in explicitly.
+   *
+   * FNXC:PlannerOversight 2026-10-12-00:50:
+   * The agent log is a whole-file read, so it is consulted only for an executor-stage card whose row evidence is already silent for the threshold; a card with a recent step transition costs no extra I/O.
+   * The clock is sampled once per observation: the "is the row silent" decision that gates the read and the derivation that consumes its result must agree, or a card crossing the threshold between two samples would be reported stuck without its agent log ever being read.
    */
   async observeTask(
     task: OverseerTaskRef,
@@ -510,15 +561,22 @@ export class PlannerOverseerMonitor {
         return null;
       }
 
-      const now = options?.now ?? Date.now;
-      const executorStuckAfterMs = options?.executorStuckAfterMs ?? DEFAULT_PLANNER_OVERSEER_EXECUTOR_STUCK_AFTER_MS;
-      const { signal, reason, sources } = deriveSignalAndSources(task.id, stage, task, { now, executorStuckAfterMs });
+      const observedAt = (options?.now ?? Date.now)();
+      const stallInput: ExecutorStallSignalInput = {
+        now: () => observedAt,
+        executorStuckAfterMs: options?.executorStuckAfterMs ?? DEFAULT_PLANNER_OVERSEER_EXECUTOR_STUCK_AFTER_MS,
+      };
+      const agentLogActivity =
+        stage === "executor" && silentExecutorRowActivityMs(task, stallInput) !== undefined
+          ? await this.readNewestAgentLogActivity(task.id)
+          : undefined;
+      const { signal, reason, sources } = deriveSignalAndSources(task.id, stage, task, stallInput, agentLogActivity);
       const observation: OverseerStageObservation = {
         taskId: task.id,
         stage,
         signal,
         oversightLevel: level,
-        observedAt: now(),
+        observedAt,
         reason,
         sources,
       };
@@ -556,6 +614,28 @@ export class PlannerOverseerMonitor {
     }
   }
 
+  private async readNewestAgentLogActivity(taskId: string): Promise<ExecutorAgentLogActivity | undefined> {
+    if (!this.store?.getAgentLogs) return undefined;
+    let failure: string;
+    try {
+      const entries = await this.store.getAgentLogs(taskId, { limit: 1 });
+      const newest = entries[entries.length - 1];
+      const newestAtMs = newest ? Date.parse(newest.timestamp) : undefined;
+      if (newestAtMs === undefined || Number.isFinite(newestAtMs)) {
+        this.agentLogReadWarned.delete(taskId);
+        return newestAtMs === undefined ? { kind: "none" } : { kind: "latest", atMs: newestAtMs };
+      }
+      failure = "the newest entry has an unparseable timestamp";
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    if (!this.agentLogReadWarned.has(taskId)) {
+      this.agentLogReadWarned.add(taskId);
+      this.logger.warn(`agent-log activity read failed for ${taskId}; executor activity is unknown, not reporting a stall: ${failure}`);
+    }
+    return { kind: "unknown" };
+  }
+
   private record(observation: OverseerStageObservation): void {
     const existing = this.observations.get(observation.taskId) ?? [];
     existing.push(observation);
@@ -576,6 +656,7 @@ export class PlannerOverseerMonitor {
     // FNXC:PlannerOversight 2026-07-05-11:00 — drop the feed-dedup key too so a
     // re-run of the same task re-logs its first observation.
     this.lastLoggedKey.delete(taskId);
+    this.agentLogReadWarned.delete(taskId);
   }
 
   /** Task IDs that currently retain at least one recorded observation. Used

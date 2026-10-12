@@ -657,12 +657,17 @@ export const BUILTIN_REVIEW_REVISION_SETTINGS: WorkflowSettingDefinition[] = [
  * staleness detection — it always reported `signal: "progressing"` regardless of
  * inactivity. `plannerOverseerExecutorStuckAfterMs` is the configurable inactivity
  * threshold: once a non-paused in-progress task's last execution activity
- * (`columnMovedAt ?? updatedAt`) is older than this, the executor stage reports
+ * (see the note below) is older than this, the executor stage reports
  * `signal: "stuck"` instead, which already flows through `decidePlannerRecovery`
  * into bounded `inject_guidance` recovery. Default 2 hours (7,200,000ms): long
  * enough that a healthy, actively-working step (the vast majority of which finish
  * well under 2h) is never nagged, short enough to actually recover a task that has
  * gone dark for "hours" (the FN-7732 symptom).
+ *
+ * FNXC:PlannerOversight 2026-10-12-00:50:
+ * Inactivity is silence, not time spent in the lane: an execution that outlives the threshold while its agent keeps working is not stuck.
+ * The last execution activity is the newest step status change or agent-log entry, and never earlier than the moment the task entered the in-progress lane.
+ * A command writes agent-log entries only when it starts and when it ends, so the threshold must exceed the longest single command the executor is expected to run.
  */
 /*
 FNXC:WorkflowOptionalStepCycle 2026-07-26-19:38:
@@ -726,7 +731,7 @@ export const BUILTIN_OVERSIGHT_SETTINGS: WorkflowSettingDefinition[] = [
     type: "number",
     default: DEFAULT_PLANNER_OVERSEER_EXECUTOR_STUCK_AFTER_MS,
     description:
-      "Milliseconds of executor-stage inactivity (no progress since the task's last column move/update) before the planner overseer reports the in-progress task as stuck, triggering bounded autonomous recovery (Autonomous level only). Default 7200000 (2 hours). Set higher to avoid nagging long-running steps; set lower to recover hung executors faster.",
+      "Milliseconds with no execution activity (no step status change and no agent-log entry since the task entered the in-progress lane or last showed activity) before the planner overseer reports the in-progress task as stuck, triggering bounded autonomous recovery (Autonomous level only). Default 7200000 (2 hours). Time spent in progress does not count while the agent keeps working. Must exceed the longest single command the executor is expected to run; set lower to recover hung executors faster.",
   },
   /*
   FNXC:PlannerOversight 2026-07-14-12:00:

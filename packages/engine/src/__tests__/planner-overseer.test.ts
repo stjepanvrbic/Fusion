@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { formatStepTransitionLogAction, type StepStatus, type Task, type TaskLogEntry } from "@fusion/core";
 import {
   OVERSEER_WATCHED_STAGES,
   PlannerOverseerMonitor,
@@ -6,7 +7,7 @@ import {
   type OverseerTaskRef,
 } from "../overseer/planner-overseer.js";
 
-function taskFixture(overrides: Partial<OverseerTaskRef> = {}): OverseerTaskRef {
+function taskFixture(overrides: Partial<Task> = {}): OverseerTaskRef {
   return {
     id: "FN-1000",
     column: "in-progress",
@@ -367,126 +368,358 @@ describe("PlannerOverseerMonitor.observeTask", () => {
   });
 });
 
-// FN-7743: executor-stage stall detection. FN-7732 was a non-paused in-progress
-// task that sat stuck for hours while the overseer always reported
-// `signal: "progressing"` because there was no staleness check. These tests lock
-// the invariant across the enumerated data states: stale (stuck), recent
-// (progressing, unchanged), paused (blocked, unchanged), and missing/malformed
-// timestamp (fail-safe progressing).
-describe("PlannerOverseerMonitor.observeTask — FN-7743 executor stall detection", () => {
-  const THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2h, mirrors the declared setting default
+/*
+FNXC:PlannerOversight 2026-10-12-00:50:
+
+THE INVARIANT: the executor stage is "stuck" only after a full threshold with no execution activity.
+
+Activity is a step status transition recorded in the task log, or any agent-log entry, and never earlier than the lane entry. Time spent in the lane is not silence: a card whose agent keeps working past the threshold is healthy.
+The overseer's own writes (its feed line, its steering comment, the executor's relay of that comment, and the `updatedAt` bumps they cause) are never activity, so the overseer cannot restart its own stall clock.
+Unknown is never a stall: missing or malformed timestamps and a failed agent-log read report "progressing".
+The agent log is a whole-file read, so it is consulted only when row evidence is already silent for the threshold.
+*/
+describe("PlannerOverseerMonitor.observeTask — executor stall detection", () => {
+  const MINUTE = 60 * 1000;
+  const HOUR = 60 * MINUTE;
+  const THRESHOLD_MS = 2 * HOUR; // mirrors the declared setting default
   const NOW = Date.UTC(2026, 6, 9, 12, 0, 0);
+  const observeOptions = { now: () => NOW, executorStuckAfterMs: THRESHOLD_MS };
 
   function isoMsAgo(ms: number): string {
     return new Date(NOW - ms).toISOString();
   }
 
-  it("reports stuck for a non-paused in-progress task whose last activity is older than the threshold", async () => {
-    const monitor = new PlannerOverseerMonitor();
+  function stepTransition(msAgo: number, status: StepStatus = "done"): TaskLogEntry {
+    return { timestamp: isoMsAgo(msAgo), action: formatStepTransitionLogAction(4, "Implementation", status) };
+  }
+
+  function logLine(msAgo: number, action: string): TaskLogEntry {
+    return { timestamp: isoMsAgo(msAgo), action };
+  }
+
+  function agentLogEntry(msAgo: number, agent?: string) {
+    return { timestamp: isoMsAgo(msAgo), taskId: "FN-1000", text: "bash", type: "tool", ...(agent ? { agent } : {}) };
+  }
+
+  function agentLogStore(entries: Array<{ timestamp: string }>) {
+    return { getAgentLogs: vi.fn().mockResolvedValue(entries) };
+  }
+
+  /** Lane entry 3h old, newest step transition 2.5h old: row evidence is silent for the threshold. */
+  function silentRow(overrides: Partial<Task> = {}): OverseerTaskRef {
+    return taskFixture({ columnMovedAt: isoMsAgo(3 * HOUR), log: [stepTransition(2.5 * HOUR)], ...overrides });
+  }
+
+  it("reports progressing, without reading the agent log, when a step changed status seconds ago on a card long past the threshold in the lane", async () => {
+    const store = agentLogStore([]);
+    const monitor = new PlannerOverseerMonitor({ store });
     const task = taskFixture({
-      column: "in-progress",
-      updatedAt: isoMsAgo(THRESHOLD_MS + 60 * 60 * 1000), // 3h idle
+      columnMovedAt: isoMsAgo(THRESHOLD_MS + 8 * 1000),
+      log: [stepTransition(24 * 1000, "done"), stepTransition(24 * 1000, "in-progress")],
     });
 
-    const observation = await monitor.observeTask(task, "autonomous", {
-      now: () => NOW,
-      executorStuckAfterMs: THRESHOLD_MS,
-    });
+    const observation = await monitor.observeTask(task, "autonomous", observeOptions);
+
+    expect(observation?.stage).toBe("executor");
+    expect(observation?.signal).toBe("progressing");
+    expect(store.getAgentLogs).not.toHaveBeenCalled();
+  });
+
+  it.each(["pending", "in-progress", "done", "skipped"] as const)("counts a recent step transition to %s as activity", async (status) => {
+    const monitor = new PlannerOverseerMonitor();
+    const task = taskFixture({ columnMovedAt: isoMsAgo(3 * HOUR), log: [stepTransition(MINUTE, status)] });
+
+    expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("progressing");
+  });
+
+  it("reports stuck from row evidence alone when the monitor has no agent-log seam, measured from the newest evidence", async () => {
+    const monitor = new PlannerOverseerMonitor();
+
+    const observation = await monitor.observeTask(silentRow(), "autonomous", observeOptions);
 
     expect(observation?.signal).toBe("stuck");
     expect(observation?.stage).toBe("executor");
-    expect(observation?.reason).toMatch(/inactive for over \d+h/);
+    // 2.5h since the newest step transition, not 3h since the lane entry.
+    expect(observation?.reason).toBe("Executor stage inactive for over 2h with no execution activity");
   });
 
-  it("prefers columnMovedAt over updatedAt when both are present", async () => {
-    const monitor = new PlannerOverseerMonitor();
-    const task = taskFixture({
-      column: "in-progress",
-      // updatedAt looks fresh, but columnMovedAt (the more specific signal) is stale.
-      updatedAt: isoMsAgo(1000),
-      columnMovedAt: isoMsAgo(THRESHOLD_MS + 60 * 60 * 1000),
-    });
+  it.each([
+    ["tagged with the executor role", "executor"],
+    ["carrying no agent role", undefined],
+  ])("reports progressing when the row is silent but the newest agent-log entry (%s) is recent", async (_label, agent) => {
+    const store = agentLogStore([agentLogEntry(3 * MINUTE, agent)]);
+    const monitor = new PlannerOverseerMonitor({ store });
 
-    const observation = await monitor.observeTask(task, "autonomous", {
-      now: () => NOW,
-      executorStuckAfterMs: THRESHOLD_MS,
-    });
-
-    expect(observation?.signal).toBe("stuck");
-  });
-
-  it("remains progressing for a non-paused in-progress task with recent activity", async () => {
-    const monitor = new PlannerOverseerMonitor();
-    const task = taskFixture({
-      column: "in-progress",
-      updatedAt: isoMsAgo(5 * 60 * 1000), // 5 minutes ago — well under threshold
-    });
-
-    const observation = await monitor.observeTask(task, "autonomous", {
-      now: () => NOW,
-      executorStuckAfterMs: THRESHOLD_MS,
-    });
+    const observation = await monitor.observeTask(silentRow(), "autonomous", observeOptions);
 
     expect(observation?.signal).toBe("progressing");
+    expect(store.getAgentLogs).toHaveBeenCalledTimes(1);
+    expect(store.getAgentLogs).toHaveBeenCalledWith("FN-1000", { limit: 1 });
   });
 
-  it("remains progressing at exactly the threshold boundary minus one ms, and flips to stuck at/after the boundary", async () => {
-    const monitor = new PlannerOverseerMonitor();
-    const justUnder = taskFixture({ column: "in-progress", updatedAt: isoMsAgo(THRESHOLD_MS - 1) });
-    const atThreshold = taskFixture({ column: "in-progress", updatedAt: isoMsAgo(THRESHOLD_MS) });
+  it("reports stuck when the row is silent and the agent log is empty", async () => {
+    const monitor = new PlannerOverseerMonitor({ store: agentLogStore([]) });
 
-    const obsUnder = await monitor.observeTask(justUnder, "autonomous", { now: () => NOW, executorStuckAfterMs: THRESHOLD_MS });
-    expect(obsUnder?.signal).toBe("progressing");
-
-    const obsAt = await monitor.observeTask(atThreshold, "autonomous", { now: () => NOW, executorStuckAfterMs: THRESHOLD_MS });
-    expect(obsAt?.signal).toBe("stuck");
+    expect((await monitor.observeTask(silentRow(), "autonomous", observeOptions))?.signal).toBe("stuck");
   });
 
-  it("still reports blocked (unchanged) for a paused in-progress task even with a stale timestamp", async () => {
-    const monitor = new PlannerOverseerMonitor();
-    const task = taskFixture({
-      column: "in-progress",
-      paused: true,
-      pausedReason: "some-engine-park-reason",
-      updatedAt: isoMsAgo(THRESHOLD_MS + 60 * 60 * 1000),
-    });
+  it("reports stuck when the row is silent and the newest agent-log entry is also older than the threshold", async () => {
+    const monitor = new PlannerOverseerMonitor({ store: agentLogStore([agentLogEntry(2.5 * HOUR)]) });
 
-    const observation = await monitor.observeTask(task, "autonomous", {
-      now: () => NOW,
-      executorStuckAfterMs: THRESHOLD_MS,
-    });
-
-    expect(observation?.signal).toBe("blocked");
+    expect((await monitor.observeTask(silentRow(), "autonomous", observeOptions))?.signal).toBe("stuck");
   });
 
-  it("fails safe to progressing when both updatedAt and columnMovedAt are missing", async () => {
-    const monitor = new PlannerOverseerMonitor();
-    const task = taskFixture({ column: "in-progress", updatedAt: undefined, columnMovedAt: undefined });
+  it("measures the stuck duration from the agent log when it holds the newest evidence", async () => {
+    const monitor = new PlannerOverseerMonitor({ store: agentLogStore([agentLogEntry(2 * HOUR + 10 * MINUTE)]) });
+    const task = taskFixture({ columnMovedAt: isoMsAgo(5 * HOUR) });
 
-    const observation = await monitor.observeTask(task, "autonomous", {
-      now: () => NOW,
-      executorStuckAfterMs: THRESHOLD_MS,
+    const observation = await monitor.observeTask(task, "autonomous", observeOptions);
+
+    expect(observation?.reason).toBe("Executor stage inactive for over 2h with no execution activity");
+  });
+
+  it.each([
+    ["rejects", () => Promise.reject(new Error("agent log unreadable"))],
+    [
+      "throws",
+      () => {
+        throw new Error("agent log unreadable");
+      },
+    ],
+  ])("reports progressing and warns once per task when the agent-log read %s", async (_label, failingRead) => {
+    const store = { getAgentLogs: vi.fn(failingRead as () => Promise<Array<{ timestamp: string }>>) };
+    const logger = { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const monitor = new PlannerOverseerMonitor({ store, logger });
+
+    for (let poll = 0; poll < 3; poll += 1) {
+      const observation = await monitor.observeTask(silentRow(), "autonomous", observeOptions);
+      expect(observation?.signal).toBe("progressing");
+    }
+    expect(store.getAgentLogs).toHaveBeenCalledTimes(3);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][0]).toContain("FN-1000");
+
+    // A read that succeeds re-arms the warning for the next failure.
+    store.getAgentLogs.mockResolvedValueOnce([]);
+    expect((await monitor.observeTask(silentRow(), "autonomous", observeOptions))?.signal).toBe("stuck");
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+
+    expect((await monitor.observeTask(silentRow(), "autonomous", observeOptions))?.signal).toBe("progressing");
+    expect((await monitor.observeTask(silentRow(), "autonomous", observeOptions))?.signal).toBe("progressing");
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("warns separately for each task whose agent-log read fails", async () => {
+    const store = { getAgentLogs: vi.fn().mockRejectedValue(new Error("agent log unreadable")) };
+    const logger = { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const monitor = new PlannerOverseerMonitor({ store, logger });
+
+    await monitor.observeTask(silentRow({ id: "FN-1001" }), "autonomous", observeOptions);
+    await monitor.observeTask(silentRow({ id: "FN-1002" }), "autonomous", observeOptions);
+    await monitor.observeTask(silentRow({ id: "FN-1001" }), "autonomous", observeOptions);
+
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports progressing and warns when the newest agent-log entry has an unparseable timestamp", async () => {
+    const logger = { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const monitor = new PlannerOverseerMonitor({ store: agentLogStore([{ timestamp: "not-a-real-date" }]), logger });
+
+    expect((await monitor.observeTask(silentRow(), "autonomous", observeOptions))?.signal).toBe("progressing");
+    expect((await monitor.observeTask(silentRow(), "autonomous", observeOptions))?.signal).toBe("progressing");
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays stuck after the overseer's own writes land in the task log and bump updatedAt", async () => {
+    const monitor = new PlannerOverseerMonitor({ store: agentLogStore([]) });
+    const task = silentRow({ updatedAt: isoMsAgo(2.5 * HOUR) });
+    const first = await monitor.observeTask(task, "autonomous", observeOptions);
+    expect(first?.signal).toBe("stuck");
+
+    const afterIntervention = silentRow({
+      updatedAt: isoMsAgo(0),
+      log: [
+        stepTransition(2.5 * HOUR),
+        logLine(0, `[planner] stage=executor signal=stuck: ${first?.reason}`),
+        logLine(0, "Comment added by agent"),
+        logLine(0, `Comment received mid-execution: [planner-oversight] Stage "executor" signal "stuck" — injecting steering guidance`),
+      ],
     });
+
+    expect((await monitor.observeTask(afterIntervention, "autonomous", observeOptions))?.signal).toBe("stuck");
+  });
+
+  it("does not count task-log entries other than step transitions as activity", async () => {
+    const monitor = new PlannerOverseerMonitor({ store: agentLogStore([]) });
+    const task = silentRow({
+      log: [
+        stepTransition(2.5 * HOUR),
+        logLine(MINUTE, "queued — concurrency limit reached: 3/3 agents running"),
+        logLine(MINUTE, "Comment added by user"),
+        logLine(MINUTE, "Reset stuck-kill streak (forward progress: step 4 (Implementation) → done)"),
+      ],
+    });
+
+    expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("stuck");
+  });
+
+  it("does not treat a fresh updatedAt as execution activity", async () => {
+    const monitor = new PlannerOverseerMonitor();
+    const task = taskFixture({ updatedAt: isoMsAgo(1000), columnMovedAt: isoMsAgo(3 * HOUR) });
+
+    expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("stuck");
+  });
+
+  describe("without a lane-entry timestamp", () => {
+    it("reports progressing for a recent step transition", async () => {
+      const monitor = new PlannerOverseerMonitor();
+      const task = taskFixture({ columnMovedAt: undefined, log: [stepTransition(MINUTE)] });
+
+      expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("progressing");
+    });
+
+    it("reports stuck when the only evidence is a step transition older than the threshold", async () => {
+      const monitor = new PlannerOverseerMonitor();
+      const task = taskFixture({ columnMovedAt: undefined, log: [stepTransition(3 * HOUR)] });
+
+      const observation = await monitor.observeTask(task, "autonomous", observeOptions);
+
+      expect(observation?.signal).toBe("stuck");
+      expect(observation?.reason).toMatch(/inactive for over 3h/);
+    });
+
+    it("never produces a stall from a stale updatedAt alone", async () => {
+      const store = agentLogStore([]);
+      const monitor = new PlannerOverseerMonitor({ store });
+      const task = taskFixture({ columnMovedAt: undefined, updatedAt: isoMsAgo(3 * HOUR), log: [] });
+
+      expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("progressing");
+      expect(store.getAgentLogs).not.toHaveBeenCalled();
+    });
+
+    it("fails safe to progressing when there is no lane entry and no step transition at all", async () => {
+      const monitor = new PlannerOverseerMonitor();
+      const task = taskFixture({ columnMovedAt: undefined, updatedAt: undefined, log: undefined });
+
+      expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("progressing");
+    });
+  });
+
+  it("fails safe to progressing when the lane-entry timestamp is malformed and nothing else is known", async () => {
+    const monitor = new PlannerOverseerMonitor();
+    const task = taskFixture({ columnMovedAt: "not-a-real-date", updatedAt: isoMsAgo(3 * HOUR) });
+
+    expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("progressing");
+  });
+
+  it("ignores a step transition whose timestamp is malformed", async () => {
+    const monitor = new PlannerOverseerMonitor();
+    const malformed = { ...stepTransition(MINUTE), timestamp: "not-a-real-date" };
+
+    const withoutLaneEntry = taskFixture({ columnMovedAt: undefined, log: [malformed] });
+    expect((await monitor.observeTask(withoutLaneEntry, "autonomous", observeOptions))?.signal).toBe("progressing");
+
+    const withStaleLaneEntry = taskFixture({ columnMovedAt: isoMsAgo(3 * HOUR), log: [malformed] });
+    expect((await monitor.observeTask(withStaleLaneEntry, "autonomous", observeOptions))?.signal).toBe("stuck");
+  });
+
+  it("treats an undefined task log as empty", async () => {
+    const monitor = new PlannerOverseerMonitor();
+    const task = taskFixture({ columnMovedAt: isoMsAgo(3 * HOUR), log: undefined });
+
+    expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("stuck");
+  });
+
+  it("uses the lane entry as a floor when the newest step transition predates it", async () => {
+    const store = agentLogStore([]);
+    const monitor = new PlannerOverseerMonitor({ store });
+    const task = taskFixture({ columnMovedAt: isoMsAgo(5 * MINUTE), log: [stepTransition(6 * HOUR)] });
+
+    expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("progressing");
+    expect(store.getAgentLogs).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the lane entry", (msAgo: number) => taskFixture({ columnMovedAt: isoMsAgo(msAgo) })],
+    ["a step transition", (msAgo: number) => taskFixture({ columnMovedAt: isoMsAgo(6 * HOUR), log: [stepTransition(msAgo)] })],
+  ])("stays progressing one millisecond under the threshold and flips to stuck exactly at it, measured from %s", async (_label, build) => {
+    const monitor = new PlannerOverseerMonitor();
+
+    expect((await monitor.observeTask(build(THRESHOLD_MS - 1), "autonomous", observeOptions))?.signal).toBe("progressing");
+    expect((await monitor.observeTask(build(THRESHOLD_MS), "autonomous", observeOptions))?.signal).toBe("stuck");
+  });
+
+  it("applies the same boundary to agent-log evidence", async () => {
+    const underStore = agentLogStore([agentLogEntry(THRESHOLD_MS - 1)]);
+    const atStore = agentLogStore([agentLogEntry(THRESHOLD_MS)]);
+
+    const under = await new PlannerOverseerMonitor({ store: underStore }).observeTask(silentRow(), "autonomous", observeOptions);
+    const at = await new PlannerOverseerMonitor({ store: atStore }).observeTask(silentRow(), "autonomous", observeOptions);
+
+    expect(under?.signal).toBe("progressing");
+    expect(at?.signal).toBe("stuck");
+  });
+
+  it("samples the clock once, so a card crossing the threshold mid-observation is never reported stuck without its agent log being read", async () => {
+    const store = agentLogStore([agentLogEntry(MINUTE)]);
+    const monitor = new PlannerOverseerMonitor({ store });
+    const task = taskFixture({ columnMovedAt: isoMsAgo(THRESHOLD_MS - 1) });
+    let samples = 0;
+    const advancingClock = () => NOW + samples++ * 10;
+
+    const observation = await monitor.observeTask(task, "autonomous", { now: advancingClock, executorStuckAfterMs: THRESHOLD_MS });
 
     expect(observation?.signal).toBe("progressing");
+    expect(observation?.observedAt).toBe(NOW);
   });
 
-  it("fails safe to progressing when the timestamp is malformed/unparseable", async () => {
-    const monitor = new PlannerOverseerMonitor();
-    const task = taskFixture({ column: "in-progress", updatedAt: "not-a-real-date" });
+  it("still reports blocked for a paused card with stale evidence, without reading the agent log", async () => {
+    const store = agentLogStore([]);
+    const monitor = new PlannerOverseerMonitor({ store });
+    const task = silentRow({ paused: true, pausedReason: "some-engine-park-reason" });
 
-    const observation = await monitor.observeTask(task, "autonomous", {
-      now: () => NOW,
-      executorStuckAfterMs: THRESHOLD_MS,
-    });
+    expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("blocked");
+    expect(store.getAgentLogs).not.toHaveBeenCalled();
+  });
+
+  it("still reports failed for a failed card with stale evidence, without reading the agent log", async () => {
+    const store = agentLogStore([]);
+    const monitor = new PlannerOverseerMonitor({ store });
+    const task = silentRow({ status: "failed" });
+
+    expect((await monitor.observeTask(task, "autonomous", observeOptions))?.signal).toBe("failed");
+    expect(store.getAgentLogs).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["merger", {}],
+    ["reviewer", { reviewState: { items: [], summary: {} } }],
+  ])("never reads the agent log for the in-review %s stage", async (stage, overrides) => {
+    const store = agentLogStore([]);
+    const monitor = new PlannerOverseerMonitor({ store });
+    const task = silentRow({ column: "in-review", ...(overrides as Partial<Task>) });
+
+    const observation = await monitor.observeTask(task, "autonomous", observeOptions);
+
+    expect(observation?.stage).toBe(stage);
+    expect(observation?.signal).toBe("progressing");
+    expect(store.getAgentLogs).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])("runs no stall check when the threshold is %s", async (executorStuckAfterMs) => {
+    const store = agentLogStore([]);
+    const monitor = new PlannerOverseerMonitor({ store });
+
+    const observation = await monitor.observeTask(silentRow(), "autonomous", { now: () => NOW, executorStuckAfterMs });
 
     expect(observation?.signal).toBe("progressing");
+    expect(store.getAgentLogs).not.toHaveBeenCalled();
   });
 
-  it("defaults executorStuckAfterMs to the declared 2h default when options are omitted", async () => {
+  it("defaults the threshold to the declared 2h default when options omit it", async () => {
     const monitor = new PlannerOverseerMonitor();
-    const staleTask = taskFixture({ column: "in-progress", updatedAt: isoMsAgo(3 * 60 * 60 * 1000) });
-    const freshTask = taskFixture({ column: "in-progress", updatedAt: isoMsAgo(60 * 1000) });
+    const staleTask = taskFixture({ columnMovedAt: isoMsAgo(4 * HOUR), log: [stepTransition(3 * HOUR)] });
+    const freshTask = taskFixture({ columnMovedAt: isoMsAgo(4 * HOUR), log: [stepTransition(MINUTE)] });
 
     const staleObs = await monitor.observeTask(staleTask, "autonomous", { now: () => NOW });
     const freshObs = await monitor.observeTask(freshTask, "autonomous", { now: () => NOW });
@@ -495,20 +728,23 @@ describe("PlannerOverseerMonitor.observeTask — FN-7743 executor stall detectio
     expect(freshObs?.signal).toBe("progressing");
   });
 
-  // FN-7577: the dedup key must stay stable within an hour bucket so an ever-
-  // changing millisecond-precise duration in the reason does not defeat dedup.
+  // The feed dedup key must stay stable within an hour bucket so an ever-changing
+  // millisecond-precise duration in the reason does not defeat dedup.
   it("keeps the stuck reason stable within the same inactivity-hour bucket for feed dedup", async () => {
     const store = { logEntry: vi.fn().mockResolvedValue(undefined) };
     const monitor = new PlannerOverseerMonitor({ store });
-    const task = taskFixture({ column: "in-progress", updatedAt: isoMsAgo(THRESHOLD_MS + 5 * 60 * 1000) });
+    const task = taskFixture({
+      columnMovedAt: isoMsAgo(6 * HOUR),
+      log: [stepTransition(THRESHOLD_MS + 5 * MINUTE)],
+    });
 
     // Two polls a few seconds apart within the same inactivity-hour bucket.
     await monitor.observeTask(task, "observe", { now: () => NOW, executorStuckAfterMs: THRESHOLD_MS });
     await monitor.observeTask(task, "observe", { now: () => NOW + 5000, executorStuckAfterMs: THRESHOLD_MS });
     expect(store.logEntry).toHaveBeenCalledTimes(1);
 
-    // An hour-boundary crossing is a real state change — re-logs once.
-    await monitor.observeTask(task, "observe", { now: () => NOW + 60 * 60 * 1000, executorStuckAfterMs: THRESHOLD_MS });
+    // An hour-boundary crossing is a real state change and re-logs once.
+    await monitor.observeTask(task, "observe", { now: () => NOW + HOUR, executorStuckAfterMs: THRESHOLD_MS });
     expect(store.logEntry).toHaveBeenCalledTimes(2);
   });
 });
