@@ -14,7 +14,19 @@ vi.mock("node:child_process", async () => {
   };
   execFn[promisify.custom] = (cmd: string, opts?: any) =>
     execMock(cmd, opts).then((stdout: string) => ({ stdout, stderr: "" }));
-  return { exec: execFn, execSync: vi.fn(), execFile: vi.fn() };
+  /*
+  FNXC:EngineTests 2026-10-11-23:54:
+  Branch resolution launches git through execFile with an argument list, in node's callback form.
+  Answer it from the same responder as command-string launches, so a resolver read settles and a case can still script it by command text.
+  */
+  const execFileFn: any = (file: string, args: readonly string[], opts: any, cb: any) => {
+    execMock([file, ...args].join(" "), opts)
+      .then((stdout: string) => cb?.(null, stdout, ""))
+      .catch((err: Error) => cb?.(err, "", err.message));
+  };
+  execFileFn[promisify.custom] = (file: string, args: readonly string[], opts?: any) =>
+    execMock([file, ...args].join(" "), opts).then((stdout: string) => ({ stdout, stderr: "" }));
+  return { exec: execFn, execSync: vi.fn(), execFile: execFileFn };
 });
 
 import { SelfHealingManager } from "../self-healing.js";

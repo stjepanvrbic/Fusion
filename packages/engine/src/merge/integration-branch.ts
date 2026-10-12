@@ -1,8 +1,48 @@
-import { exec, execSync } from "node:child_process";
-import { promisify } from "node:util";
+import { execFile, execFileSync } from "node:child_process";
 import { selectIntegrationBranch, type ProjectSettings } from "@fusion/core";
 
-const execAsync = promisify(exec);
+/*
+FNXC:IntegrationBranchReadiness 2026-10-11-22:50:
+Every git read in this module launches git directly with an argument list; none goes through a shell.
+A command string costs one extra `cmd.exe` per read on Windows, and this resolver runs at the start of every merge, worktree acquisition and recovery pass.
+It is also wrong on POSIX hosts: `git for-each-ref --format=%(refname:short) <prefix>` as a `/bin/sh` command string is a syntax error at the parenthesis, so both branch lists came back empty there and inference always fell back to `main`.
+The async runner takes node's callback form, so a passthrough mock of `node:child_process` observes the same calls production makes.
+*/
+const GIT_TIMEOUT_MS = 5_000;
+const GIT_MAX_BUFFER = 1024 * 1024;
+
+/** Runs one git command without a shell; resolves its stdout and rejects on a non-zero exit, timeout or spawn failure. */
+function runGit(rootDir: string, args: readonly string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("git", args, { cwd: rootDir, encoding: "utf8", timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+}
+
+/*
+FNXC:EngineProcessRules 2026-10-11-22:50:
+The synchronous branch-inference ladder reaches git through this one call: short fixed plumbing, launched without a shell, bounded by the same timeout and maxBuffer as the async ladder.
+Its argument lists are literals of this module (the ref prefixes included), never caller input. Keep the single call-site allowlist entry in step with this line.
+*/
+function runGitSync(rootDir: string, args: readonly string[]): string {
+  return execFileSync("git", args, {
+    cwd: rootDir,
+    encoding: "utf8",
+    timeout: GIT_TIMEOUT_MS,
+    maxBuffer: GIT_MAX_BUFFER,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+}
+
+const ORIGIN_HEAD_ARGS = ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"] as const;
+const REMOTE_LIST_ARGS = ["remote"] as const;
+const CURRENT_HEAD_ARGS = ["symbolic-ref", "--quiet", "--short", "HEAD"] as const;
+
+function branchRefsArgs(refPrefix: string): string[] {
+  return ["for-each-ref", "--format=%(refname:short)", refPrefix];
+}
 
 export type IntegrationBranchSettings =
   | ProjectSettings
@@ -57,13 +97,7 @@ function resolveFromSettings(settings: IntegrationBranchSettings): string {
 
 async function resolveFromOriginHead(rootDir: string): Promise<string> {
   try {
-    const { stdout } = await execAsync("git symbolic-ref --short refs/remotes/origin/HEAD", {
-      cwd: rootDir,
-      encoding: "utf8",
-      timeout: 5_000,
-      maxBuffer: 1024 * 1024,
-    });
-    return normalize(stdout);
+    return normalize(await runGit(rootDir, ORIGIN_HEAD_ARGS));
   } catch {
     return "";
   }
@@ -71,14 +105,7 @@ async function resolveFromOriginHead(rootDir: string): Promise<string> {
 
 function resolveFromOriginHeadSync(rootDir: string): string {
   try {
-    const stdout = execSync("git symbolic-ref --short refs/remotes/origin/HEAD", {
-      cwd: rootDir,
-      encoding: "utf8",
-      timeout: 5_000,
-      maxBuffer: 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return normalize(stdout);
+    return normalize(runGitSync(rootDir, ORIGIN_HEAD_ARGS));
   } catch {
     return "";
   }
@@ -93,13 +120,7 @@ function parseRemotes(stdout: string): string[] {
 
 async function listGitRemotes(rootDir: string): Promise<string[]> {
   try {
-    const { stdout } = await execAsync("git remote", {
-      cwd: rootDir,
-      encoding: "utf8",
-      timeout: 5_000,
-      maxBuffer: 1024 * 1024,
-    });
-    return parseRemotes(stdout);
+    return parseRemotes(await runGit(rootDir, REMOTE_LIST_ARGS));
   } catch {
     return [];
   }
@@ -107,14 +128,7 @@ async function listGitRemotes(rootDir: string): Promise<string[]> {
 
 function listGitRemotesSync(rootDir: string): string[] {
   try {
-    const stdout = execSync("git remote", {
-      cwd: rootDir,
-      encoding: "utf8",
-      timeout: 5_000,
-      maxBuffer: 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return parseRemotes(stdout);
+    return parseRemotes(runGitSync(rootDir, REMOTE_LIST_ARGS));
   } catch {
     return [];
   }
@@ -129,13 +143,7 @@ function parseBranchRefs(stdout: string, dropRemoteHead = false): string[] {
 
 async function listBranchRefs(rootDir: string, refPrefix: string, dropRemoteHead = false): Promise<string[]> {
   try {
-    const { stdout } = await execAsync(`git for-each-ref --format=%(refname:short) ${refPrefix}`, {
-      cwd: rootDir,
-      encoding: "utf8",
-      timeout: 5_000,
-      maxBuffer: 1024 * 1024,
-    });
-    return parseBranchRefs(stdout, dropRemoteHead);
+    return parseBranchRefs(await runGit(rootDir, branchRefsArgs(refPrefix)), dropRemoteHead);
   } catch {
     return [];
   }
@@ -143,14 +151,7 @@ async function listBranchRefs(rootDir: string, refPrefix: string, dropRemoteHead
 
 function listBranchRefsSync(rootDir: string, refPrefix: string, dropRemoteHead = false): string[] {
   try {
-    const stdout = execSync(`git for-each-ref --format=%(refname:short) ${refPrefix}`, {
-      cwd: rootDir,
-      encoding: "utf8",
-      timeout: 5_000,
-      maxBuffer: 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return parseBranchRefs(stdout, dropRemoteHead);
+    return parseBranchRefs(runGitSync(rootDir, branchRefsArgs(refPrefix)), dropRemoteHead);
   } catch {
     return [];
   }
@@ -176,12 +177,6 @@ async function resolveInferredBranch(rootDir: string): Promise<ReturnType<typeof
   });
 }
 
-/*
-FNXC:EngineProcessRules 2026-09-09-07:17:
-The synchronous branch-inference ladder uses only audited short git plumbing. Its execSync calls
-have explicit timeout/maxBuffer bounds, and refPrefix comes only from this module's fixed local and
-origin ref literals; retain their call-site allowlist entries when editing this fallback path.
-*/
 function resolveInferredBranchSync(rootDir: string): ReturnType<typeof selectIntegrationBranch> {
   return selectIntegrationBranch({
     localBranches: listBranchRefsSync(rootDir, "refs/heads/"),
@@ -192,13 +187,7 @@ function resolveInferredBranchSync(rootDir: string): ReturnType<typeof selectInt
 
 async function resolveCurrentHead(rootDir: string): Promise<string> {
   try {
-    const { stdout } = await execAsync("git symbolic-ref --quiet --short HEAD", {
-      cwd: rootDir,
-      encoding: "utf8",
-      timeout: 5_000,
-      maxBuffer: 1024 * 1024,
-    });
-    return normalize(stdout);
+    return normalize(await runGit(rootDir, CURRENT_HEAD_ARGS));
   } catch {
     return "";
   }
@@ -206,14 +195,7 @@ async function resolveCurrentHead(rootDir: string): Promise<string> {
 
 function resolveCurrentHeadSync(rootDir: string): string {
   try {
-    const stdout = execSync("git symbolic-ref --quiet --short HEAD", {
-      cwd: rootDir,
-      encoding: "utf8",
-      timeout: 5_000,
-      maxBuffer: 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return normalize(stdout);
+    return normalize(runGitSync(rootDir, CURRENT_HEAD_ARGS));
   } catch {
     return "";
   }

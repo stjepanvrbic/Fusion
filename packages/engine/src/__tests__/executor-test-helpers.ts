@@ -473,7 +473,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { findWorktreeUser } from "../merger.js";
 import { StepSessionExecutor } from "../execution/step-session-executor.js";
 import { withRateLimitRetry } from "../errors/rate-limit-retry.js";
-import { exec, execSync } from "node:child_process";
+import { exec, execFile, execSync } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { hydrateWorktreeDb } from "../worktree/worktree-db-hydrate.js";
 import { classifyTaskWorktree, describeRegisteredWorktrees, isUsableTaskWorktree } from "../worktree/worktree-pool.js";
@@ -489,6 +489,7 @@ export const mockedStepSessionExecutor = vi.mocked(StepSessionExecutor);
 export const mockedWithRateLimitRetry = vi.mocked(withRateLimitRetry);
 export const mockedExec = vi.mocked(exec);
 export const mockedExecSync = vi.mocked(execSync);
+export const mockedExecFile = vi.mocked(execFile);
 export const mockedExistsSync = vi.mocked(existsSync);
 export const mockedRealpathSync = vi.mocked(realpathSync);
 export const mockedStatSync = vi.mocked(statSync);
@@ -1061,6 +1062,12 @@ export function resetExecutorMocks() {
   mockedExistsSync.mockImplementation((path) => !/[\\/]worktrees[\\/]/.test(String(path)));
   mockedExec.mockReset();
   mockedExecSync.mockReset();
+  /*
+  FNXC:EngineTests 2026-10-11-23:15:
+  Branch resolution and other single git reads launch through execFile, so a case that answers one of them overrides this mock.
+  Reset it with its exec siblings: clearAllMocks keeps implementations, and an override that survived would answer every later case's git reads.
+  */
+  mockedExecFile.mockReset();
   mockedStatSync.mockReset();
   mockedStatSync.mockReturnValue({ isDirectory: () => true } as ReturnType<typeof statSync>);
   mockedIsUsableTaskWorktree.mockResolvedValue(true);

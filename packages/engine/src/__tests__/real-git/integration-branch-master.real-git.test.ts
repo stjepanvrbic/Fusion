@@ -1,10 +1,16 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { selectIntegrationBranch } from "@fusion/core";
 import { execSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { inspectBranchConflict } from "../../execution/branch-conflicts.js";
-import { resolveIntegrationBranch } from "../../merge/integration-branch.js";
+import {
+  __resetIntegrationBranchCacheForTests,
+  INTEGRATION_BRANCH_FALLBACK,
+  resolveIntegrationBranch,
+  resolveIntegrationBranchSync,
+} from "../../merge/integration-branch.js";
 
 const hasGit = spawnSync("git", ["--version"], { stdio: "pipe" }).status === 0;
 const describeIfGit = hasGit ? describe : describe.skip;
@@ -17,19 +23,92 @@ describeIfGit("integration branch resolution (real git, master)", () => {
   const repos: string[] = [];
 
   afterEach(() => {
+    __resetIntegrationBranchCacheForTests();
     for (const repo of repos.splice(0)) rmSync(repo, { recursive: true, force: true });
   });
 
-  function setupRepo(): string {
+  function setupRepoWithoutOriginHead(initialBranch: string): string {
     const repo = mkdtempSync(path.join(os.tmpdir(), "fn-5349-"));
     repos.push(repo);
-    git(repo, "git init -b master");
+    git(repo, `git init -b ${initialBranch}`);
     git(repo, 'git config user.email "test@example.com"');
     git(repo, 'git config user.name "Test"');
     git(repo, "git commit --allow-empty -m 'init'");
+    return repo;
+  }
+
+  function setupRepo(): string {
+    const repo = setupRepoWithoutOriginHead("master");
     git(repo, "git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master");
     return repo;
   }
+
+  /** Resolves through both ladders with no settings branch and returns the two results. */
+  async function resolveBoth(rootDir: string): Promise<{ asyncResolved: string; syncResolved: string }> {
+    const asyncResolved = await resolveIntegrationBranch(rootDir, undefined, { logger: { warn: vi.fn() } });
+    __resetIntegrationBranchCacheForTests();
+    const syncResolved = resolveIntegrationBranchSync(rootDir, undefined, { logger: { warn: vi.fn() } });
+    return { asyncResolved, syncResolved };
+  }
+
+  it("reads origin/HEAD the same through the async and sync ladders", async () => {
+    const repo = setupRepo();
+
+    await expect(resolveBoth(repo)).resolves.toEqual({ asyncResolved: "master", syncResolved: "master" });
+  });
+
+  /*
+  FNXC:IntegrationBranchReadiness 2026-10-11-22:50:
+  A project whose default branch is not a well-known name, with no configured branch and no origin/HEAD, is recognised from git's branch listing on every platform.
+  The listing format contains parentheses, which a POSIX shell rejects when the command is passed as a string, so these cases read the real listing output.
+  */
+  it("infers a sole local branch that is not a well-known name when origin/HEAD is unset", async () => {
+    const repo = setupRepoWithoutOriginHead("production");
+    git(repo, "git checkout --detach");
+    const expected = selectIntegrationBranch({ localBranches: ["production"], currentBranch: "", remoteBranches: [] });
+
+    expect(expected).toEqual({ branch: "production", source: "sole-local" });
+    await expect(resolveBoth(repo)).resolves.toEqual({ asyncResolved: expected?.branch, syncResolved: expected?.branch });
+  });
+
+  it("infers the checked-out local branch among several when origin/HEAD is unset", async () => {
+    const repo = setupRepoWithoutOriginHead("production");
+    git(repo, "git branch staging");
+    const expected = selectIntegrationBranch({ localBranches: ["production", "staging"], currentBranch: "production", remoteBranches: [] });
+
+    expect(expected).toEqual({ branch: "production", source: "current-head" });
+    await expect(resolveBoth(repo)).resolves.toEqual({ asyncResolved: expected?.branch, syncResolved: expected?.branch });
+  });
+
+  it("infers the only origin remote-tracking branch when no local branch exists", async () => {
+    const repo = setupRepoWithoutOriginHead("production");
+    git(repo, "git update-ref refs/remotes/origin/staging HEAD");
+    git(repo, "git checkout --detach");
+    git(repo, "git branch -D production");
+    const expected = selectIntegrationBranch({ localBranches: [], currentBranch: "", remoteBranches: ["staging"] });
+
+    expect(expected).toEqual({ branch: "staging", source: "remote-tracking" });
+    await expect(resolveBoth(repo)).resolves.toEqual({ asyncResolved: expected?.branch, syncResolved: expected?.branch });
+  });
+
+  it("falls back to main without throwing outside a repository", async () => {
+    const notARepo = mkdtempSync(path.join(os.tmpdir(), "fn-5349-plain-"));
+    repos.push(notARepo);
+
+    await expect(resolveBoth(notARepo)).resolves.toEqual({
+      asyncResolved: INTEGRATION_BRANCH_FALLBACK,
+      syncResolved: INTEGRATION_BRANCH_FALLBACK,
+    });
+  });
+
+  it("falls back to main without throwing when the directory does not exist", async () => {
+    const missing = path.join(os.tmpdir(), `fn-5349-missing-${process.pid}-${Date.now()}`);
+
+    await expect(resolveBoth(missing)).resolves.toEqual({
+      asyncResolved: INTEGRATION_BRANCH_FALLBACK,
+      syncResolved: INTEGRATION_BRANCH_FALLBACK,
+    });
+  });
 
   it("resolves origin/HEAD and respects explicit override", async () => {
     const repo = setupRepo();

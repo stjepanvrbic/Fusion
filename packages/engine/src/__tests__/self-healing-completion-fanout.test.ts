@@ -2,12 +2,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import type { Settings, Task, TaskStore } from "@fusion/core";
 
-const { execMock, execFileMock, existsSyncMock } = vi.hoisted(() => {
-  const execFileMock = vi.fn();
+const { execMock, execFileMock, answerExecFile, existsSyncMock } = vi.hoisted(() => {
+  /*
+  FNXC:EngineTests 2026-10-11-23:54:
+  Product code reaches execFile in two forms: promisified, and node's callback form (branch resolution).
+  One empty answer serves both, so a callback-form caller is never left waiting on a callback that does not come.
+  */
+  const answerExecFile = (_file: string, _args: readonly string[], _options: unknown, callback?: (error: Error | null, stdout: string, stderr: string) => void) => {
+    if (typeof callback === "function") {
+      callback(null, "", "");
+      return {};
+    }
+    return Promise.resolve({ stdout: "", stderr: "" });
+  };
+  const execFileMock = vi.fn(answerExecFile);
   (execFileMock as any)[Symbol.for("nodejs.util.promisify.custom")] = execFileMock;
   return {
     execMock: vi.fn(),
     execFileMock,
+    answerExecFile,
     existsSyncMock: vi.fn(() => false),
   };
 });
@@ -130,7 +143,7 @@ function configureTaskWorkflowSelections(
 describe("self-healing completion fan-out", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    execFileMock.mockResolvedValue({ stdout: "", stderr: "" });
+    execFileMock.mockImplementation(answerExecFile);
     execMock.mockImplementation((cmd: string, _opts: unknown, cb: (err: unknown, stdout: string, stderr: string) => void) => {
       cb(null, "", "");
     });

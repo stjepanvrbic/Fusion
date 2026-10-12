@@ -5,12 +5,25 @@ import { cleanupOrphanedWorktrees } from "../../worktree/worktree-pool.js";
 import { SelfHealingManager } from "../../self-healing.js";
 import { NativeWorktreeBackend, WorktrunkWorktreeBackend } from "../../worktree/worktree-backend.js";
 
-const { execSpy, execFileSpy, existsSpy, readdirSpy, readFileSpy } = vi.hoisted(() => {
-  const execFileSpy = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+const { execSpy, execFileSpy, answerExecFile, existsSpy, readdirSpy, readFileSpy } = vi.hoisted(() => {
+  /*
+  FNXC:EngineTests 2026-10-11-23:54:
+  Product code reaches execFile in two forms: promisified, and node's callback form (branch resolution).
+  One empty answer serves both, so a callback-form caller is never left waiting on a callback that does not come.
+  */
+  const answerExecFile = (_file: string, _args: readonly string[], _options: unknown, callback?: (error: Error | null, stdout: string, stderr: string) => void) => {
+    if (typeof callback === "function") {
+      callback(null, "", "");
+      return {};
+    }
+    return Promise.resolve({ stdout: "", stderr: "" });
+  };
+  const execFileSpy = vi.fn(answerExecFile);
   (execFileSpy as any)[Symbol.for("nodejs.util.promisify.custom")] = execFileSpy;
   return {
     execSpy: vi.fn(),
     execFileSpy,
+    answerExecFile,
     existsSpy: vi.fn(() => true),
     readdirSpy: vi.fn(() => []),
     readFileSpy: vi.fn(() => ""),
@@ -45,7 +58,7 @@ describe("reliability interactions: worktrunk worktree removal routing", () => {
     vi.clearAllMocks();
     execSpy.mockImplementation((_cmd: string, _opts: unknown, cb: (err: unknown, stdout: string, stderr: string) => void) => cb(null, "", ""));
     execFileSpy.mockReset();
-    execFileSpy.mockResolvedValue({ stdout: "", stderr: "" });
+    execFileSpy.mockImplementation(answerExecFile);
     // A workspace-group marker is an explicit delete veto in the ownership proof; these fixtures
     // are ordinary single-project worktrees, so the marker must be absent.
     existsSpy.mockImplementation(((path: string) => !String(path).endsWith("/.fusion-workspace-root")) as never);

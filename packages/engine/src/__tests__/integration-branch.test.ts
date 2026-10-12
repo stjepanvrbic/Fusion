@@ -1,15 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { selectIntegrationBranch } from "@fusion/core";
 
-const { execMock, execSyncMock } = vi.hoisted(() => ({
+const { execMock, execSyncMock, execFileMock, execFileSyncMock } = vi.hoisted(() => ({
   execMock: vi.fn(),
   execSyncMock: vi.fn(),
+  execFileMock: vi.fn(),
+  execFileSyncMock: vi.fn(),
 }));
 
 vi.mock("node:child_process", () => ({
   exec: execMock,
   execSync: execSyncMock,
-  execFile: vi.fn(),
+  execFile: execFileMock,
+  execFileSync: execFileSyncMock,
 }));
 
 import {
@@ -19,39 +22,106 @@ import {
   resolveIntegrationBranchSync,
 } from "../merge/integration-branch.js";
 
+const ORIGIN_HEAD = ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"];
+const LOCAL_BRANCHES = ["for-each-ref", "--format=%(refname:short)", "refs/heads/"];
+const CURRENT_HEAD = ["symbolic-ref", "--quiet", "--short", "HEAD"];
+const ORIGIN_BRANCHES = ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/"];
+const REMOTES = ["remote"];
+
+const TIMEOUT_MS = 5000;
+const MAX_BUFFER = 1048576;
+
+type GitAnswer = string | Error;
+type GitResponder = (args: string[]) => GitAnswer;
+type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void;
+type ShellCallback = (error: Error | null, stdout: string, stderr: string) => void;
+
+const key = (args: readonly string[]): string => args.join(" ");
+
+/** Answers by argument list; an argument list without an entry fails like a git read that found nothing. */
+function byArgs(answers: Record<string, GitAnswer>): GitResponder {
+  return (args) => answers[key(args)] ?? new Error(`git ${key(args)} failed`);
+}
+
+function answerAsync(respond: GitResponder): void {
+  execFileMock.mockImplementation((_file: string, args: string[], _opts: object, callback: ExecFileCallback) => {
+    const answer = respond(args);
+    if (answer instanceof Error) callback(answer, "", "");
+    else callback(null, answer, "");
+    return {};
+  });
+}
+
+function answerSync(respond: GitResponder): void {
+  execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+    const answer = respond(args);
+    if (answer instanceof Error) throw answer;
+    return answer;
+  });
+}
+
+function answerBoth(respond: GitResponder): void {
+  answerAsync(respond);
+  answerSync(respond);
+}
+
+const launchedArgs = (mock: typeof execFileMock): string[][] => mock.mock.calls.map((call) => call[1] as string[]);
+
 describe("integration-branch resolver", () => {
   beforeEach(() => {
     __resetIntegrationBranchCacheForTests();
     execMock.mockReset();
     execSyncMock.mockReset();
+    execFileMock.mockReset();
+    execFileSyncMock.mockReset();
+    /*
+    FNXC:IntegrationBranchReadiness 2026-10-11-22:48:
+    Branch resolution launches git without a shell, so the shell launchers answer with a failure instead of staying silent.
+    A resolver that reached one would then return its fallback and fail the case's assertion, instead of waiting on a callback that never comes.
+    */
+    execMock.mockImplementation((_command: string, _opts: object, callback: ShellCallback) => {
+      callback(new Error("exec must not be reached"), "", "");
+      return {};
+    });
+    execSyncMock.mockImplementation(() => {
+      throw new Error("execSync must not be reached");
+    });
   });
 
   afterEach(() => {
+    expect(execMock).not.toHaveBeenCalled();
+    expect(execSyncMock).not.toHaveBeenCalled();
     __resetIntegrationBranchCacheForTests();
     vi.restoreAllMocks();
   });
 
   it("integrationBranch override wins over baseBranch and origin/HEAD", async () => {
-    const resolved = await resolveIntegrationBranch("/repo", { integrationBranch: " trunk ", baseBranch: "develop" } as any);
+    const settings = { integrationBranch: " trunk ", baseBranch: "develop" } as any;
 
-    expect(resolved).toBe("trunk");
-    expect(execMock).not.toHaveBeenCalled();
+    expect(await resolveIntegrationBranch("/repo", settings)).toBe("trunk");
+    expect(resolveIntegrationBranchSync("/repo", settings)).toBe("trunk");
+
+    expect(execFileMock).not.toHaveBeenCalled();
+    expect(execFileSyncMock).not.toHaveBeenCalled();
   });
 
   it("baseBranch wins over origin/HEAD", async () => {
-    const resolved = await resolveIntegrationBranch("/repo", { baseBranch: " develop " } as any);
+    const settings = { baseBranch: " develop " } as any;
 
-    expect(resolved).toBe("develop");
-    expect(execMock).not.toHaveBeenCalled();
+    expect(await resolveIntegrationBranch("/repo", settings)).toBe("develop");
+    expect(resolveIntegrationBranchSync("/repo", settings)).toBe("develop");
+
+    expect(execFileMock).not.toHaveBeenCalled();
+    expect(execFileSyncMock).not.toHaveBeenCalled();
   });
 
   it("strips refs/remotes/origin and origin prefixes", async () => {
-    execMock.mockImplementationOnce((_command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      cb(null, { stdout: "refs/remotes/origin/master\n" });
+    execFileMock.mockImplementationOnce((_file: string, _args: string[], _opts: object, callback: ExecFileCallback) => {
+      callback(null, "refs/remotes/origin/master\n", "");
       return {};
     });
-    execMock.mockImplementationOnce((_command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      cb(null, { stdout: "origin/develop\n" });
+    execFileMock.mockImplementationOnce((_file: string, _args: string[], _opts: object, callback: ExecFileCallback) => {
+      callback(null, "origin/develop\n", "");
       return {};
     });
 
@@ -63,21 +133,89 @@ describe("integration-branch resolver", () => {
   });
 
   it("treats whitespace and empty settings as unset", async () => {
-    execMock.mockImplementation((_command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      cb(null, { stdout: "origin/master\n" });
-      return {};
-    });
+    answerAsync(() => "origin/master\n");
 
     const resolved = await resolveIntegrationBranch("/repo", { integrationBranch: "   ", baseBranch: "" } as any);
 
     expect(resolved).toBe("master");
   });
 
+  it("reads origin/HEAD with one shell-free git launch and stops there when it is set", async () => {
+    answerBoth(byArgs({ [key(ORIGIN_HEAD)]: "origin/release\n" }));
+
+    await expect(resolveIntegrationBranch("/repo", undefined)).resolves.toBe("release");
+    expect(resolveIntegrationBranchSync("/repo-sync", undefined)).toBe("release");
+
+    expect(execFileMock.mock.calls).toEqual([
+      ["git", ORIGIN_HEAD, { cwd: "/repo", encoding: "utf8", timeout: TIMEOUT_MS, maxBuffer: MAX_BUFFER }, expect.any(Function)],
+    ]);
+    expect(execFileSyncMock.mock.calls).toEqual([
+      ["git", ORIGIN_HEAD, { cwd: "/repo-sync", encoding: "utf8", timeout: TIMEOUT_MS, maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "ignore"] }],
+    ]);
+  });
+
+  it("launches the inference reads as argument lists with explicit bounds, then lists remotes when nothing is inferred", async () => {
+    answerAsync(byArgs({ [key(LOCAL_BRANCHES)]: "", [key(ORIGIN_BRANCHES)]: "", [key(REMOTES)]: "" }));
+
+    await expect(resolveIntegrationBranch("/repo", undefined, { logger: { warn: vi.fn() } })).resolves.toBe(INTEGRATION_BRANCH_FALLBACK);
+
+    const launched = launchedArgs(execFileMock);
+    expect(launched).toHaveLength(5);
+    expect(launched[0]).toEqual(ORIGIN_HEAD);
+    expect(launched.slice(1, 4)).toEqual(expect.arrayContaining([LOCAL_BRANCHES, CURRENT_HEAD, ORIGIN_BRANCHES]));
+    expect(launched[4]).toEqual(REMOTES);
+    for (const call of execFileMock.mock.calls) {
+      expect(call[0]).toBe("git");
+      expect(call[2]).toEqual({ cwd: "/repo", encoding: "utf8", timeout: TIMEOUT_MS, maxBuffer: MAX_BUFFER });
+    }
+  });
+
+  it("does not list remotes when a branch is inferred", async () => {
+    answerAsync(byArgs({ [key(LOCAL_BRANCHES)]: "develop\n", [key(CURRENT_HEAD)]: "develop\n", [key(ORIGIN_BRANCHES)]: "" }));
+
+    await expect(resolveIntegrationBranch("/repo", undefined, { logger: { warn: vi.fn() } })).resolves.toBe("develop");
+
+    const launched = launchedArgs(execFileMock);
+    expect(launched).toHaveLength(4);
+    expect(launched[0]).toEqual(ORIGIN_HEAD);
+    expect(launched.slice(1)).toEqual(expect.arrayContaining([LOCAL_BRANCHES, CURRENT_HEAD, ORIGIN_BRANCHES]));
+  });
+
+  it("launches the synchronous ladder with the same argument lists and bounds", () => {
+    answerSync(byArgs({ [key(LOCAL_BRANCHES)]: "", [key(ORIGIN_BRANCHES)]: "", [key(REMOTES)]: "" }));
+
+    expect(resolveIntegrationBranchSync("/repo", undefined, { logger: { warn: vi.fn() } })).toBe(INTEGRATION_BRANCH_FALLBACK);
+
+    const launched = launchedArgs(execFileSyncMock);
+    expect(launched).toHaveLength(5);
+    expect(launched[0]).toEqual(ORIGIN_HEAD);
+    expect(launched.slice(1, 4)).toEqual(expect.arrayContaining([LOCAL_BRANCHES, CURRENT_HEAD, ORIGIN_BRANCHES]));
+    expect(launched[4]).toEqual(REMOTES);
+    for (const call of execFileSyncMock.mock.calls) {
+      expect(call[0]).toBe("git");
+      expect(call[2]).toEqual({ cwd: "/repo", encoding: "utf8", timeout: TIMEOUT_MS, maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "ignore"] });
+    }
+  });
+
+  it("passes each ref prefix as one argument beside an unquoted format argument", async () => {
+    answerBoth(byArgs({ [key(LOCAL_BRANCHES)]: "", [key(ORIGIN_BRANCHES)]: "" }));
+
+    await resolveIntegrationBranch("/repo", undefined, { logger: { warn: vi.fn() } });
+    resolveIntegrationBranchSync("/repo-sync", undefined, { logger: { warn: vi.fn() } });
+
+    for (const launched of [launchedArgs(execFileMock), launchedArgs(execFileSyncMock)]) {
+      const listings = launched.filter((args) => args[0] === "for-each-ref");
+      expect(listings).toHaveLength(2);
+      for (const args of listings) {
+        expect(args).toHaveLength(3);
+        expect(args[1]).toBe("--format=%(refname:short)");
+      }
+      expect(listings.map((args) => args[2]).sort()).toEqual(["refs/heads/", "refs/remotes/origin/"]);
+    }
+  });
+
   it("falls back to main and warns once per rootDir", async () => {
-    execMock.mockImplementation((_command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      cb(new Error("no symbolic ref"), { stdout: "" });
-      return {};
-    });
+    answerAsync(() => new Error("no symbolic ref"));
     const warn = vi.fn();
 
     const first = await resolveIntegrationBranch("/repo", undefined, { logger: { warn } });
@@ -90,18 +228,12 @@ describe("integration-branch resolver", () => {
   });
 
   it("falls back to main with actionable guidance when origin is absent but gitlab remote exists", async () => {
-    execMock.mockImplementation((command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      if (command.includes("origin/HEAD")) {
-        cb(new Error("no symbolic ref"), { stdout: "" });
-        return {};
-      }
-      if (command.includes("for-each-ref") || command.includes("symbolic-ref --quiet --short HEAD")) {
-        cb(null, { stdout: "" });
-        return {};
-      }
-      cb(null, { stdout: "gitlab\n" });
-      return {};
-    });
+    answerAsync(byArgs({
+      [key(LOCAL_BRANCHES)]: "",
+      [key(CURRENT_HEAD)]: "",
+      [key(ORIGIN_BRANCHES)]: "",
+      [key(REMOTES)]: "gitlab\n",
+    }));
     const warn = vi.fn();
 
     const resolved = await resolveIntegrationBranch("/repo", undefined, { logger: { warn } });
@@ -115,18 +247,12 @@ describe("integration-branch resolver", () => {
   });
 
   it("warns once per rootDir when origin exists but has no HEAD", async () => {
-    execMock.mockImplementation((command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      if (command.includes("origin/HEAD")) {
-        cb(new Error("no symbolic ref"), { stdout: "" });
-        return {};
-      }
-      if (command.includes("for-each-ref") || command.includes("symbolic-ref --quiet --short HEAD")) {
-        cb(null, { stdout: "" });
-        return {};
-      }
-      cb(null, { stdout: "origin\ngitlab\norigin\n" });
-      return {};
-    });
+    answerAsync(byArgs({
+      [key(LOCAL_BRANCHES)]: "",
+      [key(CURRENT_HEAD)]: "",
+      [key(ORIGIN_BRANCHES)]: "",
+      [key(REMOTES)]: "origin\ngitlab\norigin\n",
+    }));
     const warn = vi.fn();
 
     await expect(resolveIntegrationBranch("/repo", undefined, { logger: { warn } })).resolves.toBe(INTEGRATION_BRANCH_FALLBACK);
@@ -138,22 +264,12 @@ describe("integration-branch resolver", () => {
   });
 
   it("adopts the only local master branch instead of naming main", async () => {
-    execMock.mockImplementation((command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      if (command.includes("origin/HEAD")) {
-        cb(new Error("no symbolic ref"), { stdout: "" });
-        return {};
-      }
-      if (command.includes("refs/heads/")) {
-        cb(null, { stdout: "master\n" });
-        return {};
-      }
-      if (command.includes("symbolic-ref --quiet --short HEAD")) {
-        cb(null, { stdout: "master\n" });
-        return {};
-      }
-      cb(null, { stdout: "" });
-      return {};
-    });
+    answerAsync(byArgs({
+      [key(LOCAL_BRANCHES)]: "master\n",
+      [key(CURRENT_HEAD)]: "master\n",
+      [key(ORIGIN_BRANCHES)]: "",
+      [key(REMOTES)]: "",
+    }));
     const warn = vi.fn();
 
     await expect(resolveIntegrationBranch("/master-only", undefined, { logger: { warn } })).resolves.toBe("master");
@@ -162,93 +278,53 @@ describe("integration-branch resolver", () => {
   });
 
   it("prefers a well-known local branch when multiple local branches exist", async () => {
-    execMock.mockImplementation((command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      if (command.includes("origin/HEAD")) {
-        cb(new Error("no symbolic ref"), { stdout: "" });
-        return {};
-      }
-      if (command.includes("refs/heads/")) {
-        cb(null, { stdout: "develop\nmain\n" });
-        return {};
-      }
-      if (command.includes("symbolic-ref --quiet --short HEAD")) {
-        cb(null, { stdout: "develop\n" });
-        return {};
-      }
-      cb(null, { stdout: "" });
-      return {};
-    });
+    answerAsync(byArgs({
+      [key(LOCAL_BRANCHES)]: "develop\nmain\n",
+      [key(CURRENT_HEAD)]: "develop\n",
+      [key(ORIGIN_BRANCHES)]: "",
+      [key(REMOTES)]: "",
+    }));
 
     await expect(resolveIntegrationBranch("/multiple-local", undefined, { logger: { warn: vi.fn() } })).resolves.toBe("main");
   });
 
   it("adopts an unambiguous remote-only branch", async () => {
-    execMock.mockImplementation((command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      if (command.includes("origin/HEAD") || command.includes("symbolic-ref --quiet --short HEAD")) {
-        cb(new Error("no symbolic ref"), { stdout: "" });
-        return {};
-      }
-      if (command.includes("refs/heads/")) {
-        cb(null, { stdout: "" });
-        return {};
-      }
-      if (command.includes("refs/remotes/origin/")) {
-        cb(null, { stdout: "origin/develop\n" });
-        return {};
-      }
-      cb(null, { stdout: "" });
-      return {};
-    });
+    answerAsync(byArgs({
+      [key(LOCAL_BRANCHES)]: "",
+      [key(ORIGIN_BRANCHES)]: "origin/develop\n",
+      [key(REMOTES)]: "",
+    }));
 
     await expect(resolveIntegrationBranch("/remote-only", undefined, { logger: { warn: vi.fn() } })).resolves.toBe("develop");
   });
 
+  it("drops origin's HEAD entry from the remote-tracking list", async () => {
+    answerBoth(byArgs({
+      [key(LOCAL_BRANCHES)]: "",
+      [key(ORIGIN_BRANCHES)]: "origin/HEAD\norigin/develop\n",
+      [key(REMOTES)]: "",
+    }));
+
+    await expect(resolveIntegrationBranch("/remote-head", undefined, { logger: { warn: vi.fn() } })).resolves.toBe("develop");
+    expect(resolveIntegrationBranchSync("/remote-head-sync", undefined, { logger: { warn: vi.fn() } })).toBe("develop");
+  });
+
   it("falls back when every inferred branch is a Fusion sibling", async () => {
-    execMock.mockImplementation((command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      if (command.includes("origin/HEAD") || command.includes("symbolic-ref --quiet --short HEAD")) {
-        cb(new Error("no symbolic ref"), { stdout: "" });
-        return {};
-      }
-      if (command.includes("refs/heads/")) {
-        cb(null, { stdout: "fusion/fn-123\n" });
-        return {};
-      }
-      if (command.includes("refs/remotes/origin/")) {
-        cb(null, { stdout: "origin/fusion/fn-456\n" });
-        return {};
-      }
-      cb(null, { stdout: "" });
-      return {};
-    });
+    answerAsync(byArgs({
+      [key(LOCAL_BRANCHES)]: "fusion/fn-123\n",
+      [key(ORIGIN_BRANCHES)]: "origin/fusion/fn-456\n",
+      [key(REMOTES)]: "",
+    }));
 
     await expect(resolveIntegrationBranch("/fusion-only", undefined, { logger: { warn: vi.fn() } })).resolves.toBe(INTEGRATION_BRANCH_FALLBACK);
   });
 
   it("keeps sync and async inference aligned with the shared selector", async () => {
-    const respondAsync = (command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      if (command.includes("origin/HEAD") || command.includes("symbolic-ref --quiet --short HEAD")) {
-        cb(new Error("no symbolic ref"), { stdout: "" });
-        return {};
-      }
-      if (command.includes("refs/heads/")) {
-        cb(null, { stdout: "" });
-        return {};
-      }
-      if (command.includes("refs/remotes/origin/")) {
-        cb(null, { stdout: "origin/develop\n" });
-        return {};
-      }
-      cb(null, { stdout: "" });
-      return {};
-    };
-    execMock.mockImplementation(respondAsync);
-    execSyncMock.mockImplementation((command: string) => {
-      if (command.includes("origin/HEAD") || command.includes("symbolic-ref --quiet --short HEAD")) {
-        throw new Error("no symbolic ref");
-      }
-      if (command.includes("refs/remotes/origin/")) return "origin/develop\n";
-      return "";
-    });
+    answerBoth(byArgs({
+      [key(LOCAL_BRANCHES)]: "",
+      [key(ORIGIN_BRANCHES)]: "origin/develop\n",
+      [key(REMOTES)]: "",
+    }));
     const expected = selectIntegrationBranch({
       localBranches: [],
       currentBranch: "",
@@ -264,11 +340,8 @@ describe("integration-branch resolver", () => {
   });
 
   it("sync and async variants match", async () => {
-    execMock.mockImplementation((_command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      cb(null, { stdout: "refs/remotes/origin/master\n" });
-      return {};
-    });
-    execSyncMock.mockReturnValue("origin/master\n");
+    answerAsync(() => "refs/remotes/origin/master\n");
+    answerSync(() => "origin/master\n");
 
     const asyncResolved = await resolveIntegrationBranch("/repo", undefined);
     const syncResolved = resolveIntegrationBranchSync("/repo", undefined);
@@ -278,15 +351,13 @@ describe("integration-branch resolver", () => {
   });
 
   it("swallows git failures and does not throw", async () => {
-    execMock.mockImplementation((_command: string, _opts: object, cb: (error: Error | null, result: { stdout: string }) => void) => {
-      cb(new Error("git failed"), { stdout: "" });
-      return {};
-    });
-    execSyncMock.mockImplementation(() => {
-      throw new Error("git failed");
-    });
+    answerBoth(() => new Error("git failed"));
+    const warn = vi.fn();
 
-    await expect(resolveIntegrationBranch("/repo", undefined)).resolves.toBe(INTEGRATION_BRANCH_FALLBACK);
-    expect(() => resolveIntegrationBranchSync("/repo", undefined)).not.toThrow();
+    await expect(resolveIntegrationBranch("/repo", undefined, { logger: { warn } })).resolves.toBe(INTEGRATION_BRANCH_FALLBACK);
+    expect(resolveIntegrationBranchSync("/repo-sync", undefined, { logger: { warn } })).toBe(INTEGRATION_BRANCH_FALLBACK);
+
+    expect(launchedArgs(execFileMock)).toHaveLength(5);
+    expect(launchedArgs(execFileSyncMock)).toHaveLength(5);
   });
 });

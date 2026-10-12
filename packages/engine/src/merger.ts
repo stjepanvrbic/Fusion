@@ -5151,19 +5151,29 @@ export async function captureSingleCommitLandedPaths(
   return paths;
 }
 
+/*
+FNXC:LandedCommitMetadata 2026-10-11-23:07:
+The two landed-commit reads launch git directly with an argument list; neither goes through a shell.
+Through the POSIX-shell seam each read cost two extra `bash.exe` processes on Windows, on every finalized merge.
+The timeout equals the default bound of the sibling git reads that finalization awaits in the same `Promise.all`, so this read cannot fail a finalization earlier than its neighbours would.
+*/
+const LANDED_COMMIT_READ_TIMEOUT_MS = 120_000;
+
 export async function captureSingleCommitLandedMetadata(
   rootDir: string,
   sha: string,
 ): Promise<Pick<MergeDetails, "landedFiles" | "filesChanged" | "insertions" | "deletions">> {
   const [{ stdout: landedFilesOutput }, { stdout: shortstatOutput }] = await Promise.all([
-    execAsync(`git show --name-only --format= ${quoteArg(sha)}`, {
+    execFileAsync("git", ["show", "--name-only", "--format=", sha], {
       cwd: rootDir,
       encoding: "utf-8",
+      timeout: LANDED_COMMIT_READ_TIMEOUT_MS,
       maxBuffer: 2 * 1024 * 1024,
     }),
-    execAsync(`git show --shortstat --format= ${quoteArg(sha)}`, {
+    execFileAsync("git", ["show", "--shortstat", "--format=", sha], {
       cwd: rootDir,
       encoding: "utf-8",
+      timeout: LANDED_COMMIT_READ_TIMEOUT_MS,
       maxBuffer: 2 * 1024 * 1024,
     }),
   ]);

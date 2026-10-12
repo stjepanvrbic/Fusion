@@ -35,16 +35,12 @@ const allowlist: AllowlistEntry[] = [
   { file: "src/execution/review-checkout.ts", line: 35, primitive: "execFileSync", signature: "const topLevel = execFileSync(\"git\", [\"rev-parse\", \"--show-toplevel\"], {", reason: SHORT_GIT_PLUMBING },
   // FNXC:EngineProcessRules 2026-08-23-18:30: the executor ancestry check moved to src/executor/worktree-git-refs.ts in the wave-18 executor pure peels (1cf86baa1c). Identity is file+primitive+signature; re-pin the path, not the behavior.
   { file: "src/executor/worktree-git-refs.ts", line: 121, primitive: "execSync", signature: "execSync(`git merge-base --is-ancestor ${task.baseCommitSha} HEAD`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/merge/integration-branch.ts", line: 71, primitive: "execSync", signature: "const stdout = execSync(\"git symbolic-ref --short refs/remotes/origin/HEAD\", {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/merge/integration-branch.ts", line: 107, primitive: "execSync", signature: "const stdout = execSync(\"git remote\", {", reason: SHORT_GIT_PLUMBING },
   /*
-  FNXC:EngineProcessRules 2026-09-09-07:17:
-  resolveIntegrationBranchSync backs the synchronous branch-inference ladder with fixed git
-  plumbing. Its refPrefix values are module-internal literals, both calls set timeout/maxBuffer,
-  and the asynchronous ladder remains the default path, so these sites stay call-site audited.
+  FNXC:EngineProcessRules 2026-10-11-22:50:
+  resolveIntegrationBranchSync reaches git through one shell-free runner, so the module has a single synchronous call site where it had four shell-wrapped ones.
+  It stays audited because it is still a synchronous primitive: fixed git plumbing whose argument lists are module-internal literals, bounded by timeout and maxBuffer, with the asynchronous ladder as the default path.
   */
-  { file: "src/merge/integration-branch.ts", line: 146, primitive: "execSync", signature: "const stdout = execSync(`git for-each-ref --format=%(refname:short) ${refPrefix}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/merge/integration-branch.ts", line: 203, primitive: "execSync", signature: "const stdout = execSync(\"git symbolic-ref --quiet --short HEAD\", {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/merge/integration-branch.ts", line: 30, primitive: "execFileSync", signature: "return execFileSync(\"git\", args, {", reason: SHORT_GIT_PLUMBING },
   { file: "src/merge/merger-git-parse.ts", line: 102, primitive: "execFileSync", signature: "const output = execFileSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/merge/merger-workspace-test-commands.ts", line: 204, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/merge/merger-workspace-test-commands.ts", line: 301, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
@@ -221,7 +217,8 @@ describe("engine blocking-shellout static guard", () => {
     const sites = scanSource(file, source);
     const { unmatched } = classifySites(sites);
 
-    expect(sites).toHaveLength(4);
+    expect(sites).toHaveLength(1);
+    expect(sites[0]?.primitive).toBe("execFileSync");
     expect(unmatched).toEqual([]);
   });
 

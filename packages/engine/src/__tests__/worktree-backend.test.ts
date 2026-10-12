@@ -17,6 +17,7 @@ import { nativeFixturePath } from "./_posix-fixture-path.js";
 const {
   execMock,
   execFileMock,
+  execFileAnswering,
   accessMock,
   readdirMock,
   rmMock,
@@ -32,11 +33,25 @@ const {
 } = vi.hoisted(() => {
   const mock = vi.fn();
   (mock as any)[Symbol.for("nodejs.util.promisify.custom")] = mock;
-  const execFileMock = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+  /*
+  FNXC:WorktreeBackendTests 2026-10-11-23:15:
+  Product code reaches execFile in two forms: promisified (worktree removal reads) and node's callback form (branch resolution).
+  One answer serves both, so a callback-form caller is never left waiting on a callback that does not come.
+  */
+  const execFileAnswering = (stdout: string) =>
+    (_file: string, _args: string[], _options: unknown, callback?: (error: Error | null, stdout: string, stderr: string) => void) => {
+      if (typeof callback === "function") {
+        callback(null, stdout, "");
+        return {};
+      }
+      return Promise.resolve({ stdout, stderr: "" });
+    };
+  const execFileMock = vi.fn(execFileAnswering(""));
   (execFileMock as any)[Symbol.for("nodejs.util.promisify.custom")] = execFileMock;
   return {
     execMock: mock,
     execFileMock,
+    execFileAnswering,
     accessMock: vi.fn(),
     readdirMock: vi.fn(),
     rmMock: vi.fn(),
@@ -136,7 +151,7 @@ describe("isRegenerableScratchDirectory", () => {
 beforeEach(() => {
   execMock.mockReset();
   execFileMock.mockReset();
-  execFileMock.mockResolvedValue({ stdout: "", stderr: "" });
+  execFileMock.mockImplementation(execFileAnswering(""));
   accessMock.mockReset();
   readdirMock.mockReset();
   readdirMock.mockResolvedValue([]);
@@ -907,25 +922,29 @@ describe("WorktrunkWorktreeBackend", () => {
   });
 
   it("syncs by fetching then rebasing resolved integration branch", async () => {
-    execMock.mockResolvedValue({ stdout: "origin/main\n", stderr: "" });
+    execMock.mockResolvedValue({ stdout: "", stderr: "" });
+    execFileMock.mockImplementation(execFileAnswering("origin/main\n"));
     const backend = new WorktrunkWorktreeBackend({ binaryPath: "worktrunk" });
 
     await expect(
       backend.sync({ rootDir: "/repo", worktreePath: "/repo/.worktrees/fn-1", branch: "main" }),
     ).resolves.toEqual({ skipped: false });
 
+    expect(execFileMock.mock.calls).toEqual([
+      [
+        "git",
+        ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        expect.objectContaining({ cwd: "/repo", timeout: 5000, maxBuffer: 1048576 }),
+        expect.any(Function),
+      ],
+    ]);
     expect(execMock).toHaveBeenNthCalledWith(
       1,
-      "git symbolic-ref --short refs/remotes/origin/HEAD",
-      expect.objectContaining({ cwd: "/repo", timeout: 5000, maxBuffer: 1048576 }),
-    );
-    expect(execMock).toHaveBeenNthCalledWith(
-      2,
       'git fetch origin "main"',
       expect.objectContaining({ cwd: "/repo/.worktrees/fn-1", timeout: 180000, maxBuffer: 10485760 }),
     );
     expect(execMock).toHaveBeenNthCalledWith(
-      3,
+      2,
       'git rebase "main"',
       expect.objectContaining({ cwd: "/repo/.worktrees/fn-1", timeout: 180000, maxBuffer: 10485760 }),
     );

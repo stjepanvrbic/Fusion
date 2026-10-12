@@ -32,6 +32,7 @@ import {
   mockedWithRateLimitRetry,
   mockedExec,
   mockedExecSync,
+  mockedExecFile,
   mockedExistsSync,
   mockedHydrateWorktreeDb,
   mockedClassifyTaskWorktree,
@@ -1921,16 +1922,19 @@ describe("fresh worktree integration rebase", () => {
       worktreeRebaseBeforeMerge: true,
       worktreeRebaseRemote: "origin",
     });
-    mockedExec.mockImplementation(((command: string, _options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
-      callback(null, command.includes("refs/remotes/origin/HEAD") ? "origin/release\n" : "", "");
+    const originHeadArgs = ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"];
+    const isOriginHeadRead = (args: string[]) => args.join(" ") === originHeadArgs.join(" ");
+    mockGitCommands(() => null);
+    mockedExecFile.mockImplementation(((_file: string, args: string[], _options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
+      callback(null, isOriginHeadRead(args) ? "origin/release\n" : "", "");
       return {} as any;
     }) as any);
     const executor = createWorktreeExecutor(store, "/repo");
 
     await (executor as any).rebaseNewWorktreeOntoRemote("/worktree", "fusion/fn-8839", "FN-8839");
 
+    expect(mockedExecFile).toHaveBeenCalledWith("git", originHeadArgs, expect.objectContaining({ cwd: "/repo" }), expect.any(Function));
     expect(mockedExec.mock.calls.map(([command]) => String(command))).toEqual(expect.arrayContaining([
-      "git symbolic-ref --short refs/remotes/origin/HEAD",
       "git fetch 'origin' 'release'",
       "git rebase 'origin/release'",
     ]));
@@ -1941,8 +1945,9 @@ describe("fresh worktree integration rebase", () => {
       worktreeRebaseBeforeMerge: true,
       worktreeRebaseRemote: "origin",
     });
-    mockedExec.mockImplementation(((command: string, _options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
-      callback(command.includes("refs/remotes/origin/HEAD") ? new Error("origin HEAD unset") : null, "", "");
+    mockGitCommands(() => null);
+    mockedExecFile.mockImplementation(((_file: string, args: string[], _options: unknown, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
+      callback(isOriginHeadRead(args) ? new Error("origin HEAD unset") : null, "", "");
       return {} as any;
     }) as any);
 
