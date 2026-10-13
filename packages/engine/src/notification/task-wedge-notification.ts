@@ -1,4 +1,4 @@
-import { buildTaskExternalBlockReport, classifyTerminalFailureAutoRecovery, type TaskExternalBlockReport, type TerminalFailureAutoRecoveryDecision, type Task } from "@fusion/core";
+import { buildTaskExternalBlockReport, classifyTerminalFailureAutoRecovery, EXTERNAL_BLOCK_PAUSE_REASON, EXTERNAL_BLOCK_STATUS, type TaskExternalBlockReport, type TerminalFailureAutoRecoveryDecision, type Task } from "@fusion/core";
 import { hasTransientMergeRecoveryOwner } from "../errors/transient-merge-error-classifier.js";
 import { NO_PROGRESS_REQUEUE_BUDGET_EXHAUSTED_PREFIX } from "../healing/no-progress-requeue-budget.js";
 
@@ -172,6 +172,47 @@ export function shouldWithholdWedgeAlertForAutoRecovery(task: Task, options: { a
   return decision.action === "retry" || (decision.action === "skip" && decision.reason === "escalation-already-delivered");
 }
 
+/*
+FNXC:TaskWedgeNotifications 2026-10-13-10:40:
+A frozen external-block card keeps its column (WIP, review or hold), so lane occupancy and a non-failed status are no evidence that it moved on.
+One rule decides what a notifiable freeze is, and the wedge classifier and every moved-on check read it, so wedge handling for a frozen card reaches a fixed point instead of marking and clearing its pending hold on every task:updated.
+A freeze waiting for an operator is a wedge in every lane and is announced once per freeze.
+A freeze whose next step Fusion already owns, a scheduled automatic resume or a published resume request, is recovery-owned and never a wedge; observing it resolves an open episode once.
+A rate-limit freeze with its automatic-resume budget spent carries no `autoResume`, so it waits for the operator like any other freeze.
+User-paused and auto-merge-off freezes are held by the operator and are not notifiable at all.
+*/
+export type ExternalBlockFreezeClass = "awaiting-operator" | "recovery-owned";
+
+/** Classifies a notifiable external-block freeze; null for every other task. Never reads the column. */
+export function classifyExternalBlockFreeze(task: Task): ExternalBlockFreezeClass | null {
+  if (
+    task.status !== EXTERNAL_BLOCK_STATUS
+    || task.paused !== true
+    || task.pausedReason !== EXTERNAL_BLOCK_PAUSE_REASON
+    || task.userPaused === true
+    || task.autoMerge === false
+    || !task.externalBlock
+  ) return null;
+  return task.externalBlock.autoResume || task.externalBlock.resumeRequest ? "recovery-owned" : "awaiting-operator";
+}
+
+/** Statuses that prove an active self-healing no-action episode's card resumed. */
+const SELF_HEALING_RESUMED_STATUSES = ["queued", "planning", "in-progress", "merging", "merging-pr", "merged", "done"];
+
+/**
+ * Whether a wedge subject has visibly moved on, so its pending hold and active episode can be resolved.
+ * `progressed` is the resolved hold, countsTowardWip, complete and archived lanes; `terminal` the complete and archived lanes.
+ * A freeze waiting for an operator has moved on only when it is deleted or sits in a terminal lane.
+ */
+export function hasWedgeSubjectMovedOn(task: Task, lanes: { progressed: ReadonlySet<string>; terminal: ReadonlySet<string> }): boolean {
+  if (classifyExternalBlockFreeze(task) === "awaiting-operator") return task.deletedAt != null || lanes.terminal.has(task.column);
+  const isActiveSelfHealingNoAction = task.wedgeNotification?.status === "active"
+    && task.wedgeNotification.reasonKey.startsWith("self-healing-no-action:");
+  return lanes.progressed.has(task.column)
+    || (!isActiveSelfHealingNoAction && typeof task.status === "string" && task.status !== "failed")
+    || (isActiveSelfHealingNoAction && SELF_HEALING_RESUMED_STATUSES.includes(task.status ?? ""));
+}
+
 export function describeTaskWedge(task: Task): TaskWedgeDescriptor | null {
   if (isTaskProgressing(task)) return null;
   /*
@@ -180,14 +221,9 @@ export function describeTaskWedge(task: Task): TaskWedgeDescriptor | null {
   evidence and recovery-owned failures never reach this branch, so notification cannot become a
   second recovery authority or weaken merge-boundary proof.
   */
-  if (
-    task.status === "blocked"
-    && task.paused === true
-    && task.pausedReason === "external-block"
-    && task.userPaused !== true
-    && task.autoMerge !== false
-    && task.externalBlock
-  ) {
+  const freeze = classifyExternalBlockFreeze(task);
+  if (freeze === "recovery-owned") return null;
+  if (freeze === "awaiting-operator" && task.externalBlock) {
     const report = buildTaskExternalBlockReport(task.externalBlock, task.externalBlock.report);
     return {
       reasonKey: `external-block:${task.externalBlock.origin}:${task.externalBlock.code}`,

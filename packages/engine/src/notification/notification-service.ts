@@ -16,7 +16,7 @@ import { DEFAULT_NTFY_EVENTS, buildNtfyClickUrl, formatTaskIdentifier } from "..
 import { schedulerLog } from "../logger.js";
 import { NtfyNotificationProvider } from "./ntfy-provider.js";
 import { WebhookNotificationProvider } from "./webhook-provider.js";
-import { classifyTerminalFailureAutoRecoveryForTask, describeTaskRecoveryOwner, describeTaskWedge, isTaskProgressing, shouldWithholdWedgeAlertForAutoRecovery, type TaskWedgeDescriptor } from "./task-wedge-notification.js";
+import { classifyExternalBlockFreeze, classifyTerminalFailureAutoRecoveryForTask, describeTaskRecoveryOwner, describeTaskWedge, hasWedgeSubjectMovedOn, isTaskProgressing, shouldWithholdWedgeAlertForAutoRecovery, type TaskWedgeDescriptor } from "./task-wedge-notification.js";
 import { deliverMailboxMessageOnce } from "./mailbox-delivery.js";
 
 type PendingWedgeCompletionOutcome = "delivered" | "suppressed" | "cleared" | "rearmed" | "held" | "absent" | "unreadable";
@@ -485,11 +485,15 @@ export class NotificationService {
     task:moved is a production recovery path that does not enter maybeNotifyTaskWedge. A pending
     durable hold must be cleared when its subject visibly progresses, including workflow-renamed
     hold/WIP/terminal lanes, so its timer or restart sweep cannot alert after that recovery.
+
+    FNXC:TaskWedgeNotifications 2026-10-13-10:40:
+    A move is no progress for a freeze waiting for an operator: the freeze keeps its column and its non-failed status, and clearing its hold here re-entered the mark/clear write loop.
+    Its hold stays until delivery, and the pending completion clears it if the card reaches a terminal lane.
     */
     const movedProgressedLanes = await resolveProjectColumnsForRoles(this.store, ["hold", "countsTowardWip", "complete", "archived"]);
     if (
-      movedProgressedLanes.has(data.to)
-      || (typeof data.task.status === "string" && data.task.status !== "failed")
+      classifyExternalBlockFreeze(data.task) !== "awaiting-operator"
+      && (movedProgressedLanes.has(data.to) || (typeof data.task.status === "string" && data.task.status !== "failed"))
     ) {
       await this.clearPendingWedgeNotification(data.task.id);
     }
@@ -772,8 +776,6 @@ export class NotificationService {
       resolve only when the lifecycle has visibly resumed in an active or terminal
       column, or when it carries a non-failed workflow status.
       */
-      const isActiveSelfHealingNoAction = task.wedgeNotification?.status === "active"
-        && task.wedgeNotification.reasonKey.startsWith("self-healing-no-action:");
       // FNXC:TaskWedgeNotifications 2026-07-22-15:00: A no-action task normally
       // stays in review, so arbitrary in-review/status writes are not resolution
       // evidence. Only an active owner state or real lifecycle advance can close it.
@@ -801,12 +803,14 @@ export class NotificationService {
       MEMBERSHIP over the four roles, not first-match: "has this card moved on" can be true of more
       than one lane per role on a renamed board, and a first-match answer would silently ignore the
       others. Legacy-seeded, so an unconverted board resolves exactly the four ids it used to compare.
+
+      FNXC:TaskWedgeNotifications 2026-10-13-10:40:
+      Lane membership and a non-failed status are not progress for a freeze waiting for an operator: it keeps its WIP, review or hold column and its `blocked` status.
+      `hasWedgeSubjectMovedOn` applies the shared freeze rule, so this resolve and the classifier cannot disagree; that disagreement rewrote a frozen card's row every few seconds.
+      A supplied self-healing descriptor on such a freeze lands here as held and must not resolve the freeze's own episode.
       */
       const progressedLanes = await resolveProjectColumnsForRoles(this.store, ["hold", "countsTowardWip", "complete", "archived"]);
-      const hasProgressed = progressedLanes.has(task.column)
-        || (!isActiveSelfHealingNoAction && typeof task.status === "string" && task.status !== "failed")
-        || (isActiveSelfHealingNoAction && ["queued", "planning", "in-progress", "merging", "merging-pr", "merged", "done"].includes(task.status ?? ""));
-      if (hasProgressed) {
+      if (hasWedgeSubjectMovedOn(task, { progressed: progressedLanes, terminal: terminalLanes })) {
         await this.clearPendingWedgeNotification(task.id);
         this.activeWedgeReasons.delete(task.id);
         await this.store.claimTaskWedgeNotificationEpisode?.(task.id, null);
@@ -1003,10 +1007,8 @@ export class NotificationService {
 
       const terminalLanes = await resolveProjectColumnsForRoles(this.store, ["complete", "archived"]);
       const progressedLanes = await resolveProjectColumnsForRoles(this.store, ["hold", "countsTowardWip", "complete", "archived"]);
-      const activeSelfHealing = task.wedgeNotification?.status === "active" && task.wedgeNotification.reasonKey.startsWith("self-healing-no-action:");
-      const hasProgressed = progressedLanes.has(task.column)
-        || (!activeSelfHealing && typeof task.status === "string" && task.status !== "failed")
-        || (activeSelfHealing && ["queued", "planning", "in-progress", "merging", "merging-pr", "merged", "done"].includes(task.status ?? ""));
+      // FNXC:TaskWedgeNotifications 2026-10-13-10:40: the shared freeze rule keeps an aged hold for a freeze waiting for an operator deliverable from the timer and the restart sweep in every lane.
+      const hasProgressed = hasWedgeSubjectMovedOn(task, { progressed: progressedLanes, terminal: terminalLanes });
       const suppliedHeldOrProgressing = source === "supplied" && (task.paused === true || task.userPaused === true || task.autoMerge === false || isTaskProgressing(task));
       if (task.deletedAt != null || terminalLanes.has(task.column) || describeTaskRecoveryOwner(task) != null || hasProgressed || suppliedHeldOrProgressing) {
         await this.clearPendingWedgeNotification(taskId);
