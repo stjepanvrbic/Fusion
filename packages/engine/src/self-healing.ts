@@ -973,6 +973,37 @@ function reviewCardFingerprint(task: Task): string {
   return JSON.stringify({ column: task.column, status: task.status ?? null, paused: !!task.paused, userPaused: !!task.userPaused, branch: task.branch ?? null, mergeConfirmed: !!task.mergeDetails?.mergeConfirmed, checkoutRunId: task.checkoutRunId ?? null, checkoutLeaseRenewedAt: task.checkoutLeaseRenewedAt ?? null, enabledWorkflowSteps: task.enabledWorkflowSteps ?? [], steps: task.steps ?? [], workflowStepResults: task.workflowStepResults ?? [] });
 }
 
+/*
+FNXC:WorkflowRecovery 2026-10-15-19:30:
+The already-merged rejection line is the rejection's identity: it encodes task, candidate (12-hex prefix), owner, branch, base and reason.
+The recording phase is deliberately not part of it, so the same refusal reached by two sweeps is one record.
+*/
+function alreadyMergedRejectionPrefix(taskId: string): string {
+  return `[recovery] already-merged rejected ${taskId} `;
+}
+
+function formatAlreadyMergedRejectionLine(input: {
+  taskId: string;
+  candidateSha: string;
+  candidateOwner?: string;
+  taskBranch?: string | null;
+  baseBranch: string;
+  reason: string;
+}): string {
+  return `${alreadyMergedRejectionPrefix(input.taskId)}candidate=${input.candidateSha.slice(0, 12)} owner=${input.candidateOwner ?? "unknown"} branch=${input.taskBranch ?? "?"} base=${input.baseBranch} reason=${input.reason}`;
+}
+
+/** Most recent already-merged rejection line recorded for `taskId`, or null. The trailing space in the prefix keeps `KB-1` from matching `KB-16`. */
+function lastRecordedAlreadyMergedRejection(log: Task["log"] | undefined, taskId: string): string | null {
+  if (!Array.isArray(log)) return null;
+  const prefix = alreadyMergedRejectionPrefix(taskId);
+  for (let index = log.length - 1; index >= 0; index -= 1) {
+    const action = log[index]?.action;
+    if (typeof action === "string" && action.startsWith(prefix)) return action;
+  }
+  return null;
+}
+
 export class SelfHealingManager extends SelfHealingGitEvidence {
   // ── Auto-unpause state ──────────────────────────────────────────────
   private unpauseTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2748,11 +2779,27 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
 
     FNXC:WorkflowRecovery 2026-06-29-00:15:
     Ownership lookup failures are also unsafe evidence. Record them through the same rejection audit path with `ownership-unverifiable` so transient git-show/rev-parse failures cannot proceed into reclaim or auto-finalize as if the tip were verified non-foreign.
+
+    FNXC:WorkflowRecovery 2026-10-15-19:30:
+    KB-168 sat parked for days while every 5-minute pass appended the same rejection line and run-audit row; the 1,000-entry activity log cap then evicted the card's real history.
+    The refusal is still made on every pass, but it is recorded (log line and run-audit row together) only when its line differs from the last rejection line recorded for the task.
+    The decision reads the task's persisted log, fetched fresh because callers pass slim rows whose log is empty, so it survives a daemon restart; never replace it with a process-memory set.
+    `logEntryOnce` does not fit: its time-window dedupe would suppress the third record of A, B, A, while a changed refusal must always be recorded.
+    A failed or empty read records anyway: a duplicate line is better than a lost refusal.
     */
-    await this.store.logEntry(
-      task.id,
-      `[recovery] already-merged rejected ${task.id} candidate=${candidateSha.slice(0, 12)} owner=${candidateOwner ?? "unknown"} branch=${taskBranch ?? "?"} base=${baseBranch} reason=${reason}`,
-    );
+    const line = formatAlreadyMergedRejectionLine({ taskId: task.id, candidateSha, candidateOwner, taskBranch, baseBranch, reason });
+    let lastRecorded: string | null = null;
+    try {
+      const persisted = await this.store.getTask(task.id);
+      lastRecorded = lastRecordedAlreadyMergedRejection(persisted?.log, task.id);
+    } catch (err: unknown) {
+      log.debug(`Could not read ${task.id} log before recording already-merged rejection: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (lastRecorded === line) {
+      log.debug(`Already-merged rejection for ${task.id} unchanged (${phase}); not re-recorded`);
+      return;
+    }
+    await this.store.logEntry(task.id, line);
     try {
       await emitBoundedRunAudit(this.store, {
         taskId: task.id,

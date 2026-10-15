@@ -17805,7 +17805,7 @@
     },
     {
       "callSiteId": "packages/engine/src/self-healing.ts::rejectForeignAlreadyMergedCandidate::this.store.logEntry::#1",
-      "callSiteFingerprint": "this.store.logEntry(task.id,`[recovery] already-merged rejected ${task.id} candidate=${candidateSha.slice(0, 12)} owner=${candidateOwner ?? \"unknown)",
+      "callSiteFingerprint": "this.store.logEntry(task.id,line)",
       "file": "packages/engine/src/self-healing.ts",
       "enclosingSymbolPath": "rejectForeignAlreadyMergedCandidate",
       "writer": "this.store.logEntry",
